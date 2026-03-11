@@ -79,11 +79,21 @@ pub fn discovery_create_query(
     keywords: Option<Vec<String>>,
     min_history_secs: Option<i64>,
 ) -> napi::Result<String> {
-    #[allow(clippy::cast_sign_loss)]
+    let min_history = match min_history_secs {
+        Some(s) if s < 0 => {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message: format!("min_history_secs must be non-negative, got {s}"),
+                code: "SCP-VALID-7040".to_owned(),
+            }));
+        }
+        #[allow(clippy::cast_sign_loss)]
+        Some(s) => Some(std::time::Duration::from_secs(s as u64)),
+        None => None,
+    };
     let query = DiscoveryQuery {
         capability_filter: capabilities,
         keywords,
-        min_history: min_history_secs.map(|s| std::time::Duration::from_secs(s as u64)),
+        min_history,
     };
 
     serde_json::to_string(&query).map_err(|e| {
@@ -239,6 +249,18 @@ mod tests {
             result.discovery_source,
             scp_core::discovery::ContextDiscoverySource::ContextUri
         );
+    }
+
+    #[test]
+    fn create_query_negative_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(-1));
+        assert!(result.is_err(), "negative min_history_secs should error");
+    }
+
+    #[test]
+    fn create_query_i64_min_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(i64::MIN));
+        assert!(result.is_err(), "i64::MIN min_history_secs should error");
     }
 
     #[test]

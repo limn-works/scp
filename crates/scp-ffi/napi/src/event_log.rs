@@ -414,7 +414,13 @@ pub fn event_log_checkpoint(
 
         let context_id = handle.context_id();
         let sender_did = scp_identity::DID(identity.inner.did.clone());
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        if epoch < 0.0 {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message: format!("epoch must be non-negative, got {epoch}"),
+                code: "SCP-VALID-7040".to_owned(),
+            }));
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let epoch_u64 = epoch as u64;
 
         let checkpoint = crate::runtime::with_context(&context_id, |rt| {

@@ -16,6 +16,8 @@
 
 use wasm_bindgen::prelude::*;
 
+use crate::error::ScpWasmError;
+
 // ---------------------------------------------------------------------------
 // Constants (mirror scp-core::sync)
 // ---------------------------------------------------------------------------
@@ -40,6 +42,24 @@ const RECONNECTION_DEDUP_WINDOW_SECS: u64 = 30;
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Validates that an f64 timestamp is non-negative.
+///
+/// Returns the value cast to `u64` on success, or a `JsValue` validation error
+/// on failure. This matches the NAPI bridge behavior (SCP-VALID-7040) instead
+/// of silently clamping negatives to zero.
+fn validate_non_negative_timestamp(value: f64, name: &str) -> Result<u64, JsValue> {
+    if value < 0.0 {
+        return Err(ScpWasmError::Validation {
+            message: format!("{name} must be non-negative, got {value}"),
+            code: "SCP-VALID-7040".to_owned(),
+        }
+        .into_js()
+        .into());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(value as u64)
+}
 
 /// Classifies offline duration using the given thresholds.
 fn classify(duration_secs: u64, tier_1: u64, tier_2: u64) -> &'static str {
@@ -66,21 +86,22 @@ fn classify(duration_secs: u64, tier_1: u64, tier_2: u64) -> &'static str {
 ///
 /// Returns one of: `"short"`, `"extended"`, `"long"`.
 ///
+/// # Errors
+///
+/// Returns `SCP-VALID-7040` if either parameter is negative.
+///
 /// # JS usage
 ///
 /// ```js
 /// const tier = sync_classify_offline(lastContact, Date.now() / 1000);
 /// console.log(tier); // "short" | "extended" | "long"
 /// ```
-#[must_use]
 #[wasm_bindgen]
-pub fn sync_classify_offline(last_relay_contact: f64, now: f64) -> String {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let last = last_relay_contact.max(0.0) as u64;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let current = now.max(0.0) as u64;
+pub fn sync_classify_offline(last_relay_contact: f64, now: f64) -> Result<String, JsValue> {
+    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
+    let current = validate_non_negative_timestamp(now, "now")?;
     let duration_secs = current.saturating_sub(last);
-    classify(duration_secs, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS).to_owned()
+    Ok(classify(duration_secs, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -131,30 +152,29 @@ pub fn sync_get_policy() -> String {
 ///
 /// Returns one of: `"short"`, `"extended"`, `"long"`.
 ///
+/// # Errors
+///
+/// Returns `SCP-VALID-7040` if any parameter is negative.
+///
 /// # JS usage
 ///
 /// ```js
 /// // Custom: 1 hour short, 3 days extended
 /// const tier = sync_classify_offline_custom(last, now, 3600, 259200);
 /// ```
-#[must_use]
 #[wasm_bindgen]
 pub fn sync_classify_offline_custom(
     last_relay_contact: f64,
     now: f64,
     tier_1_threshold_secs: f64,
     tier_2_threshold_secs: f64,
-) -> String {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let last = last_relay_contact.max(0.0) as u64;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let current = now.max(0.0) as u64;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let t1 = tier_1_threshold_secs.max(0.0) as u64;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let t2 = tier_2_threshold_secs.max(0.0) as u64;
+) -> Result<String, JsValue> {
+    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
+    let current = validate_non_negative_timestamp(now, "now")?;
+    let t1 = validate_non_negative_timestamp(tier_1_threshold_secs, "tier_1_threshold_secs")?;
+    let t2 = validate_non_negative_timestamp(tier_2_threshold_secs, "tier_2_threshold_secs")?;
     let duration_secs = current.saturating_sub(last);
-    classify(duration_secs, t1, t2).to_owned()
+    Ok(classify(duration_secs, t1, t2).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -168,46 +188,46 @@ mod tests {
 
     #[test]
     fn classify_short_zero_seconds() {
-        let result = sync_classify_offline(1_000_000.0, 1_000_000.0);
+        let result = sync_classify_offline(1_000_000.0, 1_000_000.0).unwrap();
         assert_eq!(result, "short");
     }
 
     #[test]
     fn classify_short_at_boundary() {
         // Exactly 4 hours = 14400 seconds
-        let result = sync_classify_offline(1_000_000.0, 1_014_400.0);
+        let result = sync_classify_offline(1_000_000.0, 1_014_400.0).unwrap();
         assert_eq!(result, "short");
     }
 
     #[test]
     fn classify_extended_just_over() {
-        let result = sync_classify_offline(1_000_000.0, 1_014_401.0);
+        let result = sync_classify_offline(1_000_000.0, 1_014_401.0).unwrap();
         assert_eq!(result, "extended");
     }
 
     #[test]
     fn classify_extended_at_boundary() {
-        let result = sync_classify_offline(1_000_000.0, 1_604_800.0);
+        let result = sync_classify_offline(1_000_000.0, 1_604_800.0).unwrap();
         assert_eq!(result, "extended");
     }
 
     #[test]
     fn classify_long_just_over() {
-        let result = sync_classify_offline(1_000_000.0, 1_604_801.0);
+        let result = sync_classify_offline(1_000_000.0, 1_604_801.0).unwrap();
         assert_eq!(result, "long");
     }
 
     #[test]
     fn classify_handles_clock_skew() {
         // now < last_relay_contact => saturating_sub => 0 => Short
-        let result = sync_classify_offline(2_000_000.0, 1_000_000.0);
+        let result = sync_classify_offline(2_000_000.0, 1_000_000.0).unwrap();
         assert_eq!(result, "short");
     }
 
     #[test]
     fn classify_custom_thresholds() {
         // Custom: 1 hour, 3 days
-        let result = sync_classify_offline_custom(0.0, 3601.0, 3600.0, 259_200.0);
+        let result = sync_classify_offline_custom(0.0, 3601.0, 3600.0, 259_200.0).unwrap();
         assert_eq!(result, "extended");
     }
 
@@ -221,8 +241,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_negative_values_treated_as_zero() {
+    fn classify_negative_last_relay_contact_errors() {
         let result = sync_classify_offline(-100.0, 0.0);
-        assert_eq!(result, "short");
+        assert!(result.is_err(), "negative last_relay_contact should error");
+    }
+
+    #[test]
+    fn classify_negative_now_errors() {
+        let result = sync_classify_offline(0.0, -1.0);
+        assert!(result.is_err(), "negative now should error");
+    }
+
+    #[test]
+    fn classify_custom_negative_threshold_errors() {
+        let result = sync_classify_offline_custom(0.0, 100.0, -3600.0, 259_200.0);
+        assert!(result.is_err(), "negative threshold should error");
     }
 }
