@@ -369,7 +369,7 @@ pub struct ContextSnapshot {
     ///
     /// Empty if no crypto state was exported (e.g., broadcast-only contexts
     /// or mock providers). See issue #645.
-    #[serde(default)]
+    #[serde(default, with = "serde_bytes")]
     pub mls_crypto_state: Vec<u8>,
 }
 

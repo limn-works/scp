@@ -80,6 +80,18 @@ struct MlsCryptoSnapshot {
     signer_bytes: Vec<u8>,
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
     group_id: Vec<u8>,
+    /// The provider-level X25519 wrapping public key (§9.16.1).
+    /// Persisted so remote members' HPKE-sealed sender key responses can
+    /// still be decrypted after a restart. Without this, the restored
+    /// provider would generate a fresh keypair whose public key doesn't
+    /// match the one published in the MLS tree's `LeafNode` extension.
+    #[serde(default)]
+    wrapping_public_key: [u8; 32],
+    /// The provider-level X25519 wrapping secret key (§9.16.1).
+    /// Wrapped in a `Vec<u8>` for serde compatibility; the 32-byte key
+    /// is re-wrapped in [`Zeroizing`] on restore.
+    #[serde(default)]
+    wrapping_secret_key: Vec<u8>,
 }
 
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
@@ -127,7 +139,9 @@ pub struct MlsCryptoProvider {
     broadcast_keys: Mutex<HashMap<[u8; 32], SenderKey>>,
     /// X25519 wrapping public key for sender key HPKE (§9.16.1).
     /// Published in the MLS `LeafNode` `scp_wrapping_key` extension.
-    wrapping_public_key: [u8; 32],
+    /// Behind a `Mutex` so it can be restored from a persisted snapshot
+    /// via [`ContextCryptoProvider::restore_crypto_state`] (which takes `&self`).
+    wrapping_public_key: Mutex<[u8; 32]>,
     /// X25519 wrapping secret key for sender key HPKE (§9.16.1).
     /// Used to open HPKE-sealed sender key responses. Wrapped in
     /// [`Zeroizing`] so key material is zeroed on drop.
@@ -148,7 +162,7 @@ impl MlsCryptoProvider {
             local_did,
             contexts: Mutex::new(HashMap::new()),
             broadcast_keys: Mutex::new(HashMap::new()),
-            wrapping_public_key,
+            wrapping_public_key: Mutex::new(wrapping_public_key),
             wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
         }
     }
@@ -194,9 +208,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
     fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let credential = self.make_credential()?;
-        let mls_group =
-            group::create_group_with_wrapping_key(&credential, Some(&self.wrapping_public_key))
-                .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+        let wrapping_pk = self
+            .wrapping_public_key
+            .lock()
+            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let mls_group = group::create_group_with_wrapping_key(&credential, Some(&*wrapping_pk))
+            .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
         let sender_key_store = SenderKeyStore::new();
@@ -762,6 +779,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .into_iter()
             .collect();
 
+        // Read the provider-level wrapping keypair for persistence.
+        let pub_key_guard = self
+            .wrapping_public_key
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
+        let secret_key_guard = self
+            .wrapping_secret_key
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
+
         let snapshot = MlsCryptoSnapshot {
             mls_storage_entries,
             local_sender_key: state.sender_key.clone(),
@@ -774,6 +801,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 .collect(),
             signer_bytes,
             group_id,
+            wrapping_public_key: *pub_key_guard,
+            wrapping_secret_key: secret_key_guard.to_vec(),
         };
 
         rmp_serde::to_vec_named(&snapshot)
@@ -853,6 +882,30 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
         contexts.insert(*context_id, crypto_state);
+
+        // Restore the provider-level X25519 wrapping keypair so HPKE-sealed
+        // sender key responses targeting the OLD public key can still be
+        // decrypted. Without this, the freshly-generated keypair would not
+        // match the public key published in the MLS tree's LeafNode extension,
+        // causing HPKE decryption failures for all incoming sender key
+        // responses sealed against the original key.
+        //
+        // Legacy snapshots (pre-wrapping-key persistence) have default
+        // [0u8; 32] — skip restore in that case to keep the fresh keypair.
+        if snapshot.wrapping_public_key != [0u8; 32] && snapshot.wrapping_secret_key.len() == 32 {
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&snapshot.wrapping_secret_key);
+
+            let mut pub_guard = self.wrapping_public_key.lock().map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
+            })?;
+            *pub_guard = snapshot.wrapping_public_key;
+
+            let mut secret_guard = self.wrapping_secret_key.lock().map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
+            })?;
+            *secret_guard = Zeroizing::new(secret);
+        }
 
         Ok(())
     }
@@ -1306,7 +1359,7 @@ mod tests {
             super::super::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
         assert_eq!(
             extracted,
-            Some(provider.wrapping_public_key),
+            Some(*provider.wrapping_public_key.lock().unwrap()),
             "own leaf node must contain provider's wrapping public key"
         );
     }
@@ -1414,11 +1467,9 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_mls) = generate_key_package_with_wrapping_key(
-            &bob_cred,
-            Some(&bob_provider.wrapping_public_key),
-        )
-        .unwrap();
+        let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_mls) =
+            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping_pk)).unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -1491,10 +1542,11 @@ mod tests {
         bob_provider.create_mls_group(&ctx_id).unwrap();
 
         let ctx_hex = hex::encode(ctx_id);
+        let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
-                &bob_provider.wrapping_public_key,
+                &bob_wrapping_pk,
                 &ctx_hex,
                 TEST_DID,
                 0,
@@ -1737,6 +1789,55 @@ mod tests {
         assert_eq!(
             epoch_before, epoch_after,
             "MLS epoch should be preserved across export/restore"
+        );
+    }
+
+    #[test]
+    fn test_wrapping_key_persisted_across_restart() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        // Capture the original wrapping keypair.
+        let original_public = *provider.wrapping_public_key.lock().unwrap();
+        let original_secret: [u8; 32] = **provider.wrapping_secret_key.lock().unwrap();
+
+        // Sanity: the keypair should not be all zeros.
+        assert_ne!(
+            original_public, [0u8; 32],
+            "wrapping public key must not be zero"
+        );
+        assert_ne!(
+            original_secret, [0u8; 32],
+            "wrapping secret key must not be zero"
+        );
+
+        // Export the crypto state.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        assert!(!exported.is_empty());
+
+        // Create a fresh provider (simulates restart — gets a NEW random keypair).
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let fresh_public = *provider2.wrapping_public_key.lock().unwrap();
+        assert_ne!(
+            fresh_public, original_public,
+            "fresh provider should have a DIFFERENT wrapping public key"
+        );
+
+        // Restore the exported state into the fresh provider.
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
+        let restored_public = *provider2.wrapping_public_key.lock().unwrap();
+        let restored_secret: [u8; 32] = **provider2.wrapping_secret_key.lock().unwrap();
+
+        assert_eq!(
+            restored_public, original_public,
+            "wrapping public key must be restored from snapshot, not freshly generated"
+        );
+        assert_eq!(
+            restored_secret, original_secret,
+            "wrapping secret key must be restored from snapshot, not freshly generated"
         );
     }
 }
