@@ -504,6 +504,7 @@ class TestBroadcast:
 
         # Unblock bob — subscriber status should be restored.
         _scp_core.py_broadcast_unblock_subscriber(handle, bob.did, alice.did)
+        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
 
     async def test_unblock_not_blocked_raises(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
