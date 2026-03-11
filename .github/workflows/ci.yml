@@ -329,3 +329,52 @@ jobs:
       - name: Run Swift tests
         working-directory: bindings/swift
         run: swift test
+
+  # ── CI Gate ─────────────────────────────────────────────────────────
+  # Single required check for branch protection. Depends on all CI jobs
+  # and uses if: always() so it runs even when paths-filter skips jobs.
+  # Reports success only when every non-skipped job succeeded.
+  ci:
+    if: always()
+    needs:
+      - error-codes
+      - rust-fmt
+      - rust-clippy
+      - rust-test
+      - rust-doc
+      - rust-deny
+      - python-lint
+      - python-test
+      - typescript-check
+      - kotlin-lint
+      - kotlin-test
+      - wasm-clippy
+      - swift-lint
+      - swift-build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        run: |
+          results=( \
+            "${{ needs.error-codes.result }}" \
+            "${{ needs.rust-fmt.result }}" \
+            "${{ needs.rust-clippy.result }}" \
+            "${{ needs.rust-test.result }}" \
+            "${{ needs.rust-doc.result }}" \
+            "${{ needs.rust-deny.result }}" \
+            "${{ needs.python-lint.result }}" \
+            "${{ needs.python-test.result }}" \
+            "${{ needs.typescript-check.result }}" \
+            "${{ needs.kotlin-lint.result }}" \
+            "${{ needs.kotlin-test.result }}" \
+            "${{ needs.wasm-clippy.result }}" \
+            "${{ needs.swift-lint.result }}" \
+            "${{ needs.swift-build-test.result }}" \
+          )
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
+              echo "::error::CI job failed or was cancelled: $r"
+              exit 1
+            fi
+          done
+          echo "All CI jobs passed or were skipped."
