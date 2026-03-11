@@ -173,7 +173,7 @@ impl NapiContextHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the tokio runtime cannot be accessed.
+    /// The `Result` return type is required by napi-rs. This getter is infallible.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u64> {
         let manager = context_manager();
@@ -660,11 +660,10 @@ pub fn context_subscribe(
 ///
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberCount")]
-pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u64> {
     let manager = context_manager();
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(count as u32)
+    Ok(count as u64)
 }
 
 /// Returns whether a DID is a member of the context.
