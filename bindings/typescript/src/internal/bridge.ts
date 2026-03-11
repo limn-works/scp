@@ -152,7 +152,7 @@ export interface Bridge {
     toolId: string,
     inputJson: string,
     identityDid: string,
-    ucanToken?: string,
+    ucanToken: string,
   ): Promise<string>;
   toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult>;
 

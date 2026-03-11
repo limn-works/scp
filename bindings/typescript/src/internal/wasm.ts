@@ -721,7 +721,7 @@ export function createWasmBridge(): Bridge {
       toolId: string,
       inputJson: string,
       identityDid: string,
-      ucanToken?: string,
+      ucanToken: string,
     ): Promise<string> {
       const wasm = getWasm();
       return await wasm.tool_invoke(handle, toolId, inputJson, identityDid, ucanToken);
