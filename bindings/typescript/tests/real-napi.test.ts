@@ -672,6 +672,20 @@ if (bridge === null) {
       expect(policy.sender_key_timeout_secs).toBeGreaterThan(0);
       expect(policy.reconnection_dedup_window_secs).toBeGreaterThan(0);
     });
+
+    test("classifies offline duration with custom thresholds", () => {
+      const now = 1_000_000;
+      // Custom: 1 hour short, 3 days extended
+      const t1 = 3600;
+      const t2 = 259_200;
+
+      // 30 min ago -> short (within custom 1h threshold)
+      expect(napi.syncClassifyOfflineCustom(now - 1800, now, t1, t2)).toBe("short");
+      // 2 hours ago -> extended (over 1h, within 3 days)
+      expect(napi.syncClassifyOfflineCustom(now - 7200, now, t1, t2)).toBe("extended");
+      // 4 days ago -> long (over 3 days)
+      expect(napi.syncClassifyOfflineCustom(now - 345_600, now, t1, t2)).toBe("long");
+    });
   });
 
   // ---------------------------------------------------------------------------

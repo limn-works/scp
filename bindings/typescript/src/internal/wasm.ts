@@ -164,6 +164,12 @@ interface WasmModule {
   provenance_check_chain_depth: (chainDepth: number, maxDepth: number | undefined) => boolean;
   // Sync
   sync_classify_offline: (lastRelayContact: number, now: number) => string;
+  sync_classify_offline_custom: (
+    lastRelayContact: number,
+    now: number,
+    tier1ThresholdSecs: number,
+    tier2ThresholdSecs: number,
+  ) => string;
   sync_get_policy: () => ReturnType<Bridge["syncGetPolicy"]>;
   // Identity Advanced
   identity_create_with_agent_key: (
@@ -812,6 +818,21 @@ export function createWasmBridge(): Bridge {
     syncClassifyOffline(lastRelayContact: number, now: number) {
       const wasm = getWasm();
       return wasm.sync_classify_offline(lastRelayContact, now);
+    },
+
+    syncClassifyOfflineCustom(
+      lastRelayContact: number,
+      now: number,
+      tier1ThresholdSecs: number,
+      tier2ThresholdSecs: number,
+    ) {
+      const wasm = getWasm();
+      return wasm.sync_classify_offline_custom(
+        lastRelayContact,
+        now,
+        tier1ThresholdSecs,
+        tier2ThresholdSecs,
+      );
     },
 
     syncGetPolicy() {

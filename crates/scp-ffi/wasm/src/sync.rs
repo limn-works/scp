@@ -44,11 +44,11 @@ const RECONNECTION_DEDUP_WINDOW_SECS: u64 = 30;
 /// Classifies offline duration using the given thresholds.
 fn classify(duration_secs: u64, tier_1: u64, tier_2: u64) -> &'static str {
     if duration_secs <= tier_1 {
-        "Short"
+        "short"
     } else if duration_secs <= tier_2 {
-        "Extended"
+        "extended"
     } else {
-        "Long"
+        "long"
     }
 }
 
@@ -64,13 +64,13 @@ fn classify(duration_secs: u64, tier_1: u64, tier_2: u64) -> &'static str {
 /// They represent Unix timestamps in seconds. The function computes
 /// `now - last_relay_contact` (with saturating subtraction for clock skew).
 ///
-/// Returns one of: `"Short"`, `"Extended"`, `"Long"`.
+/// Returns one of: `"short"`, `"extended"`, `"long"`.
 ///
 /// # JS usage
 ///
 /// ```js
 /// const tier = sync_classify_offline(lastContact, Date.now() / 1000);
-/// console.log(tier); // "Short" | "Extended" | "Long"
+/// console.log(tier); // "short" | "extended" | "long"
 /// ```
 #[must_use]
 #[wasm_bindgen]
@@ -129,7 +129,7 @@ pub fn sync_get_policy() -> String {
 /// - `tier_1_threshold_secs` — Custom Tier 1 upper bound (seconds).
 /// - `tier_2_threshold_secs` — Custom Tier 2 upper bound (seconds).
 ///
-/// Returns one of: `"Short"`, `"Extended"`, `"Long"`.
+/// Returns one of: `"short"`, `"extended"`, `"long"`.
 ///
 /// # JS usage
 ///
@@ -169,46 +169,46 @@ mod tests {
     #[test]
     fn classify_short_zero_seconds() {
         let result = sync_classify_offline(1_000_000.0, 1_000_000.0);
-        assert_eq!(result, "Short");
+        assert_eq!(result, "short");
     }
 
     #[test]
     fn classify_short_at_boundary() {
         // Exactly 4 hours = 14400 seconds
         let result = sync_classify_offline(1_000_000.0, 1_014_400.0);
-        assert_eq!(result, "Short");
+        assert_eq!(result, "short");
     }
 
     #[test]
     fn classify_extended_just_over() {
         let result = sync_classify_offline(1_000_000.0, 1_014_401.0);
-        assert_eq!(result, "Extended");
+        assert_eq!(result, "extended");
     }
 
     #[test]
     fn classify_extended_at_boundary() {
         let result = sync_classify_offline(1_000_000.0, 1_604_800.0);
-        assert_eq!(result, "Extended");
+        assert_eq!(result, "extended");
     }
 
     #[test]
     fn classify_long_just_over() {
         let result = sync_classify_offline(1_000_000.0, 1_604_801.0);
-        assert_eq!(result, "Long");
+        assert_eq!(result, "long");
     }
 
     #[test]
     fn classify_handles_clock_skew() {
         // now < last_relay_contact => saturating_sub => 0 => Short
         let result = sync_classify_offline(2_000_000.0, 1_000_000.0);
-        assert_eq!(result, "Short");
+        assert_eq!(result, "short");
     }
 
     #[test]
     fn classify_custom_thresholds() {
         // Custom: 1 hour, 3 days
         let result = sync_classify_offline_custom(0.0, 3601.0, 3600.0, 259_200.0);
-        assert_eq!(result, "Extended");
+        assert_eq!(result, "extended");
     }
 
     #[test]
@@ -223,6 +223,6 @@ mod tests {
     #[test]
     fn classify_negative_values_treated_as_zero() {
         let result = sync_classify_offline(-100.0, 0.0);
-        assert_eq!(result, "Short");
+        assert_eq!(result, "short");
     }
 }

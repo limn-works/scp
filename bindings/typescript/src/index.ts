@@ -108,7 +108,7 @@ export {
 // ---------------------------------------------------------------------------
 
 export type { SyncPolicy } from "./sync";
-export { classifyOffline, getSyncPolicy } from "./sync";
+export { classifyOffline, classifyOfflineCustom, getSyncPolicy } from "./sync";
 
 // ---------------------------------------------------------------------------
 // Errors

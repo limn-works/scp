@@ -47,6 +47,34 @@ export async function classifyOffline(lastRelayContact: number, now: number): Pr
 }
 
 /**
+ * Classifies an offline duration using custom policy thresholds.
+ *
+ * @param lastRelayContact - Unix timestamp (seconds) of last relay contact.
+ * @param now - Current Unix timestamp (seconds).
+ * @param tier1ThresholdSecs - Custom upper bound for short offline tier (seconds).
+ * @param tier2ThresholdSecs - Custom upper bound for extended offline tier (seconds).
+ * @returns `"short"`, `"extended"`, or `"long"`.
+ */
+export async function classifyOfflineCustom(
+  lastRelayContact: number,
+  now: number,
+  tier1ThresholdSecs: number,
+  tier2ThresholdSecs: number,
+): Promise<string> {
+  try {
+    const bridge = await getBridge();
+    return bridge.syncClassifyOfflineCustom(
+      lastRelayContact,
+      now,
+      tier1ThresholdSecs,
+      tier2ThresholdSecs,
+    );
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
  * Returns the default sync policy parameters.
  *
  * @returns A `SyncPolicy` with the default parameters.
