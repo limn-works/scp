@@ -10450,13 +10450,8 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state = ContextRoleState::new(
-            "grace-incon-ctx",
-            "did:key:author1",
-            ceiling,
-            vec![],
-        )
-        .unwrap();
+        let role_state =
+            ContextRoleState::new("grace-incon-ctx", "did:key:author1", ceiling, vec![]).unwrap();
         let membership = MembershipState::new();
 
         // Grace entry referencing epoch 5, but MLS epoch is only 3.
@@ -10484,7 +10479,7 @@ mod tests {
             pending_ceiling_modification: None,
             mls_epoch: 3,
             grace_entries: vec![GraceEntry {
-                epoch: 5, // epoch 5 > mls_epoch 3 → inconsistency
+                epoch: 5,                       // epoch 5 > mls_epoch 3 → inconsistency
                 expires_at_unix_secs: u64::MAX, // far-future expiry
             }],
             needs_reconnect: false,
@@ -10545,13 +10540,8 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state = ContextRoleState::new(
-            "grace-ok-ctx",
-            "did:key:author1",
-            ceiling,
-            vec![],
-        )
-        .unwrap();
+        let role_state =
+            ContextRoleState::new("grace-ok-ctx", "did:key:author1", ceiling, vec![]).unwrap();
         let membership = MembershipState::new();
 
         // Grace entry epoch 2, MLS epoch 3 → consistent (epoch <= mls_epoch).
