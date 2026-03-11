@@ -774,31 +774,54 @@ pub fn identity_resolve(did: String) -> Promise {
         }
 
         // Look up public key bytes from the local identity registry.
-        // Only extract the public key — never clone private key material
-        // out of the registry.
-        let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
+        // Only extract public keys — never clone private key material
+        // out of the registry. Derive agent public key inside the closure.
+        let key_info = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
-            map.get(&did).map(|entry| entry.public_key_bytes)
+            map.get(&did).map(|entry| {
+                let agent_pub_bytes = entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                    sk.verifying_key().to_bytes()
+                });
+                (entry.public_key_bytes, agent_pub_bytes)
+            })
         });
 
-        let (verification_methods_json, authentication_json, assertion_methods_json) =
-            pub_key_bytes.map_or_else(
+        let (verification_methods_json, authentication_json, assertion_methods_json) = key_info
+            .map_or_else(
                 || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
-                |pub_bytes| {
-                    // Build a verification method from the stored public key.
+                |(pub_bytes, agent_pub_bytes)| {
+                    // Build verification methods for ALL keys in the identity.
                     let multibase_key = format!("z{}", zbase32_encode(&pub_bytes));
-                    let vm = serde_json::json!([{
+                    let mut vms = vec![serde_json::json!({
                         "id": format!("{did}#0"),
                         "type": "Ed25519VerificationKey2020",
                         "controller": did,
                         "publicKeyMultibase": multibase_key,
-                    }]);
-                    let auth = serde_json::json!([format!("{did}#0")]);
-                    let assertion = serde_json::json!([format!("{did}#0")]);
+                    })];
+                    let mut auth = vec![serde_json::json!(format!("{did}#0"))];
+                    let mut assertion = vec![serde_json::json!(format!("{did}#0"))];
+
+                    // Include the #agent verification method if present (ADR-039).
+                    if let Some(agent_bytes) = agent_pub_bytes {
+                        let agent_multibase = format!("z{}", zbase32_encode(&agent_bytes));
+                        vms.push(serde_json::json!({
+                            "id": format!("{did}#agent"),
+                            "type": "Ed25519VerificationKey2020",
+                            "controller": did,
+                            "publicKeyMultibase": agent_multibase,
+                        }));
+                        auth.push(serde_json::json!(format!("{did}#agent")));
+                        assertion.push(serde_json::json!(format!("{did}#agent")));
+                    }
+
+                    let vm_json = serde_json::Value::Array(vms);
+                    let auth_json = serde_json::Value::Array(auth);
+                    let assertion_json = serde_json::Value::Array(assertion);
                     (
-                        serde_json::to_string(&vm).unwrap_or_else(|_| "[]".to_owned()),
-                        serde_json::to_string(&auth).unwrap_or_else(|_| "[]".to_owned()),
-                        serde_json::to_string(&assertion).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&vm_json).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&auth_json).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&assertion_json).unwrap_or_else(|_| "[]".to_owned()),
                     )
                 },
             );
