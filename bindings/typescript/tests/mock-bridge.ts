@@ -553,6 +553,18 @@ export function createMockBridge(): Bridge & {
       };
     },
 
+    // TTL
+    async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {
+      return null;
+    },
+
+    async contextExtendTtl(
+      _handle: BridgeContextHandle,
+      _additionalSecs: number,
+    ): Promise<boolean> {
+      return true;
+    },
+
     // Lifecycle
     version(): string {
       return "0.1.0-mock";

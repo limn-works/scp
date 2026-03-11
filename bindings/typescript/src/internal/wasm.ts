@@ -248,7 +248,7 @@ interface WasmModule {
   context_import: (data: Uint8Array) => Promise<string>;
   // TTL
   context_ttl_remaining: (handle: BridgeContextHandle) => number | null;
-  context_extend_ttl: (handle: BridgeContextHandle, additionalSecs: number) => Promise<void>;
+  context_extend_ttl: (handle: BridgeContextHandle, additionalSecs: number) => Promise<boolean>;
   context_handle_ttl_expiry: (handle: BridgeContextHandle) => Promise<void>;
   context_propose_ttl_extension: (
     handle: BridgeContextHandle,
@@ -591,6 +591,17 @@ export function createWasmBridge(): Bridge {
     },
 
     // TTL operations
+    async contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null> {
+      const wasm = getWasm();
+      const remaining = wasm.context_ttl_remaining(handle);
+      return remaining ?? null;
+    },
+
+    async contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<boolean> {
+      const wasm = getWasm();
+      return await wasm.context_extend_ttl(handle, additionalSecs);
+    },
+
     async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
       const wasm = getWasm();
       await wasm.context_handle_ttl_expiry(handle);

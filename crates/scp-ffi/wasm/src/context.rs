@@ -658,14 +658,16 @@ pub fn context_ttl_remaining(handle: &WasmContextHandle) -> Option<u64> {
 }
 
 /// Extends the TTL by the given number of seconds.
+///
+/// Returns `true` if the extension was applied.
 #[wasm_bindgen]
 pub fn context_extend_ttl(handle: &WasmContextHandle, additional_secs: u64) -> Promise {
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.extend_ttl(&context_id, additional_secs))
+        let applied = with_manager(|mgr| mgr.extend_ttl(&context_id, additional_secs))
             .map_err(ScpWasmError::into_js)?;
-        Ok(JsValue::UNDEFINED)
+        Ok(JsValue::from_bool(applied))
     })
 }
 

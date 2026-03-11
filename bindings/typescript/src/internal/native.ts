@@ -369,6 +369,33 @@ export function createNativeBridge(): Bridge {
     },
 
     // TTL operations
+    async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {
+      // The NAPI bridge does not export contextTtlRemaining — scp-core's
+      // ContextManager tracks TTL internally and does not expose a "remaining"
+      // query. Use contextProposeTtlExtension or contextResetTtlTimer instead.
+      throw new TransportError(
+        "contextTtlRemaining is not available in the native (NAPI) bridge. " +
+          "TTL remaining is a WASM-only concept. Use contextProposeTtlExtension " +
+          "or contextResetTtlTimer for TTL management in native environments.",
+        "SCP-TRANS-5004",
+      );
+    },
+
+    async contextExtendTtl(
+      _handle: BridgeContextHandle,
+      _additionalSecs: number,
+    ): Promise<boolean> {
+      // The NAPI bridge does not export contextExtendTtl — scp-core's
+      // ContextManager uses contextProposeTtlExtension (governance-aware) or
+      // contextResetTtlTimer instead. These are exposed separately above.
+      throw new TransportError(
+        "contextExtendTtl is not available in the native (NAPI) bridge. " +
+          "Use contextProposeTtlExtension (governance-aware) or " +
+          "contextResetTtlTimer for TTL management in native environments.",
+        "SCP-TRANS-5004",
+      );
+    },
+
     async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
       await (addon.contextHandleTtlExpiry as (h: BridgeContextHandle) => Promise<void>)(handle);
     },
