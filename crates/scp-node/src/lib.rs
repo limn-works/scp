@@ -4975,6 +4975,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_with_storage_rejects_future_version() {
+        // §17.5: A StoredValue with version > CURRENT_STORE_VERSION must be
+        // rejected with a clear error, preventing silent corruption from
+        // downgraded binaries reading data written by newer code.
+        use scp_platform::traits::KeyHandle;
+        let persisted = PersistedIdentity {
+            identity: ScpIdentity {
+                identity_key: KeyHandle::new(1),
+                active_signing_key: KeyHandle::new(2),
+                agent_signing_key: None,
+                pre_rotation_commitment: [0u8; 32],
+                did: "did:dht:zfuture".to_owned(),
+            },
+            document: DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:zfuture".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+        };
+        let future_version = CURRENT_STORE_VERSION + 1;
+        let envelope = StoredValue {
+            version: future_version,
+            data: &persisted,
+        };
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .store(IDENTITY_STORAGE_KEY, &bytes)
+            .await
+            .unwrap();
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let result = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("future-ver.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "future-ver.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await;
+
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("newer than supported version"),
+                    "expected future version rejection error, got: {msg}"
+                );
+            }
+            Ok(node) => {
+                node.shutdown();
+                panic!("expected future version rejection, but build succeeded");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn generate_identity_with_does_not_persist() {
         // Verify the original generate_identity_with does NOT persist (backward compat).
         let storage = Arc::new(InMemoryStorage::new());
