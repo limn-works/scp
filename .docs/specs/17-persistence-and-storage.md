@@ -79,6 +79,7 @@ All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy se
 
 ```
 _meta/schema_version
+scp/identity
 
 identity/{did}/document
 identity/{did}/active_signing_key
@@ -136,6 +137,8 @@ tls/private_key
 mls/{context_id}/...
 ```
 
+**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` containing the node's `ScpIdentity` and `DidDocument`. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolStore` domain methods (see §17.4 for the exception rationale).
+
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 
 **Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
@@ -153,7 +156,7 @@ The in-memory `NonceTracker` remains the primary, synchronised replay defense on
 
 ## 17.4 ProtocolStore
 
-`ProtocolStore` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolStore` is the single interface between protocol logic and persistent storage. The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolStore` is generic rather than using `Arc<dyn Storage>`.
+`ProtocolStore` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolStore` is the primary interface between protocol logic and persistent storage, with two documented exceptions (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolStore` is generic rather than using `Arc<dyn Storage>`.
 
 ```rust
 /// scp-core/src/store/mod.rs
@@ -267,6 +270,12 @@ impl<S: Storage> ProtocolStore<S> {
 ```
 
 Every `ProtocolStore` method translates to one or two `Storage` trait calls using the key convention from section 17.3. There is no query optimizer, no batch API, no transaction boundary beyond what `delete_prefix` provides. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
+
+**Exceptions to `ProtocolStore` as the single interface.** Two subsystems access `Storage` directly rather than through `ProtocolStore` domain methods:
+
+1. **MLS bridge (§17.9).** `MlsStorageBridge` accesses raw `Storage` because OpenMLS owns the storage contract and the `StorageProvider` trait dictates serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
+
+2. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolStore` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
 
 ### Module Structure
 
@@ -509,7 +518,7 @@ mls/{context_id}/encryption_key/{epoch}/{generation}
 
 The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signatures. The bridge is a thin translation layer — it adds no behavior beyond key construction and serialization.
 
-**Why this bypasses `ProtocolStore` domain methods.** Every other domain area stores data through typed `ProtocolStore` methods that apply `StoredValue` version envelopes. The MLS bridge is the sole exception — it accesses the raw `Storage` backend via `ProtocolStore::storage()`. This is intentional:
+**Why this bypasses `ProtocolStore` domain methods.** Every other domain area stores data through typed `ProtocolStore` methods that apply `StoredValue` version envelopes. The MLS bridge is one of two documented exceptions that access raw `Storage` directly (the other is identity bootstrap persistence — see §17.4). This is intentional:
 
 - **OpenMLS owns the storage contract.** The `StorageProvider` trait dictates what gets stored, key structure, and serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
 - **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolStore wrapper methods would be pure indirection.
