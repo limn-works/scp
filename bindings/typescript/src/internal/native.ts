@@ -136,26 +136,37 @@ export function createNativeBridge(): Bridge {
       const doc = await (
         addon.identityResolve as (d: string) => Promise<{
           id: string;
+          verificationMethods: readonly {
+            id: string;
+            type: string;
+            controller: string;
+            publicKeyMultibase: string;
+          }[];
           authentication: string[];
           assertionMethods: string[];
           alsoKnownAs: string[];
           serviceEndpoints: string[];
+          hasAgentKey: boolean;
+          agentPublicKey: string | null;
         }>
       )(did);
 
-      return {
+      const result: DIDDocument = {
         id: doc.id,
-        verificationMethods: doc.authentication.map((auth) => ({
-          id: auth,
-          type: "Ed25519VerificationKey2020",
-          controller: doc.id,
-          publicKeyMultibase: "",
+        verificationMethods: doc.verificationMethods.map((vm) => ({
+          id: vm.id,
+          type: vm.type,
+          controller: vm.controller,
+          publicKeyMultibase: vm.publicKeyMultibase,
         })),
         authentication: doc.authentication,
         assertionMethods: doc.assertionMethods,
         alsoKnownAs: doc.alsoKnownAs,
         serviceEndpoints: doc.serviceEndpoints,
+        hasAgentKey: doc.hasAgentKey,
+        ...(doc.agentPublicKey != null ? { agentPublicKey: doc.agentPublicKey } : {}),
       };
+      return result;
     },
 
     async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {

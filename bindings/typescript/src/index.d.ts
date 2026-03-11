@@ -112,10 +112,12 @@ export interface TrustEvaluation {
 export interface DIDDocument {
   readonly id: string;
   readonly verificationMethods: VerificationMethod[];
-  readonly services: Service[];
-  readonly alsoKnownAs: string[];
   readonly authentication: string[];
   readonly assertionMethods: string[];
+  readonly alsoKnownAs: string[];
+  readonly serviceEndpoints: string[];
+  readonly hasAgentKey: boolean;
+  readonly agentPublicKey?: string;
 }
 
 export interface VerificationMethod {
@@ -123,12 +125,6 @@ export interface VerificationMethod {
   readonly type: string;
   readonly controller: string;
   readonly publicKeyMultibase: string;
-}
-
-export interface Service {
-  readonly id: string;
-  readonly type: string;
-  readonly serviceEndpoint: string;
 }
 
 export interface UcanToken {

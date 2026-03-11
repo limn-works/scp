@@ -191,6 +191,7 @@ export function createMockBridge(): Bridge & {
         assertionMethods: [`${did}#0`],
         alsoKnownAs: [],
         serviceEndpoints: [],
+        hasAgentKey: false,
       };
     },
 

@@ -26,6 +26,7 @@ import type {
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
+  VerificationMethod,
 } from "../types";
 import type {
   Bridge,
@@ -390,13 +391,22 @@ export function createWasmBridge(): Bridge {
     async identityResolve(did: string): Promise<DIDDocument> {
       const wasm = getWasm();
       const doc = await wasm.identity_resolve(did);
+      // Derive agent key state from verificationMethodsJson — check for an
+      // `#agent` verification method, consistent with the NAPI bridge which
+      // uses `document.has_agent_key()` / `document.agent_verification_method()`.
+      const verificationMethods: VerificationMethod[] = JSON.parse(doc.verificationMethodsJson);
+      const agentVm = verificationMethods.find((vm) => vm.id.endsWith("#agent"));
       return {
         id: doc.id,
-        verificationMethods: JSON.parse(doc.verificationMethodsJson),
+        verificationMethods,
         authentication: JSON.parse(doc.authenticationJson),
         assertionMethods: JSON.parse(doc.assertionMethodsJson),
         alsoKnownAs: JSON.parse(doc.alsoKnownAsJson),
         serviceEndpoints: JSON.parse(doc.servicesJson),
+        hasAgentKey: agentVm !== undefined,
+        ...(agentVm !== undefined && {
+          agentPublicKey: agentVm.publicKeyMultibase,
+        }),
       };
     },
 

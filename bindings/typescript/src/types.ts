@@ -151,6 +151,10 @@ export interface DIDDocument {
   readonly alsoKnownAs: readonly string[];
   /** Service endpoint entries. */
   readonly serviceEndpoints: readonly string[];
+  /** Whether this document contains an `#agent` verification method (ADR-039). */
+  readonly hasAgentKey: boolean;
+  /** The agent key's public key as a multibase-encoded string, or `undefined` if no agent key exists (ADR-039). */
+  readonly agentPublicKey?: string;
 }
 
 /** A verification method from a DID Document. */
