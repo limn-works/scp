@@ -1084,6 +1084,7 @@ if (bridge === null) {
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
 
       await napi.broadcastUnblockSubscriber(ctx, subscriber.did, identity.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
     });
 
     test("unblock non-blocked subscriber throws", async () => {
