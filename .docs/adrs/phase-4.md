@@ -718,6 +718,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
 5. **Transport bridge functions:**
    - `transport_connect(relay_url) -> void` — connects to an SCP relay.
+   - `transport_disconnect() -> void` — disconnects from the current SCP relay. No-op in browser environments (WebSocket lifecycle managed externally per ADR-034).
    - `transport_status() -> TransportStatus` — returns transport connection status.
 
 6. **UCAN bridge functions:**
