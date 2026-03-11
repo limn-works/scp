@@ -395,7 +395,10 @@ export function createWasmBridge(): Bridge {
       // Derive agent key state from verificationMethodsJson — check for an
       // `#agent` verification method, consistent with the NAPI bridge which
       // uses `document.has_agent_key()` / `document.agent_verification_method()`.
-      const verificationMethods: VerificationMethod[] = safeJsonParse(doc.verificationMethodsJson, "identity_resolve") as VerificationMethod[];
+      const verificationMethods: VerificationMethod[] = safeJsonParse(
+        doc.verificationMethodsJson,
+        "identity_resolve",
+      ) as VerificationMethod[];
       const agentVm = verificationMethods.find((vm) => vm.id.endsWith("#agent"));
       return {
         id: doc.id,
