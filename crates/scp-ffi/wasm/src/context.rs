@@ -277,6 +277,9 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 /// Delegates to `WasmContextManager::leave_context`.
 #[wasm_bindgen]
 pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -292,6 +295,9 @@ pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promis
 /// only the creator or an admin can close.
 #[wasm_bindgen]
 pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     // Update handle state synchronously before the async boundary, since
@@ -396,6 +402,9 @@ pub fn context_member_count(handle: &WasmContextHandle) -> Option<u64> {
 /// Delegates to `WasmContextManager::is_member`.
 #[wasm_bindgen]
 pub fn context_is_member(handle: &WasmContextHandle, did: String) -> bool {
+    if validate_did(&did).is_err() {
+        return false;
+    }
     let context_id = handle.context_id();
     with_manager(|mgr| Ok(mgr.is_member(&context_id, &did))).unwrap_or(false)
 }
@@ -415,6 +424,9 @@ pub fn context_member_dids(handle: &WasmContextHandle) -> String {
 /// Delegates to `WasmContextManager::member_role`.
 #[wasm_bindgen]
 pub fn context_member_role(handle: &WasmContextHandle, did: String) -> Option<String> {
+    if validate_did(&did).is_err() {
+        return None;
+    }
     let context_id = handle.context_id();
     with_manager(|mgr| Ok(mgr.member_role(&context_id, &did)))
         .ok()
@@ -506,6 +518,9 @@ pub fn context_execute_governance(
 /// Delegates to `WasmContextManager::subscribe_broadcast`.
 #[wasm_bindgen]
 pub fn broadcast_subscribe(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+    if let Err(e) = validate_did(&subscriber_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -524,6 +539,9 @@ pub fn broadcast_publish(
     author_did: String,
     payload_base64: String,
 ) -> Promise {
+    if let Err(e) = validate_did(&author_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -538,6 +556,9 @@ pub fn broadcast_publish(
 /// Delegates to `WasmContextManager::unsubscribe_broadcast`.
 #[wasm_bindgen]
 pub fn broadcast_unsubscribe(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+    if let Err(e) = validate_did(&subscriber_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -620,6 +641,9 @@ pub fn broadcast_subscriber_count(handle: &WasmContextHandle) -> Option<u32> {
 /// Returns `true` if the given DID is a subscriber in a broadcast context.
 #[wasm_bindgen]
 pub fn broadcast_is_subscriber(handle: &WasmContextHandle, did: String) -> bool {
+    if validate_did(&did).is_err() {
+        return false;
+    }
     let context_id = handle.context_id();
     with_manager(|mgr| Ok(mgr.is_broadcast_subscriber(&context_id, &did))).unwrap_or(false)
 }
@@ -644,6 +668,12 @@ pub fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> Promise {
+    if let Err(e) = validate_did(&author_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&requester_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -801,6 +831,9 @@ pub fn context_propose_ttl_extension(
     proposer_did: String,
     extension_secs: u64,
 ) -> Promise {
+    if let Err(e) = validate_did(&proposer_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
