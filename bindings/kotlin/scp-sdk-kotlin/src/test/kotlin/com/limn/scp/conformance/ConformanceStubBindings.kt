@@ -61,6 +61,8 @@ class ConformanceStubBindings : NativeBindings {
     var ucanMintResult: String = "minted-token"
     var ucanMintError: BridgeException? = null
     var ucanRevokeError: BridgeException? = null
+    var ucanDelegateResult: String = "delegated-token"
+    var ucanDelegateError: BridgeException? = null
 
     var eventLogQueryResult: String = """[{"event":"joined"}]"""
     var eventLogQueryError: BridgeException? = null
@@ -202,6 +204,17 @@ class ConformanceStubBindings : NativeBindings {
         ucanRevokeError?.let { throw it }
     }
 
+    override fun ucanDelegate(
+        contextHandle: Long,
+        delegatorDid: String,
+        delegateeDid: String,
+        parentToken: String,
+        capabilitiesJson: String,
+    ): String {
+        ucanDelegateError?.let { throw it }
+        return ucanDelegateResult
+    }
+
     override fun eventLogQuery(
         contextId: String,
         filterJson: String,
@@ -263,6 +276,8 @@ class ConformanceStubBindings : NativeBindings {
         ucanMintResult = "minted-token"
         ucanMintError = null
         ucanRevokeError = null
+        ucanDelegateResult = "delegated-token"
+        ucanDelegateError = null
         eventLogQueryResult = """[{"event":"joined"}]"""
         eventLogQueryError = null
         eventLogVerifyResult = true
