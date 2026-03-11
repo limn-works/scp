@@ -161,13 +161,11 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
     }
 
     for (i, entry) in entries.iter().enumerate() {
-        // Verify prev_hash linkage.
-        let expected_prev = if i == 0 {
-            [0u8; 32]
-        } else {
-            entries[i - 1].hash
-        };
-        if entry.prev_hash != expected_prev {
+        // Skip prev_hash linkage check for the first entry: if the log was
+        // pruned, entries[0].prev_hash references a discarded predecessor and
+        // cannot be validated. This matches the logic in
+        // `providers::event_log::verify_chain_integrity`.
+        if i > 0 && entry.prev_hash != entries[i - 1].hash {
             return Err(ContextError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
@@ -803,6 +801,72 @@ mod tests {
         }
 
         // The imported log should verify.
+        assert!(new_provider.verify_chain(&ctx_id_bytes));
+    }
+
+    // -------------------------------------------------------------------
+    // Pruned event log round-trip (#705)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn pruned_event_log_export_import_roundtrip() {
+        let ctx_id_bytes = crate::context::context_id_bytes("ctx-prune-roundtrip");
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id_bytes).unwrap();
+        for i in 0..10 {
+            provider
+                .append_event(&ctx_id_bytes, &format!("Event{i}"))
+                .unwrap();
+        }
+
+        // Prune, keeping only the last 3 entries.
+        let removed = provider.prune_event_log(&ctx_id_bytes, 3).unwrap();
+        assert_eq!(removed, 7);
+
+        let entries = provider.entries(&ctx_id_bytes).unwrap();
+        assert_eq!(entries.len(), 3);
+        // First remaining entry's prev_hash is NOT the genesis sentinel.
+        assert_ne!(entries[0].prev_hash, [0u8; 32]);
+
+        // Export the pruned event log.
+        let data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
+        let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
+
+        // verify_merkle_chain must accept the pruned log.
+        let computed_root = verify_merkle_chain(&data).unwrap();
+        assert_eq!(computed_root, merkle_root);
+
+        // Full export/import pipeline with pruned data.
+        let snapshot = test_snapshot("ctx-prune-roundtrip");
+        let export = create_export(
+            snapshot,
+            data.clone(),
+            Vec::new(),
+            DID::from("did:key:prune-test"),
+            ExportScope::Full,
+        )
+        .unwrap();
+
+        let bytes = serialize_export(&export).unwrap();
+        let decoded = deserialize_export(&bytes).unwrap();
+        validate_export_for_import(&decoded).unwrap();
+
+        // Import into a fresh provider and verify chain integrity.
+        let new_provider = MerkleEventLogProvider::new();
+        new_provider
+            .import_event_log_entries(&ctx_id_bytes, &data)
+            .unwrap();
+
+        let imported_entries = new_provider.entries(&ctx_id_bytes).unwrap();
+        assert_eq!(imported_entries.len(), 3);
+        assert_eq!(imported_entries[0].event, "Event7");
+        assert!(new_provider.verify_chain(&ctx_id_bytes));
+
+        // Appending after import should chain correctly.
+        new_provider.append_event(&ctx_id_bytes, "Event10").unwrap();
+        let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
+        assert_eq!(final_entries.len(), 4);
+        assert_eq!(final_entries[3].prev_hash, final_entries[2].hash);
         assert!(new_provider.verify_chain(&ctx_id_bytes));
     }
 }
