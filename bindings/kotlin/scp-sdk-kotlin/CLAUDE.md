@@ -37,7 +37,7 @@ The single dispatcher gateway for all FFI calls. All SDK domain classes (Scp.kt,
 | `IdentityBridge` | `create()`, `load()`, `resolve()` |
 | `ContextBridge` | `create()`, `join()`, `leave()`, `close()`, `send()`, `subscribe()` |
 | `ToolBridge` | `register()`, `invoke()`, `verify()` |
-| `UcanBridge` | `validate()`, `mint()`, `revoke()` |
+| `UcanBridge` | `validate()`, `mint()`, `revoke()`, `delegate()` |
 | `InfraBridge` | `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()` |
 | `NativeBindings` | Composite interface for UniFFI-generated functions (swap impl when NativeLib.kt is generated) |
 | `CancellationHandle` | Thread-safe cancellation propagation to Rust for long-running ops |
@@ -148,7 +148,7 @@ Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API co
 | `ContextConformanceTest` | create, join, leave, close, state machine transitions |
 | `MessagingConformanceTest` | send, receive (Flow subscription), sequence ordering |
 | `ToolsConformanceTest` | register, invoke, verify test vectors |
-| `UcanConformanceTest` | validate, mint, revoke, nonce replay, ceiling enforcement |
+| `UcanConformanceTest` | validate, mint, revoke, delegate, nonce replay, ceiling enforcement |
 | `TransportConformanceTest` | connect, status |
 | `EventLogConformanceTest` | query, verify proof |
 | `EncryptionConformanceTest` | encrypted send, sender key errors, decryption errors |
