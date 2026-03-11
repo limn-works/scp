@@ -527,6 +527,11 @@ struct PerContextState {
     /// Last known member set for departure detection in the timeout loop.
     /// Compared each tick to the current member set to identify departures.
     last_known_members: HashSet<DID>,
+    /// Members who have undergone a governance-triggered epoch reset
+    /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
+    /// Drained each tick and passed to `process_pending_proposals` so
+    /// their votes on pending proposals are invalidated (ADR-031 §5).
+    pending_epoch_resets: Vec<DID>,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
     pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Monotonic MLS epoch counter. Incremented each time a governance action
@@ -1384,6 +1389,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             mls_epoch: ctx_snapshot.mls_epoch,
             grace_store,
@@ -1677,6 +1683,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
             mls_epoch: export.snapshot.mls_epoch,
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -1807,6 +1814,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -2042,6 +2050,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: HashSet::new(),
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -5134,6 +5143,16 @@ impl ContextManager {
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         self.event_log
             .append_context_event(&context_id_bytes, "MemberReset")?;
+
+        // Track the epoch reset so the governance timeout task can invalidate
+        // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.pending_epoch_resets.push(did.clone());
+            }
+        }
+
         Ok(())
     }
 
@@ -6219,12 +6238,12 @@ impl ContextManager {
                 },
                 GovernanceEvent::GovernanceActionExecuted {
                     proposal_id,
+                    action,
                     executor_did,
                     resulting_epoch,
-                    ..
                 } => ContextEvent::GovernanceActionExecuted {
                     proposal_id: *proposal_id,
-                    action_summary: "TimeoutExecution".to_owned(),
+                    action_summary: action.variant_name().to_owned(),
                     executor_did: executor_did.clone(),
                     resulting_epoch: *resulting_epoch,
                 },
@@ -6283,7 +6302,7 @@ impl ContextManager {
                 let ctx_id = ctx_id.clone();
                 async move {
                     // Phase 1: Acquire lock, snapshot data, release lock.
-                    let (gov_ctx, departed, mls_epoch, recovery_in_progress) = {
+                    let (gov_ctx, departed, epoch_resets, mls_epoch, recovery_in_progress) = {
                         let mut contexts_guard = contexts.lock().await;
                         let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
                             return false; // Context removed — stop the loop.
@@ -6308,11 +6327,21 @@ impl ContextManager {
                             .collect();
                         ctx.last_known_members = current_members;
 
+                        // Drain epoch-reset members accumulated since last tick
+                        // (ADR-031 §5: votes from reset members are invalidated).
+                        let epoch_resets: Vec<DID> = std::mem::take(&mut ctx.pending_epoch_resets);
+
                         let mls_epoch = ctx.mls_epoch;
                         let recovery_in_progress =
                             ctx.deadlock_detection_state.recovery_in_progress;
 
-                        (gov_ctx, departed, mls_epoch, recovery_in_progress)
+                        (
+                            gov_ctx,
+                            departed,
+                            epoch_resets,
+                            mls_epoch,
+                            recovery_in_progress,
+                        )
                         // Lock dropped here.
                     };
 
@@ -6327,12 +6356,12 @@ impl ContextManager {
                         // voters on about-to-resolve proposals are still visible.
                         let active_voters = collect_active_voters(ctx.governance_engine.as_ref());
 
-                        // Process pending proposals for timeout/departures.
+                        // Process pending proposals for timeout/departures/epoch resets.
                         let result = process_pending_proposals(
                             ctx.governance_engine.as_mut(),
                             &gov_ctx,
                             &departed,
-                            &[],
+                            &epoch_resets,
                         );
 
                         // Update deadlock detection state before detecting
