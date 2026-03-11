@@ -1545,7 +1545,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 |----------|-------|-------|----------------|
 | Max nesting depth | 3 | Maximum parent-child context nesting levels | §5.13.8 |
 | Max tool interfaces per context | 256 | Hard cap on registered tool interfaces | §6.2 |
-| Ceiling change notification period | 86,400s (24h) | Members notified before ceiling change takes effect | §5.6 |
+| Ceiling change notification period | 259,200s (72h) | Members notified before ceiling change takes effect | §5.3.2 |
 | Freeze timeout | 172,800s (48h) | Frozen context auto-unfreezes after this period | §5.6 |
 | Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
 | Default session cap per caller | 5 | Max concurrent tool sessions per source context | §6.2 |

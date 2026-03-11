@@ -62,18 +62,20 @@ const MAX_TOOL_INTERFACES: usize = 256;
 /// Maximum number of governance threshold signers per context.
 const MAX_THRESHOLD_SIGNERS: usize = 64;
 
-/// Default ceiling change notification period in seconds (M7, §5.3).
+/// Default ceiling change notification period in seconds (M7, §5.3.2).
 ///
 /// When a governed context's ceiling is modified, the change is pending
 /// for this duration before taking effect. Members joined under the previous
 /// ceiling are notified and may leave before the expansion applies.
-const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 86400; // 24 hours
+///
+/// Spec §5.3.2: "A mandatory notification period of 72 hours begins."
+const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 
 // ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
 // ---------------------------------------------------------------------------
 
-/// A pending ceiling modification awaiting notification period expiry (M7, §5.3).
+/// A pending ceiling modification awaiting notification period expiry (M7, §5.3.2).
 ///
 /// When a `ModifyCeiling` governance action is approved, the new ceiling
 /// is not applied immediately. Instead, it enters a notification period
@@ -329,7 +331,7 @@ pub struct ContextSnapshot {
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     #[serde(default)]
     pub governance_freeze: Option<(ProposalId, ProposalId, u64)>,
-    /// Pending ceiling modification (M7, §5.3 notification period).
+    /// Pending ceiling modification (M7, §5.3.2 notification period).
     ///
     /// When a `ModifyCeiling` governance action is approved, the new ceiling
     /// is stored here with the notification timestamp. Members are notified
@@ -493,7 +495,7 @@ struct PerContextState {
     /// Governance timeout task (SCP-271, ADR-031 §5).
     #[allow(dead_code)]
     governance_timeout_task: GovernanceTimeoutTask,
-    /// Pending ceiling modification awaiting notification period (M7, §5.3).
+    /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
     pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
@@ -4153,12 +4155,23 @@ impl ContextManager {
             // Members are notified and may leave before the expansion takes effect.
             let now = crate::time::now_secs()
                 .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
             ctx.pending_ceiling_modification = Some(PendingCeilingModification {
                 new_capabilities: new_ceiling.to_vec(),
                 notified_at: now,
-                effective_at: now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+                effective_at,
                 proposal_id,
             });
+
+            // §5.3.2 step 2: "All current members receive a
+            // CeilingChangeNotification message."
+            ctx.receive_buffer
+                .push(ContextEvent::CeilingChangeNotification {
+                    new_capabilities: new_ceiling.to_vec(),
+                    notified_at: now,
+                    effective_at,
+                    proposal_id,
+                });
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4178,7 +4191,7 @@ impl ContextManager {
     /// Applies a pending ceiling modification after the notification period.
     ///
     /// Called periodically or on demand to check if the notification period
-    /// has expired and apply the pending ceiling change (M7, §5.3).
+    /// has expired and apply the pending ceiling change (M7, §5.3.2).
     ///
     /// Returns `true` if a pending modification was applied, `false` if there
     /// was no pending modification or the notification period has not yet expired.
@@ -14536,5 +14549,271 @@ mod tests {
         assert_eq!(required_signers.len(), 2);
         assert!(required_signers.contains(&signer1));
         assert!(required_signers.contains(&signer2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling notification period tests (§5.3.2, Finding 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_ceiling_modification_effective_at_equals_notified_at_plus_259200() {
+        let notified_at = 1_000_000u64;
+        let pending = PendingCeilingModification {
+            new_capabilities: vec![Capability::MessagesRead],
+            notified_at,
+            effective_at: notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+            proposal_id: [0u8; 32],
+        };
+        assert_eq!(
+            pending.effective_at,
+            notified_at + 259_200,
+            "effective_at must be notified_at + 72h (259,200s)"
+        );
+    }
+
+    #[test]
+    fn pending_ceiling_is_effective_false_before_period_expires() {
+        let notified_at = 1_000_000u64;
+        let pending = PendingCeilingModification {
+            new_capabilities: vec![Capability::MessagesRead],
+            notified_at,
+            effective_at: notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+            proposal_id: [0u8; 32],
+        };
+        // One second before effective_at.
+        assert!(
+            !pending.is_effective(pending.effective_at - 1),
+            "is_effective must return false before the notification period expires"
+        );
+        // At notified_at (start of period).
+        assert!(
+            !pending.is_effective(notified_at),
+            "is_effective must return false at the start of the notification period"
+        );
+    }
+
+    #[test]
+    fn pending_ceiling_is_effective_true_after_period_expires() {
+        let notified_at = 1_000_000u64;
+        let pending = PendingCeilingModification {
+            new_capabilities: vec![Capability::MessagesRead],
+            notified_at,
+            effective_at: notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+            proposal_id: [0u8; 32],
+        };
+        // Exactly at effective_at.
+        assert!(
+            pending.is_effective(pending.effective_at),
+            "is_effective must return true at exactly effective_at"
+        );
+        // Well after effective_at.
+        assert!(
+            pending.is_effective(pending.effective_at + 3600),
+            "is_effective must return true after the notification period expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_modify_ceiling_sets_pending_with_72h_period() {
+        use super::super::governance::GovernanceAction;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: super::super::params::CeilingPolicy::Governed,
+            ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-ceiling".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Propose ModifyCeiling — SingleAdmin auto-approves and auto-executes.
+        let new_ceiling = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolRegister,
+        ];
+        let action = GovernanceAction::ModifyCeiling {
+            new_ceiling: new_ceiling.clone(),
+        };
+        let (_proposal, _events) = manager
+            .propose_governance_action("ctx-ceiling", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        // Verify the pending ceiling modification was stored with 72h period.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-ceiling").unwrap();
+        let pending = ctx
+            .pending_ceiling_modification
+            .as_ref()
+            .expect("pending ceiling modification should exist");
+        assert_eq!(pending.new_capabilities, new_ceiling);
+        assert_eq!(
+            pending.effective_at,
+            pending.notified_at + 259_200,
+            "effective_at must be notified_at + 72h"
+        );
+        // Ceiling should NOT yet be updated (still pending).
+        assert!(
+            !ctx.role_state.ceiling.contains(&Capability::ToolRegister),
+            "ToolRegister should not be in ceiling yet (still in notification period)"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_ceiling_modification_respects_notification_period() {
+        use super::super::governance::GovernanceAction;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: super::super::params::CeilingPolicy::Governed,
+            ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-apply".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        let new_ceiling = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolRegister,
+        ];
+        let action = GovernanceAction::ModifyCeiling {
+            new_ceiling: new_ceiling.clone(),
+        };
+        let (_proposal, _events) = manager
+            .propose_governance_action("ctx-apply", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        // Get the notified_at timestamp from the pending modification.
+        let notified_at = {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("ctx-apply").unwrap();
+            ctx.pending_ceiling_modification
+                .as_ref()
+                .unwrap()
+                .notified_at
+        };
+
+        // Before period expires: apply returns false.
+        let applied = manager
+            .apply_pending_ceiling_modification("ctx-apply", notified_at + 259_199)
+            .await
+            .unwrap();
+        assert!(
+            !applied,
+            "should not apply before notification period expires"
+        );
+
+        // At exactly effective_at: apply returns true.
+        let applied = manager
+            .apply_pending_ceiling_modification("ctx-apply", notified_at + 259_200)
+            .await
+            .unwrap();
+        assert!(applied, "should apply at exactly effective_at");
+
+        // Verify the ceiling was updated and pending cleared.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-apply").unwrap();
+        assert!(
+            ctx.pending_ceiling_modification.is_none(),
+            "pending modification should be cleared after apply"
+        );
+        assert!(
+            ctx.role_state.ceiling.contains(&Capability::ToolRegister),
+            "ToolRegister should now be in the ceiling after apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_modify_ceiling_emits_ceiling_change_notification() {
+        use super::super::governance::GovernanceAction;
+        use crate::context::membership::ContextEvent;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: super::super::params::CeilingPolicy::Governed,
+            ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-notify".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        let new_ceiling = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolRegister,
+        ];
+        let action = GovernanceAction::ModifyCeiling {
+            new_ceiling: new_ceiling.clone(),
+        };
+        let (_proposal, _events) = manager
+            .propose_governance_action("ctx-notify", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        // Drain events and check for CeilingChangeNotification.
+        let events = manager.drain_events("ctx-notify").await;
+        let notification = events
+            .iter()
+            .find(|e| matches!(e, ContextEvent::CeilingChangeNotification { .. }));
+        assert!(
+            notification.is_some(),
+            "CeilingChangeNotification event should be emitted to the receive buffer"
+        );
+        if let Some(ContextEvent::CeilingChangeNotification {
+            new_capabilities,
+            notified_at,
+            effective_at,
+            ..
+        }) = notification
+        {
+            assert_eq!(*new_capabilities, new_ceiling);
+            assert_eq!(
+                *effective_at,
+                *notified_at + 259_200,
+                "notification effective_at must be notified_at + 72h"
+            );
+        }
     }
 }
