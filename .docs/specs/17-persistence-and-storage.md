@@ -101,7 +101,7 @@ context/{context_id}/event_data/{seq:020d}
 context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
-context/{context_id}/merkle_event_log/entries
+context/{context_id}/merkle_event_log/{seq:020d}
 context/{context_id}/tool/{tool_id}
 context/{context_id}/tool_session/{session_id}
 context/{context_id}/ucan_token/{token_id}
@@ -144,7 +144,7 @@ mls/{context_id}/...
 
 **Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
 
-**Merkle event log entries.** The `merkle_event_log/entries` key stores a `Vec<EventLogEntry>` blob (MessagePack-serialized) for the `MerkleEventLogProvider` persistence layer (§9.9, #636). This is a single blob per context containing the full chain of Merkle-linked event entries, enabling crash-recovery restoration via `restore_event_log`. After pruning, the first entry's `prev_hash` references a discarded predecessor — chain verification must accept any `prev_hash` for the first entry.
+**Merkle event log entries.** Each `EventLogEntry` is stored individually under `merkle_event_log/{seq:020d}` (MessagePack-serialized), matching the per-event key pattern used by `event/{seq:020d}`. This enables O(1) append persistence — only the new entry is written, rather than re-serializing the entire list. Restore loads all entries by `list_keys("context/{id}/merkle_event_log/")` prefix scan, which returns keys in lexicographic (= sequence) order. Prune deletes removed entries by prefix and rewrites the retained entries with renumbered sequence keys starting from 0. After pruning, the first entry's `prev_hash` references a discarded predecessor — chain verification must accept any `prev_hash` for the first entry. See §9.9, #636, #710.
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 
@@ -224,10 +224,11 @@ impl<S: Storage> ProtocolStore<S> {
     pub async fn store_event_tree_node(&self, context_id: &ContextId, level: u32, index: u64, hash: &[u8; 32]) -> Result<(), StoreError>;
     pub async fn load_event_tree_node(&self, context_id: &ContextId, level: u32, index: u64) -> Result<Option<[u8; 32]>, StoreError>;
 
-    // --- Merkle event log entries (§9.9, #636) ---
-    pub async fn store_merkle_event_log_entries(&self, context_id: &ContextId, entries: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_merkle_event_log_entries(&self, context_id: &ContextId) -> Result<Option<Vec<u8>>, StoreError>;
-    pub async fn delete_merkle_event_log_entries(&self, context_id: &ContextId) -> Result<(), StoreError>;
+    // --- Merkle event log entries (§9.9, #636, #710) ---
+    pub async fn store_merkle_event_log_entry(&self, context_id: &str, seq: usize, entry: &EventLogEntry) -> Result<(), StoreError>;
+    pub async fn store_merkle_event_log_entries(&self, context_id: &str, entries: &[EventLogEntry]) -> Result<(), StoreError>;
+    pub async fn load_merkle_event_log_entries(&self, context_id: &str) -> Result<Option<Vec<EventLogEntry>>, StoreError>;
+    pub async fn delete_merkle_event_log_entries(&self, context_id: &str) -> Result<(), StoreError>;
 
     // --- DID cache ---
     pub async fn cache_did_document(&self, did: &DID, doc: &[u8], expires_at: u64) -> Result<(), StoreError>;
