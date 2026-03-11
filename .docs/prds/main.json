@@ -2315,7 +2315,7 @@
         "`maturin develop` builds the extension in-place for development.",
         "`maturin build --release` produces optimized wheels.",
         "CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).",
-        "`maturin publish` uploads built wheels to PyPI for `pip install scp-sdk` distribution.",
+        "`maturin publish` uploads built wheels to PyPI for `pip install scp-python` distribution.",
         "FFI safety: The tokio runtime MUST NEVER block on Python GIL acquisition. All GIL-requiring operations are dispatched via `Python::with_gil()` from non-async contexts or use PyO3's native async machinery which handles GIL release automatically.",
         "Shutdown ordering: Python cleanup (GC, __del__, atexit handlers) completes BEFORE the Rust tokio runtime is dropped. Module finalization respects this ordering to prevent use-after-free of Rust objects from Python destructor callbacks."
       ],
@@ -2788,13 +2788,13 @@
         "`py.typed` PEP 561 marker file exists.",
         "`pyproject.toml` declares package metadata, version, Python >=3.10 constraint, optional dependencies `[langchain]` and `[mcp]`.",
         "maturin builds the `_scp_core` extension into the `scp_sdk` package directory.",
-        "Users install with `pip install scp-sdk` — no Rust toolchain required.",
+        "Users install with `pip install scp-python` — no Rust toolchain required.",
         "Full PEP 484 type hints throughout all modules."
       ],
       "actionItems": [
         "Create `bindings/python/scp_sdk/__init__.py` with all re-exports and `__version__ = \"0.1.0\"`.",
         "Create `bindings/python/scp_sdk/py.typed` (empty PEP 561 marker file).",
-        "Create `bindings/python/pyproject.toml` with maturin build backend, package metadata, Python >=3.10 constraint, optional dependencies `scp-sdk[langchain]` and `scp-sdk[mcp]`.",
+        "Create `bindings/python/pyproject.toml` with maturin build backend, package metadata, Python >=3.10 constraint, optional dependencies `scp-python[langchain]` and `scp-python[mcp]`.",
         "Configure maturin to build `_scp_core` into the `scp_sdk` package directory."
       ],
       "blockedBy": [
@@ -3339,7 +3339,7 @@
       ],
       "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke tools, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP tools to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
       "acceptanceCriteria": [
-        "Install the SDK: `pip install scp-sdk` in a clean Python venv. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
+        "Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
         "Alice creates an identity in Python: `alice = await scp.Identity.create(custody=\"in_memory\")`. Calls through: Python wrapper (ADR-014) -> PyO3 bridge (ADR-013) -> scp-core Identity::create.",
         "Alice creates a context with tools: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"tool_invoke\"], tools=[scp.ToolDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
         "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, tool_invoke_all. UCAN signature chain traces to Alice (context creator) as root authority.",
@@ -3355,7 +3355,7 @@
       ],
       "actionItems": [
         "Create `tests/integration/phase3_integration_test.py` with the 13-step end-to-end test.",
-        "Set up clean Python venv and verify `pip install scp-sdk` works without Rust toolchain.",
+        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain.",
         "Test identity creation via Python SDK -> PyO3 bridge -> scp-core.",
         "Test context creation with tools, UCAN minting, and ceiling enforcement.",
         "Test member join with role-scoped UCAN token delegation.",
@@ -3500,7 +3500,7 @@
         "adrCompletionStory": true,
         "note": "This story writes the ADR itself, not the implementation. Implementation stories for TypeScript SDK are blocked by this."
       },
-      "result": "ADR-022 completed with full Decision, Rationale, Implementation, Dependencies, Acceptance Criteria, and Scope sections. Specifies dual-target architecture: wasm-bindgen for browser, napi-rs for Node.js/Bun, unified @scp/sdk package with runtime detection. Committed at fe7927b."
+      "result": "ADR-022 completed with full Decision, Rationale, Implementation, Dependencies, Acceptance Criteria, and Scope sections. Specifies dual-target architecture: wasm-bindgen for browser, napi-rs for Node.js/Bun, unified @limn-works/scp-ts package with runtime detection. Committed at fe7927b."
     },
     {
       "id": "SCP-061",
@@ -4587,7 +4587,7 @@
         "bindings/typescript/package.json",
         "bindings/typescript/tsup.config.ts"
       ],
-      "description": "Implement the TypeScript SDK (@scp/sdk) with dual-target architecture: browser (WASM) and Bun/Node (napi-rs native addon). Internal bridge module selects the correct backend at runtime. Public API surface covers Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules. Build pipeline: tsup config for dual ESM/CJS output. Streaming via AsyncIterable for message streams, disposal via Symbol.asyncDispose.",
+      "description": "Implement the TypeScript SDK (@limn-works/scp-ts) with dual-target architecture: browser (WASM) and Bun/Node (napi-rs native addon). Internal bridge module selects the correct backend at runtime. Public API surface covers Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules. Build pipeline: tsup config for dual ESM/CJS output. Streaming via AsyncIterable for message streams, disposal via Symbol.asyncDispose.",
       "acceptanceCriteria": [
         "Bridge selection logic: runtime detection (browser vs Bun vs Node) with fallback behavior",
         "Public API surface exposes: Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules",
@@ -4596,11 +4596,11 @@
         "Build pipeline: tsup config for dual ESM/CJS output",
         "Browser target uses WASM bridge (SCP-079)",
         "Node/Bun target uses napi bridge (SCP-080)",
-        "Package published as @scp/sdk on npm",
+        "Package published as @limn-works/scp-ts on npm",
         "All conformance tests from scaffold/shared.md pass"
       ],
       "actionItems": [
-        "Create bindings/typescript/package.json with @scp/sdk package configuration",
+        "Create bindings/typescript/package.json with @limn-works/scp-ts package configuration",
         "Create bindings/typescript/tsup.config.ts for dual ESM/CJS output",
         "Create bindings/typescript/src/bridge.ts with runtime detection (browser vs Bun vs Node) and backend selection",
         "Implement fallback behavior when preferred backend unavailable",
@@ -4640,7 +4640,7 @@
           "standards/typescript.md",
           "scaffold/shared.md"
         ],
-        "packageName": "@scp/sdk",
+        "packageName": "@limn-works/scp-ts",
         "buildTool": "tsup",
         "linter": "Biome",
         "testFramework": "bun:test",
@@ -4659,7 +4659,7 @@
           "MCP"
         ]
       },
-      "result": "TypeScript SDK @scp/sdk implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 bun:test tests pass."
+      "result": "TypeScript SDK @limn-works/scp-ts implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 bun:test tests pass."
     },
     {
       "id": "SCP-082",
@@ -6216,7 +6216,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidKeyCustody.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
       "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.",
       "acceptanceCriteria": [
@@ -6274,7 +6274,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidDeviceAttestation.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
       "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).",
       "acceptanceCriteria": [
@@ -6323,7 +6323,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidPushProvider.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
       "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.",
       "acceptanceCriteria": [
@@ -6372,7 +6372,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidStorage.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
       "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.",
       "acceptanceCriteria": [
@@ -6423,7 +6423,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/PlatformAdapter.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PlatformAdapter.kt"
       ],
       "description": "Create the scp-platform/android/ module root in mod.rs. Declares and re-exports all Android platform adapter modules: key_custody, device_attestation, push_provider, storage. Platform adapters implement traits defined in scp-platform/ (KeyCustody, PushProvider, DeviceAttestation, Storage). Android module is conditionally compiled for Android targets only. Mirrors Apple platform module root SCP-097 (gate-5).",
       "acceptanceCriteria": [
@@ -6468,7 +6468,7 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/bridge/CoroutineBridge.kt"
+        "bindings/kotlin/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
       ],
       "description": "Build the Kotlin coroutine ergonomics layer on UniFFI-generated bindings. Must decide coroutine dispatcher strategy: which operations run on Dispatchers.IO vs Dispatchers.Default. All FFI calls should use Dispatchers.IO per standards/kotlin.md. UniFFI-generated Kotlin types and suspend functions are the input.",
       "acceptanceCriteria": [
@@ -6521,7 +6521,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/stream/Streams.kt"
+        "bindings/kotlin/src/main/kotlin/works/limn/scp/stream/Streams.kt"
       ],
       "description": "Implement streaming API for the Kotlin SDK using Flow and Channel. Flow preferred for cold streams (lazy, on-demand data), Channel for hot streams (real-time events). Must decide Flow vs Channel assignment per stream type.",
       "acceptanceCriteria": [
@@ -6569,7 +6569,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/lifecycle/LifecycleManager.kt"
+        "bindings/kotlin/src/main/kotlin/works/limn/scp/lifecycle/LifecycleManager.kt"
       ],
       "description": "Implement LifecycleOwner-aware cleanup of SCP resources for the Kotlin SDK. SCP connections, MLS state, and streaming subscriptions must be tied to Android lifecycle events to prevent resource leaks when activities/fragments are destroyed.",
       "acceptanceCriteria": [
@@ -6619,7 +6619,7 @@
       "severity": "minor",
       "status": "pending",
       "files": [
-        "bindings/kotlin/src/main/kotlin/com/limn/scp/compose/StateHolders.kt"
+        "bindings/kotlin/src/main/kotlin/works/limn/scp/compose/StateHolders.kt"
       ],
       "description": "Implement Jetpack Compose integration for the Kotlin SDK. State holders and remember patterns that expose SCP state as Compose-observable state. Mirrors SwiftUI integration patterns from ADR-026.",
       "acceptanceCriteria": [
@@ -6670,9 +6670,9 @@
       "files": [
         "bindings/kotlin/build.gradle.kts"
       ],
-      "description": "Configure Maven Central publishing for the Kotlin SDK as com.limn:scp-sdk-kotlin. Gradle/KTS build setup per scaffold/kotlin.md. Must include signing, artifact metadata, and CI pipeline integration.",
+      "description": "Configure Maven Central publishing for the Kotlin SDK as works.limn:scp-kt. Gradle/KTS build setup per scaffold/kotlin.md. Must include signing, artifact metadata, and CI pipeline integration.",
       "acceptanceCriteria": [
-        "Gradle build publishes to Maven Central as com.limn:scp-sdk-kotlin",
+        "Gradle build publishes to Maven Central as works.limn:scp-kt",
         "Artifact signed with GPG key",
         "POM metadata includes license, SCM, developer info per Maven Central requirements",
         "Snapshot publishing to Maven Central snapshots repository works",
@@ -6702,7 +6702,7 @@
         "stubADR": true,
         "note": "ADR not yet fully written — story derived from expected approach and known constraints",
         "expectedDecisions": {
-          "mavenCentralConfig": "com.limn:scp-sdk-kotlin"
+          "mavenCentralConfig": "works.limn:scp-kt"
         },
         "references": [
           "scaffold/kotlin.md — Gradle/KTS build",
@@ -6718,7 +6718,7 @@
       "severity": "major",
       "status": "pending",
       "files": [
-        "bindings/kotlin/src/test/kotlin/com/limn/scp/conformance/ConformanceTests.kt"
+        "bindings/kotlin/src/test/kotlin/works/limn/scp/conformance/ConformanceTests.kt"
       ],
       "description": "Implement the cross-platform conformance test suite for the Kotlin SDK. Tests must verify that Kotlin SDK behavior matches Swift SDK and Python SDK for all protocol operations. Cross-platform conformance test suite from scaffold/shared.md is the reference.",
       "acceptanceCriteria": [
@@ -7591,12 +7591,12 @@
       "description": "Implement the binary artifact build, sign, and distribute workflow for all SDK packages. The conformance gate (100% pass) is a prerequisite — no release without it. Covers: build matrix (Linux x86_64/aarch64, macOS universal2, Windows x86_64), artifact signing per platform, distribution to all 8 package registries, version pinning to scp-core, and the 7-step release checklist.",
       "acceptanceCriteria": [
         "Build matrix: Linux (x86_64, aarch64) produces manylinux2014 wheels and .so; macOS (universal2) produces wheels, .dylib, .xcframework; Windows (x86_64) produces wheels and .dll",
-        "Distribution channels: Rust (crates.io source crate), Python (PyPI maturin wheel), TypeScript browser (@scp/sdk npm WASM bundle), TypeScript Node/Bun (@scp/sdk-node npm napi-rs addon), Swift (SPM XCFramework), Kotlin (Maven Central AAR), Go (Go modules source + .so), C# (NuGet native runtime pack), Java (Maven Central JAR with natives)",
+        "Distribution channels: Rust (crates.io source crate), Python (PyPI maturin wheel), TypeScript browser (@limn-works/scp-ts npm WASM bundle), TypeScript Node/Bun (@limn-works/scp-ts-node npm napi-rs addon), Swift (SPM XCFramework), Kotlin (Maven Central AAR), Go (Go modules source + .so), C# (NuGet native runtime pack), Java (Maven Central JAR with natives)",
         "All SDK packages pin to the exact scp-core version they were built against. Core version encoded in package metadata (Python wheel metadata, npm engines, Swift Package.swift)",
         "Signing: Rust crates verified by crates.io checksums; platform packages use native signing (Apple codesigning for .xcframework, Authenticode for .dll, GPG for Maven); PyPI uses Trusted Publishers (GitHub Actions OIDC)",
         "Release checklist enforced by CI: (1) 100% conformance tests pass, (2) changelog updated, (3) version tags created, (4) artifacts built, (5) artifacts signed, (6) published to registries, (7) GitHub Release created",
         "No release proceeds without 100% conformance test pass rate across all target platforms",
-        "Version tags follow convention: `scp-core@{version}` for core, `scp-sdk-python@{version}` etc. for SDKs",
+        "Version tags follow convention: `scp-core@{version}` for core, `scp-python@{version}` etc. for SDKs",
         "All SDKs follow SemVer 2.0: major = breaking API changes, minor = new features (backwards-compatible), patch = bug fixes and security patches",
         "Version alignment: all SDK packages share the same major.minor version. Patch versions may differ (language-specific fixes). The Rust core crate version is the source of truth",
         "Pre-1.0 stability: during 0.x development, minor version bumps may include breaking changes. The API is unstable until 1.0"
@@ -7631,7 +7631,7 @@
       ],
       "details": {
         "Build matrix": "Linux: x86_64 + aarch64 (manylinux2014 wheels, .so). macOS: universal2 (x86_64 + arm64) (wheels, .dylib, .xcframework). Windows: x86_64 (wheels, .dll).",
-        "Distribution channels": "Rust: crates.io. Python: PyPI. TypeScript browser: npm (@scp/sdk). TypeScript Node/Bun: npm (@scp/sdk-node). Swift: SPM. Kotlin: Maven Central. Go: Go modules. C#: NuGet. Java: Maven Central.",
+        "Distribution channels": "Rust: crates.io. Python: PyPI. TypeScript browser: npm (@limn-works/scp-ts). TypeScript Node/Bun: npm (@limn-works/scp-ts-node). Swift: SPM. Kotlin: Maven Central. Go: Go modules. C#: NuGet. Java: Maven Central.",
         "Signing requirements": "Rust: crates.io checksums. macOS/iOS: Apple codesigning. Windows: Authenticode. Maven: GPG. PyPI: Trusted Publishers (GitHub Actions OIDC).",
         "Versioning policy": "All SDKs follow SemVer 2.0. Major: breaking API changes. Minor: new features, backwards-compatible. Patch: bug fixes, security patches. All SDK packages share the same major.minor version; patch versions may differ. Rust core version is source of truth. During 0.x, minor bumps may break. API unstable until 1.0."
       },
@@ -9537,13 +9537,13 @@
       "files": [
         "bindings/kotlin/build.gradle.kts",
         "bindings/kotlin/settings.gradle.kts",
-        "bindings/kotlin/scp-sdk-kotlin/build.gradle.kts",
-        "bindings/kotlin/scp-sdk-kotlin-android/build.gradle.kts"
+        "bindings/kotlin/scp-kt/build.gradle.kts",
+        "bindings/kotlin/scp-kt-android/build.gradle.kts"
       ],
-      "description": "Scaffold the Kotlin SDK Gradle build infrastructure. Multi-module project with scp-sdk-kotlin (core JVM) and scp-sdk-kotlin-android (Android platform adapter). Must match ADR-028 layout conventions.",
+      "description": "Scaffold the Kotlin SDK Gradle build infrastructure. Multi-module project with scp-kt (core JVM) and scp-kt-android (Android platform adapter). Must match ADR-028 layout conventions.",
       "acceptanceCriteria": [
         "gradle build succeeds from bindings/kotlin/",
-        "Multi-module structure matches ADR-028 layout (scp-sdk-kotlin + scp-sdk-kotlin-android)",
+        "Multi-module structure matches ADR-028 layout (scp-kt + scp-kt-android)",
         "UniFFI-generated NativeLib.kt integration configured",
         "Android dependencies declared: Bouncy Castle, Play Integrity, FCM, SQLCipher, AndroidX Security",
         "Source directories exist and are recognized by Gradle"
@@ -9551,8 +9551,8 @@
       "actionItems": [
         "Create root build.gradle.kts with shared configuration",
         "Create settings.gradle.kts with module includes",
-        "Create scp-sdk-kotlin/build.gradle.kts for core JVM module",
-        "Create scp-sdk-kotlin-android/build.gradle.kts with Android dependencies",
+        "Create scp-kt/build.gradle.kts for core JVM module",
+        "Create scp-kt-android/build.gradle.kts with Android dependencies",
         "Create source directory structure per ADR-028 conventions"
       ],
       "blockedBy": [],
@@ -9572,7 +9572,7 @@
           "scaffold/kotlin.md — Build infrastructure blueprint"
         ]
       },
-      "result": "Android module scaffold complete. Both :scp-sdk-kotlin:build and :scp-sdk-kotlin-android:build succeed. Commit 9c0ff7d."
+      "result": "Android module scaffold complete. Both :scp-kt:build and :scp-kt-android:build succeed. Commit 9c0ff7d."
     },
     {
       "id": "SCP-212",
@@ -9795,7 +9795,7 @@
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/wasm/src/identity.rs",
         "crates/scp-ffi/wasm/src/context.rs",
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/Types.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/Types.kt",
         ".docs/adrs/phase-5.md",
         ".docs/adrs/phase-6.md"
       ],

@@ -38,7 +38,7 @@ section 8.5 capability filtering).
 ## Prerequisites
 
 - Python 3.12+
-- `pip install scp-sdk` (optional -- the agent includes mock fallbacks
+- `pip install scp-python` (optional -- the agent includes mock fallbacks
   for environments without the full SDK installed)
 - `pip install pytest ruff` (for testing and linting)
 

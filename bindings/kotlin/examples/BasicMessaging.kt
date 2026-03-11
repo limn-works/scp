@@ -1,9 +1,9 @@
 /** Basic messaging: create identity, create context, send and receive messages. */
 
-package com.limn.scp.examples
+package works.limn.scp.examples
 
-import com.limn.scp.Context
-import com.limn.scp.Identity
+import works.limn.scp.Context
+import works.limn.scp.Identity
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 

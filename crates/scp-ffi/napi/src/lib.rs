@@ -11,7 +11,7 @@
 //! `napi-rs` FFI bridge for SCP — the Node.js/Bun native addon.
 //!
 //! This crate is compiled to a native addon (`.node` file) via `napi build`
-//! and consumed by the `@scp/sdk` npm package. It exposes a flat set of
+//! and consumed by the `@limn-works/scp-ts` npm package. It exposes a flat set of
 //! `#[napi]` types and functions that map directly to `scp-core`'s public API
 //! surface.
 //!
@@ -172,7 +172,7 @@ pub(crate) fn decrement_handle_count() {
 /// # JS usage
 ///
 /// ```js
-/// import { scpVersion } from '@scp/sdk-napi';
+/// import { scpVersion } from '@limn-works/scp-ts-napi';
 /// console.log(scpVersion()); // "0.1.0"
 /// ```
 #[napi]

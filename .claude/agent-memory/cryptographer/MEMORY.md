@@ -180,7 +180,7 @@
 - `crates/scp-core/src/economy/credentials.rs` -- adapter credential management
 - `crates/scp-core/src/store/mod.rs` -- ProtocolStore definition
 - `crates/scp-core/src/store/economy.rs` -- adapter credential storage impl
-- `bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/` -- Android adapters
+- `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/` -- Android adapters
 - `crates/scp-core/src/envelope/pseudonym.rs` -- pseudonym derivation spec (delegates to KeyCustody)
 - `crates/scp-platform/src/testing/key_custody.rs` -- InMemoryKeyCustody reference impl + golden vectors
 - `crates/scp-transport/src/relay/bridge.rs` -- bridge auth, SCP-BRIDGE-REGISTER-V1 domain separator

@@ -1,5 +1,5 @@
 /**
- * @scp/sdk — Shared Context Protocol TypeScript SDK.
+ * @limn-works/scp-ts — Shared Context Protocol TypeScript SDK.
  *
  * Dual-target architecture: browser (WASM) and Bun/Node (napi-rs native
  * addon). The correct backend is selected automatically at runtime.
@@ -7,7 +7,7 @@
  * ## Quick start
  *
  * ```typescript
- * import { Identity, Context, Transport } from "@scp/sdk";
+ * import { Identity, Context, Transport } from "@limn-works/scp-ts";
  *
  * const identity = await Identity.create({ custody: "in_memory" });
  *

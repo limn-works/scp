@@ -1,11 +1,11 @@
 /** MCP integration: expose SCP tools via MCP JSON-RPC server. */
 
-package com.limn.scp.examples
+package works.limn.scp.examples
 
-import com.limn.scp.Context
-import com.limn.scp.Identity
-import com.limn.scp.McpClient
-import com.limn.scp.serveMcp
+import works.limn.scp.Context
+import works.limn.scp.Identity
+import works.limn.scp.McpClient
+import works.limn.scp.serveMcp
 import kotlinx.coroutines.runBlocking
 
 fun main() = runBlocking {

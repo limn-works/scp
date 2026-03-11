@@ -6,6 +6,6 @@ pluginManagement {
     }
 }
 
-rootProject.name = "scp-sdk-kotlin"
-include("scp-sdk-kotlin")
-include("scp-sdk-kotlin-android")
+rootProject.name = "scp-kt"
+include("scp-kt")
+include("scp-kt-android")

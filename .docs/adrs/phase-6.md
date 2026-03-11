@@ -38,7 +38,7 @@ Android's hardware security landscape has two tiers: TEE (Trusted Execution Envi
 
 ### Decision
 
-Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/`. Five files implement the four platform traits plus a factory:
+Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/`. Five files implement the four platform traits plus a factory:
 
 - **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. Ed25519 (`EdDSA`) at API 33+; software Ed25519 fallback (Bouncy Castle) for API 26-32. X25519 wrapping keys always software-managed. TEE-backed by default; StrongBox explicitly opt-out.
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
@@ -70,7 +70,7 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-sdk-kot
 **File layout:**
 
 ```
-bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/
+bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/
   AndroidKeyCustody.kt        — KeyCustodyProvider: Android Keystore Ed25519, software fallback
   AndroidDeviceAttestation.kt — DeviceAttestationProvider: Play Integrity Standard API
   AndroidPushProvider.kt      — PushProvider: FCM registration, opaque data payload
@@ -378,7 +378,7 @@ suspend fun SCP.Companion.create(
 **Gradle dependencies** for the platform module:
 
 ```kotlin
-// In bindings/kotlin/scp-sdk-kotlin-android/build.gradle.kts
+// In bindings/kotlin/scp-kt-android/build.gradle.kts
 dependencies {
     implementation("com.google.android.play:integrity:1.4.0")
     implementation("com.google.firebase:firebase-messaging-ktx:24.1.0")
@@ -472,7 +472,7 @@ dependencies {
 ### Scope
 
 ```
-bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/ — 5 files, ~25 functions
+bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ — 5 files, ~25 functions
 ```
 
 | File | Functions |
@@ -503,11 +503,11 @@ Kotlin 2.x with JVM 11+ is the baseline. The SDK targets both Android (API 26+) 
 - **Flow vs Channel** for streaming (`Flow` preferred for cold streams, `Channel` for hot).
 - **Android lifecycle integration:** `LifecycleOwner`-aware cleanup of SCP resources.
 - **Jetpack Compose integration:** State holders, `remember` patterns.
-- **Maven Central publishing configuration** (`com.limn:scp-sdk-kotlin`).
+- **Maven Central publishing configuration** (`works.limn:scp-kt`).
 
 ### Decision
 
-Implement the Kotlin SDK as the `com.limn:scp-sdk-kotlin` package at `bindings/kotlin/`. The SDK module imports the UniFFI-generated `NativeLib.kt` from `internal/`, re-exports its types through the ergonomics layer in `src/main/kotlin/com/limn/scp/`, and builds a pure Kotlin ergonomics layer on top. The top-level entry point is `Scp` — a class that initializes the identity and injects the Android platform adapter. `Context` is the primary interactive type — exposing `Flow<Message>` for streaming and `AutoCloseable` / explicit `close()` lifecycle.
+Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/`. The SDK module imports the UniFFI-generated `NativeLib.kt` from `internal/`, re-exports its types through the ergonomics layer in `src/main/kotlin/works/limn/scp/`, and builds a pure Kotlin ergonomics layer on top. The top-level entry point is `Scp` — a class that initializes the identity and injects the Android platform adapter. `Context` is the primary interactive type — exposing `Flow<Message>` for streaming and `AutoCloseable` / explicit `close()` lifecycle.
 
 **Dispatcher strategy:**
 - All FFI calls (blocking Rust operations) execute on `Dispatchers.IO` via `withContext(Dispatchers.IO)`. This is the designated dispatcher for blocking I/O operations in Kotlin coroutines — it is backed by a thread pool sized for blocking work.
@@ -519,7 +519,7 @@ Implement the Kotlin SDK as the `com.limn:scp-sdk-kotlin` package at `bindings/k
 - Raw `Channel` is not exposed in the public API. The internal `callbackFlow` uses a `Channel` with `Channel.BUFFERED` capacity (64 items) to absorb burst delivery from the Rust engine without dropping messages.
 
 **Android lifecycle integration:**
-- Android lifecycle integration is implemented via an extension function `Context.asFlow(lifecycleOwner: LifecycleOwner): Flow<Message>` in a separate `scp-sdk-kotlin-android` artifact. This artifact depends on `androidx.lifecycle:lifecycle-runtime-ktx` — a dependency the core SDK does not take on, keeping the JVM artifact Android-free.
+- Android lifecycle integration is implemented via an extension function `Context.asFlow(lifecycleOwner: LifecycleOwner): Flow<Message>` in a separate `scp-kt-android` artifact. This artifact depends on `androidx.lifecycle:lifecycle-runtime-ktx` — a dependency the core SDK does not take on, keeping the JVM artifact Android-free.
 - The extension launches collection in `lifecycleOwner.lifecycleScope` and cancels when the `LifecycleOwner` reaches `DESTROYED`. This prevents resource leaks when an `Activity` or `Fragment` is destroyed while a context subscription is live.
 - `ViewModel`-based usage is the recommended pattern: create `Scp` and `Context` in a `ViewModel`, expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override calls `context.close()`.
 
@@ -529,8 +529,8 @@ Implement the Kotlin SDK as the `com.limn:scp-sdk-kotlin` package at `bindings/k
 - Context lifecycle in Compose: `DisposableEffect(contextId) { onDispose { context.close() } }` ensures the context is closed when the composable leaves the composition.
 
 **Maven Central publishing:**
-- Published as `com.limn:scp-sdk-kotlin` on Maven Central.
-- Android-specific lifecycle extension published as `com.limn:scp-sdk-kotlin-android`.
+- Published as `works.limn:scp-kt` on Maven Central.
+- Android-specific lifecycle extension published as `works.limn:scp-kt-android`.
 - AAR artifact for Android targets. JAR artifact for JVM targets. Both include bundled native libraries (`.so` for Android ABIs, `.so`/`.dylib`/`.dll` for JVM targets) in the JAR resources directory.
 - GPG signing required for Maven Central upload. Signing performed in CI using a key stored in GitHub Actions secrets.
 
@@ -540,7 +540,7 @@ Implement the Kotlin SDK as the `com.limn:scp-sdk-kotlin` package at `bindings/k
 
 - **`Dispatchers.IO` for all FFI calls:** The UniFFI-generated bindings call into native Rust code via JNA. JNA calls are blocking — they block the calling thread until the Rust function returns. Kotlin's `Dispatchers.IO` is designed for exactly this: a thread pool that accepts blocking calls without starving the coroutine scheduler. Calling FFI on `Dispatchers.Default` (the CPU thread pool) would starve cooperative tasks; calling on `Dispatchers.Main` would block the UI thread. `Dispatchers.IO` is the one correct choice.
 - **`callbackFlow` over raw `Channel` or `StateFlow`:** Message streaming from the Rust engine is callback-driven: the UniFFI callback interface calls `onMessage()` from a Rust thread. `callbackFlow` is the idiomatic Kotlin bridge from callback APIs to `Flow`. It handles back-pressure via channel buffering, propagates cancellation by calling `awaitClose`, and integrates with structured concurrency automatically. `StateFlow` would only expose the latest message (wrong semantics). A raw `Channel` exposed as public API would force callers to manage collection manually (wrong ergonomics).
-- **Lifecycle-in-extension-artifact, not in core:** Android lifecycle (`LifecycleOwner`, `lifecycleScope`) is an Android-only API. Taking this dependency in the core SDK would force JVM targets (server-side, tests) to depend on Android-specific artifacts. Separating it into `scp-sdk-kotlin-android` keeps the core SDK usable on any JVM and keeps the Android extension small and focused.
+- **Lifecycle-in-extension-artifact, not in core:** Android lifecycle (`LifecycleOwner`, `lifecycleScope`) is an Android-only API. Taking this dependency in the core SDK would force JVM targets (server-side, tests) to depend on Android-specific artifacts. Separating it into `scp-kt-android` keeps the core SDK usable on any JVM and keeps the Android extension small and focused.
 - **`AutoCloseable` + explicit `close()` for resource management:** Kotlin/JVM resource management follows the `AutoCloseable` / `use { }` pattern. `Context` implements `AutoCloseable` so callers can use `context.use { }` blocks for automatic cleanup. The explicit `close()` suspend function performs graceful teardown (leave the MLS group, flush the event log, cancel the flow). `AutoCloseable.close()` is the synchronous safety net — it launches a `close()` coroutine and cancels the internal scope. This matches the `deinit` + `close()` pattern in the Swift SDK.
 - **No Compose dependencies in SDK:** Compose APIs (`@Composable`, `State<T>`, `collectAsState()`) require the Compose compiler plugin and runtime. Shipping a Compose dependency in the SDK would force every consumer to adopt Compose or deal with unused transitive dependencies. Compose integration is trivially achieved with standard `Flow.collectAsState()` and `DisposableEffect` — patterns that are Compose-idiomatic without SDK involvement.
 - **`Scp` class (not object/singleton) as top-level entry point:** `Scp` holds per-identity state (the identity handle, the platform adapter). Multiple `Scp` instances in a process are valid (e.g., in tests, or in apps that support account switching). A Kotlin `object` singleton would prevent this. The factory pattern `Scp.create()` is a `companion object` method — idiomatic for async factory construction in Kotlin.
@@ -550,7 +550,7 @@ Implement the Kotlin SDK as the `com.limn:scp-sdk-kotlin` package at `bindings/k
 
 **Language:** Kotlin 2.x
 
-**Package:** `bindings/kotlin/` published as `com.limn:scp-sdk-kotlin` on Maven Central.
+**Package:** `bindings/kotlin/` published as `works.limn:scp-kt` on Maven Central.
 
 **Dependencies from UniFFI:** `identityCreate()`, `identityLoad()`, `identityResolve()`, `contextCreate()`, `contextJoin()`, `contextLeave()`, `contextClose()`, `contextSend()`, `contextSubscribe()` (callback interface), `toolRegister()`, `toolInvoke()`, `toolVerify()`, `ucanValidate()`, `ucanMint()`, `ucanRevoke()`, `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()`, and the `ScpError` enum — all from `internal/NativeLib.kt`.
 
@@ -560,10 +560,10 @@ Implement the Kotlin SDK as the `com.limn:scp-sdk-kotlin` package at `bindings/k
 bindings/kotlin/
   build.gradle.kts                         # Root Gradle build (multi-module)
   settings.gradle.kts                      # Module declarations
-  scp-sdk-kotlin/
+  scp-kt/
     build.gradle.kts                       # SDK core module (JVM + Android)
     src/
-      main/kotlin/com/limn/scp/
+      main/kotlin/works/limn/scp/
         Scp.kt                             # Scp class — top-level entry point, factory, context creation
         Identity.kt                        # Identity class, DIDDocument data class
         Context.kt                         # Context class, Flow<Message>, AutoCloseable lifecycle
@@ -578,13 +578,13 @@ bindings/kotlin/
         internal/
           NativeLib.kt                     # UniFFI-generated native bindings (auto-generated, do not edit)
       main/resources/
-        com/limn/scp/native/
+        works/limn/scp/native/
           linux-x86-64/libscp_ffi.so
           linux-aarch64/libscp_ffi.so
           osx-x86-64/libscp_ffi.dylib
           osx-aarch64/libscp_ffi.dylib
           win32-x86-64/scp_ffi.dll
-      test/kotlin/com/limn/scp/
+      test/kotlin/works/limn/scp/
         IdentityTest.kt
         ContextTest.kt
         ToolsTest.kt
@@ -594,10 +594,10 @@ bindings/kotlin/
         McpTest.kt
         conformance/
           ConformanceTest.kt               # Cross-language conformance test suite runner
-  scp-sdk-kotlin-android/
+  scp-kt-android/
     build.gradle.kts                       # Android lifecycle extension module
     src/
-      main/kotlin/com/limn/scp/android/
+      main/kotlin/works/limn/scp/android/
         ContextLifecycle.kt                # Context.asFlow(LifecycleOwner) extension
         ScpViewModel.kt                    # Base ViewModel with SCP resource management
 ```
@@ -614,7 +614,7 @@ plugins {
     id("signing")
 }
 
-group = "com.limn"
+group = "works.limn"
 version = "0.1.0"
 
 kotlin {
@@ -919,10 +919,10 @@ suspend fun ucanRevoke(identity: Identity, tokenId: String): Unit = withContext(
 }
 ```
 
-**Android lifecycle extension (`scp-sdk-kotlin-android` module):**
+**Android lifecycle extension (`scp-kt-android` module):**
 
 ```kotlin
-// ContextLifecycle.kt — in com.limn.scp.android package
+// ContextLifecycle.kt — in works.limn.scp.android package
 
 /**
  * Collects messages from this Context as a Flow, scoped to a LifecycleOwner.
@@ -936,7 +936,7 @@ fun Context.asLifecycleFlow(
 ```
 
 ```kotlin
-// ScpViewModel.kt — in com.limn.scp.android package
+// ScpViewModel.kt — in works.limn.scp.android package
 
 /**
  * Base ViewModel that manages Scp and Context lifecycle.
@@ -945,9 +945,9 @@ fun Context.asLifecycleFlow(
 abstract class ScpViewModel : ViewModel() {
 
     protected var scpInstance: Scp? = null
-    private val activeContexts = mutableListOf<com.limn.scp.Context>()
+    private val activeContexts = mutableListOf<works.limn.scp.Context>()
 
-    protected fun trackContext(context: com.limn.scp.Context): com.limn.scp.Context {
+    protected fun trackContext(context: works.limn.scp.Context): works.limn.scp.Context {
         activeContexts.add(context)
         return context
     }
@@ -994,13 +994,13 @@ fun ContextScreen(contextId: String) {
 **Maven Central publishing configuration:**
 
 ```kotlin
-// In scp-sdk-kotlin/build.gradle.kts
+// In scp-kt/build.gradle.kts
 
 publishing {
     publications {
         create<MavenPublication>("mavenJava") {
-            groupId = "com.limn"
-            artifactId = "scp-sdk-kotlin"
+            groupId = "works.limn"
+            artifactId = "scp-kt"
             version = project.version.toString()
 
             from(components["java"])
@@ -1057,9 +1057,9 @@ signing {
 ```kotlin
 // build.gradle.kts (consumer)
 dependencies {
-    implementation("com.limn:scp-sdk-kotlin:0.1.0")
+    implementation("works.limn:scp-kt:0.1.0")
     // Optional Android lifecycle extension:
-    implementation("com.limn:scp-sdk-kotlin-android:0.1.0")
+    implementation("works.limn:scp-kt-android:0.1.0")
 }
 ```
 
@@ -1169,7 +1169,7 @@ dependencies {
     assertTrue(checkpoint.merkleRoot.isNotEmpty())
     ```
 
-11. **Android lifecycle integration (scp-sdk-kotlin-android):**
+11. **Android lifecycle integration (scp-kt-android):**
     - `context.asLifecycleFlow(lifecycleOwner)` returns a `Flow<Message>` that cancels when the `LifecycleOwner` reaches `DESTROYED`.
     - Verified by creating a `TestLifecycleOwner`, collecting the flow in a test coroutine, moving the owner to `DESTROYED`, and asserting the flow completes.
     - `ScpViewModel.onCleared()` calls `leave()` on all tracked contexts and `close()` on the `Scp` instance.
@@ -1200,7 +1200,7 @@ dependencies {
     ```kotlin
     // In a consumer's build.gradle.kts
     dependencies {
-        implementation("com.limn:scp-sdk-kotlin:0.1.0")
+        implementation("works.limn:scp-kt:0.1.0")
     }
     ```
 
@@ -1212,20 +1212,20 @@ dependencies {
 
 | File | Purpose |
 |------|---------|
-| `scp-sdk-kotlin/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
-| `src/main/kotlin/com/limn/scp/Scp.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
-| `src/main/kotlin/com/limn/scp/Identity.kt` | `Identity` class — `did`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `DIDDocument` data class |
-| `src/main/kotlin/com/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeTool()`, `registerTool()`, `leave()`, `closeContext()`, `AutoCloseable` |
-| `src/main/kotlin/com/limn/scp/Tools.kt` | `ToolDefinition`, `TestVector`, `ToolVerificationResult` data classes |
-| `src/main/kotlin/com/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
-| `src/main/kotlin/com/limn/scp/EventLog.kt` | `EventLog` class, `Event`, `Proof`, `Checkpoint` data classes |
-| `src/main/kotlin/com/limn/scp/Transport.kt` | `TransportConfig` data class, transport helpers |
-| `src/main/kotlin/com/limn/scp/Types.kt` | `Message`, `Provenance`, `Capability`, `ContextParams` data classes |
-| `src/main/kotlin/com/limn/scp/Ucan.kt` | `ucanValidate()`, `ucanMint()`, `ucanRevoke()` top-level suspend functions |
-| `src/main/kotlin/com/limn/scp/Mcp.kt` | `serveMcp()`, `McpClient` class |
-| `src/main/kotlin/com/limn/scp/Errors.kt` | `ScpException` hierarchy, `ScpException.fromFfi()` mapping |
-| `src/main/kotlin/com/limn/scp/internal/NativeLib.kt` | UniFFI-generated bindings (auto-generated, never edit manually) |
-| `scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/ContextLifecycle.kt` | `Context.asLifecycleFlow()` extension + `ScpViewModel` base class |
+| `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
+| `src/main/kotlin/works/limn/scp/Scp.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
+| `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `did`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `DIDDocument` data class |
+| `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeTool()`, `registerTool()`, `leave()`, `closeContext()`, `AutoCloseable` |
+| `src/main/kotlin/works/limn/scp/Tools.kt` | `ToolDefinition`, `TestVector`, `ToolVerificationResult` data classes |
+| `src/main/kotlin/works/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
+| `src/main/kotlin/works/limn/scp/EventLog.kt` | `EventLog` class, `Event`, `Proof`, `Checkpoint` data classes |
+| `src/main/kotlin/works/limn/scp/Transport.kt` | `TransportConfig` data class, transport helpers |
+| `src/main/kotlin/works/limn/scp/Types.kt` | `Message`, `Provenance`, `Capability`, `ContextParams` data classes |
+| `src/main/kotlin/works/limn/scp/Ucan.kt` | `ucanValidate()`, `ucanMint()`, `ucanRevoke()` top-level suspend functions |
+| `src/main/kotlin/works/limn/scp/Mcp.kt` | `serveMcp()`, `McpClient` class |
+| `src/main/kotlin/works/limn/scp/Errors.kt` | `ScpException` hierarchy, `ScpException.fromFfi()` mapping |
+| `src/main/kotlin/works/limn/scp/internal/NativeLib.kt` | UniFFI-generated bindings (auto-generated, never edit manually) |
+| `scp-kt-android/src/main/kotlin/works/limn/scp/android/ContextLifecycle.kt` | `Context.asLifecycleFlow()` extension + `ScpViewModel` base class |
 
 **Estimated functions:** ~30 public functions/methods, ~12 public types (classes + data classes + exception hierarchy), ~6 internal helpers.
 

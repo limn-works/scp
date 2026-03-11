@@ -1,21 +1,21 @@
 # SCP TypeScript SDK
 
-> `@scp/sdk` -- Shared Context Protocol for TypeScript
+> `@limn-works/scp-ts` -- Shared Context Protocol for TypeScript
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Dual-target: browser (WASM) and Bun/Node (native addon).
 
 ## Install
 
 ```bash
-npm install @scp/sdk
+npm install @limn-works/scp-ts
 # or
-bun add @scp/sdk
+bun add @limn-works/scp-ts
 ```
 
 ## Quick Start
 
 ```typescript
-import { Identity, Context } from "@scp/sdk";
+import { Identity, Context } from "@limn-works/scp-ts";
 
 // Create a cryptographic identity (DID)
 const identity = await Identity.create({ custody: "platform" });
@@ -78,7 +78,7 @@ See [`examples/`](./examples/) for runnable scripts:
 All errors extend `ScpError` with a machine-readable `code` field:
 
 ```typescript
-import { ScpError, ContextError } from "@scp/sdk";
+import { ScpError, ContextError } from "@limn-works/scp-ts";
 
 try {
   await ctx.send(payload);

@@ -10,10 +10,10 @@ Build blueprint for the SCP Java SDK: package structure, JNA bridge, build confi
 bindings/java/
   build.gradle.kts              # Root build config
   settings.gradle.kts
-  scp-sdk-java/
+  scp-java/
     build.gradle.kts
     src/
-      main/java/com/limn/scp/
+      main/java/works/limn/scp/
         Identity.java            # Identity class, DIDDocument
         Context.java             # Context class, Membership, AutoCloseable
         Tools.java               # ToolDefinition, TestVector records
@@ -33,7 +33,7 @@ bindings/java/
         darwin-x86-64/libscp_ffi.dylib
         darwin-aarch64/libscp_ffi.dylib
         win32-x86-64/scp_ffi.dll
-      test/java/com/limn/scp/
+      test/java/works/limn/scp/
         IdentityTest.java
         ContextTest.java
         ToolsTest.java
@@ -57,7 +57,7 @@ JNA (Java Native Access) loads the shared library at runtime and maps Java inter
 
 ```java
 // internal/NativeLib.java
-package com.limn.scp.internal;
+package works.limn.scp.internal;
 
 import com.sun.jna.Library;
 import com.sun.jna.Native;
@@ -121,7 +121,7 @@ plugins {
     id("com.github.spotbugs") version "6.0.0"
 }
 
-group = "com.limn"
+group = "works.limn"
 version = "0.1.0"
 
 java {
@@ -157,8 +157,8 @@ publishing {
     publications {
         create<MavenPublication>("maven") {
             from(components["java"])
-            groupId = "com.limn"
-            artifactId = "scp-sdk-java"
+            groupId = "works.limn"
+            artifactId = "scp-java"
         }
     }
 }
@@ -314,20 +314,20 @@ public final class Context implements AutoCloseable {
 
 ## Maven Central Publishing
 
-Published as `com.limn:scp-sdk-java` on Maven Central.
+Published as `works.limn:scp-java` on Maven Central.
 
 ```xml
 <!-- Consumer usage (Maven) -->
 <dependency>
-    <groupId>com.limn</groupId>
-    <artifactId>scp-sdk-java</artifactId>
+    <groupId>works.limn</groupId>
+    <artifactId>scp-java</artifactId>
     <version>0.1.0</version>
 </dependency>
 ```
 
 ```kotlin
 // Consumer usage (Gradle)
-implementation("com.limn:scp-sdk-java:0.1.0")
+implementation("works.limn:scp-java:0.1.0")
 ```
 
 Package includes:

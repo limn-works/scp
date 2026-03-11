@@ -95,11 +95,11 @@ async function getMcpAddon(): Promise<McpNativeAddon> {
   const platform = process.platform;
   const arch = process.arch;
   const platformMap: Record<string, string> = {
-    "linux-x64": "@scp/sdk-napi-linux-x64-gnu",
-    "linux-arm64": "@scp/sdk-napi-linux-arm64-gnu",
-    "darwin-x64": "@scp/sdk-napi-darwin-x64",
-    "darwin-arm64": "@scp/sdk-napi-darwin-arm64",
-    "win32-x64": "@scp/sdk-napi-win32-x64-msvc",
+    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
+    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
+    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
+    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
+    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
   };
 
   const key = `${platform}-${arch}`;

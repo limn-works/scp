@@ -84,7 +84,7 @@ Built via `wasm-pack build --target bundler`. Produces `.wasm` + JS glue code. A
 
 ```json
 {
-  "name": "@scp/sdk",
+  "name": "@limn-works/scp-ts",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -215,7 +215,7 @@ interface Message {
 
 ## npm Publishing
 
-Published as `@scp/sdk` on npm. Package includes:
+Published as `@limn-works/scp-ts` on npm. Package includes:
 - ESM + CJS bundles (via tsup)
 - Type declarations (`.d.ts`)
 - Pre-built native addon for Bun/Node (platform-specific optionalDependencies)

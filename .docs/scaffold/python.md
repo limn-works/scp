@@ -46,7 +46,7 @@ requires = ["maturin>=1.0"]
 build-backend = "maturin"
 
 [project]
-name = "scp-sdk"
+name = "scp-python"
 description = "Shared Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
 requires-python = ">=3.12"
 # license = TBD

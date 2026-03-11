@@ -1,7 +1,7 @@
 /**
  * wasm-bindgen WASM bridge adapter for browser environments.
  *
- * This module wraps the wasm-bindgen generated module (`@scp/sdk-wasm`)
+ * This module wraps the wasm-bindgen generated module (`@limn-works/scp-ts-wasm`)
  * into the unified `Bridge` interface consumed by the TypeScript SDK.
  *
  * WASM initialization is performed lazily via `initWasm()`, which must be
@@ -304,7 +304,7 @@ export async function initWasm(): Promise<void> {
       // This package is produced by `wasm-pack build --target bundler`
       // and may not be installed in all environments.
       const mod = (await import(
-        /* webpackIgnore: true */ "@scp/sdk-wasm"
+        /* webpackIgnore: true */ "@limn-works/scp-ts-wasm"
       )) as unknown as WasmModule;
       await mod.default();
       mod.scp_init();
@@ -313,7 +313,7 @@ export async function initWasm(): Promise<void> {
       _initPromise = null;
       throw new TransportError(
         `Failed to initialize WASM module: ${err instanceof Error ? err.message : String(err)}. ` +
-          "Ensure @scp/sdk-wasm is installed and the WASM binary is accessible.",
+          "Ensure @limn-works/scp-ts-wasm is installed and the WASM binary is accessible.",
         "SCP-TRANS-5002",
       );
     }

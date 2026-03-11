@@ -1170,7 +1170,7 @@
       "status": "done",
       "files": [
         "crates/scp-platform/src/android/storage.rs",
-        "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/AndroidStorage.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
       "description": "Implement Android storage adapter per sections 17.6 and 17.8. Rust side wraps trait; Kotlin side uses `net.zetetic:sqlcipher-android`. Encryption key derived from Android Keystore TEE-backed AES-256 key. Schema matches SqliteStorage. Database in app's `getNoBackupFilesDir()`.",
       "acceptanceCriteria": [

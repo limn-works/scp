@@ -7,7 +7,7 @@
  *
  * Prerequisites:
  * - The NAPI bridge must be compiled with `allow_in_memory_custody` feature.
- * - The platform-specific `@scp/sdk-napi-*` package must be loadable.
+ * - The platform-specific `@limn-works/scp-ts-napi-*` package must be loadable.
  *
  * If the native addon is not available, all tests are skipped gracefully.
  */

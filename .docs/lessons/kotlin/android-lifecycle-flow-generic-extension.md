@@ -2,7 +2,7 @@
 
 ## Context
 
-SCP-117 implemented `asLifecycleFlow()` as a lifecycle-scoped flow extension in the `scp-sdk-kotlin-android` module. The ADR-028 spec showed `Context.asLifecycleFlow()` as an extension on the ergonomics-layer `Context` class (returning `Flow<Message>`), but that class did not exist yet at implementation time.
+SCP-117 implemented `asLifecycleFlow()` as a lifecycle-scoped flow extension in the `scp-kt-android` module. The ADR-028 spec showed `Context.asLifecycleFlow()` as an extension on the ergonomics-layer `Context` class (returning `Flow<Message>`), but that class did not exist yet at implementation time.
 
 ## Decision
 

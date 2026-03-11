@@ -27,7 +27,7 @@ All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking F
 - Types/classes: `PascalCase`
 - Functions/methods/properties: `camelCase`
 - Constants: `SCREAMING_SNAKE_CASE`
-- Packages: `lowercase` (`com.limn.scp`)
+- Packages: `lowercase` (`works.limn.scp`)
 - Files: `PascalCase.kt`
 
 ## Testing

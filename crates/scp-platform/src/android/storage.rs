@@ -1,7 +1,7 @@
 //! SQLCipher [`Storage`] adapter for Android.
 //!
 //! The Android storage adapter is implemented in Kotlin at
-//! `bindings/kotlin/scp-sdk-kotlin-android/.../AndroidStorage.kt` and injected
+//! `bindings/kotlin/scp-kt-android/.../AndroidStorage.kt` and injected
 //! into the Rust engine via the UniFFI callback interface (ADR-021). This module
 //! documents the Rust-side contract and re-exports the trait types that the
 //! Kotlin adapter implements.

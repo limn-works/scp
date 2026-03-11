@@ -35,7 +35,7 @@ jobs:
       kotlin: ${{ steps.filter.outputs.kotlin }}
       swift: ${{ steps.filter.outputs.swift }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -61,7 +61,7 @@ jobs:
     name: Error code conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: bash scripts/check-error-codes.sh
 
   # ── Rust ────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ jobs:
     name: Rust / fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -86,7 +86,7 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -125,7 +125,7 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.rust == 'true'
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.rust == 'true'
@@ -161,7 +161,7 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -179,7 +179,7 @@ jobs:
     name: Rust / deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ── Python ──────────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ jobs:
       run:
         working-directory: bindings/python
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -209,7 +209,7 @@ jobs:
       run:
         working-directory: bindings/python
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -226,7 +226,7 @@ jobs:
       run:
         working-directory: bindings/typescript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: bun install
       - run: bun run check
@@ -243,7 +243,7 @@ jobs:
       run:
         working-directory: bindings/kotlin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -251,8 +251,8 @@ jobs:
       - uses: android-actions/setup-android@v3
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :scp-sdk-kotlin:runKtlintCheckOverMainSourceSet
-      - run: ./gradlew :scp-sdk-kotlin:detekt
+      - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
+      - run: ./gradlew :scp-kt:detekt
 
   kotlin-test:
     needs: changes
@@ -263,7 +263,7 @@ jobs:
       run:
         working-directory: bindings/kotlin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -280,7 +280,7 @@ jobs:
     name: WASM / clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -298,7 +298,7 @@ jobs:
       run:
         working-directory: bindings/swift
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install SwiftLint and SwiftFormat
         # HOMEBREW_NO_AUTO_UPDATE prevents brew from auto-upgrading
         # formulae between CI runs, reducing version drift risk.
@@ -315,7 +315,7 @@ jobs:
     name: Swift / build + test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.2"

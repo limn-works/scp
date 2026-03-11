@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check CHANGELOG.md exists and mentions version
         run: |
@@ -146,7 +146,7 @@ jobs:
       core-tag: ${{ steps.tags.outputs.core-tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0  # Full history for tag operations
 
@@ -345,7 +345,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -406,7 +406,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -490,7 +490,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -538,7 +538,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # SPM distribution uses binary targets pointing to a GitHub Release URL.
       # The release step (Step 7) uploads the XCFramework zip.
@@ -568,7 +568,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -604,6 +604,23 @@ jobs:
           fi
           # Write to file for gh release
           echo "$NOTES" > release-notes.md
+
+      - name: Append commit log to release notes
+        run: |
+          # Find the previous release tag (if any)
+          PREV_TAG=$(git tag --list 'scp-core@*' --sort=-version:refname | head -1)
+
+          echo "" >> release-notes.md
+          echo "---" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "### Commits" >> release-notes.md
+          echo "" >> release-notes.md
+
+          if [ -n "$PREV_TAG" ]; then
+            git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges >> release-notes.md
+          else
+            git log --pretty=format:"- %s (%h)" --no-merges -50 >> release-notes.md
+          fi
 
       - name: Generate checksums
         run: |

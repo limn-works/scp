@@ -1,10 +1,10 @@
 /** Multi-agent coordination: multiple agents collaborating in a shared context. */
 
-package com.limn.scp.examples
+package works.limn.scp.examples
 
-import com.limn.scp.Context
-import com.limn.scp.Identity
-import com.limn.scp.Ucan
+import works.limn.scp.Context
+import works.limn.scp.Identity
+import works.limn.scp.Ucan
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.collect

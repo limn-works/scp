@@ -36,7 +36,7 @@ const server: McpServer = {
 
 ## WASM ambient module declarations
 
-The `@scp/sdk-wasm` package (produced by `wasm-pack --target bundler`) does
+The `@limn-works/scp-ts-wasm` package (produced by `wasm-pack --target bundler`) does
 not ship TypeScript declarations. An ambient module declaration at
 `src/internal/wasm-types.d.ts` provides the type surface. The file must be
 covered by the tsconfig `include` glob (`src/**/*.ts` matches `.d.ts`).

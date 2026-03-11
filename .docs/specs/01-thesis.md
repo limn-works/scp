@@ -32,7 +32,7 @@ Agents ARE the killer app. The demand exists. Someone will build the killer app 
 
 ### What SDK-First Means
 
-1. **Ship the SDK before shipping any app.** `pip install scp-sdk` and `npm install @scp/sdk` are the first deliverables.
+1. **Ship the SDK before shipping any app.** `pip install scp-python` and `npm install @limn-works/scp-ts` are the first deliverables.
 2. **Python bindings are critical.** The agent ecosystem (LangChain, CrewAI, AutoGen, custom agents) is overwhelmingly Python. If agents can't `import scp`, the protocol doesn't exist to them.
 3. **Open source everything in months 2-3.** Spec (CC-BY 4.0), SDK (Apache 2.0), relay (AGPL v3). See §20 for full license structure.
 4. **Target agent builders, not app builders.** The first users are people building agents that need to interact with other agents. The second users are app developers building agent-native applications.

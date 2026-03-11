@@ -1,7 +1,7 @@
 /**
  * napi-rs native addon bridge adapter for Bun/Node.js.
  *
- * This module wraps the napi-rs native addon (`@scp/sdk-napi-{platform}`)
+ * This module wraps the napi-rs native addon (`@limn-works/scp-ts-napi-{platform}`)
  * into the unified `Bridge` interface consumed by the TypeScript SDK.
  *
  * The native addon is loaded via `createRequire` from the platform-specific
@@ -46,18 +46,18 @@ import type {
  * Resolves the platform-specific napi package name.
  *
  * Maps `process.platform` and `process.arch` to the napi-rs naming convention:
- * `@scp/sdk-napi-{os}-{arch}-{libc}`.
+ * `@limn-works/scp-ts-napi-{os}-{arch}-{libc}`.
  */
 function resolveNapiPackage(): string {
   const platform = process.platform;
   const arch = process.arch;
 
   const platformMap: Record<string, string> = {
-    "linux-x64": "@scp/sdk-napi-linux-x64-gnu",
-    "linux-arm64": "@scp/sdk-napi-linux-arm64-gnu",
-    "darwin-x64": "@scp/sdk-napi-darwin-x64",
-    "darwin-arm64": "@scp/sdk-napi-darwin-arm64",
-    "win32-x64": "@scp/sdk-napi-win32-x64-msvc",
+    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
+    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
+    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
+    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
+    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
   };
 
   const key = `${platform}-${arch}`;
@@ -66,7 +66,7 @@ function resolveNapiPackage(): string {
   if (pkg === undefined) {
     throw new TransportError(
       `No native addon available for platform ${key}. ` +
-        "Install the appropriate @scp/sdk-napi-* package or use the WASM bridge in a browser environment.",
+        "Install the appropriate @limn-works/scp-ts-napi-* package or use the WASM bridge in a browser environment.",
       "SCP-TRANS-5001",
     );
   }

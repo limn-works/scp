@@ -330,7 +330,7 @@ scp/
 │       └── wasm/              # wasm-bindgen → browser TypeScript (constrained per ADR-034)
 │
 ├── bindings/
-│   ├── python/                # Python package (scp-sdk)
+│   ├── python/                # python package (scp-python)
 │   │   ├── scp_sdk/
 │   │   │   ├── __init__.py    # Re-exports
 │   │   │   ├── identity.py    # Pythonic wrappers
@@ -340,7 +340,7 @@ scp/
 │   │   ├── pyproject.toml
 │   │   └── README.md
 │   │
-│   ├── typescript/            # TypeScript package (@scp/sdk)
+│   ├── typescript/            # TypeScript package (@limn-works/scp-ts)
 │   │   ├── src/
 │   │   │   ├── index.ts
 │   │   │   ├── identity.ts
@@ -353,8 +353,8 @@ scp/
 │   │   └── Sources/SCP/
 │   │
 │   └── kotlin/                # Kotlin multi-module SDK (UniFFI + platform adapters)
-│       ├── scp-sdk-kotlin/    # Core JVM module
-│       └── scp-sdk-kotlin-android/  # Android platform adapter module
+│       ├── scp-kt/    # Core JVM module
+│       └── scp-kt-android/  # Android platform adapter module
 │
 └── .docs/                     # Project knowledge (specs, ADRs, planning, standards)
     ├── specs/                 # Protocol specification (modular, one file per topic)
@@ -832,7 +832,7 @@ The Python SDK is the most critical binding. The agent ecosystem is Python. If t
 
 **Design principles:**
 - Pythonic. async/await. Type hints. No Rust concepts leaking through.
-- `pip install scp-sdk` installs a wheel with the Rust binary embedded (via maturin/PyO3).
+- `pip install scp-python` installs a wheel with the Rust binary embedded (via maturin/PyO3).
 - Zero Rust toolchain required for users.
 
 **The 20-line agent:**
@@ -908,7 +908,7 @@ PyO3 handles the Rust↔Python boundary: async (tokio↔asyncio), error conversi
 ### 3.2 TypeScript SDK (Web + Node)
 
 ```typescript
-import { SCP } from '@scp/sdk';
+import { SCP } from '@limn-works/scp-ts';
 
 // Node.js / Deno
 const identity = await SCP.Identity.create({ custody: 'platform' });
@@ -1036,7 +1036,7 @@ Deliverable: Two devices with full context lifecycle over real SCP relays.
 
 ### Phase 3: Python SDK + MCP
 
-**Goal:** `pip install scp-sdk` works. Agents can use SCP from Python. MCP bridge works.
+**Goal:** `pip install scp-python` works. Agents can use SCP from Python. MCP bridge works.
 
 ```
 Build:
@@ -1048,7 +1048,7 @@ Build:
   • Build infrastructure: maturin for Python wheel builds
 
 Test:
-  • `pip install scp-sdk` on clean Python venv
+  • `pip install scp-python` on clean Python venv
   • 20-line agent script works
   • MCP server exposes SCP tools to Claude/GPT
   • Integration test: LangChain agent using SCP tools
@@ -1056,7 +1056,7 @@ Test:
     through PyO3 bridge — verifies the FFI layer doesn't corrupt trait contracts
 
 Ship:
-  • PyPI: scp-sdk v0.1.0
+  • PyPI: scp-python v0.1.0
   • GitHub: open source the repo
   • Documentation: quickstart, API reference, examples
 
@@ -1090,8 +1090,8 @@ Test:
     through wasm-bindgen bridge
 
 Ship:
-  • PyPI: scp-sdk v0.2.0 (with trust model)
-  • npm: @scp/sdk v0.1.0
+  • PyPI: scp-python v0.2.0 (with trust model)
+  • npm: @limn-works/scp-ts v0.1.0
 
 Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 ```
@@ -1131,7 +1131,7 @@ Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ Typ
 
 ```
 Build:
-  • bindings/kotlin/scp-sdk-kotlin-android/ — Keystore, Play Integrity, FCM
+  • bindings/kotlin/scp-kt-android/ — Keystore, Play Integrity, FCM
   • bindings/kotlin/ — UniFFI-generated
   • Offline/sync strategy
   • Event log pruning/checkpointing

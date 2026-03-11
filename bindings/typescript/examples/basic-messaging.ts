@@ -2,7 +2,7 @@
  * Basic messaging: create identity, create context, send and receive messages.
  */
 
-import { Context, Identity } from "@scp/sdk";
+import { Context, Identity } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   // Create two identities

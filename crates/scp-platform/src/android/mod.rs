@@ -2,7 +2,7 @@
 //!
 //! This module declares and re-exports the four Android platform adapters that
 //! implement the traits defined in [`crate::traits`]. The actual implementations
-//! are in Kotlin at `bindings/kotlin/scp-sdk-kotlin-android/` and are injected
+//! are in Kotlin at `bindings/kotlin/scp-kt-android/` and are injected
 //! into the Rust engine via UniFFI callback interfaces (ADR-021, ADR-027).
 //!
 //! # Adapter Modules

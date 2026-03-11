@@ -27,7 +27,7 @@ New findings: 13 issues (3 material, 10 minor). Verdict: NEEDS REVISION (3 mater
 ## ADR-022 Review (SCP-060) (2026-02-26)
 ADR-022 (TypeScript SDK Dual-Target Architecture) reviewed and PASSED.
 - All 8 acceptance criteria satisfied.
-- 3 minor issues found: shared.md lists `@scp/sdk-node` but ADR-022 uses per-platform `@scp/sdk-napi-{platform}` (shared.md needs update); trust.ts and mcp.ts listed in wrapper layout but no acceptance criteria; Context.join() is static while other methods are instance (inconsistent surface).
+- 3 minor issues found: shared.md lists `@limn-works/scp-ts-node` but ADR-022 uses per-platform `@limn-works/scp-ts-napi-{platform}` (shared.md needs update); trust.ts and mcp.ts listed in wrapper layout but no acceptance criteria; Context.join() is static while other methods are instance (inconsistent surface).
 - 4 non-blocking suggestions: receive() generator needs cleanup on break; asyncDispose should guard on state; CI commands should match standards file exactly; private field access across classes in sketched code.
 
 ### ADR review patterns (reusable):
