@@ -2522,10 +2522,9 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         subscriber_did: &str,
+        blocker_did: &str,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
-
-        let author_did = ctx.creator_did.clone();
 
         {
             let bc = ctx
@@ -2542,7 +2541,7 @@ impl WasmContextManager {
 
         ctx.push_event(WasmContextEvent::MemberBlocked {
             blocked_did: subscriber_did.to_owned(),
-            author_did,
+            author_did: blocker_did.to_owned(),
         });
 
         Ok(())
@@ -2564,10 +2563,9 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         subscriber_did: &str,
+        unblocker_did: &str,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
-
-        let author_did = ctx.creator_did.clone();
 
         {
             let bc = ctx
@@ -2593,7 +2591,7 @@ impl WasmContextManager {
 
         ctx.push_event(WasmContextEvent::MemberUnblocked {
             unblocked_did: subscriber_did.to_owned(),
-            author_did,
+            author_did: unblocker_did.to_owned(),
         });
 
         Ok(())

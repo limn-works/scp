@@ -551,15 +551,24 @@ pub fn broadcast_unsubscribe(handle: &WasmContextHandle, subscriber_did: String)
 ///
 /// Delegates to `WasmContextManager::block_broadcast_subscriber`.
 #[wasm_bindgen]
-pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+pub fn broadcast_block(
+    handle: &WasmContextHandle,
+    subscriber_did: String,
+    blocker_did: String,
+) -> Promise {
     if let Err(e) = validate_did(&subscriber_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&blocker_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.block_broadcast_subscriber(&context_id, &subscriber_did))
-            .map_err(ScpWasmError::into_js)?;
+        with_manager(|mgr| {
+            mgr.block_broadcast_subscriber(&context_id, &subscriber_did, &blocker_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
 }
@@ -571,15 +580,24 @@ pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Pr
 ///
 /// Delegates to `WasmContextManager::unblock_broadcast_subscriber`.
 #[wasm_bindgen]
-pub fn broadcast_unblock(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+pub fn broadcast_unblock(
+    handle: &WasmContextHandle,
+    subscriber_did: String,
+    unblocker_did: String,
+) -> Promise {
     if let Err(e) = validate_did(&subscriber_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&unblocker_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.unblock_broadcast_subscriber(&context_id, &subscriber_did))
-            .map_err(ScpWasmError::into_js)?;
+        with_manager(|mgr| {
+            mgr.unblock_broadcast_subscriber(&context_id, &subscriber_did, &unblocker_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
 }
