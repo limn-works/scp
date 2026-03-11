@@ -572,7 +572,7 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     if leaves.is_empty() {
-        return [0u8; 32];
+        return crate::tree::empty_tree_root();
     }
     if leaves.len() == 1 {
         return leaves[0];

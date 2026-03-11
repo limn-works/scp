@@ -502,7 +502,7 @@ use super::tree::hash_pair;
 /// promoted directly to the next level (not hashed with themselves).
 fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
-        return [0u8; 32];
+        return super::tree::empty_tree_root();
     }
     if leaves.len() == 1 {
         return leaves[0];

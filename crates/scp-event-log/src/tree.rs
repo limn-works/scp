@@ -268,7 +268,7 @@ pub(crate) fn recompute_raw(log: &mut EventLog) {
 /// string, NOT `[0u8; 32]`. This distinguishes "empty log" from the genesis
 /// `prev_hash` sentinel (`GENESIS_PREV_HASH = [0u8; 32]`).
 #[must_use]
-fn empty_tree_root() -> [u8; 32] {
+pub(crate) fn empty_tree_root() -> [u8; 32] {
     let hash = Sha256::digest(b"");
     let mut out = [0u8; 32];
     out.copy_from_slice(&hash);
