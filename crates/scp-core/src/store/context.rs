@@ -1040,6 +1040,25 @@ impl<S: Storage> ProtocolStoreEventLogPersistence<S> {
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
     for ProtocolStoreEventLogPersistence<S>
 {
+    fn persist_entry(
+        &self,
+        context_id: &str,
+        seq: usize,
+        entry: &crate::context::providers::event_log::EventLogEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let entry_owned = entry.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                store
+                    .store_merkle_event_log_entry(&ctx_id, seq, &entry_owned)
+                    .await
+            })
+        })?;
+        Ok(())
+    }
+
     fn persist_entries(
         &self,
         context_id: &str,
@@ -1859,22 +1878,22 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolStoreEventLogPersistence::new(store);
 
-        let entries = vec![
-            EventLogEntry {
-                event: "ContextCreated".to_owned(),
-                timestamp: 1_700_000_000,
-                prev_hash: [0u8; 32],
-                hash: [1u8; 32],
-            },
-            EventLogEntry {
-                event: "MemberJoined".to_owned(),
-                timestamp: 1_700_000_001,
-                prev_hash: [1u8; 32],
-                hash: [2u8; 32],
-            },
-        ];
+        let entry0 = EventLogEntry {
+            event: "ContextCreated".to_owned(),
+            timestamp: 1_700_000_000,
+            prev_hash: [0u8; 32],
+            hash: [1u8; 32],
+        };
+        let entry1 = EventLogEntry {
+            event: "MemberJoined".to_owned(),
+            timestamp: 1_700_000_001,
+            prev_hash: [1u8; 32],
+            hash: [2u8; 32],
+        };
 
-        bridge.persist_entries("ctx-bridge-el", &entries).unwrap();
+        // O(1) per-entry persist.
+        bridge.persist_entry("ctx-bridge-el", 0, &entry0).unwrap();
+        bridge.persist_entry("ctx-bridge-el", 1, &entry1).unwrap();
 
         let loaded = bridge.load_entries("ctx-bridge-el").unwrap().unwrap();
         assert_eq!(loaded.len(), 2);
@@ -1883,6 +1902,36 @@ mod tests {
 
         bridge.delete_entries("ctx-bridge-el").unwrap();
         assert!(bridge.load_entries("ctx-bridge-el").unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn event_log_persistence_bridge_bulk_persist() {
+        use crate::context::providers::event_log::{EventLogEntry, EventLogPersistence};
+
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStoreEventLogPersistence::new(store);
+
+        let entries = vec![
+            EventLogEntry {
+                event: "BulkEvent0".to_owned(),
+                timestamp: 1_700_000_000,
+                prev_hash: [0u8; 32],
+                hash: [1u8; 32],
+            },
+            EventLogEntry {
+                event: "BulkEvent1".to_owned(),
+                timestamp: 1_700_000_001,
+                prev_hash: [1u8; 32],
+                hash: [2u8; 32],
+            },
+        ];
+
+        bridge.persist_entries("ctx-bridge-bulk", &entries).unwrap();
+
+        let loaded = bridge.load_entries("ctx-bridge-bulk").unwrap().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].event, "BulkEvent0");
+        assert_eq!(loaded[1].event, "BulkEvent1");
     }
 
     #[allow(dead_code)]

@@ -5,13 +5,17 @@
 //! provides tamper-evident event ordering: any modification to a historical
 //! event invalidates all subsequent entries in the chain.
 //!
-//! # Persistence (#636)
+//! # Persistence (#636, #710)
 //!
 //! When constructed with [`MerkleEventLogProvider::with_persistence`], the
 //! provider persists event log entries to a [`EventLogPersistence`] backend
 //! after each append operation and loads them during
 //! [`restore_event_log`](MerkleEventLogProvider::restore_event_log). This
 //! ensures events survive process restarts.
+//!
+//! As of #710, each entry is persisted individually (O(1) per append)
+//! rather than re-serializing the entire entry list (O(n)). Bulk
+//! operations (prune, import) rewrite all entries.
 //!
 //! # Structure
 //!
@@ -112,12 +116,34 @@ fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8;
 /// All methods use `context_id` as a hex string (matching `ProtocolStore` key
 /// conventions).
 ///
-/// See GitHub issue #636.
+/// # Per-entry storage (#710)
+///
+/// Each entry is stored under its own key (`merkle_event_log/{seq:020d}`)
+/// rather than as a single serialized blob. This makes `append_event` O(1)
+/// instead of O(n) per persist. Bulk operations (prune, import) use
+/// [`persist_entries`](Self::persist_entries) which rewrites all keys.
+///
+/// See GitHub issues #636, #710.
 pub trait EventLogPersistence: Send + Sync {
-    /// Persists the full event log entries for a context.
+    /// Persists a single event log entry at the given sequence index.
     ///
-    /// Called after each append operation. Replaces any previously stored
-    /// entries for this context.
+    /// Called after each append operation. O(1) serialization + I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying storage write fails.
+    fn persist_entry(
+        &self,
+        context_id: &str,
+        seq: usize,
+        entry: &EventLogEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Persists all event log entries for a context, replacing any
+    /// previously stored entries.
+    ///
+    /// Called after bulk operations (prune, import) that rewrite the full
+    /// entry set. Deletes existing per-entry keys before writing.
     ///
     /// # Errors
     ///
@@ -129,6 +155,10 @@ pub trait EventLogPersistence: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Loads previously persisted event log entries for a context.
+    ///
+    /// Loads per-entry keys by prefix scan. Falls back to the legacy
+    /// single-blob format (`merkle_event_log/entries`) for backward
+    /// compatibility with pre-#710 data.
     ///
     /// Returns `None` if no entries have been persisted.
     ///
@@ -142,7 +172,7 @@ pub trait EventLogPersistence: Send + Sync {
 
     /// Deletes persisted event log entries for a context.
     ///
-    /// Called on `destroy_event_log`.
+    /// Called on `destroy_event_log`. Removes all per-entry keys by prefix.
     ///
     /// # Errors
     ///
@@ -286,8 +316,8 @@ impl MerkleEventLogProvider {
 
         verify_chain_integrity(&entries)?;
 
-        // Persist the imported entries.
-        self.persist_best_effort(context_id, &entries);
+        // Persist the imported entries (bulk rewrite).
+        self.persist_entries_best_effort(context_id, &entries);
 
         let mut logs = self
             .logs
@@ -411,17 +441,34 @@ impl MerkleEventLogProvider {
         let remove_count = total - keep_last_n;
         log.entries.drain(..remove_count);
 
-        // Persist the pruned state.
+        // Persist the pruned state (bulk rewrite with renumbered keys).
         let entries_snapshot = log.entries.clone();
         drop(logs);
-        self.persist_best_effort(context_id, &entries_snapshot);
+        self.persist_entries_best_effort(context_id, &entries_snapshot);
 
         Some(remove_count)
     }
 
-    /// Best-effort persistence: persists entries if a backend is configured,
-    /// logging but not propagating errors.
-    fn persist_best_effort(&self, context_id: &[u8; 32], entries: &[EventLogEntry]) {
+    /// Best-effort O(1) persistence of a single entry at a given sequence.
+    ///
+    /// Used by `append_event` to persist only the newly appended entry.
+    fn persist_entry_best_effort(&self, context_id: &[u8; 32], seq: usize, entry: &EventLogEntry) {
+        if let Some(ref persistence) = self.persistence {
+            let context_id_hex = hex::encode(context_id);
+            if let Err(e) = persistence.persist_entry(&context_id_hex, seq, entry) {
+                tracing::warn!(
+                    context_id = %context_id_hex,
+                    error = %e,
+                    "failed to persist event log entry (best-effort)"
+                );
+            }
+        }
+    }
+
+    /// Best-effort bulk persistence: replaces all stored entries.
+    ///
+    /// Used by prune and import operations that rewrite the full entry set.
+    fn persist_entries_best_effort(&self, context_id: &[u8; 32], entries: &[EventLogEntry]) {
         if let Some(ref persistence) = self.persistence {
             let context_id_hex = hex::encode(context_id);
             if let Err(e) = persistence.persist_entries(&context_id_hex, entries) {
@@ -465,9 +512,10 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         logs.insert(*context_id, ContextLog::default());
 
-        // Persist the empty log to establish the context in storage.
+        // Persist the empty entry set to establish the context in storage
+        // (clears any stale per-entry keys from a previous incarnation).
         drop(logs);
-        self.persist_best_effort(context_id, &[]);
+        self.persist_entries_best_effort(context_id, &[]);
 
         Ok(())
     }
@@ -483,12 +531,12 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 hex::encode(context_id)
             ))
         })?;
-        log.append(event);
+        let entry = log.append(event);
+        let seq = log.entries.len() - 1;
 
-        // Persist after append.
-        let entries_snapshot = log.entries.clone();
+        // O(1) persist: only the newly appended entry (#710).
         drop(logs);
-        self.persist_best_effort(context_id, &entries_snapshot);
+        self.persist_entry_best_effort(context_id, seq, &entry);
 
         Ok(())
     }
@@ -723,6 +771,29 @@ mod tests {
     }
 
     impl EventLogPersistence for MockEventLogPersistence {
+        fn persist_entry(
+            &self,
+            context_id: &str,
+            seq: usize,
+            entry: &EventLogEntry,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut store = self.store.lock().unwrap();
+            let entries = store.entry(context_id.to_owned()).or_default();
+            if seq >= entries.len() {
+                entries.resize(
+                    seq + 1,
+                    EventLogEntry {
+                        event: String::new(),
+                        timestamp: 0,
+                        prev_hash: [0u8; 32],
+                        hash: [0u8; 32],
+                    },
+                );
+            }
+            entries[seq] = entry.clone();
+            Ok(())
+        }
+
         fn persist_entries(
             &self,
             context_id: &str,

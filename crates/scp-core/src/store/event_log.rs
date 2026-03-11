@@ -9,7 +9,7 @@
 //! context/{context_id}/event_meta/root                -- 32-byte Merkle root
 //! context/{context_id}/event_tree/{level}/{index}     -- Merkle tree nodes
 //! context/{context_id}/event_data/{seq:020d}          -- MessagePack-serialized Event payload
-//! context/{context_id}/merkle_event_log/entries       -- MerkleEventLogProvider entries (#636)
+//! context/{context_id}/merkle_event_log/{seq:020d}    -- per-entry MerkleEventLogProvider (#710)
 //! ```
 //!
 //! Event sequence numbers use 20-digit zero-padding for lexicographic
@@ -19,9 +19,11 @@
 //! the Merkle tree leaf hashes. This enables `query_events` to return real
 //! event data instead of just Merkle summaries. See GitHub issue #303.
 //!
-//! The `merkle_event_log/entries` key stores the serialized
-//! `Vec<EventLogEntry>` for the `MerkleEventLogProvider`, enabling event
-//! log persistence across process restarts. See GitHub issue #636.
+//! The `merkle_event_log/{seq:020d}` key space stores individual
+//! `EventLogEntry` values for the `MerkleEventLogProvider`, enabling O(1)
+//! append persistence. Restore loads all entries by prefix scan. The legacy
+//! single-blob key (`merkle_event_log/entries`) is supported for backward
+//! compatibility during load. See GitHub issues #636, #710.
 //!
 //! See spec sections 17.3, 17.4, and ADR-011.
 
@@ -98,12 +100,30 @@ fn event_data_prefix(context_id: &str) -> Result<String, StoreError> {
     Ok(format!("context/{ctx}/event_data/"))
 }
 
-/// Builds the storage key for the `MerkleEventLogProvider` entries blob.
+/// Builds the storage key for a single `MerkleEventLogProvider` entry.
+///
+/// Format: `context/{context_id}/merkle_event_log/{seq:020d}`
+/// Uses 20-digit zero-padding for lexicographic ordering, matching
+/// the `event/{seq:020d}` convention.
+/// See GitHub issues #636, #710.
+fn merkle_event_log_entry_key(context_id: &str, seq: usize) -> Result<String, StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/merkle_event_log/{seq:020}"))
+}
+
+/// Builds the prefix for listing all `MerkleEventLogProvider` entries.
+///
+/// Format: `context/{context_id}/merkle_event_log/`
+fn merkle_event_log_prefix(context_id: &str) -> Result<String, StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/merkle_event_log/"))
+}
+
+/// Builds the legacy single-blob key for backward compatibility.
 ///
 /// Format: `context/{context_id}/merkle_event_log/entries`
-/// Stores the full `Vec<EventLogEntry>` as a single serialized blob.
-/// See GitHub issue #636.
-fn merkle_event_log_key(context_id: &str) -> Result<String, StoreError> {
+/// Used only during load to migrate pre-#710 data.
+fn merkle_event_log_legacy_key(context_id: &str) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/merkle_event_log/entries"))
 }
@@ -602,11 +622,31 @@ impl<S: Storage> ProtocolStore<S> {
     // MerkleEventLogProvider persistence methods (#636)
     // -----------------------------------------------------------------------
 
-    /// Stores the full `MerkleEventLogProvider` entry list for a context.
+    /// Stores a single `MerkleEventLogProvider` entry at the given sequence.
     ///
-    /// Persists the serialized `Vec<EventLogEntry>` as a single blob under
-    /// `context/{context_id}/merkle_event_log/entries`. Called by the
-    /// `EventLogPersistence` bridge after each append operation.
+    /// Persists one `EventLogEntry` under
+    /// `context/{context_id}/merkle_event_log/{seq:020d}`. O(1) per append.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_merkle_event_log_entry(
+        &self,
+        context_id: &str,
+        seq: usize,
+        entry: &crate::context::providers::event_log::EventLogEntry,
+    ) -> Result<(), StoreError> {
+        let key = merkle_event_log_entry_key(context_id, seq)?;
+        self.store_value(&key, entry).await
+    }
+
+    /// Stores all `MerkleEventLogProvider` entries for a context, replacing
+    /// any previously stored entries.
+    ///
+    /// Deletes existing per-entry keys (and the legacy blob key) via prefix
+    /// delete, then writes each entry under its own key. Used by bulk
+    /// operations (prune, import).
     ///
     /// # Errors
     ///
@@ -617,13 +657,26 @@ impl<S: Storage> ProtocolStore<S> {
         context_id: &str,
         entries: &[crate::context::providers::event_log::EventLogEntry],
     ) -> Result<(), StoreError> {
-        let key = merkle_event_log_key(context_id)?;
-        self.store_value(&key, &entries.to_vec()).await
+        // Delete all existing keys under this prefix (per-entry + legacy blob).
+        let prefix = merkle_event_log_prefix(context_id)?;
+        self.storage.delete_prefix(&prefix).await?;
+
+        // Write each entry under its own key.
+        for (i, entry) in entries.iter().enumerate() {
+            self.store_merkle_event_log_entry(context_id, i, entry)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Loads the persisted `MerkleEventLogProvider` entries for a context.
     ///
-    /// Returns `None` if no entries have been persisted.
+    /// First tries per-entry keys via prefix scan (`merkle_event_log/`).
+    /// If no per-entry keys are found, falls back to the legacy single-blob
+    /// key (`merkle_event_log/entries`) for backward compatibility with
+    /// pre-#710 data.
+    ///
+    /// Returns `None` if no entries have been persisted in either format.
     ///
     /// # Errors
     ///
@@ -633,11 +686,37 @@ impl<S: Storage> ProtocolStore<S> {
         &self,
         context_id: &str,
     ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, StoreError> {
-        let key = merkle_event_log_key(context_id)?;
-        self.load_value(&key).await
+        let prefix = merkle_event_log_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+
+        // Filter out the legacy "entries" key — it's not a per-entry key.
+        let legacy_key = merkle_event_log_legacy_key(context_id)?;
+        let per_entry_keys: Vec<&String> = keys.iter().filter(|k| **k != legacy_key).collect();
+
+        if !per_entry_keys.is_empty() {
+            // Per-entry format (#710): load each entry individually.
+            // Keys are returned in lexicographic order (= sequence order due
+            // to zero-padding).
+            let mut entries = Vec::with_capacity(per_entry_keys.len());
+            for key in per_entry_keys {
+                let entry: crate::context::providers::event_log::EventLogEntry =
+                    self.load_value(key).await?.ok_or_else(|| {
+                        StoreError::DeserializationFailed(format!(
+                            "merkle event log entry missing after list_keys: {key}"
+                        ))
+                    })?;
+                entries.push(entry);
+            }
+            return Ok(Some(entries));
+        }
+
+        // Fall back to legacy single-blob format.
+        self.load_value(&legacy_key).await
     }
 
     /// Deletes the persisted `MerkleEventLogProvider` entries for a context.
+    ///
+    /// Removes all per-entry keys and the legacy blob key via prefix delete.
     ///
     /// # Errors
     ///
@@ -646,8 +725,8 @@ impl<S: Storage> ProtocolStore<S> {
         &self,
         context_id: &str,
     ) -> Result<(), StoreError> {
-        let key = merkle_event_log_key(context_id)?;
-        self.storage.delete(&key).await?;
+        let prefix = merkle_event_log_prefix(context_id)?;
+        self.storage.delete_prefix(&prefix).await?;
         Ok(())
     }
 }
@@ -1141,11 +1220,50 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn merkle_event_log_key_follows_convention() {
+    fn merkle_event_log_entry_key_follows_convention() {
         assert_eq!(
-            merkle_event_log_key("ctx-123").unwrap(),
-            "context/ctx-123/merkle_event_log/entries"
+            merkle_event_log_entry_key("ctx-123", 0).unwrap(),
+            "context/ctx-123/merkle_event_log/00000000000000000000"
         );
+        assert_eq!(
+            merkle_event_log_entry_key("ctx-123", 42).unwrap(),
+            "context/ctx-123/merkle_event_log/00000000000000000042"
+        );
+    }
+
+    #[test]
+    fn merkle_event_log_prefix_follows_convention() {
+        assert_eq!(
+            merkle_event_log_prefix("ctx-123").unwrap(),
+            "context/ctx-123/merkle_event_log/"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_and_load_single_merkle_event_log_entry() {
+        use crate::context::providers::event_log::EventLogEntry;
+
+        let store = make_store();
+        let entry = EventLogEntry {
+            event: "ContextCreated".to_owned(),
+            timestamp: 1_700_000_000,
+            prev_hash: [0u8; 32],
+            hash: [1u8; 32],
+        };
+
+        store
+            .store_merkle_event_log_entry("ctx-1", 0, &entry)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].event, "ContextCreated");
     }
 
     #[tokio::test]
@@ -1231,5 +1349,135 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_blob_backward_compat_loads_and_returns_entries() {
+        use crate::context::providers::event_log::EventLogEntry;
+
+        let store = make_store();
+        let entries = vec![
+            EventLogEntry {
+                event: "LegacyEvent1".to_owned(),
+                timestamp: 1_700_000_000,
+                prev_hash: [0u8; 32],
+                hash: [1u8; 32],
+            },
+            EventLogEntry {
+                event: "LegacyEvent2".to_owned(),
+                timestamp: 1_700_000_001,
+                prev_hash: [1u8; 32],
+                hash: [2u8; 32],
+            },
+        ];
+
+        // Write directly to the legacy single-blob key.
+        let legacy_key = merkle_event_log_legacy_key("ctx-legacy").unwrap();
+        store.store_value(&legacy_key, &entries).await.unwrap();
+
+        // load_merkle_event_log_entries should fall back to legacy format.
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-legacy")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].event, "LegacyEvent1");
+        assert_eq!(loaded[1].event, "LegacyEvent2");
+    }
+
+    #[tokio::test]
+    async fn per_entry_keys_take_precedence_over_legacy_blob() {
+        use crate::context::providers::event_log::EventLogEntry;
+
+        let store = make_store();
+
+        // Write a legacy blob.
+        let legacy_entry = EventLogEntry {
+            event: "LegacyOnly".to_owned(),
+            timestamp: 1_700_000_000,
+            prev_hash: [0u8; 32],
+            hash: [1u8; 32],
+        };
+        let legacy_key = merkle_event_log_legacy_key("ctx-both").unwrap();
+        store
+            .store_value(&legacy_key, &vec![legacy_entry])
+            .await
+            .unwrap();
+
+        // Write a per-entry key (simulating a partial migration).
+        let per_entry = EventLogEntry {
+            event: "PerEntry".to_owned(),
+            timestamp: 1_700_000_001,
+            prev_hash: [0u8; 32],
+            hash: [2u8; 32],
+        };
+        store
+            .store_merkle_event_log_entry("ctx-both", 0, &per_entry)
+            .await
+            .unwrap();
+
+        // Per-entry keys should take precedence.
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-both")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].event, "PerEntry");
+    }
+
+    #[tokio::test]
+    async fn bulk_store_replaces_existing_per_entry_keys() {
+        use crate::context::providers::event_log::EventLogEntry;
+
+        let store = make_store();
+
+        // Store 5 entries individually.
+        for i in 0..5u8 {
+            let entry = EventLogEntry {
+                event: format!("Event{i}"),
+                timestamp: u64::from(i),
+                prev_hash: [i; 32],
+                hash: [i + 1; 32],
+            };
+            store
+                .store_merkle_event_log_entry("ctx-bulk", usize::from(i), &entry)
+                .await
+                .unwrap();
+        }
+
+        // Bulk-store only 2 entries (simulating prune).
+        let pruned = vec![
+            EventLogEntry {
+                event: "Event3".to_owned(),
+                timestamp: 3,
+                prev_hash: [3; 32],
+                hash: [4; 32],
+            },
+            EventLogEntry {
+                event: "Event4".to_owned(),
+                timestamp: 4,
+                prev_hash: [4; 32],
+                hash: [5; 32],
+            },
+        ];
+        store
+            .store_merkle_event_log_entries("ctx-bulk", &pruned)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-bulk")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Should only have the 2 entries, not 5.
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].event, "Event3");
+        assert_eq!(loaded[1].event, "Event4");
     }
 }
