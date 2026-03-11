@@ -234,24 +234,57 @@ impl NapiIdentity {
     ///
     /// Generates a new Active Signing Key, updates the DID document on the
     /// DHT, and returns an updated identity with the same DID but a new
-    /// active signing key.
+    /// active signing key. The old key is retained in the document history
+    /// as a retired verification method for verification of past signatures.
+    ///
+    /// # Returns
+    ///
+    /// A new `NapiIdentity` with the rotated active signing key. The original
+    /// `NapiIdentity` is NOT mutated — callers must use the returned value.
+    /// Any references to the original instance retain the old (pre-rotation) state.
     ///
     /// # Errors
     ///
-    /// Returns an error if key rotation or DID document publish fails.
-    /// Platform and software custody paths require a wired
-    /// `KeyCustodyProvider` — this will be connected in a future story.
+    /// - `SCP-IDENT-1007`: The identity was externally loaded (no retained
+    ///   crypto state).
+    /// - `SCP-IDENT-1001`: Key generation or DHT publishing failed.
+    ///
+    /// See §3.3 Key Rotation, ADR-006 Key Management.
     #[napi]
-    #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
     pub async fn rotate_key(&self) -> napi::Result<Self> {
-        Err(ScpNapiError::Identity {
-            message: "key rotation requires a wired platform KeyCustodyProvider — \
-                      use the KeyCustodyProvider callback interface to inject \
-                      Secure Enclave (iOS) or Android Keystore (Android) backed custody"
-                .to_owned(),
-            code: "SCP-IDENT-1002".to_owned(),
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            let _ = self;
+            return Err(ScpNapiError::Identity {
+                message: "key rotation requires in-memory custody -- \
+                          enable allow_in_memory_custody"
+                    .to_owned(),
+                code: "SCP-IDENT-1007".to_owned(),
+            }
+            .into());
         }
-        .into())
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
+
+            let dht = make_dht_with_signer(&custody);
+            let (new_identity, new_document) = dht
+                .rotate_active_key(&scp_identity, &document, &custody.0)
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            let handle = Self {
+                inner: Arc::new(NapiIdentityInner {
+                    did: new_identity.did.clone(),
+                    custody_type: self.inner.custody_type.clone(),
+                    scp_identity: Some(new_identity),
+                    in_memory_custody: self.inner.in_memory_custody.clone(),
+                    document: Some(new_document),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
     }
 
     /// Adds an agent signing key to this identity (ADR-039).
@@ -914,4 +947,170 @@ pub async fn identity_verify_device_attestation(
             code: "SCP-IDENT-1012".to_owned(),
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "allow_in_memory_custody")]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Creates a test `NapiIdentity` with in-memory custody, returning the
+    /// identity and its initial active signing key's public key (multibase).
+    async fn create_test_identity() -> (NapiIdentity, String) {
+        let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let dht = DidDht::new();
+        let (scp_identity, document) = dht
+            .create(&key_custody.0)
+            .await
+            .expect("identity creation must succeed");
+
+        // Extract the initial active key's public key multibase from the document.
+        let initial_active_key = document
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.ends_with("#active"))
+            .expect("document must have an #active verification method")
+            .public_key_multibase
+            .clone();
+
+        let handle = NapiIdentity {
+            inner: Arc::new(NapiIdentityInner {
+                did: scp_identity.did.clone(),
+                custody_type: "in_memory".to_owned(),
+                scp_identity: Some(scp_identity),
+                in_memory_custody: Some(key_custody),
+                document: Some(document),
+            }),
+        };
+        increment_handle_count();
+        (handle, initial_active_key)
+    }
+
+    #[test]
+    fn rotate_key_returns_same_did() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+        let original_did = identity.did();
+
+        let rotated = rt
+            .block_on(identity.rotate_key())
+            .expect("rotate_key must succeed");
+
+        assert_eq!(
+            rotated.did(),
+            original_did,
+            "DID must remain the same after key rotation"
+        );
+    }
+
+    #[test]
+    fn rotate_key_changes_active_signing_key() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, initial_active_key) = rt.block_on(create_test_identity());
+
+        let rotated = rt
+            .block_on(identity.rotate_key())
+            .expect("rotate_key must succeed");
+
+        let rotated_doc = rotated
+            .inner
+            .document
+            .as_ref()
+            .expect("rotated identity must have a document");
+        let new_active_key = rotated_doc
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.ends_with("#active"))
+            .expect("rotated document must have an #active verification method")
+            .public_key_multibase
+            .clone();
+
+        assert_ne!(
+            new_active_key, initial_active_key,
+            "active signing key must change after rotation"
+        );
+    }
+
+    #[test]
+    fn rotate_key_retains_old_key_in_history() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, initial_active_key) = rt.block_on(create_test_identity());
+
+        let rotated = rt
+            .block_on(identity.rotate_key())
+            .expect("rotate_key must succeed");
+
+        let rotated_doc = rotated
+            .inner
+            .document
+            .as_ref()
+            .expect("rotated identity must have a document");
+
+        // The old active key should appear as a retired verification method.
+        // The naming convention is `#retired-{sequence}` (see document.rs).
+        let retired_keys: Vec<_> = rotated_doc
+            .verification_method
+            .iter()
+            .filter(|vm| vm.id.contains("#retired-"))
+            .collect();
+
+        assert!(
+            !retired_keys.is_empty(),
+            "rotated document must contain at least one retired active key"
+        );
+
+        // The retired key's public key should match the original active key.
+        let retired_key = &retired_keys[0].public_key_multibase;
+        assert_eq!(
+            retired_key, &initial_active_key,
+            "retired key must match the original active signing key"
+        );
+    }
+
+    #[test]
+    fn rotate_key_updates_did_document() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+
+        let rotated = rt
+            .block_on(identity.rotate_key())
+            .expect("rotate_key must succeed");
+
+        let rotated_doc = rotated
+            .inner
+            .document
+            .as_ref()
+            .expect("rotated identity must have a document");
+
+        // The document must have the new #active key in authentication refs.
+        let has_active_auth = rotated_doc
+            .authentication
+            .iter()
+            .any(|a| a.ends_with("#active"));
+        assert!(
+            has_active_auth,
+            "rotated document must reference #active in authentication"
+        );
+    }
+
+    #[test]
+    fn rotate_key_preserves_custody_type() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+
+        let rotated = rt
+            .block_on(identity.rotate_key())
+            .expect("rotate_key must succeed");
+
+        assert_eq!(
+            rotated.custody_type(),
+            "in_memory",
+            "custody type must remain in_memory after rotation"
+        );
+    }
 }
