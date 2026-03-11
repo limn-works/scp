@@ -2,14 +2,16 @@
  * Discovery module for the SCP TypeScript SDK.
  *
  * Provides functions for parsing SCP addresses, creating discovery queries,
- * normalizing addresses, and discovering contexts from DIDs or `scp://` URIs.
+ * normalizing addresses, discovering contexts from DIDs or `scp://` URIs,
+ * and resolving addresses to typed `AddressResolution` results.
  *
  * See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
  */
 
-import { mapBridgeError } from "./errors";
+import { mapBridgeError, ValidationError } from "./errors";
 import { getBridge } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
+import type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -23,7 +25,11 @@ export interface ParsedAddress {
   readonly [key: string]: unknown;
 }
 
-/** A context discovery result. */
+/**
+ * A context discovery result.
+ *
+ * Includes `trustLevel` and `resolutionPath` per §22.2.1 `AddressResolution`.
+ */
 export interface DiscoveryResult {
   readonly contextId: string;
   readonly relayUrls: readonly string[];
@@ -31,6 +37,107 @@ export interface DiscoveryResult {
   readonly discoverySource: string;
   readonly mode: string | null;
   readonly metadataSummary: string | null;
+  /** Trust level of this discovery result (§22.7). */
+  readonly trustLevel: TrustLevel;
+  /** Resolution path recording which layer produced this result (§22.7). */
+  readonly resolutionPath: ResolutionPath;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a `ResolutionPath` from a snake_case bridge JSON object.
+ */
+function parseResolutionPath(raw: Record<string, unknown>): ResolutionPath {
+  return {
+    layer: (raw.layer as ResolutionLayer) ?? "domain",
+    source: (raw.source as string) ?? "unknown",
+    sourceId: (raw.source_id ?? raw.sourceId ?? null) as string | null,
+    resolvedAt: (raw.resolved_at ?? raw.resolvedAt ?? 0) as number,
+  };
+}
+
+/** The 6 valid TrustLevel kind values per §22.7. */
+const VALID_TRUST_LEVEL_KINDS = new Set([
+  "DirectExchange",
+  "LocalPetname",
+  "DomainVerified",
+  "AttestationVerified",
+  "DiscoveryContextVerified",
+  "MultiLayerCorroborated",
+]);
+
+/**
+ * Validates that a string is one of the 6 spec-defined TrustLevel kind values.
+ *
+ * @throws {ValidationError} If the kind is not in the spec-defined set.
+ */
+function validateTrustLevelKind(kind: string): asserts kind is TrustLevel["kind"] {
+  if (!VALID_TRUST_LEVEL_KINDS.has(kind)) {
+    throw new ValidationError(
+      `Unknown TrustLevel kind: "${kind}". Expected one of: ${[...VALID_TRUST_LEVEL_KINDS].join(", ")}`,
+      "SCP-VALID-7100",
+    );
+  }
+}
+
+/**
+ * Parses a trust level from the bridge JSON. The NAPI bridge emits trust
+ * levels as `{ "kind": "..." }` objects (discriminated unions per §22.7).
+ * The `MultiLayerCorroborated` variant additionally carries `sources`.
+ *
+ * Also handles legacy string values (e.g. `"DomainVerified"`) by wrapping
+ * them into the discriminated union shape.
+ *
+ * @throws {ValidationError} On unrecognized variants or unexpected input types.
+ * §22.7 defines exactly 6 variants.
+ */
+function parseTrustLevel(raw: unknown): TrustLevel {
+  if (raw != null && typeof raw === "object" && "kind" in raw) {
+    const obj = raw as Record<string, unknown>;
+    const kind = String(obj.kind);
+    validateTrustLevelKind(kind);
+    if (kind === "MultiLayerCorroborated") {
+      const rawSources = (obj.sources ?? []) as Array<Record<string, unknown>>;
+      return {
+        kind: "MultiLayerCorroborated",
+        sources: rawSources.map(parseResolutionPath),
+      };
+    }
+    return { kind };
+  }
+  // Handle plain string trust levels from the bridge.
+  if (typeof raw === "string") {
+    validateTrustLevelKind(raw);
+    if (raw === "MultiLayerCorroborated") {
+      return { kind: "MultiLayerCorroborated", sources: [] };
+    }
+    return { kind: raw };
+  }
+  throw new ValidationError(
+    `Invalid TrustLevel value: expected object with "kind" or string, got ${typeof raw}`,
+    "SCP-VALID-7101",
+  );
+}
+
+/**
+ * Parses a raw bridge discovery result item (snake_case JSON) into a
+ * `DiscoveryResult` with trust and resolution path metadata.
+ */
+function parseDiscoveryResult(item: Record<string, unknown>): DiscoveryResult {
+  const rawPath = (item.resolution_path ?? item.resolutionPath ?? {}) as Record<string, unknown>;
+  return {
+    contextId: (item.context_id ?? item.contextId) as string,
+    relayUrls: (item.relay_urls ?? item.relayUrls) as readonly string[],
+    publisherDid: (item.publisher_did ?? item.publisherDid) as string,
+    discoverySource: (item.discovery_source ?? item.discoverySource) as string,
+    mode: (item.mode ?? null) as string | null,
+    metadataSummary: (item.metadata_summary ?? item.metadataSummary ?? null) as string | null,
+    trustLevel: parseTrustLevel(item.trust_level ?? item.trustLevel),
+    resolutionPath: parseResolutionPath(rawPath),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +203,7 @@ export async function normalizeAddress(address: string): Promise<string> {
  * Discovers contexts from a DID string or `scp://` URI.
  *
  * @param query - A DID string or `scp://` URI.
- * @returns Parsed discovery results.
+ * @returns Parsed discovery results including trust level and resolution path.
  * @throws {ContextError} If discovery fails.
  * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
  */
@@ -105,17 +212,38 @@ export async function discoverContexts(query: string): Promise<DiscoveryResult[]
     const bridge = await getBridge();
     const raw = await bridge.contextDiscover(query);
     const parsed = safeJsonParse(raw, "contextDiscover") as Array<Record<string, unknown>>;
-    // NAPI Rust returns snake_case keys; map to the camelCase DiscoveryResult interface.
-    const results: DiscoveryResult[] = parsed.map((item) => ({
-      contextId: (item.context_id ?? item.contextId) as string,
-      relayUrls: (item.relay_urls ?? item.relayUrls) as readonly string[],
-      publisherDid: (item.publisher_did ?? item.publisherDid) as string,
-      discoverySource: (item.discovery_source ?? item.discoverySource) as string,
-      mode: (item.mode ?? null) as string | null,
-      metadataSummary: (item.metadata_summary ?? item.metadataSummary ?? null) as string | null,
-    }));
-    return results;
+    return parsed.map(parseDiscoveryResult);
   } catch (error) {
     throw mapBridgeError(error);
   }
+}
+
+/**
+ * Resolves an SCP address (DID or `scp://` URI) to typed `AddressResolution` results.
+ *
+ * Wraps `discoverContexts()` and returns `AddressResolution[]` with the
+ * discriminated union structure matching §22.2.1.
+ *
+ * Currently resolves context addresses only. Identity resolution (petnames,
+ * attestation handles, domain handles) requires handle tool infrastructure
+ * defined in §22.3-22.6 and will be wired when those subsystems are
+ * available.
+ *
+ * @param query - A DID string or `scp://` URI.
+ * @returns Typed address resolution results.
+ * @throws {ContextError} If discovery fails.
+ * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
+ */
+export async function resolveAddress(query: string): Promise<AddressResolution[]> {
+  const results = await discoverContexts(query);
+  return results.map(
+    (r): AddressResolution => ({
+      type: "Context",
+      contextId: r.contextId,
+      relayUrls: r.relayUrls,
+      mode: r.mode,
+      trustLevel: r.trustLevel,
+      resolutionPath: r.resolutionPath,
+    }),
+  );
 }

@@ -159,6 +159,13 @@ export interface TransportConfig {
   readonly protocol?: string;
 }
 
+// -- Address Resolution (§22.2.1, §22.7) -------------------------------------
+// Canonical definitions live in types.ts; re-exported here for declaration consumers.
+
+export type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
+
+export declare function resolveAddress(query: string): Promise<AddressResolution[]>;
+
 // -- Identity -----------------------------------------------------------------
 
 export declare class Identity {
