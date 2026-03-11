@@ -33,6 +33,12 @@ export interface ContextParams {
   readonly promotionPolicy?: "no_promotion" | "promotable";
   /** Economic policy for the context. */
   readonly economicPolicy?: string;
+  /**
+   * Minimum protocol version required to join (spec §13.4).
+   * Encoded as `[major, minor]`, e.g., `[1, 0]` for SCP/1.0.
+   * Omit for default SCP/1.0 baseline.
+   */
+  readonly minProtocolVersion?: readonly [number, number];
 }
 
 // ---------------------------------------------------------------------------

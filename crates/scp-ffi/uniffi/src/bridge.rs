@@ -739,6 +739,10 @@ pub struct ContextParams {
     pub ttl_seconds: u64,
     /// Whether this context can be promoted from ephemeral to persistent.
     pub promotable: bool,
+    /// Minimum protocol version required to join (spec §13.4).
+    /// Encoded as `(major << 8) | minor`, e.g., `0x0100` for SCP/1.0.
+    /// `0` means no minimum (defaults to SCP/1.0).
+    pub min_protocol_version: u16,
 }
 
 /// A message received from an SCP context.
@@ -5134,12 +5138,21 @@ fn bridge_params_to_core(params: &ContextParams) -> scp_core::context::ContextPa
         PromotionPolicy::NoPromotion
     };
 
+    let min_protocol_version = if params.min_protocol_version == 0 {
+        None
+    } else {
+        let (major, minor) =
+            scp_core::context::decode_protocol_version(params.min_protocol_version);
+        Some((major, minor))
+    };
+
     scp_core::context::ContextParams {
         ceiling,
         governance,
         memory_scope,
         ttl,
         promotion_policy,
+        min_protocol_version,
         ..scp_core::context::ContextParams::default()
     }
 }

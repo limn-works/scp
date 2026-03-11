@@ -206,6 +206,14 @@ class PyContextParams:
         """Governance model (e.g., ``"single_admin"``)."""
         ...
 
+    @property
+    def min_protocol_version(self) -> tuple[int, int] | None:
+        """Minimum protocol version as ``(major, minor)`` tuple (spec §13.4).
+
+        ``None`` means no minimum set (defaults to SCP/1.0).
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 class PyMessage:

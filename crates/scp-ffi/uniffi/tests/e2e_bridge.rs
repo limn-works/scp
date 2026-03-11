@@ -99,6 +99,7 @@ fn full_capability_params() -> ContextParams {
         memory_scope: MemoryScope::Ephemeral,
         ttl_seconds: 3600,
         promotable: false,
+        min_protocol_version: 0,
     }
 }
 
@@ -113,6 +114,7 @@ fn default_encrypted_params() -> ContextParams {
         memory_scope: MemoryScope::Ephemeral,
         ttl_seconds: 3600,
         promotable: false,
+        min_protocol_version: 0,
     }
 }
 
@@ -760,6 +762,7 @@ async fn context_create_with_all_governance_models() {
             memory_scope: MemoryScope::Ephemeral,
             ttl_seconds: 3600,
             promotable: false,
+            min_protocol_version: 0,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -781,6 +784,7 @@ async fn context_create_with_all_memory_scopes() {
             memory_scope: scope,
             ttl_seconds: 3600,
             promotable: false,
+            min_protocol_version: 0,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

@@ -101,6 +101,11 @@ export interface ContextParams {
   readonly ttl?: number;
   readonly memoryScope?: "ephemeral" | "summary" | "full";
   readonly governance?: "single_admin" | "threshold" | "majority" | "unanimity";
+  /**
+   * Minimum protocol version required to join (spec §13.4).
+   * Encoded as `[major, minor]`, e.g., `[1, 0]` for SCP/1.0.
+   */
+  readonly minProtocolVersion?: readonly [number, number];
 }
 
 export interface TrustEvaluation {

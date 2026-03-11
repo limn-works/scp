@@ -34,6 +34,11 @@ use crate::runtime::{
     validate_value_against_schema, verify_inclusion,
 };
 
+/// SCP protocol version for WASM bridge (§13.2). Must match scp-core's
+/// `SCP_PROTOCOL_VERSION`. Encoded as `(major << 8) | minor`.
+/// SCP/1.0 = `0x0100` (decimal 256).
+const SCP_PROTOCOL_VERSION: u16 = 0x0100;
+
 /// Type alias for tool handler closures stored per-context.
 type ToolHandlerMap =
     HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>;
@@ -648,6 +653,37 @@ impl WasmContextManager {
     /// Returns an error if the context is not active.
     pub fn join_context(&mut self, context_id: &str, member_did: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        // Version compatibility check (spec §13.4): reject join if the
+        // context requires a protocol version higher than this SDK supports.
+        if let Some(min_ver) = ctx.params_json["minProtocolVersion"].as_array() {
+            let req_major = u8::try_from(
+                min_ver
+                    .first()
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1),
+            )
+            .unwrap_or(u8::MAX);
+            let req_minor = u8::try_from(
+                min_ver
+                    .get(1)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u8::MAX);
+            let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
+            let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
+
+            if sdk_major != req_major || sdk_minor < req_minor {
+                return Err(ScpWasmError::Context {
+                    message: format!(
+                        "protocol version incompatible: context requires {req_major}.{req_minor}, \
+                         SDK supports {sdk_major}.{sdk_minor}"
+                    ),
+                    code: "SCP-CTX-2015".to_owned(),
+                });
+            }
+        }
 
         if ctx.members.contains_key(member_did) {
             return Err(ScpWasmError::Context {

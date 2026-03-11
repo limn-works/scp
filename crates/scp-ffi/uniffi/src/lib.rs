@@ -675,6 +675,7 @@ mod tests {
             memory_scope: bridge::MemoryScope::Ephemeral,
             ttl_seconds: 0,
             promotable: false,
+            min_protocol_version: 0,
         };
 
         let handle = rt
@@ -728,6 +729,7 @@ mod tests {
             memory_scope: bridge::MemoryScope::Ephemeral,
             ttl_seconds: 0,
             promotable: false,
+            min_protocol_version: 0,
         };
 
         let handle = rt
