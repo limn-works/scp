@@ -94,8 +94,9 @@ pub struct Provenance {
 /// use `serde_bytes` for efficient `MessagePack` binary encoding.
 /// The current SCP protocol version for inner envelopes.
 ///
-/// See spec §13.2 for the version encoding scheme.
-pub const SCP_INNER_ENVELOPE_VERSION: u16 = 1;
+/// See spec §13.2 for the version encoding scheme: `(major << 8) | minor`.
+/// SCP/1.0 = `0x0100` (decimal 256).
+pub const SCP_INNER_ENVELOPE_VERSION: u16 = super::SCP_PROTOCOL_VERSION;
 
 /// Serde default for the `version` field on [`InnerEnvelope`].
 const fn default_inner_version() -> u16 {
