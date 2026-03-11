@@ -2542,6 +2542,13 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
+            // Version compatibility check (spec §13.4): reject subscribe if the
+            // context requires a protocol version higher than this SDK supports.
+            // Applies to ALL context modes including broadcast.
+            ctx.handle
+                .params()
+                .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+
             let bc = ctx
                 .broadcast_context
                 .as_mut()
