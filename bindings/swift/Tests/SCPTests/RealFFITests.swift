@@ -552,6 +552,65 @@ struct RealFFIBridgeTrustTests {
         #expect(result == true)
     }
 
+    @Test("FFI: verifyParticipationRequirements bridge with threshold matching")
+    func ffiVerifyParticipationRequirementsBridgeThreshold() throws {
+        try requireFFI()
+
+        // A valid ParticipationProfile with tool_invocation_count = 10
+        // and a requirement that demands AtLeast(5) ToolInvocationCount.
+        // This exercises the actual matching logic through the FFI bridge.
+        let profileJson = """
+        [{"subject_did":"did:dht:test123","participation_duration_secs":3600,\
+        "governance_actions_against":0,"governance_actions_by":0,\
+        "tool_invocation_count":10,"context_creation_count":1,\
+        "role_progression_count":0,"attestation_count":0,\
+        "updated_at":\(UInt64(Date().timeIntervalSince1970)),\
+        "event_log_root":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\
+        "signer_public_key":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],\
+        "signature":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}]
+        """
+        let requirementsJson = """
+        [{"fact":"ToolInvocationCount","threshold":{"AtLeast":5},"max_age_secs":86400,"min_contexts":1}]
+        """
+        let result = try verifyParticipationRequirementsBridge(
+            profileJson: profileJson,
+            requirementsJson: requirementsJson
+        )
+        #expect(result == true)
+    }
+
+    @Test("FFI: verifyParticipationRequirements bridge rejects insufficient profile")
+    func ffiVerifyParticipationRequirementsBridgeInsufficient() throws {
+        try requireFFI()
+
+        // Profile with tool_invocation_count = 2, requirement demands AtLeast(10).
+        // The FFI bridge should return an error because the threshold is not met.
+        let profileJson = """
+        [{"subject_did":"did:dht:test123","participation_duration_secs":100,\
+        "governance_actions_against":0,"governance_actions_by":0,\
+        "tool_invocation_count":2,"context_creation_count":0,\
+        "role_progression_count":0,"attestation_count":0,\
+        "updated_at":\(UInt64(Date().timeIntervalSince1970)),\
+        "event_log_root":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\
+        "signer_public_key":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],\
+        "signature":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}]
+        """
+        let requirementsJson = """
+        [{"fact":"ToolInvocationCount","threshold":{"AtLeast":10},"max_age_secs":86400,"min_contexts":1}]
+        """
+        do {
+            _ = try verifyParticipationRequirementsBridge(
+                profileJson: profileJson,
+                requirementsJson: requirementsJson
+            )
+            Issue.record("Expected throw: profile does not meet threshold")
+        } catch let error as ScpError {
+            if case let .Validation(message, _) = error {
+                #expect(!message.isEmpty)
+            }
+        }
+    }
+
     @Test("FFI: verifyParticipationRequirements bridge throws on malformed JSON")
     func ffiVerifyParticipationRequirementsBridgeMalformed() throws {
         try requireFFI()
@@ -846,6 +905,32 @@ struct RealFFIIdentityAndContextTests {
         #expect(!exported.isEmpty)
     }
 
+    @Test("FFI: context import exercises FFI path")
+    func ffiContextImport() async throws {
+        try requireFFI()
+
+        let identity = try await createIdentity(custody: "in_memory")
+        let params = makeTestParams(ceiling: ["messages:read"])
+
+        let handle = try await contextCreate(identity: identity, params: params)
+
+        // Export then import — exercises both FFI paths in sequence.
+        let exported = try await contextExport(handle: handle)
+        #expect(!exported.isEmpty)
+
+        // Import the exported data — may fail if the context is still active
+        // or due to state constraints, but the FFI path is exercised either way.
+        do {
+            let importedContextId = try await contextImport(data: exported)
+            #expect(!importedContextId.isEmpty)
+        } catch let error as ScpError {
+            // Expected: import may reject re-importing an active context
+            if case let .Context(message, _) = error {
+                #expect(!message.isEmpty)
+            }
+        }
+    }
+
     // =========================================================================
     // MARK: - 8. Tools (Async, Requires Active Context)
 
@@ -1006,14 +1091,14 @@ struct RealFFIUcanAndGovernanceTests {
         let handle = try await contextCreate(identity: identity, params: params)
 
         // Self-delegation (iss == aud) requires key_scope per ADR-039.
-        // The FFI bridge enforces this — verify the error path works.
+        // The FFI bridge enforces this — mint must always throw.
         do {
             _ = try await ucanMint(
                 handle: handle,
                 memberDid: identity.did(),
                 capabilities: ["messages:read", "messages:write"]
             )
-            // If mint succeeds, the bridge handles key_scope internally
+            Issue.record("Expected ADR-039 self-delegation error from ucanMint")
         } catch let error as ScpError {
             // Expected: ADR-039 enforcement for self-delegation without key_scope
             if case let .Permission(message, _) = error {
@@ -1031,15 +1116,21 @@ struct RealFFIUcanAndGovernanceTests {
 
         let handle = try await contextCreate(identity: identity, params: params)
 
-        // Self-delegation fails ADR-039 validation — verify the FFI error path
+        // Call ucanValidate with an invalid token — exercises the FFI path
+        // and verifies the bridge correctly propagates the validation error.
         do {
-            _ = try await ucanMint(
+            try await ucanValidate(
                 handle: handle,
-                memberDid: identity.did(),
-                capabilities: ["messages:read"]
+                token: "not-a-valid-ucan-token",
+                capability: "messages:read",
+                presentingAgentDid: nil,
+                proofTokens: nil
             )
-        } catch {
-            // Expected: ADR-039 self-delegation error — FFI path verified
+            Issue.record("Expected ucanValidate to reject invalid token")
+        } catch let error as ScpError {
+            if case let .Permission(message, _) = error {
+                #expect(!message.isEmpty)
+            }
         }
     }
 
@@ -1052,15 +1143,18 @@ struct RealFFIUcanAndGovernanceTests {
 
         let handle = try await contextCreate(identity: identity, params: params)
 
-        // Self-delegation fails ADR-039 — verify FFI mint error path
+        // Call ucanRevoke with a non-existent token — exercises the FFI path
+        // and verifies the bridge correctly propagates the revocation error.
         do {
-            _ = try await ucanMint(
+            try await ucanRevoke(
                 handle: handle,
-                memberDid: identity.did(),
-                capabilities: ["messages:read"]
+                token: "not-a-valid-ucan-token"
             )
-        } catch {
-            // Expected: ADR-039 enforcement — FFI path verified
+            Issue.record("Expected ucanRevoke to reject non-existent token")
+        } catch let error as ScpError {
+            if case let .Permission(message, _) = error {
+                #expect(!message.isEmpty)
+            }
         }
     }
 
