@@ -361,9 +361,11 @@ fn parse_event_query_filter(
         }
         if let Some(v) = f.get_item("after_timestamp")? {
             let ts = v.extract::<f64>()?;
-            if ts < 0.0 {
+            if ts < 0.0 || !ts.is_finite() {
                 return Err(ScpPyError::ValidationError {
-                    message: format!("after_timestamp must be non-negative, got {ts}"),
+                    message: format!(
+                        "after_timestamp must be a finite non-negative value, got {ts}"
+                    ),
                     code: "SCP-VALID-7040".to_owned(),
                 }
                 .into());
@@ -375,9 +377,11 @@ fn parse_event_query_filter(
         }
         if let Some(v) = f.get_item("before_timestamp")? {
             let ts = v.extract::<f64>()?;
-            if ts < 0.0 {
+            if ts < 0.0 || !ts.is_finite() {
                 return Err(ScpPyError::ValidationError {
-                    message: format!("before_timestamp must be non-negative, got {ts}"),
+                    message: format!(
+                        "before_timestamp must be a finite non-negative value, got {ts}"
+                    ),
                     code: "SCP-VALID-7040".to_owned(),
                 }
                 .into());

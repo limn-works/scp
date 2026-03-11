@@ -617,4 +617,16 @@ mod tests {
             "error should contain SCP-VALID-7040, got: {msg}"
         );
     }
+
+    #[test]
+    fn validate_epoch_rejects_nan() {
+        let result = validate_non_negative_epoch(f64::NAN);
+        assert!(result.is_err(), "NaN epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_positive_infinity() {
+        let result = validate_non_negative_epoch(f64::INFINITY);
+        assert!(result.is_err(), "INFINITY epoch should error");
+    }
 }

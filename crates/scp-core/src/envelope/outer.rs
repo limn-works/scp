@@ -71,6 +71,14 @@ pub struct OuterEnvelope {
 
     /// The MLS-encrypted blob containing the serialized inner envelope.
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    ///
+    /// **Interaction with `#[serde(flatten)]` on `extensions`:** When
+    /// `flatten` is present, serde buffers all map entries before dispatching
+    /// to field deserializers. This means `serde_bounded_bytes` fires *after*
+    /// the full input has been buffered into memory. The pre-deserialization
+    /// `MAX_ENVELOPE_SIZE` check in [`OuterEnvelope::from_bytes`] is the
+    /// primary defense against oversized inputs; `serde_bounded_bytes` acts
+    /// as defense-in-depth for the individual field.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_blob: Vec<u8>,
 
@@ -134,13 +142,20 @@ impl OuterEnvelope {
         rmp_serde::to_vec_named(self).map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))
     }
 
+    /// Maximum number of unknown extension keys allowed in a deserialized
+    /// outer envelope. Limits memory amplification from adversarial inputs
+    /// that pack many small keys into a single envelope.
+    const MAX_EXTENSION_KEYS: usize = 32;
+
     /// Deserializes an outer envelope from `MessagePack` binary format.
     ///
     /// Performs a pre-deserialization size check against
     /// [`MAX_ENVELOPE_SIZE`] to reject obviously oversized inputs before the
     /// deserializer allocates memory (#347). Individual fields are further
     /// bounded by serde-level helpers (e.g., `serde_bounded_bytes` for
-    /// `encrypted_blob`).
+    /// `encrypted_blob`). After deserialization, extension keys are capped at
+    /// [`Self::MAX_EXTENSION_KEYS`] to prevent memory amplification from
+    /// adversarial inputs.
     ///
     /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
     ///
@@ -149,7 +164,8 @@ impl OuterEnvelope {
     /// Returns [`EnvelopeError::EnvelopeTooLarge`] if `bytes.len()` exceeds
     /// `MAX_ENVELOPE_SIZE`.
     /// Returns [`EnvelopeError::DeserializationFailed`] if the bytes are not
-    /// a valid `MessagePack`-encoded `OuterEnvelope`.
+    /// a valid `MessagePack`-encoded `OuterEnvelope`, or if the number of
+    /// unknown extension fields exceeds `MAX_EXTENSION_KEYS`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
         use crate::serde_util::MAX_ENVELOPE_SIZE;
 
@@ -165,6 +181,13 @@ impl OuterEnvelope {
             return Err(EnvelopeError::UnsupportedVersion {
                 version: envelope.version,
             });
+        }
+        if envelope.extensions.len() > Self::MAX_EXTENSION_KEYS {
+            return Err(EnvelopeError::DeserializationFailed(format!(
+                "too many unknown extension fields ({}, max {})",
+                envelope.extensions.len(),
+                Self::MAX_EXTENSION_KEYS
+            )));
         }
         Ok(envelope)
     }
@@ -682,6 +705,111 @@ mod tests {
         assert!(
             re_decoded.extensions.contains_key("v2_routing_priority"),
             "unknown field must survive msgpack serialize → deserialize → serialize → deserialize"
+        );
+    }
+
+    /// #593-F2: `from_bytes` rejects envelopes with more than
+    /// `MAX_EXTENSION_KEYS` unknown extension fields.
+    #[test]
+    fn from_bytes_rejects_too_many_extension_keys() {
+        // Build a valid envelope, then inject 33 extension keys (above limit of 32).
+        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+        let map = json.as_object_mut().unwrap();
+        for i in 0..33 {
+            map.insert(format!("ext_key_{i}"), serde_json::json!(i));
+        }
+
+        // Serialize to MessagePack so we can test from_bytes.
+        let tweaked: OuterEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(tweaked.extensions.len(), 33);
+        let bytes = tweaked.to_bytes().unwrap();
+
+        let result = OuterEnvelope::from_bytes(&bytes);
+        assert!(result.is_err(), "should reject >32 extension keys");
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("too many unknown extension fields"),
+            "error should mention extension field limit, got: {err_msg}"
+        );
+    }
+
+    /// #593-F2: `from_bytes` accepts envelopes at exactly `MAX_EXTENSION_KEYS`.
+    #[test]
+    fn from_bytes_accepts_at_extension_key_limit() {
+        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+        let map = json.as_object_mut().unwrap();
+        for i in 0..32 {
+            map.insert(format!("ext_key_{i}"), serde_json::json!(i));
+        }
+
+        let tweaked: OuterEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(tweaked.extensions.len(), 32);
+        let bytes = tweaked.to_bytes().unwrap();
+
+        let result = OuterEnvelope::from_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "should accept exactly 32 extension keys: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    /// #593-F4: `serde_bounded_bytes` still fires on `encrypted_blob` even
+    /// when `#[serde(flatten)]` on `extensions` causes serde to buffer all
+    /// fields. Crafts a `MessagePack` map with `encrypted_blob` exceeding
+    /// `BOUNDED_BYTES_MAX` but within `MAX_ENVELOPE_SIZE`, verifying that
+    /// the per-field guard still rejects it.
+    #[test]
+    fn serde_bounded_bytes_fires_with_flatten_present() {
+        use crate::serde_util::{BOUNDED_BYTES_MAX, MAX_ENVELOPE_SIZE};
+
+        // Build a struct with an oversized encrypted_blob that's still
+        // within MAX_ENVELOPE_SIZE. BOUNDED_BYTES_MAX = 512 KiB,
+        // MAX_ENVELOPE_SIZE = 576 KiB. Use BOUNDED_BYTES_MAX + 1 bytes
+        // for the blob.
+        let oversized_blob = vec![0xAAu8; BOUNDED_BYTES_MAX + 1];
+
+        // Construct a valid msgpack map with the oversized blob.
+        // We use a helper struct to ensure correct serde_bytes encoding.
+        #[derive(serde::Serialize)]
+        struct OversizedEnvelope {
+            version: u16,
+            #[serde(with = "serde_bytes")]
+            routing_id: Vec<u8>,
+            blob_ttl: u32,
+            #[serde(with = "serde_bytes")]
+            encrypted_blob: Vec<u8>,
+        }
+
+        let crafted = OversizedEnvelope {
+            version: SCP_OUTER_ENVELOPE_VERSION,
+            routing_id: vec![0xBB; 32],
+            blob_ttl: 3600,
+            encrypted_blob: oversized_blob,
+        };
+        let bytes = rmp_serde::to_vec_named(&crafted).unwrap();
+
+        // Sanity: total size is within MAX_ENVELOPE_SIZE (the oversized blob
+        // is just over 512 KiB, but the total is under 576 KiB).
+        assert!(
+            bytes.len() <= MAX_ENVELOPE_SIZE,
+            "test expects total size within MAX_ENVELOPE_SIZE, got {}",
+            bytes.len()
+        );
+
+        // from_bytes should fail because serde_bounded_bytes rejects the
+        // oversized encrypted_blob.
+        let result = OuterEnvelope::from_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "serde_bounded_bytes should reject blob > BOUNDED_BYTES_MAX even with flatten"
+        );
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("DeserializationFailed"),
+            "should be DeserializationFailed from serde_bounded_bytes, got: {err_msg}"
         );
     }
 }

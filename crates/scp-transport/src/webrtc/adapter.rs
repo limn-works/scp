@@ -649,6 +649,7 @@ mod tests {
 
         // Create a minimal outer envelope.
         let envelope = OuterEnvelope {
+            version: scp_core::envelope::outer::SCP_OUTER_ENVELOPE_VERSION,
             routing_id: vec![0xAA; 32],
             recipient_hint: None,
             blob_ttl: 3600,
