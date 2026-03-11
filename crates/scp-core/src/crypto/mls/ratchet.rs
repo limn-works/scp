@@ -548,17 +548,16 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn process_commit_triggers_callback_on_grace_store_eviction() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
+        use std::sync::{Arc, Mutex};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let evicted = Rc::new(RefCell::new(Vec::<u64>::new()));
-        let evicted_clone = Rc::clone(&evicted);
+        let evicted = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let evicted_clone = Arc::clone(&evicted);
 
         // Use a very small grace store that will evict quickly.
         let mut grace_store = EpochGraceStore::with_max_capacity(2);
         grace_store.set_on_epoch_expired(Box::new(move |epochs| {
-            evicted_clone.borrow_mut().extend_from_slice(epochs);
+            evicted_clone.lock().unwrap().extend_from_slice(epochs);
         }));
 
         // Advance 3 times to fill and then exceed the grace store capacity.
@@ -570,9 +569,8 @@ mod tests {
 
         // The grace store has capacity 2, so the first epoch should have been
         // evicted when the third was added.
-        let evicted_epochs = evicted.borrow();
         assert!(
-            !evicted_epochs.is_empty(),
+            !evicted.lock().unwrap().is_empty(),
             "callback should have been invoked for evicted epoch"
         );
         assert_eq!(

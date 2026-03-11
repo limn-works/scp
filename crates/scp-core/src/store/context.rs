@@ -1618,6 +1618,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
         }
     }
 
@@ -1895,7 +1896,7 @@ mod tests {
         grace.add_epoch(101);
         grace.add_epoch(102);
 
-        let entries = grace.to_grace_entries();
+        let entries = grace.to_grace_entries().unwrap();
         assert_eq!(entries.len(), 3);
 
         for entry in &entries {
@@ -1910,7 +1911,7 @@ mod tests {
         assert_eq!(persisted.len(), 3);
 
         let mut recovered = EpochGraceStore::new();
-        let expired = recovered.restore_from_entries(&persisted);
+        let expired = recovered.restore_from_entries(&persisted).unwrap();
         assert!(expired.is_empty(), "all entries should still be live");
         assert_eq!(recovered.len(), 3);
         assert!(recovered.is_in_grace(100));
@@ -1957,7 +1958,7 @@ mod tests {
         // Recovery.
         let persisted = store.load_grace_entries("ctx-expired").await.unwrap();
         let mut recovered = EpochGraceStore::new();
-        let expired = recovered.restore_from_entries(&persisted);
+        let expired = recovered.restore_from_entries(&persisted).unwrap();
 
         assert_eq!(expired, vec![50]);
         assert_eq!(recovered.len(), 1);

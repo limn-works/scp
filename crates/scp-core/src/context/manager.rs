@@ -344,6 +344,15 @@ pub struct ContextSnapshot {
     /// `RevokeReadAccess`, `ResetMember`).
     #[serde(default)]
     pub mls_epoch: u64,
+    /// Persisted epoch grace window entries (§23.11).
+    ///
+    /// Captured from [`EpochGraceStore::to_grace_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::to_grace_entries)
+    /// during snapshot creation. On recovery, fed to
+    /// [`EpochGraceStore::restore_from_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::restore_from_entries)
+    /// to reconstruct the grace store. Persisted alongside all other context
+    /// state to ensure transactional consistency (§23.11 step 2).
+    #[serde(default)]
+    pub grace_entries: Vec<crate::crypto::mls::epoch_grace::GraceEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +510,13 @@ struct PerContextState {
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.
     mls_epoch: u64,
+    /// Epoch grace window store (§23.11).
+    ///
+    /// Tracks which old epochs are still within their grace window after
+    /// epoch advances. Persisted alongside the context snapshot and restored
+    /// on startup. Used by the MLS decrypt path to determine whether to
+    /// attempt decryption for a given past epoch.
+    grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1009,12 +1025,50 @@ impl ContextManager {
         }
     }
 
+    /// Initializes a `BroadcastContext` if the context is in Broadcast mode
+    /// (SCP-227). Derives admission policy from `template_id` and registers
+    /// the creator as the first author. Persists the initial broadcast state
+    /// for crash recovery.
+    fn init_broadcast_context(
+        &self,
+        context_id: &str,
+        params: &ContextParams,
+        creator_did: &DID,
+    ) -> Result<Option<BroadcastContext>, ContextCreationError> {
+        if params.mode != ContextMode::Broadcast {
+            return Ok(None);
+        }
+        let admission = match params.template_id {
+            Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
+            Some(TemplateId::PublicBroadcast | TemplateId::PaidBroadcast) => {
+                BroadcastAdmission::Open
+            }
+            _ => BroadcastAdmission::Open,
+        };
+        let mut bc = BroadcastContext::new(context_id.to_owned(), &params.mode, admission)
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        // Register the creator as the first author (messagesWrite).
+        bc.add_author(creator_did)
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        // Persist initial broadcast state for crash recovery.
+        if self.has_persistence() {
+            self.persist_broadcast_snapshot(context_id, &bc.to_snapshot());
+        }
+        Ok(Some(bc))
+    }
+
     /// Takes a `ContextSnapshot` from the current `PerContextState`.
     ///
     /// Must be called while the contexts mutex is held (snapshot under lock).
     fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
         let ttl_remaining_secs = ctx.ttl_timer.remaining_secs();
+        // Capture grace entries for transactional persistence (§23.11).
+        // On clock error, persist an empty vec — the recovery path will
+        // treat the missing entries as expired (conservative: forward secrecy
+        // prioritized over message recovery, per §23.11 inconsistent state
+        // fallback).
+        let grace_entries = ctx.grace_store.to_grace_entries().unwrap_or_default();
         ContextSnapshot {
             context_id: ctx.handle.context_id().to_owned(),
             state,
@@ -1037,6 +1091,7 @@ impl ContextManager {
             governance_freeze: ctx.governance_freeze,
             pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
             mls_epoch: ctx.mls_epoch,
+            grace_entries,
         }
     }
 
@@ -1114,6 +1169,70 @@ impl ContextManager {
         let governance_engine =
             restore_governance_engine_from_snapshot(&ctx_snapshot, self.key_resolver.clone())?;
 
+        // Restore the epoch grace store from persisted entries (§23.11
+        // recovery-on-startup).
+        let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
+        if !ctx_snapshot.grace_entries.is_empty() {
+            // Inconsistency detection (§23.11): if any grace entry references
+            // an epoch newer than the persisted MLS epoch, a partial write
+            // escaped the transaction boundary.
+            let has_inconsistency = ctx_snapshot
+                .grace_entries
+                .iter()
+                .any(|entry| entry.epoch > ctx_snapshot.mls_epoch);
+
+            if has_inconsistency {
+                // §23.11 inconsistent state fallback: discard all grace
+                // entries and destroy old epoch key material. The context
+                // should re-enter the reconnection protocol (§23.3) for
+                // re-sync. Log the inconsistency for the application layer.
+                //
+                // We do not return the error — the context is still
+                // restorable without grace entries (conservative: forward
+                // secrecy prioritized over message recovery).
+                let inconsistency = crate::sync::SyncError::EpochGraceStoreInconsistency {
+                    context_id: context_id.into(),
+                    reason: format!(
+                        "grace entry references epoch newer than persisted MLS epoch {}",
+                        ctx_snapshot.mls_epoch,
+                    ),
+                };
+                tracing::warn!(
+                    context_id = %context_id,
+                    mls_epoch = ctx_snapshot.mls_epoch,
+                    error = %inconsistency,
+                    "epoch grace store inconsistency detected during restore; \
+                     discarding all grace entries (forward secrecy prioritized)"
+                );
+                // Grace store stays empty — all old epoch keys are effectively
+                // destroyed (forward secrecy). Messages encrypted under lost
+                // epochs are unrecoverable, matching the §23.11 fallback.
+            } else {
+                // Normal restore path: feed persisted entries into the grace
+                // store. Entries that expired during downtime are returned in
+                // the `expired` vec — the caller should destroy any cached
+                // key material for those epochs.
+                match grace_store.restore_from_entries(&ctx_snapshot.grace_entries) {
+                    Ok(_expired) => {
+                        // Expired epochs' key material is already gone (OpenMLS
+                        // manages key lifecycle internally). The grace store now
+                        // reflects the surviving entries.
+                    }
+                    Err(clock_err) => {
+                        // Clock error during restore — fall back to empty grace
+                        // store (conservative: forward secrecy over recovery).
+                        tracing::warn!(
+                            context_id = %context_id,
+                            error = %clock_err,
+                            "clock error during grace store restore; \
+                             discarding all grace entries (forward secrecy prioritized)"
+                        );
+                        grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
+                    }
+                }
+            }
+        }
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
@@ -1138,6 +1257,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             mls_epoch: ctx_snapshot.mls_epoch,
+            grace_store,
         };
 
         {
@@ -1380,6 +1500,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
             mls_epoch: export.snapshot.mls_epoch,
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
         };
 
         // 6. Register the context.
@@ -1479,30 +1600,7 @@ impl ContextManager {
             .unwrap_or_default();
         membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
 
-        // Initialize broadcast context for Broadcast mode (SCP-227).
-        // Derives admission policy from template_id: PublicBroadcast/PaidBroadcast
-        // → Open, GatedBroadcast → Gated. Defaults to Open when no template.
-        let broadcast_context = if params.mode == ContextMode::Broadcast {
-            let admission = match params.template_id {
-                Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
-                Some(TemplateId::PublicBroadcast | TemplateId::PaidBroadcast) => {
-                    BroadcastAdmission::Open
-                }
-                _ => BroadcastAdmission::Open,
-            };
-            let mut bc = BroadcastContext::new(context_id.clone(), &params.mode, admission)
-                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            // Register the creator as the first author (messagesWrite).
-            bc.add_author(&creator_did)
-                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            // Persist initial broadcast state for crash recovery.
-            if self.has_persistence() {
-                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
-            }
-            Some(bc)
-        } else {
-            None
-        };
+        let broadcast_context = self.init_broadcast_context(&context_id, &params, &creator_did)?;
 
         // Extract threshold signers and value from GovernanceModel at creation
         // time so PerContextState is correctly initialized for Threshold
@@ -1536,6 +1634,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1799,6 +1898,7 @@ impl ContextManager {
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
         })
     }
 
@@ -2672,12 +2772,18 @@ impl ContextManager {
         };
 
         // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
-        // ResetMember), increment the epoch counter and report it. Non-MLS
-        // actions leave the epoch unchanged and report None.
+        // ResetMember), increment the epoch counter, place the old epoch into
+        // the grace store (§23.11), and report the new epoch. Non-MLS actions
+        // leave the epoch unchanged and report None.
         let resulting_epoch = if classify_action(&proposal.action) == MlsImpact::MembershipChange {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.mls_epoch = ctx.mls_epoch.saturating_add(1);
+                let old_epoch = ctx.mls_epoch;
+                ctx.mls_epoch = old_epoch.saturating_add(1);
+                // Place the old epoch into the grace window so in-flight
+                // messages encrypted under it can still be decrypted for
+                // up to 30 seconds (ADR-001 criterion 6, §23.11).
+                let _expired = ctx.grace_store.add_epoch(old_epoch);
                 Some(ctx.mls_epoch)
             } else {
                 None
@@ -9902,6 +10008,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -10000,6 +10107,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
         };
 
         persistence
@@ -10086,6 +10194,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -10151,6 +10260,7 @@ mod tests {
                 governance_freeze: None,
                 pending_ceiling_modification: None,
                 mls_epoch: 0,
+                grace_entries: Vec::new(),
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -10215,6 +10325,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -11215,6 +11326,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
