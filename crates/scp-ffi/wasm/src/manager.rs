@@ -657,6 +657,15 @@ impl WasmContextManager {
         // Version compatibility check (spec §13.4): reject join if the
         // context requires a protocol version higher than this SDK supports.
         if let Some(min_ver) = ctx.params_json["minProtocolVersion"].as_array() {
+            if min_ver.len() < 2 {
+                return Err(ScpWasmError::Context {
+                    message: format!(
+                        "malformed minProtocolVersion: expected [major, minor] array with at \
+                         least 2 elements, got {min_ver:?}"
+                    ),
+                    code: "SCP-CTX-2015".to_owned(),
+                });
+            }
             let req_major = u8::try_from(
                 min_ver
                     .first()
@@ -674,13 +683,16 @@ impl WasmContextManager {
             let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
             let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
 
+            // Exact major match is intentional: different major versions have
+            // incompatible wire formats per §13.1. This rejects both lower AND
+            // higher majors.
             if sdk_major != req_major || sdk_minor < req_minor {
                 return Err(ScpWasmError::Context {
                     message: format!(
                         "protocol version incompatible: context requires {req_major}.{req_minor}, \
                          SDK supports {sdk_major}.{sdk_minor}"
                     ),
-                    code: "SCP-CTX-2015".to_owned(),
+                    code: "SCP-CTX-2016".to_owned(),
                 });
             }
         }

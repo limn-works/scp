@@ -800,8 +800,9 @@ impl ContextParams {
         let (req_major, req_minor) = self.effective_min_protocol_version();
         let (sdk_major, sdk_minor) = decode_protocol_version(sdk_version);
 
-        // Major version must match exactly — different major versions are
-        // incompatible wire formats (§13.1). Minor version must be >=.
+        // Exact major match is intentional: different major versions have
+        // incompatible wire formats per §13.1. This rejects both lower AND
+        // higher majors. Minor version must be >=.
         if sdk_major != req_major || sdk_minor < req_minor {
             return Err(super::ContextError::VersionIncompatible {
                 required_major: req_major,

@@ -2235,6 +2235,11 @@ pub async fn context_join(
 
             // Delegate to the shared ContextManager. Build a core ContextHandle
             // to pass the context_id, then join via the manager.
+            //
+            // This ephemeral ContextHandle is a placeholder: UniFFI's
+            // join_context doesn't use the handle's params — the
+            // ContextManager performs its own version compatibility check
+            // using the params already stored on the managed context.
             let manager = crate::runtime::context_manager();
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
