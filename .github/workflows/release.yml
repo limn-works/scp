@@ -606,6 +606,23 @@ jobs:
           # Write to file for gh release
           echo "$NOTES" > release-notes.md
 
+      - name: Append commit log to release notes
+        run: |
+          # Find the previous release tag (if any)
+          PREV_TAG=$(git tag --list 'scp-core@*' --sort=-version:refname | head -1)
+
+          echo "" >> release-notes.md
+          echo "---" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "### Commits" >> release-notes.md
+          echo "" >> release-notes.md
+
+          if [ -n "$PREV_TAG" ]; then
+            git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges >> release-notes.md
+          else
+            git log --pretty=format:"- %s (%h)" --no-merges -50 >> release-notes.md
+          fi
+
       - name: Generate checksums
         run: |
           cd release-artifacts
