@@ -619,7 +619,8 @@ export function createWasmBridge(): Bridge {
     // Drain events
     async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
       const wasm = getWasm();
-      const json = await wasm.context_drain_events(handle);
+      // context_drain_events is synchronous in the WASM export — no await needed.
+      const json = wasm.context_drain_events(handle);
       return JSON.parse(json) as string[];
     },
 
