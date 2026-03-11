@@ -1681,7 +1681,7 @@ mod tests {
             .unwrap();
         crate::runtime::with_context(&ctx_id, |st| {
             assert!(!st.role_state.members.contains(target));
-            assert!(st.role_state.assignments.get(target).is_none());
+            assert!(!st.role_state.assignments.contains_key(target));
             Ok(())
         })
         .unwrap();

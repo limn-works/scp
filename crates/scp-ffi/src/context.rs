@@ -2999,7 +2999,7 @@ mod tests {
         crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
         crate::runtime::with_context(&ctx_id, |st| {
             assert!(!st.role_state.members.contains(target));
-            assert!(st.role_state.assignments.get(target).is_none());
+            assert!(!st.role_state.assignments.contains_key(target));
             Ok(())
         })
         .unwrap();
