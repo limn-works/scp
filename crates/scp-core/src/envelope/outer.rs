@@ -142,20 +142,15 @@ impl OuterEnvelope {
         rmp_serde::to_vec_named(self).map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))
     }
 
-    /// Maximum number of unknown extension keys allowed in a deserialized
-    /// outer envelope. Limits memory amplification from adversarial inputs
-    /// that pack many small keys into a single envelope.
-    const MAX_EXTENSION_KEYS: usize = 32;
-
     /// Deserializes an outer envelope from `MessagePack` binary format.
     ///
     /// Performs a pre-deserialization size check against
     /// [`MAX_ENVELOPE_SIZE`] to reject obviously oversized inputs before the
     /// deserializer allocates memory (#347). Individual fields are further
     /// bounded by serde-level helpers (e.g., `serde_bounded_bytes` for
-    /// `encrypted_blob`). After deserialization, extension keys are capped at
-    /// [`Self::MAX_EXTENSION_KEYS`] to prevent memory amplification from
-    /// adversarial inputs.
+    /// `encrypted_blob`). Unknown extension fields are preserved
+    /// unconditionally per spec §13.5.1 (relays MUST NOT strip unknown
+    /// fields from outer envelopes).
     ///
     /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
     ///
@@ -164,8 +159,7 @@ impl OuterEnvelope {
     /// Returns [`EnvelopeError::EnvelopeTooLarge`] if `bytes.len()` exceeds
     /// `MAX_ENVELOPE_SIZE`.
     /// Returns [`EnvelopeError::DeserializationFailed`] if the bytes are not
-    /// a valid `MessagePack`-encoded `OuterEnvelope`, or if the number of
-    /// unknown extension fields exceeds `MAX_EXTENSION_KEYS`.
+    /// a valid `MessagePack`-encoded `OuterEnvelope`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
         use crate::serde_util::MAX_ENVELOPE_SIZE;
 
@@ -181,13 +175,6 @@ impl OuterEnvelope {
             return Err(EnvelopeError::UnsupportedVersion {
                 version: envelope.version,
             });
-        }
-        if envelope.extensions.len() > Self::MAX_EXTENSION_KEYS {
-            return Err(EnvelopeError::DeserializationFailed(format!(
-                "too many unknown extension fields ({}, max {})",
-                envelope.extensions.len(),
-                Self::MAX_EXTENSION_KEYS
-            )));
         }
         Ok(envelope)
     }
@@ -708,51 +695,32 @@ mod tests {
         );
     }
 
-    /// #593-F2: `from_bytes` rejects envelopes with more than
-    /// `MAX_EXTENSION_KEYS` unknown extension fields.
+    /// §13.5.1: `from_bytes` preserves many extension keys unconditionally.
+    /// Relays MUST NOT strip unknown fields from outer envelopes.
     #[test]
-    fn from_bytes_rejects_too_many_extension_keys() {
-        // Build a valid envelope, then inject 33 extension keys (above limit of 32).
+    fn from_bytes_preserves_many_extension_keys() {
         let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
         let mut json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
         let map = json.as_object_mut().unwrap();
-        for i in 0..33 {
-            map.insert(format!("ext_key_{i}"), serde_json::json!(i));
-        }
-
-        // Serialize to MessagePack so we can test from_bytes.
-        let tweaked: OuterEnvelope = serde_json::from_value(json).unwrap();
-        assert_eq!(tweaked.extensions.len(), 33);
-        let bytes = tweaked.to_bytes().unwrap();
-
-        let result = OuterEnvelope::from_bytes(&bytes);
-        assert!(result.is_err(), "should reject >32 extension keys");
-        let err_msg = format!("{result:?}");
-        assert!(
-            err_msg.contains("too many unknown extension fields"),
-            "error should mention extension field limit, got: {err_msg}"
-        );
-    }
-
-    /// #593-F2: `from_bytes` accepts envelopes at exactly `MAX_EXTENSION_KEYS`.
-    #[test]
-    fn from_bytes_accepts_at_extension_key_limit() {
-        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
-        let mut json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
-        let map = json.as_object_mut().unwrap();
-        for i in 0..32 {
+        for i in 0..64 {
             map.insert(format!("ext_key_{i}"), serde_json::json!(i));
         }
 
         let tweaked: OuterEnvelope = serde_json::from_value(json).unwrap();
-        assert_eq!(tweaked.extensions.len(), 32);
+        assert_eq!(tweaked.extensions.len(), 64);
         let bytes = tweaked.to_bytes().unwrap();
 
         let result = OuterEnvelope::from_bytes(&bytes);
         assert!(
             result.is_ok(),
-            "should accept exactly 32 extension keys: {:?}",
+            "should preserve all extension keys per §13.5.1: {:?}",
             result.unwrap_err()
+        );
+        let recovered = result.unwrap();
+        assert_eq!(
+            recovered.extensions.len(),
+            64,
+            "all 64 extension keys must survive roundtrip"
         );
     }
 
