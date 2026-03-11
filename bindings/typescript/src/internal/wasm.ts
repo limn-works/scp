@@ -278,6 +278,9 @@ interface WasmModule {
     expiresAt: number | null;
     encoded: string;
   }>;
+  // Economic policy (§19.3)
+  context_set_economic_policy: (handle: BridgeContextHandle, policyJson: string) => void;
+  context_get_economic_policy: (handle: BridgeContextHandle) => string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +657,17 @@ export function createWasmBridge(): Bridge {
     ): Promise<void> {
       const wasm = getWasm();
       await wasm.context_reset_ttl_timer(handle, newDurationSecs);
+    },
+
+    // Economic policy (§19.3)
+    async contextSetEconomicPolicy(handle: BridgeContextHandle, policyJson: string): Promise<void> {
+      const wasm = getWasm();
+      wasm.context_set_economic_policy(handle, policyJson);
+    },
+
+    async contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null> {
+      const wasm = getWasm();
+      return wasm.context_get_economic_policy(handle) ?? null;
     },
 
     // Context export/import

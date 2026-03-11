@@ -525,6 +525,51 @@ class Context:
             return None
         return MemberRole.from_bridge(raw)
 
+    # -- Economic policy ----------------------------------------------------
+
+    async def set_economic_policy(self, policy_json: str) -> None:
+        """Set the economic policy for this context (spec section 19).
+
+        Validates the JSON against the ``EconomicPolicy`` schema before
+        storing.
+
+        Args:
+            policy_json: The economic policy as a JSON string.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+            ValidationError: If the JSON is invalid or does not conform
+                to the ``EconomicPolicy`` schema.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        _scp_core.py_set_economic_policy(self._handle, policy_json)
+
+    async def get_economic_policy(self) -> str | None:
+        """Return the economic policy for this context as a JSON string.
+
+        Returns:
+            The economic policy JSON, or ``None`` if no policy is set.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        return _scp_core.py_get_economic_policy(self._handle)
+
     # -- Broadcast operations -----------------------------------------------
 
     async def broadcast_subscribe(self, subscriber_did: str) -> None:

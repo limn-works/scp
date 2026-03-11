@@ -1432,6 +1432,8 @@ pub struct ContextHandle {
     pub(crate) tool_handlers: tokio::sync::Mutex<ToolHandlerMap>,
     /// Session store for stateful tool sessions (spec section 6.2.1).
     pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
+    /// Optional economic policy as a JSON string (§19.3, ADR-033).
+    pub(crate) economic_policy: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for ContextHandle {
@@ -2189,6 +2191,7 @@ pub async fn context_create(
                 session_store: tokio::sync::Mutex::new(
                     scp_core::context::tools::SessionStore::new(),
                 ),
+                economic_policy: std::sync::Mutex::new(None),
             });
             increment_handle_count();
             Ok(handle)
@@ -5546,6 +5549,80 @@ pub fn verify_participation_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// Economic policy bridge (§19.3, ADR-033)
+// ---------------------------------------------------------------------------
+
+/// Sets the economic policy for a context (§19.3).
+///
+/// Accepts the economic policy as a JSON string. Validates the JSON against
+/// the `EconomicPolicy` schema before storing. If the existing policy has
+/// `locked: true`, the mutation is rejected — matching the
+/// `ContextManager::execute_set_economic_policy` behaviour in scp-core.
+///
+/// # Warning
+///
+/// This is a low-level FFI function that directly overwrites the economic
+/// policy. It does **not** go through governance — no event logging, no
+/// 24-hour notification period, no proposal flow. Governance enforcement
+/// is the SDK / application layer's responsibility.
+///
+/// # Errors
+///
+/// - `ScpError::Validation` if the JSON is invalid or does not parse as
+///   `EconomicPolicy`.
+/// - `ScpError::Permission` if the existing economic policy is locked.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
+pub fn set_economic_policy(
+    handle: Arc<ContextHandle>,
+    policy_json: String,
+) -> Result<(), ScpError> {
+    // Hold the mutex for the entire check-validate-store sequence to prevent
+    // TOCTOU races (another thread bypassing the lock between check and store).
+    let mut guard = handle
+        .economic_policy
+        .lock()
+        .map_err(|_| ScpError::Context {
+            message: "economic_policy lock is poisoned".to_owned(),
+            code: "SCP-CTX-2012".to_owned(),
+        })?;
+
+    // Check whether the existing policy is locked (§19.3).
+    if let Some(ref existing_json) = *guard
+        && let Ok(existing) =
+            serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
+        && existing.locked
+    {
+        return Err(ScpError::Permission {
+            message: "economic policy is locked and cannot be changed".to_owned(),
+            code: "SCP-CTX-2013".to_owned(),
+        });
+    }
+
+    let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(&policy_json)
+        .map_err(|e| ScpError::Validation {
+            message: format!("invalid economic policy JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })?;
+
+    *guard = Some(policy_json);
+    Ok(())
+}
+
+/// Returns the economic policy for a context as a JSON string, or `None`.
+#[uniffi::export]
+pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    let guard = handle
+        .economic_policy
+        .lock()
+        .map_err(|_| ScpError::Context {
+            message: "economic_policy lock is poisoned".to_owned(),
+            code: "SCP-CTX-2012".to_owned(),
+        })?;
+    Ok(guard.clone())
+}
+
+// ---------------------------------------------------------------------------
 // Context export/import (#363)
 // ---------------------------------------------------------------------------
 
@@ -6561,6 +6638,7 @@ mod tests {
             tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
             tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
         })
     }
 
@@ -6598,5 +6676,49 @@ mod tests {
             }
             other => panic!("expected ScpError::Permission, got {other:?}"),
         }
+    }
+
+    /// Roundtrip set / get for economic policy on the `UniFFI` `ContextHandle`.
+    #[test]
+    fn set_get_economic_policy_roundtrip() {
+        let handle = test_handle();
+
+        // Initially None.
+        let result = get_economic_policy(Arc::clone(&handle)).unwrap();
+        assert!(result.is_none());
+
+        // Set valid policy.
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        set_economic_policy(Arc::clone(&handle), json.to_owned()).unwrap();
+
+        let result = get_economic_policy(Arc::clone(&handle)).unwrap();
+        assert_eq!(result.as_deref(), Some(json));
+
+        // Invalid JSON is rejected.
+        let err = set_economic_policy(Arc::clone(&handle), "not json".to_owned());
+        assert!(err.is_err());
+
+        // Original policy unchanged after rejected set.
+        let result = get_economic_policy(handle).unwrap();
+        assert_eq!(result.as_deref(), Some(json));
+    }
+
+    /// Verifies that setting economic policy on a locked policy is rejected.
+    #[test]
+    fn set_economic_policy_rejects_when_locked() {
+        let handle = test_handle();
+
+        // Set a locked policy.
+        let locked_json = r#"{"locked":true,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        set_economic_policy(Arc::clone(&handle), locked_json.to_owned()).unwrap();
+
+        // Attempting to overwrite should fail.
+        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let result = set_economic_policy(Arc::clone(&handle), new_json.to_owned());
+        assert!(result.is_err());
+
+        // Locked policy should be unchanged.
+        let result = get_economic_policy(handle).unwrap();
+        assert_eq!(result.as_deref(), Some(locked_json));
     }
 }

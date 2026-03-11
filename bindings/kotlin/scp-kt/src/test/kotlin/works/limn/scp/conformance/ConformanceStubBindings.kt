@@ -134,6 +134,8 @@ class ConformanceStubBindings : NativeBindings {
     }
 
     override fun contextUnsubscribe(subscriptionHandle: Long) = Unit
+    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) = Unit
+    override fun contextGetEconomicPolicy(contextHandle: Long): String? = null
 
     // MembershipBindings
     override fun contextMemberCount(contextHandle: Long): Long? = 1L

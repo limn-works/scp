@@ -450,6 +450,30 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
+    // Economic policy roundtrip tests (#592)
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class EconomicPolicyTests {
+        @Test
+        fun `setEconomicPolicy then getEconomicPolicy roundtrip`() =
+            runTest(ioDispatcher) {
+                @Suppress("MaxLineLength")
+                val policyJson =
+                    """{"locked":false,"cost_schedule":{"currency":[85,83,68,0]},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"""
+
+                // Initially null.
+                val initial = bridge.context.getEconomicPolicy(1L)
+                assertEquals(null, initial)
+
+                // Set, then get.
+                bridge.context.setEconomicPolicy(1L, policyJson)
+                val result = bridge.context.getEconomicPolicy(1L)
+                assertEquals(policyJson, result)
+            }
+    }
+
+    // -------------------------------------------------------------------
     // Error handling tests
     // -------------------------------------------------------------------
 
@@ -581,6 +605,12 @@ class StubNativeBindings : NativeBindings {
         contextUnsubscribeCalled = true
         lastUnsubscribeHandle = subscriptionHandle
     }
+
+    var lastEconomicPolicy: String? = null
+    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) {
+        lastEconomicPolicy = policyJson
+    }
+    override fun contextGetEconomicPolicy(contextHandle: Long): String? = lastEconomicPolicy
 
     // MembershipBindings
     override fun contextMemberCount(contextHandle: Long): Long? = 1L

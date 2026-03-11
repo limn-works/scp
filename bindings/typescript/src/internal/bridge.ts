@@ -134,6 +134,10 @@ export interface Bridge {
   ): Promise<boolean>;
   contextResetTtlTimer(handle: BridgeContextHandle, newDurationSecs: number): Promise<void>;
 
+  // Economic policy (§19.3)
+  contextSetEconomicPolicy(handle: BridgeContextHandle, policyJson: string): Promise<void>;
+  contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null>;
+
   // Context export/import
   contextExport(handle: BridgeContextHandle): Promise<Uint8Array>;
   contextImport(data: Uint8Array): Promise<string>;

@@ -1295,6 +1295,64 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Economic policy bridge (§19.3, ADR-033)
+// ---------------------------------------------------------------------------
+
+/// Sets the economic policy on a context handle (§19.3).
+///
+/// Validates the JSON against the `EconomicPolicy` schema before storing.
+/// If the existing policy has `locked: true`, the mutation is rejected —
+/// matching the `ContextManager::execute_set_economic_policy` behaviour
+/// in scp-core.
+///
+/// # Warning
+///
+/// This is a low-level FFI function that directly overwrites the economic
+/// policy. It does **not** go through governance — no event logging, no
+/// 24-hour notification period, no proposal flow. Governance enforcement
+/// is the SDK / application layer's responsibility.
+///
+/// # Errors
+///
+/// - NAPI error if the JSON is invalid or does not parse as `EconomicPolicy`.
+/// - NAPI error if the existing economic policy is locked.
+#[napi(js_name = "contextSetEconomicPolicy")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub fn context_set_economic_policy(
+    handle: &mut NapiContextHandle,
+    policy_json: String,
+) -> napi::Result<()> {
+    // Check whether the existing policy is locked (§19.3).
+    if let Some(ref existing_json) = handle.economic_policy
+        && let Ok(existing) =
+            serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
+        && existing.locked
+    {
+        return Err(NapiError::from(ScpNapiError::Context {
+            message: "economic policy is locked and cannot be changed".to_owned(),
+            code: "SCP-CTX-2013".to_owned(),
+        }));
+    }
+
+    let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(&policy_json)
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid economic policy JSON: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            })
+        })?;
+    handle.economic_policy = Some(policy_json);
+    Ok(())
+}
+
+/// Returns the economic policy for a context as a JSON string, or `null`.
+#[napi(js_name = "contextGetEconomicPolicy")]
+#[must_use]
+pub fn context_get_economic_policy(handle: &NapiContextHandle) -> Option<String> {
+    handle.economic_policy.clone()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1340,5 +1398,77 @@ mod tests {
 
         let count = manager.member_count(&ctx_id).await.unwrap();
         assert_eq!(count, 2, "after join, context should have 2 members");
+    }
+
+    /// Verifies roundtrip set / get for economic policy on `NapiContextHandle`.
+    #[test]
+    fn set_get_economic_policy_roundtrip() {
+        use super::*;
+        use std::sync::Mutex;
+
+        let mut handle = NapiContextHandle {
+            context_id: "test-ctx-econ".to_owned(),
+            state: Mutex::new(ContextState::Active),
+            creator_did: "did:key:z6MkTest".to_owned(),
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            signing_key: None,
+            core_handle: None,
+        };
+
+        // Initially None.
+        assert!(context_get_economic_policy(&handle).is_none());
+
+        // Set valid policy.
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        context_set_economic_policy(&mut handle, json.to_owned()).unwrap();
+        assert_eq!(context_get_economic_policy(&handle).as_deref(), Some(json));
+
+        // Invalid JSON is rejected.
+        let bad = context_set_economic_policy(&mut handle, "not json".to_owned());
+        assert!(bad.is_err());
+        // Original policy unchanged after rejected set.
+        assert_eq!(context_get_economic_policy(&handle).as_deref(), Some(json));
+    }
+
+    /// Verifies that setting economic policy on a locked policy is rejected.
+    #[test]
+    fn set_economic_policy_rejects_when_locked() {
+        use super::*;
+        use std::sync::Mutex;
+
+        let locked_json = r#"{"locked":true,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let mut handle = NapiContextHandle {
+            context_id: "test-ctx-econ-locked".to_owned(),
+            state: Mutex::new(ContextState::Active),
+            creator_did: "did:key:z6MkTest".to_owned(),
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: Some(locked_json.to_owned()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            signing_key: None,
+            core_handle: None,
+        };
+
+        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let result = context_set_economic_policy(&mut handle, new_json.to_owned());
+        assert!(result.is_err());
+        // Original locked policy should be unchanged.
+        assert_eq!(
+            context_get_economic_policy(&handle).as_deref(),
+            Some(locked_json)
+        );
     }
 }

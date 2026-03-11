@@ -439,6 +439,20 @@ export function createNativeBridge(): Bridge {
       );
     },
 
+    // Economic policy (§19.3)
+    async contextSetEconomicPolicy(handle: BridgeContextHandle, policyJson: string): Promise<void> {
+      await (
+        addon.contextSetEconomicPolicy as (h: BridgeContextHandle, p: string) => Promise<void>
+      )(handle, policyJson);
+    },
+
+    async contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null> {
+      const result = await (
+        addon.contextGetEconomicPolicy as (h: BridgeContextHandle) => Promise<string | null>
+      )(handle);
+      return result ?? null;
+    },
+
     // Context export/import
     async contextExport(handle: BridgeContextHandle): Promise<Uint8Array> {
       const data = await (addon.contextExport as (h: BridgeContextHandle) => Promise<Buffer>)(
