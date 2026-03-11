@@ -256,6 +256,14 @@ interface UcanBindings {
         identityHandle: Long,
         token: String,
     )
+
+    fun ucanDelegate(
+        contextHandle: Long,
+        delegatorDid: String,
+        delegateeDid: String,
+        parentToken: String,
+        capabilitiesJson: String,
+    ): String
 }
 
 /**
@@ -730,6 +738,40 @@ class UcanBridge internal constructor(
         identityHandle: Long,
         token: String,
     ): Unit = bridge.ffiCall { bindings.ucanRevoke(identityHandle, token) }
+
+    /**
+     * Delegate a UCAN token to another entity with attenuated capabilities.
+     *
+     * Creates a new UCAN derived from a parent token, signed with the delegator's
+     * Ed25519 key. Delegation enforces attenuation: capabilities can only narrow,
+     * never widen. The delegator must be the audience of the parent token.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param delegatorDid DID of the entity delegating (must match parent token's audience).
+     * @param delegateeDid DID of the entity receiving the delegation.
+     * @param parentToken The encoded parent UCAN token (JWT format).
+     * @param capabilitiesJson JSON-encoded list of capability URIs to delegate
+     *   (must be a subset of parent's capabilities).
+     * @return The delegated UCAN token string.
+     * @throws BridgeException if delegation fails (e.g., capabilities wider than parent).
+     *
+     * See ADR-016 criterion 4, spec section 7.2.
+     */
+    suspend fun delegate(
+        contextHandle: Long,
+        delegatorDid: String,
+        delegateeDid: String,
+        parentToken: String,
+        capabilitiesJson: String,
+    ): String = bridge.ffiCall {
+        bindings.ucanDelegate(
+            contextHandle,
+            delegatorDid,
+            delegateeDid,
+            parentToken,
+            capabilitiesJson,
+        )
+    }
 }
 
 /**
