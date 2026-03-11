@@ -349,6 +349,8 @@ pub fn provenance_attach(
         (new_depth, serde_json::json!(path))
     };
 
+    // WASM has no real timer — age is always 0 at attachment time.
+    // The field must be present for structural parity with the NAPI bridge.
     let result = serde_json::json!({
         "source_context": source_context_id,
         "source_type": st.to_string(),
@@ -356,7 +358,7 @@ pub fn provenance_attach(
         "memory_scope": ms.to_string(),
         "chain_depth": chain_depth,
         "chain_path": chain_path,
-        "target_context": target_context_id,
+        "age_secs": 0,
         "discovery_method": dm,
         "purpose": purpose,
         "payment_amount": serde_json::Value::Null,
