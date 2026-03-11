@@ -2968,7 +2968,7 @@ fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
 }
 
 // ===========================================================================
-// SCP_PROTOCOL_VERSION constant sync conformance (#707)
+// SCP_PROTOCOL_VERSION constant sync conformance (#717)
 //
 // The WASM bridge defines its own SCP_PROTOCOL_VERSION constant because it
 // cannot depend on scp-core (ADR-034). This test ensures both values match.
