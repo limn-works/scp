@@ -47,10 +47,14 @@ jobs:
               - 'deny.toml'
             python:
               - 'bindings/python/**'
+              - 'crates/scp-ffi/src/**'
             typescript:
               - 'bindings/typescript/**'
+              - 'crates/scp-ffi/napi/**'
+              - 'crates/scp-ffi/wasm/**'
             kotlin:
               - 'bindings/kotlin/**'
+              - 'crates/scp-ffi/uniffi/**'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
