@@ -1013,7 +1013,10 @@ pub struct ContextManager {
     /// writes (DID registration) are rare.
     local_dids: RwLock<HashSet<DID>>,
     /// Per-context state, keyed by `context_id` string.
-    contexts: Mutex<HashMap<String, PerContextState>>,
+    ///
+    /// Wrapped in `Arc` so spawned timer tasks can push events to the
+    /// receive buffer when TTL expiry completes or fails (#612).
+    contexts: Arc<Mutex<HashMap<String, PerContextState>>>,
     /// Resolver that maps a DID to its Ed25519 verifying key for governance
     /// vote signature verification (spec §5.9, ADR-031). Passed through to
     /// governance engines at creation and restoration time.
@@ -1048,7 +1051,7 @@ impl ContextManager {
             event_log: Arc::from(event_log),
             persistence: None,
             local_dids: RwLock::new(HashSet::new()),
-            contexts: Mutex::new(HashMap::new()),
+            contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
         }
     }
@@ -1081,7 +1084,7 @@ impl ContextManager {
             event_log: Arc::from(event_log),
             persistence: Some(Arc::from(persistence)),
             local_dids: RwLock::new(HashSet::new()),
-            contexts: Mutex::new(HashMap::new()),
+            contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
         }
     }
@@ -5955,19 +5958,30 @@ impl ContextManager {
 
         // Async TTL expiry logic -- no lock held. Pass transport for
         // best-effort relay ciphertext deletion (§5.11).
-        ttl::handle_ttl_expiry_with_transport(
+        let result = ttl::try_ttl_expiry_cleanup(
             handle,
             self.crypto.as_ref(),
             Some(self.transport.as_ref()),
             self.event_log.as_ref(),
+            0,
         )
-        .await?;
+        .await;
 
-        // Emit expiry notification (lock acquired, then dropped).
+        // Emit appropriate event (lock acquired, then dropped).
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.receive_buffer.push(ContextEvent::Expired);
+                if result.is_complete() {
+                    ctx.receive_buffer.push(ContextEvent::Expired);
+                } else {
+                    ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
+                        reason: result.to_string(),
+                        state_transitioned: result.state_transitioned(),
+                        mls_destroyed: result.mls_destroyed(),
+                        sender_key_destroyed: result.sender_key_destroyed(),
+                        event_logged: result.event_logged(),
+                    });
+                }
             }
         }
 
@@ -5979,6 +5993,17 @@ impl ContextManager {
                 drop(contexts);
                 self.persist_context_snapshot(&context_id, &snapshot);
             }
+        }
+
+        if result.has_failures() {
+            let msg = result.errors().join("; ");
+            return Err(
+                if !result.mls_destroyed() || !result.sender_key_destroyed() {
+                    ContextError::CryptoFailed(msg)
+                } else {
+                    ContextError::EventLogFailed(msg)
+                },
+            );
         }
 
         Ok(())
@@ -6070,13 +6095,19 @@ impl ContextManager {
 
     /// Spawns a TTL timer for the given context.
     ///
-    /// When the timer fires, it calls [`ttl::handle_ttl_expiry`] which:
+    /// When the timer fires, it runs [`ttl::run_ttl_expiry_with_retries`]
+    /// which:
     /// - Transitions the context from `Active` to `Expired`.
     /// - For `Ephemeral` and `Summary` memory scopes: destroys MLS group
     ///   state and sender keys via the crypto provider.
     /// - Logs a `ContextExpired` event to the event log.
     ///
+    /// On success, emits [`ContextEvent::Expired`] to the receive buffer.
+    /// If all retries fail, emits [`ContextEvent::ExpiryFailed`] so the
+    /// application layer can observe and react to the failure.
+    ///
     /// This matches the behavior of [`TtlTimer::spawn`] and ensures key
+    /// destruction and event logging use the manager's shared providers.
     async fn spawn_ttl_timer(
         &self,
         context_id: &str,
@@ -6093,21 +6124,43 @@ impl ContextManager {
         };
 
         // Clone Arc-wrapped providers so the spawned task can perform
-        // key destruction and event logging on TTL expiry.
+        // key destruction, relay deletion, and event logging on TTL expiry.
         let crypto = Arc::clone(&self.crypto);
+        let transport = Arc::clone(&self.transport);
         let event_log = Arc::clone(&self.event_log);
+        let contexts_ref = Arc::clone(&self.contexts);
+        let context_id_owned = context_id.to_owned();
 
         let task = tokio::spawn(async move {
             tokio::select! {
                 () = tokio::time::sleep(duration) => {
-                    // Timer fired. Delegate to handle_ttl_expiry which
-                    // transitions to Expired, destroys keys per memory
-                    // scope, and logs ContextExpired event (SCP-169).
-                    let _ = ttl::handle_ttl_expiry(
+                    // Timer fired. Run cleanup with exponential backoff
+                    // retries (SCP-169, #612). Pass transport so relay
+                    // ciphertext deletion happens on timer-initiated expiry
+                    // (§5.11, #612 finding 2).
+                    let result = ttl::run_ttl_expiry_with_retries(
                         &handle,
                         crypto.as_ref(),
+                        Some(transport.as_ref()),
                         event_log.as_ref(),
+                        &cancel,
                     ).await;
+
+                    // Emit event to the receive buffer (lock, push, drop).
+                    let mut contexts = contexts_ref.lock().await;
+                    if let Some(ctx) = contexts.get_mut(&context_id_owned) {
+                        if result.is_complete() {
+                            ctx.receive_buffer.push(ContextEvent::Expired);
+                        } else {
+                            ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
+                                reason: result.to_string(),
+                                state_transitioned: result.state_transitioned(),
+                                mls_destroyed: result.mls_destroyed(),
+                                sender_key_destroyed: result.sender_key_destroyed(),
+                                event_logged: result.event_logged(),
+                            });
+                        }
+                    }
                 }
                 () = cancel.notified() => {
                     // Timer was cancelled.
@@ -6116,9 +6169,9 @@ impl ContextManager {
         });
 
         // Store the task handle (lock, then drop).
-        let context_id_owned = context_id.to_owned();
+        let context_id_for_store = context_id.to_owned();
         let mut contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(&context_id_owned) {
+        if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
             ctx.ttl_timer.task = Some(task);
         }
     }
