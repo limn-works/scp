@@ -368,6 +368,13 @@ pub async fn context_create(
         .map(scp_core::context::roles::Capability::new)
         .collect();
 
+    // Parse minProtocolVersion: [major, minor] array or null (spec §13.4).
+    let min_protocol_version = params["minProtocolVersion"].as_array().and_then(|arr| {
+        let major = u8::try_from(arr.first()?.as_u64()?).ok()?;
+        let minor = u8::try_from(arr.get(1)?.as_u64()?).ok()?;
+        Some((major, minor))
+    });
+
     let context_params = ContextParams {
         mode,
         ceiling: core_ceiling,
@@ -376,6 +383,7 @@ pub async fn context_create(
         ttl: ttl_seconds.map(std::time::Duration::from_secs),
         memory_scope: core_memory_scope,
         governance: core_governance,
+        min_protocol_version,
         ..ContextParams::default()
     };
 

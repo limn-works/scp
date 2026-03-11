@@ -31,6 +31,47 @@ from scp_sdk.identity import Identity
 from scp_sdk.types import CustodyType
 
 # ---------------------------------------------------------------------------
+# PyContextParams
+# ---------------------------------------------------------------------------
+
+
+class TestPyContextParams:
+    """Tests for PyContextParams field parsing through real FFI."""
+
+    def test_min_protocol_version_set(self) -> None:
+        params = _scp_core.PyContextParams(
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+                "min_protocol_version": (1, 2),
+            }
+        )
+        assert params.min_protocol_version == (1, 2)
+
+    def test_min_protocol_version_none_when_absent(self) -> None:
+        params = _scp_core.PyContextParams(
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            }
+        )
+        assert params.min_protocol_version is None
+
+    def test_min_protocol_version_zero_zero(self) -> None:
+        params = _scp_core.PyContextParams(
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+                "min_protocol_version": (0, 0),
+            }
+        )
+        assert params.min_protocol_version == (0, 0)
+
+
+# ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------
 

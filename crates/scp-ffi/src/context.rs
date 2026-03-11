@@ -191,6 +191,9 @@ pub struct PyContextParams {
     template_id: Option<String>,
     /// Optional economic policy as a JSON string (spec §19).
     economic_policy: Option<String>,
+    /// Minimum protocol version as `(major, minor)` tuple (spec §13.4).
+    /// When `None`, defaults to `(1, 0)`.
+    min_protocol_version: Option<(u8, u8)>,
 }
 
 #[pymethods]
@@ -276,11 +279,20 @@ impl PyContextParams {
         self.economic_policy.as_deref()
     }
 
+    /// Returns the minimum protocol version as `(major, minor)` tuple,
+    /// or `None` if no minimum is set (defaults to SCP/1.0, spec §13.4).
+    #[getter]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 getter cannot be const.
+    fn min_protocol_version(&self) -> Option<(u8, u8)> {
+        self.min_protocol_version
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
              memory_scope='{}', governance='{}', mode='{}', ceiling_policy='{}', \
-             promotion_policy='{}', template_id={:?}, economic_policy={:?})",
+             promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
+             min_protocol_version={:?})",
             self.ceiling,
             self.roles,
             self.tools,
@@ -292,6 +304,7 @@ impl PyContextParams {
             self.promotion_policy,
             self.template_id,
             self.economic_policy,
+            self.min_protocol_version,
         )
     }
 }
@@ -454,6 +467,16 @@ impl PyContextParams {
             None => None,
         };
 
+        // min_protocol_version: Optional[tuple[int, int]] (default: None) -- spec §13.4
+        let min_protocol_version: Option<(u8, u8)> = match dict.get_item("min_protocol_version")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let (major, minor): (u8, u8) = val.extract()?;
+                Some((major, minor))
+            }
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -466,6 +489,7 @@ impl PyContextParams {
             promotion_policy,
             template_id,
             economic_policy,
+            min_protocol_version,
         })
     }
 }
@@ -1409,6 +1433,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         participation_requirements: Vec::new(),
         incomplete_verification_policy:
             scp_core::context::params::IncompleteVerificationPolicy::default(),
+        min_protocol_version: py_params.min_protocol_version,
     }
 }
 
@@ -2404,6 +2429,7 @@ mod tests {
             promotion_policy: "no_promotion".to_owned(),
             template_id: None,
             economic_policy: None,
+            min_protocol_version: None,
         }
     }
 

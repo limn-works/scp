@@ -480,6 +480,14 @@ pub struct PublicMetadata {
     pub memory_scope: MemoryScope,
     /// The visibility policy itself (so prospective members know what's hidden).
     pub metadata_visibility: MetadataVisibilityPolicy,
+    /// Minimum protocol version required to join this context (spec §13.4).
+    ///
+    /// Encoded as `(major, minor)`, e.g., `(1, 0)` for SCP/1.0. Structural
+    /// field — always visible before joining so prospective members can
+    /// evaluate SDK compatibility. When `None`, defaults to `(1, 0)`.
+    #[serde(default)]
+    pub min_protocol_version: Option<(u8, u8)>,
+
     /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
     ///
     /// Bridge presence is always visible in context metadata before opt-in
@@ -698,6 +706,22 @@ pub struct ContextParams {
     /// See issue #365.
     #[serde(default)]
     pub incomplete_verification_policy: IncompleteVerificationPolicy,
+
+    /// Minimum protocol version required to join this context (spec §13.4).
+    ///
+    /// Encoded as `(major, minor)`, e.g., `(1, 0)` for SCP/1.0. When set,
+    /// the SDK MUST reject attempts to join a context whose
+    /// `min_protocol_version` exceeds the SDK's supported version. The check
+    /// is client-side — the SDK compares `min_protocol_version` against
+    /// [`SCP_PROTOCOL_VERSION`](crate::envelope::SCP_PROTOCOL_VERSION) and
+    /// refuses to join if incompatible.
+    ///
+    /// When `None`, defaults to `(1, 0)` — SCP/1.0 baseline.
+    ///
+    /// This field is visible in context structural metadata alongside the
+    /// capability ceiling and governance model (§5.7, §13.4).
+    #[serde(default)]
+    pub min_protocol_version: Option<(u8, u8)>,
 }
 
 impl Default for ContextParams {
@@ -721,11 +745,76 @@ impl Default for ContextParams {
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
+            min_protocol_version: None,
         }
     }
 }
 
+/// Decodes a packed `u16` protocol version (e.g., `0x0100`) into its
+/// `(major, minor)` components.
+#[must_use]
+pub const fn decode_protocol_version(packed: u16) -> (u8, u8) {
+    ((packed >> 8) as u8, (packed & 0xFF) as u8)
+}
+
+/// Encodes a `(major, minor)` pair into the packed `u16` wire format
+/// used by [`SCP_PROTOCOL_VERSION`](crate::envelope::SCP_PROTOCOL_VERSION).
+#[must_use]
+pub const fn encode_protocol_version(major: u8, minor: u8) -> u16 {
+    ((major as u16) << 8) | (minor as u16)
+}
+
 impl ContextParams {
+    /// Returns the effective minimum protocol version for this context.
+    ///
+    /// When `min_protocol_version` is `None`, returns `(1, 0)` — the SCP/1.0
+    /// baseline per spec §13.4.
+    #[must_use]
+    pub const fn effective_min_protocol_version(&self) -> (u8, u8) {
+        match self.min_protocol_version {
+            Some(v) => v,
+            None => (1, 0),
+        }
+    }
+
+    /// Checks whether the given SDK protocol version satisfies this context's
+    /// minimum protocol version requirement (spec §13.4).
+    ///
+    /// Returns `Ok(())` if the SDK version is >= the context's minimum, or
+    /// [`ContextError::VersionIncompatible`](super::ContextError::VersionIncompatible)
+    /// if the SDK version is too low.
+    ///
+    /// # Arguments
+    ///
+    /// * `sdk_version` — The SDK's protocol version as a packed `u16`
+    ///   (e.g., [`SCP_PROTOCOL_VERSION`](crate::envelope::SCP_PROTOCOL_VERSION)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::VersionIncompatible`](super::ContextError::VersionIncompatible)
+    /// when the SDK version does not meet the context's minimum requirement.
+    pub const fn check_version_compatibility(
+        &self,
+        sdk_version: u16,
+    ) -> Result<(), super::ContextError> {
+        let (req_major, req_minor) = self.effective_min_protocol_version();
+        let (sdk_major, sdk_minor) = decode_protocol_version(sdk_version);
+
+        // Exact major match is intentional: different major versions have
+        // incompatible wire formats per §13.1. This rejects both lower AND
+        // higher majors. Minor version must be >=.
+        if sdk_major != req_major || sdk_minor < req_minor {
+            return Err(super::ContextError::VersionIncompatible {
+                required_major: req_major,
+                required_minor: req_minor,
+                supported_major: sdk_major,
+                supported_minor: sdk_minor,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Return metadata filtered by the visibility policy (spec section 5.7).
     ///
     /// Structural fields are always included. Operational fields are included
@@ -752,6 +841,7 @@ impl ContextParams {
             promotion_policy: self.promotion_policy,
             memory_scope: self.memory_scope,
             metadata_visibility: self.metadata_visibility.clone(),
+            min_protocol_version: self.min_protocol_version,
             bridges: runtime.bridges.clone(),
             bridge_operator_dids: runtime.bridge_operator_dids.clone(),
 
@@ -869,6 +959,7 @@ mod tests {
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
+            min_protocol_version: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -986,6 +1077,7 @@ mod tests {
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
+            min_protocol_version: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1042,6 +1134,7 @@ mod tests {
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
+            min_protocol_version: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -1621,5 +1714,160 @@ mod tests {
         }"#;
         let params: ContextParams = serde_json::from_str(json).unwrap();
         assert!(params.participation_requirements.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Version negotiation (spec §13.4, issue #607)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_protocol_version_scp_1_0() {
+        let (major, minor) = decode_protocol_version(0x0100);
+        assert_eq!(major, 1);
+        assert_eq!(minor, 0);
+    }
+
+    #[test]
+    fn decode_protocol_version_scp_1_2() {
+        let (major, minor) = decode_protocol_version(0x0102);
+        assert_eq!(major, 1);
+        assert_eq!(minor, 2);
+    }
+
+    #[test]
+    fn encode_protocol_version_roundtrip() {
+        for major in [0u8, 1, 2, 255] {
+            for minor in [0u8, 1, 127, 255] {
+                let packed = encode_protocol_version(major, minor);
+                let (m, n) = decode_protocol_version(packed);
+                assert_eq!((m, n), (major, minor));
+            }
+        }
+    }
+
+    #[test]
+    fn context_params_default_min_protocol_version_is_none() {
+        let params = ContextParams::default();
+        assert!(params.min_protocol_version.is_none());
+    }
+
+    #[test]
+    fn effective_min_protocol_version_defaults_to_1_0() {
+        let params = ContextParams::default();
+        assert_eq!(params.effective_min_protocol_version(), (1, 0));
+    }
+
+    #[test]
+    fn effective_min_protocol_version_returns_set_value() {
+        let params = ContextParams {
+            min_protocol_version: Some((1, 2)),
+            ..ContextParams::default()
+        };
+        assert_eq!(params.effective_min_protocol_version(), (1, 2));
+    }
+
+    #[test]
+    fn check_version_compatibility_passes_for_matching_version() {
+        let params = ContextParams {
+            min_protocol_version: Some((1, 0)),
+            ..ContextParams::default()
+        };
+        assert!(params.check_version_compatibility(0x0100).is_ok());
+    }
+
+    #[test]
+    fn check_version_compatibility_passes_for_higher_minor_version() {
+        let params = ContextParams {
+            min_protocol_version: Some((1, 0)),
+            ..ContextParams::default()
+        };
+        // SDK version 1.2 meets context requirement of 1.0.
+        assert!(params.check_version_compatibility(0x0102).is_ok());
+    }
+
+    #[test]
+    fn check_version_compatibility_fails_for_lower_minor_version() {
+        let params = ContextParams {
+            min_protocol_version: Some((1, 2)),
+            ..ContextParams::default()
+        };
+        // SDK version 1.0 does not meet context requirement of 1.2.
+        let result = params.check_version_compatibility(0x0100);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("1.2"),
+            "error should mention required 1.2: {msg}"
+        );
+        assert!(
+            msg.contains("1.0"),
+            "error should mention supported 1.0: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_version_compatibility_fails_for_different_major_version() {
+        let params = ContextParams {
+            min_protocol_version: Some((2, 0)),
+            ..ContextParams::default()
+        };
+        // SDK version 1.0 does not meet context requirement of 2.0.
+        let result = params.check_version_compatibility(0x0100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_version_compatibility_none_defaults_to_1_0_and_passes() {
+        let params = ContextParams::default();
+        // SDK version 1.0 (0x0100) meets default requirement of 1.0.
+        assert!(params.check_version_compatibility(0x0100).is_ok());
+    }
+
+    #[test]
+    fn min_protocol_version_serialization_roundtrip() {
+        let params = ContextParams {
+            min_protocol_version: Some((1, 3)),
+            ..ContextParams::default()
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ContextParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.min_protocol_version, Some((1, 3)));
+    }
+
+    #[test]
+    fn min_protocol_version_backwards_compat_deserialization() {
+        // JSON without min_protocol_version field deserializes to None.
+        let json = r#"{
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": null,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": null
+        }"#;
+        let params: ContextParams = serde_json::from_str(json).unwrap();
+        assert!(params.min_protocol_version.is_none());
+    }
+
+    #[test]
+    fn public_metadata_includes_min_protocol_version() {
+        let params = ContextParams {
+            min_protocol_version: Some((1, 2)),
+            ..ContextParams::default()
+        };
+        let meta = params.public_metadata(&RuntimeMetadata::default());
+        assert_eq!(meta.min_protocol_version, Some((1, 2)));
+    }
+
+    #[test]
+    fn public_metadata_min_protocol_version_none_when_unset() {
+        let params = ContextParams::default();
+        let meta = params.public_metadata(&RuntimeMetadata::default());
+        assert!(meta.min_protocol_version.is_none());
     }
 }

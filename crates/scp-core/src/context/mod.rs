@@ -85,7 +85,8 @@ pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
     ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy, PublicMetadata,
-    RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration, decode_protocol_version,
+    encode_protocol_version,
 };
 pub use state_machine::transition;
 
@@ -353,6 +354,27 @@ pub enum ContextError {
     /// Context creation failed due to invalid parameters or internal error.
     #[error("creation failed: {0}")]
     CreationFailed(String),
+
+    /// The local SDK's protocol version does not meet the context's minimum
+    /// protocol version requirement (spec §13.4).
+    ///
+    /// The SDK MUST reject attempts to join a context whose
+    /// `min_protocol_version` exceeds the SDK's supported version. This is
+    /// enforced client-side during the join flow.
+    #[error(
+        "protocol version incompatible: context requires {required_major}.{required_minor}, \
+         SDK supports {supported_major}.{supported_minor}"
+    )]
+    VersionIncompatible {
+        /// The minimum major version the context requires.
+        required_major: u8,
+        /// The minimum minor version the context requires.
+        required_minor: u8,
+        /// The major version the SDK supports.
+        supported_major: u8,
+        /// The minor version the SDK supports.
+        supported_minor: u8,
+    },
 }
 
 // ---------------------------------------------------------------------------

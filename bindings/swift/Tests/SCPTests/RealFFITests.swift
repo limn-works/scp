@@ -85,14 +85,16 @@ private func makeTestParams(
     governance: GovernanceModel = .singleAdmin,
     memoryScope: MemoryScope = .full,
     ttlSeconds: UInt64 = 3600,
-    promotable: Bool = false
+    promotable: Bool = false,
+    minProtocolVersion: UInt16 = 0
 ) -> ContextParams {
     ContextParams(
         ceiling: ceiling,
         governance: governance,
         memoryScope: memoryScope,
         ttlSeconds: ttlSeconds,
-        promotable: promotable
+        promotable: promotable,
+        minProtocolVersion: minProtocolVersion
     )
 }
 

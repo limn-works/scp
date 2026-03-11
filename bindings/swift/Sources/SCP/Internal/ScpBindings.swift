@@ -2137,6 +2137,12 @@ public struct ContextParams {
      * Whether this context can be promoted from ephemeral to persistent.
      */
     public var promotable: Bool
+    /**
+     * Minimum protocol version required to join (spec §13.4).
+     * Encoded as `(major << 8) | minor`, e.g., `0x0100` for SCP/1.0.
+     * `0` means no minimum (defaults to SCP/1.0).
+     */
+    public var minProtocolVersion: UInt16
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2144,24 +2150,29 @@ public struct ContextParams {
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
          * Empty list means no ceiling restriction.
-         */ceiling: [String], 
+         */ceiling: [String],
         /**
          * Governance model for this context.
-         */governance: GovernanceModel, 
+         */governance: GovernanceModel,
         /**
          * Memory scope governing key destruction on close.
-         */memoryScope: MemoryScope, 
+         */memoryScope: MemoryScope,
         /**
          * Optional time-to-live in seconds (0 = no TTL).
-         */ttlSeconds: UInt64, 
+         */ttlSeconds: UInt64,
         /**
          * Whether this context can be promoted from ephemeral to persistent.
-         */promotable: Bool) {
+         */promotable: Bool,
+        /**
+         * Minimum protocol version required to join (spec §13.4).
+         * `0` means no minimum (defaults to SCP/1.0).
+         */minProtocolVersion: UInt16 = 0) {
         self.ceiling = ceiling
         self.governance = governance
         self.memoryScope = memoryScope
         self.ttlSeconds = ttlSeconds
         self.promotable = promotable
+        self.minProtocolVersion = minProtocolVersion
     }
 }
 
@@ -2187,6 +2198,9 @@ extension ContextParams: Equatable, Hashable {
         if lhs.promotable != rhs.promotable {
             return false
         }
+        if lhs.minProtocolVersion != rhs.minProtocolVersion {
+            return false
+        }
         return true
     }
 
@@ -2196,6 +2210,7 @@ extension ContextParams: Equatable, Hashable {
         hasher.combine(memoryScope)
         hasher.combine(ttlSeconds)
         hasher.combine(promotable)
+        hasher.combine(minProtocolVersion)
     }
 }
 
@@ -2208,11 +2223,12 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContextParams {
         return
             try ContextParams(
-                ceiling: FfiConverterSequenceString.read(from: &buf), 
-                governance: FfiConverterTypeGovernanceModel.read(from: &buf), 
-                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf), 
-                ttlSeconds: FfiConverterUInt64.read(from: &buf), 
-                promotable: FfiConverterBool.read(from: &buf)
+                ceiling: FfiConverterSequenceString.read(from: &buf),
+                governance: FfiConverterTypeGovernanceModel.read(from: &buf),
+                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf),
+                ttlSeconds: FfiConverterUInt64.read(from: &buf),
+                promotable: FfiConverterBool.read(from: &buf),
+                minProtocolVersion: FfiConverterUInt16.read(from: &buf)
         )
     }
 
@@ -2222,6 +2238,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         FfiConverterTypeMemoryScope.write(value.memoryScope, into: &buf)
         FfiConverterUInt64.write(value.ttlSeconds, into: &buf)
         FfiConverterBool.write(value.promotable, into: &buf)
+        FfiConverterUInt16.write(value.minProtocolVersion, into: &buf)
     }
 }
 

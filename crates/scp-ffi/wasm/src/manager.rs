@@ -34,6 +34,11 @@ use crate::runtime::{
     validate_value_against_schema, verify_inclusion,
 };
 
+/// SCP protocol version for WASM bridge (§13.2). Must match scp-core's
+/// `SCP_PROTOCOL_VERSION`. Encoded as `(major << 8) | minor`.
+/// SCP/1.0 = `0x0100` (decimal 256).
+const SCP_PROTOCOL_VERSION: u16 = 0x0100;
+
 /// Type alias for tool handler closures stored per-context.
 type ToolHandlerMap =
     HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>;
@@ -280,8 +285,9 @@ impl BroadcastState {
 struct PerContextState {
     /// Context lifecycle state.
     state: String,
-    /// Context creation parameters stored as JSON. Preserved for snapshot/restore.
-    #[allow(dead_code)]
+    /// Context creation parameters stored as JSON. Used for version compatibility
+    /// checks and snapshot/restore. `minProtocolVersion` is read from this field
+    /// during `join_context` and `subscribe_broadcast`.
     params_json: serde_json::Value,
     /// Creator DID.
     creator_did: String,
@@ -440,6 +446,63 @@ impl PerContextState {
             }
             _ => false,
         }
+    }
+
+    /// Checks that the SDK's protocol version is compatible with this context's
+    /// `minProtocolVersion` requirement (spec §13.4).
+    ///
+    /// Returns `Ok(())` if compatible (or if no minimum is set). Returns an
+    /// error if the context requires a higher protocol version than the SDK
+    /// supports, or if the major versions differ.
+    fn check_version_compatibility(&self) -> Result<(), ScpWasmError> {
+        let Some(min_ver) = self.params_json["minProtocolVersion"].as_array() else {
+            return Ok(());
+        };
+        if min_ver.len() < 2 {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "malformed minProtocolVersion: expected [major, minor] array with at \
+                     least 2 elements, got {min_ver:?}"
+                ),
+                code: "SCP-CTX-2015".to_owned(),
+            });
+        }
+        let raw_major = min_ver
+            .first()
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let req_major = u8::try_from(raw_major).map_err(|_| ScpWasmError::Context {
+            message: format!(
+                "malformed minProtocolVersion: major version {raw_major} exceeds u8 range"
+            ),
+            code: "SCP-CTX-2015".to_owned(),
+        })?;
+        let raw_minor = min_ver
+            .get(1)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let req_minor = u8::try_from(raw_minor).map_err(|_| ScpWasmError::Context {
+            message: format!(
+                "malformed minProtocolVersion: minor version {raw_minor} exceeds u8 range"
+            ),
+            code: "SCP-CTX-2015".to_owned(),
+        })?;
+        let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
+        let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
+
+        // Exact major match is intentional: different major versions have
+        // incompatible wire formats per §13.1. This rejects both lower AND
+        // higher majors.
+        if sdk_major != req_major || sdk_minor < req_minor {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "protocol version incompatible: context requires {req_major}.{req_minor}, \
+                     SDK supports {sdk_major}.{sdk_minor}"
+                ),
+                code: "SCP-CTX-2016".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -648,6 +711,10 @@ impl WasmContextManager {
     /// Returns an error if the context is not active.
     pub fn join_context(&mut self, context_id: &str, member_did: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        // Version compatibility check (spec §13.4): reject join if the
+        // context requires a protocol version higher than this SDK supports.
+        ctx.check_version_compatibility()?;
 
         if ctx.members.contains_key(member_did) {
             return Err(ScpWasmError::Context {
@@ -2277,6 +2344,11 @@ impl WasmContextManager {
         subscriber_did: &str,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        // Version compatibility check (spec §13.4): reject subscribe if the
+        // context requires a protocol version higher than this SDK supports.
+        // Applies to ALL context modes including broadcast.
+        ctx.check_version_compatibility()?;
 
         let bc = ctx
             .broadcast

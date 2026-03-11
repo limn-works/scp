@@ -2104,6 +2104,14 @@ impl ContextManager {
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
 
+            // Version compatibility check (spec §13.4): reject join if the
+            // context requires a protocol version higher than this SDK supports.
+            // Uses the stored context's params (not the caller's handle params)
+            // to ensure the check reflects the actual context configuration.
+            ctx.handle
+                .params()
+                .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+
             // Add member to role state.
             ctx.role_state.members.insert(member_did.to_string());
 
@@ -2533,6 +2541,13 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
             require_active(&ctx.handle)?;
+
+            // Version compatibility check (spec §13.4): reject subscribe if the
+            // context requires a protocol version higher than this SDK supports.
+            // Applies to ALL context modes including broadcast.
+            ctx.handle
+                .params()
+                .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
 
             let bc = ctx
                 .broadcast_context
