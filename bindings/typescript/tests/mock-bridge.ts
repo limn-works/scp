@@ -557,8 +557,8 @@ export function createMockBridge(): Bridge & {
       return null;
     },
 
-    async contextExtendTtl(_handle: BridgeContextHandle, _additionalSecs: number): Promise<void> {
-      // No-op in mock bridge
+    async contextExtendTtl(_handle: BridgeContextHandle, _additionalSecs: number): Promise<boolean> {
+      return true;
     },
 
     // Lifecycle
