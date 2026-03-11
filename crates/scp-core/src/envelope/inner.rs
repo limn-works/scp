@@ -401,7 +401,7 @@ pub fn enforce_inner_envelope_category_a(
 
 /// Validates that an inner envelope's version field is supported (§13.2.1).
 ///
-/// Currently only inner envelope version 1 is recognized. Call this after
+/// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
 /// deserialization to reject envelopes from incompatible protocol versions.
 ///
 /// # Errors
