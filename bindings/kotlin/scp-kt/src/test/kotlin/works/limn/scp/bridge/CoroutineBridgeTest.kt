@@ -451,6 +451,7 @@ class CoroutineBridgeTest {
         @Test
         fun `setEconomicPolicy then getEconomicPolicy roundtrip`() =
             runTest(ioDispatcher) {
+                @Suppress("MaxLineLength")
                 val policyJson =
                     """{"locked":false,"cost_schedule":{"currency":[85,83,68,0]},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"""
 

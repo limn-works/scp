@@ -593,6 +593,7 @@ struct ContextTests {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
+
     // MARK: - Economic policy roundtrip (#592)
 
     @Test("setEconomicPolicy + getEconomicPolicy roundtrip")
