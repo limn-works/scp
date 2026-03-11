@@ -67,10 +67,10 @@ where
 
 /// Governance action variants dispatchable through the `WasmContextManager`.
 ///
-/// Mirrors all 24 `GovernanceAction` variants from
+/// Mirrors all 28 `GovernanceAction` variants from
 /// `scp_core::context::governance::GovernanceAction`. WASM bridge functions
 /// serialize JS governance requests into this enum for dispatch.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WasmGovernanceAction {
     AddMember {
@@ -125,7 +125,7 @@ pub enum WasmGovernanceAction {
     },
     ResetMember {
         did: String,
-        reason: Option<String>,
+        reason: String,
     },
     ResolveConflict {
         proposal_a: String,
@@ -135,6 +135,7 @@ pub enum WasmGovernanceAction {
     PromoteContext,
     RevokeWriteAccess {
         did: String,
+        scope: String,
     },
     RestoreWriteAccess {
         did: String,
@@ -148,13 +149,45 @@ pub enum WasmGovernanceAction {
     },
     BlockAuthor {
         did: String,
+        reason: Option<String>,
     },
     RevokeReadAccess {
         did: String,
+        scope: String,
     },
     RestoreReadAccess {
         did: String,
     },
+    SetEconomicPolicy {
+        policy_json: String,
+    },
+    ApproveSpend {
+        spender: String,
+        amount: u64,
+        purpose: String,
+    },
+    LockEconomicPolicy,
+}
+
+/// Validates a revocation scope string.
+///
+/// Core's `RevocationScope` has two variants: `Full` and `FutureOnly`.
+/// The WASM bridge accepts these as lowercase `snake_case` strings.
+///
+/// # Errors
+///
+/// Returns `ScpWasmError::Validation` if the string is not `"full"` or
+/// `"future_only"`.
+fn validate_revocation_scope(scope: &str) -> Result<&str, ScpWasmError> {
+    match scope {
+        "full" | "future_only" => Ok(scope),
+        _ => Err(ScpWasmError::Validation {
+            message: format!(
+                "invalid revocation scope '{scope}': expected 'full' or 'future_only'"
+            ),
+            code: "SCP-VALID-7100".to_owned(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +328,19 @@ struct PerContextState {
     broadcast: Option<BroadcastState>,
     /// Stateful tool sessions (spec section 6.2.1).
     sessions: HashMap<String, WasmToolSession>,
+    /// Threshold governance signers (ADR-031 §4b).
+    threshold_signers: Vec<String>,
+    /// Current threshold value (ADR-031 §4b). `0` means threshold governance
+    /// is not configured.
+    threshold_value: u32,
+    /// Established tool interfaces (spec section 6.2).
+    tool_interfaces: Vec<String>,
+    /// Whether governance is frozen due to conflicting proposals (ADR-031 §7).
+    governance_freeze: bool,
+    /// Pruning policy JSON string (ADR-030 §6).
+    pruning_policy: Option<String>,
+    /// Whether the economic policy is locked (§19.3, ADR-033).
+    economic_policy_locked: bool,
 }
 
 /// A stateful tool session for the WASM bridge.
@@ -525,31 +571,7 @@ impl WasmContextManager {
             .unwrap_or("single_admin")
             .to_owned();
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
-
-        // Build default ceiling strings (matching scp-core ContextRoleState::new).
-        // Default ceiling strings must match scp-core's `Capability::Display`
-        // format exactly. scp-core uses `{resource}:{action}` (colon-separated),
-        // NOT `{resource}_{action}:*` (underscore + wildcard). Cross-bridge
-        // UCAN delegation breaks if formats differ (H5).
-        let ceiling_strings: HashSet<String> = if ceiling.is_empty() {
-            [
-                "messages:read",
-                "messages:write",
-                "tool:register",
-                "tool:invoke:*",
-                "role:assign",
-                "member:invite",
-                "member:remove",
-                "governance:propose",
-                "governance:vote",
-                "context:close",
-            ]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect()
-        } else {
-            ceiling.iter().cloned().collect()
-        };
+        let ceiling_strings = Self::build_ceiling_strings(&ceiling);
 
         // Initialize broadcast state for Broadcast mode.
         let broadcast = if mode == "Broadcast" {
@@ -596,6 +618,12 @@ impl WasmContextManager {
             read_exclusion_list: HashSet::new(),
             broadcast,
             sessions: HashMap::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            tool_interfaces: Vec::new(),
+            governance_freeze: false,
+            pruning_policy: None,
+            economic_policy_locked: false,
         };
 
         self.contexts.insert(context_id.to_owned(), per_context);
@@ -1542,7 +1570,10 @@ impl WasmContextManager {
             | WasmGovernanceAction::ModifyThreshold { .. }
             | WasmGovernanceAction::ResolveConflict { .. }
             | WasmGovernanceAction::RotateContentKeys { .. }
-            | WasmGovernanceAction::ReconfigureGovernance { .. } => "governance:propose",
+            | WasmGovernanceAction::ReconfigureGovernance { .. }
+            | WasmGovernanceAction::SetEconomicPolicy { .. }
+            | WasmGovernanceAction::ApproveSpend { .. }
+            | WasmGovernanceAction::LockEconomicPolicy => "governance:propose",
         }
     }
 
@@ -1675,13 +1706,10 @@ impl WasmContextManager {
             }
             WasmGovernanceAction::ChangeRole { did, new_role } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                let member = ctx
-                    .members
-                    .get_mut(did)
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: format!("member '{did}' not found"),
-                        code: "SCP-CTX-2015".to_owned(),
-                    })?;
+                let member = ctx.members.get_mut(did).ok_or_else(|| ScpWasmError::Context {
+                    message: format!("member '{did}' not found"),
+                    code: "SCP-CTX-2015".to_owned(),
+                })?;
                 new_role.clone_into(&mut member.role);
                 Ok(serde_json::json!({"action": "ChangeRole", "did": did, "newRole": new_role}))
             }
@@ -1723,7 +1751,26 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "ExtendTtl", "additionalSecs": additional_secs}))
             }
-            _ => self.dispatch_governance_action_ext(context_id, action),
+            WasmGovernanceAction::TransferAdmin { .. } // 20 remaining: exhaustive, no wildcard
+            | WasmGovernanceAction::RevokeWriteAccess { .. }
+            | WasmGovernanceAction::RestoreWriteAccess { .. }
+            | WasmGovernanceAction::BlockAuthor { .. }
+            | WasmGovernanceAction::RevokeReadAccess { .. }
+            | WasmGovernanceAction::RestoreReadAccess { .. }
+            | WasmGovernanceAction::PromoteContext
+            | WasmGovernanceAction::CreateChildContext { .. }
+            | WasmGovernanceAction::ModifyPruningPolicy { .. }
+            | WasmGovernanceAction::AddSigner { .. }
+            | WasmGovernanceAction::RemoveSigner { .. }
+            | WasmGovernanceAction::ModifyThreshold { .. }
+            | WasmGovernanceAction::EstablishToolInterface { .. }
+            | WasmGovernanceAction::ResetMember { .. }
+            | WasmGovernanceAction::ResolveConflict { .. }
+            | WasmGovernanceAction::RotateContentKeys { .. }
+            | WasmGovernanceAction::ReconfigureGovernance { .. }
+            | WasmGovernanceAction::SetEconomicPolicy { .. }
+            | WasmGovernanceAction::ApproveSpend { .. }
+            | WasmGovernanceAction::LockEconomicPolicy => self.dispatch_governance_action_ext(context_id, action),
         }
     }
 
@@ -1746,10 +1793,11 @@ impl WasmContextManager {
                 new_admin.clone_into(&mut ctx.creator_did);
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin}))
             }
-            WasmGovernanceAction::RevokeWriteAccess { did } => {
+            WasmGovernanceAction::RevokeWriteAccess { did, scope } => {
+                validate_revocation_scope(scope)?;
                 let ctx = self.require_active_context_mut(context_id)?;
                 ctx.write_revoked_members.insert(did.clone());
-                Ok(serde_json::json!({"action": "RevokeWriteAccess", "did": did}))
+                Ok(serde_json::json!({"action": "RevokeWriteAccess", "did": did, "scope": scope}))
             }
             WasmGovernanceAction::RestoreWriteAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1761,7 +1809,7 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "RestoreWriteAccess", "did": did}))
             }
-            WasmGovernanceAction::BlockAuthor { did } => {
+            WasmGovernanceAction::BlockAuthor { did, reason } => {
                 // CAC-008: BlockAuthor delegates to RevokeWriteAccess(Full).
                 // Destroy the author's broadcast key and mark write-revoked.
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1770,16 +1818,19 @@ impl WasmContextManager {
                 }
                 ctx.write_revoked_members.insert(did.clone());
                 ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
-                Ok(serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full"}))
+                Ok(
+                    serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "full", "reason": reason}),
+                )
             }
-            WasmGovernanceAction::RevokeReadAccess { did } => {
+            WasmGovernanceAction::RevokeReadAccess { did, scope } => {
+                validate_revocation_scope(scope)?;
                 let ctx = self.require_active_context_mut(context_id)?;
                 ctx.read_revoked_members.insert(did.clone());
                 if let Some(bc) = ctx.broadcast.as_mut() {
                     bc.subscribers.remove(did);
                     bc.blocked_subscribers.insert(did.clone());
                 }
-                Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did}))
+                Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did, "scope": scope}))
             }
             WasmGovernanceAction::RestoreReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1795,14 +1846,360 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "RestoreReadAccess", "did": did}))
             }
-            _ => {
-                // Remaining actions: PromoteContext, CreateChildContext, ModifyPruningPolicy,
-                // AddSigner, RemoveSigner, ModifyThreshold, EstablishToolInterface,
-                // ResetMember, ResolveConflict, RotateContentKeys, ReconfigureGovernance
-                let _ = self.require_active_context_mut(context_id)?;
-                Ok(serde_json::json!({"action": "executed"}))
+            // 8 variants handled by upstream dispatch method (exhaustive, no wildcard).
+            WasmGovernanceAction::AddMember { .. }
+            | WasmGovernanceAction::RemoveMember { .. }
+            | WasmGovernanceAction::ChangeRole { .. }
+            | WasmGovernanceAction::RegisterTool { .. }
+            | WasmGovernanceAction::RemoveTool { .. }
+            | WasmGovernanceAction::ModifyCeiling { .. }
+            | WasmGovernanceAction::CloseContext { .. }
+            | WasmGovernanceAction::ExtendTtl { .. } => unreachable!(),
+            // 14 variants handled by downstream dispatch methods.
+            WasmGovernanceAction::PromoteContext
+            | WasmGovernanceAction::CreateChildContext { .. }
+            | WasmGovernanceAction::ModifyPruningPolicy { .. }
+            | WasmGovernanceAction::AddSigner { .. }
+            | WasmGovernanceAction::RemoveSigner { .. }
+            | WasmGovernanceAction::ModifyThreshold { .. }
+            | WasmGovernanceAction::EstablishToolInterface { .. }
+            | WasmGovernanceAction::ResetMember { .. }
+            | WasmGovernanceAction::ResolveConflict { .. }
+            | WasmGovernanceAction::RotateContentKeys { .. }
+            | WasmGovernanceAction::ReconfigureGovernance { .. }
+            | WasmGovernanceAction::SetEconomicPolicy { .. }
+            | WasmGovernanceAction::ApproveSpend { .. }
+            | WasmGovernanceAction::LockEconomicPolicy => {
+                self.dispatch_governance_action_structural(context_id, action)
             }
         }
+    }
+
+    /// Handles structural, threshold, and economic governance actions.
+    ///
+    /// Split from `dispatch_governance_action_ext` to stay within the line
+    /// limit. Handles: `PromoteContext`, `CreateChildContext`,
+    /// `ModifyPruningPolicy`, `AddSigner`, `RemoveSigner`,
+    /// `ModifyThreshold`, and delegates remaining to
+    /// `dispatch_governance_action_remaining`.
+    fn dispatch_governance_action_structural(
+        &mut self,
+        context_id: &str,
+        action: &WasmGovernanceAction,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        match action {
+            WasmGovernanceAction::PromoteContext => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if ctx.promotion_policy.as_deref() != Some("Promotable") {
+                    return Err(ScpWasmError::Permission {
+                        message: "context promotion_policy is not Promotable".to_owned(),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                // Promote: cancel TTL (§5.10).
+                ctx.ttl_seconds = None;
+                Ok(serde_json::json!({"action": "PromoteContext"}))
+            }
+            WasmGovernanceAction::CreateChildContext { .. } => {
+                let _ = self.require_active_context_mut(context_id)?;
+                // Child context creation is delegated to create_context by the
+                // caller with the parent_context_id field set. This method
+                // records the governance event on the parent.
+                Ok(serde_json::json!({"action": "CreateChildContext"}))
+            }
+            WasmGovernanceAction::ModifyPruningPolicy { policy_json } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                ctx.pruning_policy = Some(policy_json.clone());
+                Ok(serde_json::json!({"action": "ModifyPruningPolicy"}))
+            }
+            WasmGovernanceAction::AddSigner { did } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if !ctx.members.contains_key(did) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("member '{did}' not found"),
+                        code: "SCP-CTX-2015".to_owned(),
+                    });
+                }
+                if ctx.threshold_signers.contains(did) {
+                    return Err(ScpWasmError::Permission {
+                        message: format!("DID is already a signer: {did}"),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                ctx.threshold_signers.push(did.clone());
+                Ok(serde_json::json!({"action": "AddSigner", "did": did}))
+            }
+            WasmGovernanceAction::RemoveSigner { did } => {
+                self.dispatch_remove_signer(context_id, did)
+            }
+            WasmGovernanceAction::ModifyThreshold { new_threshold } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                let signer_count = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                if *new_threshold == 0 || *new_threshold > signer_count {
+                    return Err(ScpWasmError::Permission {
+                        message: format!(
+                            "threshold must be 1..={signer_count}, got {new_threshold}"
+                        ),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                ctx.threshold_value = *new_threshold;
+                Ok(serde_json::json!({"action": "ModifyThreshold", "newThreshold": new_threshold}))
+            }
+            WasmGovernanceAction::AddMember { .. } // 14 upstream (exhaustive, no wildcard)
+            | WasmGovernanceAction::RemoveMember { .. }
+            | WasmGovernanceAction::ChangeRole { .. }
+            | WasmGovernanceAction::RegisterTool { .. }
+            | WasmGovernanceAction::RemoveTool { .. }
+            | WasmGovernanceAction::ModifyCeiling { .. }
+            | WasmGovernanceAction::CloseContext { .. }
+            | WasmGovernanceAction::ExtendTtl { .. }
+            | WasmGovernanceAction::TransferAdmin { .. }
+            | WasmGovernanceAction::RevokeWriteAccess { .. }
+            | WasmGovernanceAction::RestoreWriteAccess { .. }
+            | WasmGovernanceAction::BlockAuthor { .. }
+            | WasmGovernanceAction::RevokeReadAccess { .. }
+            | WasmGovernanceAction::RestoreReadAccess { .. } => unreachable!(),
+            WasmGovernanceAction::EstablishToolInterface { .. } // 8 downstream
+            | WasmGovernanceAction::ResetMember { .. }
+            | WasmGovernanceAction::ResolveConflict { .. }
+            | WasmGovernanceAction::RotateContentKeys { .. }
+            | WasmGovernanceAction::ReconfigureGovernance { .. }
+            | WasmGovernanceAction::SetEconomicPolicy { .. }
+            | WasmGovernanceAction::ApproveSpend { .. }
+            | WasmGovernanceAction::LockEconomicPolicy => {
+                self.dispatch_governance_action_remaining(context_id, action)
+            }
+        }
+    }
+
+    /// Handles remaining governance actions: `EstablishToolInterface`,
+    /// `ResetMember`, `ResolveConflict`, `RotateContentKeys`,
+    /// `ReconfigureGovernance`.
+    fn dispatch_governance_action_remaining(
+        &mut self,
+        context_id: &str,
+        action: &WasmGovernanceAction,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        match action {
+            WasmGovernanceAction::EstablishToolInterface { interface_json } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                ctx.tool_interfaces.push(interface_json.clone());
+                Ok(serde_json::json!({"action": "EstablishToolInterface"}))
+            }
+            WasmGovernanceAction::ResetMember { did, reason } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if !ctx.members.contains_key(did) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("member '{did}' not found"),
+                        code: "SCP-CTX-2015".to_owned(),
+                    });
+                }
+                // Member reset: remove + re-add with same role (ADR-029 §Tier 3).
+                let role = ctx
+                    .members
+                    .get(did)
+                    .map(|m| m.role.clone())
+                    .unwrap_or_default();
+                ctx.members.insert(
+                    did.clone(),
+                    MemberEntry {
+                        did: did.clone(),
+                        role,
+                        sequence_number: 0,
+                    },
+                );
+                Ok(serde_json::json!({"action": "ResetMember", "did": did, "reason": reason}))
+            }
+            WasmGovernanceAction::ResolveConflict {
+                proposal_a,
+                proposal_b,
+                resolution,
+            } => self.dispatch_resolve_conflict(context_id, proposal_a, proposal_b, resolution),
+            WasmGovernanceAction::RotateContentKeys { .. } => {
+                let _ = self.require_active_context_mut(context_id)?;
+                // Key rotation in WASM: no MLS backend — records event only.
+                // In broadcast mode, the event signals JS to re-derive keys.
+                Ok(serde_json::json!({"action": "RotateContentKeys"}))
+            }
+            WasmGovernanceAction::ReconfigureGovernance {
+                changes_json,
+                justification,
+            } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if changes_json.is_empty() {
+                    return Err(ScpWasmError::Permission {
+                        message: "reconfigure_governance requires at least one change".to_owned(),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                if justification.is_empty() {
+                    return Err(ScpWasmError::Permission {
+                        message: "deadlock justification must not be empty".to_owned(),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                // Clear governance freeze as the reconfiguration resolves it.
+                ctx.governance_freeze = false;
+                Ok(serde_json::json!({"action": "ReconfigureGovernance"}))
+            }
+            // 20 variants handled by upstream dispatch methods (exhaustive, no wildcard).
+            WasmGovernanceAction::AddMember { .. }
+            | WasmGovernanceAction::RemoveMember { .. }
+            | WasmGovernanceAction::ChangeRole { .. }
+            | WasmGovernanceAction::RegisterTool { .. }
+            | WasmGovernanceAction::RemoveTool { .. }
+            | WasmGovernanceAction::ModifyCeiling { .. }
+            | WasmGovernanceAction::CloseContext { .. }
+            | WasmGovernanceAction::ExtendTtl { .. }
+            | WasmGovernanceAction::TransferAdmin { .. }
+            | WasmGovernanceAction::RevokeWriteAccess { .. }
+            | WasmGovernanceAction::RestoreWriteAccess { .. }
+            | WasmGovernanceAction::BlockAuthor { .. }
+            | WasmGovernanceAction::RevokeReadAccess { .. }
+            | WasmGovernanceAction::RestoreReadAccess { .. }
+            | WasmGovernanceAction::PromoteContext
+            | WasmGovernanceAction::CreateChildContext { .. }
+            | WasmGovernanceAction::ModifyPruningPolicy { .. }
+            | WasmGovernanceAction::AddSigner { .. }
+            | WasmGovernanceAction::RemoveSigner { .. }
+            | WasmGovernanceAction::ModifyThreshold { .. } => unreachable!(),
+            // 3 variants handled by dispatch_governance_action_economic.
+            WasmGovernanceAction::SetEconomicPolicy { .. }
+            | WasmGovernanceAction::ApproveSpend { .. }
+            | WasmGovernanceAction::LockEconomicPolicy => {
+                self.dispatch_governance_action_economic(context_id, action)
+            }
+        }
+    }
+
+    /// Handles economic governance actions: `SetEconomicPolicy`,
+    /// `ApproveSpend`, `LockEconomicPolicy`.
+    fn dispatch_governance_action_economic(
+        &mut self,
+        context_id: &str,
+        action: &WasmGovernanceAction,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        match action {
+            WasmGovernanceAction::SetEconomicPolicy { policy_json } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if ctx.economic_policy_locked {
+                    return Err(ScpWasmError::Permission {
+                        message: "economic policy is locked and cannot be changed".to_owned(),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                ctx.economic_policy = Some(policy_json.clone());
+                Ok(serde_json::json!({"action": "SetEconomicPolicy"}))
+            }
+            WasmGovernanceAction::ApproveSpend {
+                spender,
+                amount,
+                purpose,
+            } => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if !ctx.members.contains_key(spender) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("spender '{spender}' is not a member"),
+                        code: "SCP-CTX-2015".to_owned(),
+                    });
+                }
+                Ok(serde_json::json!({
+                    "action": "ApproveSpend",
+                    "spender": spender,
+                    "amount": amount,
+                    "purpose": purpose,
+                }))
+            }
+            WasmGovernanceAction::LockEconomicPolicy => {
+                let ctx = self.require_active_context_mut(context_id)?;
+                if ctx.economic_policy.is_none() {
+                    return Err(ScpWasmError::Permission {
+                        message: "cannot lock economic policy: no policy is set".to_owned(),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                if ctx.economic_policy_locked {
+                    return Err(ScpWasmError::Permission {
+                        message: "economic policy is already locked".to_owned(),
+                        code: "SCP-PERM-3000".to_owned(),
+                    });
+                }
+                ctx.economic_policy_locked = true;
+                Ok(serde_json::json!({"action": "LockEconomicPolicy"}))
+            }
+            // 25 variants handled by upstream dispatch methods (exhaustive, no wildcard).
+            WasmGovernanceAction::AddMember { .. }
+            | WasmGovernanceAction::RemoveMember { .. }
+            | WasmGovernanceAction::ChangeRole { .. }
+            | WasmGovernanceAction::RegisterTool { .. }
+            | WasmGovernanceAction::RemoveTool { .. }
+            | WasmGovernanceAction::ModifyCeiling { .. }
+            | WasmGovernanceAction::CloseContext { .. }
+            | WasmGovernanceAction::ExtendTtl { .. }
+            | WasmGovernanceAction::TransferAdmin { .. }
+            | WasmGovernanceAction::RevokeWriteAccess { .. }
+            | WasmGovernanceAction::RestoreWriteAccess { .. }
+            | WasmGovernanceAction::BlockAuthor { .. }
+            | WasmGovernanceAction::RevokeReadAccess { .. }
+            | WasmGovernanceAction::RestoreReadAccess { .. }
+            | WasmGovernanceAction::PromoteContext
+            | WasmGovernanceAction::CreateChildContext { .. }
+            | WasmGovernanceAction::ModifyPruningPolicy { .. }
+            | WasmGovernanceAction::AddSigner { .. }
+            | WasmGovernanceAction::RemoveSigner { .. }
+            | WasmGovernanceAction::ModifyThreshold { .. }
+            | WasmGovernanceAction::EstablishToolInterface { .. }
+            | WasmGovernanceAction::ResetMember { .. }
+            | WasmGovernanceAction::ResolveConflict { .. }
+            | WasmGovernanceAction::RotateContentKeys { .. }
+            | WasmGovernanceAction::ReconfigureGovernance { .. } => unreachable!(),
+        }
+    }
+
+    /// Helper for `ResolveConflict` governance action.
+    ///
+    /// Validates the `resolution` value, then records conflicting proposals as
+    /// executed (invalidated). `resolution` must be `"invalidateBoth"` or one
+    /// of the two proposal IDs.
+    fn dispatch_resolve_conflict(
+        &mut self,
+        context_id: &str,
+        proposal_a: &str,
+        proposal_b: &str,
+        resolution: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        // Validate resolution value before mutating state.
+        let is_invalidate_both = resolution == "invalidateBoth";
+        let is_accept_proposal = resolution == proposal_a || resolution == proposal_b;
+        if !is_invalidate_both && !is_accept_proposal {
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "invalid resolution: must be 'invalidateBoth' or one of the proposal IDs, got '{resolution}'"
+                ),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        let ctx = self.require_active_context_mut(context_id)?;
+        // Clear governance freeze (ADR-031 §7).
+        ctx.governance_freeze = false;
+        // Record conflicting proposals as executed (invalidated).
+        let now = crate::time::now_ms();
+        if is_invalidate_both {
+            ctx.executed_proposals.insert(proposal_a.to_owned(), now);
+            ctx.executed_proposals.insert(proposal_b.to_owned(), now);
+        } else {
+            // AcceptProposal: resolution is the winner_id, loser is
+            // invalidated. The winner remains eligible for execution.
+            let loser = if resolution == proposal_a {
+                proposal_b
+            } else {
+                proposal_a
+            };
+            ctx.executed_proposals.insert(loser.to_owned(), now);
+        }
+        Ok(serde_json::json!({"action": "ResolveConflict"}))
     }
 
     /// Helper for `RegisterTool` governance action.
@@ -1830,6 +2227,39 @@ impl WasmContextManager {
                 code: "SCP-TOOL-6001".to_owned(),
             })?;
         Ok(serde_json::json!({"action": "RegisterTool", "toolId": tool_id}))
+    }
+
+    /// Helper for `RemoveSigner` governance action.
+    fn dispatch_remove_signer(
+        &mut self,
+        context_id: &str,
+        did: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        let before = ctx.threshold_signers.len();
+        ctx.threshold_signers.retain(|s| s != did);
+        if ctx.threshold_signers.len() == before {
+            return Err(ScpWasmError::Context {
+                message: format!("signer '{did}' not found"),
+                code: "SCP-CTX-2015".to_owned(),
+            });
+        }
+        // Reject if removing would make threshold > signers.len().
+        if ctx.threshold_value > 0 {
+            let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+            if ctx.threshold_value > remaining {
+                // Undo the removal.
+                ctx.threshold_signers.push(did.to_owned());
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "removing signer would leave {remaining} signers < threshold {}",
+                        ctx.threshold_value
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
+        }
+        Ok(serde_json::json!({"action": "RemoveSigner", "did": did}))
     }
 
     // -----------------------------------------------------------------------
@@ -2243,6 +2673,30 @@ impl WasmContextManager {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Builds the capability ceiling string set from explicit ceiling entries
+    /// or defaults matching scp-core's `Capability::Display` format (H5).
+    fn build_ceiling_strings(ceiling: &[String]) -> HashSet<String> {
+        if ceiling.is_empty() {
+            [
+                "messages:read",
+                "messages:write",
+                "tool:register",
+                "tool:invoke:*",
+                "role:assign",
+                "member:invite",
+                "member:remove",
+                "governance:propose",
+                "governance:vote",
+                "context:close",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+        } else {
+            ceiling.iter().cloned().collect()
+        }
+    }
+
     /// Returns a reference to context state, or an error if not found.
     fn require_context(&self, context_id: &str) -> Result<&PerContextState, ScpWasmError> {
         self.contexts
@@ -2357,6 +2811,12 @@ impl WasmContextManager {
             broadcast,
             revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
             seen_nonces: ctx.seen_nonces.keys().cloned().collect(),
+            threshold_signers: ctx.threshold_signers.clone(),
+            threshold_value: ctx.threshold_value,
+            tool_interfaces: ctx.tool_interfaces.clone(),
+            governance_freeze: ctx.governance_freeze,
+            pruning_policy: ctx.pruning_policy.clone(),
+            economic_policy_locked: ctx.economic_policy_locked,
         };
 
         // Serialize snapshot to canonical JSON for HMAC computation.
@@ -2538,6 +2998,12 @@ impl WasmContextManager {
             read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
             broadcast,
             sessions: HashMap::new(),
+            threshold_signers: snap.threshold_signers.clone(),
+            threshold_value: snap.threshold_value,
+            tool_interfaces: snap.tool_interfaces.clone(),
+            governance_freeze: snap.governance_freeze,
+            pruning_policy: snap.pruning_policy.clone(),
+            economic_policy_locked: snap.economic_policy_locked,
         };
 
         self.contexts.insert(context_id.clone(), ctx);
@@ -2630,6 +3096,24 @@ struct WasmContextExportSnapshot {
     /// export/import so that previously used nonces are still rejected.
     #[serde(default)]
     seen_nonces: Vec<String>,
+    /// Threshold governance signers (ADR-031 §4b).
+    #[serde(default)]
+    threshold_signers: Vec<String>,
+    /// Current threshold value (ADR-031 §4b).
+    #[serde(default)]
+    threshold_value: u32,
+    /// Established tool interface JSON strings (§6.2).
+    #[serde(default)]
+    tool_interfaces: Vec<String>,
+    /// Whether governance is frozen (ADR-031 §7).
+    #[serde(default)]
+    governance_freeze: bool,
+    /// Pruning policy JSON (ADR-030 §6).
+    #[serde(default)]
+    pruning_policy: Option<String>,
+    /// Whether the economic policy is locked (§19.3, ADR-033).
+    #[serde(default)]
+    economic_policy_locked: bool,
 }
 
 /// Serializable member entry for export.
@@ -2656,3 +3140,407 @@ struct WasmExportBroadcast {
 // `compute_event_hash` replaced by `WasmEventLog::append_event` which uses
 // the canonical hash format matching native `compute_event_canonical_hash`.
 // See `crate::runtime::compute_canonical_event_hash`.
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // WasmGovernanceAction serde roundtrip tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: serialize to JSON, deserialize back, and assert equal JSON.
+    fn roundtrip(action: &WasmGovernanceAction) {
+        let json = serde_json::to_string(action).unwrap();
+        let back: WasmGovernanceAction = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2, "roundtrip mismatch for {action:?}");
+    }
+
+    #[test]
+    fn serde_roundtrip_add_member() {
+        roundtrip(&WasmGovernanceAction::AddMember {
+            did: "did:dht:z123".to_owned(),
+            role: "admin".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_remove_member() {
+        roundtrip(&WasmGovernanceAction::RemoveMember {
+            did: "did:dht:z123".to_owned(),
+            reason: Some("inactive".to_owned()),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_change_role() {
+        roundtrip(&WasmGovernanceAction::ChangeRole {
+            did: "did:dht:z123".to_owned(),
+            new_role: "member".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_register_tool() {
+        roundtrip(&WasmGovernanceAction::RegisterTool {
+            tool_id: "tool-abc".to_owned(),
+            name: "my-tool".to_owned(),
+            description: "A test tool".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_remove_tool() {
+        roundtrip(&WasmGovernanceAction::RemoveTool {
+            tool_id: "tool-abc".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_modify_ceiling() {
+        roundtrip(&WasmGovernanceAction::ModifyCeiling {
+            new_ceiling: vec!["messages:read".to_owned(), "messages:write".to_owned()],
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_close_context() {
+        roundtrip(&WasmGovernanceAction::CloseContext {
+            reason: Some("done".to_owned()),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_extend_ttl() {
+        roundtrip(&WasmGovernanceAction::ExtendTtl {
+            additional_secs: 3600,
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_transfer_admin() {
+        roundtrip(&WasmGovernanceAction::TransferAdmin {
+            new_admin: "did:dht:zadmin".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_create_child_context() {
+        roundtrip(&WasmGovernanceAction::CreateChildContext {
+            params_json: r#"{"mode":"Encrypted"}"#.to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_modify_pruning_policy() {
+        roundtrip(&WasmGovernanceAction::ModifyPruningPolicy {
+            policy_json: r#"{"retention":"30d"}"#.to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_add_signer() {
+        roundtrip(&WasmGovernanceAction::AddSigner {
+            did: "did:dht:zsigner".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_remove_signer() {
+        roundtrip(&WasmGovernanceAction::RemoveSigner {
+            did: "did:dht:zsigner".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_modify_threshold() {
+        roundtrip(&WasmGovernanceAction::ModifyThreshold { new_threshold: 3 });
+    }
+
+    #[test]
+    fn serde_roundtrip_establish_tool_interface() {
+        roundtrip(&WasmGovernanceAction::EstablishToolInterface {
+            interface_json: r#"{"tool":"calc"}"#.to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_reset_member() {
+        roundtrip(&WasmGovernanceAction::ResetMember {
+            did: "did:dht:z123".to_owned(),
+            reason: "stale state".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_resolve_conflict() {
+        roundtrip(&WasmGovernanceAction::ResolveConflict {
+            proposal_a: "prop-1".to_owned(),
+            proposal_b: "prop-2".to_owned(),
+            resolution: "invalidateBoth".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_promote_context() {
+        roundtrip(&WasmGovernanceAction::PromoteContext);
+    }
+
+    #[test]
+    fn serde_roundtrip_revoke_write_access() {
+        roundtrip(&WasmGovernanceAction::RevokeWriteAccess {
+            did: "did:dht:z123".to_owned(),
+            scope: "full".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_restore_write_access() {
+        roundtrip(&WasmGovernanceAction::RestoreWriteAccess {
+            did: "did:dht:z123".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_rotate_content_keys() {
+        roundtrip(&WasmGovernanceAction::RotateContentKeys {
+            reason: Some("compromise".to_owned()),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_reconfigure_governance() {
+        roundtrip(&WasmGovernanceAction::ReconfigureGovernance {
+            changes_json: r#"[{"action":"reduceThreshold","value":2}]"#.to_owned(),
+            justification: "deadlock recovery".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_block_author() {
+        roundtrip(&WasmGovernanceAction::BlockAuthor {
+            did: "did:dht:zauthor".to_owned(),
+            reason: Some("spam".to_owned()),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_revoke_read_access() {
+        roundtrip(&WasmGovernanceAction::RevokeReadAccess {
+            did: "did:dht:z123".to_owned(),
+            scope: "future_only".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_restore_read_access() {
+        roundtrip(&WasmGovernanceAction::RestoreReadAccess {
+            did: "did:dht:z123".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_set_economic_policy() {
+        roundtrip(&WasmGovernanceAction::SetEconomicPolicy {
+            policy_json: r#"{"locked":false,"costSchedule":{}}"#.to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_approve_spend() {
+        roundtrip(&WasmGovernanceAction::ApproveSpend {
+            spender: "did:dht:zspender".to_owned(),
+            amount: 1000,
+            purpose: "compute resources".to_owned(),
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_lock_economic_policy() {
+        roundtrip(&WasmGovernanceAction::LockEconomicPolicy);
+    }
+
+    // -----------------------------------------------------------------------
+    // Variant count exhaustiveness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn governance_action_has_28_variants() {
+        // Ensure all 28 variants are covered by serializing each and counting
+        // unique "type" values.
+        let all: Vec<WasmGovernanceAction> = vec![
+            WasmGovernanceAction::AddMember {
+                did: "d".into(),
+                role: "r".into(),
+            },
+            WasmGovernanceAction::RemoveMember {
+                did: "d".into(),
+                reason: None,
+            },
+            WasmGovernanceAction::ChangeRole {
+                did: "d".into(),
+                new_role: "r".into(),
+            },
+            WasmGovernanceAction::RegisterTool {
+                tool_id: "t".into(),
+                name: "n".into(),
+                description: "d".into(),
+            },
+            WasmGovernanceAction::RemoveTool {
+                tool_id: "t".into(),
+            },
+            WasmGovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            WasmGovernanceAction::CloseContext { reason: None },
+            WasmGovernanceAction::ExtendTtl { additional_secs: 1 },
+            WasmGovernanceAction::TransferAdmin {
+                new_admin: "d".into(),
+            },
+            WasmGovernanceAction::CreateChildContext {
+                params_json: "{}".into(),
+            },
+            WasmGovernanceAction::ModifyPruningPolicy {
+                policy_json: "{}".into(),
+            },
+            WasmGovernanceAction::AddSigner { did: "d".into() },
+            WasmGovernanceAction::RemoveSigner { did: "d".into() },
+            WasmGovernanceAction::ModifyThreshold { new_threshold: 1 },
+            WasmGovernanceAction::EstablishToolInterface {
+                interface_json: "{}".into(),
+            },
+            WasmGovernanceAction::ResetMember {
+                did: "d".into(),
+                reason: "stale".into(),
+            },
+            WasmGovernanceAction::ResolveConflict {
+                proposal_a: "a".into(),
+                proposal_b: "b".into(),
+                resolution: "c".into(),
+            },
+            WasmGovernanceAction::PromoteContext,
+            WasmGovernanceAction::RevokeWriteAccess {
+                did: "d".into(),
+                scope: "full".into(),
+            },
+            WasmGovernanceAction::RestoreWriteAccess { did: "d".into() },
+            WasmGovernanceAction::RotateContentKeys { reason: None },
+            WasmGovernanceAction::ReconfigureGovernance {
+                changes_json: "[]".into(),
+                justification: "j".into(),
+            },
+            WasmGovernanceAction::BlockAuthor {
+                did: "d".into(),
+                reason: None,
+            },
+            WasmGovernanceAction::RevokeReadAccess {
+                did: "d".into(),
+                scope: "future_only".into(),
+            },
+            WasmGovernanceAction::RestoreReadAccess { did: "d".into() },
+            WasmGovernanceAction::SetEconomicPolicy {
+                policy_json: "{}".into(),
+            },
+            WasmGovernanceAction::ApproveSpend {
+                spender: "d".into(),
+                amount: 0,
+                purpose: "p".into(),
+            },
+            WasmGovernanceAction::LockEconomicPolicy,
+        ];
+        assert_eq!(all.len(), 28, "expected 28 governance action variants");
+
+        // Verify each serializes to unique "type" tag.
+        let types: std::collections::HashSet<String> = all
+            .iter()
+            .map(|a| {
+                let v: serde_json::Value = serde_json::to_value(a).unwrap();
+                v["type"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            types.len(),
+            28,
+            "expected 28 unique type tags, got {}: {types:?}",
+            types.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deserialization from JS-shaped JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deserialize_set_economic_policy_from_json() {
+        let json = r#"{"type":"setEconomicPolicy","policy_json":"flat-rate"}"#;
+        let action: WasmGovernanceAction = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            action,
+            WasmGovernanceAction::SetEconomicPolicy { ref policy_json }
+                if policy_json == "flat-rate"
+        ));
+    }
+
+    #[test]
+    fn deserialize_approve_spend_from_json() {
+        let json =
+            r#"{"type":"approveSpend","spender":"did:dht:z1","amount":500,"purpose":"infra"}"#;
+        let action: WasmGovernanceAction = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            action,
+            WasmGovernanceAction::ApproveSpend {
+                ref spender,
+                amount: 500,
+                ref purpose,
+            } if spender == "did:dht:z1" && purpose == "infra"
+        ));
+    }
+
+    #[test]
+    fn deserialize_lock_economic_policy_from_json() {
+        let json = r#"{"type":"lockEconomicPolicy"}"#;
+        let action: WasmGovernanceAction = serde_json::from_str(json).unwrap();
+        assert!(matches!(action, WasmGovernanceAction::LockEconomicPolicy));
+    }
+
+    // -----------------------------------------------------------------------
+    // ResolveConflict validation
+    // -----------------------------------------------------------------------
+
+    /// Invalid resolution values must be rejected before any state mutation.
+    /// This test runs on native (non-WASM) because the validation returns
+    /// early before calling `crate::time::now_ms()` (which requires WASM).
+    #[test]
+    fn resolve_conflict_invalid_resolution_rejected() {
+        let mut mgr = WasmContextManager::new();
+        // No context needed — validation rejects before accessing context state.
+        let err = mgr
+            .dispatch_resolve_conflict("ctx-1", "prop-a", "prop-b", "bogus-value")
+            .unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Permission { .. }),
+            "expected Permission error, got: {err:?}"
+        );
+        if let ScpWasmError::Permission {
+            ref message,
+            ref code,
+        } = err
+        {
+            assert!(
+                message.contains("invalid resolution"),
+                "unexpected message: {message}"
+            );
+            assert!(
+                message.contains("bogus-value"),
+                "message should include the bad value: {message}"
+            );
+            assert_eq!(code, "SCP-PERM-3000");
+        }
+    }
+}
