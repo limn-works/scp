@@ -193,7 +193,7 @@ async function enterChat(d){
   $('join').style.display='none';$('chat').style.display='flex';
   $('user-label').textContent=S.name;
   try{
-    const r=await fetch('/api/history');
+    const r=await fetch('/api/history?session_token='+encodeURIComponent(S.token));
     if(r.ok){const data=await r.json();if(data.messages)for(const m of data.messages)addMsg(m.sender_name,m.text,m.sender_did===S.did,m.timestamp)}
   }catch{}
   scrollBottom();
@@ -238,7 +238,7 @@ async function doPasskeySignIn(){
 
 function connectChat(){
   const proto=location.protocol==='https:'?'wss:':'ws:';
-  const url=`${proto}//${location.host}/ws/chat`;
+  const url=`${proto}//${location.host}/ws/chat?session_token=${encodeURIComponent(S.token)}`;
   status('Connecting...','');
   let ws;
   try{ws=new WebSocket(url);S.ws=ws}catch{status('Failed','err');return}

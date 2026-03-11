@@ -475,6 +475,8 @@ async fn chat_loop(
 
 /// Try decrypting with the peer's sender key at a range of sequence numbers.
 /// Returns the first successful decryption, or `None`.
+///
+// Demo-only: sequence window weakens replay protection. Production uses MLS ratcheting.
 fn try_decrypt_any_seq(
     sender_key: &SenderKey,
     ciphertext: &[u8],

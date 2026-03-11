@@ -8,7 +8,9 @@
 )]
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
 
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -70,15 +72,18 @@ const MAX_TEXT_LEN: usize = 4096;
 /// Maximum number of members allowed in the chat room. Each join creates a
 /// new DID (CPU-intensive crypto), so this caps resource consumption.
 const MAX_MEMBERS: usize = 50;
+/// Session tokens expire after 24 hours. Stale sessions are evicted on each
+/// new session creation and on periodic cleanup.
+const SESSION_TTL_SECS: u64 = 86_400;
 
-/// Derives a passphrase for `FileKeyCustody` from machine-specific entropy.
+/// Generates a passphrase for `FileKeyCustody` from machine-specific entropy.
 ///
 /// Priority:
 /// 1. `SCP_CHAT_PASSPHRASE` environment variable (if set).
 /// 2. SHA-256 of the canonical data-directory path concatenated with a random
 ///    salt stored in `<data_dir>/.passphrase_salt`. The salt is generated once
 ///    on first run and persisted alongside the identity.
-fn derive_passphrase(data_dir: &std::path::Path) -> String {
+fn generate_machine_secret(data_dir: &std::path::Path) -> String {
     // Allow explicit override via environment variable.
     if let Ok(val) = std::env::var("SCP_CHAT_PASSPHRASE")
         && !val.is_empty()
@@ -86,6 +91,9 @@ fn derive_passphrase(data_dir: &std::path::Path) -> String {
         return val;
     }
 
+    // The salt file is the entropy source — the path prefix is just a domain
+    // separator to bind the secret to this data directory. The 32-byte random
+    // salt is generated once on first run and persisted alongside the identity.
     let salt_path = data_dir.join(SALT_FILE_NAME);
     let salt = if salt_path.exists() {
         std::fs::read(&salt_path).expect("failed to read passphrase salt file")
@@ -93,7 +101,14 @@ fn derive_passphrase(data_dir: &std::path::Path) -> String {
         use rand::RngCore;
         let mut salt = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut salt);
-        std::fs::write(&salt_path, &salt).expect("failed to write passphrase salt file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&salt_path)
+            .and_then(|mut f| f.write_all(&salt))
+            .expect("failed to write passphrase salt file");
         salt
     };
 
@@ -256,18 +271,6 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn format_time(ts: u64) -> String {
-    // Convert unix timestamp to HH:MM local time via POSIX localtime_r.
-    // SAFETY: localtime_r is reentrant and writes to caller-provided buffer.
-    #[allow(unsafe_code)]
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let time_val = ts.cast_signed() as libc::time_t;
-        libc::localtime_r(&raw const time_val, &raw mut tm);
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SDK persistence helpers
 // ---------------------------------------------------------------------------
@@ -351,6 +354,7 @@ struct Member {
 struct SessionInfo {
     did: String,
     name: String,
+    created_at: u64,
 }
 
 struct ChatRoom {
@@ -454,13 +458,44 @@ impl ChatRoom {
 
     /// Generates a cryptographically random session token, stores it in the
     /// sessions map, and returns the hex-encoded token string.
+    ///
+    /// Invalidates any previous sessions for the same DID and evicts sessions
+    /// older than `SESSION_TTL_SECS` (24 h).
     async fn create_session(&self, did: String, name: String) -> String {
         let mut bytes = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
+        let now = now_unix();
         let mut sessions = self.sessions.write().await;
-        sessions.insert(token.clone(), SessionInfo { did, name });
+        // Invalidate previous sessions for the same DID.
+        sessions.retain(|_, s| s.did != did);
+        // Evict expired sessions (24 h TTL).
+        sessions.retain(|_, s| now.saturating_sub(s.created_at) < SESSION_TTL_SECS);
+        sessions.insert(
+            token.clone(),
+            SessionInfo {
+                did,
+                name,
+                created_at: now,
+            },
+        );
         token
+    }
+
+    /// Validates a session token: checks existence and TTL.
+    /// Returns a clone of the `SessionInfo` if valid, `None` otherwise.
+    async fn validate_session(&self, token: &str) -> Option<SessionInfo> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(token)?;
+        let now = now_unix();
+        if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
+            return None;
+        }
+        Some(SessionInfo {
+            did: session.did.clone(),
+            name: session.name.clone(),
+            created_at: session.created_at,
+        })
     }
 
     /// Persists app-level member metadata to storage.
@@ -635,7 +670,7 @@ async fn main() {
     // storage. Key handles index into the FileKeyCustody keyring which is
     // persisted in keys.enc. On first run, create a new identity and persist it.
     let keys_path = dir.join("keys.enc");
-    let passphrase = derive_passphrase(&dir);
+    let passphrase = generate_machine_secret(&dir);
 
     let custody = Arc::new(
         FileKeyCustody::new(&keys_path, &passphrase)
@@ -1342,14 +1377,40 @@ async fn handle_passkey_auth(
     (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
 }
 
-async fn handle_members(State(room): State<Arc<ChatRoom>>) -> impl IntoResponse {
-    let members = room.members_snapshot().await;
-    Json(serde_json::json!({"members": members}))
+/// Query parameter for session token authentication on GET endpoints.
+#[derive(Deserialize)]
+struct SessionTokenQuery {
+    session_token: String,
 }
 
-async fn handle_history(State(room): State<Arc<ChatRoom>>) -> impl IntoResponse {
+async fn handle_members(
+    State(room): State<Arc<ChatRoom>>,
+    Query(query): Query<SessionTokenQuery>,
+) -> impl IntoResponse {
+    if room.validate_session(&query.session_token).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or expired session token"})),
+        )
+            .into_response();
+    }
+    let members = room.members_snapshot().await;
+    Json(serde_json::json!({"members": members})).into_response()
+}
+
+async fn handle_history(
+    State(room): State<Arc<ChatRoom>>,
+    Query(query): Query<SessionTokenQuery>,
+) -> impl IntoResponse {
+    if room.validate_session(&query.session_token).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or expired session token"})),
+        )
+            .into_response();
+    }
     let messages = room.messages.read().await;
-    Json(serde_json::json!({"messages": *messages}))
+    Json(serde_json::json!({"messages": *messages})).into_response()
 }
 
 async fn handle_send(
@@ -1367,8 +1428,7 @@ async fn handle_send(
 
     // Resolve the sender identity from the session token. This prevents
     // sender DID spoofing — the client never supplies its own DID/name.
-    let sessions = room.sessions.read().await;
-    let Some(session) = sessions.get(&req.session_token) else {
+    let Some(session) = room.validate_session(&req.session_token).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid or expired session token"})),
@@ -1377,7 +1437,6 @@ async fn handle_send(
     };
     let sender_did = session.did.clone();
     let sender_name = session.name.clone();
-    drop(sessions);
 
     // Verify the sender is still a member.
     if !room.manager.is_member(&room.context_id, &sender_did).await {
@@ -1402,9 +1461,20 @@ async fn handle_send(
 
 async fn handle_ws_upgrade(
     State(room): State<Arc<ChatRoom>>,
+    Query(query): Query<SessionTokenQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // Validate session token before upgrading. Reject unauthenticated
+    // WebSocket connections before subscribing to the broadcast channel.
+    if room.validate_session(&query.session_token).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or expired session token"})),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws_connection(socket, room))
+        .into_response()
 }
 
 async fn handle_ws_connection(socket: WebSocket, room: Arc<ChatRoom>) {

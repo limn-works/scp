@@ -6970,7 +6970,7 @@
       "details": {
         "stubADR": true,
         "note": "ADR not yet fully written — story derived from expected approach and known constraints",
-        "approachDirection": "Last-writer-wins for metadata, Merkle tree for event ordering, governance deadlock = context fork",
+        "approachDirection": "First-writer-wins for metadata (lower Merkle leaf index wins), Merkle tree for event ordering, governance deadlock = context fork",
         "openQuestions": [
           "Conflict resolution for concurrent offline governance changes (two admins both offline, both propose role changes)"
         ],
