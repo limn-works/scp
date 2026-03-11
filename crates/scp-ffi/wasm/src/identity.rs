@@ -791,18 +791,35 @@ pub fn identity_resolve(did: String) -> Promise {
             .map_or_else(
                 || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
                 |(pub_bytes, agent_pub_bytes)| {
-                    // Build verification methods for ALL keys in the identity.
-                    let multibase_key = format!("z{}", zbase32_encode(&pub_bytes));
+                    // Build verification methods for ALL keys in the identity
+                    // per ADR-039: #0 (Identity Key), #active (Active Signing
+                    // Key), and optionally #agent (Agent Signing Key).
+                    let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+
+                    // #0 — Identity Key (DID-deriving key, never rotates).
                     let mut vms = vec![serde_json::json!({
                         "id": format!("{did}#0"),
                         "type": "Ed25519VerificationKey2020",
                         "controller": did,
-                        "publicKeyMultibase": multibase_key,
+                        "publicKeyMultibase": identity_multibase,
                     })];
-                    let mut auth = vec![serde_json::json!(format!("{did}#0"))];
-                    let mut assertion = vec![serde_json::json!(format!("{did}#0"))];
 
-                    // Include the #agent verification method if present (ADR-039).
+                    // #active — Active Signing Key (Human Signing Key). In the
+                    // WASM bridge's simplified key model, the active signing key
+                    // uses the same keypair as the identity key. Authentication
+                    // and assertionMethod reference #active (not #0), matching
+                    // the scp-core DidDocument pattern.
+                    vms.push(serde_json::json!({
+                        "id": format!("{did}#active"),
+                        "type": "Ed25519VerificationKey2020",
+                        "controller": did,
+                        "publicKeyMultibase": identity_multibase,
+                    }));
+
+                    let mut auth = vec![serde_json::json!(format!("{did}#active"))];
+                    let mut assertion = vec![serde_json::json!(format!("{did}#active"))];
+
+                    // #agent — Agent Signing Key (ADR-039), included when present.
                     if let Some(agent_bytes) = agent_pub_bytes {
                         let agent_multibase = format!("z{}", zbase32_encode(&agent_bytes));
                         vms.push(serde_json::json!({
@@ -826,11 +843,24 @@ pub fn identity_resolve(did: String) -> Promise {
                 },
             );
 
+        // Populate alsoKnownAs from MIGRATION_LINKS — after identity_migrate
+        // or identity_rotate_key, the new DID maps to the old DID (#540).
+        let also_known_as_json = MIGRATION_LINKS.with(|links| {
+            let map = links.borrow();
+            map.get(&did).map_or_else(
+                || "[]".to_owned(),
+                |old_did| {
+                    let arr = serde_json::Value::Array(vec![serde_json::json!(old_did)]);
+                    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned())
+                },
+            )
+        });
+
         Ok(JsValue::from(WasmDIDDocument::from_fields(
             did,
             verification_methods_json,
             "[]".to_owned(),
-            "[]".to_owned(),
+            also_known_as_json,
             authentication_json,
             assertion_methods_json,
         )))
