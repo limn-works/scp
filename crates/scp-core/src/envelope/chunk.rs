@@ -55,7 +55,7 @@ pub const MAX_TOTAL_CHUNKS: u32 = 262_144;
 /// # Fields
 ///
 /// - `message_id` — A unique identifier for the complete message, shared by
-///   all chunks. Derived as `SHA-256(full_payload || sender_did || timestamp)`
+///   all chunks. Derived as `SHA-256("SCP-CHUNK-MSG-ID-V1:" || BE32(len(payload)) || payload || BE32(len(sender_did)) || sender_did || BE64(timestamp))`
 ///   to ensure uniqueness without requiring coordination.
 /// - `chunk_index` — Zero-based position of this chunk in the sequence.
 /// - `total_chunks` — Total number of chunks in the complete message.
@@ -99,7 +99,7 @@ pub struct ChunkEnvelope {
 ///
 /// Each chunk carries at most [`MAX_CHUNK_PAYLOAD_SIZE`] bytes of payload data.
 /// The `message_id` is derived as
-/// `SHA-256("SCP-CHUNK-V1:" || LE32(payload.len) || payload || LE32(did.len) || sender_did || BE64(timestamp))`
+/// `SHA-256("SCP-CHUNK-MSG-ID-V1:" || BE32(payload.len) || payload || BE32(did.len) || sender_did || BE64(timestamp))`
 /// using length-prefixed, domain-separated hashing to provide a unique,
 /// deterministic identifier without coordination or field-collision ambiguity.
 ///
@@ -126,16 +126,16 @@ pub fn split_into_chunks(
     // Derive message_id with length-prefixed fields for unambiguous domain
     // separation. Without length prefixes, payload="ab" + did="cd" collides
     // with payload="abc" + did="d".
-    // Format: SHA-256("SCP-CHUNK-V1:" || LE32(payload.len) || payload
-    //                  || LE32(did.len) || sender_did || BE64(timestamp))
+    // Format: SHA-256("SCP-CHUNK-MSG-ID-V1:" || BE32(payload.len) || payload
+    //                  || BE32(did.len) || sender_did || BE64(timestamp))
     let message_id: [u8; 32] = {
         let mut hasher = Sha256::new();
-        hasher.update(b"SCP-CHUNK-V1:");
+        hasher.update(b"SCP-CHUNK-MSG-ID-V1:");
         #[allow(clippy::cast_possible_truncation)]
-        hasher.update((payload.len() as u32).to_le_bytes());
+        hasher.update((payload.len() as u32).to_be_bytes());
         hasher.update(payload);
         #[allow(clippy::cast_possible_truncation)]
-        hasher.update((sender_did.len() as u32).to_le_bytes());
+        hasher.update((sender_did.len() as u32).to_be_bytes());
         hasher.update(sender_did.as_bytes());
         hasher.update(timestamp.to_be_bytes());
         hasher.finalize().into()
