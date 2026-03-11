@@ -210,38 +210,38 @@ async fn mls_destroy_group() {
 
 #[tokio::test]
 async fn mls_forward_secrecy() {
-    // Verify that old epoch material is discarded after max_past_epochs+1 advances.
-    // max_past_epochs=2 (SCP default), so epoch 0 material should be gone after
-    // 3 epoch advances.
+    use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
+    use scp_core::crypto::mls::ratchet::{process_commit, serialize_commit};
 
-    // Create Alice's group and add Bob so we have a 2-member group for encrypt/decrypt.
+    // Forward secrecy: ciphertext from epoch N must be undecryptable after
+    // max_past_epochs+1 epoch advances discard the key material.
+    // max_past_epochs=2 (SCP default).
+
+    // Step 1: Create a 2-member group (Alice + Bob).
     let alice_cred =
         ScpCredential::new("did:dht:z6MkAliceFS".to_owned(), None, SigningKeyId::Active).unwrap();
     let bob_cred =
         ScpCredential::new("did:dht:z6MkBobFS".to_owned(), None, SigningKeyId::Active).unwrap();
 
     let mut alice_group = create_group(&alice_cred).unwrap();
-    assert_eq!(alice_group.epoch().unwrap(), 0);
-
     let (bob_kpb, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
     let bob_kp_bytes = bob_kpb.key_package().tls_serialize_detached().unwrap();
     let bob_kp_in = KeyPackageIn::tls_deserialize(&mut bob_kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, bob_kp_in).unwrap();
-
-    // Bob joins from Welcome.
     let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
     assert_eq!(alice_group.epoch().unwrap(), 1);
     assert_eq!(bob_group.epoch().unwrap(), 1);
 
-    // Encrypt a message at epoch 1 — Bob should be able to decrypt it now.
+    // Step 2: Encrypt at epoch 1. Bob can decrypt — proves the group works.
     let plaintext = b"epoch 1 secret";
     let ct = encrypt(&mut alice_group, plaintext).unwrap();
-    let ct_bytes = serialize_ciphertext(&ct).unwrap();
-    let decrypted = decrypt(&mut bob_group, &ct_bytes).unwrap();
+    let epoch1_ct_bytes = serialize_ciphertext(&ct).unwrap();
+    let decrypted = decrypt(&mut bob_group, &epoch1_ct_bytes).unwrap();
     assert_eq!(decrypted.as_slice(), plaintext);
 
-    // Advance epochs by adding/removing members 3 more times (epoch 1→2→3→4).
-    // With max_past_epochs=2, epoch 1 material should be gone after reaching epoch 4.
+    // Step 3: Advance BOTH groups past max_past_epochs (2) via add_member.
+    // Each add_member on Alice produces a Commit; Bob processes it to stay in sync.
+    let mut bob_grace = EpochGraceStore::new();
     for i in 0..3 {
         let temp_cred =
             ScpCredential::new(format!("did:dht:z6MkTempFS{i}"), None, SigningKeyId::Active)
@@ -249,12 +249,25 @@ async fn mls_forward_secrecy() {
         let (temp_kpb, _signer, _provider) = generate_key_package(&temp_cred).unwrap();
         let kp_bytes = temp_kpb.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
-        add_member(&mut alice_group, kp_in).unwrap();
+        let result = add_member(&mut alice_group, kp_in).unwrap();
+
+        // Bob processes Alice's Commit to advance his epoch too.
+        let commit_bytes = serialize_commit(&result.commit).unwrap();
+        process_commit(&mut bob_group, &commit_bytes, &mut bob_grace).unwrap();
     }
 
+    // Both groups are now at epoch 4. With max_past_epochs=2, epoch 1 material
+    // should have been discarded by OpenMLS.
+    assert!(alice_group.epoch().unwrap() >= 4);
+    assert!(bob_group.epoch().unwrap() >= 4);
+
+    // Step 4: Attempt to decrypt the epoch-1 ciphertext with Bob's advanced group.
+    // This MUST fail — if it succeeds, forward secrecy is broken.
+    let replay_result = decrypt(&mut bob_group, &epoch1_ct_bytes);
     assert!(
-        alice_group.epoch().unwrap() >= 4,
-        "epoch should be >= 4 after 3 more adds"
+        replay_result.is_err(),
+        "forward secrecy violated: epoch 1 ciphertext was decryptable at epoch {}",
+        bob_group.epoch().unwrap()
     );
 }
 
