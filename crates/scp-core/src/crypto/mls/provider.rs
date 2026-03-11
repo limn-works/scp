@@ -27,7 +27,7 @@ use openmls_traits::OpenMlsProvider;
 use scp_identity::SigningKeyId;
 use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::credential::ScpCredential;
 use super::encrypt::{encrypt, serialize_ciphertext};
@@ -56,11 +56,33 @@ use crate::crypto::sender_keys::{
 /// re-injected into a fresh `MemoryStorage` and the `MlsGroup` is
 /// reconstructed via `MlsGroup::load`.
 ///
-/// # Security
+/// # Security — Sensitive Key Material
 ///
-/// This snapshot contains cryptographic key material (sender keys, MLS
-/// epoch secrets). It MUST be stored encrypted at rest (§17.5) and
-/// destroyed on context close/expiry per the memory scope policy.
+/// **This struct contains raw private key material:**
+///
+/// - `signer_bytes` — Ed25519 private signing key (MLS credential signer)
+/// - `local_sender_key` — AES-256 sender key (per-context message encryption)
+/// - `wrapping_secret_key` — X25519 secret key (HPKE-sealed sender key decryption)
+/// - `mls_storage_entries` — `OpenMLS` `MemoryStorage` dump, which includes MLS
+///   epoch secrets, HPKE private keys, and the key schedule
+///
+/// **Why self-encryption is not feasible:** Encrypting the snapshot before
+/// returning from `export_crypto_state` creates a circular dependency — the
+/// encryption key would need to be stored outside the snapshot or derived
+/// from material inside it (defeating the purpose). This is the same trust
+/// model used by `OpenMLS` itself, which stores MLS `KeyPackage` private
+/// keys in its `StorageProvider` backend in plaintext.
+///
+/// **Storage layer requirements:** The `Storage` backend that persists this
+/// blob MUST provide encryption at rest (§17.5). Platform implementations
+/// (Keychain on iOS/macOS, Android Keystore, OS-level encrypted storage)
+/// satisfy this. In-memory storage used in tests is acceptable because no
+/// persistence occurs.
+///
+/// **Defense in depth:** `export_crypto_state` and `restore_crypto_state`
+/// zeroize the intermediate `MlsCryptoSnapshot` struct after
+/// serialization/extraction to minimize the window where private keys
+/// exist as a structured, easily-extractable object in memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MlsCryptoSnapshot {
     /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
@@ -789,7 +811,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
 
-        let snapshot = MlsCryptoSnapshot {
+        let mut snapshot = MlsCryptoSnapshot {
             mls_storage_entries,
             local_sender_key: state.sender_key.clone(),
             sender_key_entries,
@@ -805,8 +827,24 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             wrapping_secret_key: secret_key_guard.to_vec(),
         };
 
-        rmp_serde::to_vec_named(&snapshot)
-            .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")))
+        let result = rmp_serde::to_vec_named(&snapshot)
+            .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")));
+
+        // SECURITY: Zeroize sensitive key material in the intermediate snapshot
+        // to minimize the window where private keys exist as structured data in
+        // memory. The serialized blob is the caller's responsibility (Storage
+        // layer must encrypt at rest per §17.5).
+        snapshot.signer_bytes.zeroize();
+        snapshot.local_sender_key.zeroize();
+        snapshot.wrapping_secret_key.zeroize();
+        for (_, value) in &mut snapshot.mls_storage_entries {
+            value.zeroize();
+        }
+        for (_, key) in &mut snapshot.sender_key_entries {
+            key.zeroize();
+        }
+
+        result
     }
 
     fn restore_crypto_state(&self, context_id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
@@ -814,7 +852,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             return Ok(());
         }
 
-        let snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
         // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
@@ -824,14 +862,21 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 provider.storage().values.write().map_err(|e| {
                     ContextError::CryptoFailed(format!("storage lock poisoned: {e}"))
                 })?;
-            for (k, v) in snapshot.mls_storage_entries {
+            // Drain entries so the snapshot no longer holds MLS storage data
+            // (which contains epoch secrets and HPKE private keys).
+            for (k, v) in snapshot.mls_storage_entries.drain(..) {
                 values.insert(k, v);
             }
         }
 
-        // Deserialize the signer.
+        // Deserialize the signer from the snapshot's raw bytes.
         let signer: SignatureKeyPair = rmp_serde::from_slice(&snapshot.signer_bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("signer deserialization: {e}")))?;
+
+        // SECURITY: Zeroize the raw signer bytes now that they've been
+        // deserialized — the Ed25519 private key should not linger in this
+        // intermediate buffer.
+        snapshot.signer_bytes.zeroize();
 
         // Re-store the signer in the provider's key store so OpenMLS can find it.
         signer
@@ -849,16 +894,17 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 )
             })?;
 
-        // Reconstruct SenderKeyStore.
+        // Reconstruct SenderKeyStore. drain() moves keys out and clears the
+        // snapshot's copy.
         let ctx_id_hex = hex::encode(context_id);
         let mut sender_key_store = SenderKeyStore::new();
-        for (did, key) in snapshot.sender_key_entries {
+        for (did, key) in snapshot.sender_key_entries.drain(..) {
             sender_key_store.set(&ctx_id_hex, &did, key);
         }
 
         // Reconstruct member wrapping keys.
         let member_wrapping_keys: HashMap<String, [u8; 32]> =
-            snapshot.member_wrapping_keys.into_iter().collect();
+            snapshot.member_wrapping_keys.drain(..).collect();
 
         let scp_group = ScpMlsGroup {
             group: Some(mls_group),
@@ -867,9 +913,17 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             destroyed: false,
         };
 
+        // Take the local_sender_key and leave a zeroed placeholder. SenderKey
+        // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
+        // drops, and the original is moved into crypto_state.
+        let local_sender_key = std::mem::replace(
+            &mut snapshot.local_sender_key,
+            SenderKey::from_bytes([0u8; 32]),
+        );
+
         let crypto_state = ContextCryptoState {
             mls_group: scp_group,
-            sender_key: snapshot.local_sender_key,
+            sender_key: local_sender_key,
             sender_key_store,
             sender_key_epoch: snapshot.sender_key_epoch,
             pending_distributions: Vec::new(),
@@ -906,6 +960,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             })?;
             *secret_guard = Zeroizing::new(secret);
         }
+
+        // SECURITY: Zeroize the wrapping secret key bytes remaining in the
+        // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
+        // above (or skipped for legacy snapshots), so this intermediate Vec
+        // should not retain raw X25519 secret key material.
+        snapshot.wrapping_secret_key.zeroize();
 
         Ok(())
     }
