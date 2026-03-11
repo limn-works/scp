@@ -940,6 +940,15 @@ export function createWasmBridge(): Bridge {
       // WASM bridge uses f64 for existing_chain_depth (-1 means first hop)
       // and a separate existing_chain_path_json parameter.
       const depth = existingChainDepth !== undefined ? existingChainDepth : -1;
+      // counterpartyPolicy is intentionally not forwarded to the WASM bridge.
+      // The WASM bridge re-implements provenance locally (no scp-core dependency
+      // per ADR-034) and its provenance_attach Rust export does not accept a
+      // counterpartyPolicy parameter. The counterparty list is still included
+      // in the record (via the members/counterparties_json param); only the
+      // *policy* controlling how counterparties are represented (full /
+      // pseudonymized / redacted) is unavailable in the WASM path. Callers
+      // needing counterpartyPolicy support should use the native (napi-rs)
+      // bridge.
       return wasm.provenance_attach(
         sourceContextId,
         sourceType,

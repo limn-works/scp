@@ -261,6 +261,17 @@ pub fn evaluate_provenance_quality(
 /// - `discovery_method` — Optional: `"none"`, `"shared_context:<id>"`, or `"registry:<id>"`.
 /// - `purpose` — Optional human-readable purpose description.
 ///
+/// # WASM limitation: no `counterparty_policy`
+///
+/// The native (napi-rs) bridge accepts a `counterparty_policy` parameter
+/// (`"full"` / `"pseudonymized"` / `"redacted"`) that controls how
+/// counterparty DIDs are represented in the output record. This WASM bridge
+/// does not support `counterparty_policy` because the policy application
+/// logic lives in `scp-core::provenance::attach`, which cannot be compiled
+/// to `wasm32-unknown-unknown` (tokio multi-thread dependency; see ADR-034).
+/// Counterparty DIDs are always included verbatim ("full" behavior).
+/// The TypeScript WASM adapter (`wasm.ts`) silently drops the parameter.
+///
 /// # Errors
 ///
 /// Returns `JsError` if parameters are invalid or JSON parsing fails.

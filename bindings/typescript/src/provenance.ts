@@ -35,7 +35,7 @@ export interface ProvenanceRecord {
   readonly counterparties: readonly string[];
   readonly ageSecs: number;
   readonly memoryScope: string;
-  readonly chainPath: string | null;
+  readonly chainPath: readonly string[] | null;
   readonly purpose: string | null;
   /** How the data source was discovered (§24.2.3). */
   readonly discoveryMethod: DiscoveryMethod;
