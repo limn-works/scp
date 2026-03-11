@@ -1028,6 +1028,88 @@ mod tests {
     }
 
     #[test]
+    fn collect_active_voters_returns_voters_from_pending_proposals() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+
+        let now = 1_000_000;
+        let ctx = threshold_context(now);
+
+        // No proposals yet — no active voters.
+        let voters = collect_active_voters(&engine);
+        assert!(voters.is_empty(), "no proposals means no active voters");
+
+        // Alice proposes (auto-approval counts as a vote).
+        let (proposal, _events) = engine
+            .propose(
+                &alice(),
+                GovernanceAction::AddMember {
+                    did: dave(),
+                    role: "member".to_owned(),
+                },
+                &ctx,
+                &test_signing_key(),
+            )
+            .unwrap();
+
+        let voters = collect_active_voters(&engine);
+        assert_eq!(voters.len(), 1, "only Alice voted so far");
+        assert!(voters.contains(&alice()));
+
+        // Bob approves — now both Alice and Bob are active voters.
+        let (_status, _events) = engine
+            .approve(&proposal.proposal_id, &bob(), &ctx, &test_signing_key_2())
+            .unwrap();
+
+        let voters = collect_active_voters(&engine);
+        // Proposal may have resolved (2-of-3 threshold met), so pending_proposal_ids
+        // may be empty. Verify the resolved case: no pending proposals → no voters.
+        let pending = engine.pending_proposal_ids();
+        if pending.is_empty() {
+            assert!(
+                voters.is_empty(),
+                "resolved proposals should not contribute voters"
+            );
+        } else {
+            assert_eq!(voters.len(), 2);
+            assert!(voters.contains(&alice()));
+            assert!(voters.contains(&bob()));
+        }
+    }
+
+    #[test]
+    fn collect_active_voters_includes_rejections() {
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+
+        let now = 1_000_000;
+        let ctx = threshold_context(now);
+
+        // Alice proposes.
+        let (proposal, _events) = engine
+            .propose(
+                &alice(),
+                GovernanceAction::AddMember {
+                    did: dave(),
+                    role: "member".to_owned(),
+                },
+                &ctx,
+                &test_signing_key(),
+            )
+            .unwrap();
+
+        // Bob rejects.
+        let _result = engine.reject(&proposal.proposal_id, &bob(), &ctx, &test_signing_key_2());
+
+        let voters = collect_active_voters(&engine);
+        assert!(
+            voters.contains(&alice()),
+            "proposer approval should be counted"
+        );
+        assert!(voters.contains(&bob()), "rejection votes should be counted");
+    }
+
+    #[test]
     fn single_admin_never_deadlocks() {
         let engine = SingleAdminEngine::new(alice(), mock_resolver());
         let ctx = GovernanceContext {
