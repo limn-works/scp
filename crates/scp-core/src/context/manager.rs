@@ -1180,6 +1180,20 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let (ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
 
+        // Restore the event log from persistence (#636).
+        let ctx_id_bytes = context_id_to_bytes(context_id);
+        if let Err(e) = self.event_log.restore_event_log(&ctx_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to restore event log from persistence; \
+                 context will start with an empty event log"
+            );
+            // Best-effort: initialize an empty event log so operations
+            // can continue even if the persisted data is corrupt.
+            let _ = self.event_log.init_event_log(&ctx_id_bytes);
+        }
+
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
 
         // Reconstruct the governance engine from the persisted snapshot.

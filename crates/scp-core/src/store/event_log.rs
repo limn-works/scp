@@ -9,6 +9,7 @@
 //! context/{context_id}/event_meta/root                -- 32-byte Merkle root
 //! context/{context_id}/event_tree/{level}/{index}     -- Merkle tree nodes
 //! context/{context_id}/event_data/{seq:020d}          -- MessagePack-serialized Event payload
+//! context/{context_id}/merkle_event_log/entries       -- MerkleEventLogProvider entries (#636)
 //! ```
 //!
 //! Event sequence numbers use 20-digit zero-padding for lexicographic
@@ -17,6 +18,10 @@
 //! The `event_data/` key space stores full serialized event payloads alongside
 //! the Merkle tree leaf hashes. This enables `query_events` to return real
 //! event data instead of just Merkle summaries. See GitHub issue #303.
+//!
+//! The `merkle_event_log/entries` key stores the serialized
+//! `Vec<EventLogEntry>` for the `MerkleEventLogProvider`, enabling event
+//! log persistence across process restarts. See GitHub issue #636.
 //!
 //! See spec sections 17.3, 17.4, and ADR-011.
 
@@ -91,6 +96,16 @@ fn event_data_key(context_id: &str, seq: u64) -> Result<String, StoreError> {
 fn event_data_prefix(context_id: &str) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/event_data/"))
+}
+
+/// Builds the storage key for the `MerkleEventLogProvider` entries blob.
+///
+/// Format: `context/{context_id}/merkle_event_log/entries`
+/// Stores the full `Vec<EventLogEntry>` as a single serialized blob.
+/// See GitHub issue #636.
+fn merkle_event_log_key(context_id: &str) -> Result<String, StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/merkle_event_log/entries"))
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +597,59 @@ impl<S: Storage> ProtocolStore<S> {
             None => Ok(None),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // MerkleEventLogProvider persistence methods (#636)
+    // -----------------------------------------------------------------------
+
+    /// Stores the full `MerkleEventLogProvider` entry list for a context.
+    ///
+    /// Persists the serialized `Vec<EventLogEntry>` as a single blob under
+    /// `context/{context_id}/merkle_event_log/entries`. Called by the
+    /// `EventLogPersistence` bridge after each append operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_merkle_event_log_entries(
+        &self,
+        context_id: &str,
+        entries: &[crate::context::providers::event_log::EventLogEntry],
+    ) -> Result<(), StoreError> {
+        let key = merkle_event_log_key(context_id)?;
+        self.store_value(&key, &entries.to_vec()).await
+    }
+
+    /// Loads the persisted `MerkleEventLogProvider` entries for a context.
+    ///
+    /// Returns `None` if no entries have been persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_merkle_event_log_entries(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, StoreError> {
+        let key = merkle_event_log_key(context_id)?;
+        self.load_value(&key).await
+    }
+
+    /// Deletes the persisted `MerkleEventLogProvider` entries for a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
+    pub async fn delete_merkle_event_log_entries(
+        &self,
+        context_id: &str,
+    ) -> Result<(), StoreError> {
+        let key = merkle_event_log_key(context_id)?;
+        self.storage.delete(&key).await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1133,103 @@ mod tests {
         assert_eq!(
             event_data_prefix("ctx-123").unwrap(),
             "context/ctx-123/event_data/"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Merkle event log persistence tests (#636)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn merkle_event_log_key_follows_convention() {
+        assert_eq!(
+            merkle_event_log_key("ctx-123").unwrap(),
+            "context/ctx-123/merkle_event_log/entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_and_load_merkle_event_log_entries_roundtrip() {
+        use crate::context::providers::event_log::EventLogEntry;
+
+        let store = make_store();
+        let entries = vec![
+            EventLogEntry {
+                event: "ContextCreated".to_owned(),
+                timestamp: 1_700_000_000,
+                prev_hash: [0u8; 32],
+                hash: [1u8; 32],
+            },
+            EventLogEntry {
+                event: "MemberJoined".to_owned(),
+                timestamp: 1_700_000_001,
+                prev_hash: [1u8; 32],
+                hash: [2u8; 32],
+            },
+        ];
+
+        store
+            .store_merkle_event_log_entries("ctx-1", &entries)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].event, "ContextCreated");
+        assert_eq!(loaded[1].event, "MemberJoined");
+    }
+
+    #[tokio::test]
+    async fn load_merkle_event_log_entries_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store
+            .load_merkle_event_log_entries("nonexistent")
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_merkle_event_log_entries() {
+        use crate::context::providers::event_log::EventLogEntry;
+
+        let store = make_store();
+        let entries = vec![EventLogEntry {
+            event: "ContextCreated".to_owned(),
+            timestamp: 1_700_000_000,
+            prev_hash: [0u8; 32],
+            hash: [1u8; 32],
+        }];
+
+        store
+            .store_merkle_event_log_entries("ctx-del", &entries)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .load_merkle_event_log_entries("ctx-del")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .delete_merkle_event_log_entries("ctx-del")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .load_merkle_event_log_entries("ctx-del")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }
