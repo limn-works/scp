@@ -1556,6 +1556,10 @@ impl Drop for UcanToken {
 /// Exposes connection status and relay URL without leaking connection state.
 /// The actual transport (WebSocket, multi-relay routing) is managed internally.
 ///
+/// Holds a reference to the underlying `NativeRelayAdapter` established by
+/// `transport_connect`. The adapter represents a live WebSocket connection
+/// to an SCP relay.
+///
 /// Generated as `class TransportManager` in both Swift and Kotlin.
 ///
 /// See ADR-005 (Transport Abstraction).
@@ -1563,25 +1567,40 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state.
     pub(crate) status: std::sync::Mutex<TransportStatus>,
+    /// The underlying relay adapter (live WebSocket connection).
+    /// `None` after `transport_disconnect` is called.
+    #[allow(dead_code)]
+    pub(crate) adapter:
+        std::sync::Mutex<Option<Arc<scp_transport::native::adapter::NativeRelayAdapter>>>,
 }
 
 #[uniffi::export]
 impl TransportManager {
     /// Returns the current transport connection status record.
+    ///
+    /// Reflects actual connection state: `connected` is `true` only if the
+    /// underlying relay adapter is still held.
     pub fn status(&self) -> TransportStatus {
-        self.status
+        let has_adapter = self.adapter.lock().map(|a| a.is_some()).unwrap_or(false);
+        let status = self
+            .status
             .lock()
             .map(|s| s.clone())
             .unwrap_or(TransportStatus {
                 connected: false,
                 relay_url: None,
                 latency_ms: None,
-            })
+            });
+        TransportStatus {
+            connected: has_adapter && status.connected,
+            relay_url: if has_adapter { status.relay_url } else { None },
+            latency_ms: status.latency_ms,
+        }
     }
 
     /// Returns `true` if the transport is currently connected.
     pub fn is_connected(&self) -> bool {
-        self.status.lock().map(|s| s.connected).unwrap_or(false)
+        self.adapter.lock().map(|a| a.is_some()).unwrap_or(false)
     }
 }
 
@@ -3367,6 +3386,12 @@ pub async fn tool_session_close(
 
 /// Connects to an SCP relay.
 ///
+/// Establishes a WebSocket connection to the specified relay URL using
+/// [`NativeRelayAdapter::connect_sourced`] with `Explicit` source
+/// (requires `wss://`). The adapter is stored in both the returned
+/// `TransportManager` handle and the global relay connection state for
+/// use by other bridge functions.
+///
 /// # Arguments
 ///
 /// * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`).
@@ -3377,10 +3402,15 @@ pub async fn tool_session_close(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Transport` if the connection fails (unreachable relay,
+/// Returns `ScpError::Transport` if the URL scheme is not permitted
+/// (only `wss://` is accepted for explicit connections) or if the
+/// WebSocket connection cannot be established (unreachable relay,
 /// protocol mismatch, timeout, authentication failure).
 #[uniffi::export]
 pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager>, ScpError> {
+    use scp_transport::native::adapter::NativeRelayAdapter;
+    use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
     validate_relay_url(&relay_url)?;
     if !relay_url.starts_with("wss://") {
         return Err(ScpError::Transport {
@@ -3394,12 +3424,33 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
     runtime()
         .spawn(async move {
+            let sourced = SourcedRelayUrl {
+                url: relay_url.clone(),
+                source: RelayUrlSource::Explicit,
+            };
+
+            // Establish a real WebSocket connection to the relay.
+            let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+                .await
+                .map_err(ScpError::from)?;
+
+            let arc_adapter = Arc::new(adapter);
+
+            // Store the connection in global state for other bridge functions.
+            runtime::set_relay_connection(Arc::clone(&arc_adapter), relay_url.clone()).map_err(
+                |e| ScpError::Transport {
+                    message: e,
+                    code: "SCP-TRANS-5002".to_owned(),
+                },
+            )?;
+
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
                     relay_url: Some(relay_url),
                     latency_ms: None,
                 }),
+                adapter: std::sync::Mutex::new(Some(arc_adapter)),
             });
             increment_handle_count();
             Ok(handle)
@@ -3413,12 +3464,61 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
 /// Returns the current transport connection status.
 ///
+/// Reflects actual connection state: `connected` is `true` only if the
+/// underlying relay adapter is still held by the manager.
+///
 /// # Errors
 ///
 /// Returns `ScpError::Transport` if querying the transport status fails.
 #[uniffi::export]
 pub async fn transport_status(manager: Arc<TransportManager>) -> Result<TransportStatus, ScpError> {
     Ok(manager.status())
+}
+
+/// Disconnects from the current SCP relay.
+///
+/// Clears the relay adapter from both the `TransportManager` handle and the
+/// global relay connection state. After this call, the `TransportManager`
+/// reports `connected: false` and the adapter's WebSocket connection is
+/// released when the last reference is dropped.
+///
+/// This is idempotent — calling it when already disconnected is a no-op.
+///
+/// # Arguments
+///
+/// * `manager` — The `TransportManager` returned by `transport_connect`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if clearing connection state fails.
+#[uniffi::export]
+pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            // Clear the adapter from the manager.
+            if let Ok(mut adapter_guard) = manager.adapter.lock() {
+                *adapter_guard = None;
+            }
+
+            // Update the status to disconnected.
+            if let Ok(mut status_guard) = manager.status.lock() {
+                status_guard.connected = false;
+                status_guard.relay_url = None;
+            }
+
+            // Clear global relay connection state.
+            runtime::clear_relay_connection().map_err(|e| ScpError::Transport {
+                message: e,
+                code: "SCP-TRANS-5003".to_owned(),
+            })?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Transport {
+            message: format!("tokio task join error during transport disconnect: {e}"),
+            code: "SCP-TRANS-5003".to_owned(),
+        })?
 }
 
 // ---------------------------------------------------------------------------

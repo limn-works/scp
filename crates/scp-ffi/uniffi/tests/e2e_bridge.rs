@@ -72,6 +72,8 @@ use scp_ffi_uniffi::{
     // Free functions — tools
     tool_register,
     tool_verify,
+    // Free functions — transport
+    transport_connect,
     // Free functions — UCAN
     ucan_mint,
     ucan_revoke,
@@ -799,4 +801,45 @@ async fn invalid_did_rejected_at_bridge_boundary() {
     // Empty DID should fail validation or return false
     let result = context_is_member(handle, String::new()).await;
     let _ = result;
+}
+
+// ---------------------------------------------------------------------------
+// Transport operations (#620)
+//
+// `transport_disconnect` and `transport_status` require a live
+// `TransportManager` returned from a successful `transport_connect`,
+// which in turn requires a real relay endpoint. They are tested via
+// the URL validation and error propagation paths below, plus the
+// `TransportManager::status()` / `is_connected()` methods which are
+// tested in the unit tests.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transport_connect_rejects_plaintext_ws() {
+    // ws:// is not permitted from explicit source — only wss://
+    let result = transport_connect("ws://relay.example.com/scp/v1".to_owned()).await;
+    assert!(
+        result.is_err(),
+        "ws:// should be rejected for explicit connections"
+    );
+}
+
+#[tokio::test]
+async fn transport_connect_rejects_invalid_url() {
+    // Empty URL should fail validation
+    let result = transport_connect(String::new()).await;
+    assert!(result.is_err(), "Empty URL should be rejected");
+}
+
+#[tokio::test]
+async fn transport_connect_returns_error_on_unreachable_relay() {
+    // Before #620, transport_connect returned connected=true without
+    // establishing any WebSocket connection. Now it calls
+    // NativeRelayAdapter::connect_sourced() and propagates connection
+    // failures as ScpError::Transport.
+    let result = transport_connect("wss://127.0.0.1:1/nonexistent-scp-relay".to_owned()).await;
+    assert!(
+        result.is_err(),
+        "Connecting to an unreachable relay must return an error, not a fictional success"
+    );
 }

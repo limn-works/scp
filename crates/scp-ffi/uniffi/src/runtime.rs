@@ -24,7 +24,7 @@
 //! (deleted as part of issue #387).
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
 use scp_core::context::builder::{
@@ -376,6 +376,80 @@ impl ContextEventLogProvider for FfiBridgeEventLog {
     fn destroy_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Relay connection state (transport wiring)
+// ---------------------------------------------------------------------------
+
+/// Global relay connection for the `UniFFI` bridge.
+///
+/// Set by [`set_relay_connection`] when `transport_connect` succeeds.
+/// Read by `transport_status` to report actual connection state.
+/// Cleared by `transport_disconnect` to tear down the connection.
+///
+/// Uses `RwLock` for infrequent writes (connect/disconnect) and concurrent
+/// reads (status queries).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. A single relay connection is active
+/// at a time — matching the `PyO3` bridge pattern.
+static RELAY_CONNECTION: OnceLock<
+    RwLock<Option<Arc<scp_transport::native::adapter::NativeRelayAdapter>>>,
+> = OnceLock::new();
+
+/// Tracks the URL of the currently connected relay.
+///
+/// Set by `transport_connect`, cleared by `transport_disconnect`,
+/// read by `transport_status`.
+static CONNECTED_RELAY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// Returns a reference to the global relay connection state.
+fn relay_state() -> &'static RwLock<Option<Arc<scp_transport::native::adapter::NativeRelayAdapter>>>
+{
+    RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
+}
+
+/// Returns a reference to the connected relay URL state.
+fn connected_url_state() -> &'static RwLock<Option<String>> {
+    CONNECTED_RELAY_URL.get_or_init(|| RwLock::new(None))
+}
+
+/// Stores a relay adapter connection after a successful connect.
+///
+/// # Errors
+///
+/// Returns an error string if the relay state lock is poisoned.
+pub fn set_relay_connection(
+    adapter: Arc<scp_transport::native::adapter::NativeRelayAdapter>,
+    url: String,
+) -> Result<(), String> {
+    *relay_state()
+        .write()
+        .map_err(|_| "relay connection state lock is poisoned".to_owned())? = Some(adapter);
+    *connected_url_state()
+        .write()
+        .map_err(|_| "connected relay URL lock is poisoned".to_owned())? = Some(url);
+    Ok(())
+}
+
+/// Clears the active relay connection.
+///
+/// Called by `transport_disconnect` to tear down the connection.
+/// After this, `transport_status` will report disconnected.
+///
+/// # Errors
+///
+/// Returns an error string if the state lock is poisoned.
+pub fn clear_relay_connection() -> Result<(), String> {
+    *relay_state()
+        .write()
+        .map_err(|_| "relay connection state lock is poisoned".to_owned())? = None;
+    *connected_url_state()
+        .write()
+        .map_err(|_| "connected relay URL lock is poisoned".to_owned())? = None;
+    Ok(())
 }
 
 /// Queries event counts for trust scoring within a context.

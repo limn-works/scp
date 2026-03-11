@@ -153,6 +153,7 @@ pub use bridge::{
     tool_verify,
     // Free functions — transport
     transport_connect,
+    transport_disconnect,
     transport_status,
     // Free functions — UCAN
     ucan_mint,
