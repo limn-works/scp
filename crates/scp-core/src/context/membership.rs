@@ -365,6 +365,27 @@ pub enum ContextEvent {
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
     Expired,
+    /// TTL expiry cleanup failed after exhausting all retry attempts.
+    ///
+    /// The context transitioned to `Expired` state but one or more cleanup
+    /// operations failed (MLS group destruction, sender key destruction,
+    /// or event log write). The `reason` field contains a human-readable
+    /// description of what failed.
+    ///
+    /// Application layers should treat this as a degraded state: the context
+    /// is expired but cryptographic material may not have been fully destroyed.
+    ExpiryFailed {
+        /// Human-readable description of the failure(s).
+        reason: String,
+        /// Whether the state transition to `Expired` succeeded.
+        state_transitioned: bool,
+        /// Whether MLS group keys were successfully destroyed (or not required).
+        mls_destroyed: bool,
+        /// Whether sender keys were successfully destroyed (or not required).
+        sender_key_destroyed: bool,
+        /// Whether the `ContextExpired` event was logged.
+        event_logged: bool,
+    },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.
