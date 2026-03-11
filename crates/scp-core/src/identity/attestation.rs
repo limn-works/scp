@@ -903,6 +903,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attestation_claim_ignores_unknown_fields() {
+        let claim = AttestationClaim::new(
+            "github.com".to_owned(),
+            "alice".to_owned(),
+            Some("12345".to_owned()),
+        );
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&claim).unwrap()).unwrap();
+        map.insert("future_field".into(), "v2-data".into());
+        let result = serde_json::from_value::<AttestationClaim>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.platform, "github.com");
+        assert_eq!(decoded.platform_handle, "alice");
+    }
+
+    #[test]
+    fn attestation_evidence_ignores_unknown_fields() {
+        let evidence = AttestationEvidence {
+            method: VerificationMethod::Oauth,
+            proof: "proof-data".to_owned(),
+            verified_at: 1_700_000_000_000,
+            verifier_did: None,
+        };
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&evidence).unwrap()).unwrap();
+        map.insert("future_field".into(), serde_json::json!(42));
+        let result = serde_json::from_value::<AttestationEvidence>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.method, VerificationMethod::Oauth);
+        assert_eq!(decoded.verified_at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn attestation_revocation_ignores_unknown_fields() {
+        let revocation = AttestationRevocation::new("/revocations".to_owned());
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&revocation).unwrap()).unwrap();
+        map.insert("future_field".into(), "v2-data".into());
+        let result =
+            serde_json::from_value::<AttestationRevocation>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.endpoint, "/revocations");
+    }
+
     // -----------------------------------------------------------------------
     // Signature verification
     // -----------------------------------------------------------------------

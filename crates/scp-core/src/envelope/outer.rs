@@ -17,6 +17,8 @@
 //!
 //! See ADR-002 in `.docs/adrs/phase-1.md` for the full outer envelope design.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -71,6 +73,12 @@ pub struct OuterEnvelope {
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_blob: Vec<u8>,
+
+    /// Unknown fields from newer protocol versions, preserved for
+    /// forward compatibility per spec §13.5.1. Intermediaries (relays,
+    /// bridges) MUST NOT strip fields they do not recognize.
+    #[serde(flatten)]
+    pub extensions: HashMap<String, serde_json::Value>,
 }
 
 /// Constructs an outer envelope from its components.
@@ -112,6 +120,7 @@ pub fn create_outer_envelope(
         recipient_hint: recipient_hint.map(<[u8]>::to_vec),
         blob_ttl,
         encrypted_blob,
+        extensions: HashMap::new(),
     })
 }
 
@@ -516,6 +525,97 @@ mod tests {
         assert!(
             err_msg.contains("DeserializationFailed"),
             "should be DeserializationFailed at the limit, got: {err_msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn outer_envelope_ignores_unknown_fields() {
+        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        map.insert("future_protocol_field".into(), "v2-data".into());
+        let result = serde_json::from_value::<OuterEnvelope>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.routing_id, envelope.routing_id);
+        assert_eq!(decoded.blob_ttl, envelope.blob_ttl);
+    }
+
+    /// §13.5.1: `OuterEnvelope` MUST preserve unknown fields so intermediaries
+    /// (relays, bridges) don't strip fields from newer protocol versions.
+    #[test]
+    fn outer_envelope_preserves_unknown_fields_roundtrip() {
+        let envelope =
+            create_outer_envelope(&[0xBB; 32], Some(&[0xCC; 32]), 7200, vec![0xDE, 0xAD]).unwrap();
+
+        // Serialize to JSON, inject an unknown field.
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        map.insert(
+            "v2_routing_priority".into(),
+            serde_json::json!({"level": "high", "ttl_override": 9000}),
+        );
+
+        // Deserialize back — the unknown field should land in `extensions`.
+        let decoded: OuterEnvelope =
+            serde_json::from_value(serde_json::Value::Object(map)).unwrap();
+        assert_eq!(decoded.routing_id, envelope.routing_id);
+        assert_eq!(decoded.blob_ttl, 7200);
+        assert_eq!(decoded.encrypted_blob, vec![0xDE, 0xAD]);
+
+        // Verify the injected field survived in extensions.
+        assert!(
+            decoded.extensions.contains_key("v2_routing_priority"),
+            "unknown field must be preserved in extensions"
+        );
+        let ext = &decoded.extensions["v2_routing_priority"];
+        assert_eq!(ext["level"], "high");
+        assert_eq!(ext["ttl_override"], 9000);
+
+        // Re-serialize and verify the field is still present.
+        let reserialized: serde_json::Value = serde_json::to_value(&decoded).unwrap();
+        let reserialized_map = reserialized.as_object().unwrap();
+        assert!(
+            reserialized_map.contains_key("v2_routing_priority"),
+            "unknown field must survive serialize → deserialize → serialize roundtrip"
+        );
+    }
+
+    /// Finding 2: Full roundtrip — serialize → inject unknown → deserialize →
+    /// compare key fields.
+    #[test]
+    fn outer_envelope_roundtrip_with_unknown_field() {
+        let original =
+            create_outer_envelope(&[0xAA; 32], Some(&[0xDD; 32]), 3600, vec![0x42; 16]).unwrap();
+
+        // Serialize to JSON Value.
+        let mut json = serde_json::to_value(&original).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("future_version_hint".into(), serde_json::json!("scp/2.0"));
+
+        // Deserialize back.
+        let decoded: OuterEnvelope = serde_json::from_value(json).unwrap();
+
+        // Key fields match the original.
+        assert_eq!(decoded.version, original.version);
+        assert_eq!(decoded.routing_id, original.routing_id);
+        assert_eq!(decoded.recipient_hint, original.recipient_hint);
+        assert_eq!(decoded.blob_ttl, original.blob_ttl);
+        assert_eq!(decoded.encrypted_blob, original.encrypted_blob);
+
+        // Unknown field preserved.
+        assert_eq!(
+            decoded.extensions.get("future_version_hint"),
+            Some(&serde_json::json!("scp/2.0")),
         );
     }
 }

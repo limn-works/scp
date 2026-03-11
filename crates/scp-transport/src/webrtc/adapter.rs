@@ -653,6 +653,7 @@ mod tests {
             recipient_hint: None,
             blob_ttl: 3600,
             encrypted_blob: vec![0x01, 0x02, 0x03],
+            extensions: std::collections::HashMap::new(),
         };
 
         let blob_id = adapter.send(&envelope).await.unwrap();

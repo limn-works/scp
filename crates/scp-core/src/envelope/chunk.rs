@@ -497,4 +497,30 @@ mod tests {
         let reassembled = reassemble_chunks(&chunks).unwrap();
         assert_eq!(reassembled, payload);
     }
+
+    // -------------------------------------------------------------------
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn chunk_envelope_ignores_unknown_fields() {
+        let payload = vec![0xAB; 1024];
+        let chunks = split_into_chunks(&payload, TEST_DID, TEST_TIMESTAMP).unwrap();
+        let chunk = &chunks[0];
+
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(chunk).unwrap()).unwrap();
+        map.insert("future_field".into(), "v2-data".into());
+
+        let result = serde_json::from_value::<ChunkEnvelope>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.chunk_index, chunk.chunk_index);
+        assert_eq!(decoded.total_chunks, chunk.total_chunks);
+        assert_eq!(decoded.message_id, chunk.message_id);
+    }
 }
