@@ -383,8 +383,34 @@ pub fn resolve_governance_conflict(
         });
     }
 
-    // All conflicting pairs have different leaf indices.
-    // Resolve by finding the pair with the smallest gap and using
+    // Mutual removal: each proposer removes the other. Even with different
+    // leaf indices this is a logical deadlock — executing the first removal
+    // invalidates the authority of the second proposer, creating a paradox.
+    // Consistent with `detect_deadlock`, return GovernanceFreeze.
+    let mutual_removal_ids: Vec<ProposalId> = conflicting_pairs
+        .iter()
+        .filter(|(i, j)| {
+            is_mutual_removal(
+                &proposals[*i].action,
+                &proposals[*i].proposer_did,
+                &proposals[*j].action,
+                &proposals[*j].proposer_did,
+            )
+        })
+        .flat_map(|(i, j)| vec![proposals[*i].proposal_id, proposals[*j].proposal_id])
+        .collect();
+
+    if !mutual_removal_ids.is_empty() {
+        let mut deduped = mutual_removal_ids;
+        deduped.sort_unstable();
+        deduped.dedup();
+        return Ok(ConflictResolutionStrategy::GovernanceFreeze {
+            conflicting_proposals: deduped,
+        });
+    }
+
+    // All conflicting pairs have different leaf indices and are not mutual
+    // removals. Resolve by finding the pair with the smallest gap and using
     // the lower leaf index as winner.
     //
     // For simplicity (and per ADR-031 section 7), we resolve the first
@@ -1144,7 +1170,10 @@ mod tests {
     }
 
     #[test]
-    fn governance_conflict_mutual_removal_resolved_by_order() {
+    fn governance_conflict_mutual_removal_triggers_freeze() {
+        // Mutual removal (each proposer removes the other) is a logical
+        // deadlock even with different leaf indices — consistent with
+        // detect_deadlock. See issue #576.
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
@@ -1165,13 +1194,77 @@ mod tests {
         );
         let result = resolve_governance_conflict(&[p1, p2]);
         assert!(result.is_ok());
-        assert_eq!(
-            result.ok(),
-            Some(ConflictResolutionStrategy::MerkleOrdered {
-                winner_proposal_id: proposal_id(1),
-                loser_proposal_id: proposal_id(2),
-            }),
+        match result.ok() {
+            Some(ConflictResolutionStrategy::GovernanceFreeze {
+                conflicting_proposals,
+            }) => {
+                assert_eq!(conflicting_proposals.len(), 2);
+                assert!(conflicting_proposals.contains(&proposal_id(1)));
+                assert!(conflicting_proposals.contains(&proposal_id(2)));
+            }
+            other => panic!("expected GovernanceFreeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn governance_conflict_mutual_removal_reversed_order_triggers_freeze() {
+        // Same as above but proposals passed in reversed array order —
+        // result must be identical (deterministic).
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:bob"),
+                reason: None,
+            },
+            3,
         );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:alice"),
+                reason: None,
+            },
+            7,
+        );
+        let result_ab = resolve_governance_conflict(&[p1.clone(), p2.clone()]);
+        let result_ba = resolve_governance_conflict(&[p2, p1]);
+        assert_eq!(result_ab.ok(), result_ba.ok());
+    }
+
+    #[test]
+    fn governance_conflict_mutual_removal_same_leaf_index_triggers_freeze() {
+        // Mutual removal with same leaf index — should still freeze (caught
+        // by the simultaneous-commit check before the mutual-removal check).
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:bob"),
+                reason: None,
+            },
+            5,
+        );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:alice"),
+                reason: None,
+            },
+            5,
+        );
+        let result = resolve_governance_conflict(&[p1, p2]);
+        assert!(result.is_ok());
+        match result.ok() {
+            Some(ConflictResolutionStrategy::GovernanceFreeze {
+                conflicting_proposals,
+            }) => {
+                assert_eq!(conflicting_proposals.len(), 2);
+            }
+            other => panic!("expected GovernanceFreeze, got {other:?}"),
+        }
     }
 
     #[test]
