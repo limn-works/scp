@@ -958,10 +958,24 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             SenderKey::from_bytes([0u8; 32]),
         );
 
+        let crypto_state = ContextCryptoState {
+            mls_group: scp_group,
+            sender_key: local_sender_key,
+            sender_key_store,
+            sender_key_epoch: snapshot.sender_key_epoch,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys,
+        };
+
         // Restore the provider-level X25519 wrapping keypair BEFORE inserting
-        // the context state, so that a lock-poisoned error here does not leave
-        // the context map in an inconsistent state (context inserted but
-        // wrapping keys mismatched).
+        // into the contexts map. This prevents partial state: if any lock is
+        // poisoned the function returns early without modifying either the
+        // contexts map or the wrapping keys.
+        //
+        // Both wrapping key locks are acquired before either is written. This
+        // ensures that a poison on the second lock cannot leave the first key
+        // updated while the second retains its old value.
         //
         // Legacy snapshots (pre-wrapping-key persistence) have default
         // [0u8; 32] — skip restore in that case to keep the fresh keypair.
@@ -974,11 +988,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             let mut pub_guard = self.wrapping_public_key.lock().map_err(|e| {
                 ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
             })?;
-            *pub_guard = snapshot.wrapping_public_key;
-
             let mut secret_guard = self.wrapping_secret_key.lock().map_err(|e| {
                 ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
             })?;
+
+            *pub_guard = snapshot.wrapping_public_key;
             *secret_guard = Zeroizing::new(*secret);
         }
 
@@ -987,16 +1001,6 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // above (or skipped for legacy snapshots), so this intermediate Vec
         // should not retain raw X25519 secret key material.
         snapshot.wrapping_secret_key.zeroize();
-
-        let crypto_state = ContextCryptoState {
-            mls_group: scp_group,
-            sender_key: local_sender_key,
-            sender_key_store,
-            sender_key_epoch: snapshot.sender_key_epoch,
-            pending_distributions: Vec::new(),
-            nonce_dedup: NonceDedup::new(),
-            member_wrapping_keys,
-        };
 
         let mut contexts = self
             .contexts
