@@ -134,26 +134,40 @@ describe("type definitions", () => {
 
   // -- Address Resolution types (§22.2.1, §22.7) ---------------------------
 
-  it("TrustLevel accepts all valid variants", () => {
+  it("TrustLevel accepts all simple variants", () => {
     const levels: TrustLevel[] = [
-      "DirectExchange",
-      "LocalPetname",
-      "MultiLayerCorroborated",
-      "DomainVerified",
-      "AttestationVerified",
-      "DiscoveryContextVerified",
+      { kind: "unverified" },
+      { kind: "petname_only" },
+      { kind: "discovery_context_verified" },
+      { kind: "domain_verified" },
+      { kind: "attestation_verified" },
+      { kind: "direct_exchange" },
     ];
     expect(levels).toHaveLength(6);
   });
 
+  it("TrustLevel multi_layer_corroborated carries sources", () => {
+    const level: TrustLevel = {
+      kind: "multi_layer_corroborated",
+      sources: [
+        { layer: "petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
+        { layer: "domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
+      ],
+    };
+    expect(level.kind).toBe("multi_layer_corroborated");
+    if (level.kind === "multi_layer_corroborated") {
+      expect(level.sources).toHaveLength(2);
+    }
+  });
+
   it("ResolutionPath has all required fields", () => {
     const path: ResolutionPath = {
-      layer: "DiscoveryContext",
+      layer: "discovery_context",
       source: "cooking-community",
       sourceId: "ctx-disc-1",
       resolvedAt: 1700000000,
     };
-    expect(path.layer).toBe("DiscoveryContext");
+    expect(path.layer).toBe("discovery_context");
     expect(path.source).toBe("cooking-community");
     expect(path.sourceId).toBe("ctx-disc-1");
     expect(path.resolvedAt).toBe(1700000000);
@@ -161,7 +175,7 @@ describe("type definitions", () => {
 
   it("ResolutionPath allows null sourceId", () => {
     const path: ResolutionPath = {
-      layer: "Domain",
+      layer: "domain",
       source: "dht",
       sourceId: null,
       resolvedAt: 1700000000,
@@ -173,9 +187,9 @@ describe("type definitions", () => {
     const resolution: AddressResolution = {
       type: "Identity",
       did: "did:dht:z6MkAlice",
-      trustLevel: "DiscoveryContextVerified",
+      trustLevel: { kind: "discovery_context_verified" },
       resolutionPath: {
-        layer: "DiscoveryContext",
+        layer: "discovery_context",
         source: "cooking-community",
         sourceId: "ctx-disc-1",
         resolvedAt: 1700000000,
@@ -184,8 +198,8 @@ describe("type definitions", () => {
     expect(resolution.type).toBe("Identity");
     if (resolution.type === "Identity") {
       expect(resolution.did).toBe("did:dht:z6MkAlice");
-      expect(resolution.trustLevel).toBe("DiscoveryContextVerified");
-      expect(resolution.resolutionPath.layer).toBe("DiscoveryContext");
+      expect(resolution.trustLevel.kind).toBe("discovery_context_verified");
+      expect(resolution.resolutionPath.layer).toBe("discovery_context");
     }
   });
 
@@ -195,9 +209,9 @@ describe("type definitions", () => {
       contextId: "a1b2c3d4e5f6",
       relayUrls: ["wss://relay.example.com/scp/v1"],
       mode: "broadcast",
-      trustLevel: "DomainVerified",
+      trustLevel: { kind: "domain_verified" },
       resolutionPath: {
-        layer: "Domain",
+        layer: "domain",
         source: "dht",
         sourceId: null,
         resolvedAt: 1700000000,
@@ -208,8 +222,8 @@ describe("type definitions", () => {
       expect(resolution.contextId).toBe("a1b2c3d4e5f6");
       expect(resolution.relayUrls).toEqual(["wss://relay.example.com/scp/v1"]);
       expect(resolution.mode).toBe("broadcast");
-      expect(resolution.trustLevel).toBe("DomainVerified");
-      expect(resolution.resolutionPath.layer).toBe("Domain");
+      expect(resolution.trustLevel.kind).toBe("domain_verified");
+      expect(resolution.resolutionPath.layer).toBe("domain");
     }
   });
 
@@ -219,9 +233,9 @@ describe("type definitions", () => {
       contextId: "deadbeef",
       relayUrls: [],
       mode: null,
-      trustLevel: "DiscoveryContextVerified",
+      trustLevel: { kind: "discovery_context_verified" },
       resolutionPath: {
-        layer: "DiscoveryContext",
+        layer: "discovery_context",
         source: "discovery_context",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,

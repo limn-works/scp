@@ -19,22 +19,22 @@ describe("DiscoveryResult type (§22.2.1)", () => {
       discoverySource: "dht_did_document",
       mode: "broadcast",
       metadataSummary: null,
-      trustLevel: "DomainVerified",
+      trustLevel: { kind: "domain_verified" },
       resolutionPath: {
-        layer: "Domain",
+        layer: "domain",
         source: "dht",
         sourceId: null,
         resolvedAt: 1700000000,
       },
     };
-    expect(result.trustLevel).toBe("DomainVerified");
-    expect(result.resolutionPath.layer).toBe("Domain");
+    expect(result.trustLevel.kind).toBe("domain_verified");
+    expect(result.resolutionPath.layer).toBe("domain");
     expect(result.resolutionPath.source).toBe("dht");
     expect(result.resolutionPath.sourceId).toBeNull();
     expect(result.resolutionPath.resolvedAt).toBe(1700000000);
   });
 
-  it("accepts DiscoveryContextVerified trust level for discovery context source", () => {
+  it("accepts discovery_context_verified trust level for discovery context source", () => {
     const result: DiscoveryResult = {
       contextId: "ctx456",
       relayUrls: ["wss://relay.example.com"],
@@ -42,16 +42,36 @@ describe("DiscoveryResult type (§22.2.1)", () => {
       discoverySource: "discovery_context",
       mode: null,
       metadataSummary: null,
-      trustLevel: "DiscoveryContextVerified",
+      trustLevel: { kind: "discovery_context_verified" },
       resolutionPath: {
-        layer: "DiscoveryContext",
+        layer: "discovery_context",
         source: "discovery_context",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,
       },
     };
-    expect(result.trustLevel).toBe("DiscoveryContextVerified");
+    expect(result.trustLevel.kind).toBe("discovery_context_verified");
     expect(result.resolutionPath.sourceId).toBe("disc-ctx-1");
+  });
+
+  it("maps context_uri to direct_exchange trust level (§22.7)", () => {
+    const result: DiscoveryResult = {
+      contextId: "deadbeef",
+      relayUrls: ["wss://relay.example.com/scp/v1"],
+      publisherDid: "did:dht:zTest",
+      discoverySource: "context_uri",
+      mode: "broadcast",
+      metadataSummary: null,
+      trustLevel: { kind: "direct_exchange" },
+      resolutionPath: {
+        layer: "domain",
+        source: "context_uri",
+        sourceId: null,
+        resolvedAt: 1700000000,
+      },
+    };
+    expect(result.trustLevel.kind).toBe("direct_exchange");
+    expect(result.resolutionPath.layer).toBe("domain");
   });
 });
 
@@ -61,9 +81,9 @@ describe("AddressResolution discriminated union", () => {
       {
         type: "Identity",
         did: "did:dht:z6MkAlice",
-        trustLevel: "LocalPetname",
+        trustLevel: { kind: "petname_only" },
         resolutionPath: {
-          layer: "Petname",
+          layer: "petname",
           source: "local",
           sourceId: null,
           resolvedAt: 1700000000,
@@ -74,9 +94,9 @@ describe("AddressResolution discriminated union", () => {
         contextId: "abc123",
         relayUrls: ["wss://relay.example.com"],
         mode: "broadcast",
-        trustLevel: "DomainVerified",
+        trustLevel: { kind: "domain_verified" },
         resolutionPath: {
-          layer: "Domain",
+          layer: "domain",
           source: "dht",
           sourceId: null,
           resolvedAt: 1700000000,
@@ -97,39 +117,63 @@ describe("AddressResolution discriminated union", () => {
     }
   });
 
-  it("all TrustLevel values are assignable", () => {
+  it("all simple TrustLevel kinds are assignable", () => {
     const levels: TrustLevel[] = [
-      "DirectExchange",
-      "LocalPetname",
-      "MultiLayerCorroborated",
-      "DomainVerified",
-      "AttestationVerified",
-      "DiscoveryContextVerified",
+      { kind: "unverified" },
+      { kind: "petname_only" },
+      { kind: "discovery_context_verified" },
+      { kind: "domain_verified" },
+      { kind: "attestation_verified" },
+      { kind: "direct_exchange" },
     ];
-    // Verify each can be used in an AddressResolution
     for (const level of levels) {
       const resolution: AddressResolution = {
         type: "Identity",
         did: "did:dht:zTest",
         trustLevel: level,
         resolutionPath: {
-          layer: "Domain",
+          layer: "domain",
           source: "test",
           sourceId: null,
           resolvedAt: 0,
         },
       };
-      expect(resolution.trustLevel).toBe(level);
+      expect(resolution.trustLevel.kind).toBe(level.kind);
     }
   });
 
-  it("all ResolutionLayer values are assignable", () => {
+  it("MultiLayerCorroborated TrustLevel carries sources array (§22.7)", () => {
+    const level: TrustLevel = {
+      kind: "multi_layer_corroborated",
+      sources: [
+        { layer: "petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
+        { layer: "domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
+      ],
+    };
+    const resolution: AddressResolution = {
+      type: "Identity",
+      did: "did:dht:zTest",
+      trustLevel: level,
+      resolutionPath: {
+        layer: "domain",
+        source: "test",
+        sourceId: null,
+        resolvedAt: 0,
+      },
+    };
+    expect(resolution.trustLevel.kind).toBe("multi_layer_corroborated");
+    if (resolution.trustLevel.kind === "multi_layer_corroborated") {
+      expect(resolution.trustLevel.sources).toHaveLength(2);
+      expect(resolution.trustLevel.sources[0].layer).toBe("petname");
+    }
+  });
+
+  it("all ResolutionLayer values are assignable (exactly 4 per §22.7)", () => {
     const layers: ResolutionPath["layer"][] = [
-      "Petname",
-      "DiscoveryContext",
-      "Attestation",
-      "Domain",
-      "MultiLayerCorroborated",
+      "petname",
+      "discovery_context",
+      "attestation",
+      "domain",
     ];
     for (const layer of layers) {
       const path: ResolutionPath = {

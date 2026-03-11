@@ -125,28 +125,27 @@ pub fn discovery_normalize_address(address: String) -> String {
 fn discovery_result_to_json(
     result: &scp_core::discovery::ContextDiscoveryResult,
 ) -> serde_json::Value {
-    let (source_str, trust_level, resolution_layer, resolution_source, resolution_source_id) =
+    let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
         match &result.discovery_source {
             scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
-                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
+                ("dht_did_document", "domain_verified", "domain", "dht", None)
             }
             scp_core::discovery::ContextDiscoverySource::WellKnown => {
-                ("well_known", "DomainVerified", "Domain", "well-known", None)
+                ("well_known", "domain_verified", "domain", "well-known", None)
             }
             scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
                 "discovery_context",
-                "DiscoveryContextVerified",
-                "DiscoveryContext",
+                "discovery_context_verified",
+                "discovery_context",
                 "discovery_context",
                 Some(context_id.as_str()),
             ),
-            scp_core::discovery::ContextDiscoverySource::ContextUri => (
-                "context_uri",
-                "DiscoveryContextVerified",
-                "DiscoveryContext",
-                "context_uri",
-                None,
-            ),
+            // §22.7: An scp:// URI is shared out-of-band, so the trust level is
+            // DirectExchange and the resolution layer is "domain" (closest match
+            // for URI-based resolution — no discovery context is involved).
+            scp_core::discovery::ContextDiscoverySource::ContextUri => {
+                ("context_uri", "direct_exchange", "domain", "context_uri", None)
+            }
         };
 
     let now_secs = std::time::SystemTime::now()
@@ -161,7 +160,9 @@ fn discovery_result_to_json(
         "discovery_source": source_str,
         "mode": result.mode,
         "metadata_summary": result.metadata_summary,
-        "trust_level": trust_level,
+        "trust_level": {
+            "kind": trust_level_kind,
+        },
         "resolution_path": {
             "layer": resolution_layer,
             "source": resolution_source,
@@ -310,9 +311,10 @@ mod tests {
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
-        // §22.2.1: trust_level and resolution_path are included.
-        assert_eq!(json["trust_level"], "DomainVerified");
-        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        // §22.7: trust_level is a discriminated union object; resolution_path
+        // uses spec snake_case layer values.
+        assert_eq!(json["trust_level"]["kind"], "domain_verified");
+        assert_eq!(json["resolution_path"]["layer"], "domain");
         assert_eq!(json["resolution_path"]["source"], "dht");
         assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
     }
@@ -331,8 +333,8 @@ mod tests {
         };
 
         let json = discovery_result_to_json(&result);
-        assert_eq!(json["trust_level"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["trust_level"]["kind"], "discovery_context_verified");
+        assert_eq!(json["resolution_path"]["layer"], "discovery_context");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");

@@ -162,19 +162,15 @@ export interface TransportConfig {
 // -- Address Resolution (§22.2.1, §22.7) -------------------------------------
 
 export type TrustLevel =
-  | "DirectExchange"
-  | "LocalPetname"
-  | "MultiLayerCorroborated"
-  | "DomainVerified"
-  | "AttestationVerified"
-  | "DiscoveryContextVerified";
+  | { readonly kind: "unverified" }
+  | { readonly kind: "petname_only" }
+  | { readonly kind: "discovery_context_verified" }
+  | { readonly kind: "domain_verified" }
+  | { readonly kind: "attestation_verified" }
+  | { readonly kind: "direct_exchange" }
+  | { readonly kind: "multi_layer_corroborated"; readonly sources: readonly ResolutionPath[] };
 
-export type ResolutionLayer =
-  | "Petname"
-  | "DiscoveryContext"
-  | "Attestation"
-  | "Domain"
-  | "MultiLayerCorroborated";
+export type ResolutionLayer = "petname" | "discovery_context" | "attestation" | "domain";
 
 export interface ResolutionPath {
   readonly layer: ResolutionLayer;

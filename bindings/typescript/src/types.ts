@@ -429,27 +429,28 @@ export interface RequireParticipation {
  * context-dependent. The SDK exposes them to consumers; consumers decide
  * what is sufficient.
  *
+ * Modeled as a discriminated union so that `multi_layer_corroborated` can
+ * carry its required `sources` field (§22.7).
+ *
  * See §22.7 Trust Levels.
  */
 export type TrustLevel =
-  | "DirectExchange"
-  | "LocalPetname"
-  | "MultiLayerCorroborated"
-  | "DomainVerified"
-  | "AttestationVerified"
-  | "DiscoveryContextVerified";
+  | { readonly kind: "unverified" }
+  | { readonly kind: "petname_only" }
+  | { readonly kind: "discovery_context_verified" }
+  | { readonly kind: "domain_verified" }
+  | { readonly kind: "attestation_verified" }
+  | { readonly kind: "direct_exchange" }
+  | { readonly kind: "multi_layer_corroborated"; readonly sources: readonly ResolutionPath[] };
 
 /**
  * The resolution layer that produced an address resolution result.
  *
+ * Exactly four values per §22.7 `ResolutionPath.layer`. Uses spec snake_case.
+ *
  * See §22.7 Resolution Path.
  */
-export type ResolutionLayer =
-  | "Petname"
-  | "DiscoveryContext"
-  | "Attestation"
-  | "Domain"
-  | "MultiLayerCorroborated";
+export type ResolutionLayer = "petname" | "discovery_context" | "attestation" | "domain";
 
 /**
  * Structured metadata recording which layer resolved an address.

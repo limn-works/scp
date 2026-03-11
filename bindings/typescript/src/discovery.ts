@@ -52,11 +52,33 @@ export interface DiscoveryResult {
  */
 function parseResolutionPath(raw: Record<string, unknown>): ResolutionPath {
   return {
-    layer: (raw.layer as ResolutionLayer) ?? "Domain",
+    layer: (raw.layer as ResolutionLayer) ?? "domain",
     source: (raw.source as string) ?? "unknown",
     sourceId: (raw.source_id ?? raw.sourceId ?? null) as string | null,
     resolvedAt: (raw.resolved_at ?? raw.resolvedAt ?? 0) as number,
   };
+}
+
+/**
+ * Parses a trust level from the bridge JSON. The NAPI bridge emits trust
+ * levels as `{ "kind": "..." }` objects (discriminated unions per §22.7).
+ * The `multi_layer_corroborated` variant additionally carries `sources`.
+ */
+function parseTrustLevel(raw: unknown): TrustLevel {
+  if (raw != null && typeof raw === "object" && "kind" in raw) {
+    const obj = raw as Record<string, unknown>;
+    const kind = obj.kind as string;
+    if (kind === "multi_layer_corroborated") {
+      const rawSources = (obj.sources ?? []) as Array<Record<string, unknown>>;
+      return {
+        kind: "multi_layer_corroborated",
+        sources: rawSources.map(parseResolutionPath),
+      };
+    }
+    return { kind } as TrustLevel;
+  }
+  // Fallback for unexpected input.
+  return { kind: "unverified" };
 }
 
 /**
@@ -72,7 +94,7 @@ function parseDiscoveryResult(item: Record<string, unknown>): DiscoveryResult {
     discoverySource: (item.discovery_source ?? item.discoverySource) as string,
     mode: (item.mode ?? null) as string | null,
     metadataSummary: (item.metadata_summary ?? item.metadataSummary ?? null) as string | null,
-    trustLevel: (item.trust_level ?? item.trustLevel ?? "DiscoveryContextVerified") as TrustLevel,
+    trustLevel: parseTrustLevel(item.trust_level ?? item.trustLevel),
     resolutionPath: parseResolutionPath(rawPath),
   };
 }
