@@ -113,16 +113,17 @@ pub enum TtlError {
 }
 
 // ---------------------------------------------------------------------------
-// TtlExpiryError — structured expiry failure with partial-success tracking
+// TtlExpiryResult — structured expiry outcome with partial-success tracking
 // ---------------------------------------------------------------------------
 
 /// Tracks which cleanup operations succeeded/failed during TTL expiry.
 ///
-/// When expiry cleanup fails, some operations may have completed
-/// successfully (e.g., MLS group destroyed but event log write failed).
-/// This struct preserves that information so callers know the exact state.
+/// Returned from both individual cleanup attempts and the retry loop.
+/// On full success, all step bits are set and `errors` is empty.
+/// On partial failure, the bitmask records which operations completed
+/// so that retries can skip already-succeeded steps.
 #[derive(Debug, Clone)]
-pub struct TtlExpiryError {
+pub struct TtlExpiryResult {
     /// Bitfield tracking completion of each cleanup step.
     ///
     /// Bit 0: state transition to `Expired`.
@@ -134,7 +135,7 @@ pub struct TtlExpiryError {
     errors: Vec<String>,
 }
 
-/// Bit positions for [`TtlExpiryError::completed_steps`].
+/// Bit positions for [`TtlExpiryResult::completed_steps`].
 const STEP_STATE_TRANSITIONED: u8 = 0b0000_0001;
 const STEP_MLS_DESTROYED: u8 = 0b0000_0010;
 const STEP_SENDER_KEY_DESTROYED: u8 = 0b0000_0100;
@@ -144,7 +145,7 @@ const STEP_EVENT_LOGGED: u8 = 0b0000_1000;
 const ALL_STEPS: u8 =
     STEP_STATE_TRANSITIONED | STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED | STEP_EVENT_LOGGED;
 
-impl TtlExpiryError {
+impl TtlExpiryResult {
     /// Whether the state transition to `Expired` succeeded.
     #[must_use]
     pub const fn state_transitioned(&self) -> bool {
@@ -180,22 +181,24 @@ impl TtlExpiryError {
     }
 }
 
-impl std::fmt::Display for TtlExpiryError {
+impl std::fmt::Display for TtlExpiryResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "TTL expiry incomplete (state_transitioned={}, mls_destroyed={}, \
-             sender_key_destroyed={}, event_logged={}): {}",
-            self.state_transitioned(),
-            self.mls_destroyed(),
-            self.sender_key_destroyed(),
-            self.event_logged(),
-            self.errors.join("; "),
-        )
+        if self.is_complete() {
+            write!(f, "TTL expiry complete")
+        } else {
+            write!(
+                f,
+                "TTL expiry incomplete (state_transitioned={}, mls_destroyed={}, \
+                 sender_key_destroyed={}, event_logged={}): {}",
+                self.state_transitioned(),
+                self.mls_destroyed(),
+                self.sender_key_destroyed(),
+                self.event_logged(),
+                self.errors.join("; "),
+            )
+        }
     }
 }
-
-impl std::error::Error for TtlExpiryError {}
 
 /// Maximum number of retry attempts for TTL expiry cleanup.
 const TTL_EXPIRY_MAX_RETRIES: u32 = 5;
@@ -208,7 +211,7 @@ const TTL_EXPIRY_BASE_DELAY: Duration = Duration::from_millis(500);
 /// Called with `(context_id, error)` when TTL expiry fails after all retries
 /// are exhausted. This allows the application layer to observe and react to
 /// failed expirations (e.g., mark the context as needing manual cleanup).
-pub type TtlExpiryErrorCallback = Arc<dyn Fn(String, TtlExpiryError) + Send + Sync>;
+pub type TtlExpiryFailureCallback = Arc<dyn Fn(String, TtlExpiryResult) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // check_ttl -- Clock-based TTL checking
@@ -707,7 +710,7 @@ pub async fn handle_ttl_expiry_with_transport(
         return Err(ContextError::ContextNotActive);
     }
 
-    let result = try_ttl_expiry_cleanup(handle, crypto, transport, event_log).await;
+    let result = try_ttl_expiry_cleanup(handle, crypto, transport, event_log, 0).await;
 
     if result.has_failures() {
         // Return the first error as a ContextError for backward compatibility.
@@ -726,25 +729,28 @@ pub async fn handle_ttl_expiry_with_transport(
 
 /// Attempts TTL expiry cleanup, returning a structured result.
 ///
-/// Returns a [`TtlExpiryError`] that tracks which operations succeeded and
-/// which failed. This function is idempotent: if the context has already
-/// transitioned to `Expired`, it skips the transition and retries only the
-/// remaining cleanup operations.
+/// Returns a [`TtlExpiryResult`] that tracks which operations succeeded and
+/// which failed. The `prior_completed` bitmask carries forward steps that
+/// already succeeded on a previous attempt so they are not re-executed.
+/// This prevents duplicate event log entries and redundant crypto operations
+/// across retries.
 ///
-/// Partial successes are preserved across retries — an operation that
-/// succeeded on a previous attempt is not re-attempted.
+/// State transition is inherently idempotent (an already-`Expired` context
+/// is recognized as transitioned), but crypto destruction and event log
+/// appends are **not** idempotent — hence the bitmask guard.
 pub async fn try_ttl_expiry_cleanup(
     handle: &ContextHandle,
     crypto: &dyn ContextCryptoProvider,
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,
-) -> TtlExpiryError {
+    prior_completed: u8,
+) -> TtlExpiryResult {
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
 
-    let mut result = TtlExpiryError {
-        completed_steps: 0,
+    let mut result = TtlExpiryResult {
+        completed_steps: prior_completed,
         errors: Vec::new(),
     };
 
@@ -756,57 +762,67 @@ pub async fn try_ttl_expiry_cleanup(
         result.set_step(STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED);
     }
 
-    // 1. State transition (idempotent — skip if already Expired).
-    let state = handle.state().await;
-    match state {
-        ContextState::Active => match handle.transition_to(&ContextState::Expired).await {
-            Ok(_) => result.set_step(STEP_STATE_TRANSITIONED),
-            Err(e) => {
-                let msg = format!("state transition failed: {e}");
+    // 1. State transition (idempotent — skip if already Expired or already
+    //    completed on a prior attempt).
+    if result.completed_steps & STEP_STATE_TRANSITIONED == 0 {
+        let state = handle.state().await;
+        match state {
+            ContextState::Active => match handle.transition_to(&ContextState::Expired).await {
+                Ok(_) => result.set_step(STEP_STATE_TRANSITIONED),
+                Err(e) => {
+                    let msg = format!("state transition failed: {e}");
+                    tracing::error!(context_id = %context_id, "{msg}");
+                    result.errors.push(msg);
+                    // Cannot proceed with cleanup if transition failed.
+                    return result;
+                }
+            },
+            ContextState::Expired => {
+                // Already expired (retry path). Continue with cleanup.
+                result.set_step(STEP_STATE_TRANSITIONED);
+            }
+            _ => {
+                let msg = format!(
+                    "context is in {state} state, expected Active or Expired for TTL expiry"
+                );
                 tracing::error!(context_id = %context_id, "{msg}");
                 result.errors.push(msg);
-                // Cannot proceed with cleanup if transition failed.
                 return result;
             }
-        },
-        ContextState::Expired => {
-            // Already expired (retry path). Continue with cleanup.
-            result.set_step(STEP_STATE_TRANSITIONED);
-        }
-        _ => {
-            let msg =
-                format!("context is in {state} state, expected Active or Expired for TTL expiry");
-            tracing::error!(context_id = %context_id, "{msg}");
-            result.errors.push(msg);
-            return result;
         }
     }
 
     // 2. Key destruction (Ephemeral/Summary only). Each operation is
-    //    independent — a failure in one does not block the other.
+    //    independent — a failure in one does not block the other. Skip
+    //    operations that already succeeded on a prior attempt.
     if needs_key_destruction {
-        match crypto.destroy_mls_group(&context_id_bytes) {
-            Ok(()) => result.set_step(STEP_MLS_DESTROYED),
-            Err(e) => {
-                let msg = format!("failed to destroy MLS group: {e}");
-                tracing::warn!(context_id = %context_id, error = %e,
-                    "failed to destroy MLS group after TTL expiry — keys may persist");
-                result.errors.push(msg);
+        if result.completed_steps & STEP_MLS_DESTROYED == 0 {
+            match crypto.destroy_mls_group(&context_id_bytes) {
+                Ok(()) => result.set_step(STEP_MLS_DESTROYED),
+                Err(e) => {
+                    let msg = format!("failed to destroy MLS group: {e}");
+                    tracing::warn!(context_id = %context_id, error = %e,
+                        "failed to destroy MLS group after TTL expiry — keys may persist");
+                    result.errors.push(msg);
+                }
             }
         }
-        match crypto.destroy_sender_key(&context_id_bytes) {
-            Ok(()) => result.set_step(STEP_SENDER_KEY_DESTROYED),
-            Err(e) => {
-                let msg = format!("failed to destroy sender key: {e}");
-                tracing::warn!(context_id = %context_id, error = %e,
-                    "failed to destroy sender key after TTL expiry — keys may persist");
-                result.errors.push(msg);
+        if result.completed_steps & STEP_SENDER_KEY_DESTROYED == 0 {
+            match crypto.destroy_sender_key(&context_id_bytes) {
+                Ok(()) => result.set_step(STEP_SENDER_KEY_DESTROYED),
+                Err(e) => {
+                    let msg = format!("failed to destroy sender key: {e}");
+                    tracing::warn!(context_id = %context_id, error = %e,
+                        "failed to destroy sender key after TTL expiry — keys may persist");
+                    result.errors.push(msg);
+                }
             }
         }
 
         // Best-effort relay ciphertext deletion (§5.11). Relay deletion is
         // non-blocking — even if the relay retains the encrypted blobs, the
-        // keys are destroyed and the data is unreadable.
+        // keys are destroyed and the data is unreadable. Not tracked in the
+        // bitmask since it is best-effort by design.
         if let Some(transport) = transport
             && let Err(e) = transport.delete_published(&context_id_bytes)
         {
@@ -815,21 +831,24 @@ pub async fn try_ttl_expiry_cleanup(
         }
     }
 
-    // 3. Event log append.
-    match event_log.append_context_event(&context_id_bytes, "ContextExpired") {
-        Ok(()) => result.set_step(STEP_EVENT_LOGGED),
-        Err(e) => {
-            let msg = format!("failed to log ContextExpired event: {e}");
-            tracing::warn!(context_id = %context_id, error = %e,
-                "failed to append ContextExpired to event log");
-            result.errors.push(msg);
+    // 3. Event log append — skip if already succeeded on a prior attempt to
+    //    avoid duplicate ContextExpired entries in the Merkle log.
+    if result.completed_steps & STEP_EVENT_LOGGED == 0 {
+        match event_log.append_context_event(&context_id_bytes, "ContextExpired") {
+            Ok(()) => result.set_step(STEP_EVENT_LOGGED),
+            Err(e) => {
+                let msg = format!("failed to log ContextExpired event: {e}");
+                tracing::warn!(context_id = %context_id, error = %e,
+                    "failed to append ContextExpired to event log");
+                result.errors.push(msg);
+            }
         }
     }
 
     result
 }
 
-impl TtlExpiryError {
+impl TtlExpiryResult {
     /// Returns `true` if any cleanup operation failed.
     #[must_use]
     pub const fn has_failures(&self) -> bool {
@@ -845,23 +864,31 @@ impl TtlExpiryError {
 
 /// Runs TTL expiry cleanup with exponential backoff retries.
 ///
-/// Attempts cleanup up to [`TTL_EXPIRY_MAX_RETRIES`] times. Partial successes
-/// are tracked — only failed operations are retried. If the cancel signal
-/// fires during a retry delay, cleanup is abandoned.
+/// Attempts cleanup up to [`TTL_EXPIRY_MAX_RETRIES`] times. The
+/// `completed_steps` bitmask from each attempt is carried forward to the
+/// next, so operations that already succeeded (state transition, key
+/// destruction, event log append) are never re-executed. This prevents
+/// duplicate Merkle event log entries and redundant crypto operations.
 ///
-/// Returns the final [`TtlExpiryError`] result after all retries are
-/// exhausted or cleanup succeeds.
+/// If the cancel signal fires during a retry delay, cleanup is abandoned
+/// and the partial result is returned immediately.
+///
+/// Returns the final [`TtlExpiryResult`] after all retries are exhausted
+/// or cleanup succeeds.
 pub async fn run_ttl_expiry_with_retries(
     handle: &ContextHandle,
     crypto: &dyn ContextCryptoProvider,
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,
     cancel: &Notify,
-) -> TtlExpiryError {
+) -> TtlExpiryResult {
     let context_id = handle.context_id().to_owned();
+    let mut completed_steps: u8 = 0;
 
     for attempt in 0..TTL_EXPIRY_MAX_RETRIES {
-        let result = try_ttl_expiry_cleanup(handle, crypto, transport, event_log).await;
+        let result =
+            try_ttl_expiry_cleanup(handle, crypto, transport, event_log, completed_steps).await;
+        completed_steps = result.completed_steps;
 
         if result.is_complete() {
             if attempt > 0 {
@@ -909,7 +936,7 @@ pub async fn run_ttl_expiry_with_retries(
     }
 
     // Unreachable in practice, but satisfies the type system.
-    TtlExpiryError {
+    TtlExpiryResult {
         completed_steps: 0,
         errors: vec!["retry loop exited without result".into()],
     }
@@ -924,7 +951,7 @@ pub async fn run_ttl_expiry_with_retries(
 /// On expiry, the timer runs cleanup with exponential backoff retries (up to
 /// [`TTL_EXPIRY_MAX_RETRIES`] attempts). If cleanup fails after all retries,
 /// the optional `on_error` callback is invoked with the context ID and a
-/// [`TtlExpiryError`] describing which operations succeeded and which failed.
+/// [`TtlExpiryResult`] describing which operations succeeded and which failed.
 ///
 /// See ADR-008 acceptance criterion 9.
 pub struct TtlTimer {
@@ -936,7 +963,7 @@ pub struct TtlTimer {
     /// Used to compute remaining TTL for persistence snapshots.
     pub(crate) deadline_unix_secs: Option<u64>,
     /// Optional callback invoked when TTL expiry fails after all retries.
-    pub(crate) on_error: Option<TtlExpiryErrorCallback>,
+    pub(crate) on_error: Option<TtlExpiryFailureCallback>,
 }
 
 impl TtlTimer {
@@ -956,7 +983,7 @@ impl TtlTimer {
     /// The callback is invoked with `(context_id, error)` when TTL expiry
     /// cleanup fails after all retry attempts are exhausted.
     #[must_use]
-    pub fn with_error_callback(on_error: TtlExpiryErrorCallback) -> Self {
+    pub fn with_error_callback(on_error: TtlExpiryFailureCallback) -> Self {
         Self {
             task: None,
             cancel: Arc::new(Notify::new()),
@@ -966,7 +993,7 @@ impl TtlTimer {
     }
 
     /// Sets the error callback. Replaces any existing callback.
-    pub fn set_error_callback(&mut self, on_error: TtlExpiryErrorCallback) {
+    pub fn set_error_callback(&mut self, on_error: TtlExpiryFailureCallback) {
         self.on_error = Some(on_error);
     }
 
@@ -2448,7 +2475,7 @@ mod tests {
         let crypto = FailingMlsCrypto::default();
         let event_log = MockEventLog::default();
 
-        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log).await;
+        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log, 0).await;
 
         // State transition succeeded.
         assert!(result.state_transitioned());
@@ -2473,7 +2500,7 @@ mod tests {
         let crypto = MockCrypto::default();
         let event_log = FailingEventLog;
 
-        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log).await;
+        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log, 0).await;
 
         assert!(result.state_transitioned());
         assert!(result.mls_destroyed());
@@ -2491,7 +2518,7 @@ mod tests {
         let crypto = FailingMlsCrypto::default();
         let event_log = MockEventLog::default();
 
-        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log).await;
+        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log, 0).await;
 
         // Even though crypto would fail, Full scope skips key destruction.
         assert!(result.state_transitioned());
@@ -2510,12 +2537,16 @@ mod tests {
         let event_log = MockEventLog::default();
 
         // First cleanup.
-        let result1 = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log).await;
+        let result1 = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log, 0).await;
         assert!(result1.is_complete());
         assert_eq!(handle.state().await, ContextState::Expired);
 
-        // Second cleanup (already Expired) — idempotent.
-        let result2 = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log).await;
+        // Second cleanup (already Expired) — state transition is idempotent.
+        // Pass prior_completed from the first result to skip already-done
+        // non-idempotent operations (key destruction, event log).
+        let result2 =
+            try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log, result1.completed_steps)
+                .await;
         assert!(result2.is_complete());
         assert_eq!(handle.state().await, ContextState::Expired);
     }
@@ -2531,7 +2562,7 @@ mod tests {
         let crypto = MockCrypto::default();
         let event_log = MockEventLog::default();
 
-        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log).await;
+        let result = try_ttl_expiry_cleanup(&handle, &crypto, None, &event_log, 0).await;
 
         assert!(!result.state_transitioned());
         assert!(result.has_failures());
@@ -2568,8 +2599,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttl_expiry_error_display_includes_step_status() {
-        let err = TtlExpiryError {
+    async fn ttl_expiry_result_display_includes_step_status() {
+        let err = TtlExpiryResult {
             completed_steps: STEP_STATE_TRANSITIONED | STEP_SENDER_KEY_DESTROYED,
             errors: vec!["MLS fail".into(), "log fail".into()],
         };
@@ -2636,7 +2667,7 @@ mod tests {
         let callback_context_id = Arc::new(Mutex::new(String::new()));
         let callback_context_id_clone = Arc::clone(&callback_context_id);
 
-        let on_error: TtlExpiryErrorCallback = Arc::new(move |ctx_id, error| {
+        let on_error: TtlExpiryFailureCallback = Arc::new(move |ctx_id, error| {
             callback_invoked_clone.store(true, Ordering::SeqCst);
             *callback_context_id_clone.lock().unwrap() = ctx_id;
             assert!(!error.mls_destroyed());
@@ -2884,7 +2915,8 @@ mod tests {
 
         // MLS destruction succeeded once (on the 3rd attempt — first 2 failed).
         assert_eq!(crypto.mls_destroyed.lock().unwrap().len(), 1);
-        // Sender key destruction succeeded on each attempt (3 total).
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 3);
+        // Sender key destruction succeeded on the first attempt and was
+        // skipped on retries (prior_completed bitmask preserves success).
+        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
     }
 }

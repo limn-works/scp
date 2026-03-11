@@ -5882,6 +5882,7 @@ impl ContextManager {
             self.crypto.as_ref(),
             Some(self.transport.as_ref()),
             self.event_log.as_ref(),
+            0,
         )
         .await;
 
@@ -6087,9 +6088,9 @@ impl ContextManager {
         });
 
         // Store the task handle (lock, then drop).
-        let context_id_owned2 = context_id.to_owned();
+        let context_id_for_store = context_id.to_owned();
         let mut contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(&context_id_owned2) {
+        if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
             ctx.ttl_timer.task = Some(task);
         }
     }

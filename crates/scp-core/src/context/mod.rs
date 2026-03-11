@@ -172,7 +172,7 @@ pub use export_import::{
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
-pub use ttl::{CloseResult, TtlExpiryError, TtlExpiryErrorCallback, TtlExtension, TtlTimer};
+pub use ttl::{CloseResult, TtlExpiryFailureCallback, TtlExpiryResult, TtlExtension, TtlTimer};
 pub use ttl::{
     ExtensionConsentMode, TtlEnforcer, TtlError, TtlExtensionProposal, TtlPolicy, TtlTimerHandle,
     check_ttl, consent_mode_for_member_count, run_ttl_expiry_with_retries, try_ttl_expiry_cleanup,
