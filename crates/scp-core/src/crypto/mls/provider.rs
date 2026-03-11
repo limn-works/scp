@@ -83,7 +83,7 @@ use crate::crypto::sender_keys::{
 /// zeroize the intermediate `MlsCryptoSnapshot` struct after
 /// serialization/extraction to minimize the window where private keys
 /// exist as a structured, easily-extractable object in memory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct MlsCryptoSnapshot {
     /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
     /// Each pair is `(key_bytes, value_bytes)`.
@@ -114,6 +114,36 @@ struct MlsCryptoSnapshot {
     /// is re-wrapped in [`Zeroizing`] on restore.
     #[serde(default)]
     wrapping_secret_key: Vec<u8>,
+}
+
+// SECURITY: Manual Debug impl redacts all sensitive key material.
+// Clone is intentionally NOT derived — snapshots contain raw private keys
+// (Ed25519 signer, AES-256 sender key, X25519 wrapping secret, MLS epoch
+// secrets) and should not be freely duplicated. The export/restore path
+// constructs snapshots fresh each time without cloning.
+impl std::fmt::Debug for MlsCryptoSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsCryptoSnapshot")
+            .field(
+                "mls_storage_entries",
+                &format_args!("[{} entries, REDACTED]", self.mls_storage_entries.len()),
+            )
+            .field("local_sender_key", &"[REDACTED]")
+            .field(
+                "sender_key_entries",
+                &format_args!("[{} entries, REDACTED]", self.sender_key_entries.len()),
+            )
+            .field("sender_key_epoch", &self.sender_key_epoch)
+            .field(
+                "member_wrapping_keys",
+                &format_args!("[{} entries]", self.member_wrapping_keys.len()),
+            )
+            .field("signer_bytes", &"[REDACTED]")
+            .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
+            .field("wrapping_public_key", &"[REDACTED]")
+            .field("wrapping_secret_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
@@ -778,8 +808,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let group_id = group.group_id().as_slice().to_vec();
 
         // Serialize the signer via serde (it derives Serialize).
-        let signer_bytes = rmp_serde::to_vec_named(signer)
-            .map_err(|e| ContextError::CryptoFailed(format!("signer serialization: {e}")))?;
+        // SECURITY: Wrapped in Zeroizing so the Ed25519 private key bytes are
+        // zeroed if an early `?` return occurs before the snapshot is built.
+        let mut signer_bytes = Zeroizing::new(
+            rmp_serde::to_vec_named(signer)
+                .map_err(|e| ContextError::CryptoFailed(format!("signer serialization: {e}")))?,
+        );
 
         // Extract the raw key-value pairs from the OpenMLS MemoryStorage.
         let mls_storage_entries = {
@@ -821,7 +855,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
-            signer_bytes,
+            // Move signer bytes out of the Zeroizing wrapper and into the
+            // snapshot. The wrapper is left holding an empty Vec (which it
+            // will zeroize on drop — a no-op for an empty vec).
+            signer_bytes: std::mem::take(&mut signer_bytes),
             group_id,
             wrapping_public_key: *pub_key_guard,
             wrapping_secret_key: secret_key_guard.to_vec(),
@@ -921,6 +958,36 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             SenderKey::from_bytes([0u8; 32]),
         );
 
+        // Restore the provider-level X25519 wrapping keypair BEFORE inserting
+        // the context state, so that a lock-poisoned error here does not leave
+        // the context map in an inconsistent state (context inserted but
+        // wrapping keys mismatched).
+        //
+        // Legacy snapshots (pre-wrapping-key persistence) have default
+        // [0u8; 32] — skip restore in that case to keep the fresh keypair.
+        if snapshot.wrapping_public_key != [0u8; 32] && snapshot.wrapping_secret_key.len() == 32 {
+            // SECURITY: Wrap the intermediate secret in Zeroizing so it is
+            // zeroed on drop even if a `?` return occurs below.
+            let mut secret = Zeroizing::new([0u8; 32]);
+            secret.copy_from_slice(&snapshot.wrapping_secret_key);
+
+            let mut pub_guard = self.wrapping_public_key.lock().map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
+            })?;
+            *pub_guard = snapshot.wrapping_public_key;
+
+            let mut secret_guard = self.wrapping_secret_key.lock().map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
+            })?;
+            *secret_guard = Zeroizing::new(*secret);
+        }
+
+        // SECURITY: Zeroize the wrapping secret key bytes remaining in the
+        // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
+        // above (or skipped for legacy snapshots), so this intermediate Vec
+        // should not retain raw X25519 secret key material.
+        snapshot.wrapping_secret_key.zeroize();
+
         let crypto_state = ContextCryptoState {
             mls_group: scp_group,
             sender_key: local_sender_key,
@@ -936,36 +1003,6 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
         contexts.insert(*context_id, crypto_state);
-
-        // Restore the provider-level X25519 wrapping keypair so HPKE-sealed
-        // sender key responses targeting the OLD public key can still be
-        // decrypted. Without this, the freshly-generated keypair would not
-        // match the public key published in the MLS tree's LeafNode extension,
-        // causing HPKE decryption failures for all incoming sender key
-        // responses sealed against the original key.
-        //
-        // Legacy snapshots (pre-wrapping-key persistence) have default
-        // [0u8; 32] — skip restore in that case to keep the fresh keypair.
-        if snapshot.wrapping_public_key != [0u8; 32] && snapshot.wrapping_secret_key.len() == 32 {
-            let mut secret = [0u8; 32];
-            secret.copy_from_slice(&snapshot.wrapping_secret_key);
-
-            let mut pub_guard = self.wrapping_public_key.lock().map_err(|e| {
-                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
-            })?;
-            *pub_guard = snapshot.wrapping_public_key;
-
-            let mut secret_guard = self.wrapping_secret_key.lock().map_err(|e| {
-                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
-            })?;
-            *secret_guard = Zeroizing::new(secret);
-        }
-
-        // SECURITY: Zeroize the wrapping secret key bytes remaining in the
-        // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
-        // above (or skipped for legacy snapshots), so this intermediate Vec
-        // should not retain raw X25519 secret key material.
-        snapshot.wrapping_secret_key.zeroize();
 
         Ok(())
     }
