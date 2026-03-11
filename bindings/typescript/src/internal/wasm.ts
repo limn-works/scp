@@ -894,12 +894,7 @@ export function createWasmBridge(): Bridge {
       contextId: string | undefined,
     ) {
       const wasm = getWasm();
-      return wasm.bridge_create_shadow(
-        bridgeId,
-        platformHandle,
-        bridgeMode,
-        contextId,
-      );
+      return wasm.bridge_create_shadow(bridgeId, platformHandle, bridgeMode, contextId);
     },
 
     // Discovery
