@@ -249,14 +249,11 @@ pub fn discovery_create_query(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Pure helper tests — no wasm-bindgen dependency, run on all targets.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // Pure helper tests — no wasm-bindgen dependency
-    // -----------------------------------------------------------------------
 
     #[test]
     fn validate_local_part_valid() {
@@ -306,10 +303,13 @@ mod tests {
         assert_eq!(classify_scope("did:key:z6MkTest"), "AttestationHandle");
         assert_eq!(classify_scope("photography"), "DiscoveryHandle");
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Bridge function tests — JsError works on native targets
-    // -----------------------------------------------------------------------
+/// Bridge function tests — call `#[wasm_bindgen]` exports, only run on wasm32.
+#[cfg(all(test, target_arch = "wasm32"))]
+#[allow(clippy::unwrap_used)]
+mod wasm_tests {
+    use super::*;
 
     #[test]
     fn parse_discovery_handle() {
