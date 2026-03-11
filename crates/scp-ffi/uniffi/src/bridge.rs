@@ -1569,7 +1569,6 @@ pub struct TransportManager {
     pub(crate) status: std::sync::Mutex<TransportStatus>,
     /// The underlying relay adapter (live WebSocket connection).
     /// `None` after `transport_disconnect` is called.
-    #[allow(dead_code)]
     pub(crate) adapter:
         std::sync::Mutex<Option<Arc<scp_transport::native::adapter::NativeRelayAdapter>>>,
 }
@@ -3436,14 +3435,6 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
             let arc_adapter = Arc::new(adapter);
 
-            // Store the connection in global state for other bridge functions.
-            runtime::set_relay_connection(Arc::clone(&arc_adapter), relay_url.clone()).map_err(
-                |e| ScpError::Transport {
-                    message: e,
-                    code: "SCP-TRANS-5002".to_owned(),
-                },
-            )?;
-
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
@@ -3477,10 +3468,9 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 
 /// Disconnects from the current SCP relay.
 ///
-/// Clears the relay adapter from both the `TransportManager` handle and the
-/// global relay connection state. After this call, the `TransportManager`
-/// reports `connected: false` and the adapter's WebSocket connection is
-/// released when the last reference is dropped.
+/// Clears the relay adapter from the `TransportManager` handle. After this
+/// call, the `TransportManager` reports `connected: false` and the adapter's
+/// WebSocket connection is released when the last reference is dropped.
 ///
 /// This is idempotent — calling it when already disconnected is a no-op.
 ///
@@ -3490,27 +3480,31 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Transport` if clearing connection state fails.
+/// Returns `ScpError::Transport` if the internal mutex is poisoned.
 #[uniffi::export]
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
             // Clear the adapter from the manager.
-            if let Ok(mut adapter_guard) = manager.adapter.lock() {
+            {
+                let mut adapter_guard =
+                    manager.adapter.lock().map_err(|_| ScpError::Transport {
+                        message: "adapter mutex is poisoned — cannot clear relay adapter"
+                            .to_owned(),
+                        code: "SCP-TRANS-5003".to_owned(),
+                    })?;
                 *adapter_guard = None;
             }
 
             // Update the status to disconnected.
-            if let Ok(mut status_guard) = manager.status.lock() {
+            {
+                let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
+                    message: "status mutex is poisoned — cannot update transport status".to_owned(),
+                    code: "SCP-TRANS-5003".to_owned(),
+                })?;
                 status_guard.connected = false;
                 status_guard.relay_url = None;
             }
-
-            // Clear global relay connection state.
-            runtime::clear_relay_connection().map_err(|e| ScpError::Transport {
-                message: e,
-                code: "SCP-TRANS-5003".to_owned(),
-            })?;
 
             Ok(())
         })
