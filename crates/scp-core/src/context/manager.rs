@@ -3525,9 +3525,8 @@ impl ContextManager {
                 let cid_bytes = context_id_to_bytes(context_id);
                 for event in &freeze_events {
                     if let GovernanceEvent::ConflictResolved { .. } = event {
-                        let _ = self
-                            .event_log
-                            .append_context_event(&cid_bytes, "GovernanceFreezeExpired");
+                        self.event_log
+                            .append_context_event(&cid_bytes, "GovernanceFreezeExpired")?;
                     }
                 }
             }
@@ -3580,14 +3579,12 @@ impl ContextManager {
             for event in &conflict_events {
                 match event {
                     GovernanceEvent::ConflictDetected { .. } => {
-                        let _ = self
-                            .event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected");
+                        self.event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected")?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
-                        let _ = self
-                            .event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved");
+                        self.event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
                     }
                     _ => {}
                 }
@@ -3704,14 +3701,12 @@ impl ContextManager {
             for event in &conflict_events {
                 match event {
                     GovernanceEvent::ConflictDetected { .. } => {
-                        let _ = self
-                            .event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected");
+                        self.event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected")?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
-                        let _ = self
-                            .event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved");
+                        self.event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
                     }
                     _ => {}
                 }
@@ -3982,9 +3977,8 @@ impl ContextManager {
 
         let context_id_bytes = context_id_to_bytes(context_id);
         for event in &events {
-            let _ = self
-                .event_log
-                .append_context_event(&context_id_bytes, Self::governance_event_label(event));
+            self.event_log
+                .append_context_event(&context_id_bytes, Self::governance_event_label(event))?;
         }
 
         // Persist context state after withdrawal.
