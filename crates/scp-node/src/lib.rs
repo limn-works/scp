@@ -532,12 +532,24 @@ pub fn builder() -> ApplicationNodeBuilder {
 /// The value stored under this key is a JSON-serialized [`PersistedIdentity`].
 const IDENTITY_STORAGE_KEY: &str = "scp/identity";
 
+/// Current schema version for [`PersistedIdentity`].
+const PERSISTED_IDENTITY_VERSION: u32 = 1;
+
+/// Returns the default version for deserialization of legacy data that predates
+/// the `version` field.
+const fn persisted_identity_default_version() -> u32 {
+    PERSISTED_IDENTITY_VERSION
+}
+
 /// Serializable snapshot of an [`ScpIdentity`] and its [`DidDocument`].
 ///
 /// Used by [`ApplicationNodeBuilder::identity_with_storage`] to persist a newly
 /// created identity so that subsequent restarts produce the same DID.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedIdentity {
+    /// Schema version for forward-compatible deserialization.
+    #[serde(default = "persisted_identity_default_version")]
+    version: u32,
     identity: ScpIdentity,
     document: DidDocument,
 }
@@ -1980,6 +1992,35 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 let persisted: PersistedIdentity = serde_json::from_slice(&bytes).map_err(|e| {
                     NodeError::Storage(format!("failed to deserialize persisted identity: {e}"))
                 })?;
+
+                // 2a. Validate that persisted key handles are resolvable in the
+                //     provided custody backend.  A mismatch (e.g. fresh in-memory
+                //     custody after restart) is caught here rather than surfacing
+                //     as an opaque signing failure later.
+                key_custody
+                    .public_key(&persisted.identity.identity_key)
+                    .await
+                    .map_err(|e| {
+                        NodeError::Storage(format!(
+                            "persisted identity key handle not found in custody: {e}"
+                        ))
+                    })?;
+                key_custody
+                    .public_key(&persisted.identity.active_signing_key)
+                    .await
+                    .map_err(|e| {
+                        NodeError::Storage(format!(
+                            "persisted active signing key handle not found in custody: {e}"
+                        ))
+                    })?;
+                if let Some(ref agent_key) = persisted.identity.agent_signing_key {
+                    key_custody.public_key(agent_key).await.map_err(|e| {
+                        NodeError::Storage(format!(
+                            "persisted agent signing key handle not found in custody: {e}"
+                        ))
+                    })?;
+                }
+
                 tracing::info!(
                     did = %persisted.identity.did,
                     "reloaded persisted identity from storage"
@@ -1989,6 +2030,7 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 // 3. Generate a new identity and persist it.
                 let (identity, document) = did_method.create(&*key_custody).await?;
                 let persisted = PersistedIdentity {
+                    version: PERSISTED_IDENTITY_VERSION,
                     identity: identity.clone(),
                     document: document.clone(),
                 };
@@ -4717,6 +4759,7 @@ mod tests {
             .unwrap()
             .expect("identity should be persisted to storage");
         let persisted: PersistedIdentity = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(persisted.version, PERSISTED_IDENTITY_VERSION);
         assert_eq!(persisted.identity.did, did);
         assert_eq!(persisted.document.id, did);
 
@@ -4765,6 +4808,80 @@ mod tests {
         );
 
         node2.shutdown();
+    }
+
+    #[tokio::test]
+    async fn identity_with_storage_rejects_mismatched_custody() {
+        // First run: create identity with one custody instance.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody1 = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody1));
+
+        let node1 = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("mismatch.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "mismatch.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody1, Arc::clone(&did_method))
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        node1.shutdown();
+
+        // Second run: fresh custody with NO keys → should fail validation.
+        let custody2 = Arc::new(InMemoryKeyCustody::new());
+        let did_method2 = Arc::new(make_test_dht(&custody2));
+
+        let result = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("mismatch.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "mismatch.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody2, did_method2)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await;
+
+        let err = result
+            .err()
+            .expect("build should fail with mismatched custody");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found in custody"),
+            "expected custody validation error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_with_storage_version_field_backward_compat() {
+        // Simulate legacy data without a `version` field — serde default should
+        // fill in the current version.
+        let legacy_json = serde_json::json!({
+            "identity": {
+                "identity_key": 1,
+                "active_signing_key": 2,
+                "agent_signing_key": null,
+                "pre_rotation_commitment": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "did": "did:dht:zlegacy"
+            },
+            "document": {
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "did:dht:zlegacy",
+                "verificationMethod": [],
+                "authentication": [],
+                "assertionMethod": []
+            }
+        });
+        let bytes = serde_json::to_vec(&legacy_json).unwrap();
+        let persisted: PersistedIdentity = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            persisted.version, PERSISTED_IDENTITY_VERSION,
+            "missing version field should default to current version"
+        );
     }
 
     #[tokio::test]
