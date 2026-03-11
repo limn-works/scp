@@ -500,10 +500,15 @@ export class Context implements AsyncDisposable {
   // ---------------------------------------------------------------------------
 
   /**
-   * Returns the remaining TTL in seconds, or `null` if no TTL is configured.
+   * Returns the configured TTL duration in seconds, or `null` if no TTL is set.
    *
-   * @returns Remaining seconds, or `null` for persistent contexts.
+   * Note: In the WASM bridge, this returns the current TTL value stored on the
+   * context (which increases when extended), not a real-time countdown. The
+   * native (NAPI) bridge does not support this operation.
+   *
+   * @returns The configured TTL duration in seconds, or `null` for persistent contexts.
    * @throws {ContextError} If the context has been disposed.
+   * @throws {TransportError} If using the native (NAPI) bridge, which does not support this operation.
    */
   async ttlRemaining(): Promise<number | null> {
     this.assertActive();
@@ -518,14 +523,19 @@ export class Context implements AsyncDisposable {
   /**
    * Extends the TTL by the given number of seconds.
    *
-   * @param additionalSecs - Number of seconds to add to the TTL.
+   * @param additionalSecs - Number of seconds to add to the TTL. Must be greater than zero.
+   * @returns `true` if the extension was applied.
    * @throws {ContextError} If the context has been disposed or extension fails.
+   * @throws {ContextError} If `additionalSecs` is zero or negative.
    */
-  async extendTtl(additionalSecs: number): Promise<void> {
+  async extendTtl(additionalSecs: number): Promise<boolean> {
     this.assertActive();
+    if (additionalSecs <= 0) {
+      throw new ContextError("additionalSecs must be greater than zero", "SCP-CTX-2031");
+    }
     try {
       const bridge = await getBridge();
-      await bridge.contextExtendTtl(this._handle, additionalSecs);
+      return await bridge.contextExtendTtl(this._handle, additionalSecs);
     } catch (error) {
       throw mapBridgeError(error);
     }
