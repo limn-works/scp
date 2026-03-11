@@ -530,7 +530,7 @@ export class Context implements AsyncDisposable {
    */
   async extendTtl(additionalSecs: number): Promise<boolean> {
     this.assertActive();
-    if (additionalSecs <= 0) {
+    if (additionalSecs <= 0 || Number.isNaN(additionalSecs)) {
       throw new ContextError("additionalSecs must be greater than zero", "SCP-CTX-2031");
     }
     try {
