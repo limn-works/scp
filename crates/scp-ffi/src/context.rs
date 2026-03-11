@@ -1671,6 +1671,17 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             .await
             .map_err(|e| PyRuntimeError::new_err(format!("governance execution failed: {e}")))?;
 
+        // Re-sync local role state cache from ContextManager after any
+        // governance action that may have modified roles/membership (#560).
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance action — \
+                 local capability checks may be stale"
+            );
+        }
+
         use scp_core::context::manager::GovernanceActionResult;
         let result_str = match result {
             GovernanceActionResult::MemberAdded => "MemberAdded",
@@ -2796,5 +2807,202 @@ mod tests {
         let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         py_set_economic_policy(&mut handle, new_json).unwrap();
         assert_eq!(handle.params.economic_policy.as_deref(), Some(new_json));
+    }
+
+    // -----------------------------------------------------------------------
+    // Role state sync after governance (#560)
+    // -----------------------------------------------------------------------
+
+    fn approved_proposal(
+        pid: [u8; 32],
+        context_id: &str,
+        action: scp_core::context::governance::GovernanceAction,
+        approver_did: &str,
+    ) -> scp_core::context::governance::GovernanceProposal {
+        use scp_core::context::governance::{SignedVote, VoteType};
+        scp_core::context::governance::GovernanceProposal {
+            proposal_id: pid,
+            context_id: context_id.into(),
+            proposer_did: scp_identity::DID(approver_did.to_owned()),
+            action,
+            status: scp_core::context::governance::ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: scp_identity::DID(approver_did.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        }
+    }
+
+    #[test]
+    fn role_state_syncs_after_change_role() {
+        crate::init_runtime().ok();
+        let ctx_id = format!("sync-role-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkCreatorSync1";
+        crate::runtime::register_context(&ctx_id, creator).unwrap();
+        let mgr = crate::runtime::context_manager().unwrap();
+        let rt = crate::runtime().unwrap();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(mgr.create_context(
+            ctx_id.clone(),
+            params,
+            scp_identity::DID(creator.to_owned()),
+        ))
+        .unwrap();
+        let new_did = "did:key:z6MkNewMember1";
+        let add = approved_proposal(
+            [1u8; 32],
+            &ctx_id,
+            scp_core::context::governance::GovernanceAction::AddMember {
+                did: scp_identity::DID(new_did.to_owned()),
+                role: "member".to_owned(),
+            },
+            creator,
+        );
+        rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
+        let change = approved_proposal(
+            [2u8; 32],
+            &ctx_id,
+            scp_core::context::governance::GovernanceAction::ChangeRole {
+                did: scp_identity::DID(new_did.to_owned()),
+                new_role: "observer".to_owned(),
+            },
+            creator,
+        );
+        rt.block_on(mgr.execute_governance_action(&ctx_id, &change))
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            let assignment = st
+                .role_state
+                .assignments
+                .get(new_did)
+                .expect("member should have an assignment");
+            assert_eq!(
+                assignment.role_name, "observer",
+                "role should be observer after ChangeRole + sync"
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn role_state_syncs_after_add_member() {
+        crate::init_runtime().ok();
+        let ctx_id = format!("sync-add-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkCreatorSync2";
+        crate::runtime::register_context(&ctx_id, creator).unwrap();
+        let mgr = crate::runtime::context_manager().unwrap();
+        let rt = crate::runtime().unwrap();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(mgr.create_context(
+            ctx_id.clone(),
+            params,
+            scp_identity::DID(creator.to_owned()),
+        ))
+        .unwrap();
+        let new_did = "did:key:z6MkAdded1";
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(!st.role_state.members.contains(new_did));
+            Ok(())
+        })
+        .unwrap();
+        let add = approved_proposal(
+            [3u8; 32],
+            &ctx_id,
+            scp_core::context::governance::GovernanceAction::AddMember {
+                did: scp_identity::DID(new_did.to_owned()),
+                role: "member".to_owned(),
+            },
+            creator,
+        );
+        rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(st.role_state.members.contains(new_did));
+            assert_eq!(
+                st.role_state
+                    .assignments
+                    .get(new_did)
+                    .map(|a| a.role_name.as_str()),
+                Some("member")
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn role_state_syncs_after_remove_member() {
+        crate::init_runtime().ok();
+        let ctx_id = format!("sync-rm-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkCreatorSync3";
+        let target = "did:key:z6MkRemoveTarget";
+        crate::runtime::register_context(&ctx_id, creator).unwrap();
+        let mgr = crate::runtime::context_manager().unwrap();
+        let rt = crate::runtime().unwrap();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(mgr.create_context(
+            ctx_id.clone(),
+            params,
+            scp_identity::DID(creator.to_owned()),
+        ))
+        .unwrap();
+        let add = approved_proposal(
+            [4u8; 32],
+            &ctx_id,
+            scp_core::context::governance::GovernanceAction::AddMember {
+                did: scp_identity::DID(target.to_owned()),
+                role: "member".to_owned(),
+            },
+            creator,
+        );
+        rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(st.role_state.members.contains(target));
+            Ok(())
+        })
+        .unwrap();
+        let rm = approved_proposal(
+            [5u8; 32],
+            &ctx_id,
+            scp_core::context::governance::GovernanceAction::RemoveMember {
+                did: scp_identity::DID(target.to_owned()),
+                reason: Some("test removal".to_owned()),
+            },
+            creator,
+        );
+        rt.block_on(mgr.execute_governance_action(&ctx_id, &rm))
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(!st.role_state.members.contains(target));
+            assert!(st.role_state.assignments.get(target).is_none());
+            Ok(())
+        })
+        .unwrap();
+        crate::runtime::remove_context(&ctx_id);
     }
 }
