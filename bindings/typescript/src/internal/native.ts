@@ -742,6 +742,9 @@ export function createNativeBridge(): Bridge {
       members: string[],
       targetContextId: string,
       existingChainDepth: number | undefined,
+      discoveryMethod: string | undefined,
+      purpose: string | undefined,
+      counterpartyPolicy: string | undefined,
     ) {
       return (
         addon.provenanceAttach as (
@@ -751,8 +754,21 @@ export function createNativeBridge(): Bridge {
           m: string[],
           tc: string,
           e: number | undefined,
+          dm: string | undefined,
+          p: string | undefined,
+          cp: string | undefined,
         ) => string
-      )(sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth);
+      )(
+        sourceContextId,
+        sourceType,
+        memoryScope,
+        members,
+        targetContextId,
+        existingChainDepth,
+        discoveryMethod,
+        purpose,
+        counterpartyPolicy,
+      );
     },
 
     provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined) {

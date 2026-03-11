@@ -96,7 +96,7 @@ export { createQuery, discoverContexts, normalizeAddress, parseAddress } from ".
 // Provenance
 // ---------------------------------------------------------------------------
 
-export type { ProvenanceRecord } from "./provenance";
+export type { DiscoveryMethod, ProvenanceRecord } from "./provenance";
 export {
   evaluateProvenanceQuality,
   provenanceAttach,

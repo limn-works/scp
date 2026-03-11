@@ -258,6 +258,19 @@ pub fn evaluate_provenance_quality(
 /// - `target_context_id` — ID of the target context.
 /// - `existing_chain_depth` — Chain depth from existing provenance, or -1 for first hop.
 /// - `existing_chain_path_json` — JSON array of context IDs from existing provenance, or empty.
+/// - `discovery_method` — Optional: `"none"`, `"shared_context:<id>"`, or `"registry:<id>"`.
+/// - `purpose` — Optional human-readable purpose description.
+///
+/// # WASM limitation: no `counterparty_policy`
+///
+/// The native (napi-rs) bridge accepts a `counterparty_policy` parameter
+/// (`"full"` / `"pseudonymized"` / `"redacted"`) that controls how
+/// counterparty DIDs are represented in the output record. This WASM bridge
+/// does not support `counterparty_policy` because the policy application
+/// logic lives in `scp-core::provenance::attach`, which cannot be compiled
+/// to `wasm32-unknown-unknown` (tokio multi-thread dependency; see ADR-034).
+/// Counterparty DIDs are always included verbatim ("full" behavior).
+/// The TypeScript WASM adapter (`wasm.ts`) silently drops the parameter.
 ///
 /// # Errors
 ///
@@ -268,10 +281,12 @@ pub fn evaluate_provenance_quality(
 /// ```js
 /// const prov = provenance_attach(
 ///   "ctx-source", "Persistent", "Full",
-///   '["did:key:alice"]', "ctx-target", -1, "[]"
+///   '["did:key:alice"]', "ctx-target", -1, "[]",
+///   "none", null
 /// );
 /// ```
 #[wasm_bindgen]
+#[allow(clippy::too_many_arguments)] // wasm_bindgen requires explicit params
 pub fn provenance_attach(
     source_context_id: String,
     source_type: String,
@@ -280,6 +295,8 @@ pub fn provenance_attach(
     target_context_id: String,
     existing_chain_depth: f64,
     existing_chain_path_json: String,
+    discovery_method: Option<String>,
+    purpose: Option<String>,
 ) -> Result<String, JsError> {
     if source_context_id.is_empty() {
         return Err(JsError::new(
@@ -310,6 +327,8 @@ pub fn provenance_attach(
         ))
     })?;
 
+    let dm = parse_wasm_discovery_method(discovery_method.as_deref())?;
+
     // Compute chain depth and path
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let (chain_depth, chain_path) = if existing_chain_depth < 0.0 {
@@ -330,6 +349,8 @@ pub fn provenance_attach(
         (new_depth, serde_json::json!(path))
     };
 
+    // WASM has no real timer — age is always 0 at attachment time.
+    // The field must be present for structural parity with the NAPI bridge.
     let result = serde_json::json!({
         "source_context": source_context_id,
         "source_type": st.to_string(),
@@ -337,10 +358,37 @@ pub fn provenance_attach(
         "memory_scope": ms.to_string(),
         "chain_depth": chain_depth,
         "chain_path": chain_path,
-        "target_context": target_context_id,
+        "age_secs": 0,
+        "discovery_method": dm,
+        "purpose": purpose,
+        "payment_amount": serde_json::Value::Null,
+        "payment_adapter": serde_json::Value::Null,
+        "payment_receipt_id": serde_json::Value::Null,
     });
 
     Ok(result.to_string())
+}
+
+/// Parses a discovery method string into a JSON value (§24.2.3).
+fn parse_wasm_discovery_method(s: Option<&str>) -> Result<serde_json::Value, JsError> {
+    let Some(s) = s else {
+        return Ok(serde_json::json!("None"));
+    };
+    match s {
+        "none" | "None" => Ok(serde_json::json!("None")),
+        _ if s.starts_with("shared_context:") => {
+            let ctx_id = &s["shared_context:".len()..];
+            Ok(serde_json::json!({"SharedContext": ctx_id}))
+        }
+        _ if s.starts_with("registry:") => {
+            let ctx_id = &s["registry:".len()..];
+            Ok(serde_json::json!({"Registry": ctx_id}))
+        }
+        other => Err(JsError::new(&format!(
+            "[SCP-VALID-7216] invalid discovery_method '{other}': expected 'none', \
+             'shared_context:<context_id>', or 'registry:<context_id>'"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +525,8 @@ mod tests {
             "ctx-target".to_owned(),
             -1.0,
             "[]".to_owned(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -484,6 +534,11 @@ mod tests {
         assert_eq!(json["chain_depth"], 0);
         assert!(json["chain_path"].is_null());
         assert_eq!(json["source_context"], "ctx-source");
+        assert_eq!(json["discovery_method"], "None");
+        assert!(json["purpose"].is_null());
+        assert!(json["payment_amount"].is_null());
+        assert!(json["payment_adapter"].is_null());
+        assert!(json["payment_receipt_id"].is_null());
     }
 
     #[test]
@@ -496,6 +551,8 @@ mod tests {
             "ctx-target".to_owned(),
             0.0,
             "[]".to_owned(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -504,6 +561,45 @@ mod tests {
         let path = json["chain_path"].as_array().unwrap();
         assert_eq!(path.len(), 1);
         assert_eq!(path[0], "ctx-hop2");
+    }
+
+    #[test]
+    fn attach_with_discovery_method() {
+        let result = provenance_attach(
+            "ctx-source".to_owned(),
+            "Persistent".to_owned(),
+            "Full".to_owned(),
+            "[]".to_owned(),
+            "ctx-target".to_owned(),
+            -1.0,
+            "[]".to_owned(),
+            Some("shared_context:ctx-shared".to_owned()),
+            Some("data sharing".to_owned()),
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["discovery_method"]["SharedContext"], "ctx-shared");
+        assert_eq!(json["purpose"], "data sharing");
+    }
+
+    #[test]
+    fn attach_with_registry_discovery() {
+        let result = provenance_attach(
+            "ctx-source".to_owned(),
+            "Persistent".to_owned(),
+            "Full".to_owned(),
+            "[]".to_owned(),
+            "ctx-target".to_owned(),
+            -1.0,
+            "[]".to_owned(),
+            Some("registry:ctx-registry".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["discovery_method"]["Registry"], "ctx-registry");
     }
 
     #[test]
@@ -517,6 +613,8 @@ mod tests {
                 "ctx-target".to_owned(),
                 -1.0,
                 "[]".to_owned(),
+                None,
+                None,
             )
             .is_err()
         );
@@ -533,6 +631,26 @@ mod tests {
                 "ctx-target".to_owned(),
                 -1.0,
                 "[]".to_owned(),
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attach_invalid_discovery_method_fails() {
+        assert!(
+            provenance_attach(
+                "ctx-source".to_owned(),
+                "Persistent".to_owned(),
+                "Full".to_owned(),
+                "[]".to_owned(),
+                "ctx-target".to_owned(),
+                -1.0,
+                "[]".to_owned(),
+                Some("invalid_method".to_owned()),
+                None,
             )
             .is_err()
         );
