@@ -1987,27 +1987,7 @@ impl WasmContextManager {
                 proposal_a,
                 proposal_b,
                 resolution,
-            } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                // Clear governance freeze (ADR-031 §7).
-                ctx.governance_freeze = false;
-                // Record conflicting proposals as executed (invalidated).
-                let now = crate::time::now_ms();
-                if resolution.as_str() == "invalidateBoth" {
-                    ctx.executed_proposals.insert(proposal_a.clone(), now);
-                    ctx.executed_proposals.insert(proposal_b.clone(), now);
-                } else {
-                    // AcceptProposal: resolution is the winner_id, loser is
-                    // invalidated. The winner remains eligible for execution.
-                    let loser = if resolution == proposal_a {
-                        proposal_b
-                    } else {
-                        proposal_a
-                    };
-                    ctx.executed_proposals.insert(loser.clone(), now);
-                }
-                Ok(serde_json::json!({"action": "ResolveConflict"}))
-            }
+            } => self.dispatch_resolve_conflict(context_id, proposal_a, proposal_b, resolution),
             WasmGovernanceAction::RotateContentKeys { .. } => {
                 let _ = self.require_active_context_mut(context_id)?;
                 // Key rotation in WASM: no MLS backend — records event only.
@@ -2147,6 +2127,51 @@ impl WasmContextManager {
             | WasmGovernanceAction::RotateContentKeys { .. }
             | WasmGovernanceAction::ReconfigureGovernance { .. } => unreachable!(),
         }
+    }
+
+    /// Helper for `ResolveConflict` governance action.
+    ///
+    /// Validates the `resolution` value, then records conflicting proposals as
+    /// executed (invalidated). `resolution` must be `"invalidateBoth"` or one
+    /// of the two proposal IDs.
+    fn dispatch_resolve_conflict(
+        &mut self,
+        context_id: &str,
+        proposal_a: &str,
+        proposal_b: &str,
+        resolution: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        // Validate resolution value before mutating state.
+        let is_invalidate_both = resolution == "invalidateBoth";
+        let is_accept_proposal = resolution == proposal_a || resolution == proposal_b;
+        if !is_invalidate_both && !is_accept_proposal {
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "invalid resolution: must be 'invalidateBoth' or one of the proposal IDs, got '{resolution}'"
+                ),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        let ctx = self.require_active_context_mut(context_id)?;
+        // Clear governance freeze (ADR-031 §7).
+        ctx.governance_freeze = false;
+        // Record conflicting proposals as executed (invalidated).
+        let now = crate::time::now_ms();
+        if is_invalidate_both {
+            ctx.executed_proposals.insert(proposal_a.to_owned(), now);
+            ctx.executed_proposals.insert(proposal_b.to_owned(), now);
+        } else {
+            // AcceptProposal: resolution is the winner_id, loser is
+            // invalidated. The winner remains eligible for execution.
+            let loser = if resolution == proposal_a {
+                proposal_b
+            } else {
+                proposal_a
+            };
+            ctx.executed_proposals.insert(loser.to_owned(), now);
+        }
+        Ok(serde_json::json!({"action": "ResolveConflict"}))
     }
 
     /// Helper for `RegisterTool` governance action.
@@ -3395,5 +3420,38 @@ mod tests {
         let json = r#"{"type":"lockEconomicPolicy"}"#;
         let action: WasmGovernanceAction = serde_json::from_str(json).unwrap();
         assert!(matches!(action, WasmGovernanceAction::LockEconomicPolicy));
+    }
+
+    // -----------------------------------------------------------------------
+    // ResolveConflict validation
+    // -----------------------------------------------------------------------
+
+    /// Invalid resolution values must be rejected before any state mutation.
+    /// This test runs on native (non-WASM) because the validation returns
+    /// early before calling `crate::time::now_ms()` (which requires WASM).
+    #[test]
+    fn resolve_conflict_invalid_resolution_rejected() {
+        let mut mgr = WasmContextManager::new();
+        // No context needed — validation rejects before accessing context state.
+        let err = mgr
+            .dispatch_resolve_conflict("ctx-1", "prop-a", "prop-b", "bogus-value")
+            .unwrap_err();
+        match err {
+            ScpWasmError::Permission {
+                ref message,
+                ref code,
+            } => {
+                assert!(
+                    message.contains("invalid resolution"),
+                    "unexpected message: {message}"
+                );
+                assert!(
+                    message.contains("bogus-value"),
+                    "message should include the bad value: {message}"
+                );
+                assert_eq!(code, "SCP-PERM-3000");
+            }
+            ref other => panic!("expected Permission error, got: {other:?}"),
+        }
     }
 }
