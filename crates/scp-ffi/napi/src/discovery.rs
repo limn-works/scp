@@ -36,28 +36,28 @@ pub fn discovery_parse_address(address: String) -> napi::Result<String> {
     let result = match parsed {
         ParsedAddress::DiscoveryHandle { local_part, scope } => {
             serde_json::json!({
-                "type": "discovery_handle",
+                "type": "DiscoveryHandle",
                 "local_part": local_part,
                 "scope": scope,
             })
         }
         ParsedAddress::DomainHandle { local_part, domain } => {
             serde_json::json!({
-                "type": "domain_handle",
+                "type": "DomainHandle",
                 "local_part": local_part,
                 "domain": domain,
             })
         }
         ParsedAddress::AttestationHandle { handle, platform } => {
             serde_json::json!({
-                "type": "attestation_handle",
+                "type": "AttestationHandle",
                 "handle": handle,
                 "platform": platform,
             })
         }
         ParsedAddress::Unscoped { name } => {
             serde_json::json!({
-                "type": "unscoped",
+                "type": "Unscoped",
                 "name": name,
             })
         }

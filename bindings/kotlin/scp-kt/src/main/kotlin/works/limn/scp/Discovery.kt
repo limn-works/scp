@@ -79,8 +79,8 @@ class DiscoveryBridge internal constructor(
      * Parses an SCP address string into its components.
      *
      * Returns a JSON string with parsed address type and fields.
-     * Address types: "discovery_handle", "domain_handle",
-     * "attestation_handle", "unscoped".
+     * Address types: "DiscoveryHandle", "DomainHandle",
+     * "AttestationHandle", "Unscoped".
      *
      * @param address The address string to parse.
      * @return JSON string with parsed address components.
