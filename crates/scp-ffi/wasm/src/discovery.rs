@@ -1,10 +1,12 @@
 //! `wasm-bindgen` bridge for discovery address operations.
 //!
-//! Exposes address parsing and normalization to JavaScript (browser target):
+//! Exposes address parsing, normalization, and context discovery to JavaScript
+//! (browser target):
 //!
 //! - [`discovery_parse_address`] — Parse a `local@scope` address into components.
 //! - [`discovery_normalize_address`] — Normalize an address to canonical form.
 //! - [`discovery_create_query`] — Create a discovery query descriptor.
+//! - [`context_discover`] — Discover contexts from a DID or `scp://` URI.
 //!
 //! # WASM constraints
 //!
@@ -12,12 +14,17 @@
 //! with `wasm32-unknown-unknown`). Address parsing and normalization are pure
 //! string operations re-implemented locally with algorithm-identical validation.
 //!
-//! DHT-based context discovery (`context_discover`) is NOT included — it
-//! requires network I/O and must be handled by the TypeScript wrapper layer.
+//! `context_discover` handles `scp://` URIs locally (pure parsing, no network
+//! I/O). For `did:` queries, DHT resolution requires network I/O that cannot
+//! be performed from Rust in WASM — the function returns an empty results
+//! array. The TypeScript wrapper layer should implement DID-based discovery
+//! via the Fetch API if needed.
 //!
 //! See spec section 22 and ADR-022.
 
+use js_sys::Promise;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
 
 // ---------------------------------------------------------------------------
 // Constants (mirror scp-core::discovery::addressing)
@@ -246,6 +253,220 @@ pub fn discovery_create_query(
 }
 
 // ---------------------------------------------------------------------------
+// scp:// URI parsing (mirrors scp-core::uri::ScpUri)
+// ---------------------------------------------------------------------------
+
+/// Validates that a string contains only hexadecimal characters and is
+/// non-empty. Mirrors `scp_core::uri::is_valid_hex`.
+fn is_valid_hex(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Percent-decodes a string. Minimal implementation sufficient for scp://
+/// URI query parameter values. Mirrors the percent-decoding in
+/// `scp_core::uri::parse_query_params`.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let high = hex_digit(bytes[i + 1]);
+            let low = hex_digit(bytes[i + 2]);
+            if let (Some(h), Some(l)) = (high, low) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Converts an ASCII hex digit byte to its numeric value.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses query parameters from a query string. Returns key-value pairs.
+/// Values are percent-decoded. Mirrors `scp_core::uri::parse_query_params`.
+fn parse_query_params(query: &str) -> Vec<(String, String)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let eq_pos = pair.find('=')?;
+            let key = percent_decode(&pair[..eq_pos]);
+            let value = percent_decode(&pair[eq_pos + 1..]);
+            Some((key, value))
+        })
+        .collect()
+}
+
+/// Parses an `scp://` URI and returns a JSON array of discovery results.
+///
+/// Algorithm-identical to `scp_core::uri::ScpUri::from_str` +
+/// `scp_core::discovery::resolve_context_uri`. Returns a single-element
+/// array on success.
+fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
+    // Split scheme from the rest.
+    let (scheme, after_scheme) = uri_str
+        .split_once("://")
+        .ok_or_else(|| "missing '://' separator".to_owned())?;
+
+    if scheme != "scp" {
+        return Err(format!(
+            "invalid URI scheme: expected 'scp', got '{scheme}'"
+        ));
+    }
+
+    // Split path from query string.
+    let (path, query_str) = match after_scheme.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (after_scheme, ""),
+    };
+
+    // Determine path type and extract context ID.
+    let (context_id_raw, is_legacy_broadcast) = if let Some(hex) = path.strip_prefix("context/") {
+        (hex, false)
+    } else if let Some(hex) = path.strip_prefix("broadcast/") {
+        (hex, true)
+    } else {
+        return Err(
+            "missing or invalid context path — expected 'context/<hex>' or 'broadcast/<hex>'"
+                .to_owned(),
+        );
+    };
+
+    let context_id = percent_decode(context_id_raw);
+    if !is_valid_hex(&context_id) {
+        return Err(format!("invalid context ID hex: '{context_id}'"));
+    }
+
+    // Parse query parameters.
+    let params = parse_query_params(query_str);
+
+    let mut relay_urls: Vec<String> = Vec::new();
+    let mut mode: Option<&str> = if is_legacy_broadcast {
+        Some("broadcast")
+    } else {
+        None
+    };
+    let mut name: Option<String> = None;
+
+    for (key, value) in &params {
+        match key.as_str() {
+            "relay" => {
+                if !value.starts_with("wss://") && !value.starts_with("WSS://") {
+                    return Err(format!("relay URL must use wss:// scheme: '{value}'"));
+                }
+                relay_urls.push(value.clone());
+            }
+            "mode" => match value.as_str() {
+                "encrypted" => mode = Some("encrypted"),
+                "broadcast" => mode = Some("broadcast"),
+                _ => {} // Unknown mode values are ignored (advisory field)
+            },
+            "name" => {
+                name = Some(value.clone());
+            }
+            _ => {} // Unknown query parameters ignored (forward compatibility)
+        }
+    }
+
+    if relay_urls.is_empty() {
+        return Err("missing required 'relay' query parameter".to_owned());
+    }
+
+    // Build a single ContextDiscoveryResult matching the NAPI bridge's
+    // discovery_result_to_json output format.
+    let result = serde_json::json!([{
+        "context_id": context_id,
+        "relay_urls": relay_urls,
+        "publisher_did": "",
+        "discovery_source": "context_uri",
+        "mode": mode,
+        "metadata_summary": name,
+    }]);
+
+    Ok(result.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// context_discover
+// ---------------------------------------------------------------------------
+
+/// Discovers contexts from a DID string or `scp://` URI.
+///
+/// Detects whether the query is a DID or an `scp://` URI and handles
+/// accordingly:
+///
+/// - **`scp://` URIs**: Parsed locally (pure string operation, no network I/O).
+///   Returns a JSON array with a single discovery result.
+/// - **`did:` queries**: DHT resolution requires network I/O that cannot be
+///   performed from Rust in WASM. Returns an empty JSON array `"[]"`. The
+///   TypeScript wrapper layer should implement DID-based discovery via the
+///   Fetch API if needed.
+///
+/// Returns a JSON string containing an array of discovery results, each with:
+/// `context_id`, `relay_urls`, `publisher_did`, `discovery_source`, `mode`,
+/// `metadata_summary`.
+///
+/// See §5.14.11, §18.2.2, §18.4.
+///
+/// # Errors
+///
+/// Returns `JsError` if the query is not a valid DID or `scp://` URI, or
+/// if the `scp://` URI is malformed.
+///
+/// # JS usage
+///
+/// ```js
+/// // scp:// URI — parsed locally
+/// const results = await context_discover(
+///     "scp://context/deadbeef?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1&mode=broadcast"
+/// );
+/// const arr = JSON.parse(results);
+/// console.log(arr[0].context_id); // "deadbeef"
+///
+/// // DID query — returns empty array (DHT unavailable in WASM)
+/// const empty = await context_discover("did:dht:z6MkTest");
+/// console.log(JSON.parse(empty)); // []
+/// ```
+#[wasm_bindgen]
+pub fn context_discover(query: String) -> Promise {
+    future_to_promise(async move {
+        if query.starts_with("scp://") {
+            // Parse scp:// URI — synchronous, no network I/O.
+            let results_json = parse_scp_uri(&query).map_err(|e| {
+                JsValue::from_str(&format!("[SCP-CTX-2020] failed to resolve scp:// URI: {e}"))
+            })?;
+            Ok(JsValue::from_str(&results_json))
+        } else if query.starts_with("did:") {
+            // DHT resolution requires network I/O — not available in WASM.
+            // Return empty results array. The TypeScript wrapper layer can
+            // implement DID-based discovery via the Fetch API if needed.
+            Ok(JsValue::from_str("[]"))
+        } else {
+            Err(JsValue::from_str(&format!(
+                "[SCP-VALID-7027] query must be a DID (starts with 'did:') or an scp:// URI \
+                     (starts with 'scp://'), got: {query}"
+            )))
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -302,6 +523,100 @@ mod tests {
         assert_eq!(classify_scope("example.com"), "DomainHandle");
         assert_eq!(classify_scope("did:key:z6MkTest"), "AttestationHandle");
         assert_eq!(classify_scope("photography"), "DiscoveryHandle");
+    }
+
+    // -- scp:// URI parsing tests -------------------------------------------
+
+    #[test]
+    fn parse_scp_uri_basic() {
+        let result = parse_scp_uri(
+            "scp://context/deadbeef?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1&mode=broadcast",
+        )
+        .unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["context_id"], "deadbeef");
+        assert_eq!(arr[0]["relay_urls"][0], "wss://relay.example.com/scp/v1");
+        assert_eq!(arr[0]["discovery_source"], "context_uri");
+        assert_eq!(arr[0]["mode"], "broadcast");
+    }
+
+    #[test]
+    fn parse_scp_uri_legacy_broadcast() {
+        let result = parse_scp_uri(
+            "scp://broadcast/abcdef12?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1",
+        )
+        .unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(arr[0]["context_id"], "abcdef12");
+        assert_eq!(arr[0]["mode"], "broadcast");
+    }
+
+    #[test]
+    fn parse_scp_uri_with_name() {
+        let result = parse_scp_uri(
+            "scp://context/aabb?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1&name=Test%20Context",
+        )
+        .unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(arr[0]["metadata_summary"], "Test Context");
+    }
+
+    #[test]
+    fn parse_scp_uri_missing_relay_fails() {
+        assert!(parse_scp_uri("scp://context/abcdef").is_err());
+    }
+
+    #[test]
+    fn parse_scp_uri_invalid_scheme_fails() {
+        assert!(
+            parse_scp_uri("https://context/abcdef?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_scp_uri_invalid_hex_fails() {
+        assert!(
+            parse_scp_uri("scp://context/zzzz?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_scp_uri_non_wss_relay_fails() {
+        assert!(
+            parse_scp_uri("scp://context/abcdef?relay=https%3A%2F%2Frelay.example.com%2Fscp%2Fv1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_scp_uri_multiple_relays() {
+        let result = parse_scp_uri(
+            "scp://context/aabb?relay=wss%3A%2F%2Frelay1.example.com%2Fscp%2Fv1&relay=wss%3A%2F%2Frelay2.example.com%2Fscp%2Fv1",
+        )
+        .unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let relays = arr[0]["relay_urls"].as_array().unwrap();
+        assert_eq!(relays.len(), 2);
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(
+            percent_decode("wss%3A%2F%2Fexample.com"),
+            "wss://example.com"
+        );
+        assert_eq!(percent_decode("Hello%20World"), "Hello World");
+        assert_eq!(percent_decode("no-encoding"), "no-encoding");
+    }
+
+    #[test]
+    fn percent_decode_incomplete_sequence() {
+        // Incomplete percent sequence at end — treated literally.
+        assert_eq!(percent_decode("test%2"), "test%2");
+        assert_eq!(percent_decode("test%"), "test%");
     }
 }
 

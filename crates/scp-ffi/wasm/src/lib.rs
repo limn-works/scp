@@ -72,6 +72,7 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.
 
+pub mod bridge;
 pub mod context;
 pub mod custody;
 pub mod discovery;
