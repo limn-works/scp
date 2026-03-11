@@ -255,6 +255,17 @@ pub enum ContextEvent {
         /// The DID of the author who performed the block.
         author_did: DID,
     },
+    /// A subscriber was unblocked by an author in a broadcast context (§9.16.8).
+    ///
+    /// The author's broadcast key has NOT been rotated (forward-only
+    /// restoration). The unblocked subscriber can request the current key
+    /// on next pull but cannot decrypt content from the block period.
+    MemberUnblocked {
+        /// The DID of the unblocked subscriber.
+        unblocked_did: DID,
+        /// The DID of the author who performed the unblock.
+        author_did: DID,
+    },
     /// An author was blocked from publishing in a broadcast context (SCP-227).
     ///
     /// The author's sender key has been destroyed; they can no longer publish

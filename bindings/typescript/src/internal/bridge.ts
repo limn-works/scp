@@ -102,6 +102,11 @@ export interface Bridge {
     subscriberDid: string,
     blockerDid: string,
   ): Promise<void>;
+  broadcastUnblockSubscriber(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    unblockerDid: string,
+  ): Promise<void>;
   broadcastHandleKeyRequest(
     handle: BridgeContextHandle,
     authorDid: string,

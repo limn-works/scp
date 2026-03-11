@@ -1806,6 +1806,39 @@ fn py_broadcast_block_subscriber(
     })
 }
 
+/// Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
+///
+/// Forward-only: the unblocked subscriber can request the current key on
+/// next pull but cannot decrypt content from the block period.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the operation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did, unblocker_did))]
+fn py_broadcast_unblock_subscriber(
+    handle: &PyContextHandle,
+    subscriber_did: &str,
+    unblocker_did: &str,
+) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    validate::validate_did(unblocker_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
+    let unblocker: scp_identity::DID = unblocker_did.to_owned().into();
+
+    rt.block_on(async move {
+        mgr.unblock_broadcast_subscriber(&context_id, &unblocker, &subscriber)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast unblock failed: {e}")))?;
+        Ok(())
+    })
+}
+
 /// Handles a broadcast key request from a subscriber.
 ///
 /// # Returns
@@ -2096,6 +2129,7 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_publish, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_block_subscriber, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_unblock_subscriber, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_handle_key_request, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_subscriber_count, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_is_subscriber, m)?)?;

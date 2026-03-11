@@ -1018,6 +1018,37 @@ pub async fn broadcast_block_subscriber(
     Ok(())
 }
 
+/// Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
+///
+/// Forward-only: the unblocked subscriber can request the current key on
+/// next pull but cannot decrypt content from the block period.
+///
+/// Delegates to [`ContextManager::unblock_broadcast_subscriber`].
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the operation fails.
+#[napi(js_name = "broadcastUnblockSubscriber")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_unblock_subscriber(
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+    unblocker_did: String,
+) -> napi::Result<()> {
+    validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+    let subscriber: DID = DID(subscriber_did);
+    let unblocker: DID = DID(unblocker_did);
+
+    manager
+        .unblock_broadcast_subscriber(&context_id, &unblocker, &subscriber)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(())
+}
+
 /// Handles a broadcast key request from a subscriber.
 ///
 /// Validates the author DID is locally controlled and processes the key

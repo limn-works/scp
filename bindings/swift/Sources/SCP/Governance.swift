@@ -256,6 +256,12 @@ public enum BroadcastBridge {
         _ blockerDid: String
     ) async throws -> Void
 
+    public typealias UnblockSubscriberFn = @Sendable (
+        _ handle: ContextHandle,
+        _ subscriberDid: String,
+        _ unblockerDid: String
+    ) async throws -> Void
+
     public typealias HandleKeyRequestFn = @Sendable (
         _ handle: ContextHandle,
         _ authorDid: String,
@@ -292,6 +298,13 @@ public enum BroadcastBridge {
     public static let defaultBlockSubscriber: BlockSubscriberFn = { handle, subscriberDid, blockerDid in
         try await broadcastBlockSubscriber(
             handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
+        )
+    }
+
+    public static let defaultUnblockSubscriber: UnblockSubscriberFn = {
+        handle, subscriberDid, unblockerDid in
+        try await broadcastUnblockSubscriber(
+            handle: handle, subscriberDid: subscriberDid, unblockerDid: unblockerDid
         )
     }
 
@@ -540,6 +553,34 @@ public extension Context {
             )
         }
         try await blockSubscriberFn(contextHandle, subscriberDid, blockerDid)
+    }
+
+    /// Unblocks a previously blocked subscriber in this broadcast context (§9.16.8).
+    ///
+    /// Forward-only restoration: the unblocked subscriber can request the
+    /// current key on next pull but cannot decrypt content from the block period.
+    ///
+    /// - Parameters:
+    ///   - subscriberDid: The DID of the subscriber to unblock.
+    ///   - unblockerDid: The DID of the author performing the unblock.
+    ///   - unblockSubscriberFn: Bridge function override for testing.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the operation fails.
+    func broadcastUnblockSubscriber(
+        subscriberDid: String,
+        unblockerDid: String,
+        unblockSubscriberFn: BroadcastBridge.UnblockSubscriberFn =
+            BroadcastBridge.defaultUnblockSubscriber
+    ) async throws {
+        guard state == .active else {
+            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        try await unblockSubscriberFn(contextHandle, subscriberDid, unblockerDid)
     }
 
     /// Handles a broadcast key request from a subscriber.

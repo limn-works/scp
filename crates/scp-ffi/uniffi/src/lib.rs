@@ -101,6 +101,7 @@ pub use bridge::{
     // Free functions — broadcast (#387)
     broadcast_subscribe,
     broadcast_subscriber_count,
+    broadcast_unblock_subscriber,
     broadcast_unsubscribe,
     // Free functions — context lifecycle
     context_close,

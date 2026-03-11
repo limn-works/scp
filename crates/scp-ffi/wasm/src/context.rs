@@ -542,6 +542,23 @@ pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Pr
     })
 }
 
+/// Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
+///
+/// Forward-only: the unblocked subscriber can request the current key on
+/// next pull but cannot decrypt content from the block period.
+///
+/// Delegates to `WasmContextManager::unblock_broadcast_subscriber`.
+#[wasm_bindgen]
+pub fn broadcast_unblock(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.unblock_broadcast_subscriber(&context_id, &subscriber_did))
+            .map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::UNDEFINED)
+    })
+}
+
 /// Returns the number of subscribers in a broadcast context.
 ///
 /// Returns `null` if the context is not a broadcast context.

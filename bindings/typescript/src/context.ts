@@ -403,6 +403,26 @@ export class Context implements AsyncDisposable {
   }
 
   /**
+   * Unblocks a previously blocked subscriber in this broadcast context.
+   *
+   * Forward-only restoration (section 9.16.8): the unblocked subscriber can request
+   * the current key on next pull but cannot decrypt content from the block period.
+   *
+   * @param subscriberDid - The DID of the subscriber to unblock.
+   * @param unblockerDid - The DID of the author performing the unblock.
+   * @throws {ContextError} If the operation fails.
+   */
+  async broadcastUnblockSubscriber(subscriberDid: string, unblockerDid: string): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.broadcastUnblockSubscriber(this._handle, subscriberDid, unblockerDid);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
    * Handles a broadcast key request from a subscriber.
    *
    * @param authorDid - The DID of the author handling the request.

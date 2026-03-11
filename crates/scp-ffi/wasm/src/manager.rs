@@ -2424,6 +2424,43 @@ impl WasmContextManager {
         Ok(())
     }
 
+    /// Unblocks a previously blocked subscriber in a broadcast context
+    /// (§9.16.8 — forward-only restoration).
+    ///
+    /// Removes the subscriber DID from the blocked set. Does NOT restore
+    /// historical access — the subscriber can request the current key on
+    /// next pull but cannot decrypt content from the block period.
+    ///
+    /// # Errors
+    ///
+    /// - [`ScpWasmError::Context`] if the context is not active or not
+    ///   a broadcast context.
+    /// - [`ScpWasmError::Context`] if the subscriber is not blocked.
+    pub fn unblock_broadcast_subscriber(
+        &mut self,
+        context_id: &str,
+        subscriber_did: &str,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        let bc = ctx
+            .broadcast
+            .as_mut()
+            .ok_or_else(|| ScpWasmError::Context {
+                message: "not a broadcast context".to_owned(),
+                code: "SCP-CTX-2001".to_owned(),
+            })?;
+
+        if !bc.blocked_subscribers.remove(subscriber_did) {
+            return Err(ScpWasmError::Context {
+                message: format!("subscriber not blocked: {subscriber_did}"),
+                code: "SCP-CTX-2001".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Returns the number of subscribers in a broadcast context.
     ///
     /// Returns `None` if the context is not a broadcast context.

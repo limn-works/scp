@@ -194,6 +194,12 @@ interface BroadcastBindings {
         blockerDid: String,
     )
 
+    fun broadcastUnblockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        unblockerDid: String,
+    )
+
     fun broadcastHandleKeyRequest(
         contextHandle: Long,
         authorDid: String,
@@ -903,6 +909,24 @@ class BroadcastBridgeOps internal constructor(
         blockerDid: String,
     ): Unit = bridge.ffiCall {
         bindings.broadcastBlockSubscriber(contextHandle, subscriberDid, blockerDid)
+    }
+
+    /**
+     * Unblock a previously blocked subscriber in a broadcast context (§9.16.8).
+     *
+     * Forward-only: the unblocked subscriber can request the current key on
+     * next pull but cannot decrypt content from the block period.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param subscriberDid The DID of the subscriber to unblock.
+     * @param unblockerDid The DID of the author performing the unblock.
+     */
+    suspend fun unblockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        unblockerDid: String,
+    ): Unit = bridge.ffiCall {
+        bindings.broadcastUnblockSubscriber(contextHandle, subscriberDid, unblockerDid)
     }
 
     /**

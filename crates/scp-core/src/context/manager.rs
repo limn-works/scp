@@ -2831,6 +2831,72 @@ impl ContextManager {
         Ok(result)
     }
 
+    /// Unblocks a previously blocked subscriber in a broadcast context
+    /// (§9.16.8 — forward-only restoration).
+    ///
+    /// Removes the subscriber DID from the specified author's block list.
+    /// Per §9.16.8, the author does NOT rotate their sender key. The
+    /// unblocked subscriber can request the current key on next pull but
+    /// cannot decrypt content from the block period.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    ///   or is not a broadcast context.
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
+    /// - [`ContextError::PermissionDenied`] if the subscriber is not blocked.
+    pub async fn unblock_broadcast_subscriber(
+        &self,
+        context_id: &str,
+        author_did: &DID,
+        subscriber_did: &DID,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let _result = bc.unblock_subscriber(author_did, subscriber_did)?;
+
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
+
+            // Emit unblock event to receive buffer.
+            ctx.receive_buffer.push(ContextEvent::MemberUnblocked {
+                unblocked_did: subscriber_did.clone(),
+                author_did: author_did.clone(),
+            });
+
+            snapshot
+        };
+        // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
+
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberUnblocked")?;
+
+        Ok(())
+    }
+
     /// Executes an approved governance action on a broadcast context.
     ///
     /// This is the sole entry point for governance-gated operations. The caller
@@ -7533,6 +7599,136 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(decision, super::KeyRequestDecision::Deny { .. }));
+    }
+
+    /// §9.16.8: `unblock_broadcast_subscriber` removes from block list
+    /// without key rotation, emits `MemberUnblocked` event, and allows
+    /// subsequent key requests.
+    #[tokio::test]
+    async fn broadcast_unblock_restores_key_access() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe a subscriber.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:victim".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Block the victim.
+        manager
+            .block_broadcast_subscriber(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:victim".into(),
+            )
+            .await
+            .unwrap();
+
+        // Key request from blocked subscriber should be denied.
+        let decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:victim".into(),
+            )
+            .await;
+        assert!(matches!(
+            decision,
+            Ok(super::KeyRequestDecision::Deny { .. })
+        ));
+
+        // Unblock the victim.
+        manager
+            .unblock_broadcast_subscriber(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:victim".into(),
+            )
+            .await
+            .unwrap();
+
+        // Key request should now succeed.
+        let decision = manager
+            .handle_broadcast_key_request(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:victim".into(),
+            )
+            .await;
+        assert!(
+            !matches!(decision, Ok(super::KeyRequestDecision::Deny { .. })),
+            "unblocked subscriber should be able to request keys"
+        );
+
+        // Drain events and verify MemberUnblocked event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, super::ContextEvent::MemberUnblocked { .. })),
+            "MemberUnblocked event must be emitted"
+        );
+    }
+
+    /// §9.16.8: unblocking a non-blocked subscriber returns an error.
+    #[tokio::test]
+    async fn broadcast_unblock_not_blocked_returns_error() {
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        // Subscribe.
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Unblock without prior block should fail.
+        let result = manager
+            .unblock_broadcast_subscriber(
+                &ctx_id,
+                &"did:key:author1".into(),
+                &"did:key:sub1".into(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "unblocking non-blocked subscriber should fail"
+        );
     }
 
     /// SCP-227 AC5: broadcast capabilities enforce `MessagesWrite` restricted
