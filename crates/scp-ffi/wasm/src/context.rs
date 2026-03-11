@@ -668,3 +668,53 @@ pub fn context_extend_ttl(handle: &WasmContextHandle, additional_secs: u64) -> P
         Ok(JsValue::UNDEFINED)
     })
 }
+
+/// Handles TTL expiry for a context.
+///
+/// Transitions the context to `"expired"` state and records a
+/// `ContextExpired` event.
+#[wasm_bindgen]
+pub fn context_handle_ttl_expiry(handle: &WasmContextHandle) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.handle_ttl_expiry(&context_id)).map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::UNDEFINED)
+    })
+}
+
+/// Proposes a TTL extension from a specific member.
+///
+/// Returns `true` if the extension was applied. In the WASM bridge, TTL
+/// extension is immediate (no multi-member unanimity — the TypeScript SDK
+/// coordinates consensus).
+#[wasm_bindgen]
+pub fn context_propose_ttl_extension(
+    handle: &WasmContextHandle,
+    proposer_did: String,
+    extension_secs: u64,
+) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let applied = with_manager(|mgr| {
+            mgr.propose_ttl_extension(&context_id, &proposer_did, extension_secs)
+        })
+        .map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::from_bool(applied))
+    })
+}
+
+/// Resets the TTL timer to a new duration.
+///
+/// Replaces the context's TTL with the given value.
+#[wasm_bindgen]
+pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u64) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.reset_ttl_timer(&context_id, new_duration_secs))
+            .map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::UNDEFINED)
+    })
+}

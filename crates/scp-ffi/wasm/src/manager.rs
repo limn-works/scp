@@ -2127,6 +2127,9 @@ impl WasmContextManager {
 
     /// Handles TTL expiry.
     ///
+    /// Transitions the context to `"expired"` state and records a
+    /// `ContextExpired` event in the event log.
+    ///
     /// # Errors
     ///
     /// Returns an error if the context is not active.
@@ -2141,6 +2144,50 @@ impl WasmContextManager {
             b"",
         );
 
+        Ok(())
+    }
+
+    /// Proposes a TTL extension from a specific member.
+    ///
+    /// In the WASM bridge, TTL extension is immediate (no multi-member
+    /// unanimity required — the TypeScript SDK coordinates consensus).
+    /// Returns `true` if the extension was applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active, has no TTL, or the
+    /// proposer is not a member.
+    pub fn propose_ttl_extension(
+        &mut self,
+        context_id: &str,
+        proposer_did: &str,
+        extension_secs: u64,
+    ) -> Result<bool, ScpWasmError> {
+        // Verify proposer is a member.
+        if !self.is_member(context_id, proposer_did) {
+            return Err(ScpWasmError::Context {
+                message: format!("DID '{proposer_did}' is not a member of context '{context_id}'"),
+                code: "SCP-CTX-2005".to_owned(),
+            });
+        }
+        self.extend_ttl(context_id, extension_secs)
+    }
+
+    /// Resets the TTL timer to a new duration.
+    ///
+    /// Replaces the context's TTL with the given value. If the context has
+    /// no TTL, one is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active.
+    pub fn reset_ttl_timer(
+        &mut self,
+        context_id: &str,
+        new_seconds: u64,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        ctx.ttl_seconds = Some(new_seconds);
         Ok(())
     }
 

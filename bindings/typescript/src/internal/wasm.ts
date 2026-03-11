@@ -243,8 +243,8 @@ interface WasmModule {
   }>;
   // Context drain/export/import
   context_drain_events: (handle: BridgeContextHandle) => string;
-  context_export: (handle: BridgeContextHandle) => Promise<string>;
-  context_import: (data: string) => Promise<string>;
+  context_export: (handle: BridgeContextHandle) => Promise<Uint8Array>;
+  context_import: (data: Uint8Array) => Promise<string>;
   // TTL
   context_ttl_remaining: (handle: BridgeContextHandle) => number | null;
   context_extend_ttl: (handle: BridgeContextHandle, additionalSecs: number) => Promise<void>;
@@ -254,10 +254,7 @@ interface WasmModule {
     proposerDid: string,
     extensionSecs: number,
   ) => Promise<boolean>;
-  context_reset_ttl_timer: (
-    handle: BridgeContextHandle,
-    newDurationSecs: number,
-  ) => Promise<void>;
+  context_reset_ttl_timer: (handle: BridgeContextHandle, newDurationSecs: number) => Promise<void>;
   // UCAN delegate
   ucan_delegate: (
     handle: BridgeContextHandle,
@@ -576,12 +573,11 @@ export function createWasmBridge(): Bridge {
       proposerDid: string,
     ): Promise<string> {
       const wasm = getWasm();
-      return await wasm.context_execute_governance(
-        handle,
-        proposerDid,
-        "",
-        actionJson,
-      );
+      // Generate a unique proposal ID for replay protection. The WASM manager
+      // uses this as a HashMap key — empty string causes all subsequent
+      // governance actions to fail as "already executed".
+      const proposalId = globalThis.crypto.randomUUID();
+      return await wasm.context_execute_governance(handle, proposerDid, proposalId, actionJson);
     },
 
     // TTL operations
@@ -610,14 +606,14 @@ export function createWasmBridge(): Bridge {
     // Context export/import
     async contextExport(handle: BridgeContextHandle): Promise<Uint8Array> {
       const wasm = getWasm();
-      const base64 = await wasm.context_export(handle);
-      return base64ToUint8(base64);
+      // WASM export returns Uint8Array directly — no base64 conversion needed.
+      return await wasm.context_export(handle);
     },
 
     async contextImport(data: Uint8Array): Promise<string> {
       const wasm = getWasm();
-      const base64 = uint8ToBase64(data);
-      return await wasm.context_import(base64);
+      // WASM import takes Uint8Array directly — no base64 conversion needed.
+      return await wasm.context_import(data);
     },
 
     // Drain events
