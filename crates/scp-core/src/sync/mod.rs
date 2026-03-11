@@ -586,7 +586,8 @@ pub enum SyncOutcome {
 /// Compares a local consistency checkpoint against a received remote
 /// checkpoint and returns an `EquivocationAlert` if divergence is detected.
 ///
-/// Returns `None` if event counts differ (one member is behind) or if
+/// Returns `None` if context IDs differ (cross-context comparison is
+/// meaningless), if event counts differ (one member is behind), or if
 /// Merkle roots match (consistent). See spec §9.9.3.
 #[must_use]
 pub fn compare_checkpoints(
@@ -594,6 +595,9 @@ pub fn compare_checkpoints(
     remote: &ConsistencyCheckpoint,
     now: u64,
 ) -> Option<EquivocationAlert> {
+    if local.context_id != remote.context_id {
+        return None;
+    }
     if local.event_count != remote.event_count {
         return None;
     }
@@ -738,6 +742,15 @@ mod tests {
         let json = serde_json::to_string(&cp).unwrap();
         let deserialized: ConsistencyCheckpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(cp, deserialized);
+    }
+
+    #[test]
+    fn compare_checkpoints_cross_context_returns_none() {
+        // Two different contexts with same event count but different roots
+        // must NOT trigger equivocation — they are independent contexts.
+        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10));
+        let remote = make_checkpoint("ctx-2", "did:key:bob", 100, [2u8; 32], Some(10));
+        assert!(compare_checkpoints(&local, &remote, 1_700_000_100).is_none());
     }
 
     #[test]
