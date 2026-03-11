@@ -23,7 +23,10 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
-use super::governance::timeout::GovernanceTimeoutTask;
+use super::governance::timeout::{
+    DeadlockDetectionState, GovernanceTimeoutTask, collect_active_voters,
+    process_pending_proposals, update_detection_state,
+};
 use super::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
     GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
@@ -518,8 +521,17 @@ struct PerContextState {
     /// Mutable economic policy (§19.3, ADR-033).
     economic_policy: Option<EconomicPolicy>,
     /// Governance timeout task (SCP-271, ADR-031 §5).
-    #[allow(dead_code)]
     governance_timeout_task: GovernanceTimeoutTask,
+    /// Per-context deadlock detection tracking (ADR-031 §10).
+    deadlock_detection_state: DeadlockDetectionState,
+    /// Last known member set for departure detection in the timeout loop.
+    /// Compared each tick to the current member set to identify departures.
+    last_known_members: HashSet<DID>,
+    /// Members who have undergone a governance-triggered epoch reset
+    /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
+    /// Drained each tick and passed to `process_pending_proposals` so
+    /// their votes on pending proposals are invalidated (ADR-031 §5).
+    pending_epoch_resets: Vec<DID>,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
     pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Monotonic MLS epoch counter. Incremented each time a governance action
@@ -1014,8 +1026,8 @@ pub struct ContextManager {
     local_dids: RwLock<HashSet<DID>>,
     /// Per-context state, keyed by `context_id` string.
     ///
-    /// Wrapped in `Arc` so spawned timer tasks can push events to the
-    /// receive buffer when TTL expiry completes or fails (#612).
+    /// Wrapped in `Arc` so spawned timer tasks (TTL expiry #612,
+    /// governance timeout ADR-031 §5) can push events to the receive buffer.
     contexts: Arc<Mutex<HashMap<String, PerContextState>>>,
     /// Resolver that maps a DID to its Ed25519 verifying key for governance
     /// vote signature verification (spec §5.9, ADR-031). Passed through to
@@ -1183,6 +1195,25 @@ impl ContextManager {
         Ok(Some(bc))
     }
 
+    /// Persists context and broadcast state if a persistence provider is configured.
+    async fn persist_context_and_broadcast(&self, context_id: &str) {
+        if self.has_persistence() {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                let bc_snapshot = ctx
+                    .broadcast_context
+                    .as_ref()
+                    .map(BroadcastContext::to_snapshot);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+                if let Some(ref bcs) = bc_snapshot {
+                    self.persist_broadcast_snapshot(context_id, bcs);
+                }
+            }
+        }
+    }
+
     /// Takes a `ContextSnapshot` from the current `PerContextState`.
     ///
     /// Must be called while the contexts mutex is held (snapshot under lock).
@@ -1328,6 +1359,12 @@ impl ContextManager {
                 .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
         }
 
+        let initial_members: HashSet<DID> = ctx_snapshot
+            .membership
+            .members()
+            .map(|m| m.did.clone())
+            .collect();
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
@@ -1350,6 +1387,9 @@ impl ContextManager {
             governance_engine,
             economic_policy: ctx_snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            deadlock_detection_state: DeadlockDetectionState::default(),
+            last_known_members: initial_members,
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             mls_epoch: ctx_snapshot.mls_epoch,
             grace_store,
@@ -1365,6 +1405,9 @@ impl ContextManager {
             }
             contexts.insert(context_id.to_owned(), per_context);
         }
+
+        // Start governance timeout task (ADR-031 §5).
+        self.start_governance_timeout_task(context_id).await;
 
         // Re-spawn TTL timer if there was remaining TTL.
         if let Some(remaining_secs) = ttl_remaining {
@@ -1609,6 +1652,13 @@ impl ContextManager {
             restore_governance_engine_from_snapshot(&export.snapshot, self.key_resolver.clone())?;
 
         // 5. Build PerContextState from the snapshot.
+        let initial_members: HashSet<DID> = export
+            .snapshot
+            .membership
+            .members()
+            .map(|m| m.did.clone())
+            .collect();
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: export.snapshot.membership,
@@ -1631,6 +1681,9 @@ impl ContextManager {
             governance_engine,
             economic_policy: export.snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            deadlock_detection_state: DeadlockDetectionState::default(),
+            last_known_members: initial_members,
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
             mls_epoch: export.snapshot.mls_epoch,
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -1647,6 +1700,9 @@ impl ContextManager {
             }
             contexts.insert(context_id.clone(), per_context);
         }
+
+        // Start governance timeout task (ADR-031 §5).
+        self.start_governance_timeout_task(&context_id).await;
 
         // 7. Persist if persistence is configured.
         if self.has_persistence() {
@@ -1701,14 +1757,9 @@ impl ContextManager {
         params: ContextParams,
         creator_did: DID,
     ) -> Result<ContextHandle, ContextCreationError> {
-        // Validate governance model parameters before proceeding.
         validate_governance_model(&params.governance)?;
-
-        // Instantiate the governance engine based on GovernanceModel (ADR-031).
         let governance_engine =
             create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
-
-        // Phase 1+2: builder performs validation and creation (async, no lock held).
         let handle = builder_create_context(
             context_id.clone(),
             params.clone(),
@@ -1718,14 +1769,9 @@ impl ContextManager {
         )
         .await?;
 
-        // Build ceiling from params (params::Capability is now the same type as roles::Capability).
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
-
-        // Initialize role state with the creator as admin.
         let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
             .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-
-        // Initialize membership with the creator.
         let mut membership = MembershipState::new();
         let creator_tokens = role_state
             .assignments
@@ -1736,13 +1782,13 @@ impl ContextManager {
 
         let broadcast_context = self.init_broadcast_context(&context_id, &params, &creator_did)?;
 
-        // Extract threshold signers and value from GovernanceModel at creation
-        // time so PerContextState is correctly initialized for Threshold
-        // governance (ADR-031).
+        // Extract threshold signers/value from GovernanceModel (ADR-031).
         let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
             GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
             _ => (Vec::new(), 0),
         };
+
+        let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
 
         let per_context = PerContextState {
             handle: handle.clone(),
@@ -1766,13 +1812,15 @@ impl ContextManager {
             governance_engine,
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            deadlock_detection_state: DeadlockDetectionState::default(),
+            last_known_members: initial_members,
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
         };
 
-        // Atomic duplicate check + insert under lock -- no .await inside this scope.
         {
             let mut contexts = self.contexts.lock().await;
             if contexts.contains_key(&context_id) {
@@ -1783,29 +1831,12 @@ impl ContextManager {
             contexts.insert(context_id.clone(), per_context);
         }
 
-        // Persist context + broadcast state after creation (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                let bc_snapshot = ctx
-                    .broadcast_context
-                    .as_ref()
-                    .map(BroadcastContext::to_snapshot);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
-                if let Some(ref bcs) = bc_snapshot {
-                    self.persist_broadcast_snapshot(&context_id, bcs);
-                }
-            }
-        }
-
-        // Spawn TTL timer if TTL is configured (SCP-021).
+        self.start_governance_timeout_task(&context_id).await;
+        self.persist_context_and_broadcast(&context_id).await;
         if let Some(ttl_duration) = params.ttl {
             self.spawn_ttl_timer(&context_id, ttl_duration, handle.clone())
                 .await;
         }
-
         Ok(handle)
     }
 
@@ -1932,22 +1963,8 @@ impl ContextManager {
             contexts.insert(context_id.clone(), per_context);
         }
 
-        // Persist context + broadcast state after creation (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                let bc_snapshot = ctx
-                    .broadcast_context
-                    .as_ref()
-                    .map(BroadcastContext::to_snapshot);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
-                if let Some(ref bcs) = bc_snapshot {
-                    self.persist_broadcast_snapshot(&context_id, bcs);
-                }
-            }
-        }
+        self.start_governance_timeout_task(&context_id).await;
+        self.persist_context_and_broadcast(&context_id).await;
 
         // Spawn TTL timer if TTL is configured (SCP-021).
         if let Some(ttl_duration) = params.ttl {
@@ -2031,6 +2048,9 @@ impl ContextManager {
             governance_engine,
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            deadlock_detection_state: DeadlockDetectionState::default(),
+            last_known_members: HashSet::new(),
+            pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -4597,8 +4617,9 @@ impl ContextManager {
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
-            // Cancel TTL timer if active.
+            // Cancel TTL timer and governance timeout task if active.
             ctx.ttl_timer.cancel();
+            ctx.governance_timeout_task.cancel();
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
@@ -5122,6 +5143,16 @@ impl ContextManager {
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         self.event_log
             .append_context_event(&context_id_bytes, "MemberReset")?;
+
+        // Track the epoch reset so the governance timeout task can invalidate
+        // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.pending_epoch_resets.push(did.clone());
+            }
+        }
+
         Ok(())
     }
 
@@ -5883,12 +5914,13 @@ impl ContextManager {
         let result =
             ttl::close_context(handle, initiator_did, &role_state, self.event_log.as_ref()).await?;
 
-        // Cancel TTL timer, drop broadcast state, and emit close notification
-        // (second lock acquisition).
+        // Cancel TTL timer, governance timeout task, drop broadcast state,
+        // and emit close notification (second lock acquisition).
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.ttl_timer.cancel();
+                ctx.governance_timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
@@ -5967,10 +5999,12 @@ impl ContextManager {
         )
         .await;
 
-        // Emit appropriate event (lock acquired, then dropped).
+        // Cancel governance timeout task and emit appropriate event
+        // (lock acquired, then dropped).
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
+                ctx.governance_timeout_task.cancel();
                 if result.is_complete() {
                     ctx.receive_buffer.push(ContextEvent::Expired);
                 } else {
@@ -6174,6 +6208,197 @@ impl ContextManager {
         if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
             ctx.ttl_timer.task = Some(task);
         }
+    }
+
+    /// Translates governance events from timeout processing into
+    /// [`ContextEvent`]s for the receive buffer (ADR-031 §5, §10).
+    fn translate_timeout_events(
+        result_events: &[GovernanceEvent],
+        mls_epoch: u64,
+        conditions: &[super::governance::timeout::DeadlockCondition],
+        recovery_in_progress: bool,
+    ) -> Vec<ContextEvent> {
+        let mut ctx_events = Vec::new();
+        for event in result_events {
+            let ctx_event = match event {
+                GovernanceEvent::ProposalResolved {
+                    proposal_id,
+                    status,
+                } => ContextEvent::ProposalTimedOut {
+                    proposal_id: *proposal_id,
+                    resolution_summary: format!("ProposalResolved({status:?})"),
+                    resulting_epoch: Some(mls_epoch),
+                },
+                GovernanceEvent::VoteWithdrawn {
+                    proposal_id,
+                    voter_did,
+                } => ContextEvent::VoteWithdrawn {
+                    proposal_id: *proposal_id,
+                    voter_did: voter_did.clone(),
+                },
+                GovernanceEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action,
+                    executor_did,
+                    resulting_epoch,
+                } => ContextEvent::GovernanceActionExecuted {
+                    proposal_id: *proposal_id,
+                    action_summary: action.variant_name().to_owned(),
+                    executor_did: executor_did.clone(),
+                    resulting_epoch: *resulting_epoch,
+                },
+                // ProposalCreated and VoteCast are not expected from
+                // timeout processing; skip them if they appear.
+                _ => continue,
+            };
+            ctx_events.push(ctx_event);
+        }
+
+        if !conditions.is_empty() && !recovery_in_progress {
+            for condition in conditions {
+                let summary = match condition {
+                    super::governance::timeout::DeadlockCondition::ThresholdInsufficient {
+                        ..
+                    } => "ThresholdInsufficient",
+                    super::governance::timeout::DeadlockCondition::MajorityUnresponsive {
+                        ..
+                    } => "MajorityUnresponsive",
+                    super::governance::timeout::DeadlockCondition::UnanimityOffline { .. } => {
+                        "UnanimityOffline"
+                    }
+                };
+                ctx_events.push(ContextEvent::DeadlockDetected {
+                    condition_summary: summary.to_owned(),
+                    resulting_epoch: Some(mls_epoch),
+                });
+            }
+        }
+
+        ctx_events
+    }
+
+    /// Starts the governance timeout background task for a context (ADR-031 §5).
+    ///
+    /// The task runs a 60-second interval loop that:
+    /// 1. Checks active proposals for timeout expiry via `resolve()`.
+    /// 2. Detects proposer/voter departures and adjusts tallies.
+    /// 3. Detects deadlock conditions and emits recovery events.
+    ///
+    /// The task stops when the context is no longer `Active` or when
+    /// cancelled via [`GovernanceTimeoutTask::cancel()`].
+    async fn start_governance_timeout_task(&self, context_id: &str) {
+        let contexts = Arc::clone(&self.contexts);
+        let ctx_id = context_id.to_owned();
+
+        let mut contexts_guard = self.contexts.lock().await;
+        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
+            return;
+        };
+
+        ctx.governance_timeout_task.start({
+            let ctx_id = ctx_id.clone();
+            move || {
+                let contexts = Arc::clone(&contexts);
+                let ctx_id = ctx_id.clone();
+                async move {
+                    // Phase 1: Acquire lock, snapshot data, process proposals,
+                    // detect deadlock, release lock.
+                    let (result, conditions, mls_epoch, recovery_in_progress) = {
+                        let mut contexts_guard = contexts.lock().await;
+                        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
+                            return false; // Context removed — stop the loop.
+                        };
+
+                        // Use blocking async read — `try_read_state()` returns
+                        // `None` on transient write-contention which would
+                        // permanently stop this task.
+                        if !matches!(ctx.handle.state().await, super::ContextState::Active) {
+                            return false; // No longer active — stop the loop.
+                        }
+
+                        let gov_ctx = Self::build_governance_context(ctx);
+                        // Detect departed members since last tick.
+                        let current_members: HashSet<DID> =
+                            ctx.membership.members().map(|m| m.did.clone()).collect();
+                        let departed: Vec<DID> = ctx
+                            .last_known_members
+                            .difference(&current_members)
+                            .cloned()
+                            .collect();
+                        ctx.last_known_members = current_members;
+
+                        // Drain epoch-reset members accumulated since last tick
+                        // (ADR-031 §5: votes from reset members are invalidated).
+                        let epoch_resets: Vec<DID> = std::mem::take(&mut ctx.pending_epoch_resets);
+
+                        let mls_epoch = ctx.mls_epoch;
+                        let recovery_in_progress =
+                            ctx.deadlock_detection_state.recovery_in_progress;
+
+                        // Snapshot active voters BEFORE processing proposals so
+                        // voters on about-to-resolve proposals are still visible.
+                        let active_voters = collect_active_voters(ctx.governance_engine.as_ref());
+
+                        // Process pending proposals for timeout/departures/epoch resets.
+                        let result = process_pending_proposals(
+                            ctx.governance_engine.as_mut(),
+                            &gov_ctx,
+                            &departed,
+                            &epoch_resets,
+                        );
+
+                        // Update deadlock detection state before detecting
+                        // deadlock so missed-window counters reflect this tick.
+                        update_detection_state(
+                            &mut ctx.deadlock_detection_state,
+                            ctx.governance_engine.as_ref(),
+                            &gov_ctx,
+                            &active_voters,
+                        );
+
+                        // Detect deadlock conditions (ADR-031 §10).
+                        let conditions = super::governance::timeout::detect_deadlock(
+                            ctx.governance_engine.as_ref(),
+                            &gov_ctx,
+                            &ctx.deadlock_detection_state,
+                        );
+
+                        (result, conditions, mls_epoch, recovery_in_progress)
+                        // Lock dropped here.
+                    };
+
+                    // Phase 2: Build context events (no lock needed).
+                    let ctx_events = Self::translate_timeout_events(
+                        &result.events,
+                        mls_epoch,
+                        &conditions,
+                        recovery_in_progress,
+                    );
+
+                    // Phase 3: Write results back and update recovery state.
+                    let needs_write = !ctx_events.is_empty()
+                        || (conditions.is_empty() && recovery_in_progress)
+                        || (!conditions.is_empty() && !recovery_in_progress);
+                    if needs_write {
+                        let mut contexts_guard = contexts.lock().await;
+                        if let Some(ctx) = contexts_guard.get_mut(&ctx_id) {
+                            for ctx_event in ctx_events {
+                                ctx.receive_buffer.push(ctx_event);
+                            }
+                            // Reset recovery_in_progress when deadlock conditions
+                            // clear so future deadlocks can be detected.
+                            if conditions.is_empty() && recovery_in_progress {
+                                ctx.deadlock_detection_state.recovery_in_progress = false;
+                            } else if !conditions.is_empty() && !recovery_in_progress {
+                                ctx.deadlock_detection_state.recovery_in_progress = true;
+                            }
+                        }
+                    }
+
+                    true // Continue the loop.
+                }
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
