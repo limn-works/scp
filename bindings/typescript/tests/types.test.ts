@@ -8,13 +8,16 @@
 
 import { describe, expect, it } from "bun:test";
 import type {
+  AddressResolution,
   ContextParams,
   DIDDocument,
   Event,
   Message,
   Proof,
+  ResolutionPath,
   ToolDefinition,
   TransportStatus,
+  TrustLevel,
   UcanToken,
 } from "../src/types";
 
@@ -127,5 +130,105 @@ describe("type definitions", () => {
       details: { path: [] },
     };
     expect(proof.verified).toBe(true);
+  });
+
+  // -- Address Resolution types (§22.2.1, §22.7) ---------------------------
+
+  it("TrustLevel accepts all valid variants", () => {
+    const levels: TrustLevel[] = [
+      "DirectExchange",
+      "LocalPetname",
+      "MultiLayerCorroborated",
+      "DomainVerified",
+      "AttestationVerified",
+      "DiscoveryContextVerified",
+    ];
+    expect(levels).toHaveLength(6);
+  });
+
+  it("ResolutionPath has all required fields", () => {
+    const path: ResolutionPath = {
+      layer: "DiscoveryContext",
+      source: "cooking-community",
+      sourceId: "ctx-disc-1",
+      resolvedAt: 1700000000,
+    };
+    expect(path.layer).toBe("DiscoveryContext");
+    expect(path.source).toBe("cooking-community");
+    expect(path.sourceId).toBe("ctx-disc-1");
+    expect(path.resolvedAt).toBe(1700000000);
+  });
+
+  it("ResolutionPath allows null sourceId", () => {
+    const path: ResolutionPath = {
+      layer: "Domain",
+      source: "dht",
+      sourceId: null,
+      resolvedAt: 1700000000,
+    };
+    expect(path.sourceId).toBeNull();
+  });
+
+  it("AddressResolution Identity variant has all fields", () => {
+    const resolution: AddressResolution = {
+      type: "Identity",
+      did: "did:dht:z6MkAlice",
+      trustLevel: "DiscoveryContextVerified",
+      resolutionPath: {
+        layer: "DiscoveryContext",
+        source: "cooking-community",
+        sourceId: "ctx-disc-1",
+        resolvedAt: 1700000000,
+      },
+    };
+    expect(resolution.type).toBe("Identity");
+    if (resolution.type === "Identity") {
+      expect(resolution.did).toBe("did:dht:z6MkAlice");
+      expect(resolution.trustLevel).toBe("DiscoveryContextVerified");
+      expect(resolution.resolutionPath.layer).toBe("DiscoveryContext");
+    }
+  });
+
+  it("AddressResolution Context variant has all fields", () => {
+    const resolution: AddressResolution = {
+      type: "Context",
+      contextId: "a1b2c3d4e5f6",
+      relayUrls: ["wss://relay.example.com/scp/v1"],
+      mode: "broadcast",
+      trustLevel: "DomainVerified",
+      resolutionPath: {
+        layer: "Domain",
+        source: "dht",
+        sourceId: null,
+        resolvedAt: 1700000000,
+      },
+    };
+    expect(resolution.type).toBe("Context");
+    if (resolution.type === "Context") {
+      expect(resolution.contextId).toBe("a1b2c3d4e5f6");
+      expect(resolution.relayUrls).toEqual(["wss://relay.example.com/scp/v1"]);
+      expect(resolution.mode).toBe("broadcast");
+      expect(resolution.trustLevel).toBe("DomainVerified");
+      expect(resolution.resolutionPath.layer).toBe("Domain");
+    }
+  });
+
+  it("AddressResolution Context variant allows null mode", () => {
+    const resolution: AddressResolution = {
+      type: "Context",
+      contextId: "deadbeef",
+      relayUrls: [],
+      mode: null,
+      trustLevel: "DiscoveryContextVerified",
+      resolutionPath: {
+        layer: "DiscoveryContext",
+        source: "discovery_context",
+        sourceId: "disc-ctx-1",
+        resolvedAt: 1700000000,
+      },
+    };
+    if (resolution.type === "Context") {
+      expect(resolution.mode).toBeNull();
+    }
   });
 });

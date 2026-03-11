@@ -119,15 +119,40 @@ pub fn discovery_normalize_address(address: String) -> String {
 // ---------------------------------------------------------------------------
 
 /// Converts a [`ContextDiscoveryResult`] into a JSON value.
+///
+/// Includes `trust_level` and `resolution_path` fields per §22.2.1, mapping
+/// from `ContextDiscoverySource` to appropriate trust and path metadata.
 fn discovery_result_to_json(
     result: &scp_core::discovery::ContextDiscoveryResult,
 ) -> serde_json::Value {
-    let source_str = match &result.discovery_source {
-        scp_core::discovery::ContextDiscoverySource::DhtDidDocument => "dht_did_document",
-        scp_core::discovery::ContextDiscoverySource::WellKnown => "well_known",
-        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { .. } => "discovery_context",
-        scp_core::discovery::ContextDiscoverySource::ContextUri => "context_uri",
-    };
+    let (source_str, trust_level, resolution_layer, resolution_source, resolution_source_id) =
+        match &result.discovery_source {
+            scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
+                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
+            }
+            scp_core::discovery::ContextDiscoverySource::WellKnown => {
+                ("well_known", "DomainVerified", "Domain", "well-known", None)
+            }
+            scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
+                "discovery_context",
+                "DiscoveryContextVerified",
+                "DiscoveryContext",
+                "discovery_context",
+                Some(context_id.as_str()),
+            ),
+            scp_core::discovery::ContextDiscoverySource::ContextUri => (
+                "context_uri",
+                "DiscoveryContextVerified",
+                "DiscoveryContext",
+                "context_uri",
+                None,
+            ),
+        };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     let mut obj = serde_json::json!({
         "context_id": result.context_id,
@@ -136,6 +161,13 @@ fn discovery_result_to_json(
         "discovery_source": source_str,
         "mode": result.mode,
         "metadata_summary": result.metadata_summary,
+        "trust_level": trust_level,
+        "resolution_path": {
+            "layer": resolution_layer,
+            "source": resolution_source,
+            "source_id": resolution_source_id,
+            "resolved_at": now_secs,
+        },
     });
 
     // Add discovery_context_id if applicable.
@@ -278,5 +310,31 @@ mod tests {
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
+        // §22.2.1: trust_level and resolution_path are included.
+        assert_eq!(json["trust_level"], "DomainVerified");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "dht");
+        assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn context_discover_result_discovery_context_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "ctx456".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:dht:zTest".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::DiscoveryContext {
+                context_id: "disc-ctx-1".to_owned(),
+            },
+            mode: None,
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"], "DiscoveryContextVerified");
+        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
+        assert_eq!(json["discovery_context_id"], "disc-ctx-1");
     }
 }

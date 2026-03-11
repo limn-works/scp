@@ -90,7 +90,13 @@ export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridg
 // ---------------------------------------------------------------------------
 
 export type { DiscoveryResult, ParsedAddress } from "./discovery";
-export { createQuery, discoverContexts, normalizeAddress, parseAddress } from "./discovery";
+export {
+  createQuery,
+  discoverContexts,
+  normalizeAddress,
+  parseAddress,
+  resolveAddress,
+} from "./discovery";
 
 // ---------------------------------------------------------------------------
 // Provenance
@@ -135,6 +141,7 @@ export {
 // ---------------------------------------------------------------------------
 
 export type {
+  AddressResolution,
   AttestationSummary,
   BehavioralRecord,
   BroadcastAdmissionPolicy,
@@ -156,12 +163,15 @@ export type {
   Proof,
   Provenance,
   RequireParticipation,
+  ResolutionLayer,
+  ResolutionPath,
   TestVector,
   ToolDefinition,
   ToolVerificationResult,
   TransportConfig,
   TransportStatus,
   TrustEvaluation,
+  TrustLevel,
   UcanToken,
   VerificationMethod,
 } from "./types";

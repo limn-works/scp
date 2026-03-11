@@ -418,6 +418,94 @@ export interface RequireParticipation {
 }
 
 // ---------------------------------------------------------------------------
+// Discovery — Address Resolution (§22.2.1, §22.7)
+// ---------------------------------------------------------------------------
+
+/**
+ * Trust level indicating the strength and source of a handle-to-identifier
+ * binding. Every resolution result carries a trust level.
+ *
+ * Trust levels are not strictly ordered -- their relative strength is
+ * context-dependent. The SDK exposes them to consumers; consumers decide
+ * what is sufficient.
+ *
+ * See §22.7 Trust Levels.
+ */
+export type TrustLevel =
+  | "DirectExchange"
+  | "LocalPetname"
+  | "MultiLayerCorroborated"
+  | "DomainVerified"
+  | "AttestationVerified"
+  | "DiscoveryContextVerified";
+
+/**
+ * The resolution layer that produced an address resolution result.
+ *
+ * See §22.7 Resolution Path.
+ */
+export type ResolutionLayer =
+  | "Petname"
+  | "DiscoveryContext"
+  | "Attestation"
+  | "Domain"
+  | "MultiLayerCorroborated";
+
+/**
+ * Structured metadata recording which layer resolved an address.
+ *
+ * This is provenance for the resolution itself: which layer, what source,
+ * and when.
+ *
+ * See §22.7 Resolution Path.
+ */
+export interface ResolutionPath {
+  /** The resolution layer that produced this result. */
+  readonly layer: ResolutionLayer;
+  /** Human-readable source identifier (discovery context name, domain, platform). */
+  readonly source: string;
+  /** Discovery context ID (hex), present only for the `DiscoveryContext` layer. */
+  readonly sourceId: string | null;
+  /** Unix timestamp (seconds) when resolution occurred. */
+  readonly resolvedAt: number;
+}
+
+/**
+ * A single resolution result from the addressing layer.
+ *
+ * An address may resolve to an identity (DID) or a context (context ID +
+ * relay URLs). Each result carries a trust level and the resolution path
+ * that produced it.
+ *
+ * See §22.2.1 Address Types.
+ */
+export type AddressResolution =
+  | {
+      /** Discriminant for identity resolution. */
+      readonly type: "Identity";
+      /** The resolved DID. */
+      readonly did: string;
+      /** Trust level of this resolution. */
+      readonly trustLevel: TrustLevel;
+      /** How this resolution was produced. */
+      readonly resolutionPath: ResolutionPath;
+    }
+  | {
+      /** Discriminant for context resolution. */
+      readonly type: "Context";
+      /** The context ID (hex-encoded). */
+      readonly contextId: string;
+      /** Relay URLs for reaching this context. */
+      readonly relayUrls: readonly string[];
+      /** The context mode, if known. */
+      readonly mode: string | null;
+      /** Trust level of this resolution. */
+      readonly trustLevel: TrustLevel;
+      /** How this resolution was produced. */
+      readonly resolutionPath: ResolutionPath;
+    };
+
+// ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
 

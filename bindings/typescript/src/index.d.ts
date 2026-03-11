@@ -159,6 +159,48 @@ export interface TransportConfig {
   readonly protocol?: string;
 }
 
+// -- Address Resolution (§22.2.1, §22.7) -------------------------------------
+
+export type TrustLevel =
+  | "DirectExchange"
+  | "LocalPetname"
+  | "MultiLayerCorroborated"
+  | "DomainVerified"
+  | "AttestationVerified"
+  | "DiscoveryContextVerified";
+
+export type ResolutionLayer =
+  | "Petname"
+  | "DiscoveryContext"
+  | "Attestation"
+  | "Domain"
+  | "MultiLayerCorroborated";
+
+export interface ResolutionPath {
+  readonly layer: ResolutionLayer;
+  readonly source: string;
+  readonly sourceId: string | null;
+  readonly resolvedAt: number;
+}
+
+export type AddressResolution =
+  | {
+      readonly type: "Identity";
+      readonly did: string;
+      readonly trustLevel: TrustLevel;
+      readonly resolutionPath: ResolutionPath;
+    }
+  | {
+      readonly type: "Context";
+      readonly contextId: string;
+      readonly relayUrls: readonly string[];
+      readonly mode: string | null;
+      readonly trustLevel: TrustLevel;
+      readonly resolutionPath: ResolutionPath;
+    };
+
+export declare function resolveAddress(query: string): Promise<AddressResolution[]>;
+
 // -- Identity -----------------------------------------------------------------
 
 export declare class Identity {
