@@ -62,6 +62,8 @@ pub struct WasmContextHandle {
     governance: String,
     member_count: u64,
     economic_policy: Option<String>,
+    /// Minimum protocol version as `[major, minor]`, or `None` if unset.
+    min_protocol_version: Option<Vec<u8>>,
 }
 
 #[wasm_bindgen]
@@ -131,6 +133,22 @@ impl WasmContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
+
+    /// Returns the minimum protocol version as a `[major, minor]` JS array,
+    /// or `undefined` if no minimum is set. Mirrors the NAPI bridge's
+    /// `minProtocolVersion` field on the TypeScript `ContextHandle`.
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "minProtocolVersion")]
+    pub fn min_protocol_version(&self) -> JsValue {
+        self.min_protocol_version
+            .as_ref()
+            .map_or(JsValue::UNDEFINED, |v| {
+                let arr = js_sys::Array::new();
+                arr.push(&JsValue::from(v[0]));
+                arr.push(&JsValue::from(v[1]));
+                arr.into()
+            })
+    }
 }
 
 impl WasmContextHandle {
@@ -148,6 +166,7 @@ impl WasmContextHandle {
             governance: meta.governance,
             member_count: meta.member_count,
             economic_policy: meta.economic_policy,
+            min_protocol_version: meta.min_protocol_version.map(|(maj, min)| vec![maj, min]),
         }
     }
 }

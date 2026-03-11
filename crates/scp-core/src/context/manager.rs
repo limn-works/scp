@@ -1757,6 +1757,13 @@ impl ContextManager {
         params: ContextParams,
         creator_did: DID,
     ) -> Result<ContextHandle, ContextCreationError> {
+        // Defense-in-depth: verify that the creator's SDK version satisfies the
+        // min_protocol_version it is setting. Without this check, an SDK 1.0
+        // creator could set min_protocol_version: (2, 0), creating a context
+        // nobody — including themselves — can join.
+        params.check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+
+        // Validate governance model parameters before proceeding.
         validate_governance_model(&params.governance)?;
         let governance_engine =
             create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
@@ -1891,6 +1898,10 @@ impl ContextManager {
         creator_did: DID,
         governance_config: GovernanceModelConfig,
     ) -> Result<ContextHandle, ContextCreationError> {
+        // Defense-in-depth: verify that the creator's SDK version satisfies the
+        // min_protocol_version it is setting (same check as create_context).
+        params.check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+
         // Validate consistency between GovernanceModel and GovernanceModelConfig.
         validate_governance_consistency(&params.governance, &governance_config)?;
 
@@ -15747,5 +15758,77 @@ mod tests {
                 "notification effective_at must be notified_at + 72h"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // min_protocol_version defense-in-depth at create_context (#707)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_context_rejects_incompatible_min_protocol_version() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = ContextParams {
+            min_protocol_version: Some((2, 0)), // SDK is 1.0, this is unreachable
+            ..ContextParams::default()
+        };
+        let result = manager
+            .create_context("ver-reject".into(), params, "did:key:creator".into())
+            .await;
+        assert!(
+            result.is_err(),
+            "create_context should reject min_protocol_version (2,0)"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("version incompatible"),
+            "error should mention version incompatibility: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_context_accepts_compatible_min_protocol_version() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = ContextParams {
+            min_protocol_version: Some((1, 0)), // matches SDK version
+            ..ContextParams::default()
+        };
+        let result = manager
+            .create_context("ver-accept".into(), params, "did:key:creator".into())
+            .await;
+        assert!(
+            result.is_ok(),
+            "create_context should accept min_protocol_version (1,0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_context_accepts_none_min_protocol_version() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = ContextParams {
+            min_protocol_version: None, // defaults to (1,0) — always compatible
+            ..ContextParams::default()
+        };
+        let result = manager
+            .create_context("ver-none".into(), params, "did:key:creator".into())
+            .await;
+        assert!(
+            result.is_ok(),
+            "create_context should accept min_protocol_version None"
+        );
     }
 }
