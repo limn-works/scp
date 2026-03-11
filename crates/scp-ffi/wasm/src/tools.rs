@@ -215,8 +215,6 @@ pub fn tool_invoke(
             }
         }
 
-        // WASM operates in echo mode — no external handler dispatch.
-        // Returns a validated-status result.
         let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),
@@ -224,11 +222,11 @@ pub fn tool_invoke(
             }
             .into_js()
         })?;
-        let result = serde_json::json!({
-            "status": "validated",
-            "tool_id": tool_id,
-            "input": parsed_input,
-        });
+
+        let result = with_manager(|mgr| {
+            mgr.invoke_tool(&context_id, &tool_id, &parsed_input, &identity_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Tool {
