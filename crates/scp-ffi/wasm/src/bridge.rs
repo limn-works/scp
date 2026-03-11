@@ -359,7 +359,8 @@ pub fn bridge_register(
 /// - `bridge_id` — Unique ID of the bridge connector.
 /// - `platform_handle` — External platform handle (e.g., `"@user#1234"`).
 /// - `bridge_mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
-/// - `context_id` — Context for the shadow identity.
+/// - `context_id` — Optional context for the shadow identity. Defaults to
+///   `"ctx-shadow"` when `None`, matching the NAPI bridge behavior.
 ///
 /// # Errors
 ///
@@ -378,7 +379,7 @@ pub fn bridge_create_shadow(
     bridge_id: String,
     platform_handle: String,
     bridge_mode: String,
-    context_id: String,
+    context_id: Option<String>,
 ) -> Result<WasmShadowIdentity, JsError> {
     if bridge_id.is_empty() {
         return Err(ScpWasmError::Validation {
@@ -399,15 +400,14 @@ pub fn bridge_create_shadow(
     // we don't use the parsed value for shadow creation logic).
     let _mode = BridgeMode::from_str(&bridge_mode).map_err(ScpWasmError::into_js)?;
 
+    // Default to "ctx-shadow" when context_id is None, matching the NAPI
+    // bridge's `context_id.unwrap_or_else(|| "ctx-shadow".to_string())`.
+    let _ctx_id = context_id.unwrap_or_else(|| "ctx-shadow".to_owned());
+
     // Deterministic shadow ID: "shadow-{bridge_id}-{handle_sans_at}"
     // Mirrors the NAPI bridge's ID generation logic.
     let handle_clean = platform_handle.replace('@', "");
     let shadow_id = format!("shadow-{bridge_id}-{handle_clean}");
-
-    // Suppress unused variable warning for context_id — it is accepted
-    // for API parity with the NAPI bridge but shadow creation does not
-    // require it beyond ID generation (which uses bridge_id + handle).
-    let _ = &context_id;
 
     Ok(WasmShadowIdentity {
         shadow_id,
@@ -562,11 +562,23 @@ mod wasm_tests {
             "bridge-1".to_owned(),
             "@user".to_owned(),
             "relay".to_owned(),
-            "ctx-1".to_owned(),
+            Some("ctx-1".to_owned()),
         )
         .unwrap();
         assert_eq!(result.attributed_role(), "observer");
         assert_eq!(result.provenance_status(), "Shadow");
+    }
+
+    #[test]
+    fn create_shadow_with_none_context_id() {
+        let result = bridge_create_shadow(
+            "bridge-1".to_owned(),
+            "@user".to_owned(),
+            "relay".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.attributed_role(), "observer");
     }
 
     #[test]
@@ -575,7 +587,7 @@ mod wasm_tests {
             "bridge-1".to_owned(),
             "@user#1234".to_owned(),
             "relay".to_owned(),
-            "ctx-1".to_owned(),
+            Some("ctx-1".to_owned()),
         )
         .unwrap();
         assert_eq!(result.shadow_id(), "shadow-bridge-1-user#1234");
@@ -588,7 +600,7 @@ mod wasm_tests {
                 "bridge-1".to_owned(),
                 "@user".to_owned(),
                 "invalid".to_owned(),
-                "ctx-1".to_owned(),
+                Some("ctx-1".to_owned()),
             )
             .is_err()
         );
@@ -601,7 +613,7 @@ mod wasm_tests {
                 String::new(),
                 "@user".to_owned(),
                 "relay".to_owned(),
-                "ctx-1".to_owned(),
+                Some("ctx-1".to_owned()),
             )
             .is_err()
         );
@@ -614,7 +626,7 @@ mod wasm_tests {
                 "bridge-1".to_owned(),
                 String::new(),
                 "relay".to_owned(),
-                "ctx-1".to_owned(),
+                Some("ctx-1".to_owned()),
             )
             .is_err()
         );
@@ -641,7 +653,7 @@ mod wasm_tests {
                 "bridge-1".to_owned(),
                 "@user".to_owned(),
                 mode.to_owned(),
-                "ctx-1".to_owned(),
+                Some("ctx-1".to_owned()),
             );
             assert!(result.is_ok());
         }

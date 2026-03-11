@@ -107,13 +107,13 @@ fn validate_scope(scope: &str) -> Result<(), String> {
 /// - Otherwise => `"DiscoveryHandle"` (e.g., `alice@photography`)
 fn classify_scope(scope: &str) -> &'static str {
     if scope == "_" {
-        "Unscoped"
+        "unscoped"
     } else if scope.contains('.') {
-        "DomainHandle"
+        "domain_handle"
     } else if scope.starts_with("did:") {
-        "AttestationHandle"
+        "attestation_handle"
     } else {
-        "DiscoveryHandle"
+        "discovery_handle"
     }
 }
 
@@ -123,7 +123,8 @@ fn classify_scope(scope: &str) -> &'static str {
 
 /// Parses a `local@scope` address into its components.
 ///
-/// Returns a JSON string with `local`, `scope`, `address_type`, and `raw` fields.
+/// Returns a JSON string with `type`, `local_part`, `scope`, and `raw` fields,
+/// matching the NAPI bridge's `discovery_parse_address` output format.
 ///
 /// # Errors
 ///
@@ -134,9 +135,9 @@ fn classify_scope(scope: &str) -> &'static str {
 /// ```js
 /// const parsed = discovery_parse_address("alice@photography");
 /// const obj = JSON.parse(parsed);
-/// console.log(obj.address_type); // "DiscoveryHandle"
-/// console.log(obj.local);        // "alice"
-/// console.log(obj.scope);        // "photography"
+/// console.log(obj.type);       // "discovery_handle"
+/// console.log(obj.local_part); // "alice"
+/// console.log(obj.scope);      // "photography"
 /// ```
 #[wasm_bindgen]
 pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
@@ -165,9 +166,9 @@ pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
     let address_type = classify_scope(scope);
 
     let result = serde_json::json!({
-        "local": local,
+        "type": address_type,
+        "local_part": local,
         "scope": scope,
-        "address_type": address_type,
         "raw": address,
     });
 
@@ -206,47 +207,62 @@ pub fn discovery_normalize_address(address: String) -> String {
 ///
 /// # Arguments
 ///
-/// - `handle` — Optional address handle to search for.
-/// - `context_type` — Optional context type filter.
-/// - `max_results` — Optional maximum number of results (f64 for JS compatibility).
+/// - `capabilities_json` — Optional JSON array of capability filter strings.
+/// - `keywords_json` — Optional JSON array of keyword strings.
+/// - `min_history_secs` — Optional minimum history duration in seconds (f64
+///   for JS compatibility).
+///
+/// Matches the NAPI bridge's `discovery_create_query(capabilities, keywords,
+/// min_history_secs)` signature and the TypeScript adapter's calling
+/// convention.
 ///
 /// # Errors
 ///
-/// Returns `JsError` if both `handle` and `context_type` are `None` (empty query).
+/// Returns `JsError` if `min_history_secs` is negative, or if JSON parsing
+/// fails for the provided arrays.
 ///
 /// # JS usage
 ///
 /// ```js
-/// const query = discovery_create_query("alice@photography", null, 10);
+/// const query = discovery_create_query('["code_review"]', '["rust"]', 3600);
 /// const obj = JSON.parse(query);
 /// ```
 #[wasm_bindgen]
 pub fn discovery_create_query(
-    handle: Option<String>,
-    context_type: Option<String>,
-    max_results: Option<f64>,
+    capabilities_json: Option<String>,
+    keywords_json: Option<String>,
+    min_history_secs: Option<f64>,
 ) -> Result<String, JsError> {
-    if handle.is_none() && context_type.is_none() {
-        return Err(JsError::new(
-            "[SCP-VALID-7110] at least one of handle or context_type must be provided",
-        ));
-    }
+    let capabilities: Option<Vec<String>> = match capabilities_json {
+        Some(ref s) => Some(serde_json::from_str(s).map_err(|e| {
+            JsError::new(&format!("[SCP-VALID-7040] invalid capabilities JSON: {e}"))
+        })?),
+        None => None,
+    };
 
-    let max = match max_results {
+    let keywords: Option<Vec<String>> =
+        match keywords_json {
+            Some(ref s) => Some(serde_json::from_str(s).map_err(|e| {
+                JsError::new(&format!("[SCP-VALID-7040] invalid keywords JSON: {e}"))
+            })?),
+            None => None,
+        };
+
+    let min_history = match min_history_secs {
         Some(v) if v < 0.0 || !v.is_finite() => {
             return Err(JsError::new(
-                "[SCP-VALID-7040] max_results must be non-negative",
+                "[SCP-VALID-7040] min_history_secs must be non-negative",
             ));
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        Some(v) => v as u64,
-        None => 20,
+        Some(v) => Some(v as u64),
+        None => None,
     };
 
     let result = serde_json::json!({
-        "handle": handle,
-        "context_type": context_type,
-        "max_results": max,
+        "capability_filter": capabilities,
+        "keywords": keywords,
+        "min_history": min_history,
     });
 
     Ok(result.to_string())
@@ -388,8 +404,27 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
         return Err("missing required 'relay' query parameter".to_owned());
     }
 
+    // Timestamp: js_sys is not available in non-wasm test builds, so use a
+    // seconds-since-epoch value. In wasm32, js_sys::Date::now() provides
+    // milliseconds; for native test builds, fall back to std::time.
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     // Build a single ContextDiscoveryResult matching the NAPI bridge's
-    // discovery_result_to_json output format.
+    // discovery_result_to_json output format, including trust_level and
+    // resolution_path per §22.2.1.
+    //
+    // An scp:// URI is shared out-of-band, so the trust level is
+    // DirectExchange and the resolution layer is "domain" (closest match
+    // for URI-based resolution — no discovery context is involved).
+    // See NAPI bridge: ContextDiscoverySource::ContextUri mapping.
     let result = serde_json::json!([{
         "context_id": context_id,
         "relay_urls": relay_urls,
@@ -397,6 +432,15 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
         "discovery_source": "context_uri",
         "mode": mode,
         "metadata_summary": name,
+        "trust_level": {
+            "kind": "DirectExchange",
+        },
+        "resolution_path": {
+            "layer": "domain",
+            "source": "context_uri",
+            "source_id": null,
+            "resolved_at": now_secs,
+        },
     }]);
 
     Ok(result.to_string())
@@ -420,7 +464,17 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
 ///
 /// Returns a JSON string containing an array of discovery results, each with:
 /// `context_id`, `relay_urls`, `publisher_did`, `discovery_source`, `mode`,
-/// `metadata_summary`.
+/// `metadata_summary`, `trust_level`, `resolution_path`.
+///
+/// # DID query limitation
+///
+/// DID-based queries (`did:dht:...`, `did:web:...`, etc.) always return an
+/// empty results array `"[]"` in the WASM bridge. DHT resolution requires
+/// network I/O (BEP44 DHT lookups via HTTP relays), which is not available
+/// from Rust compiled to `wasm32-unknown-unknown`. The TypeScript wrapper
+/// layer can implement DID-based discovery via the browser Fetch API if
+/// needed — this is a known architectural limitation per ADR-034, not a
+/// missing feature.
 ///
 /// See §5.14.11, §18.2.2, §18.4.
 ///
@@ -519,10 +573,10 @@ mod tests {
 
     #[test]
     fn classify_scope_types() {
-        assert_eq!(classify_scope("_"), "Unscoped");
-        assert_eq!(classify_scope("example.com"), "DomainHandle");
-        assert_eq!(classify_scope("did:key:z6MkTest"), "AttestationHandle");
-        assert_eq!(classify_scope("photography"), "DiscoveryHandle");
+        assert_eq!(classify_scope("_"), "unscoped");
+        assert_eq!(classify_scope("example.com"), "domain_handle");
+        assert_eq!(classify_scope("did:key:z6MkTest"), "attestation_handle");
+        assert_eq!(classify_scope("photography"), "discovery_handle");
     }
 
     // -- scp:// URI parsing tests -------------------------------------------
@@ -539,6 +593,12 @@ mod tests {
         assert_eq!(arr[0]["relay_urls"][0], "wss://relay.example.com/scp/v1");
         assert_eq!(arr[0]["discovery_source"], "context_uri");
         assert_eq!(arr[0]["mode"], "broadcast");
+        // §22.7: trust_level and resolution_path must be present
+        assert_eq!(arr[0]["trust_level"]["kind"], "DirectExchange");
+        assert_eq!(arr[0]["resolution_path"]["layer"], "domain");
+        assert_eq!(arr[0]["resolution_path"]["source"], "context_uri");
+        assert!(arr[0]["resolution_path"]["source_id"].is_null());
+        assert!(arr[0]["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -630,8 +690,8 @@ mod wasm_tests {
     fn parse_discovery_handle() {
         let result = discovery_parse_address("alice@photography".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["address_type"], "DiscoveryHandle");
-        assert_eq!(json["local"], "alice");
+        assert_eq!(json["type"], "discovery_handle");
+        assert_eq!(json["local_part"], "alice");
         assert_eq!(json["scope"], "photography");
     }
 
@@ -639,21 +699,21 @@ mod wasm_tests {
     fn parse_domain_handle() {
         let result = discovery_parse_address("alice@example.com".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["address_type"], "DomainHandle");
+        assert_eq!(json["type"], "domain_handle");
     }
 
     #[test]
     fn parse_attestation_handle() {
         let result = discovery_parse_address("alice@did:key:z6MkTest".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["address_type"], "AttestationHandle");
+        assert_eq!(json["type"], "attestation_handle");
     }
 
     #[test]
     fn parse_unscoped() {
         let result = discovery_parse_address("alice@_".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["address_type"], "Unscoped");
+        assert_eq!(json["type"], "unscoped");
     }
 
     #[test]
@@ -703,24 +763,34 @@ mod wasm_tests {
     }
 
     #[test]
-    fn create_query_with_handle() {
+    fn create_query_with_capabilities() {
         let result =
-            discovery_create_query(Some("alice@photo".to_owned()), None, Some(5.0)).unwrap();
+            discovery_create_query(Some(r#"["code_review"]"#.to_owned()), None, Some(3600.0))
+                .unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["handle"], "alice@photo");
-        assert_eq!(json["max_results"], 5);
+        assert_eq!(json["capability_filter"][0], "code_review");
+        assert_eq!(json["min_history"], 3600);
     }
 
     #[test]
-    fn create_query_empty_fails() {
-        assert!(discovery_create_query(None, None, None).is_err());
+    fn create_query_empty_returns_nulls() {
+        // Unlike the old signature, an empty query (all None) is valid —
+        // it returns a query with all-null fields matching the NAPI bridge
+        // which serializes an empty DiscoveryQuery.
+        let result = discovery_create_query(None, None, None).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json["capability_filter"].is_null());
+        assert!(json["keywords"].is_null());
+        assert!(json["min_history"].is_null());
     }
 
     #[test]
-    fn create_query_default_max_results() {
-        let result = discovery_create_query(Some("alice@photo".to_owned()), None, None).unwrap();
+    fn create_query_with_keywords() {
+        let result =
+            discovery_create_query(None, Some(r#"["rust","wasm"]"#.to_owned()), None).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["max_results"], 20);
+        assert_eq!(json["keywords"][0], "rust");
+        assert_eq!(json["keywords"][1], "wasm");
     }
 
     #[test]
@@ -734,37 +804,41 @@ mod wasm_tests {
     }
 
     #[test]
-    fn create_query_negative_max_results_errors() {
-        let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(-1.0));
-        assert!(result.is_err(), "negative max_results should error");
+    fn create_query_negative_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(-1.0));
+        assert!(result.is_err(), "negative min_history_secs should error");
     }
 
     #[test]
-    fn create_query_neg_infinity_max_results_errors() {
-        let result = discovery_create_query(
-            Some("alice@photo".to_owned()),
-            None,
-            Some(f64::NEG_INFINITY),
+    fn create_query_neg_infinity_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(f64::NEG_INFINITY));
+        assert!(
+            result.is_err(),
+            "NEG_INFINITY min_history_secs should error"
         );
-        assert!(result.is_err(), "NEG_INFINITY max_results should error");
     }
 
     #[test]
-    fn create_query_f64_min_max_results_errors() {
-        let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::MIN));
-        assert!(result.is_err(), "f64::MIN max_results should error");
+    fn create_query_f64_min_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(f64::MIN));
+        assert!(result.is_err(), "f64::MIN min_history_secs should error");
     }
 
     #[test]
-    fn create_query_nan_max_results_errors() {
-        let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::NAN));
-        assert!(result.is_err(), "NaN max_results should error");
+    fn create_query_nan_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(f64::NAN));
+        assert!(result.is_err(), "NaN min_history_secs should error");
     }
 
     #[test]
-    fn create_query_positive_infinity_max_results_errors() {
-        let result =
-            discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::INFINITY));
-        assert!(result.is_err(), "INFINITY max_results should error");
+    fn create_query_positive_infinity_min_history_errors() {
+        let result = discovery_create_query(None, None, Some(f64::INFINITY));
+        assert!(result.is_err(), "INFINITY min_history_secs should error");
+    }
+
+    #[test]
+    fn create_query_invalid_capabilities_json_errors() {
+        let result = discovery_create_query(Some("not-valid-json".to_owned()), None, None);
+        assert!(result.is_err(), "invalid capabilities JSON should error");
     }
 }
