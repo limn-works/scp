@@ -1,85 +1,107 @@
-@testable import SCP
 import Foundation
+@testable import SCP
 import Testing
 
 // MARK: - Real FFI Tests
 
-/// End-to-end tests that exercise the real UniFFI bridge functions — no mocks.
-///
-/// These tests call the default bridge implementations which delegate to the
-/// UniFFI-generated functions in `ScpBindings.swift`, which in turn call into
-/// the compiled Rust native library via FFI.
-///
-/// ## Availability
-///
-/// The tests require the compiled `ScpFFI.xcframework` (native Rust library)
-/// to be linked. When the library is unavailable, the tests detect this at
-/// runtime and skip gracefully using the `#if canImport(scpFFI)` compile-time
-/// check and a runtime availability guard.
-///
-/// ## Test Categories
-///
-/// 1. **Stateless synchronous functions** — Pure computation, no ContextHandle
-///    needed. These are the most reliable FFI tests (discovery, provenance,
-///    sync classification, bridge trust evaluation, participation requirements).
-///
-/// 2. **Identity lifecycle** — Requires the Rust async runtime. Creates real
-///    identities via `identityCreate(custody: "in_memory")`, exercises DID
-///    operations, agent key management, and device attestation.
-///
-/// 3. **Context lifecycle** — Requires identity + context creation. Exercises
-///    context create/join/leave/close, membership queries, governance, tools,
-///    UCAN mint/validate/revoke, event log query/verify, and broadcast ops.
-///
-/// ## Provenance
-///
-/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Issue #453 (E2E FFI Tests)
-struct RealFFITests {
+// End-to-end tests that exercise the real UniFFI bridge functions — no mocks.
+//
+// These tests call the default bridge implementations which delegate to the
+// UniFFI-generated functions in `ScpBindings.swift`, which in turn call into
+// the compiled Rust native library via FFI.
+//
+// ## Availability
+//
+// The tests require the compiled `ScpFFI.xcframework` (native Rust library)
+// to be linked. When the library is unavailable, the tests detect this at
+// runtime and skip gracefully using the `#if canImport(scpFFI)` compile-time
+// check and a runtime availability guard.
+//
+// ## Test Categories
+//
+// 1. **Stateless synchronous functions** — Pure computation, no ContextHandle
+//    needed. These are the most reliable FFI tests (discovery, provenance,
+//    sync classification, bridge trust evaluation, participation requirements).
+//
+// 2. **Identity lifecycle** — Requires the Rust async runtime. Creates real
+//    identities via `identityCreate(custody: "in_memory")`, exercises DID
+//    operations, agent key management, and device attestation.
+//
+// 3. **Context lifecycle** — Requires identity + context creation. Exercises
+//    context create/join/leave/close, membership queries, governance, tools,
+//    UCAN mint/validate/revoke, event log query/verify, and broadcast ops.
+//
+// ## Provenance
+//
+// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+// - Issue #453 (E2E FFI Tests)
 
-    // MARK: - FFI Availability Guard
+// MARK: - FFI Availability Guard
 
-    /// Returns `true` if the native Rust FFI library is linked and callable.
-    ///
-    /// Attempts a trivial synchronous FFI call (`discoveryNormalizeAddress`)
-    /// to verify the native library is available. If the function executes
-    /// without crashing, the library is linked. If the library is not linked,
-    /// the process would crash (dylib not found) — so this guard must only
-    /// be used after a compile-time `#if canImport(scpFFI)` check passes.
-    ///
-    /// For builds without the XCFramework, the `canImport` check prevents
-    /// compilation of FFI-dependent test paths entirely.
-    private static var isFFIAvailable: Bool = {
-        // Use a synchronous, infallible UniFFI function as a probe.
-        // discoveryNormalizeAddress is a pure function that never throws
-        // and requires no state — it just lowercases and trims whitespace.
-        #if canImport(scpFFI)
+/// Returns `true` if the native Rust FFI library is linked and callable.
+///
+/// Attempts a trivial synchronous FFI call (`discoveryNormalizeAddress`)
+/// to verify the native library is available. If the function executes
+/// without crashing, the library is linked. If the library is not linked,
+/// the process would crash (dylib not found) — so this guard must only
+/// be used after a compile-time `#if canImport(scpFFI)` check passes.
+///
+/// For builds without the XCFramework, the `canImport` check prevents
+/// compilation of FFI-dependent test paths entirely.
+private let isFFIAvailable: Bool = {
+    // Use a synchronous, infallible UniFFI function as a probe.
+    // discoveryNormalizeAddress is a pure function that never throws
+    // and requires no state — it just lowercases and trims whitespace.
+    #if canImport(scpFFI)
         // If scpFFI can be imported, the dylib is linked. Verify it loads.
         let result = discoveryNormalizeAddress(address: "  TEST  ")
         return result == "test"
-        #else
+    #else
         return false
-        #endif
-    }()
+    #endif
+}()
 
-    /// Skips the current test if FFI is not available.
-    ///
-    /// Call this at the top of every test that uses real FFI functions.
-    /// When the native library is not linked, the test records an
-    /// informational skip message rather than crashing.
-    private func requireFFI() throws {
-        guard RealFFITests.isFFIAvailable else {
-            // withKnownIssue marks the test as an expected skip
-            // rather than a failure.
-            throw SkipError()
-        }
+/// Skips the current test if FFI is not available.
+///
+/// Call this at the top of every test that uses real FFI functions.
+/// When the native library is not linked, the test records an
+/// informational skip message rather than crashing.
+private func requireFFI() throws {
+    guard isFFIAvailable else {
+        // withKnownIssue marks the test as an expected skip
+        // rather than a failure.
+        throw FFISkipError()
     }
+}
 
-    /// Error thrown to skip tests when FFI is unavailable.
-    private struct SkipError: Error {}
+/// Error thrown to skip tests when FFI is unavailable.
+private struct FFISkipError: Error {}
 
+// MARK: - Test Helpers
+
+/// Creates a ``ContextParams`` with sensible test defaults.
+private func makeTestParams(
+    ceiling: [String] = ["messages:read", "messages:write"],
+    governance: GovernanceModel = .singleAdmin,
+    memoryScope: MemoryScope = .full,
+    ttlSeconds: UInt64 = 3600,
+    promotable: Bool = false
+) -> ContextParams {
+    ContextParams(
+        ceiling: ceiling,
+        governance: governance,
+        memoryScope: memoryScope,
+        ttlSeconds: ttlSeconds,
+        promotable: promotable
+    )
+}
+
+// MARK: - Stateless Tests (Sections 1-3)
+
+struct RealFFIStatelessTests {
     // =========================================================================
     // MARK: - 1. Discovery (Stateless, Synchronous)
+
     // =========================================================================
 
     @Test("FFI: discoveryNormalizeAddress lowercases and trims")
@@ -169,6 +191,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 2. Provenance (Stateless, Synchronous)
+
     // =========================================================================
 
     @Test("FFI: provenanceCheckChainDepth within default limit")
@@ -309,6 +332,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 3. Sync Classification (Stateless, Synchronous)
+
     // =========================================================================
 
     @Test("FFI: syncClassifyOffline short duration")
@@ -413,9 +437,14 @@ struct RealFFITests {
         )
         #expect(tier == "long")
     }
+}
 
+// MARK: - Bridge Trust & Participation Tests (Sections 4-5)
+
+struct RealFFIBridgeTrustTests {
     // =========================================================================
     // MARK: - 4. Bridge Trust Evaluation (Stateless, Synchronous)
+
     // =========================================================================
 
     @Test("FFI: bridgeEvaluateTrust native-native highest trust")
@@ -507,6 +536,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 5. Participation Requirements (Stateless, Synchronous)
+
     // =========================================================================
 
     @Test("FFI: verifyParticipationRequirements bridge with valid JSON")
@@ -599,9 +629,14 @@ struct RealFFITests {
         // Missing entry treated as zero -> 0 < 1 -> fails
         #expect(!verifyParticipationRequirements(requirement: requirement, profile: profile))
     }
+}
 
+// MARK: - Identity & Context Tests (Sections 6-8)
+
+struct RealFFIIdentityAndContextTests {
     // =========================================================================
     // MARK: - 6. Identity Lifecycle (Async, Requires Rust Runtime)
+
     // =========================================================================
 
     @Test("FFI: identityCreate with in_memory custody")
@@ -678,7 +713,7 @@ struct RealFFITests {
             // Get the public key
             let pubKey = identityGetAgentPublicKey(withKey)
             #expect(pubKey != nil)
-            #expect(!pubKey!.isEmpty)
+            if let pubKey { #expect(!pubKey.isEmpty) }
 
             // Remove the agent key
             let withoutKey = try await removeAgentKeyFromIdentity(withKey)
@@ -736,24 +771,8 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 7. Context Lifecycle (Async, Requires Identity + Context)
-    // =========================================================================
 
-    /// Creates a ``ContextParams`` with sensible test defaults.
-    private func makeTestParams(
-        ceiling: [String] = ["messages:read", "messages:write"],
-        governance: GovernanceModel = .singleAdmin,
-        memoryScope: MemoryScope = .full,
-        ttlSeconds: UInt64 = 3600,
-        promotable: Bool = false
-    ) -> ContextParams {
-        ContextParams(
-            ceiling: ceiling,
-            governance: governance,
-            memoryScope: memoryScope,
-            ttlSeconds: ttlSeconds,
-            promotable: promotable
-        )
-    }
+    // =========================================================================
 
     @Test("FFI: context create with real identity")
     func ffiContextCreate() async throws {
@@ -836,6 +855,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 8. Tools (Async, Requires Active Context)
+
     // =========================================================================
 
     @Test("FFI: tool register and invoke")
@@ -971,9 +991,14 @@ struct RealFFITests {
         // Close session
         try await toolSessionClose(handle: handle, sessionId: sessionId)
     }
+}
 
+// MARK: - UCAN, EventLog & Governance Tests (Sections 9-11)
+
+struct RealFFIUcanAndGovernanceTests {
     // =========================================================================
     // MARK: - 9. UCAN (Async, Requires Active Context)
+
     // =========================================================================
 
     @Test("FFI: UCAN mint returns valid token")
@@ -1063,6 +1088,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 10. Event Log (Async, Requires Active Context)
+
     // =========================================================================
 
     @Test("FFI: event log query returns events")
@@ -1130,6 +1156,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 11. Governance (Async, Requires Active Context)
+
     // =========================================================================
 
     @Test("FFI: governance execute action")
@@ -1185,9 +1212,14 @@ struct RealFFITests {
         #expect(MemberRole.fromBridge("\"Member\"") == .member)
         #expect(MemberRole.fromBridge("unknown_role") == .custom)
     }
+}
 
+// MARK: - Trust & Broadcast Tests (Sections 12-14)
+
+struct RealFFITrustTests {
     // =========================================================================
     // MARK: - 12. Trust (Mixed: Some FFI, Some Pure Swift)
+
     // =========================================================================
 
     @Test("FFI: TrustEvaluation from TrustInput")
@@ -1302,6 +1334,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 13. Broadcast Operations (Async, Requires Active Context)
+
     // =========================================================================
 
     @Test("FFI: broadcast subscribe and query")
@@ -1340,6 +1373,7 @@ struct RealFFITests {
 
     // =========================================================================
     // MARK: - 14. Local DID Management (Async)
+
     // =========================================================================
 
     @Test("FFI: registerLocalDid and isLocalDid roundtrip")
@@ -1359,9 +1393,14 @@ struct RealFFITests {
         let isNotLocal = await isLocalDid(did: "did:dht:z6MkNonLocal")
         #expect(isNotLocal == false)
     }
+}
 
+// MARK: - Type Shape Tests (Section 15)
+
+struct RealFFITypeShapeTests {
     // =========================================================================
     // MARK: - 15. Type Shape Verification (No FFI Required)
+
     // =========================================================================
 
     @Test("FFI: ContextState has all 5 cases")
@@ -1519,17 +1558,17 @@ struct RealFFITests {
             contextId: "ctx-checkpoint",
             senderDid: "did:dht:z6MkSender",
             eventCount: 100,
-            merkleRoot: Data(repeating: 0xAA, count: 32),
+            merkleRoot: String(repeating: "aa", count: 32),
             epoch: 5,
             timestamp: 1_700_000_000,
-            signature: Data(repeating: 0xBB, count: 64)
+            signature: String(repeating: "bb", count: 64)
         )
         #expect(checkpoint.contextId == "ctx-checkpoint")
         #expect(checkpoint.senderDid == "did:dht:z6MkSender")
         #expect(checkpoint.eventCount == 100)
-        #expect(checkpoint.merkleRoot.count == 32)
+        #expect(checkpoint.merkleRoot.count == 64) // 32 bytes hex-encoded = 64 chars
         #expect(checkpoint.epoch == 5)
-        #expect(checkpoint.signature.count == 64)
+        #expect(checkpoint.signature.count == 128) // 64 bytes hex-encoded = 128 chars
     }
 
     @Test("FFI: ToolInvocationResult struct construction")
@@ -1582,7 +1621,7 @@ struct RealFFITests {
             contextId: "ctx-bridge"
         )
         #expect(result.bridgeId == "bridge-001")
-        #expect(result.bridgeMode == .relay)
+        #expect(result.mode == "relay")
         #expect(result.status == "active")
     }
 
@@ -1596,7 +1635,7 @@ struct RealFFITests {
             provenanceStatus: "shadow"
         )
         #expect(shadow.shadowId == "shadow-001")
-        #expect(shadow.typedShadowStatus == .shadow)
+        #expect(shadow.provenanceStatus == "shadow")
 
         let claimed = ShadowIdentityResult(
             shadowId: "shadow-002",
@@ -1605,7 +1644,7 @@ struct RealFFITests {
             attributedRole: "Admin",
             provenanceStatus: "claimed"
         )
-        #expect(claimed.typedShadowStatus == .claimed)
+        #expect(claimed.provenanceStatus == "claimed")
     }
 
     @Test("FFI: ToolSessionResult struct construction")
@@ -1627,4 +1666,4 @@ struct RealFFITests {
         #expect(prov.chainDepth == 2)
         #expect(prov.signature.count == 64)
     }
-} // end RealFFITests
+}

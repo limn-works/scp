@@ -230,8 +230,15 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 // but the crate itself is also named `_scp_core`, creating a path collision.
 // This re-export bridges the gap: tests reference `_scp_core::__PYO3_NAME`
 // (crate root) which resolves to the re-exported generated symbols.
+//
+// Gated with `not(doctest)` because `rustdoc --test` compiles with both the
+// crate extern AND the `#[pymodule]`-generated module in scope, making the
+// bare `_scp_core` path ambiguous (E0659). Integration tests don't run
+// doctests, so this gate has no effect on real test builds.
+#[cfg(not(doctest))]
 #[doc(hidden)]
 pub use _scp_core::__PYO3_NAME;
+#[cfg(not(doctest))]
 #[doc(hidden)]
 pub use _scp_core::__pyo3_init;
 
