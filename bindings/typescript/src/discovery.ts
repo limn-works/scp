@@ -8,7 +8,7 @@
  * See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
  */
 
-import { mapBridgeError } from "./errors";
+import { mapBridgeError, ValidationError } from "./errors";
 import { getBridge } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
 import type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
@@ -70,6 +70,20 @@ const VALID_TRUST_LEVEL_KINDS = new Set([
 ]);
 
 /**
+ * Validates that a string is one of the 6 spec-defined TrustLevel kind values.
+ *
+ * @throws {ValidationError} If the kind is not in the spec-defined set.
+ */
+function validateTrustLevelKind(kind: string): asserts kind is TrustLevel["kind"] {
+  if (!VALID_TRUST_LEVEL_KINDS.has(kind)) {
+    throw new ValidationError(
+      `Unknown TrustLevel kind: "${kind}". Expected one of: ${[...VALID_TRUST_LEVEL_KINDS].join(", ")}`,
+      "SCP-VALID-7100",
+    );
+  }
+}
+
+/**
  * Parses a trust level from the bridge JSON. The NAPI bridge emits trust
  * levels as `{ "kind": "..." }` objects (discriminated unions per §22.7).
  * The `MultiLayerCorroborated` variant additionally carries `sources`.
@@ -77,17 +91,14 @@ const VALID_TRUST_LEVEL_KINDS = new Set([
  * Also handles legacy string values (e.g. `"DomainVerified"`) by wrapping
  * them into the discriminated union shape.
  *
- * Throws on unrecognized values -- §22.7 defines exactly 6 variants.
+ * @throws {ValidationError} On unrecognized variants or unexpected input types.
+ * §22.7 defines exactly 6 variants.
  */
 function parseTrustLevel(raw: unknown): TrustLevel {
   if (raw != null && typeof raw === "object" && "kind" in raw) {
     const obj = raw as Record<string, unknown>;
-    const kind = obj.kind as string;
-    if (!VALID_TRUST_LEVEL_KINDS.has(kind)) {
-      throw new Error(
-        `Unknown TrustLevel kind: "${kind}". Expected one of: ${[...VALID_TRUST_LEVEL_KINDS].join(", ")}`,
-      );
-    }
+    const kind = String(obj.kind);
+    validateTrustLevelKind(kind);
     if (kind === "MultiLayerCorroborated") {
       const rawSources = (obj.sources ?? []) as Array<Record<string, unknown>>;
       return {
@@ -95,22 +106,19 @@ function parseTrustLevel(raw: unknown): TrustLevel {
         sources: rawSources.map(parseResolutionPath),
       };
     }
-    return { kind } as TrustLevel;
+    return { kind };
   }
   // Handle plain string trust levels from the bridge.
   if (typeof raw === "string") {
-    if (!VALID_TRUST_LEVEL_KINDS.has(raw)) {
-      throw new Error(
-        `Unknown TrustLevel kind: "${raw}". Expected one of: ${[...VALID_TRUST_LEVEL_KINDS].join(", ")}`,
-      );
-    }
+    validateTrustLevelKind(raw);
     if (raw === "MultiLayerCorroborated") {
       return { kind: "MultiLayerCorroborated", sources: [] };
     }
-    return { kind: raw } as TrustLevel;
+    return { kind: raw };
   }
-  throw new Error(
+  throw new ValidationError(
     `Invalid TrustLevel value: expected object with "kind" or string, got ${typeof raw}`,
+    "SCP-VALID-7101",
   );
 }
 

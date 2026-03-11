@@ -160,39 +160,9 @@ export interface TransportConfig {
 }
 
 // -- Address Resolution (§22.2.1, §22.7) -------------------------------------
+// Canonical definitions live in types.ts; re-exported here for declaration consumers.
 
-export type TrustLevel =
-  | { readonly kind: "DirectExchange" }
-  | { readonly kind: "LocalPetname" }
-  | { readonly kind: "DomainVerified" }
-  | { readonly kind: "AttestationVerified" }
-  | { readonly kind: "DiscoveryContextVerified" }
-  | { readonly kind: "MultiLayerCorroborated"; readonly sources: readonly ResolutionPath[] };
-
-export type ResolutionLayer = "petname" | "discovery_context" | "attestation" | "domain";
-
-export interface ResolutionPath {
-  readonly layer: ResolutionLayer;
-  readonly source: string;
-  readonly sourceId: string | null;
-  readonly resolvedAt: number;
-}
-
-export type AddressResolution =
-  | {
-      readonly type: "Identity";
-      readonly did: string;
-      readonly trustLevel: TrustLevel;
-      readonly resolutionPath: ResolutionPath;
-    }
-  | {
-      readonly type: "Context";
-      readonly contextId: string;
-      readonly relayUrls: readonly string[];
-      readonly mode: string | null;
-      readonly trustLevel: TrustLevel;
-      readonly resolutionPath: ResolutionPath;
-    };
+export type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
 
 export declare function resolveAddress(query: string): Promise<AddressResolution[]>;
 
