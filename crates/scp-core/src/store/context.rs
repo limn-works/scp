@@ -8,9 +8,10 @@
 //! context/{context_id}/params
 //! context/{context_id}/membership/{did}
 //! context/{context_id}/role/{role_name}
+//! context/{context_id}/grace/{epoch:020d}
 //! ```
 //!
-//! See spec sections 17.3 and 17.4.
+//! See spec sections 17.3, 17.4, and 23.11.
 
 use std::collections::HashSet;
 
@@ -227,6 +228,28 @@ pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::
 pub fn governance_deadlock_state_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/governance/deadlock_state"))
+}
+
+// ---------------------------------------------------------------------------
+// Epoch grace persistence key helpers (§23.11)
+// ---------------------------------------------------------------------------
+
+/// Builds the storage key for a single grace window entry.
+///
+/// Format: `context/{context_id}/grace/{epoch:020d}`
+/// See spec §23.11: grace entries are persisted transactionally with MLS
+/// group state.
+fn grace_entry_key(context_id: &str, epoch: u64) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/grace/{epoch:020}"))
+}
+
+/// Builds the prefix for listing all grace entries in a context.
+///
+/// Format: `context/{context_id}/grace/`
+fn grace_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/grace/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +792,110 @@ impl<S: Storage> ProtocolStore<S> {
     ) -> Result<Option<crate::context::memory_scope::EphemeralContextMetadata>, StoreError> {
         let key = ephemeral_metadata_key(context_id)?;
         self.load_value(&key).await
+    }
+
+    // -------------------------------------------------------------------
+    // Epoch grace persistence (§23.11)
+    // -------------------------------------------------------------------
+
+    /// Persists a single grace window entry under
+    /// `context/{context_id}/grace/{epoch:020d}`.
+    ///
+    /// **Note:** The primary production persistence path for grace entries is
+    /// the [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob,
+    /// which persists grace entries atomically alongside all other context
+    /// state (membership, roles, governance, TTL, etc.) to ensure
+    /// transactional consistency (§23.11 step 2). This individual CRUD method
+    /// is available for direct-access patterns (e.g., targeted cleanup,
+    /// testing, or recovery workflows) but is not called in the standard
+    /// snapshot-based persistence flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_grace_entry(
+        &self,
+        context_id: &str,
+        entry: &crate::crypto::mls::epoch_grace::GraceEntry,
+    ) -> Result<(), StoreError> {
+        let key = grace_entry_key(context_id, entry.epoch)?;
+        self.store_value(&key, entry).await
+    }
+
+    /// Loads all persisted grace entries for a context from individual
+    /// `context/{context_id}/grace/{epoch:020d}` keys.
+    ///
+    /// Returns entries sorted by epoch number.
+    ///
+    /// **Note:** The primary production persistence path loads grace entries
+    /// from the [`ContextSnapshot`](crate::context::manager::ContextSnapshot)
+    /// blob (see `restore_context` in `context/manager.rs`). This method
+    /// loads from individual storage keys and is available for direct-access
+    /// patterns (e.g., recovery, diagnostics, testing) but is not called in
+    /// the standard snapshot-based restore flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage fails.
+    /// Returns [`StoreError::DeserializationFailed`] if a stored entry is
+    /// corrupted.
+    pub async fn load_grace_entries(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<crate::crypto::mls::epoch_grace::GraceEntry>, StoreError> {
+        let prefix = grace_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+        let mut entries = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(entry) = self
+                .load_value::<crate::crypto::mls::epoch_grace::GraceEntry>(key)
+                .await?
+            {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by_key(|e| e.epoch);
+        Ok(entries)
+    }
+
+    /// Deletes a single grace entry for a specific epoch from the
+    /// individual `context/{context_id}/grace/{epoch:020d}` key.
+    ///
+    /// **Note:** The primary production persistence path manages grace
+    /// entries atomically within the
+    /// [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// This individual CRUD method is available for direct-access patterns
+    /// (e.g., targeted cleanup during recovery or testing) but expired
+    /// entries are normally excluded at snapshot creation time rather than
+    /// deleted individually.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage fails.
+    pub async fn delete_grace_entry(&self, context_id: &str, epoch: u64) -> Result<(), StoreError> {
+        let key = grace_entry_key(context_id, epoch)?;
+        self.storage.delete(&key).await?;
+        Ok(())
+    }
+
+    /// Deletes all grace entries for a context from individual
+    /// `context/{context_id}/grace/` keys.
+    ///
+    /// **Note:** The primary production persistence path manages grace
+    /// entries atomically within the
+    /// [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// This method is available for bulk cleanup of individually-stored
+    /// grace entries (e.g., during the inconsistent state fallback §23.11
+    /// or migration from individual keys to the snapshot path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage fails.
+    pub async fn delete_all_grace_entries(&self, context_id: &str) -> Result<u64, StoreError> {
+        let prefix = grace_prefix(context_id)?;
+        let deleted = self.storage.delete_prefix(&prefix).await?;
+        Ok(deleted)
     }
 }
 
@@ -1513,6 +1640,8 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            grace_entries: Vec::new(),
+            needs_reconnect: false,
         }
     }
 
@@ -1642,5 +1771,251 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolStorePersistence::new(store);
         assert_object_safe(&bridge);
+    }
+
+    // -------------------------------------------------------------------
+    // Epoch grace persistence (§23.11)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_grace_entry_roundtrip() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        let entry = GraceEntry {
+            epoch: 42,
+            expires_at_unix_secs: 1_700_000_000,
+        };
+        store.store_grace_entry("ctx-1", &entry).await.unwrap();
+        let loaded = store.load_grace_entries("ctx-1").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], entry);
+    }
+
+    #[tokio::test]
+    async fn load_grace_entries_returns_sorted_by_epoch() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        // Store out of order.
+        for &epoch in &[30, 10, 20] {
+            let entry = GraceEntry {
+                epoch,
+                expires_at_unix_secs: 1_700_000_000 + epoch,
+            };
+            store.store_grace_entry("ctx-1", &entry).await.unwrap();
+        }
+
+        let loaded = store.load_grace_entries("ctx-1").await.unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].epoch, 10);
+        assert_eq!(loaded[1].epoch, 20);
+        assert_eq!(loaded[2].epoch, 30);
+    }
+
+    #[tokio::test]
+    async fn load_grace_entries_empty_returns_empty() {
+        let store = make_store();
+        let loaded = store.load_grace_entries("ctx-1").await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_grace_entry_removes_single_epoch() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        for epoch in 1..=3 {
+            let entry = GraceEntry {
+                epoch,
+                expires_at_unix_secs: 1_700_000_000 + epoch,
+            };
+            store.store_grace_entry("ctx-1", &entry).await.unwrap();
+        }
+
+        store.delete_grace_entry("ctx-1", 2).await.unwrap();
+        let loaded = store.load_grace_entries("ctx-1").await.unwrap();
+        let epochs: Vec<u64> = loaded.iter().map(|e| e.epoch).collect();
+        assert_eq!(epochs, vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn delete_all_grace_entries_clears_context() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        for epoch in 1..=5 {
+            let entry = GraceEntry {
+                epoch,
+                expires_at_unix_secs: 1_700_000_000,
+            };
+            store.store_grace_entry("ctx-1", &entry).await.unwrap();
+        }
+
+        let deleted = store.delete_all_grace_entries("ctx-1").await.unwrap();
+        assert_eq!(deleted, 5);
+
+        let loaded = store.load_grace_entries("ctx-1").await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_context_removes_grace_entries() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        let entry = GraceEntry {
+            epoch: 99,
+            expires_at_unix_secs: 1_700_000_000,
+        };
+        store.store_grace_entry("ctx-1", &entry).await.unwrap();
+        store.store_context_state("ctx-1", b"state").await.unwrap();
+
+        // delete_context should remove everything including grace entries.
+        store.delete_context("ctx-1").await.unwrap();
+
+        let loaded = store.load_grace_entries("ctx-1").await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grace_entries_isolated_per_context() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        let entry1 = GraceEntry {
+            epoch: 1,
+            expires_at_unix_secs: 1_700_000_000,
+        };
+        let entry2 = GraceEntry {
+            epoch: 2,
+            expires_at_unix_secs: 1_700_000_001,
+        };
+        store.store_grace_entry("ctx-1", &entry1).await.unwrap();
+        store.store_grace_entry("ctx-2", &entry2).await.unwrap();
+
+        let loaded1 = store.load_grace_entries("ctx-1").await.unwrap();
+        assert_eq!(loaded1.len(), 1);
+        assert_eq!(loaded1[0].epoch, 1);
+
+        let loaded2 = store.load_grace_entries("ctx-2").await.unwrap();
+        assert_eq!(loaded2.len(), 1);
+        assert_eq!(loaded2[0].epoch, 2);
+    }
+
+    /// Integration test: epoch grace crash recovery (§23.11).
+    ///
+    /// Simulates: add epochs -> persist via `ProtocolStore` -> crash ->
+    /// restart -> load entries -> restore grace store -> verify state.
+    #[tokio::test]
+    async fn crash_recovery_persist_and_restore() {
+        use crate::crypto::mls::epoch_grace::EpochGraceStore;
+
+        let store = make_store();
+
+        // Phase 1: normal operation — add epochs and persist.
+        let mut grace = EpochGraceStore::new();
+        grace.add_epoch(100);
+        grace.add_epoch(101);
+        grace.add_epoch(102);
+
+        let entries = grace.to_grace_entries().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        for entry in &entries {
+            store.store_grace_entry("ctx-crash", entry).await.unwrap();
+        }
+
+        // Phase 2: simulate crash — drop the in-memory grace store.
+        drop(grace);
+
+        // Phase 3: recovery — load from ProtocolStore and restore.
+        let persisted = store.load_grace_entries("ctx-crash").await.unwrap();
+        assert_eq!(persisted.len(), 3);
+
+        let mut recovered = EpochGraceStore::new();
+        let expired = recovered.restore_from_entries(&persisted).unwrap();
+        assert!(expired.is_empty(), "all entries should still be live");
+        assert_eq!(recovered.len(), 3);
+        assert!(recovered.is_in_grace(100));
+        assert!(recovered.is_in_grace(101));
+        assert!(recovered.is_in_grace(102));
+
+        // Phase 4: clean up expired entries from storage.
+        for ep in &expired {
+            store.delete_grace_entry("ctx-crash", *ep).await.unwrap();
+        }
+    }
+
+    /// Integration test: crash recovery with expired grace entries.
+    ///
+    /// Simulates a crash where some grace entries expire during downtime.
+    #[tokio::test]
+    async fn crash_recovery_with_expired_entries() {
+        use crate::crypto::mls::epoch_grace::{EpochGraceStore, GraceEntry};
+
+        let store = make_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Persist entries: one expired, one still live.
+        let expired_entry = GraceEntry {
+            epoch: 50,
+            expires_at_unix_secs: now.saturating_sub(10),
+        };
+        let live_entry = GraceEntry {
+            epoch: 51,
+            expires_at_unix_secs: now + 20,
+        };
+        store
+            .store_grace_entry("ctx-expired", &expired_entry)
+            .await
+            .unwrap();
+        store
+            .store_grace_entry("ctx-expired", &live_entry)
+            .await
+            .unwrap();
+
+        // Recovery.
+        let persisted = store.load_grace_entries("ctx-expired").await.unwrap();
+        let mut recovered = EpochGraceStore::new();
+        let expired = recovered.restore_from_entries(&persisted).unwrap();
+
+        assert_eq!(expired, vec![50]);
+        assert_eq!(recovered.len(), 1);
+        assert!(!recovered.is_in_grace(50));
+        assert!(recovered.is_in_grace(51));
+
+        // Clean up expired entries from storage.
+        for ep in &expired {
+            store.delete_grace_entry("ctx-expired", *ep).await.unwrap();
+        }
+        // Verify only live entry remains.
+        let remaining = store.load_grace_entries("ctx-expired").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].epoch, 51);
+    }
+
+    #[tokio::test]
+    async fn grace_entry_key_uses_zero_padded_epoch() {
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let store = make_store();
+        let entry = GraceEntry {
+            epoch: 42,
+            expires_at_unix_secs: 1_700_000_000,
+        };
+        store.store_grace_entry("ctx-1", &entry).await.unwrap();
+
+        // Verify the key format: context/{context_id}/grace/{epoch:020d}
+        let keys = store
+            .storage()
+            .list_keys("context/ctx-1/grace/")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], "context/ctx-1/grace/00000000000000000042");
     }
 }

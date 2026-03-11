@@ -527,6 +527,19 @@ pub enum SyncError {
         /// Milliseconds elapsed before timeout.
         elapsed_ms: u64,
     },
+    /// Persisted grace state was inconsistent with MLS group state on
+    /// recovery (§23.11).
+    ///
+    /// This indicates a partial write escaped the transaction boundary.
+    /// The SDK discards all grace entries, destroys old epoch key material,
+    /// and re-enters the reconnection protocol for the affected context.
+    #[error("epoch grace store inconsistency in context {context_id}: {reason}")]
+    EpochGraceStoreInconsistency {
+        /// The context where the inconsistency was detected.
+        context_id: ContextId,
+        /// Human-readable description of the inconsistency.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

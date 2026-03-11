@@ -199,14 +199,14 @@ The `EpochGraceStore` (ADR-001) holds old epoch keys in memory during the grace 
 **Transactional persistence with MLS group state.** EpochGraceStore state -- specifically the set of epoch numbers with active grace windows and their expiration timestamps -- MUST be persisted transactionally with the MLS group state update. When a Commit is processed and the epoch advances, the following MUST occur in a single database transaction:
 
 1. The new MLS group state is written to `ProtocolStore`.
-2. The grace window entry (epoch number, expiration timestamp) is written to `ProtocolStore` under `context/{context_id}/grace/{epoch:020d}`.
-3. Any expired grace window entries are deleted within the same transaction.
+2. The grace window entries are persisted atomically within the `ContextSnapshot` blob alongside all other context state (membership, roles, governance, TTL, etc.). This ensures transactional consistency: either the entire snapshot (including grace entries) is written, or none of it is. Individual grace entry CRUD methods (`store_grace_entry`, `load_grace_entries`, `delete_grace_entry`) are available on `ProtocolStore` under `context/{context_id}/grace/{epoch:020d}` for direct-access patterns, but the snapshot path is the primary production persistence mechanism.
+3. Any expired grace window entries are excluded from the snapshot within the same transaction.
 
-If the transaction fails, neither the MLS group state nor the grace window entry is persisted -- the node remains at the previous epoch.
+If the transaction fails, neither the MLS group state nor the grace window entries are persisted -- the node remains at the previous epoch.
 
 **Recovery on startup.** On node startup after a crash, the SDK MUST:
 
-1. Load all persisted grace window entries from `ProtocolStore`.
+1. Load all persisted grace window entries from the `ContextSnapshot` blob (which includes grace entries alongside other context state).
 2. For each entry, compare the persisted expiration timestamp against the current wall-clock time.
 3. If the grace period has expired during downtime, immediately destroy the corresponding old epoch keys (remove the grace entry and any cached key material for that epoch). These keys MUST NOT be retained past their expiration -- forward secrecy requires prompt destruction.
 4. If the grace period has NOT yet expired, retain the keys and restart the grace timer from the persisted expiration timestamp (not from recovery time). This ensures the total grace window duration is preserved regardless of crash timing.
@@ -215,7 +215,7 @@ If the transaction fails, neither the MLS group state nor the grace window entry
 
 1. Discard all grace window entries.
 2. Destroy any old epoch key material.
-3. Re-sync the MLS group state from the relay by re-entering the reconnection protocol (section 23.3) for the affected context.
+3. Mark the context as requiring reconnection (`needs_reconnect = true`). The reconnection protocol (section 23.3) requires network I/O that is not available during context restore at startup. When message processing begins for the affected context (i.e., at least one relay WebSocket connection is re-established), the SDK MUST detect the `needs_reconnect` flag and initiate the reconnection protocol before processing any new messages. The flag is cleared once the reconnection protocol completes successfully.
 4. Log an `EpochGraceStoreInconsistency` warning to the application layer.
 
 This fallback is conservative -- it prioritizes forward secrecy (destroy keys) over message recovery (retain keys). Messages encrypted under the lost epoch keys are unrecoverable, which is the same outcome as a grace window expiring normally.

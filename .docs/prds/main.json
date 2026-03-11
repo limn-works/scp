@@ -532,14 +532,16 @@
       "files": [
         "crates/scp-core/src/crypto/mls/ratchet.rs",
         "crates/scp-core/src/crypto/mls/epoch_grace.rs",
-        "crates/scp-core/src/crypto/mls/key_package.rs"
+        "crates/scp-core/src/crypto/mls/key_package.rs",
+        "crates/scp-core/src/context/manager.rs",
+        "crates/scp-core/src/store/context.rs"
       ],
-      "description": "Implement MLS epoch ratcheting with grace window key management, post-compromise security via Update proposals, and KeyPackage generation with buffer management. The epoch grace store provides in-memory-only retention of old epoch keys during the transition window, with automatic purge after 30 seconds or when all members have sent in the new epoch.",
+      "description": "Implement MLS epoch ratcheting with grace window key management, post-compromise security via Update proposals, and KeyPackage generation with buffer management. The epoch grace store provides in-memory retention of old epoch keys during the transition window, with grace entry metadata (epoch number + expiration timestamp) persisted atomically within the ContextSnapshot blob for crash recovery (§23.11). Automatic purge after 30 seconds or when all members have sent in the new epoch.",
       "acceptanceCriteria": [
         "ratchet(group, commit) processes a Commit message, advancing the group to a new epoch",
-        "Old epoch key material enters a grace window after new epoch is established — in-memory only, never persisted to disk, used exclusively for decrypting in-flight messages encrypted under old epoch",
+        "Old epoch key material enters a grace window after new epoch is established — in-memory at runtime, with grace entry metadata (epoch + expiration) persisted atomically within ContextSnapshot for crash recovery (§23.11), used exclusively for decrypting in-flight messages encrypted under old epoch",
         "Grace window duration: shorter of (a) all members have sent at least one message or ACK in new epoch, or (b) 30 seconds from local Commit processing time. 30-second hard ceiling is not configurable",
-        "EpochGraceStore is (1) in-memory only, (2) indexed by epoch number, (3) automatically purged when grace window closes",
+        "EpochGraceStore is (1) in-memory at runtime with metadata persisted in ContextSnapshot for crash recovery, (2) indexed by epoch number, (3) automatically purged when grace window closes",
         "EpochGraceStore MUST NOT be accessible to any code path other than decrypt() with a matching epoch number",
         "After grace window closes, old epoch secrets, application key schedules, and ratchet tree states for past epochs are destroyed and MUST NOT be recoverable (forward secrecy, spec section 9.7.2)",
         "Messages arriving after grace window closes referencing old epochs are unrecoverable — SDK MUST log a warning and emit a StaleEpochMessage event with sender DID and epoch number",
@@ -550,7 +552,11 @@
         "KeyPackage signed by the identity's Ed25519 key",
         "SDK maintains a buffer of at least 10 unused KeyPackages per identity (spec section 9.7.4), replenished when buffer drops below 5",
         "All functions have unit tests",
-        "No unwrap() or expect() in library code"
+        "No unwrap() or expect() in library code",
+        "On startup after crash, persisted grace entries are loaded from ContextSnapshot and expired entries (expiration < current wall-clock) are immediately destroyed (forward secrecy per §23.11)",
+        "Unexpired grace entries restart their grace timer from the persisted expiration timestamp, not from recovery time, preserving total grace window duration (§23.11)",
+        "If persisted grace state is inconsistent with MLS group state (grace entry epoch > persisted group epoch), all grace entries are discarded, old epoch keys destroyed, context marked needs_reconnect = true, and an EpochGraceStoreInconsistency warning logged to the application layer (§23.11 inconsistent state fallback steps 1-4)",
+        "Grace entries are persisted transactionally within the ContextSnapshot blob alongside MLS group state; if the transaction fails, node remains at previous epoch (§23.11 atomicity requirement)"
       ],
       "actionItems": [
         "Implement EpochGraceStore in epoch_grace.rs — in-memory old epoch key retention with timer-based purge, per-epoch indexing",
@@ -573,10 +579,14 @@
         {
           "file": ".docs/adrs/phase-1.md",
           "section": "## ADR-001: MLS Wrapper (OpenMLS Integration)"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "## 23.11 EpochGraceStore Crash Recovery"
         }
       ],
       "details": {
-        "graceWindowKeyIsolation": "Old epoch keys held during the grace window MUST be stored in a separate EpochGraceStore that is (1) in-memory only, (2) indexed by epoch number, (3) automatically purged when the grace window closes. The grace store MUST NOT be accessible to any code path other than decrypt() with a matching epoch number.",
+        "graceWindowKeyIsolation": "Old epoch keys held during the grace window MUST be stored in a separate EpochGraceStore that is (1) in-memory at runtime with metadata (epoch + expiration) persisted atomically in ContextSnapshot for crash recovery (§23.11), (2) indexed by epoch number, (3) automatically purged when the grace window closes. The grace store MUST NOT be accessible to any code path other than decrypt() with a matching epoch number.",
         "forwardSecrecy": "After the grace window closes, old epoch secrets, application key schedules, and ratchet tree states for past epochs are destroyed and MUST NOT be recoverable. This satisfies forward secrecy (spec section 9.7.2).",
         "keyPackageBuffer": "SDK must maintain a buffer of at least 10 unused KeyPackages per identity (spec section 9.7.4). Replenished when buffer drops below 5.",
         "pcsRecommendation": "Recommended Update interval: every 24 hours for active contexts."
