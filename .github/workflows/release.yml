@@ -14,7 +14,7 @@
 #
 # Required repository secrets:
 #   CRATES_IO_TOKEN        — crates.io API token for publishing Rust crates
-#   NPM_TOKEN              — npm automation token for @limn-works/scp-ts and @limn-works/scp-ts-node
+#   NPM_TOKEN              — npm automation token for @limn-works/scp-ts
 #   APPLE_CERTIFICATE      — Base64-encoded Apple Developer ID certificate (.p12)
 #   APPLE_CERTIFICATE_PWD  — Password for the Apple certificate
 #   APPLE_TEAM_ID          — Apple Developer Team ID
@@ -92,7 +92,7 @@ jobs:
           restore-keys: conformance-
 
       - name: Run all workspace tests
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing
 
       # Conformance test suite runs against JSON fixtures.
       # When tests/conformance/ exists, run the dedicated conformance runner.
@@ -170,7 +170,6 @@ jobs:
             "scp-mcp@${{ env.VERSION }}"
             "scp-python@${{ env.VERSION }}"
             "scp-ts@${{ env.VERSION }}"
-            "scp-ts-node@${{ env.VERSION }}"
             "scp-swift@${{ env.VERSION }}"
             "scp-kt@${{ env.VERSION }}"
             "scp-go@${{ env.VERSION }}"
@@ -672,10 +671,9 @@ jobs:
           echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
           echo "- crates.io: scp-platform, scp-core, scp-transport, scp-mcp" >> $GITHUB_STEP_SUMMARY
           echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
-          echo "- npm: @limn-works/scp-ts, @limn-works/scp-ts-node" >> $GITHUB_STEP_SUMMARY
-          echo "- Maven Central: works.limn:scp-kt, works.limn:scp-java" >> $GITHUB_STEP_SUMMARY
-          echo "- NuGet: Limn.Scp" >> $GITHUB_STEP_SUMMARY
+          echo "- npm: @limn-works/scp-ts" >> $GITHUB_STEP_SUMMARY
+          echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY
           echo "- SPM: SCP (via GitHub Release)" >> $GITHUB_STEP_SUMMARY
-          echo "- Go: github.com/limn/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
+          echo "- Go: github.com/limn-works/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Re-run without dry-run to publish." >> $GITHUB_STEP_SUMMARY
