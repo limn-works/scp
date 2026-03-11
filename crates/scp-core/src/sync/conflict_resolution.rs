@@ -570,7 +570,7 @@ pub fn fork_context(
 /// Uses the canonical hash infrastructure with a domain separator and
 /// length-prefixed variable-length fields per the post-#371 standard.
 fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> String {
-    use crate::crypto::canonical::{canonical_hash, CanonicalField};
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     let hash = canonical_hash(
         "SCP-FORK-ID-V1:",
