@@ -3046,7 +3046,7 @@ struct WasmExportBroadcast {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -3366,19 +3366,13 @@ mod tests {
 
     #[test]
     fn deserialize_set_economic_policy_from_json() {
-        // Verify the actual serialized key name first.
-        let action = WasmGovernanceAction::SetEconomicPolicy {
-            policy_json: r#"{"locked":false}"#.to_owned(),
-        };
-        let serialized = serde_json::to_string(&action).unwrap();
-        // Deserialize back from the serialized form.
-        let back: WasmGovernanceAction = serde_json::from_str(&serialized).unwrap();
-        match back {
-            WasmGovernanceAction::SetEconomicPolicy { policy_json } => {
-                assert_eq!(policy_json, r#"{"locked":false}"#);
-            }
-            other => panic!("expected SetEconomicPolicy, got {other:?}"),
-        }
+        let json = r#"{"type":"setEconomicPolicy","policy_json":"flat-rate"}"#;
+        let action: WasmGovernanceAction = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            action,
+            WasmGovernanceAction::SetEconomicPolicy { ref policy_json }
+                if policy_json == "flat-rate"
+        ));
     }
 
     #[test]
@@ -3386,18 +3380,14 @@ mod tests {
         let json =
             r#"{"type":"approveSpend","spender":"did:dht:z1","amount":500,"purpose":"infra"}"#;
         let action: WasmGovernanceAction = serde_json::from_str(json).unwrap();
-        match action {
+        assert!(matches!(
+            action,
             WasmGovernanceAction::ApproveSpend {
-                spender,
-                amount,
-                purpose,
-            } => {
-                assert_eq!(spender, "did:dht:z1");
-                assert_eq!(amount, 500);
-                assert_eq!(purpose, "infra");
-            }
-            other => panic!("expected ApproveSpend, got {other:?}"),
-        }
+                ref spender,
+                amount: 500,
+                ref purpose,
+            } if spender == "did:dht:z1" && purpose == "infra"
+        ));
     }
 
     #[test]
