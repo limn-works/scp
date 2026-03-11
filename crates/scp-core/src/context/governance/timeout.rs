@@ -489,6 +489,23 @@ pub fn update_detection_state(
     }
 }
 
+/// Collect DIDs that cast votes on currently-pending proposals.
+///
+/// Iterates all pending proposals and returns the unique set of voter DIDs
+/// from both approval and rejection votes. Used to feed
+/// [`update_detection_state`] with the active voters for the current window.
+#[must_use]
+pub fn collect_active_voters(engine: &dyn GovernanceEngine) -> Vec<DID> {
+    let mut seen = std::collections::HashSet::new();
+    for pid in engine.pending_proposal_ids() {
+        if let Some(p) = engine.get_proposal(&pid) {
+            seen.extend(p.approvals.iter().map(|v| v.voter_did.clone()));
+            seen.extend(p.rejections.iter().map(|v| v.voter_did.clone()));
+        }
+    }
+    seen.into_iter().collect()
+}
+
 /// Check whether a fallback quorum (majority-of-active) is achievable.
 ///
 /// Requires at least [`MIN_ACTIVE_VOTERS_FOR_FALLBACK`] (2) active voters.
