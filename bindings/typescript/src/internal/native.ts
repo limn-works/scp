@@ -485,7 +485,7 @@ export function createNativeBridge(): Bridge {
       toolId: string,
       inputJson: string,
       identityDid: string,
-      ucanToken?: string,
+      ucanToken: string,
     ): Promise<string> {
       const result = await (
         addon.toolInvoke as (
