@@ -1593,10 +1593,20 @@ impl WasmContextManager {
             });
         }
 
-        // Evict expired nonces when over capacity.
+        // Evict expired nonces when over capacity, then reject if still full.
+        // Matches scp-core's `NonceTracker::check_and_record` capacity behavior.
         if ctx.seen_nonces.len() >= WASM_NONCE_CAP {
             let cutoff = now - WASM_NONCE_TTL_MS;
             ctx.seen_nonces.retain(|_, ts| *ts > cutoff);
+
+            if ctx.seen_nonces.len() >= WASM_NONCE_CAP {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "nonce tracker full: capacity {WASM_NONCE_CAP} reached and no expired entries to evict"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
         }
 
         ctx.seen_nonces.insert(nonce.to_owned(), now);
