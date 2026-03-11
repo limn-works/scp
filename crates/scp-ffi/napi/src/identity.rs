@@ -527,6 +527,23 @@ impl Drop for NapiIdentity {
 // NapiDIDDocument — DID document data returned by identity_resolve
 // ---------------------------------------------------------------------------
 
+/// A verification method from a DID Document.
+///
+/// Contains the full key material (id, type, controller, publicKeyMultibase)
+/// so that callers receive actual public keys instead of just reference IDs.
+#[napi(object)]
+pub struct NapiVerificationMethod {
+    /// The full URI of this verification method (e.g., `did:dht:z...#0`).
+    pub id: String,
+    /// The type of verification method (e.g., `"Ed25519VerificationKey2020"`).
+    #[napi(js_name = "type")]
+    pub method_type: String,
+    /// The DID that controls this verification method.
+    pub controller: String,
+    /// The public key encoded as a multibase string (z-prefix + base58btc).
+    pub public_key_multibase: String,
+}
+
 /// A DID Document returned by identity resolution.
 ///
 /// All fields are plain data (no crypto state) and safe to copy across the
@@ -538,11 +555,14 @@ impl Drop for NapiIdentity {
 /// const doc = await identityResolve("did:dht:z...");
 /// console.log(doc.id);               // "did:dht:z..."
 /// console.log(doc.authentication);   // ["did:dht:z...#key-0"]
+/// console.log(doc.verificationMethods[0].publicKeyMultibase); // "z..."
 /// ```
 #[napi(object)]
 pub struct NapiDIDDocument {
     /// The DID string this document describes.
     pub id: String,
+    /// Full verification method objects with key material.
+    pub verification_methods: Vec<NapiVerificationMethod>,
     /// Verification method IDs listed in the `authentication` relationship.
     pub authentication: Vec<String>,
     /// Verification method IDs listed in the `assertion_method` relationship.
@@ -834,8 +854,20 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
         .agent_verification_method()
         .map(|vm| vm.public_key_multibase.clone());
 
+    let verification_methods = document
+        .verification_method
+        .iter()
+        .map(|vm| NapiVerificationMethod {
+            id: vm.id.clone(),
+            method_type: vm.method_type.clone(),
+            controller: vm.controller.clone(),
+            public_key_multibase: vm.public_key_multibase.clone(),
+        })
+        .collect();
+
     Ok(NapiDIDDocument {
         id: document.id.clone(),
+        verification_methods,
         authentication: document.authentication.clone(),
         assertion_methods: document.assertion_method.clone(),
         also_known_as: document.also_known_as.clone(),
@@ -1218,6 +1250,91 @@ mod tests {
                 rotated_2.inner.in_memory_custody.as_ref().expect("custody"),
             ),
             "rotated identities must share the same Arc<InMemoryKeyCustody>"
+        );
+    }
+
+    #[test]
+    fn napi_did_document_contains_full_verification_methods() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+
+        let document = identity
+            .inner
+            .document
+            .as_ref()
+            .expect("identity must have a document");
+
+        // Build NapiDIDDocument the same way identity_resolve does.
+        let has_agent_key = document.has_agent_key();
+        let agent_public_key = document
+            .agent_verification_method()
+            .map(|vm| vm.public_key_multibase.clone());
+
+        let verification_methods: Vec<NapiVerificationMethod> = document
+            .verification_method
+            .iter()
+            .map(|vm| NapiVerificationMethod {
+                id: vm.id.clone(),
+                method_type: vm.method_type.clone(),
+                controller: vm.controller.clone(),
+                public_key_multibase: vm.public_key_multibase.clone(),
+            })
+            .collect();
+
+        let napi_doc = NapiDIDDocument {
+            id: document.id.clone(),
+            verification_methods,
+            authentication: document.authentication.clone(),
+            assertion_methods: document.assertion_method.clone(),
+            also_known_as: document.also_known_as.clone(),
+            service_endpoints: document
+                .service
+                .iter()
+                .map(|s| s.service_endpoint.clone())
+                .collect(),
+            has_agent_key,
+            agent_public_key,
+        };
+
+        // Verification methods must be non-empty.
+        assert!(
+            !napi_doc.verification_methods.is_empty(),
+            "NapiDIDDocument must contain at least one verification method"
+        );
+
+        // Every verification method must have non-empty publicKeyMultibase.
+        for vm in &napi_doc.verification_methods {
+            assert!(
+                !vm.public_key_multibase.is_empty(),
+                "publicKeyMultibase must not be empty for VM {}",
+                vm.id
+            );
+            assert!(
+                vm.public_key_multibase.starts_with('z'),
+                "publicKeyMultibase must start with 'z' (multibase prefix) for VM {}",
+                vm.id
+            );
+            assert!(
+                !vm.id.is_empty(),
+                "verification method id must not be empty"
+            );
+            assert!(
+                !vm.controller.is_empty(),
+                "verification method controller must not be empty for VM {}",
+                vm.id
+            );
+            assert!(
+                !vm.method_type.is_empty(),
+                "verification method type must not be empty for VM {}",
+                vm.id
+            );
+        }
+
+        // The number of NapiVerificationMethods must match the source document.
+        assert_eq!(
+            napi_doc.verification_methods.len(),
+            document.verification_method.len(),
+            "NapiDIDDocument verification_methods count must match source document"
         );
     }
 }
