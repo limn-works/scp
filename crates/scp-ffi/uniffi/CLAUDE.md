@@ -42,7 +42,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 | Tools | `tool_register`, `tool_invoke`, `tool_verify` |
 | UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | Event Log | `event_log_query`, `event_log_verify` |
-| Transport | `transport_connect`, `transport_status` |
+| Transport | `transport_connect`, `transport_disconnect`, `transport_status` |
 
 ### Build
 

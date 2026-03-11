@@ -105,7 +105,8 @@ pub(crate) fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
 ///
 /// Returns `PyRuntimeError` if tokio runtime construction fails, which
 /// prevents undefined behavior from panicking across the FFI boundary.
-fn init_runtime() -> PyResult<()> {
+#[doc(hidden)]
+pub fn init_runtime() -> PyResult<()> {
     // If already initialized, return immediately.
     if RUNTIME.get().is_some() {
         return Ok(());
@@ -184,7 +185,7 @@ fn shutdown_runtime() {
 /// 2. Registers an `atexit` handler for graceful shutdown.
 /// 3. Registers bridge functions and classes (added by subsequent stories).
 #[pymodule]
-fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Step 1: Initialize the tokio runtime.
     init_runtime()?;
 
@@ -222,6 +223,24 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     Ok(())
 }
+
+// Re-export PyO3-generated module init symbols at crate root so that
+// `pyo3::append_to_inittab!(_scp_core)` works from integration test binaries.
+// The `#[pymodule]` proc macro generates these inside a module named `_scp_core`,
+// but the crate itself is also named `_scp_core`, creating a path collision.
+// This re-export bridges the gap: tests reference `_scp_core::__PYO3_NAME`
+// (crate root) which resolves to the re-exported generated symbols.
+//
+// Gated with `not(doctest)` because `rustdoc --test` compiles with both the
+// crate extern AND the `#[pymodule]`-generated module in scope, making the
+// bare `_scp_core` path ambiguous (E0659). Integration tests don't run
+// doctests, so this gate has no effect on real test builds.
+#[cfg(not(doctest))]
+#[doc(hidden)]
+pub use _scp_core::__PYO3_NAME;
+#[cfg(not(doctest))]
+#[doc(hidden)]
+pub use _scp_core::__pyo3_init;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -5,6 +5,10 @@
 //! Mirrors the pattern established for transport conformance (spec section
 //! 16.12.1) and blob store conformance (spec section 17.11, 17.13).
 
+pub mod attestation;
 pub mod blob_store;
+pub mod key_custody;
 pub mod payment;
+pub mod push;
 pub mod storage;
+pub mod transport;

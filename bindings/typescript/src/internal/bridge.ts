@@ -114,8 +114,25 @@ export interface Bridge {
   // Governance
   contextExecuteGovernanceAction(
     handle: BridgeContextHandle,
-    proposalJson: string,
+    actionJson: string,
+    proposerDid: string,
   ): Promise<string>;
+
+  // TTL operations
+  contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void>;
+  contextProposeTtlExtension(
+    handle: BridgeContextHandle,
+    proposerDid: string,
+    extensionSecs: number,
+  ): Promise<boolean>;
+  contextResetTtlTimer(handle: BridgeContextHandle, newDurationSecs: number): Promise<void>;
+
+  // Context export/import
+  contextExport(handle: BridgeContextHandle): Promise<Uint8Array>;
+  contextImport(data: Uint8Array): Promise<string>;
+
+  // Drain events
+  contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]>;
 
   // Tools
   toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string>;
@@ -140,6 +157,13 @@ export interface Bridge {
     capabilities: readonly string[],
   ): Promise<UcanToken>;
   ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void>;
+  ucanDelegate(
+    handle: BridgeContextHandle,
+    delegatorDid: string,
+    delegateeDid: string,
+    parentToken: string,
+    capabilities: readonly string[],
+  ): Promise<UcanToken>;
 
   // Event Log
   eventLogQuery(
@@ -214,6 +238,12 @@ export interface Bridge {
 
   // Sync
   syncClassifyOffline(lastRelayContact: number, now: number): string;
+  syncClassifyOfflineCustom(
+    lastRelayContact: number,
+    now: number,
+    tier1ThresholdSecs: number,
+    tier2ThresholdSecs: number,
+  ): string;
   syncGetPolicy(): {
     tier_1_threshold_secs: number;
     tier_2_threshold_secs: number;

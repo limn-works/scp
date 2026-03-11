@@ -48,6 +48,7 @@ class ConformanceDispatcher(
         "tool_verify" -> dispatchToolVerify(input)
         "ucan_validate" -> dispatchUcanValidate(input)
         "ucan_mint" -> dispatchUcanMint(input)
+        "ucan_delegate" -> dispatchUcanDelegate(input)
         "ucan_revoke" -> dispatchUcanRevoke(input)
         "transport_connect" -> dispatchTransportConnect(input)
         "transport_status" -> dispatchTransportStatus(input)
@@ -169,6 +170,24 @@ class ConformanceDispatcher(
         val memberDid = input["audience_did"] ?: input["member_did"] ?: ""
         val capabilities = input["capabilities"] ?: "[]"
         val token = bridge.ucan.mint(identityHandle, memberDid, capabilities)
+        mapOf("token" to token)
+    }
+
+    private suspend fun dispatchUcanDelegate(
+        input: Map<String, String>,
+    ): Map<String, String> = catchBridge {
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
+        val delegatorDid = input["delegator_did"] ?: ""
+        val delegateeDid = input["delegatee_did"] ?: ""
+        val parentToken = input["parent_token"] ?: ""
+        val capabilities = input["capabilities"] ?: "[]"
+        val token = bridge.ucan.delegate(
+            contextHandle,
+            delegatorDid,
+            delegateeDid,
+            parentToken,
+            capabilities,
+        )
         mapOf("token" to token)
     }
 

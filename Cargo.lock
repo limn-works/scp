@@ -5125,21 +5125,36 @@ dependencies = [
 name = "scp-testing"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
  "bytes",
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
+ "http-body-util",
+ "hyper 1.8.1",
  "openmls",
+ "openmls_basic_credential",
+ "openmls_rust_crypto 0.5.1",
  "openmls_traits 0.5.0",
+ "rand 0.8.5",
  "rmp-serde",
  "scp-core",
+ "scp-event-log",
  "scp-identity",
+ "scp-node",
  "scp-platform",
+ "scp-primitives",
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.18",
+ "tls_codec",
  "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.24.0",
+ "tower",
 ]
 
 [[package]]

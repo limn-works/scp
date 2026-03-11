@@ -17,18 +17,33 @@ combined = ["scp-transport/combined"]
 [dependencies]
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
-scp-platform = { path = "../scp-platform" }
-scp-transport = { path = "../scp-transport" }
-sha2 = { workspace = true }
-bytes = "1"
-futures = "0.3"
-tokio = { workspace = true }
-
-[dev-dependencies]
-scp-core = { path = "../scp-core" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-primitives = { path = "../scp-primitives" }
+scp-node = { path = "../scp-node" }
 scp-transport = { path = "../scp-transport" }
 ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+openmls = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+bytes = "1"
+futures = "0.3"
+rmp-serde = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+scp-core = { path = "../scp-core", features = ["testing"] }
+scp-event-log = { path = "../scp-event-log" }
+scp-identity = { path = "../scp-identity" }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-transport = { path = "../scp-transport" }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 hex = { workspace = true }
@@ -37,6 +52,16 @@ openmls_traits = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = "3"
+tls_codec = "0.4"
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+axum = { workspace = true, features = ["ws"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1"
+
+[[test]]
+name = "harness_meta"
+path = "tests/integration/harness_meta.rs"
 
 [[test]]
 name = "phase1"
@@ -53,6 +78,94 @@ path = "tests/integration/persistence_advanced.rs"
 [[test]]
 name = "protocol_store"
 path = "tests/integration/protocol_store.rs"
+
+[[test]]
+name = "identity"
+path = "tests/integration/identity.rs"
+
+[[test]]
+name = "agent_binding"
+path = "tests/integration/agent_binding.rs"
+
+[[test]]
+name = "context_lifecycle"
+path = "tests/integration/context_lifecycle.rs"
+
+[[test]]
+name = "broadcast"
+path = "tests/integration/broadcast.rs"
+
+[[test]]
+name = "transport_integration"
+path = "tests/integration/transport.rs"
+
+[[test]]
+name = "economics"
+path = "tests/integration/economics.rs"
+
+[[test]]
+name = "governance"
+path = "tests/integration/governance.rs"
+
+[[test]]
+name = "capabilities"
+path = "tests/integration/capabilities.rs"
+
+[[test]]
+name = "encryption"
+path = "tests/integration/encryption.rs"
+
+[[test]]
+name = "trust"
+path = "tests/integration/trust.rs"
+
+[[test]]
+name = "discovery"
+path = "tests/integration/discovery.rs"
+
+[[test]]
+name = "node"
+path = "tests/integration/node.rs"
+
+[[test]]
+name = "content_access"
+path = "tests/integration/content_access.rs"
+
+[[test]]
+name = "attacks"
+path = "tests/integration/attacks.rs"
+
+[[test]]
+name = "bridge_cooperative"
+path = "tests/integration/bridge_cooperative.rs"
+
+[[test]]
+name = "compromise_recovery"
+path = "tests/integration/compromise_recovery.rs"
+
+[[test]]
+name = "demo"
+path = "tests/integration/demo.rs"
+
+[[test]]
+name = "fullstack"
+path = "tests/integration/fullstack.rs"
+
+[[test]]
+name = "conformance"
+path = "tests/integration/conformance.rs"
+
+[[test]]
+name = "ffi_conformance"
+path = "tests/integration/ffi_conformance.rs"
+
+[[test]]
+name = "sdk_wrapper"
+path = "tests/integration/sdk_wrapper.rs"
+
+[[test]]
+name = "sdk_usability"
+path = "tests/integration/sdk_usability.rs"
 
 [lints]
 workspace = true

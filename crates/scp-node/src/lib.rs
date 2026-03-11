@@ -2122,7 +2122,13 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
 ) -> Result<ApplicationNode<S>, NodeError> {
-    let tier = nat_strategy.select_tier(bound_addr.port()).await?;
+    // Resolve the HTTP bind address first — NAT strategy needs the public-facing
+    // HTTP port, not the internal relay port (which is bound to loopback and
+    // unreachable externally). UPnP maps this port on the router and the relay
+    // URL uses it. See #641.
+    let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
+
+    let tier = nat_strategy.select_tier(http_bind_addr.port()).await?;
 
     let relay_url = match &tier {
         ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
@@ -2154,8 +2160,6 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
-
     // 5. Spawn periodic tier re-evaluation (§10.12.1, SCP-243).
     let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
         inner: Arc::clone(&did_method),
@@ -2176,7 +2180,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         publisher,
         bg_identity,
         document.clone(),
-        bound_addr.port(),
+        http_bind_addr.port(),
         relay_url.clone(),
         Some(tier_event_tx),
         TIER_REEVALUATION_INTERVAL,
@@ -3226,18 +3230,19 @@ mod tests {
         // AC9: When .domain() is set and TLS provisioning fails (ACME),
         // automatic fallthrough to Tiers 1-3 (§10.12.8 step 4).
         // AC11: Verify that NAT is probed on fallthrough.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-        /// Mock NAT strategy that records whether it was called.
+        /// Mock NAT strategy that records whether it was called and what port it received.
         struct RecordingNatStrategy {
             called: Arc<AtomicBool>,
+            received_port: Arc<AtomicU16>,
             tier: ReachabilityTier,
         }
 
         impl NatStrategy for RecordingNatStrategy {
             fn select_tier(
                 &self,
-                _relay_port: u16,
+                relay_port: u16,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>>
@@ -3246,12 +3251,14 @@ mod tests {
                 >,
             > {
                 self.called.store(true, Ordering::SeqCst);
+                self.received_port.store(relay_port, Ordering::SeqCst);
                 let tier = self.tier.clone();
                 Box::pin(async move { Ok(tier) })
             }
         }
 
         let nat_called = Arc::new(AtomicBool::new(false));
+        let nat_port = Arc::new(AtomicU16::new(0));
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
 
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -3263,6 +3270,7 @@ mod tests {
             .tls_provider(Arc::new(FailingTlsProvider))
             .nat_strategy(Arc::new(RecordingNatStrategy {
                 called: Arc::clone(&nat_called),
+                received_port: Arc::clone(&nat_port),
                 tier: ReachabilityTier::Stun { external_addr },
             }))
             .generate_identity_with(custody, did_method)
@@ -3281,6 +3289,14 @@ mod tests {
         assert!(
             nat_called.load(Ordering::SeqCst),
             "NAT strategy should have been called on ACME failure fallthrough"
+        );
+
+        // Verify the HTTP port (not relay port) was passed to NAT strategy.
+        assert_eq!(
+            nat_port.load(Ordering::SeqCst),
+            DEFAULT_HTTP_BIND_ADDR.port(),
+            "NAT strategy should receive the HTTP port ({}), not the relay port",
+            DEFAULT_HTTP_BIND_ADDR.port()
         );
 
         // Verify the relay URL uses ws:// (not wss://).

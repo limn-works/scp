@@ -1070,9 +1070,11 @@ fn recompute_tree_from_leaves(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
 }
 
 /// Computes the Merkle root from a set of leaf hashes.
+///
+/// Returns `SHA-256("")` for an empty set (spec §25.8 Vector 15).
 fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
-        return [0u8; 32];
+        return crate::tree::empty_tree_root();
     }
     if leaves.len() == 1 {
         return leaves[0];
@@ -1085,7 +1087,7 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
         return top[0];
     }
 
-    [0u8; 32]
+    unreachable!("recompute_tree_from_leaves always produces a single root for non-empty input")
 }
 
 /// Computes `SHA-256(0x01 || left || right)` for an interior node.
@@ -1293,7 +1295,9 @@ mod tests {
         let checkpoint = generate_checkpoint(&log, &did, 0, &signer).await.unwrap();
 
         assert_eq!(checkpoint.event_count, 0);
-        assert_eq!(checkpoint.merkle_root, [0u8; 32]);
+        // Empty root is SHA-256(""), not [0u8; 32] (spec §25.8 Vector 15).
+        let expected_empty_root: [u8; 32] = Sha256::digest(b"").into();
+        assert_eq!(checkpoint.merkle_root, expected_empty_root);
     }
 
     // -------------------------------------------------------------------
@@ -2442,13 +2446,16 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 32. compute_root_from_leaves empty returns zero hash
+    // 32. compute_root_from_leaves empty returns SHA-256("") per spec §25.8
     // -------------------------------------------------------------------
 
     #[test]
-    fn compute_root_from_leaves_empty_returns_zero() {
+    fn compute_root_from_leaves_empty_returns_sha256_empty() {
         let root = compute_root_from_leaves(&[]);
-        assert_eq!(root, [0u8; 32]);
+        let expected: [u8; 32] = Sha256::digest(b"").into();
+        assert_eq!(root, expected);
+        // Must NOT be [0u8; 32].
+        assert_ne!(root, [0u8; 32]);
     }
 
     // -------------------------------------------------------------------

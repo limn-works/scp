@@ -183,6 +183,21 @@ class CoroutineBridgeTest {
             }
 
         @Test
+        fun `ucanDelegate dispatches on IO`() =
+            runTest(ioDispatcher) {
+                stubBindings.ucanDelegateResult = "delegated-token"
+                val result = bridge.ucan.delegate(
+                    10L,
+                    "did:dht:delegator",
+                    "did:dht:delegatee",
+                    "parent.token.sig",
+                    """["read"]""",
+                )
+                assertEquals("delegated-token", result)
+                assertTrue(stubBindings.ucanDelegateCalled)
+            }
+
+        @Test
         fun `eventLogQuery dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.eventLogQueryResult = """[{"event":"joined"}]"""
@@ -439,6 +454,7 @@ class StubNativeBindings : NativeBindings {
     var lastUnsubscribeHandle: Long? = null
     var ucanValidateCalled = false
     var ucanRevokeCalled = false
+    var ucanDelegateCalled = false
 
     // Argument captures
     var lastCustody: String? = null
@@ -458,6 +474,7 @@ class StubNativeBindings : NativeBindings {
     var toolInvokeResult = ""
     var toolVerifyResult = false
     var ucanMintResult = ""
+    var ucanDelegateResult = ""
     var eventLogQueryResult = ""
     var eventLogVerifyResult = false
     var transportConnectResult = 0L
@@ -576,6 +593,17 @@ class StubNativeBindings : NativeBindings {
         token: String,
     ) {
         ucanRevokeCalled = true
+    }
+
+    override fun ucanDelegate(
+        contextHandle: Long,
+        delegatorDid: String,
+        delegateeDid: String,
+        parentToken: String,
+        capabilitiesJson: String,
+    ): String {
+        ucanDelegateCalled = true
+        return ucanDelegateResult
     }
 
     override fun eventLogQuery(

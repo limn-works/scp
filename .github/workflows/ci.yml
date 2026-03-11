@@ -83,6 +83,9 @@ jobs:
     name: Rust / clippy
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -111,6 +114,17 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
+      - name: Free disk space (Ubuntu)
+        if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
+        run: |
+          # The full Rust workspace (657 deps, 16 crates) needs ~12GB to compile.
+          # Ubuntu runners ship with ~14GB free but pre-installed SDKs consume
+          # most of it. Remove unused toolchains to reclaim ~20GB.
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v4
         if: needs.changes.outputs.rust == 'true'
       - uses: dtolnay/rust-toolchain@stable
@@ -144,6 +158,9 @@ jobs:
     name: Rust / doc
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5

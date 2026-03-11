@@ -66,7 +66,11 @@ mod wasm_mirror {
 
         pub fn root(&self) -> [u8; 32] {
             if self.leaves.is_empty() {
-                return [0u8; 32];
+                // SHA-256("") — matches scp-event-log::tree::empty_tree_root()
+                let hash = Sha256::digest(b"");
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&hash);
+                return out;
             }
             if self.tree.is_empty() {
                 return self.leaves[0];
@@ -538,7 +542,7 @@ fn merkle_roots_identical_at_each_step() {
     let mut core_log = EventLog::new("ctx-conformance".to_owned());
     let mut wasm_log = wasm_mirror::WasmEventLog::new();
 
-    // Both empty logs should return the same zero root.
+    // Both empty logs should return the same root: SHA-256("") per spec §25.8.
     assert_eq!(
         core_tree::root(&core_log),
         wasm_log.root(),
@@ -1168,7 +1172,14 @@ fn empty_log_edge_cases_match() {
         wasm_log.root(),
         "empty log root differs"
     );
-    assert_eq!(core_tree::root(&core_log), [0u8; 32]);
+    // SHA-256("") — the canonical empty tree root per spec §25.8 Vector 15.
+    let empty_root: [u8; 32] = {
+        let hash = Sha256::digest(b"");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hash);
+        out
+    };
+    assert_eq!(core_tree::root(&core_log), empty_root);
 
     // Event count of empty log.
     assert_eq!(core_tree::event_count(&core_log), 0);

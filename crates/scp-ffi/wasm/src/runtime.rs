@@ -123,6 +123,17 @@ pub struct TestVector {
 /// This is `[0u8; 32]` — all zeros. Matches native `scp_event_log::tree::GENESIS_PREV_HASH`.
 const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 
+/// Returns `SHA-256("")` — the Merkle root for an empty event log.
+///
+/// Per spec §25.8 Vector 15, the empty tree root is the hash of the empty
+/// string, NOT `[0u8; 32]`. Mirrors `scp_event_log::tree::empty_tree_root`.
+fn wasm_empty_tree_root() -> [u8; 32] {
+    let hash = Sha256::digest(b"");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    out
+}
+
 /// An append-only Merkle tree for a single SCP context.
 ///
 /// Mirrors `scp_event_log::EventLog`. Follows Certificate Transparency
@@ -206,10 +217,13 @@ impl WasmEventLog {
     }
 
     /// Returns the current Merkle root hash.
+    ///
+    /// Per spec §25.8 Vector 15, an empty log returns `SHA-256("")`, not
+    /// `[0u8; 32]`.
     #[must_use]
     pub fn root(&self) -> [u8; 32] {
         if self.leaves.is_empty() {
-            return [0u8; 32];
+            return wasm_empty_tree_root();
         }
         if self.tree.is_empty() {
             return self.leaves[0];
