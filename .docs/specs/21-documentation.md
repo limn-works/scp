@@ -112,7 +112,7 @@ An agent or developer who has never seen the repo. They should go from zero to "
 Each binding directory gets a README answering:
 
 1. **What is this** — One sentence (e.g., "Python SDK for SCP, providing identity, contexts, encryption, and transport")
-2. **Install** — `pip install scp-sdk` / SPM / npm
+2. **Install** — `pip install scp-python` / SPM / npm
 3. **Quickstart** — 10-20 lines of working code: create identity, create context, send message
 4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: WASM vs NAPI)
 5. **API overview** — Brief listing of main classes/modules with one-line descriptions
@@ -401,7 +401,7 @@ Each scaffold is a minimal, working project structure with:
 | Scaffold | Language | What it provides |
 |---|---|---|
 | `scaffolds/rust-client/` | Rust | Minimal Rust binary using scp-core directly |
-| `scaffolds/python-agent/` | Python | Python agent with scp-sdk, async runtime, identity setup |
+| `scaffolds/python-agent/` | Python | Python agent with scp-python, async runtime, identity setup |
 | `scaffolds/typescript-web/` | TypeScript | Browser app using WASM binding, identity in IndexedDB |
 | `scaffolds/typescript-node/` | TypeScript | Node.js agent using NAPI binding |
 | `scaffolds/swift-ios/` | Swift | iOS app with Keychain custody, push notifications |

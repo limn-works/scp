@@ -1,7 +1,7 @@
 //! Firebase Cloud Messaging [`Push`] adapter for Android.
 //!
 //! The Android push provider is implemented in Kotlin at
-//! `bindings/kotlin/scp-sdk-kotlin-android/.../AndroidPushProvider.kt` and
+//! `bindings/kotlin/scp-kt-android/.../AndroidPushProvider.kt` and
 //! injected into the Rust engine via the UniFFI callback interface (ADR-021).
 //! This module documents the Rust-side contract and re-exports the trait types
 //! that the Kotlin adapter implements.

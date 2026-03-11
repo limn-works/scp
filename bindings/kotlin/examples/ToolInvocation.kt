@@ -1,9 +1,9 @@
 /** Tool invocation: register a tool with test vectors and invoke it. */
 
-package com.limn.scp.examples
+package works.limn.scp.examples
 
-import com.limn.scp.Context
-import com.limn.scp.Identity
+import works.limn.scp.Context
+import works.limn.scp.Identity
 import kotlinx.coroutines.runBlocking
 
 fun main() = runBlocking {

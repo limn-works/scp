@@ -189,11 +189,11 @@ jobs:
           <h1>SCP SDK API Reference</h1>
           <ul>
             <li><a href="docs-rust/scp_core/">Rust (scp-core)</a></li>
-            <li><a href="docs-python/">Python (scp-sdk)</a></li>
-            <li><a href="docs-typescript/">TypeScript (@scp/sdk)</a></li>
+            <li><a href="docs-python/">Python (scp-python)</a></li>
+            <li><a href="docs-typescript/">TypeScript (@limn-works/scp-ts)</a></li>
             <li><a href="docs-swift/">Swift (SCP)</a></li>
-            <li><a href="docs-kotlin/">Kotlin (scp-sdk-kotlin)</a></li>
-            <li><a href="docs-java/">Java (scp-sdk-java)</a></li>
+            <li><a href="docs-kotlin/">Kotlin (scp-kt)</a></li>
+            <li><a href="docs-java/">Java (scp-java)</a></li>
           </ul>
           <p>Go docs available at <a href="https://pkg.go.dev/github.com/limn/scp-go">pkg.go.dev</a></p>
           </body>

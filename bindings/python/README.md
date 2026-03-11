@@ -1,13 +1,13 @@
 # SCP Python SDK
 
-> `scp-sdk` -- Shared Context Protocol for Python
+> `scp-python` -- Shared Context Protocol for Python
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via PyO3.
 
 ## Install
 
 ```bash
-pip install scp-sdk
+pip install scp-python
 ```
 
 ## Quick Start

@@ -1,4 +1,4 @@
-scp-sdk
+scp-python
 =======
 
 Python SDK for the Shared Context Protocol.

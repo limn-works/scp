@@ -1,6 +1,6 @@
 # SCP Kotlin SDK
 
-> `com.limn:scp-sdk-kotlin` -- Shared Context Protocol for Kotlin
+> `works.limn:scp-kt` -- Shared Context Protocol for Kotlin
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via UniFFI with Kotlin coroutines.
 
@@ -9,15 +9,15 @@ Cryptographic identity, encrypted contexts, capability-based auth, and tool invo
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("com.limn:scp-sdk-kotlin:0.1.0")
+    implementation("works.limn:scp-kt:0.1.0")
 }
 ```
 
 ## Quick Start
 
 ```kotlin
-import com.limn.scp.Identity
-import com.limn.scp.Context
+import works.limn.scp.Identity
+import works.limn.scp.Context
 import kotlinx.coroutines.flow.first
 
 suspend fun main() {
@@ -94,7 +94,7 @@ Publish to Maven Local for integration testing:
 ./gradlew publishToMavenLocal
 ```
 
-Artifacts are written to `~/.m2/repository/com/limn/scp-sdk-kotlin/`.
+Artifacts are written to `~/.m2/repository/works/limn/scp-kt/`.
 
 ### Maven Central (Release)
 

@@ -18,10 +18,10 @@ crates/
     wasm/             # Browser TypeScript FFI (wasm-bindgen)
     napi/             # Node/Bun TypeScript FFI (napi-rs)
 bindings/
-  python/             # scp-sdk (PyPI) — scp_sdk package
-  typescript/         # @scp/sdk (npm) — dual target: browser WASM + Bun/Node native
+  python/             # scp-python (PyPI) — scp_sdk package
+  typescript/         # @limn-works/scp-ts (npm) — dual target: browser WASM + Bun/Node native
   swift/              # SCP (Swift Package Manager)
-  kotlin/             # com.limn:scp-sdk-kotlin (Maven Central)
+  kotlin/             # works.limn:scp-kt (Maven Central)
 ```
 
 ## Crate Responsibilities
@@ -71,7 +71,7 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | UCAN mint | `ucan::mint` | `mint()` | `mint()` | `mintUcanToken()` | `ucanMint()` | `UcanMint()` | `UcanMintAsync()` | `ucanMint()` |
 | UCAN revoke | `ucan::revoke` | `revoke()` | `revoke()` | `revokeUcanToken()` | `ucanRevoke()` | `UcanRevoke()` | `UcanRevokeAsync()` | `ucanRevoke()` |
 | Error base | `ScpError` | `ScpError` | `ScpError` | `ScpError` | `ScpException` | `ScpError` | `ScpException` | `ScpException` |
-| Package name | `scp-core` | `scp-sdk` | `@scp/sdk` | `SCP` | `com.limn:scp-sdk-kotlin` | `scp-go` | `Limn.Scp` | `com.limn:scp-sdk-java` |
+| Package name | `scp-core` | `scp-python` | `@limn-works/scp-ts` | `SCP` | `works.limn:scp-kt` | `scp-go` | `Limn.Scp` | `works.limn:scp-java` |
 
 ### Casing rules per language
 
@@ -114,7 +114,7 @@ All SDKs follow [SemVer 2.0](https://semver.org/):
 All SDK packages share the same major.minor version. Patch versions may differ (language-specific fixes). The Rust core crate version is the source of truth.
 
 ```
-scp-core 0.1.0 → scp-sdk (Python) 0.1.x, @scp/sdk 0.1.x, SCP (Swift) 0.1.x, ...
+scp-core 0.1.0 → scp-python (Python) 0.1.x, @limn-works/scp-ts 0.1.x, SCP (Swift) 0.1.x, ...
 ```
 
 ### Pre-1.0 stability
@@ -195,11 +195,11 @@ Binary artifact build, sign, and distribute workflow. Conformance gate (100% pas
 | Language | Package | Registry | Artifact |
 |----------|---------|----------|----------|
 | Rust | `scp-core`, `scp-transport`, `scp-platform` | crates.io | Source crate |
-| Python | `scp-sdk` | PyPI | maturin-built wheel (includes compiled Rust) |
-| TypeScript (browser) | `@scp/sdk` | npm | WASM bundle |
-| TypeScript (Node/Bun) | `@scp/sdk-node` | npm | napi-rs native addon |
+| Python | `scp-python` | PyPI | maturin-built wheel (includes compiled Rust) |
+| TypeScript (browser) | `@limn-works/scp-ts` | npm | WASM bundle |
+| TypeScript (Node/Bun) | `@limn-works/scp-ts-node` | npm | napi-rs native addon |
 | Swift | `SCP` | Swift Package Manager | XCFramework binary target |
-| Kotlin | `com.limn:scp-sdk-kotlin` | Maven Central | AAR with bundled .so |
+| Kotlin | `works.limn:scp-kt` | Maven Central | AAR with bundled .so |
 
 ### Version pinning
 
@@ -213,7 +213,7 @@ All release artifacts are signed. Rust crates are verified by crates.io's built-
 
 1. All conformance tests pass (100%) across all target platforms
 2. Changelog updated with version bump and summary of changes
-3. Version tags created: `scp-core@{version}`, per-SDK tags (`scp-sdk-python@{version}`, etc.)
+3. Version tags created: `scp-core@{version}`, per-SDK tags (`scp-python@{version}`, etc.)
 4. CI builds artifacts for all platforms in the build matrix
 5. Artifacts signed per platform signing requirements
 6. Publish to registries (crates.io, PyPI, npm, SPM, Maven Central, NuGet, Go proxy)

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This crate is the `@scp/sdk-napi` native addon (`.node` file). It exposes scp-core APIs to
+This crate is the `@limn-works/scp-ts-napi` native addon (`.node` file). It exposes scp-core APIs to
 Node.js/Bun via napi-rs `#[napi]` types and functions.
 
 ## Architecture

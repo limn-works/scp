@@ -8,7 +8,7 @@
 //! TypeScript SDK.
 //!
 //! This crate is compiled to WebAssembly via `wasm-pack` and consumed by the
-//! `@scp/sdk` npm package. It exposes a flat set of `#[wasm_bindgen]` types
+//! `@limn-works/scp-ts` npm package. It exposes a flat set of `#[wasm_bindgen]` types
 //! and functions that map directly to `scp-core`'s public API surface.
 //!
 //! # Architecture
@@ -107,7 +107,7 @@ use wasm_bindgen::prelude::*;
 /// # JS usage
 ///
 /// ```js
-/// import init, { scp_init } from '@scp/sdk-wasm';
+/// import init, { scp_init } from '@limn-works/scp-ts-wasm';
 /// await init();
 /// scp_init();
 /// ```
@@ -128,7 +128,7 @@ pub fn scp_init() {
 /// # JS usage
 ///
 /// ```js
-/// import { scp_version } from '@scp/sdk-wasm';
+/// import { scp_version } from '@limn-works/scp-ts-wasm';
 /// console.log(scp_version()); // "0.1.0"
 /// ```
 #[must_use]

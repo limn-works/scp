@@ -1,7 +1,7 @@
 //! Android Keystore [`KeyCustody`] adapter.
 //!
 //! The Android key custody adapter is implemented in Kotlin at
-//! `bindings/kotlin/scp-sdk-kotlin-android/.../AndroidKeyCustody.kt` and injected
+//! `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt` and injected
 //! into the Rust engine via the UniFFI callback interface (ADR-021). This module
 //! documents the Rust-side contract and re-exports the trait types that the
 //! Kotlin adapter implements.

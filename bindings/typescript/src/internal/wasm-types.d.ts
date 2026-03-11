@@ -1,11 +1,11 @@
 /**
- * Type declarations for the `@scp/sdk-wasm` package.
+ * Type declarations for the `@limn-works/scp-ts-wasm` package.
  *
  * This module is produced by `wasm-pack build --target bundler` from
  * `crates/scp-ffi/wasm/` and does not ship its own TypeScript declarations.
  * This ambient module declaration provides the expected type surface.
  */
-declare module "@scp/sdk-wasm" {
+declare module "@limn-works/scp-ts-wasm" {
   function init(): Promise<void>;
   export default init;
   export function scp_init(): void;

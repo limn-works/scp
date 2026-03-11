@@ -46,7 +46,7 @@ try (var identity = Identity.create("in_memory").join();
 - Types/classes/records: `PascalCase`
 - Methods/fields: `camelCase`
 - Constants: `SCREAMING_SNAKE_CASE`
-- Packages: `lowercase` (`com.limn.scp`)
+- Packages: `lowercase` (`works.limn.scp`)
 - Files: `PascalCase.java` (one public class per file)
 
 ## Testing

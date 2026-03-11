@@ -2,7 +2,7 @@
 
 ## Overview
 
-This crate is the browser-target Rust half of the `@scp/sdk` TypeScript package. It exposes SCP protocol operations to JavaScript via `wasm-bindgen`, compiled to WebAssembly with `wasm-pack`. See ADR-022 in `.docs/adrs/phase-4.md`.
+This crate is the browser-target Rust half of the `@limn-works/scp-ts` TypeScript package. It exposes SCP protocol operations to JavaScript via `wasm-bindgen`, compiled to WebAssembly with `wasm-pack`. See ADR-022 in `.docs/adrs/phase-4.md`.
 
 ## Architecture Constraint: No scp-core Dependency
 

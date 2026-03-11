@@ -9,7 +9,7 @@
 #   ./scripts/generate-uniffi-kotlin.sh [--release]
 #
 # Output:
-#   bindings/kotlin/scp-sdk-kotlin/src/main/kotlin/com/limn/scp/internal/
+#   bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
 #
 # Prerequisites:
 #   - Rust toolchain (via mise)
@@ -29,7 +29,7 @@ fi
 
 UNIFFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
 UDL_FILE="$UNIFFI_CRATE_DIR/src/scp.udl"
-OUTPUT_DIR="$REPO_ROOT/bindings/kotlin/scp-sdk-kotlin/src/main/kotlin/com/limn/scp/internal"
+OUTPUT_DIR="$REPO_ROOT/bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal"
 
 # Step 1: Build the Rust cdylib.
 echo "==> Building scp-ffi-uniffi ($PROFILE)..."

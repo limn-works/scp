@@ -2,8 +2,8 @@
  * Tool invocation: register a tool with test vectors and invoke it.
  */
 
-import { Context, Identity } from "@scp/sdk";
-import type { ToolDefinition } from "@scp/sdk";
+import { Context, Identity } from "@limn-works/scp-ts";
+import type { ToolDefinition } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   const identity = await Identity.create({ custody: "platform" });

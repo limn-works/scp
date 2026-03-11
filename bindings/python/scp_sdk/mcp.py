@@ -70,7 +70,7 @@ def _bridge() -> Any:
     except ImportError as exc:
         raise TransportError(
             "The _scp_core extension module is not installed. "
-            "Install scp-sdk with: pip install scp-sdk",
+            "Install scp-python with: pip install scp-python",
             code="SCP-MCP-10001",
         ) from exc
 

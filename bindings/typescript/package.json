@@ -1,5 +1,5 @@
 {
-  "name": "@scp/sdk",
+  "name": "@limn-works/scp-ts",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -32,11 +32,11 @@
     "wa-sqlite": "^1.0.0"
   },
   "optionalDependencies": {
-    "@scp/sdk-napi-linux-x64-gnu": "0.1.0",
-    "@scp/sdk-napi-linux-arm64-gnu": "0.1.0",
-    "@scp/sdk-napi-darwin-x64": "0.1.0",
-    "@scp/sdk-napi-darwin-arm64": "0.1.0",
-    "@scp/sdk-napi-win32-x64-msvc": "0.1.0"
+    "@limn-works/scp-ts-napi-linux-x64-gnu": "0.1.0",
+    "@limn-works/scp-ts-napi-linux-arm64-gnu": "0.1.0",
+    "@limn-works/scp-ts-napi-darwin-x64": "0.1.0",
+    "@limn-works/scp-ts-napi-darwin-arm64": "0.1.0",
+    "@limn-works/scp-ts-napi-win32-x64-msvc": "0.1.0"
   },
   "devDependencies": {
     "@biomejs/biome": "latest",

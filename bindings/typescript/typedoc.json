@@ -2,7 +2,7 @@
   "$schema": "https://typedoc.org/schema.json",
   "entryPoints": ["src/index.ts"],
   "out": "docs",
-  "name": "@scp/sdk",
+  "name": "@limn-works/scp-ts",
   "readme": "README.md",
   "excludePrivate": true,
   "excludeInternal": true,

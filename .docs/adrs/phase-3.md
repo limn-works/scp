@@ -1,7 +1,7 @@
 # Phase 3 Architecture Decision Records — Python SDK
 
 **Date:** February 22, 2026
-**Phase goal:** `pip install scp-sdk` works. Python agents use SCP. MCP bridge connects any MCP-compatible model to SCP contexts.
+**Phase goal:** `pip install scp-python` works. Python agents use SCP. MCP bridge connects any MCP-compatible model to SCP contexts.
 **Deliverable:** Python SDK on PyPI, MCP adapter, UCAN validation in SDK. Two Python agents on different machines exchange encrypted messages, invoke tools, and expose SCP contexts as MCP tools.
 **Timeline:** Weeks 9-12
 **Dependencies between ADRs:**
@@ -37,7 +37,7 @@ Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 
 
 The Python SDK is the most critical language binding for SCP. The agent ecosystem — LangChain, CrewAI, AutoGen, custom agents — is overwhelmingly Python (architecture.md section 3.1). If agents cannot `import scp`, the protocol does not exist to them. The bridge layer is the boundary between the Rust protocol engine (scp-core, scp-transport, scp-platform) and the Python world. It must expose core SCP types and operations to Python without leaking Rust concepts, while bridging async runtimes (tokio on the Rust side, asyncio on the Python side).
 
-PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users run `pip install scp-sdk` and get a working binary extension with zero Rust toolchain requirement (architecture.md section 3.1).
+PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users run `pip install scp-python` and get a working binary extension with zero Rust toolchain requirement (architecture.md section 3.1).
 
 ### Decision
 
@@ -162,7 +162,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
     - `maturin build --release` produces optimized wheels.
     - `maturin publish` uploads to PyPI.
     - CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).
-    - Users install with `pip install scp-sdk` — no Rust toolchain required.
+    - Users install with `pip install scp-python` — no Rust toolchain required.
 
 ### Scope
 
@@ -209,9 +209,9 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 ### Implementation
 
 - **Language:** Python 3.10+ (for `match` statements, `ParamSpec`, union type syntax)
-- **Package:** `scp_sdk` (published to PyPI as `scp-sdk`)
+- **Package:** `scp_sdk` (published to PyPI as `scp-python`)
 - **Dependencies:** `_scp_core` (PyO3 extension, bundled in the wheel), no external runtime dependencies beyond asyncio (stdlib)
-- **Optional dependencies:** `scp-sdk[langchain]` for LangChain integration, `scp-sdk[mcp]` for MCP server (ADR-015)
+- **Optional dependencies:** `scp-python[langchain]` for LangChain integration, `scp-python[mcp]` for MCP server (ADR-015)
 - **Module structure:** `bindings/python/scp_sdk/`
 - **Build:** maturin builds the `_scp_core` extension into the `scp_sdk` package directory. `pyproject.toml` declares the package metadata, version, Python version constraints, and optional dependencies.
 
@@ -899,7 +899,7 @@ Build order:
 The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks:
 
 ```
-1. Install the SDK: `pip install scp-sdk` in a clean Python venv. No Rust toolchain.
+1. Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain.
    Zero compilation. Binary wheel installs in seconds.
 
 2. Alice creates an identity in Python:

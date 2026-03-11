@@ -226,7 +226,7 @@ maturin build --release --target x86_64-pc-windows-msvc
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users install with `pip install scp-sdk` — no Rust toolchain required.
+maturin builds binary wheels with the Rust extension embedded. Users install with `pip install scp-python` — no Rust toolchain required.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|

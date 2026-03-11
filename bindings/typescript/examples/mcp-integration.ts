@@ -2,8 +2,8 @@
  * MCP integration: expose SCP tools via MCP JSON-RPC server.
  */
 
-import { Context, Identity } from "@scp/sdk";
-import { McpClient, serveMcp } from "@scp/sdk/mcp";
+import { Context, Identity } from "@limn-works/scp-ts";
+import { McpClient, serveMcp } from "@limn-works/scp-ts/mcp";
 
 async function main(): Promise<void> {
   const identity = await Identity.create({ custody: "platform" });

@@ -31,7 +31,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 ### [01-THESIS] SDK package names are specified without versioning scheme
 
 - **Category**: Missing constants/defaults
-- **Location**: Section 1.3, line 35 -- "`pip install scp-sdk` and `npm install @scp/sdk`"
+- **Location**: Section 1.3, line 35 -- "`pip install scp-python` and `npm install @limn-works/scp-ts`"
 - **What's missing**: No versioning scheme is defined for SDK packages. Is it SemVer? CalVer? What constitutes a breaking change at the SDK level vs. the protocol level?
 - **Why it matters**: SDK consumers need versioning guarantees. Section 13 (Versioning) addresses protocol evolution but does not specify SDK versioning contracts.
 - **Severity**: LOW

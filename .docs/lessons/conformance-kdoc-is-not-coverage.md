@@ -5,7 +5,7 @@
 
 ## What Happened
 
-Each conformance test file in `bindings/kotlin/scp-sdk-kotlin/src/test/kotlin/com/limn/scp/conformance/` carries a class-level KDoc listing the protocol operations it covers, copied from `.docs/scaffold/shared.md`. Several listed operations are neither implemented in `ConformanceDispatcher` nor exercised by any `@Test` method:
+Each conformance test file in `bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/conformance/` carries a class-level KDoc listing the protocol operations it covers, copied from `.docs/scaffold/shared.md`. Several listed operations are neither implemented in `ConformanceDispatcher` nor exercised by any `@Test` method:
 
 | File | Claimed in KDoc | Actually Implemented |
 |------|----------------|---------------------|

@@ -234,8 +234,8 @@ jobs:
       - uses: android-actions/setup-android@v3
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :scp-sdk-kotlin:runKtlintCheckOverMainSourceSet
-      - run: ./gradlew :scp-sdk-kotlin:detekt
+      - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
+      - run: ./gradlew :scp-kt:detekt
 
   kotlin-test:
     needs: changes

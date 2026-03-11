@@ -645,7 +645,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 - **UDL file:** `crates/scp-ffi/uniffi/src/scp.udl` — callback interface definitions and supplementary type mappings
 - **Build output:**
   - Swift: `ScpBindings.swift` — imported by the `SCP` Swift package (bindings/swift/)
-  - Kotlin: `NativeLib.kt` — imported by the `scp-sdk-kotlin` module (bindings/kotlin/)
+  - Kotlin: `NativeLib.kt` — imported by the `scp-kt` module (bindings/kotlin/)
   - C headers + module map for XCFramework packaging
 - **Async runtime:** A single tokio `Runtime` is created at library initialization (via `uniffi::setup_scaffolding!()` init hook) and stored in a `OnceLock<Runtime>`. All async bridge functions run on this runtime. Runtime shutdown occurs on library unload with a 5-second grace period for in-flight tasks.
 - **Platform libraries:** The Rust shared library is compiled for each target:
@@ -879,7 +879,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 15. **Build and distribution:**
     - `uniffi-bindgen generate` produces Swift and Kotlin source files from the proc-macro exports and UDL.
     - Swift bindings are packaged into the `SCP` XCFramework (scaffold/swift.md build process).
-    - Kotlin bindings are packaged into the `scp-sdk-kotlin` AAR/JAR with native libraries bundled as resources (scaffold/kotlin.md).
+    - Kotlin bindings are packaged into the `scp-kt` AAR/JAR with native libraries bundled as resources (scaffold/kotlin.md).
     - CI runs `uniffi-bindgen generate` and verifies that the generated Swift and Kotlin output compiles against the current Rust API.
 
 ### Scope
@@ -905,7 +905,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
 The TypeScript SDK is the second most critical language binding for SCP after Python. The web and server-side JavaScript ecosystems are divided across two distinct runtime categories: browsers (Chrome, Firefox, Safari, WebView) and server-side runtimes (Bun, Node.js). These two environments have fundamentally different I/O models, available APIs, and binary addon support. Browsers can execute WebAssembly natively but cannot load native binary addons. Bun and Node.js can load native addons (`.node` files) with near-zero overhead but have no requirement to support WASM-only APIs.
 
-A single TypeScript package (`@scp/sdk`) must serve both environments. Shipping two separate packages would fracture the ecosystem and force application developers to conditionally import different SDKs based on their deployment target — a violation of the builder tenet of simple, clean APIs. The dual-target architecture solves this by maintaining a single public package with unified types and identical method signatures, while dispatching to the correct FFI bridge at runtime.
+A single TypeScript package (`@limn-works/scp-ts`) must serve both environments. Shipping two separate packages would fracture the ecosystem and force application developers to conditionally import different SDKs based on their deployment target — a violation of the builder tenet of simple, clean APIs. The dual-target architecture solves this by maintaining a single public package with unified types and identical method signatures, while dispatching to the correct FFI bridge at runtime.
 
 The ADR-013 PyO3 bridge and ADR-021 UniFFI bridge established the project-wide FFI pattern: flat function surface, opaque types for crypto state, async bridging, unified error hierarchy. The TypeScript SDK follows the same logical pattern adapted for the JavaScript ecosystem (Promises instead of coroutines, `AsyncIterable` instead of generators, `Symbol.asyncDispose` for resource management).
 
@@ -913,16 +913,16 @@ The ADR-013 PyO3 bridge and ADR-021 UniFFI bridge established the project-wide F
 
 - The two FFI bridges (wasm-bindgen for browser, napi-rs for Bun/Node) and their Rust crate structure.
 - Runtime detection logic in `internal/bridge.ts` — how the correct backend is selected at import time without top-level await.
-- The public API surface for the `@scp/sdk` package: `Identity`, `Context`, `Tools`, `EventLog`, `Transport`, `UCAN`, `MCP` modules.
+- The public API surface for the `@limn-works/scp-ts` package: `Identity`, `Context`, `Tools`, `EventLog`, `Transport`, `UCAN`, `MCP` modules.
 - Error mapping from Rust `Result<T, E>` to the TypeScript `ScpError` hierarchy.
 - Streaming: `AsyncIterable<Message>` for message receive, `Symbol.asyncDispose` for resource lifecycle.
 - Build pipeline: tsup for ESM/CJS bundles, wasm-pack for browser WASM, napi-rs CLI for native addon.
 - Browser-specific platform adapters: WebCrypto for key operations, wa-sqlite (OPFS) for storage.
-- Package structure and npm publishing: `@scp/sdk` (unified) + `@scp/sdk-napi-{platform}` optional platform dependencies.
+- Package structure and npm publishing: `@limn-works/scp-ts` (unified) + `@limn-works/scp-ts-napi-{platform}` optional platform dependencies.
 
 ### Decision
 
-Implement the TypeScript SDK as two FFI bridge crates — `crates/scp-ffi/wasm` (wasm-bindgen) and `crates/scp-ffi/napi` (napi-rs) — with a unified TypeScript wrapper package at `bindings/typescript/` published as `@scp/sdk` on npm. The bridge crates are thin translation layers (zero protocol logic); the TypeScript wrapper layer builds the idiomatic API on top. A runtime detection module (`internal/bridge.ts`) selects the correct backend at package import time using synchronous environment checks, with no top-level await, to preserve CJS compatibility.
+Implement the TypeScript SDK as two FFI bridge crates — `crates/scp-ffi/wasm` (wasm-bindgen) and `crates/scp-ffi/napi` (napi-rs) — with a unified TypeScript wrapper package at `bindings/typescript/` published as `@limn-works/scp-ts` on npm. The bridge crates are thin translation layers (zero protocol logic); the TypeScript wrapper layer builds the idiomatic API on top. A runtime detection module (`internal/bridge.ts`) selects the correct backend at package import time using synchronous environment checks, with no top-level await, to preserve CJS compatibility.
 
 Both bridge crates expose the same flat function surface, mirroring the ADR-013 and ADR-021 patterns. All functions that perform I/O are async (Rust `Future` bridged to JS `Promise`). Message streaming uses a callback-to-`AsyncIterable` adapter in the TypeScript wrapper. `Context` and `Identity` implement `AsyncDisposable` via `Symbol.asyncDispose` for automatic resource cleanup.
 
@@ -931,7 +931,7 @@ Both bridge crates expose the same flat function surface, mirroring the ADR-013 
 - **Two bridges over one:** Browsers cannot load native `.node` addons — only WASM. Bun/Node can load native addons with no WASM overhead. A single WASM-only bridge would impose unnecessary overhead on Bun/Node servers; a native-only bridge would exclude browsers entirely. Two bridges behind a single public API is the only approach that serves both environments without compromise.
 - **wasm-bindgen over Emscripten or manual WASM:** wasm-bindgen generates idiomatic TypeScript/JavaScript bindings with automatic type conversion, Promise integration via `wasm-bindgen-futures`, and zero manual glue code. Emscripten targets C and produces heavier output unsuited to a Rust codebase. Manual WASM bindings require hand-maintaining the entire JS/Rust boundary — maintenance cost grows linearly with the API surface.
 - **napi-rs over node-bindgen or N-API manual bindings:** napi-rs provides macro-driven bindings (`#[napi]`), native async support via `ThreadsafeFunction` and `AsyncTask`, and a build CLI (`napi build`) that handles cross-compilation and binary publishing via optional platform-specific npm packages. node-bindgen is less actively maintained. Manual N-API requires hand-writing C glue. napi-rs is the Rust-Node community standard.
-- **Single `@scp/sdk` package with optional platform dependencies:** Application code imports `@scp/sdk` unconditionally. The package internally detects the runtime environment and loads the appropriate bridge. For Bun/Node, native addon binaries are distributed as `@scp/sdk-napi-{platform}` optional dependencies (following the pattern established by napi-rs community packages like `@napi-rs/canvas`). The WASM bundle is included directly in the main package since it is a pure JS+WASM artifact that works in any bundler.
+- **Single `@limn-works/scp-ts` package with optional platform dependencies:** Application code imports `@limn-works/scp-ts` unconditionally. The package internally detects the runtime environment and loads the appropriate bridge. For Bun/Node, native addon binaries are distributed as `@limn-works/scp-ts-napi-{platform}` optional dependencies (following the pattern established by napi-rs community packages like `@napi-rs/canvas`). The WASM bundle is included directly in the main package since it is a pure JS+WASM artifact that works in any bundler.
 - **Flat function surface mirroring ADR-013:** The bridge crates are deliberately flat (no class hierarchies). Each exported function maps to one Rust function. The ergonomic TypeScript API (class methods, `AsyncIterable`, `Symbol.asyncDispose`) is built in the pure TypeScript wrapper layer (`bindings/typescript/src/`), not in the FFI bridge. This keeps the bridges thin and testable, exactly matching the ADR-013 pattern.
 - **Runtime detection without top-level await:** CJS modules cannot use top-level await. Bridge selection must be synchronous at import time. The detection logic uses `typeof window`, `typeof process`, `process.versions.bun`, and `globalThis` checks — all synchronous. The WASM binary is loaded lazily on first use (via `initWasm()` called from the async constructors), so the synchronous import path never blocks.
 - **`Symbol.asyncDispose` for resource management:** TypeScript 5.2+ and Bun natively support ECMAScript Explicit Resource Management. `await using ctx = await Context.create(...)` ensures `ctx.leave()` is called even on exception. This is the idiomatic TypeScript pattern for resources with cleanup obligations, matching the Python SDK's `async with` pattern.
@@ -945,7 +945,7 @@ Both bridge crates expose the same flat function surface, mirroring the ADR-013 
 - `crates/scp-ffi/wasm/` — wasm-bindgen bridge, built with `wasm-pack`
 - `crates/scp-ffi/napi/` — napi-rs bridge, built with `napi build`
 
-**TypeScript package:** `bindings/typescript/` published as `@scp/sdk`
+**TypeScript package:** `bindings/typescript/` published as `@limn-works/scp-ts`
 
 **Bridge crate: wasm-bindgen (`crates/scp-ffi/wasm/`)**
 
@@ -980,7 +980,7 @@ crates/scp-ffi/napi/
 - Message streaming uses a `#[napi(ts_return_type = "AsyncIterable<Message>")]` generator function backed by a `tokio::sync::mpsc` channel converted to an `AsyncIterable` via napi-rs's `Generator` type.
 - Key custody uses the OS keychain (delegated to `scp-platform`'s `KeyCustody` trait implementation).
 - Storage uses `scp-platform`'s `Storage` trait backed by SQLite (bundled-sqlcipher per §17).
-- `napi build --release` produces `scp-sdk.{platform}.node` artifacts distributed as `@scp/sdk-napi-{platform}` optional dependencies.
+- `napi build --release` produces `scp-ts.{platform}.node` artifacts distributed as `@limn-works/scp-ts-napi-{platform}` optional dependencies.
 
 **TypeScript wrapper layer (`bindings/typescript/src/`)**
 
@@ -1180,14 +1180,14 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 **Build pipeline**
 
 1. **WASM bridge:** `wasm-pack build crates/scp-ffi/wasm --target bundler` — produces `pkg/scp_ffi_wasm.js` + `pkg/scp_ffi_wasm_bg.wasm`. The `.wasm` file is inlined or bundled by tsup.
-2. **napi bridge:** `cd crates/scp-ffi/napi && napi build --release --platform` — produces `scp-sdk.{os}-{arch}.node`. Cross-compilation via GitHub Actions matrix produces all platform binaries. Binaries are distributed as `@scp/sdk-napi-linux-x64-gnu`, `@scp/sdk-napi-darwin-arm64`, etc., declared as `optionalDependencies` in `@scp/sdk`'s package.json.
+2. **napi bridge:** `cd crates/scp-ffi/napi && napi build --release --platform` — produces `scp-ts.{os}-{arch}.node`. Cross-compilation via GitHub Actions matrix produces all platform binaries. Binaries are distributed as `@limn-works/scp-ts-napi-linux-x64-gnu`, `@limn-works/scp-ts-napi-darwin-arm64`, etc., declared as `optionalDependencies` in `@limn-works/scp-ts`'s package.json.
 3. **TypeScript bundle:** `tsup src/index.ts --format esm,cjs --dts` — produces `dist/index.js`, `dist/index.cjs`, `dist/index.d.ts`.
 
 **`package.json` structure**
 
 ```json
 {
-  "name": "@scp/sdk",
+  "name": "@limn-works/scp-ts",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -1210,11 +1210,11 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
   },
   "engines": { "node": ">=22", "bun": ">=1.0" },
   "optionalDependencies": {
-    "@scp/sdk-napi-linux-x64-gnu": "0.1.0",
-    "@scp/sdk-napi-linux-arm64-gnu": "0.1.0",
-    "@scp/sdk-napi-darwin-x64": "0.1.0",
-    "@scp/sdk-napi-darwin-arm64": "0.1.0",
-    "@scp/sdk-napi-win32-x64-msvc": "0.1.0"
+    "@limn-works/scp-ts-napi-linux-x64-gnu": "0.1.0",
+    "@limn-works/scp-ts-napi-linux-arm64-gnu": "0.1.0",
+    "@limn-works/scp-ts-napi-darwin-x64": "0.1.0",
+    "@limn-works/scp-ts-napi-darwin-arm64": "0.1.0",
+    "@limn-works/scp-ts-napi-win32-x64-msvc": "0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",
@@ -1324,7 +1324,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
     - The WASM binary (`scp_ffi_wasm_bg.wasm`) is fetched relative to the JS module URL; bundlers that inline assets will embed it at build time.
 
 11. **napi bridge — Bun/Node-specific:**
-    - The native addon is loaded via `require('@scp/sdk-napi-{platform}')`, resolved from `optionalDependencies`.
+    - The native addon is loaded via `require('@limn-works/scp-ts-napi-{platform}')`, resolved from `optionalDependencies`.
     - If the platform-specific package is not installed, `getBridge()` throws `TransportError` with code `SCP-TRANS-5001` and an actionable message indicating the missing package.
     - Async bridge functions run on a multi-threaded tokio runtime. The runtime is created once at addon load time via `OnceLock<Runtime>` and shared across all calls.
     - The tokio runtime is shut down cleanly when the Node.js process exits (via napi-rs cleanup hook).
@@ -1349,8 +1349,8 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
     - Conformance pass rate is 100% in both Bun and Node.js 22 LTS environments.
 
 15. **Publishing:**
-    - `@scp/sdk` is published to npm with ESM + CJS bundles, type declarations, and WASM bundle.
-    - `@scp/sdk-napi-{platform}` packages are published for each supported platform.
+    - `@limn-works/scp-ts` is published to npm with ESM + CJS bundles, type declarations, and WASM bundle.
+    - `@limn-works/scp-ts-napi-{platform}` packages are published for each supported platform.
     - `package.json` `engines` field requires `node >= 22` and `bun >= 1.0`.
     - All packages are version-pinned to `scp-core` version (sdk-common.md §Versioning).
 
@@ -1369,7 +1369,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 
 | File | Purpose |
 |------|---------|
-| `bindings/typescript/package.json` | Package manifest: `@scp/sdk`, exports map, optionalDependencies for napi platform packages |
+| `bindings/typescript/package.json` | Package manifest: `@limn-works/scp-ts`, exports map, optionalDependencies for napi platform packages |
 | `bindings/typescript/tsconfig.json` | TypeScript config: strict, ESNext target, bundler module resolution, declaration output |
 | `bindings/typescript/biome.json` | Biome linter + formatter config |
 | `bindings/typescript/tsup.config.ts` | tsup bundler config: ESM + CJS output, dts, sourcemap |
@@ -1443,7 +1443,7 @@ The re-implementation is NOT a fork — it is a second implementation of the sam
 
 2. **Cross-language conformance in CI.** The `tests/conformance/conformance.test.ts` runner (ADR-022 acceptance criterion 14) executes the full conformance suite in both Bun (napi-rs bridge) and a browser environment (wasm-bindgen bridge). CI fails if either bridge produces different results.
 
-3. **Shared type definitions.** The `@scp/sdk` TypeScript types are defined once in `bindings/typescript/src/types/` and used by both bridges. Type-level drift is caught by the TypeScript compiler.
+3. **Shared type definitions.** The `@limn-works/scp-ts` TypeScript types are defined once in `bindings/typescript/src/types/` and used by both bridges. Type-level drift is caught by the TypeScript compiler.
 
 4. **New feature checklist.** Every PR that adds a new scp-core public API function must include a corresponding WASM bridge implementation or a tracking issue. CI can enforce this via a bridge surface parity check script.
 

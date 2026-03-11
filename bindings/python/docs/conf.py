@@ -1,11 +1,11 @@
-"""Sphinx configuration for scp-sdk Python API reference."""
+"""Sphinx configuration for scp-python Python API reference."""
 
 import os
 import sys
 
 sys.path.insert(0, os.path.abspath(".."))
 
-project = "scp-sdk"
+project = "scp-python"
 author = "Limn"
 release = "0.1.0"
 
@@ -26,6 +26,6 @@ intersphinx_mapping = {
 }
 
 html_theme = "furo"
-html_title = "scp-sdk"
+html_title = "scp-python"
 
 exclude_patterns = ["_build"]

@@ -65,5 +65,5 @@ but silently leaks every resource the ViewModel was supposed to release.
 
 ## Affected Files (SCP-117)
 
-- `bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/ScpViewModel.kt`
-- `bindings/kotlin/scp-sdk-kotlin-android/src/test/kotlin/com/limn/scp/android/ScpViewModelTest.kt`
+- `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/ScpViewModel.kt`
+- `bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/ScpViewModelTest.kt`

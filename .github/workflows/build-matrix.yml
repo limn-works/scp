@@ -167,10 +167,10 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # TypeScript (browser) — wasm-pack WASM bundle for @scp/sdk
+  # TypeScript (browser) — wasm-pack WASM bundle for @limn-works/scp-ts
   # ---------------------------------------------------------------------------
   typescript-wasm:
-    name: TypeScript WASM (@scp/sdk)
+    name: TypeScript WASM (@limn-works/scp-ts)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -199,7 +199,7 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # TypeScript (Node/Bun) — napi-rs native addon for @scp/sdk-node
+  # TypeScript (Node/Bun) — napi-rs native addon for @limn-works/scp-ts-node
   # ---------------------------------------------------------------------------
   typescript-napi:
     name: TypeScript napi (${{ matrix.target }})
@@ -412,7 +412,7 @@ jobs:
 
       - name: Stage native libraries for AAR
         run: |
-          JNILIBS=bindings/kotlin/scp-sdk-kotlin-android/src/main/jniLibs
+          JNILIBS=bindings/kotlin/scp-kt-android/src/main/jniLibs
           mkdir -p "$JNILIBS/arm64-v8a" "$JNILIBS/armeabi-v7a" "$JNILIBS/x86_64" "$JNILIBS/x86"
           cp target/aarch64-linux-android/release/libscp_ffi_uniffi.so "$JNILIBS/arm64-v8a/"
           cp target/armv7-linux-androideabi/release/libscp_ffi_uniffi.so "$JNILIBS/armeabi-v7a/"
@@ -421,19 +421,19 @@ jobs:
 
       - name: Build Android AAR
         working-directory: bindings/kotlin
-        run: ./gradlew :scp-sdk-kotlin-android:assembleRelease
+        run: ./gradlew :scp-kt-android:assembleRelease
 
       - name: Build Kotlin JVM JAR
         working-directory: bindings/kotlin
-        run: ./gradlew :scp-sdk-kotlin:jar
+        run: ./gradlew :scp-kt:jar
 
       - name: Upload Kotlin AAR
         uses: actions/upload-artifact@v4
         with:
           name: kotlin-aar
           path: |
-            bindings/kotlin/scp-sdk-kotlin-android/build/outputs/aar/*-release.aar
-            bindings/kotlin/scp-sdk-kotlin/build/libs/*.jar
+            bindings/kotlin/scp-kt-android/build/outputs/aar/*-release.aar
+            bindings/kotlin/scp-kt/build/libs/*.jar
           retention-days: 7
 
   # ---------------------------------------------------------------------------

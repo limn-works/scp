@@ -2,8 +2,8 @@
  * Multi-agent coordination: multiple agents collaborating in a shared context.
  */
 
-import { Context, Identity } from "@scp/sdk";
-import { mint } from "@scp/sdk/ucan";
+import { Context, Identity } from "@limn-works/scp-ts";
+import { mint } from "@limn-works/scp-ts/ucan";
 
 async function runAgent(
   name: string,

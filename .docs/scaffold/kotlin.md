@@ -10,10 +10,10 @@ Build blueprint for the SCP Kotlin SDK: package structure, UniFFI bridge pattern
 bindings/kotlin/
   build.gradle.kts              # Root build config
   settings.gradle.kts
-  scp-sdk-kotlin/
+  scp-kt/
     build.gradle.kts             # SDK module build
     src/
-      main/kotlin/com/limn/scp/
+      main/kotlin/works/limn/scp/
         Identity.kt              # Identity class, DIDDocument
         Context.kt               # Context class, Membership
         Tools.kt                 # ToolDefinition, TestVector data classes
@@ -30,7 +30,7 @@ bindings/kotlin/
         libscp_ffi.so            # Linux native library (bundled in JAR)
         libscp_ffi.dylib         # macOS native library
         scp_ffi.dll              # Windows native library
-      test/kotlin/com/limn/scp/
+      test/kotlin/works/limn/scp/
         IdentityTest.kt
         ContextTest.kt
         ToolsTest.kt
@@ -126,8 +126,8 @@ plugins {
     id("io.gitlab.arturbosch.detekt") version "1.23.7"
 }
 
-group = "com.limn"
-artifactId = "scp-sdk-kotlin"
+group = "works.limn"
+artifactId = "scp-kt"
 version = "0.1.0"
 
 kotlin {
@@ -247,12 +247,12 @@ Context.create(params).use { ctx ->
 
 ## Maven Central Publishing
 
-Published as `com.limn:scp-sdk-kotlin` on Maven Central.
+Published as `works.limn:scp-kt` on Maven Central.
 
 ```kotlin
 // Consumer usage
 dependencies {
-    implementation("com.limn:scp-sdk-kotlin:0.1.0")
+    implementation("works.limn:scp-kt:0.1.0")
 }
 ```
 
