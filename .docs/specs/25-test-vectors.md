@@ -102,7 +102,7 @@ Domain: `"SCP-INNER-ENVELOPE-V1:"`
 
 ```
 Input:
-  version:           1
+  version:           256 (0x0100 — SCP/1.0)
   message_type:      0x00 (Standard discriminator byte)
   context_id:       "test-context-01"
   sender_did:       "did:dht:z6MkTest"
@@ -116,7 +116,7 @@ Input:
 
 Canonical hash input (concatenated bytes):
   "SCP-INNER-ENVELOPE-V1:"                    (22 bytes, no length prefix)
-  || BE16(1)                                   (2 bytes — version)
+  || BE16(256)                                  (2 bytes — version, 0x01 0x00)
   || 0x00                                      (1 byte — message_type discriminator)
   || BE32(15) || "test-context-01"             (4 + 15 = 19 bytes)
   || BE32(16) || "did:dht:z6MkTest"           (4 + 16 = 20 bytes)
