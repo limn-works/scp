@@ -990,6 +990,58 @@ class TestContextRepr:
 
 
 # ---------------------------------------------------------------------------
+# Economic policy roundtrip tests (#592)
+# ---------------------------------------------------------------------------
+
+
+class TestEconomicPolicyRoundtrip:
+    """Roundtrip tests for set/get economic policy via mock bridge."""
+
+    @pytest.mark.asyncio
+    async def test_set_then_get_roundtrip(self) -> None:
+        """Set a policy, get it back, verify equality."""
+        mock_bridge = MagicMock()
+        # py_set_economic_policy stores the JSON on the handle;
+        # py_get_economic_policy reads it back. We simulate this
+        # by having the mock mutate a shared dict.
+        stored: dict[str, str | None] = {"policy": None}
+
+        def fake_set(handle: object, policy_json: str) -> None:
+            stored["policy"] = policy_json
+
+        def fake_get(handle: object) -> str | None:
+            return stored["policy"]
+
+        mock_bridge.py_set_economic_policy.side_effect = fake_set
+        mock_bridge.py_get_economic_policy.side_effect = fake_get
+
+        ctx = _make_context()
+        ep_json = (
+            '{"locked":false,"cost_schedule":{"currency":[85,83,68,0]},'
+            '"payment_adapters":[],"pricing_formula":null,'
+            '"payee":"did:dht:z6MkPayee"}'
+        )
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await ctx.set_economic_policy(ep_json)
+            result = await ctx.get_economic_policy()
+
+        assert result == ep_json
+
+    @pytest.mark.asyncio
+    async def test_get_returns_none_when_unset(self) -> None:
+        """get_economic_policy returns None before any set."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_get_economic_policy.return_value = None
+
+        ctx = _make_context()
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            result = await ctx.get_economic_policy()
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
 # Package re-export tests
 # ---------------------------------------------------------------------------
 

@@ -722,3 +722,40 @@ describe("UCAN full lifecycle", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8. Economic policy roundtrip tests (#592)
+// ---------------------------------------------------------------------------
+
+describe("Economic policy roundtrip (mock bridge)", () => {
+  it("set then get returns the same policy JSON", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"] }),
+    );
+
+    const policyJson = JSON.stringify({
+      locked: false,
+      cost_schedule: { currency: [85, 83, 68, 0] },
+      payment_adapters: [],
+      pricing_formula: null,
+      payee: "did:dht:z6MkPayee",
+    });
+
+    await mockBridge.contextSetEconomicPolicy(ctx, policyJson);
+    const result = await mockBridge.contextGetEconomicPolicy(ctx);
+    expect(result).toBe(policyJson);
+  });
+
+  it("get returns null when no policy is set", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"] }),
+    );
+
+    const result = await mockBridge.contextGetEconomicPolicy(ctx);
+    expect(result).toBeNull();
+  });
+});

@@ -593,4 +593,39 @@ struct ContextTests {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
+    // MARK: - Economic policy roundtrip (#592)
+
+    @Test("setEconomicPolicy + getEconomicPolicy roundtrip")
+    func economicPolicyRoundtrip() async throws {
+        let stored = Locked<String?>(nil)
+        let setFn: ContextBridge.SetEconomicPolicyFn = { _, json in
+            stored.withLock { $0 = json }
+        }
+        let getFn: ContextBridge.GetEconomicPolicyFn = { _ in
+            stored.current
+        }
+
+        let handle = MockContextHandle()
+        let context = Context(
+            handle: handle,
+            sendFn: { _, _ in },
+            subscribeFn: { _, _ in },
+            leaveFn: { _ in },
+            closeFn: { _ in },
+            setEconomicPolicyFn: setFn,
+            getEconomicPolicyFn: getFn
+        )
+
+        // Initially nil.
+        let initial = try await context.getEconomicPolicy()
+        #expect(initial == nil)
+
+        // Set a policy, then read it back.
+        let policyJson = """
+        {"locked":false,"cost_schedule":{"currency":[85,83,68,0]},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}
+        """
+        try await context.setEconomicPolicy(policyJson)
+        let result = try await context.getEconomicPolicy()
+        #expect(result == policyJson)
+    }
 } // end ContextTests

@@ -443,6 +443,29 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
+    // Economic policy roundtrip tests (#592)
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class EconomicPolicyTests {
+        @Test
+        fun `setEconomicPolicy then getEconomicPolicy roundtrip`() =
+            runTest(ioDispatcher) {
+                val policyJson =
+                    """{"locked":false,"cost_schedule":{"currency":[85,83,68,0]},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"""
+
+                // Initially null.
+                val initial = bridge.context.getEconomicPolicy(1L)
+                assertEquals(null, initial)
+
+                // Set, then get.
+                bridge.context.setEconomicPolicy(1L, policyJson)
+                val result = bridge.context.getEconomicPolicy(1L)
+                assertEquals(policyJson, result)
+            }
+    }
+
+    // -------------------------------------------------------------------
     // Error handling tests
     // -------------------------------------------------------------------
 

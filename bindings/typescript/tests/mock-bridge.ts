@@ -48,6 +48,7 @@ interface MockContext {
   subscriptions: MessageCallback[];
   ucans: Map<string, UcanToken>;
   revokedTokens: Set<string>;
+  economicPolicy: string | null;
 }
 
 interface MockTransport {
@@ -221,6 +222,7 @@ export function createMockBridge(): Bridge & {
         subscriptions: [],
         ucans: new Map(),
         revokedTokens: new Set(),
+        economicPolicy: null,
       };
 
       // Record ContextCreated event
@@ -563,6 +565,17 @@ export function createMockBridge(): Bridge & {
       _additionalSecs: number,
     ): Promise<boolean> {
       return true;
+    },
+
+    // Economic policy (§19.3)
+    async contextSetEconomicPolicy(handle: BridgeContextHandle, policyJson: string): Promise<void> {
+      const ctx = getContext(handle);
+      ctx.economicPolicy = policyJson;
+    },
+
+    async contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null> {
+      const ctx = getContext(handle);
+      return ctx.economicPolicy;
     },
 
     // Lifecycle
