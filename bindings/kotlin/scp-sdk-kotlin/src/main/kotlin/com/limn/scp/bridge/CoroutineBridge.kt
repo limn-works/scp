@@ -755,7 +755,7 @@ class UcanBridge internal constructor(
      * @return The delegated UCAN token string.
      * @throws BridgeException if delegation fails (e.g., capabilities wider than parent).
      *
-     * See ADR-016 criterion 4, spec section 7.4.
+     * See ADR-016 criterion 4, spec section 7.2.
      */
     suspend fun delegate(
         contextHandle: Long,
