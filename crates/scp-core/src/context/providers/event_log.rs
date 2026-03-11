@@ -304,6 +304,10 @@ impl MerkleEventLogProvider {
     /// entry's `hash`, and each entry's `hash` is correctly computed.
     /// Returns `false` if any chain link is broken.
     ///
+    /// The first entry's `prev_hash` is accepted unconditionally because the
+    /// log may have been pruned — the predecessor it references may no longer
+    /// exist.
+    ///
     /// Returns `true` for empty logs and contexts that do not exist.
     #[must_use]
     pub fn verify_chain(&self, context_id: &[u8; 32]) -> bool {
@@ -316,13 +320,10 @@ impl MerkleEventLogProvider {
         };
 
         for (i, entry) in log.entries.iter().enumerate() {
-            // Check prev_hash linkage.
-            let expected_prev = if i == 0 {
-                [0u8; 32]
-            } else {
-                log.entries[i - 1].hash
-            };
-            if entry.prev_hash != expected_prev {
+            // Skip prev_hash linkage check for the first entry: if the log
+            // was pruned, entries[0].prev_hash references a discarded
+            // predecessor and cannot be validated.
+            if i > 0 && entry.prev_hash != log.entries[i - 1].hash {
                 return false;
             }
 
@@ -542,18 +543,20 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
 
 /// Verifies Merkle chain integrity for a list of entries.
 ///
+/// The first entry's `prev_hash` is accepted unconditionally because the log
+/// may have been pruned — the predecessor it references may no longer exist.
+/// Subsequent entries must chain correctly to their immediate predecessor.
+///
 /// # Errors
 ///
 /// Returns [`ContextCreationError::EventLogFailed`] if any chain link is
 /// broken (`prev_hash` mismatch or hash mismatch).
 fn verify_chain_integrity(entries: &[EventLogEntry]) -> Result<(), ContextCreationError> {
     for (i, entry) in entries.iter().enumerate() {
-        let expected_prev = if i == 0 {
-            [0u8; 32]
-        } else {
-            entries[i - 1].hash
-        };
-        if entry.prev_hash != expected_prev {
+        // Skip prev_hash linkage check for the first entry: if the log was
+        // pruned, entries[0].prev_hash references a discarded predecessor
+        // and cannot be validated.
+        if i > 0 && entry.prev_hash != entries[i - 1].hash {
             return Err(ContextCreationError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
@@ -890,6 +893,58 @@ mod tests {
         let ctx_id = [16u8; 32];
 
         assert!(provider.prune_event_log(&ctx_id, 5).is_none());
+    }
+
+    #[test]
+    fn restore_after_prune() {
+        let persistence = std::sync::Arc::new(MockEventLogPersistence::new());
+        let ctx_id = [18u8; 32];
+
+        // Phase 1: create entries, prune, verify persisted state.
+        {
+            let provider = MerkleEventLogProvider::with_persistence(persistence.clone());
+            provider.init_event_log(&ctx_id).unwrap();
+            for i in 0..10 {
+                provider
+                    .append_event(&ctx_id, &format!("Event{i}"))
+                    .unwrap();
+            }
+
+            // Prune to keep only the last 3 entries.
+            let removed = provider.prune_event_log(&ctx_id, 3).unwrap();
+            assert_eq!(removed, 7);
+
+            // First remaining entry's prev_hash should NOT be [0u8; 32]
+            // because it references a pruned predecessor.
+            let entries = provider.entries(&ctx_id).unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_ne!(entries[0].prev_hash, [0u8; 32]);
+
+            // Chain should still verify after prune.
+            assert!(provider.verify_chain(&ctx_id));
+        }
+
+        // Phase 2: restore from persistence (simulating process restart).
+        {
+            let provider = MerkleEventLogProvider::with_persistence(persistence);
+            provider.restore_event_log(&ctx_id).unwrap();
+
+            let entries = provider.entries(&ctx_id).unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries[0].event, "Event7");
+            assert_eq!(entries[1].event, "Event8");
+            assert_eq!(entries[2].event, "Event9");
+
+            // Chain integrity must pass after restore of pruned log.
+            assert!(provider.verify_chain(&ctx_id));
+
+            // Appending after restore should chain correctly.
+            provider.append_event(&ctx_id, "Event10").unwrap();
+            let entries = provider.entries(&ctx_id).unwrap();
+            assert_eq!(entries.len(), 4);
+            assert_eq!(entries[3].prev_hash, entries[2].hash);
+            assert!(provider.verify_chain(&ctx_id));
+        }
     }
 
     #[test]
