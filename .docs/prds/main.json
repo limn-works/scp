@@ -6938,20 +6938,20 @@
       "files": [
         "crates/scp-core/sync/conflict_resolution.rs"
       ],
-      "description": "Implement conflict resolution for concurrent offline operations. When two admins are both offline and both propose conflicting role changes or governance modifications, the protocol must resolve the conflict deterministically. Expected approach: first-writer-wins for metadata (lower Merkle leaf index wins per §23.6.1), Merkle tree for event ordering, governance deadlock = context fork.",
+      "description": "Implement conflict resolution for concurrent offline operations. When two admins are both offline and both propose conflicting role changes or governance modifications, the protocol must resolve the conflict deterministically. Expected approach: first-writer-wins for metadata (lower Merkle leaf index wins per §23.6.1), Merkle tree for event ordering, governance deadlock = GovernanceFreeze (explicit fork available).",
       "acceptanceCriteria": [
         "Concurrent offline metadata changes resolved via first-writer-wins (lower Merkle leaf index wins)",
         "Event ordering determined by Merkle tree position, not wall-clock time",
         "Concurrent governance proposals from multiple offline admins resolved deterministically",
-        "Governance deadlock detected and triggers context fork",
+        "Governance deadlock detected and triggers GovernanceFreeze state (explicit fork available per §23.6.1)",
         "No synchronized clock dependency in conflict resolution per §9.8.3",
-        "Tests verify conflict resolution for all concurrent offline scenarios"
+        "Tests verify conflict resolution for concurrent offline scenarios: metadata conflict (first-writer-wins), governance deadlock (GovernanceFreeze), event log divergence (Merkle-ordered resolution)"
       ],
       "actionItems": [
         "Implement first-writer-wins resolution for concurrent metadata changes (lower Merkle leaf index wins per §23.6.1)",
         "Implement Merkle tree-based event ordering for conflict resolution",
         "Define governance deadlock detection criteria",
-        "Implement context fork mechanism for irreconcilable governance deadlocks",
+        "Implement GovernanceFreeze mechanism for irreconcilable governance deadlocks (explicit fork available per §23.6.1)",
         "Ensure all resolution is clock-independent per §9.8.3",
         "Add tests for concurrent offline governance conflict scenarios"
       ],
@@ -6965,12 +6965,15 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-029: Offline/Sync Strategy"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "### 23.6.1 Resolution Strategies"
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
-        "approachDirection": "First-writer-wins for metadata (lower Merkle leaf index wins), Merkle tree for event ordering, governance deadlock = context fork",
+        "note": "ADR-029 fully written — story aligned with §23.6.1 resolution strategies",
+        "approachDirection": "First-writer-wins for metadata (lower Merkle leaf index wins), Merkle tree for event ordering, governance deadlock = GovernanceFreeze (explicit fork available)",
         "openQuestions": [
           "Conflict resolution for concurrent offline governance changes (two admins both offline, both propose role changes)"
         ],
@@ -6979,7 +6982,7 @@
           "§9.8.5 — Message gap handling"
         ]
       },
-      "result": "conflict_resolution.rs: ConflictType/Resolution enums, Merkle-ordered resolution, deadlock detection, context fork. Tests pass."
+      "result": "conflict_resolution.rs: ConflictType/Resolution enums, Merkle-ordered resolution, deadlock detection, GovernanceFreeze. Tests pass."
     },
     {
       "id": "SCP-125",
