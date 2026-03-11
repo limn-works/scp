@@ -47,13 +47,21 @@ jobs:
               - 'deny.toml'
             python:
               - 'bindings/python/**'
+              - 'crates/scp-ffi/src/**'
+              - 'crates/scp-ffi/common/**'
             typescript:
               - 'bindings/typescript/**'
+              - 'crates/scp-ffi/napi/**'
+              - 'crates/scp-ffi/wasm/**'
+              - 'crates/scp-ffi/common/**'
             kotlin:
               - 'bindings/kotlin/**'
+              - 'crates/scp-ffi/uniffi/**'
+              - 'crates/scp-ffi/common/**'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
+              - 'crates/scp-ffi/common/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
