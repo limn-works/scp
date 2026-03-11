@@ -84,6 +84,51 @@ class TransportConformanceTest {
     }
 
     @Nested
+    inner class TransportDisconnect {
+        @Test
+        fun `transport_disconnect returns disconnected`() =
+            runTest(testDispatcher) {
+                val result = dispatcher.dispatch(
+                    "transport_disconnect",
+                    mapOf("transport_handle" to "99"),
+                )
+                assertEquals("disconnected", result["status"])
+                assertTrue(stubBindings.transportDisconnectCalled)
+            }
+
+        @Test
+        fun `transport_disconnect propagates error`() =
+            runTest(testDispatcher) {
+                stubBindings.transportDisconnectError =
+                    BridgeException("Transport not connected", "SCP-TRANS-5003")
+                val result = dispatcher.dispatch(
+                    "transport_disconnect",
+                    mapOf("transport_handle" to "99"),
+                )
+                assertEquals("SCP-TRANS-5003", result["error"])
+            }
+
+        @Test
+        fun `transport connect then disconnect lifecycle`() =
+            runTest(testDispatcher) {
+                stubBindings.transportConnectResult = 42L
+                val connectResult = dispatcher.dispatch(
+                    "transport_connect",
+                    mapOf("relay_url" to "wss://relay.example.com/scp/v1"),
+                )
+                assertEquals("42", connectResult["handle"])
+                assertEquals("connected", connectResult["status"])
+
+                val disconnectResult = dispatcher.dispatch(
+                    "transport_disconnect",
+                    mapOf("transport_handle" to "42"),
+                )
+                assertEquals("disconnected", disconnectResult["status"])
+                assertTrue(stubBindings.transportDisconnectCalled)
+            }
+    }
+
+    @Nested
     inner class TransportStatus {
         @Test
         fun `transport_status returns status JSON`() =

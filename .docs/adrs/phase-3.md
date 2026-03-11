@@ -113,6 +113,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 
 5. **Transport bridge functions:**
    - `py_transport_connect(relay_url) -> None` — connects to an SCP relay.
+   - `py_transport_disconnect() -> None` — disconnects from the current SCP relay. Idempotent.
    - `py_transport_status() -> PyTransportStatus` — returns transport connection status.
 
 6. **UCAN bridge functions:**

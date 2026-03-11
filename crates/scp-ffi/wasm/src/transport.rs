@@ -3,6 +3,7 @@
 //! Exposes SCP transport operations to JavaScript:
 //!
 //! - [`transport_connect`] — Connect to an SCP relay.
+//! - [`transport_disconnect`] — Disconnect from the current relay.
 //! - [`transport_status`] — Query the current transport status.
 //!
 //! # Types
@@ -144,6 +145,30 @@ pub fn transport_connect(relay_url: String) -> Promise {
         };
 
         Ok(JsValue::from(status))
+    })
+}
+
+/// Disconnects from the current SCP relay.
+///
+/// In browser targets, the actual `WebSocket` teardown is managed by the
+/// TypeScript SDK wrapper. This bridge function signals the intent to
+/// disconnect and returns a `Promise<void>` for API consistency with the
+/// other bridge targets (`PyO3`, napi-rs, `UniFFI`).
+///
+/// This is idempotent — calling it when already disconnected is a no-op.
+///
+/// # Returns
+///
+/// `Promise<void>` — resolves immediately.
+///
+/// See ADR-022 acceptance criterion 1.
+#[wasm_bindgen]
+pub fn transport_disconnect() -> Promise {
+    future_to_promise(async move {
+        // The TypeScript SDK wrapper manages the browser WebSocket lifecycle.
+        // This bridge function is a no-op — the wrapper closes the WebSocket
+        // connection and updates its local state.
+        Ok(JsValue::UNDEFINED)
     })
 }
 

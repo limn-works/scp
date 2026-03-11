@@ -73,6 +73,8 @@ class ConformanceStubBindings : NativeBindings {
     var transportConnectError: BridgeException? = null
     var transportStatusResult: String = """{"connected":true}"""
     var transportStatusError: BridgeException? = null
+    var transportDisconnectCalled = false
+    var transportDisconnectError: BridgeException? = null
 
     override fun identityCreate(custody: String): Long {
         identityCreateCustody = custody
@@ -245,6 +247,11 @@ class ConformanceStubBindings : NativeBindings {
         return transportStatusResult
     }
 
+    override fun transportDisconnect(transportHandle: Long) {
+        transportDisconnectCalled = true
+        transportDisconnectError?.let { throw it }
+    }
+
     fun reset() {
         identityCreateResult = 1L
         identityCreateError = null
@@ -287,5 +294,7 @@ class ConformanceStubBindings : NativeBindings {
         transportConnectError = null
         transportStatusResult = """{"connected":true}"""
         transportStatusError = null
+        transportDisconnectCalled = false
+        transportDisconnectError = null
     }
 }

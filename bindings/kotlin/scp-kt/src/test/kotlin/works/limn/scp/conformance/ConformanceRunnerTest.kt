@@ -211,6 +211,7 @@ class ConformanceRunnerTest {
         fun `dispatcher handles all infra operations`() =
             runTest(testDispatcher) {
                 assertDispatchSucceeds("transport_connect", mapOf("relay_url" to "wss://r"))
+                assertDispatchSucceeds("transport_disconnect", emptyMap())
                 assertDispatchSucceeds("transport_status", emptyMap())
                 assertDispatchSucceeds("event_log_query", mapOf("context_id" to "c"))
                 assertDispatchSucceeds("event_log_verify", mapOf("context_id" to "c"))
