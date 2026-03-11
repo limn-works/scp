@@ -72,9 +72,11 @@ use scp_core::store::ProtocolStore;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
+use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
 use crate::context::PyMessage;
 use crate::error::ScpPyError;
@@ -174,10 +176,15 @@ pub fn init_context_manager_with(
 /// expected during early initialization -- the `ContextManager` will operate
 /// without persistence until the storage provider is available.
 ///
-/// Uses `Arc<InMemoryStorage>` as the storage backend for
-/// `ProtocolStore`, sharing the same underlying storage instance as the
-/// identity layer. This ensures that identity and context data coexist in
-/// the same store, matching the `ApplicationNode` pattern in `scp-node`.
+/// Uses `Arc<EncryptingAdapter<InMemoryStorage>>` as the storage backend
+/// for `ProtocolStore`, sharing the same underlying storage instance as
+/// the identity layer. This ensures that identity and context data
+/// coexist in the same store, matching the `ApplicationNode` pattern in
+/// `scp-node`.
+///
+/// The `EncryptingAdapter` wraps `InMemoryStorage` with per-value
+/// AES-256-GCM encryption, satisfying the sealed `EncryptedStorage`
+/// bound required by `ProtocolStore::new()`.
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
     STORAGE_PROVIDER.get().map(|storage| {
         let protocol_store = Arc::new(ProtocolStore::new(Arc::clone(storage)));
@@ -936,9 +943,14 @@ pub fn remove_identity(did: &str) {
 ///
 /// Injected via [`init_storage`] at Python initialization time. Bridge
 /// functions use [`get_storage`] to access the provider for storing and
-/// loading identity state. The storage backend is `InMemoryStorage` for
-/// now -- persistent backends (`SQLite` via [`SqliteStorage`]) will replace it
-/// when platform storage adapters land.
+/// loading identity state.
+///
+/// The storage backend is `InMemoryStorage` wrapped in
+/// [`EncryptingAdapter`] with a random AES-256-GCM key. This satisfies
+/// the sealed `EncryptedStorage` bound required by
+/// `ProtocolStore::new()`, matching the `scp-node` ephemeral mode
+/// pattern. Persistent backends (`SQLite` via [`SqliteStorage`]) will
+/// replace it when platform storage adapters land.
 ///
 /// Uses the same `OnceLock` pattern as `FFI_BRIDGE_STATE` and
 /// `RELAY_CONNECTION`. The `Arc` enables shared ownership across bridge
@@ -951,13 +963,17 @@ pub fn remove_identity(did: &str) {
 ///
 /// This registry is process-global. In multi-tenant deployments,
 /// ALL tenants share the storage provider. See RED-017 / SCP-228.
-static STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>> = OnceLock::new();
+static STORAGE_PROVIDER: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>> = OnceLock::new();
 
 /// Initializes the global storage provider.
 ///
 /// Must be called before any storage-dependent bridge function
 /// (`py_identity_create`, `py_identity_load`). Calling multiple times is
 /// a no-op — the first call wins.
+///
+/// Wraps `InMemoryStorage` in [`EncryptingAdapter`] with a random
+/// AES-256-GCM key generated via `OsRng`. This ensures all stored
+/// values are encrypted at rest, satisfying the `EncryptedStorage` bound.
 ///
 /// # Arguments
 ///
@@ -970,7 +986,10 @@ static STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>> = OnceLock::new();
 pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
     match storage_type {
         "in_memory" => {
-            let _ = STORAGE_PROVIDER.set(Arc::new(InMemoryStorage::new()));
+            let mut key = Zeroizing::new([0u8; 32]);
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
+            let encrypted = EncryptingAdapter::new(InMemoryStorage::new(), key);
+            let _ = STORAGE_PROVIDER.set(Arc::new(encrypted));
             Ok(())
         }
         other => Err(ScpPyError::validation(format!(
@@ -985,7 +1004,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 ///
 /// Returns `ScpPyError::IdentityError` if storage has not been initialized
 /// via [`init_storage`].
-pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
+pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>, ScpPyError> {
     STORAGE_PROVIDER.get().ok_or_else(|| {
         ScpPyError::identity(
             "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),

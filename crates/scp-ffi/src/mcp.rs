@@ -959,9 +959,9 @@ impl ContextProvider for FfiBridgeProvider {
                 // instead of just a LogSummary (GitHub issue #303).
                 //
                 // Uses the Storage trait directly because the global storage
-                // is Arc<InMemoryStorage> and ProtocolStore requires an owned
-                // Storage impl. The key convention matches ProtocolStore's
-                // event_data_key format.
+                // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolStore
+                // requires an owned Storage impl. The key convention matches
+                // ProtocolStore's event_data_key format.
                 if let Ok(storage) = crate::runtime::get_storage()
                     && let Ok(rt) = crate::runtime()
                 {

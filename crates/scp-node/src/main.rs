@@ -26,6 +26,7 @@ use scp_identity::{
     DidCache, DidDht, IdentityError, InMemoryDhtClient, InMemorySequenceStore, PkarrDhtClient,
 };
 use scp_node::{ApplicationNodeBuilder, TlsProvider};
+use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_platform::traits::Storage;
@@ -594,13 +595,22 @@ async fn run_full_node_ephemeral() {
 
     let seq_init_method = Arc::clone(&did_method);
     let seq_init = make_seq_init(seq_init_method);
+    // Wrap InMemoryStorage in EncryptingAdapter to satisfy the
+    // EncryptedStorage bound. Ephemeral mode data is lost on restart
+    // anyway, so a random key is fine.
+    let mut ephemeral_key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ephemeral_key);
+    let encrypted_storage = scp_platform::encrypting_adapter::EncryptingAdapter::new(
+        InMemoryStorage::new(),
+        Zeroizing::new(ephemeral_key),
+    );
     run_node_with(
         domain,
         http_addr,
         custody,
         seq_init,
         did_method,
-        InMemoryStorage::new(),
+        encrypted_storage,
     )
     .await;
 }
@@ -839,7 +849,7 @@ fn make_seq_init<D: scp_identity::DhtClient + 'static>(
 async fn run_node_with<
     K: scp_platform::KeyCustody + 'static,
     D: scp_identity::DidMethod + 'static,
-    S: Storage + 'static,
+    S: EncryptedStorage + 'static,
 >(
     domain: String,
     http_addr: SocketAddr,

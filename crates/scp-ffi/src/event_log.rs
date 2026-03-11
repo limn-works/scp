@@ -231,9 +231,9 @@ pub fn py_event_log_query(
 
     // Attempt to load real events from storage if available.
     // Uses the Storage trait directly because the global storage is
-    // Arc<InMemoryStorage> and ProtocolStore requires an owned Storage
-    // impl. The key convention matches ProtocolStore's event_data key
-    // format (GitHub issue #303).
+    // Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolStore requires
+    // an owned Storage impl. The key convention matches ProtocolStore's
+    // event_data key format (GitHub issue #303).
     if let Ok(storage) = crate::runtime::get_storage() {
         let rt = crate::runtime()?;
         let prefix = format!("context/{context_id}/event_data/");

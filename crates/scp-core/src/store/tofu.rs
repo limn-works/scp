@@ -90,7 +90,7 @@ mod tests {
     }
 
     fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new(InMemoryStorage::new())
+        ProtocolStore::new_for_testing(InMemoryStorage::new())
     }
 
     fn sample_keys() -> ObservedKeys {

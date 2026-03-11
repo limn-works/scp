@@ -36,7 +36,7 @@ use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
 /// Creates a test [`ProtocolStore`] backed by a fresh [`InMemoryStorage`].
 fn make_store() -> ProtocolStore<InMemoryStorage> {
-    ProtocolStore::new(InMemoryStorage::new())
+    ProtocolStore::new_for_testing(InMemoryStorage::new())
 }
 
 /// Creates a deterministic test DID from a suffix.

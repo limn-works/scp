@@ -44,7 +44,7 @@ impl SimulatedIdentity {
         custody: Arc<InMemoryKeyCustody>,
         storage: InMemoryStorage,
     ) -> Self {
-        let protocol_store = ProtocolStore::new(InMemoryStorage::new());
+        let protocol_store = ProtocolStore::new_for_testing(InMemoryStorage::new());
         Self {
             did,
             custody,

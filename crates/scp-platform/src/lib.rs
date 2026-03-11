@@ -33,6 +33,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod encrypted;
+#[cfg(feature = "encrypting")]
+pub mod encrypting_adapter;
 pub mod error;
 // In-memory platform adapters — gated by the `testing` feature, NOT by
 // `software_platform`. This ensures production mobile builds can enable
@@ -60,6 +63,7 @@ pub mod syncable;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.
+pub use encrypted::EncryptedStorage;
 pub use error::PlatformError;
 pub use traits::{
     CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyType,

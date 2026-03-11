@@ -37,7 +37,7 @@ use scp_platform::testing::InMemoryStorage;
 
 /// Creates a fresh `ProtocolStore<InMemoryStorage>` for each test.
 fn make_store() -> ProtocolStore<InMemoryStorage> {
-    ProtocolStore::new(InMemoryStorage::new())
+    ProtocolStore::new_for_testing(InMemoryStorage::new())
 }
 
 // =========================================================================

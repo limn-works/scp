@@ -503,7 +503,7 @@ mod tests {
     use super::*;
 
     fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new(InMemoryStorage::new())
+        ProtocolStore::new_for_testing(InMemoryStorage::new())
     }
 
     fn test_envelope(id: u8) -> Vec<u8> {

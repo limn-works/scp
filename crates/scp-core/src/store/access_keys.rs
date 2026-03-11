@@ -155,7 +155,7 @@ mod tests {
     use crate::crypto::access_keys::generate_access_key;
 
     fn make_store() -> ProtocolStore<scp_platform::testing::InMemoryStorage> {
-        ProtocolStore::new(scp_platform::testing::InMemoryStorage::new())
+        ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new())
     }
 
     #[tokio::test]

@@ -40,6 +40,7 @@ use scp_identity::{
     DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
     NoOpRelayQuerier, ScpIdentity,
 };
+use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
@@ -499,10 +500,10 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            // Bind to &InMemoryStorage to resolve method ambiguity with the
+            // Bind to concrete type to resolve method ambiguity with the
             // Arc<T>: Storage blanket impl (issue #329).
             if let Ok(arc_storage) = crate::runtime::get_storage() {
-                let s: &InMemoryStorage = arc_storage.as_ref();
+                let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
                 s.store(&key, &data).await.map_err(|e| {
@@ -566,10 +567,10 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            // Bind to &InMemoryStorage to resolve method ambiguity with the
+            // Bind to concrete type to resolve method ambiguity with the
             // Arc<T>: Storage blanket impl (issue #329).
             if let Ok(arc_storage) = crate::runtime::get_storage() {
-                let s: &InMemoryStorage = arc_storage.as_ref();
+                let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
                 s.store(&key, &data).await.map_err(|e| {
@@ -640,9 +641,9 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
 
         rt.block_on(async {
             let key = identity_state_key(&did_owned);
-            // Bind to &InMemoryStorage to resolve method ambiguity with the
+            // Bind to concrete type to resolve method ambiguity with the
             // Arc<T>: Storage blanket impl (issue #329).
-            let s: &InMemoryStorage = arc_storage.as_ref();
+            let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
             let data = s
                 .retrieve(&key)
                 .await

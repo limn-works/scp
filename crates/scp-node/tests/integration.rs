@@ -101,7 +101,7 @@ async fn build_test_node() -> (
         }))
         .generate_identity_with(custody, Arc::new(did_dht))
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build()
+        .build_for_testing()
         .await
         .expect("ApplicationNode should build successfully");
 
@@ -478,7 +478,7 @@ async fn build_test_node_with_dev_api() -> (
         .generate_identity_with(custody, Arc::new(did_dht))
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
         .local_api(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build()
+        .build_for_testing()
         .await
         .expect("ApplicationNode with dev API should build successfully");
 

@@ -1062,7 +1062,7 @@ mod tests {
 
     /// Helper to create a test `ProtocolStore` with `InMemoryStorage`.
     fn test_store() -> Arc<ProtocolStore<scp_platform::testing::InMemoryStorage>> {
-        Arc::new(ProtocolStore::new(
+        Arc::new(ProtocolStore::new_for_testing(
             scp_platform::testing::InMemoryStorage::new(),
         ))
     }

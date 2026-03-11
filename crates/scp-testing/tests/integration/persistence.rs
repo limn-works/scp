@@ -47,7 +47,7 @@ use scp_platform::sqlite::SqliteStorage;
 
 /// Creates a `ProtocolStore` wrapping fresh `InMemoryStorage`.
 fn make_store() -> ProtocolStore<InMemoryStorage> {
-    ProtocolStore::new(InMemoryStorage::new())
+    ProtocolStore::new_for_testing(InMemoryStorage::new())
 }
 
 /// Creates a deterministic `BroadcastContextSnapshot` for testing.
@@ -858,7 +858,7 @@ persistence_tests!(filesystem, {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     let _ = Box::leak(Box::new(dir));
-    ProtocolStore::new(FilesystemStorage::new(&dir_path).unwrap())
+    ProtocolStore::new_for_testing(FilesystemStorage::new(&dir_path).unwrap())
 });
 
 // ---------------------------------------------------------------------------

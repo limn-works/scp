@@ -19,7 +19,7 @@ scp-transport = { path = "../scp-transport", features = [
     "postgres-blob",
     "s3-blob",
 ] }
-scp-platform = { path = "../scp-platform", features = ["testing", "sqlite", "file"] }
+scp-platform = { path = "../scp-platform", features = ["testing", "sqlite", "file", "encrypting"] }
 axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }
 instant-acme = "0.8"
@@ -55,6 +55,7 @@ x509-parser = "0.16"
 ed25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
+scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
@@ -63,6 +64,9 @@ rcgen = "0.14"
 tempfile = "3"
 
 [features]
+# Gates `ApplicationNodeBuilder::build_for_testing()` — accepts any `Storage`
+# backend without the `EncryptedStorage` bound. See issue #695.
+allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 quic = ["scp-transport/quic"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]
