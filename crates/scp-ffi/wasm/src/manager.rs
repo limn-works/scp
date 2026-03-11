@@ -125,7 +125,7 @@ pub enum WasmGovernanceAction {
     },
     ResetMember {
         did: String,
-        reason: Option<String>,
+        reason: String,
     },
     ResolveConflict {
         proposal_a: String,
@@ -135,6 +135,7 @@ pub enum WasmGovernanceAction {
     PromoteContext,
     RevokeWriteAccess {
         did: String,
+        scope: String,
     },
     RestoreWriteAccess {
         did: String,
@@ -148,9 +149,11 @@ pub enum WasmGovernanceAction {
     },
     BlockAuthor {
         did: String,
+        reason: Option<String>,
     },
     RevokeReadAccess {
         did: String,
+        scope: String,
     },
     RestoreReadAccess {
         did: String,
@@ -164,6 +167,27 @@ pub enum WasmGovernanceAction {
         purpose: String,
     },
     LockEconomicPolicy,
+}
+
+/// Validates a revocation scope string.
+///
+/// Core's `RevocationScope` has two variants: `Full` and `FutureOnly`.
+/// The WASM bridge accepts these as lowercase `snake_case` strings.
+///
+/// # Errors
+///
+/// Returns `ScpWasmError::Validation` if the string is not `"full"` or
+/// `"future_only"`.
+fn validate_revocation_scope(scope: &str) -> Result<&str, ScpWasmError> {
+    match scope {
+        "full" | "future_only" => Ok(scope),
+        _ => Err(ScpWasmError::Validation {
+            message: format!(
+                "invalid revocation scope '{scope}': expected 'full' or 'future_only'"
+            ),
+            code: "SCP-VALID-7100".to_owned(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,10 +1793,11 @@ impl WasmContextManager {
                 new_admin.clone_into(&mut ctx.creator_did);
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin}))
             }
-            WasmGovernanceAction::RevokeWriteAccess { did } => {
+            WasmGovernanceAction::RevokeWriteAccess { did, scope } => {
+                validate_revocation_scope(scope)?;
                 let ctx = self.require_active_context_mut(context_id)?;
                 ctx.write_revoked_members.insert(did.clone());
-                Ok(serde_json::json!({"action": "RevokeWriteAccess", "did": did}))
+                Ok(serde_json::json!({"action": "RevokeWriteAccess", "did": did, "scope": scope}))
             }
             WasmGovernanceAction::RestoreWriteAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1784,7 +1809,7 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "RestoreWriteAccess", "did": did}))
             }
-            WasmGovernanceAction::BlockAuthor { did } => {
+            WasmGovernanceAction::BlockAuthor { did, reason } => {
                 // CAC-008: BlockAuthor delegates to RevokeWriteAccess(Full).
                 // Destroy the author's broadcast key and mark write-revoked.
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1793,16 +1818,19 @@ impl WasmContextManager {
                 }
                 ctx.write_revoked_members.insert(did.clone());
                 ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
-                Ok(serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full"}))
+                Ok(
+                    serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full", "reason": reason}),
+                )
             }
-            WasmGovernanceAction::RevokeReadAccess { did } => {
+            WasmGovernanceAction::RevokeReadAccess { did, scope } => {
+                validate_revocation_scope(scope)?;
                 let ctx = self.require_active_context_mut(context_id)?;
                 ctx.read_revoked_members.insert(did.clone());
                 if let Some(bc) = ctx.broadcast.as_mut() {
                     bc.subscribers.remove(did);
                     bc.blocked_subscribers.insert(did.clone());
                 }
-                Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did}))
+                Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did, "scope": scope}))
             }
             WasmGovernanceAction::RestoreReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1959,7 +1987,7 @@ impl WasmContextManager {
                 ctx.tool_interfaces.push(interface_json.clone());
                 Ok(serde_json::json!({"action": "EstablishToolInterface"}))
             }
-            WasmGovernanceAction::ResetMember { did, .. } => {
+            WasmGovernanceAction::ResetMember { did, reason } => {
                 let ctx = self.require_active_context_mut(context_id)?;
                 if !ctx.members.contains_key(did) {
                     return Err(ScpWasmError::Context {
@@ -1981,7 +2009,7 @@ impl WasmContextManager {
                         sequence_number: 0,
                     },
                 );
-                Ok(serde_json::json!({"action": "ResetMember", "did": did}))
+                Ok(serde_json::json!({"action": "ResetMember", "did": did, "reason": reason}))
             }
             WasmGovernanceAction::ResolveConflict {
                 proposal_a,
@@ -3199,7 +3227,7 @@ mod tests {
     fn serde_roundtrip_reset_member() {
         roundtrip(&WasmGovernanceAction::ResetMember {
             did: "did:dht:z123".to_owned(),
-            reason: Some("stale state".to_owned()),
+            reason: "stale state".to_owned(),
         });
     }
 
@@ -3221,6 +3249,7 @@ mod tests {
     fn serde_roundtrip_revoke_write_access() {
         roundtrip(&WasmGovernanceAction::RevokeWriteAccess {
             did: "did:dht:z123".to_owned(),
+            scope: "full".to_owned(),
         });
     }
 
@@ -3250,6 +3279,7 @@ mod tests {
     fn serde_roundtrip_block_author() {
         roundtrip(&WasmGovernanceAction::BlockAuthor {
             did: "did:dht:zauthor".to_owned(),
+            reason: Some("spam".to_owned()),
         });
     }
 
@@ -3257,6 +3287,7 @@ mod tests {
     fn serde_roundtrip_revoke_read_access() {
         roundtrip(&WasmGovernanceAction::RevokeReadAccess {
             did: "did:dht:z123".to_owned(),
+            scope: "future_only".to_owned(),
         });
     }
 
@@ -3339,7 +3370,7 @@ mod tests {
             },
             WasmGovernanceAction::ResetMember {
                 did: "d".into(),
-                reason: None,
+                reason: "stale".into(),
             },
             WasmGovernanceAction::ResolveConflict {
                 proposal_a: "a".into(),
@@ -3347,15 +3378,24 @@ mod tests {
                 resolution: "c".into(),
             },
             WasmGovernanceAction::PromoteContext,
-            WasmGovernanceAction::RevokeWriteAccess { did: "d".into() },
+            WasmGovernanceAction::RevokeWriteAccess {
+                did: "d".into(),
+                scope: "full".into(),
+            },
             WasmGovernanceAction::RestoreWriteAccess { did: "d".into() },
             WasmGovernanceAction::RotateContentKeys { reason: None },
             WasmGovernanceAction::ReconfigureGovernance {
                 changes_json: "[]".into(),
                 justification: "j".into(),
             },
-            WasmGovernanceAction::BlockAuthor { did: "d".into() },
-            WasmGovernanceAction::RevokeReadAccess { did: "d".into() },
+            WasmGovernanceAction::BlockAuthor {
+                did: "d".into(),
+                reason: None,
+            },
+            WasmGovernanceAction::RevokeReadAccess {
+                did: "d".into(),
+                scope: "future_only".into(),
+            },
             WasmGovernanceAction::RestoreReadAccess { did: "d".into() },
             WasmGovernanceAction::SetEconomicPolicy {
                 policy_json: "{}".into(),
