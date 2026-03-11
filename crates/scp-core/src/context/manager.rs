@@ -584,6 +584,86 @@ fn create_governance_engine(
     }
 }
 
+/// Restores the [`EpochGraceStore`](crate::crypto::mls::epoch_grace::EpochGraceStore)
+/// from persisted snapshot entries, applying the §23.11 inconsistency
+/// detection and fallback steps.
+///
+/// Returns the (possibly empty) grace store and a flag indicating whether
+/// the context needs to re-enter the reconnection protocol (§23.3).
+fn restore_grace_store_from_snapshot(
+    context_id: &str,
+    snapshot: &ContextSnapshot,
+) -> (crate::crypto::mls::epoch_grace::EpochGraceStore, bool) {
+    let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
+    let mut needs_reconnect = snapshot.needs_reconnect;
+
+    if !snapshot.grace_entries.is_empty() {
+        // Inconsistency detection (§23.11): if any grace entry references
+        // an epoch newer than the persisted MLS epoch, a partial write
+        // escaped the transaction boundary.
+        let has_inconsistency = snapshot
+            .grace_entries
+            .iter()
+            .any(|entry| entry.epoch > snapshot.mls_epoch);
+
+        if has_inconsistency {
+            // §23.11 inconsistent state fallback:
+            // Step 1: Discard all grace entries (grace store stays empty).
+            // Step 2: Destroy old epoch key material (OpenMLS manages
+            //         actual keys; empty grace store prevents SCP-layer
+            //         decrypt attempts for old epochs).
+            // Step 3: Mark context for reconnection (§23.3). Network I/O
+            //         is not available during restore_context; the flag
+            //         triggers reconnection when message processing begins.
+            // Step 4: Log the inconsistency for the application layer.
+            needs_reconnect = true;
+            let inconsistency = crate::sync::SyncError::EpochGraceStoreInconsistency {
+                context_id: context_id.into(),
+                reason: format!(
+                    "grace entry references epoch newer than persisted MLS epoch {}",
+                    snapshot.mls_epoch,
+                ),
+            };
+            tracing::warn!(
+                context_id = %context_id,
+                mls_epoch = snapshot.mls_epoch,
+                error = %inconsistency,
+                "epoch grace store inconsistency detected during restore; \
+                 discarding all grace entries and marking context for \
+                 reconnection (§23.11 fallback steps 1-4)"
+            );
+            // Grace store stays empty — all old epoch keys are effectively
+            // destroyed (forward secrecy). Messages encrypted under lost
+            // epochs are unrecoverable, matching the §23.11 fallback.
+        } else {
+            // Normal restore path: feed persisted entries into the grace
+            // store. Entries that expired during downtime are returned in
+            // the `expired` vec — the caller should destroy any cached
+            // key material for those epochs.
+            match grace_store.restore_from_entries(&snapshot.grace_entries) {
+                Ok(_expired) => {
+                    // Expired epochs' key material is already gone (OpenMLS
+                    // manages key lifecycle internally). The grace store now
+                    // reflects the surviving entries.
+                }
+                Err(clock_err) => {
+                    // Clock error during restore — fall back to empty grace
+                    // store (conservative: forward secrecy over recovery).
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %clock_err,
+                        "clock error during grace store restore; \
+                         discarding all grace entries (forward secrecy prioritized)"
+                    );
+                    grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
+                }
+            }
+        }
+    }
+
+    (grace_store, needs_reconnect)
+}
+
 /// Reconstructs a governance engine from a persisted [`GovernanceModelConfig`]
 /// and the context's current member set.
 ///
@@ -1232,75 +1312,8 @@ impl ContextManager {
 
         // Restore the epoch grace store from persisted entries (§23.11
         // recovery-on-startup).
-        let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
-        // §23.11 inconsistent state fallback step 3: if grace store
-        // inconsistency was detected (either now or during a previous
-        // restore), the context needs to re-enter the reconnection
-        // protocol (§23.3) before processing new messages.
-        let mut needs_reconnect = ctx_snapshot.needs_reconnect;
-        if !ctx_snapshot.grace_entries.is_empty() {
-            // Inconsistency detection (§23.11): if any grace entry references
-            // an epoch newer than the persisted MLS epoch, a partial write
-            // escaped the transaction boundary.
-            let has_inconsistency = ctx_snapshot
-                .grace_entries
-                .iter()
-                .any(|entry| entry.epoch > ctx_snapshot.mls_epoch);
-
-            if has_inconsistency {
-                // §23.11 inconsistent state fallback:
-                // Step 1: Discard all grace entries (grace store stays empty).
-                // Step 2: Destroy old epoch key material (OpenMLS manages
-                //         actual keys; empty grace store prevents SCP-layer
-                //         decrypt attempts for old epochs).
-                // Step 3: Mark context for reconnection (§23.3). Network I/O
-                //         is not available during restore_context; the flag
-                //         triggers reconnection when message processing begins.
-                // Step 4: Log the inconsistency for the application layer.
-                needs_reconnect = true;
-                let inconsistency = crate::sync::SyncError::EpochGraceStoreInconsistency {
-                    context_id: context_id.into(),
-                    reason: format!(
-                        "grace entry references epoch newer than persisted MLS epoch {}",
-                        ctx_snapshot.mls_epoch,
-                    ),
-                };
-                tracing::warn!(
-                    context_id = %context_id,
-                    mls_epoch = ctx_snapshot.mls_epoch,
-                    error = %inconsistency,
-                    "epoch grace store inconsistency detected during restore; \
-                     discarding all grace entries and marking context for \
-                     reconnection (§23.11 fallback steps 1-4)"
-                );
-                // Grace store stays empty — all old epoch keys are effectively
-                // destroyed (forward secrecy). Messages encrypted under lost
-                // epochs are unrecoverable, matching the §23.11 fallback.
-            } else {
-                // Normal restore path: feed persisted entries into the grace
-                // store. Entries that expired during downtime are returned in
-                // the `expired` vec — the caller should destroy any cached
-                // key material for those epochs.
-                match grace_store.restore_from_entries(&ctx_snapshot.grace_entries) {
-                    Ok(_expired) => {
-                        // Expired epochs' key material is already gone (OpenMLS
-                        // manages key lifecycle internally). The grace store now
-                        // reflects the surviving entries.
-                    }
-                    Err(clock_err) => {
-                        // Clock error during restore — fall back to empty grace
-                        // store (conservative: forward secrecy over recovery).
-                        tracing::warn!(
-                            context_id = %context_id,
-                            error = %clock_err,
-                            "clock error during grace store restore; \
-                             discarding all grace entries (forward secrecy prioritized)"
-                        );
-                        grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
-                    }
-                }
-            }
-        }
+        let (grace_store, needs_reconnect) =
+            restore_grace_store_from_snapshot(context_id, &ctx_snapshot);
 
         // Restore MLS crypto state from the persisted snapshot (#645).
         // This must happen before constructing PerContextState so the crypto
