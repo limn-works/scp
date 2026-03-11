@@ -156,10 +156,7 @@ pub trait EventLogPersistence: Send + Sync {
 
     /// Loads previously persisted event log entries for a context.
     ///
-    /// Loads per-entry keys by prefix scan. Falls back to the legacy
-    /// single-blob format (`merkle_event_log/entries`) for backward
-    /// compatibility with pre-#710 data.
-    ///
+    /// Loads per-entry keys by prefix scan.
     /// Returns `None` if no entries have been persisted.
     ///
     /// # Errors
