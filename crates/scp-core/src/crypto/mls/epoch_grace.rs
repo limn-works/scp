@@ -1,4 +1,4 @@
-//! In-memory epoch grace window store for SCP MLS ratcheting.
+//! Epoch grace window store for SCP MLS ratcheting.
 //!
 //! When a group advances to a new epoch via a Commit, the old epoch's key
 //! material must be retained briefly so that in-flight messages encrypted under
@@ -10,7 +10,10 @@
 //! - **Duration:** The shorter of (a) all members have sent a message in the
 //!   new epoch, or (b) 30 seconds from local Commit processing time. The
 //!   30-second hard ceiling is **not** configurable.
-//! - **Storage:** In-memory only, never persisted to disk.
+//! - **Storage:** Persisted transactionally with MLS group state under
+//!   `context/{context_id}/grace/{epoch:020d}` in `ProtocolStore` (§23.11).
+//!   The in-memory store is the authoritative runtime cache; persisted entries
+//!   are loaded on recovery and used to restore the grace store after crashes.
 //! - **Indexing:** By epoch number.
 //! - **Isolation:** Only `decrypt()` with a matching epoch number may access
 //!   the grace store. No other code path should reach it.
@@ -58,7 +61,9 @@
 //! a slice of expired epoch numbers.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 /// Callback type invoked when epochs are expired or evicted from the grace store.
@@ -73,11 +78,32 @@ use tokio::time::Instant;
 /// key deletion operations if needed.
 pub type OnEpochExpired = Box<dyn FnMut(&[u64])>;
 
+/// A persistable grace window entry for crash recovery (§23.11).
+///
+/// This struct is serialized to `ProtocolStore` under
+/// `context/{context_id}/grace/{epoch:020d}` and loaded on startup to restore
+/// the [`EpochGraceStore`] after crashes. The `expires_at_unix_secs` field
+/// records the absolute wall-clock expiration time so that recovery can compare
+/// against `now` to determine whether the grace period has elapsed during
+/// downtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraceEntry {
+    /// The epoch number this grace entry covers.
+    pub epoch: u64,
+    /// Absolute expiration time as Unix seconds.
+    ///
+    /// On recovery, compare against `now` — if `now >= expires_at_unix_secs`,
+    /// the entry has expired and the old epoch keys MUST be destroyed
+    /// (forward secrecy). If `now < expires_at_unix_secs`, retain the keys
+    /// and restart the grace timer from this timestamp.
+    pub expires_at_unix_secs: u64,
+}
+
 /// Hard ceiling for the epoch grace window: 30 seconds.
 ///
 /// This bounds the forward secrecy window. It is intentionally not
 /// configurable — see ADR-001 criterion 6.
-const GRACE_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+const GRACE_WINDOW_DURATION: Duration = Duration::from_secs(30);
 
 /// Maximum number of epochs the grace store will track simultaneously.
 ///
@@ -297,6 +323,75 @@ impl EpochGraceStore {
     pub const fn max_capacity(&self) -> usize {
         self.max_capacity
     }
+
+    // -------------------------------------------------------------------
+    // Persistence support (§23.11)
+    // -------------------------------------------------------------------
+
+    /// Converts the current in-memory state to a list of persistable
+    /// [`GraceEntry`] values.
+    ///
+    /// Each entry's `expires_at_unix_secs` is computed by adding the remaining
+    /// grace duration (from `Instant::now()`) to the current wall-clock time.
+    /// Epochs whose grace window has already expired are excluded.
+    ///
+    /// Used by the transactional write path: after `process_commit` adds the
+    /// old epoch, the caller serializes the returned entries alongside the
+    /// new MLS group state in a single storage transaction (§23.11 step 2).
+    #[must_use]
+    pub fn to_grace_entries(&self) -> Vec<GraceEntry> {
+        let now_instant = Instant::now();
+        let now_unix = unix_now_secs();
+        self.epochs
+            .iter()
+            .filter_map(|(&epoch, &deadline)| {
+                if now_instant >= deadline {
+                    // Already expired — do not persist.
+                    return None;
+                }
+                let remaining = deadline.duration_since(now_instant);
+                Some(GraceEntry {
+                    epoch,
+                    expires_at_unix_secs: now_unix.saturating_add(remaining.as_secs()),
+                })
+            })
+            .collect()
+    }
+
+    /// Restores the grace store from persisted [`GraceEntry`] values
+    /// loaded on startup (§23.11 recovery-on-startup).
+    ///
+    /// For each entry:
+    /// - If the grace period has expired (current time >= `expires_at_unix_secs`),
+    ///   the entry is added to the returned `expired` vec. The caller MUST
+    ///   destroy any cached key material for these epochs and delete the
+    ///   persisted entry.
+    /// - If the grace period has NOT expired, the entry is inserted into
+    ///   the in-memory store with a deadline computed from the remaining
+    ///   wall-clock time. This ensures the total grace window duration is
+    ///   preserved regardless of crash timing.
+    ///
+    /// Returns the list of expired epoch numbers.
+    pub fn restore_from_entries(&mut self, entries: &[GraceEntry]) -> Vec<u64> {
+        let now_unix = unix_now_secs();
+        let now_instant = Instant::now();
+        let mut expired = Vec::new();
+
+        for entry in entries {
+            if now_unix >= entry.expires_at_unix_secs {
+                // Grace period expired during downtime — forward secrecy
+                // requires immediate destruction.
+                expired.push(entry.epoch);
+            } else {
+                let remaining_secs = entry.expires_at_unix_secs.saturating_sub(now_unix);
+                let deadline = now_instant + Duration::from_secs(remaining_secs);
+                // Only insert if not already present (idempotent restore).
+                self.epochs.entry(entry.epoch).or_insert(deadline);
+            }
+        }
+
+        expired
+    }
 }
 
 impl Default for EpochGraceStore {
@@ -319,6 +414,17 @@ pub struct StaleEpochMessage {
     pub sender_did: String,
     /// The epoch number the message was encrypted under.
     pub epoch: u64,
+}
+
+/// Returns the current wall-clock time as Unix seconds.
+///
+/// Used by persistence methods to convert between `tokio::time::Instant`
+/// (monotonic, not persitable) and absolute timestamps that survive restarts.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -700,5 +806,183 @@ mod tests {
         assert!(!expired.contains(&2), "epoch 2 should not be evicted");
         assert!(store.is_in_grace(2));
         assert!(store.is_in_grace(3));
+    }
+
+    // -------------------------------------------------------------------
+    // GraceEntry persistence tests (§23.11)
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn grace_entry_serialization_roundtrip() {
+        let entry = GraceEntry {
+            epoch: 42,
+            expires_at_unix_secs: 1_700_000_000,
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let decoded: GraceEntry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn to_grace_entries_excludes_expired_epochs() {
+        let mut store = EpochGraceStore::new();
+        // Insert a live epoch.
+        store.add_epoch(5);
+        // Insert an expired epoch.
+        store
+            .epochs
+            .insert(3, Instant::now() - Duration::from_secs(1));
+
+        let entries = store.to_grace_entries();
+        let epochs: Vec<u64> = entries.iter().map(|e| e.epoch).collect();
+        assert!(epochs.contains(&5), "live epoch should be included");
+        assert!(
+            !epochs.contains(&3),
+            "expired epoch should be excluded from persistence"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn to_grace_entries_captures_expiration_timestamp() {
+        let mut store = EpochGraceStore::new();
+        store.add_epoch(10);
+
+        let entries = store.to_grace_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].epoch, 10);
+        // The expiration should be roughly now + 30s.
+        let now = unix_now_secs();
+        let diff = entries[0].expires_at_unix_secs.saturating_sub(now);
+        assert!(
+            diff <= 31,
+            "expiration should be ~30s from now, got {diff}s"
+        );
+        assert!(
+            diff >= 28,
+            "expiration should be ~30s from now, got {diff}s"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restore_from_entries_retains_live_entries() {
+        let mut store = EpochGraceStore::new();
+        let now = unix_now_secs();
+
+        let entries = vec![GraceEntry {
+            epoch: 7,
+            expires_at_unix_secs: now + 20,
+        }];
+
+        let expired = store.restore_from_entries(&entries);
+        assert!(expired.is_empty(), "entry should still be live");
+        assert!(store.is_in_grace(7));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restore_from_entries_expires_old_entries() {
+        let mut store = EpochGraceStore::new();
+        let now = unix_now_secs();
+
+        let entries = vec![GraceEntry {
+            epoch: 3,
+            // Expired 10 seconds ago.
+            expires_at_unix_secs: now.saturating_sub(10),
+        }];
+
+        let expired = store.restore_from_entries(&entries);
+        assert_eq!(expired, vec![3]);
+        assert!(!store.is_in_grace(3));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restore_from_entries_mixed_live_and_expired() {
+        let mut store = EpochGraceStore::new();
+        let now = unix_now_secs();
+
+        let entries = vec![
+            GraceEntry {
+                epoch: 1,
+                expires_at_unix_secs: now.saturating_sub(5),
+            },
+            GraceEntry {
+                epoch: 2,
+                expires_at_unix_secs: now + 15,
+            },
+            GraceEntry {
+                epoch: 3,
+                expires_at_unix_secs: now.saturating_sub(1),
+            },
+            GraceEntry {
+                epoch: 4,
+                expires_at_unix_secs: now + 25,
+            },
+        ];
+
+        let expired = store.restore_from_entries(&entries);
+        assert_eq!(expired.len(), 2);
+        assert!(expired.contains(&1));
+        assert!(expired.contains(&3));
+        assert_eq!(store.len(), 2);
+        assert!(store.is_in_grace(2));
+        assert!(store.is_in_grace(4));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restore_is_idempotent() {
+        let mut store = EpochGraceStore::new();
+        let now = unix_now_secs();
+
+        let entries = vec![GraceEntry {
+            epoch: 5,
+            expires_at_unix_secs: now + 20,
+        }];
+
+        let expired1 = store.restore_from_entries(&entries);
+        assert!(expired1.is_empty());
+        assert_eq!(store.len(), 1);
+
+        // Restoring again should not duplicate.
+        let expired2 = store.restore_from_entries(&entries);
+        assert!(expired2.is_empty());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn to_grace_entries_empty_store_returns_empty() {
+        let store = EpochGraceStore::new();
+        let entries = store.to_grace_entries();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn roundtrip_persist_and_restore() {
+        // Simulate: add epochs -> persist -> crash -> restore.
+        let mut store = EpochGraceStore::new();
+        store.add_epoch(10);
+        store.add_epoch(11);
+        store.add_epoch(12);
+
+        let entries = store.to_grace_entries();
+        assert_eq!(entries.len(), 3);
+
+        // Simulate crash: new empty store.
+        let mut recovered = EpochGraceStore::new();
+        let expired = recovered.restore_from_entries(&entries);
+        assert!(expired.is_empty(), "all entries should still be live");
+        assert_eq!(recovered.len(), 3);
+        assert!(recovered.is_in_grace(10));
+        assert!(recovered.is_in_grace(11));
+        assert!(recovered.is_in_grace(12));
     }
 }
