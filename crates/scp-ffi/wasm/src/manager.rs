@@ -3436,22 +3436,24 @@ mod tests {
         let err = mgr
             .dispatch_resolve_conflict("ctx-1", "prop-a", "prop-b", "bogus-value")
             .unwrap_err();
-        match err {
-            ScpWasmError::Permission {
-                ref message,
-                ref code,
-            } => {
-                assert!(
-                    message.contains("invalid resolution"),
-                    "unexpected message: {message}"
-                );
-                assert!(
-                    message.contains("bogus-value"),
-                    "message should include the bad value: {message}"
-                );
-                assert_eq!(code, "SCP-PERM-3000");
-            }
-            ref other => panic!("expected Permission error, got: {other:?}"),
+        assert!(
+            matches!(err, ScpWasmError::Permission { .. }),
+            "expected Permission error, got: {err:?}"
+        );
+        if let ScpWasmError::Permission {
+            ref message,
+            ref code,
+        } = err
+        {
+            assert!(
+                message.contains("invalid resolution"),
+                "unexpected message: {message}"
+            );
+            assert!(
+                message.contains("bogus-value"),
+                "message should include the bad value: {message}"
+            );
+            assert_eq!(code, "SCP-PERM-3000");
         }
     }
 }
