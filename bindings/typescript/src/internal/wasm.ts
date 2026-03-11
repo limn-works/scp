@@ -402,10 +402,7 @@ export function createWasmBridge(): Bridge {
       const agentVm = verificationMethods.find((vm) => vm.id.endsWith("#agent"));
       return {
         id: doc.id,
-        verificationMethods: safeJsonParse(
-          doc.verificationMethodsJson,
-          "identity_resolve",
-        ) as DIDDocument["verificationMethods"],
+        verificationMethods: verificationMethods as DIDDocument["verificationMethods"],
         authentication: safeJsonParse(
           doc.authenticationJson,
           "identity_resolve",
