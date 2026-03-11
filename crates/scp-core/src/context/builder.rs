@@ -420,6 +420,25 @@ pub trait ContextEventLogProvider: Send + Sync {
             "merkle root not supported by this provider".into(),
         ))
     }
+
+    // -- Persistence for process restart recovery (#636) --------------------
+
+    /// Restores the event log for a context from persistent storage.
+    ///
+    /// Called during [`ContextManager::restore_context`] to reload event log
+    /// entries that were persisted before the process restarted.
+    ///
+    /// The default implementation initializes an empty event log (no-op for
+    /// providers without persistence support).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if the persisted data is corrupt
+    /// (e.g., broken Merkle chain).
+    fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // Default: initialize empty event log (no persistence).
+        self.init_event_log(context_id)
+    }
 }
 
 // ---------------------------------------------------------------------------

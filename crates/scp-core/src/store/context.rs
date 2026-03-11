@@ -1015,6 +1015,80 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
 }
 
 // ---------------------------------------------------------------------------
+// ProtocolStoreEventLogPersistence — event log bridge (#636)
+// ---------------------------------------------------------------------------
+
+/// Canonical bridge from [`EventLogPersistence`] (synchronous) to the async
+/// `ProtocolStore` event log methods.
+///
+/// Wraps `Arc<ProtocolStore<S>>` and implements the synchronous
+/// [`EventLogPersistence`] trait by blocking on async methods via
+/// `tokio::task::block_in_place` + `Handle::block_on`.
+///
+/// See GitHub issue #636.
+pub struct ProtocolStoreEventLogPersistence<S: Storage> {
+    store: std::sync::Arc<ProtocolStore<S>>,
+}
+
+impl<S: Storage> ProtocolStoreEventLogPersistence<S> {
+    /// Creates a new bridge wrapping the given `ProtocolStore`.
+    pub const fn new(store: std::sync::Arc<ProtocolStore<S>>) -> Self {
+        Self { store }
+    }
+}
+
+impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
+    for ProtocolStoreEventLogPersistence<S>
+{
+    fn persist_entries(
+        &self,
+        context_id: &str,
+        entries: &[crate::context::providers::event_log::EventLogEntry],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let entries_owned = entries.to_vec();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                store
+                    .store_merkle_event_log_entries(&ctx_id, &entries_owned)
+                    .await
+            })
+        })?;
+        Ok(())
+    }
+
+    fn load_entries(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<Vec<crate::context::providers::event_log::EventLogEntry>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.load_merkle_event_log_entries(&ctx_id).await })
+        })?;
+        Ok(result)
+    }
+
+    fn delete_entries(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { store.delete_merkle_event_log_entries(&ctx_id).await })
+        })?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1770,6 +1844,52 @@ mod tests {
         fn assert_object_safe(_: &dyn crate::context::manager::ContextPersistence) {}
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolStorePersistence::new(store);
+        assert_object_safe(&bridge);
+    }
+
+    // -------------------------------------------------------------------
+    // ProtocolStoreEventLogPersistence bridge (#636)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn event_log_persistence_bridge_roundtrip() {
+        use crate::context::providers::event_log::{EventLogEntry, EventLogPersistence};
+
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStoreEventLogPersistence::new(store);
+
+        let entries = vec![
+            EventLogEntry {
+                event: "ContextCreated".to_owned(),
+                timestamp: 1_700_000_000,
+                prev_hash: [0u8; 32],
+                hash: [1u8; 32],
+            },
+            EventLogEntry {
+                event: "MemberJoined".to_owned(),
+                timestamp: 1_700_000_001,
+                prev_hash: [1u8; 32],
+                hash: [2u8; 32],
+            },
+        ];
+
+        bridge.persist_entries("ctx-bridge-el", &entries).unwrap();
+
+        let loaded = bridge.load_entries("ctx-bridge-el").unwrap().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].event, "ContextCreated");
+        assert_eq!(loaded[1].event, "MemberJoined");
+
+        bridge.delete_entries("ctx-bridge-el").unwrap();
+        assert!(bridge.load_entries("ctx-bridge-el").unwrap().is_none());
+    }
+
+    #[allow(dead_code)]
+    fn event_log_persistence_bridge_is_object_safe() {
+        // Compile-time dyn-compatibility check.
+        fn assert_object_safe(_: &dyn crate::context::providers::event_log::EventLogPersistence) {}
+        let store = std::sync::Arc::new(make_store());
+        let bridge = super::ProtocolStoreEventLogPersistence::new(store);
         assert_object_safe(&bridge);
     }
 
