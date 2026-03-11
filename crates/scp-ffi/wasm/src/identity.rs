@@ -741,6 +741,119 @@ pub fn identity_create(custody: String) -> Promise {
     })
 }
 
+/// Resolved DID document fields returned by [`resolve_did_document_fields`].
+///
+/// Each field is a JSON-serialized string matching the shape consumed by
+/// [`WasmDIDDocument::from_fields`]. The `_json` suffix mirrors
+/// [`WasmDIDDocument`]'s field naming convention.
+#[allow(clippy::struct_field_names)]
+struct ResolvedDocumentFields {
+    verification_methods_json: String,
+    services_json: String,
+    also_known_as_json: String,
+    authentication_json: String,
+    assertion_methods_json: String,
+}
+
+/// Builds the DID document fields for a locally-known identity.
+///
+/// Pure logic extracted from [`identity_resolve`] so it can be tested without
+/// `wasm_bindgen` / `Promise` / `JsValue` dependencies.
+///
+/// Reads from `IDENTITY_REGISTRY` and `MIGRATION_LINKS` thread-local state.
+fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
+    // Look up public key bytes from the local identity registry.
+    // Only extract public keys — never clone private key material
+    // out of the registry. Derive agent public key inside the closure.
+    let key_info = IDENTITY_REGISTRY.with(|reg| {
+        let map = reg.borrow();
+        map.get(did).map(|entry| {
+            let agent_pub_bytes = entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                sk.verifying_key().to_bytes()
+            });
+            (entry.public_key_bytes, agent_pub_bytes)
+        })
+    });
+
+    let (verification_methods_json, authentication_json, assertion_methods_json) = key_info
+        .map_or_else(
+            || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
+            |(pub_bytes, agent_pub_bytes)| {
+                // Build verification methods for ALL keys in the identity
+                // per ADR-039: #0 (Identity Key), #active (Active Signing
+                // Key), and optionally #agent (Agent Signing Key).
+                let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+
+                // #0 — Identity Key (DID-deriving key, never rotates).
+                let mut vms = vec![serde_json::json!({
+                    "id": format!("{did}#0"),
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": did,
+                    "publicKeyMultibase": identity_multibase,
+                })];
+
+                // #active — Active Signing Key (Human Signing Key). In the
+                // WASM bridge's simplified key model, the active signing key
+                // uses the same keypair as the identity key. Authentication
+                // and assertionMethod reference #active (not #0), matching
+                // the scp-core DidDocument pattern.
+                vms.push(serde_json::json!({
+                    "id": format!("{did}#active"),
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": did,
+                    "publicKeyMultibase": identity_multibase,
+                }));
+
+                let mut auth = vec![serde_json::json!(format!("{did}#active"))];
+                let mut assertion = vec![serde_json::json!(format!("{did}#active"))];
+
+                // #agent — Agent Signing Key (ADR-039), included when present.
+                if let Some(agent_bytes) = agent_pub_bytes {
+                    let agent_multibase = format!("z{}", zbase32_encode(&agent_bytes));
+                    vms.push(serde_json::json!({
+                        "id": format!("{did}#agent"),
+                        "type": "Ed25519VerificationKey2020",
+                        "controller": did,
+                        "publicKeyMultibase": agent_multibase,
+                    }));
+                    auth.push(serde_json::json!(format!("{did}#agent")));
+                    assertion.push(serde_json::json!(format!("{did}#agent")));
+                }
+
+                let vm_json = serde_json::Value::Array(vms);
+                let auth_json = serde_json::Value::Array(auth);
+                let assertion_json = serde_json::Value::Array(assertion);
+                (
+                    serde_json::to_string(&vm_json).unwrap_or_else(|_| "[]".to_owned()),
+                    serde_json::to_string(&auth_json).unwrap_or_else(|_| "[]".to_owned()),
+                    serde_json::to_string(&assertion_json).unwrap_or_else(|_| "[]".to_owned()),
+                )
+            },
+        );
+
+    // Populate alsoKnownAs from MIGRATION_LINKS — after identity_migrate
+    // or identity_rotate_key, the new DID maps to the old DID (#540).
+    let also_known_as_json = MIGRATION_LINKS.with(|links| {
+        let map = links.borrow();
+        map.get(did).map_or_else(
+            || "[]".to_owned(),
+            |old_did| {
+                let arr = serde_json::Value::Array(vec![serde_json::json!(old_did)]);
+                serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned())
+            },
+        )
+    });
+
+    ResolvedDocumentFields {
+        verification_methods_json,
+        services_json: "[]".to_owned(),
+        also_known_as_json,
+        authentication_json,
+        assertion_methods_json,
+    }
+}
+
 /// Resolves a DID to its DID Document.
 ///
 /// For locally-created identities, returns a DID document with the Ed25519
@@ -773,96 +886,15 @@ pub fn identity_resolve(did: String) -> Promise {
             .into());
         }
 
-        // Look up public key bytes from the local identity registry.
-        // Only extract public keys — never clone private key material
-        // out of the registry. Derive agent public key inside the closure.
-        let key_info = IDENTITY_REGISTRY.with(|reg| {
-            let map = reg.borrow();
-            map.get(&did).map(|entry| {
-                let agent_pub_bytes = entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
-                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                    sk.verifying_key().to_bytes()
-                });
-                (entry.public_key_bytes, agent_pub_bytes)
-            })
-        });
-
-        let (verification_methods_json, authentication_json, assertion_methods_json) = key_info
-            .map_or_else(
-                || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
-                |(pub_bytes, agent_pub_bytes)| {
-                    // Build verification methods for ALL keys in the identity
-                    // per ADR-039: #0 (Identity Key), #active (Active Signing
-                    // Key), and optionally #agent (Agent Signing Key).
-                    let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
-
-                    // #0 — Identity Key (DID-deriving key, never rotates).
-                    let mut vms = vec![serde_json::json!({
-                        "id": format!("{did}#0"),
-                        "type": "Ed25519VerificationKey2020",
-                        "controller": did,
-                        "publicKeyMultibase": identity_multibase,
-                    })];
-
-                    // #active — Active Signing Key (Human Signing Key). In the
-                    // WASM bridge's simplified key model, the active signing key
-                    // uses the same keypair as the identity key. Authentication
-                    // and assertionMethod reference #active (not #0), matching
-                    // the scp-core DidDocument pattern.
-                    vms.push(serde_json::json!({
-                        "id": format!("{did}#active"),
-                        "type": "Ed25519VerificationKey2020",
-                        "controller": did,
-                        "publicKeyMultibase": identity_multibase,
-                    }));
-
-                    let mut auth = vec![serde_json::json!(format!("{did}#active"))];
-                    let mut assertion = vec![serde_json::json!(format!("{did}#active"))];
-
-                    // #agent — Agent Signing Key (ADR-039), included when present.
-                    if let Some(agent_bytes) = agent_pub_bytes {
-                        let agent_multibase = format!("z{}", zbase32_encode(&agent_bytes));
-                        vms.push(serde_json::json!({
-                            "id": format!("{did}#agent"),
-                            "type": "Ed25519VerificationKey2020",
-                            "controller": did,
-                            "publicKeyMultibase": agent_multibase,
-                        }));
-                        auth.push(serde_json::json!(format!("{did}#agent")));
-                        assertion.push(serde_json::json!(format!("{did}#agent")));
-                    }
-
-                    let vm_json = serde_json::Value::Array(vms);
-                    let auth_json = serde_json::Value::Array(auth);
-                    let assertion_json = serde_json::Value::Array(assertion);
-                    (
-                        serde_json::to_string(&vm_json).unwrap_or_else(|_| "[]".to_owned()),
-                        serde_json::to_string(&auth_json).unwrap_or_else(|_| "[]".to_owned()),
-                        serde_json::to_string(&assertion_json).unwrap_or_else(|_| "[]".to_owned()),
-                    )
-                },
-            );
-
-        // Populate alsoKnownAs from MIGRATION_LINKS — after identity_migrate
-        // or identity_rotate_key, the new DID maps to the old DID (#540).
-        let also_known_as_json = MIGRATION_LINKS.with(|links| {
-            let map = links.borrow();
-            map.get(&did).map_or_else(
-                || "[]".to_owned(),
-                |old_did| {
-                    let arr = serde_json::Value::Array(vec![serde_json::json!(old_did)]);
-                    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned())
-                },
-            )
-        });
+        let fields = resolve_did_document_fields(&did);
 
         Ok(JsValue::from(WasmDIDDocument::from_fields(
             did,
-            verification_methods_json,
-            "[]".to_owned(),
-            also_known_as_json,
-            authentication_json,
-            assertion_methods_json,
+            fields.verification_methods_json,
+            fields.services_json,
+            fields.also_known_as_json,
+            fields.authentication_json,
+            fields.assertion_methods_json,
         )))
     })
 }
@@ -1422,4 +1454,215 @@ pub fn identity_load(did: String) -> Promise {
             agent_public_key_multibase: agent_pub_multibase,
         }))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Helper: generate an Ed25519 keypair and register it in `IDENTITY_REGISTRY`.
+    /// Returns `(did, public_key_bytes)`.
+    fn register_identity() -> (String, [u8; 32]) {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    public_key_bytes: pub_bytes,
+                    custody_type: "in_memory".to_owned(),
+                    agent_signing_key_bytes: None,
+                },
+            );
+        });
+        (did, pub_bytes)
+    }
+
+    /// Helper: generate an Ed25519 keypair and register it with an agent key
+    /// in `IDENTITY_REGISTRY`. Returns `(did, identity_pub_bytes, agent_pub_bytes)`.
+    fn register_identity_with_agent() -> (String, [u8; 32], [u8; 32]) {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let agent_pub_bytes = agent_key.verifying_key().to_bytes();
+
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    public_key_bytes: pub_bytes,
+                    custody_type: "in_memory".to_owned(),
+                    agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                },
+            );
+        });
+        (did, pub_bytes, agent_pub_bytes)
+    }
+
+    /// Helper: clean up thread-local state after each test to avoid cross-test
+    /// pollution (thread-local state persists across tests in the same thread).
+    fn cleanup_registries() {
+        IDENTITY_REGISTRY.with(|reg| reg.borrow_mut().clear());
+        MIGRATION_LINKS.with(|links| links.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_resolve_unknown_did() {
+        cleanup_registries();
+
+        let fields = resolve_did_document_fields("did:dht:zunknown");
+
+        // Unknown DID: no keys in registry, so all arrays should be empty.
+        let vms: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.verification_methods_json).unwrap();
+        let auth: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.authentication_json).unwrap();
+        let assertion: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.assertion_methods_json).unwrap();
+        let aka: Vec<serde_json::Value> = serde_json::from_str(&fields.also_known_as_json).unwrap();
+
+        assert!(vms.is_empty(), "unknown DID should have no VMs");
+        assert!(auth.is_empty(), "unknown DID should have no authentication");
+        assert!(
+            assertion.is_empty(),
+            "unknown DID should have no assertionMethod"
+        );
+        assert!(
+            aka.is_empty(),
+            "unknown DID should have no alsoKnownAs entries"
+        );
+        assert_eq!(fields.services_json, "[]");
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn test_resolve_known_did_basic() {
+        cleanup_registries();
+
+        let (did, pub_bytes) = register_identity();
+        let expected_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+
+        let fields = resolve_did_document_fields(&did);
+
+        // Verification methods: #0 (identity) and #active (signing).
+        let vms: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.verification_methods_json).unwrap();
+        assert_eq!(vms.len(), 2, "should have #0 and #active VMs");
+
+        // #0 — Identity Key
+        assert_eq!(vms[0]["id"], format!("{did}#0"));
+        assert_eq!(vms[0]["type"], "Ed25519VerificationKey2020");
+        assert_eq!(vms[0]["controller"], did);
+        assert_eq!(vms[0]["publicKeyMultibase"], expected_multibase);
+
+        // #active — Active Signing Key (same key material in simplified model)
+        assert_eq!(vms[1]["id"], format!("{did}#active"));
+        assert_eq!(vms[1]["type"], "Ed25519VerificationKey2020");
+        assert_eq!(vms[1]["controller"], did);
+        assert_eq!(vms[1]["publicKeyMultibase"], expected_multibase);
+
+        // Authentication and assertionMethod reference #active.
+        let auth: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.authentication_json).unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0], format!("{did}#active"));
+
+        let assertion: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.assertion_methods_json).unwrap();
+        assert_eq!(assertion.len(), 1);
+        assert_eq!(assertion[0], format!("{did}#active"));
+
+        // No migration link → empty alsoKnownAs.
+        let aka: Vec<serde_json::Value> = serde_json::from_str(&fields.also_known_as_json).unwrap();
+        assert!(aka.is_empty());
+
+        // Services always empty for locally-created identities.
+        assert_eq!(fields.services_json, "[]");
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn test_resolve_with_agent_key() {
+        cleanup_registries();
+
+        let (did, pub_bytes, agent_pub_bytes) = register_identity_with_agent();
+        let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+        let agent_multibase = format!("z{}", zbase32_encode(&agent_pub_bytes));
+
+        let fields = resolve_did_document_fields(&did);
+
+        // Verification methods: #0, #active, and #agent.
+        let vms: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.verification_methods_json).unwrap();
+        assert_eq!(vms.len(), 3, "should have #0, #active, and #agent VMs");
+
+        // #0 — Identity Key
+        assert_eq!(vms[0]["id"], format!("{did}#0"));
+        assert_eq!(vms[0]["publicKeyMultibase"], identity_multibase);
+
+        // #active — Active Signing Key
+        assert_eq!(vms[1]["id"], format!("{did}#active"));
+        assert_eq!(vms[1]["publicKeyMultibase"], identity_multibase);
+
+        // #agent — Agent Signing Key (ADR-039)
+        assert_eq!(vms[2]["id"], format!("{did}#agent"));
+        assert_eq!(vms[2]["type"], "Ed25519VerificationKey2020");
+        assert_eq!(vms[2]["controller"], did);
+        assert_eq!(vms[2]["publicKeyMultibase"], agent_multibase);
+
+        // Authentication references both #active and #agent.
+        let auth: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.authentication_json).unwrap();
+        assert_eq!(auth.len(), 2);
+        assert_eq!(auth[0], format!("{did}#active"));
+        assert_eq!(auth[1], format!("{did}#agent"));
+
+        // assertionMethod references both #active and #agent.
+        let assertion: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.assertion_methods_json).unwrap();
+        assert_eq!(assertion.len(), 2);
+        assert_eq!(assertion[0], format!("{did}#active"));
+        assert_eq!(assertion[1], format!("{did}#agent"));
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn test_resolve_with_migration_link() {
+        cleanup_registries();
+
+        let (did, _pub_bytes) = register_identity();
+        let old_did = "did:dht:zOldDid12345";
+
+        // Simulate a migration: new DID maps to old DID.
+        MIGRATION_LINKS.with(|links| {
+            links.borrow_mut().insert(did.clone(), old_did.to_owned());
+        });
+
+        let fields = resolve_did_document_fields(&did);
+
+        // alsoKnownAs should contain the old DID.
+        let aka: Vec<serde_json::Value> = serde_json::from_str(&fields.also_known_as_json).unwrap();
+        assert_eq!(aka.len(), 1, "should have exactly one alsoKnownAs entry");
+        assert_eq!(aka[0], old_did);
+
+        // VMs should still be populated (identity exists in registry).
+        let vms: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.verification_methods_json).unwrap();
+        assert_eq!(vms.len(), 2, "should have #0 and #active VMs");
+
+        cleanup_registries();
+    }
 }
