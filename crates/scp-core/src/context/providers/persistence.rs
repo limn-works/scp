@@ -188,6 +188,7 @@ mod tests {
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_entries: Vec::new(),
+            needs_reconnect: false,
         }
     }
 

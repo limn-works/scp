@@ -801,8 +801,14 @@ impl<S: Storage> ProtocolStore<S> {
     /// Persists a single grace window entry under
     /// `context/{context_id}/grace/{epoch:020d}`.
     ///
-    /// Called as part of the transactional write alongside the new MLS group
-    /// state when a Commit is processed (§23.11 step 2).
+    /// **Note:** The primary production persistence path for grace entries is
+    /// the [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob,
+    /// which persists grace entries atomically alongside all other context
+    /// state (membership, roles, governance, TTL, etc.) to ensure
+    /// transactional consistency (§23.11 step 2). This individual CRUD method
+    /// is available for direct-access patterns (e.g., targeted cleanup,
+    /// testing, or recovery workflows) but is not called in the standard
+    /// snapshot-based persistence flow.
     ///
     /// # Errors
     ///
@@ -817,11 +823,17 @@ impl<S: Storage> ProtocolStore<S> {
         self.store_value(&key, entry).await
     }
 
-    /// Loads all persisted grace entries for a context.
+    /// Loads all persisted grace entries for a context from individual
+    /// `context/{context_id}/grace/{epoch:020d}` keys.
     ///
-    /// Returns entries sorted by epoch number. Called on startup recovery
-    /// to restore the [`EpochGraceStore`](crate::crypto::mls::epoch_grace::EpochGraceStore)
-    /// (§23.11 recovery-on-startup).
+    /// Returns entries sorted by epoch number.
+    ///
+    /// **Note:** The primary production persistence path loads grace entries
+    /// from the [`ContextSnapshot`](crate::context::manager::ContextSnapshot)
+    /// blob (see `restore_context` in `context/manager.rs`). This method
+    /// loads from individual storage keys and is available for direct-access
+    /// patterns (e.g., recovery, diagnostics, testing) but is not called in
+    /// the standard snapshot-based restore flow.
     ///
     /// # Errors
     ///
@@ -847,10 +859,16 @@ impl<S: Storage> ProtocolStore<S> {
         Ok(entries)
     }
 
-    /// Deletes a single grace entry for a specific epoch.
+    /// Deletes a single grace entry for a specific epoch from the
+    /// individual `context/{context_id}/grace/{epoch:020d}` key.
     ///
-    /// Called when a grace window expires during recovery or during normal
-    /// operation as part of the transactional write (§23.11 step 3).
+    /// **Note:** The primary production persistence path manages grace
+    /// entries atomically within the
+    /// [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// This individual CRUD method is available for direct-access patterns
+    /// (e.g., targeted cleanup during recovery or testing) but expired
+    /// entries are normally excluded at snapshot creation time rather than
+    /// deleted individually.
     ///
     /// # Errors
     ///
@@ -861,11 +879,15 @@ impl<S: Storage> ProtocolStore<S> {
         Ok(())
     }
 
-    /// Deletes all grace entries for a context.
+    /// Deletes all grace entries for a context from individual
+    /// `context/{context_id}/grace/` keys.
     ///
-    /// Used during the inconsistent state fallback (§23.11): discard all
-    /// grace window entries when persisted grace state is inconsistent
-    /// with MLS group state.
+    /// **Note:** The primary production persistence path manages grace
+    /// entries atomically within the
+    /// [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// This method is available for bulk cleanup of individually-stored
+    /// grace entries (e.g., during the inconsistent state fallback §23.11
+    /// or migration from individual keys to the snapshot path).
     ///
     /// # Errors
     ///
@@ -1619,6 +1641,7 @@ mod tests {
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_entries: Vec::new(),
+            needs_reconnect: false,
         }
     }
 

@@ -287,6 +287,8 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // Grace entries are not exported in public scope — they are
         // runtime state that is only meaningful to the local node.
         grace_entries: Vec::new(),
+        // Reconnection flag is not exported — only meaningful to the local node.
+        needs_reconnect: false,
     }
 }
 
@@ -384,6 +386,7 @@ mod tests {
             pending_ceiling_modification: None,
             mls_epoch: 0,
             grace_entries: Vec::new(),
+            needs_reconnect: false,
         }
     }
 
