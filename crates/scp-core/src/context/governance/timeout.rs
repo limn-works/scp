@@ -196,8 +196,14 @@ impl GovernanceTimeoutTask {
     }
 
     /// Cancels the running task, if any.
+    ///
+    /// Signals the cancellation token AND aborts the `JoinHandle` for
+    /// consistency with the `Drop` implementation.
     pub fn cancel(&self) {
         self.cancel.notify_one();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 

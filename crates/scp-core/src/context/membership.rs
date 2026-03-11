@@ -365,6 +365,41 @@ pub enum ContextEvent {
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
     Expired,
+    /// A governance vote was withdrawn (ADR-031 §5).
+    ///
+    /// Emitted when a voter's vote is removed from a pending proposal,
+    /// typically due to voter departure from the context.
+    VoteWithdrawn {
+        /// The proposal ID the vote was withdrawn from.
+        proposal_id: [u8; 32],
+        /// The DID of the voter whose vote was withdrawn.
+        voter_did: DID,
+    },
+    /// A governance proposal was resolved by the timeout system (ADR-031 §5).
+    ///
+    /// Emitted when a pending proposal is resolved (expired, rejected,
+    /// invalidated) by the background timeout task rather than by an
+    /// explicit governance action execution.
+    ProposalTimedOut {
+        /// The proposal ID that was resolved.
+        proposal_id: [u8; 32],
+        /// Human-readable summary of the resolution status.
+        resolution_summary: String,
+        /// The MLS epoch at the time of resolution, if applicable.
+        resulting_epoch: Option<u64>,
+    },
+    /// A governance deadlock condition was detected (ADR-031 §10).
+    ///
+    /// Emitted by the background timeout task when the governance model
+    /// cannot make progress due to insufficient active participants.
+    /// SDK consumers should observe this event and consider initiating
+    /// a `ReconfigureGovernance` proposal with deadlock justification.
+    DeadlockDetected {
+        /// Human-readable summary of the deadlock condition.
+        condition_summary: String,
+        /// The MLS epoch at the time of detection, if applicable.
+        resulting_epoch: Option<u64>,
+    },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.

@@ -5820,6 +5820,73 @@ impl ContextManager {
         }
     }
 
+    /// Translates governance events from timeout processing into
+    /// [`ContextEvent`]s for the receive buffer (ADR-031 §5, §10).
+    fn translate_timeout_events(
+        result_events: &[GovernanceEvent],
+        mls_epoch: u64,
+        conditions: &[super::governance::timeout::DeadlockCondition],
+        recovery_in_progress: bool,
+    ) -> Vec<ContextEvent> {
+        let mut ctx_events = Vec::new();
+        for event in result_events {
+            let ctx_event = match event {
+                GovernanceEvent::ProposalResolved {
+                    proposal_id,
+                    status,
+                } => ContextEvent::ProposalTimedOut {
+                    proposal_id: *proposal_id,
+                    resolution_summary: format!("ProposalResolved({status:?})"),
+                    resulting_epoch: Some(mls_epoch),
+                },
+                GovernanceEvent::VoteWithdrawn {
+                    proposal_id,
+                    voter_did,
+                } => ContextEvent::VoteWithdrawn {
+                    proposal_id: *proposal_id,
+                    voter_did: voter_did.clone(),
+                },
+                GovernanceEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    executor_did,
+                    resulting_epoch,
+                    ..
+                } => ContextEvent::GovernanceActionExecuted {
+                    proposal_id: *proposal_id,
+                    action_summary: "TimeoutExecution".to_owned(),
+                    executor_did: executor_did.clone(),
+                    resulting_epoch: *resulting_epoch,
+                },
+                // ProposalCreated and VoteCast are not expected from
+                // timeout processing; skip them if they appear.
+                _ => continue,
+            };
+            ctx_events.push(ctx_event);
+        }
+
+        if !conditions.is_empty() && !recovery_in_progress {
+            for condition in conditions {
+                let summary = match condition {
+                    super::governance::timeout::DeadlockCondition::ThresholdInsufficient {
+                        ..
+                    } => "ThresholdInsufficient",
+                    super::governance::timeout::DeadlockCondition::MajorityUnresponsive {
+                        ..
+                    } => "MajorityUnresponsive",
+                    super::governance::timeout::DeadlockCondition::UnanimityOffline { .. } => {
+                        "UnanimityOffline"
+                    }
+                };
+                ctx_events.push(ContextEvent::DeadlockDetected {
+                    condition_summary: summary.to_owned(),
+                    resulting_epoch: Some(mls_epoch),
+                });
+            }
+        }
+
+        ctx_events
+    }
+
     /// Starts the governance timeout background task for a context (ADR-031 §5).
     ///
     /// The task runs a 60-second interval loop that:
@@ -5844,93 +5911,107 @@ impl ContextManager {
                 let contexts = Arc::clone(&contexts);
                 let ctx_id = ctx_id.clone();
                 async move {
-                    let mut contexts_guard = contexts.lock().await;
-                    let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
-                        return false; // Context removed — stop the loop.
+                    // Phase 1: Acquire lock, extract data, release lock.
+                    // This minimizes the critical section so other ContextManager
+                    // operations are not blocked during processing.
+                    let (gov_ctx, departed, mls_epoch, recovery_in_progress, deadlock_state) = {
+                        let mut contexts_guard = contexts.lock().await;
+                        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
+                            return false; // Context removed — stop the loop.
+                        };
+
+                        // Stop if context is no longer active.
+                        if !ctx
+                            .handle
+                            .try_read_state()
+                            .is_some_and(|s| matches!(s, super::ContextState::Active))
+                        {
+                            return false;
+                        }
+
+                        // Build governance context snapshot.
+                        let gov_ctx = Self::build_governance_context(ctx);
+
+                        // Detect departed members since last tick.
+                        let current_members: HashSet<DID> =
+                            ctx.membership.members().map(|m| m.did.clone()).collect();
+                        let departed: Vec<DID> = ctx
+                            .last_known_members
+                            .difference(&current_members)
+                            .cloned()
+                            .collect();
+                        ctx.last_known_members = current_members;
+
+                        let mls_epoch = ctx.mls_epoch;
+                        let recovery_in_progress =
+                            ctx.deadlock_detection_state.recovery_in_progress;
+                        let deadlock_state = ctx.deadlock_detection_state.clone();
+
+                        (
+                            gov_ctx,
+                            departed,
+                            mls_epoch,
+                            recovery_in_progress,
+                            deadlock_state,
+                        )
+                        // Lock dropped here.
                     };
 
-                    // Stop if context is no longer active.
-                    if !ctx.handle.try_read_state().is_some_and(|s| {
-                        matches!(s, super::ContextState::Active)
-                    }) {
-                        return false;
-                    }
-
-                    // Build governance context snapshot.
-                    let gov_ctx = Self::build_governance_context(ctx);
-
-                    // Detect departed members since last tick.
-                    let current_members: HashSet<DID> = ctx
-                        .membership
-                        .members()
-                        .map(|m| m.did.clone())
-                        .collect();
-                    let departed: Vec<DID> = ctx
-                        .last_known_members
-                        .difference(&current_members)
-                        .cloned()
-                        .collect();
-                    ctx.last_known_members = current_members;
-
-                    // Process pending proposals for timeout and departures.
-                    // Epoch reset members are handled by other code paths when
-                    // epoch resets actually occur; the timeout loop passes empty.
-                    let result = process_pending_proposals(
-                        ctx.governance_engine.as_mut(),
-                        &gov_ctx,
-                        &departed,
-                        &[],
-                    );
-
-                    // Push governance events into the receive buffer.
-                    for event in &result.events {
-                        let ctx_event = match event {
-                            GovernanceEvent::ProposalResolved {
-                                proposal_id,
-                                status,
-                            } => ContextEvent::GovernanceActionExecuted {
-                                proposal_id: *proposal_id,
-                                action_summary: format!("ProposalResolved({status:?})"),
-                                executor_did: DID::from("system:timeout"),
-                                resulting_epoch: Some(ctx.mls_epoch),
-                            },
-                            _ => continue,
+                    // Phase 2: Process proposals and detect deadlock outside the lock.
+                    // Re-acquire briefly to call engine methods that need &mut.
+                    let (result, conditions) = {
+                        let mut contexts_guard = contexts.lock().await;
+                        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
+                            return false;
                         };
-                        ctx.receive_buffer.push(ctx_event);
-                    }
 
-                    // Detect deadlock conditions (ADR-031 §10).
-                    let conditions = super::governance::timeout::detect_deadlock(
-                        ctx.governance_engine.as_ref(),
-                        &gov_ctx,
-                        &ctx.deadlock_detection_state,
+                        // Process pending proposals for timeout and departures.
+                        // Epoch reset members are handled by other code paths when
+                        // epoch resets actually occur; the timeout loop passes empty.
+                        let result = process_pending_proposals(
+                            ctx.governance_engine.as_mut(),
+                            &gov_ctx,
+                            &departed,
+                            &[],
+                        );
+
+                        // Detect deadlock conditions (ADR-031 §10).
+                        let conditions = super::governance::timeout::detect_deadlock(
+                            ctx.governance_engine.as_ref(),
+                            &gov_ctx,
+                            &deadlock_state,
+                        );
+
+                        (result, conditions)
+                        // Lock dropped here.
+                    };
+
+                    // Phase 3: Build context events from results (no lock needed).
+                    let ctx_events = Self::translate_timeout_events(
+                        &result.events,
+                        mls_epoch,
+                        &conditions,
+                        recovery_in_progress,
                     );
 
-                    if !conditions.is_empty() && !ctx.deadlock_detection_state.recovery_in_progress
-                    {
-                        ctx.deadlock_detection_state.recovery_in_progress = true;
-                        // Emit deadlock detection as a governance event summary
-                        // so SDK consumers can observe and initiate recovery.
-                        for condition in &conditions {
-                            let summary = match condition {
-                                super::governance::timeout::DeadlockCondition::ThresholdInsufficient { .. } => {
-                                    "DeadlockDetected(ThresholdInsufficient)"
-                                }
-                                super::governance::timeout::DeadlockCondition::MajorityUnresponsive { .. } => {
-                                    "DeadlockDetected(MajorityUnresponsive)"
-                                }
-                                super::governance::timeout::DeadlockCondition::UnanimityOffline { .. } => {
-                                    "DeadlockDetected(UnanimityOffline)"
-                                }
-                            };
-                            ctx.receive_buffer.push(
-                                ContextEvent::GovernanceActionExecuted {
-                                    proposal_id: [0u8; 32],
-                                    action_summary: summary.to_owned(),
-                                    executor_did: DID::from("system:deadlock-detector"),
-                                    resulting_epoch: Some(ctx.mls_epoch),
-                                },
-                            );
+                    // Phase 4: Re-acquire lock briefly to write results back
+                    // and update deadlock recovery state.
+                    let needs_write = !ctx_events.is_empty()
+                        || (conditions.is_empty() && recovery_in_progress)
+                        || (!conditions.is_empty() && !recovery_in_progress);
+                    if needs_write {
+                        let mut contexts_guard = contexts.lock().await;
+                        if let Some(ctx) = contexts_guard.get_mut(&ctx_id) {
+                            for ctx_event in ctx_events {
+                                ctx.receive_buffer.push(ctx_event);
+                            }
+                            // Reset recovery_in_progress when deadlock conditions
+                            // clear so future deadlocks can be detected.
+                            if conditions.is_empty() && recovery_in_progress {
+                                ctx.deadlock_detection_state.recovery_in_progress = false;
+                            } else if !conditions.is_empty() && !recovery_in_progress {
+                                ctx.deadlock_detection_state.recovery_in_progress = true;
+                            }
                         }
                     }
 
