@@ -567,11 +567,20 @@ if (bridge === null) {
         ["did:dht:z6MkMember1"],
         "ctx-target",
         undefined,
+        undefined,
+        undefined,
+        undefined,
       );
       const record = JSON.parse(raw);
       expect(record.source_context).toBe("ctx-source");
       expect(record.chain_depth).toBe(1);
       expect(Array.isArray(record.counterparties)).toBe(true);
+      // New fields present with default values.
+      expect(record.discovery_method).toBe("None");
+      expect(record.purpose).toBeNull();
+      expect(record.payment_amount).toBeNull();
+      expect(record.payment_adapter).toBeNull();
+      expect(record.payment_receipt_id).toBeNull();
     });
 
     test("attaches provenance with existing chain depth", () => {
@@ -582,10 +591,63 @@ if (bridge === null) {
         ["did:dht:z6MkMember1"],
         "ctx-target",
         2,
+        undefined,
+        undefined,
+        undefined,
       );
       const record = JSON.parse(raw);
       // Chain depth should be existing + 1 = 3.
       expect(record.chain_depth).toBe(3);
+    });
+
+    test("attaches provenance with discovery_method SharedContext", () => {
+      const raw = napi.provenanceAttach(
+        "ctx-source",
+        "persistent",
+        "full",
+        ["did:dht:z6MkMember1"],
+        "ctx-target",
+        undefined,
+        "shared_context:ctx-shared-abc",
+        "data sharing purpose",
+        undefined,
+      );
+      const record = JSON.parse(raw);
+      expect(record.discovery_method).toEqual({ SharedContext: "ctx-shared-abc" });
+      expect(record.purpose).toBe("data sharing purpose");
+    });
+
+    test("attaches provenance with discovery_method Registry", () => {
+      const raw = napi.provenanceAttach(
+        "ctx-source",
+        "persistent",
+        "full",
+        [],
+        "ctx-target",
+        undefined,
+        "registry:ctx-registry-abc",
+        undefined,
+        undefined,
+      );
+      const record = JSON.parse(raw);
+      expect(record.discovery_method).toEqual({ Registry: "ctx-registry-abc" });
+    });
+
+    test("attaches provenance with counterparty_policy", () => {
+      const raw = napi.provenanceAttach(
+        "ctx-source",
+        "persistent",
+        "full",
+        ["did:dht:z6MkMember1"],
+        "ctx-target",
+        undefined,
+        undefined,
+        undefined,
+        "redacted",
+      );
+      const record = JSON.parse(raw);
+      // Redacted policy results in empty counterparties.
+      expect(record.counterparties).toEqual([]);
     });
 
     test("checks chain depth within default limit (3)", () => {
@@ -863,6 +925,9 @@ if (bridge === null) {
         "full",
         ["did:dht:z6MkA", "did:dht:z6MkB"],
         "ctx-destination",
+        undefined,
+        undefined,
+        undefined,
         undefined,
       );
       const prov = JSON.parse(provRaw);

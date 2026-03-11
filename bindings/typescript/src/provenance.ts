@@ -15,6 +15,18 @@ import { safeJsonParse } from "./internal/json-utils";
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Discovery method describing how the data source was found (§24.2.3).
+ *
+ * - `"None"` — no protocol-level discovery path.
+ * - `{ SharedContext: string }` — found via shared context membership.
+ * - `{ Registry: string }` — found via a discovery registry context.
+ */
+export type DiscoveryMethod =
+  | "None"
+  | { readonly SharedContext: string }
+  | { readonly Registry: string };
+
 /** Provenance record returned by {@link provenanceAttach}. */
 export interface ProvenanceRecord {
   readonly sourceContext: string;
@@ -25,6 +37,14 @@ export interface ProvenanceRecord {
   readonly memoryScope: string;
   readonly chainPath: string | null;
   readonly purpose: string | null;
+  /** How the data source was discovered (§24.2.3). */
+  readonly discoveryMethod: DiscoveryMethod;
+  /** Cost of producing this data in atomic units, if any (§24.3.4, §19.6). */
+  readonly paymentAmount: number | null;
+  /** Payment adapter used (e.g., `"lightning"`, `"stripe"`), if any. */
+  readonly paymentAdapter: string | null;
+  /** Hex-encoded 32-byte receipt ID for payment verification, if any. */
+  readonly paymentReceiptId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,8 +85,13 @@ export async function evaluateProvenanceQuality(options: {
  * @param memoryScope - `"full"`, `"summary"`, or `"ephemeral"`.
  * @param members - Member DID strings from the source context.
  * @param targetContextId - ID of the target context.
- * @param existingChainDepth - Chain depth of existing provenance (if any).
- * @returns Parsed provenance record.
+ * @param options - Optional additional provenance fields.
+ * @param options.existingChainDepth - Chain depth of existing provenance (if any).
+ * @param options.discoveryMethod - How the source was discovered: `"none"`,
+ *   `"shared_context:<context_id>"`, or `"registry:<context_id>"`.
+ * @param options.purpose - Human-readable purpose of the cross-context data flow.
+ * @param options.counterpartyPolicy - `"full"`, `"pseudonymized"`, or `"redacted"`.
+ * @returns Parsed provenance record with all 12 spec fields (§24.2.1).
  * @throws {ValidationError} If sourceType or memoryScope is invalid.
  */
 export async function provenanceAttach(
@@ -75,7 +100,12 @@ export async function provenanceAttach(
   memoryScope: string,
   members: string[],
   targetContextId: string,
-  existingChainDepth?: number,
+  options?: {
+    existingChainDepth?: number;
+    discoveryMethod?: string;
+    purpose?: string;
+    counterpartyPolicy?: string;
+  },
 ): Promise<ProvenanceRecord> {
   try {
     const bridge = await getBridge();
@@ -85,9 +115,27 @@ export async function provenanceAttach(
       memoryScope,
       members,
       targetContextId,
-      existingChainDepth,
+      options?.existingChainDepth,
+      options?.discoveryMethod,
+      options?.purpose,
+      options?.counterpartyPolicy,
     );
-    const record = safeJsonParse(raw, "provenanceAttach") as ProvenanceRecord;
+    const parsed = safeJsonParse(raw, "provenanceAttach") as Record<string, unknown>;
+    // Map snake_case JSON keys from the bridge to camelCase TypeScript interface.
+    const record: ProvenanceRecord = {
+      sourceContext: parsed.source_context as string,
+      sourceType: parsed.source_type as string,
+      chainDepth: parsed.chain_depth as number,
+      counterparties: parsed.counterparties as readonly string[],
+      ageSecs: (parsed.age_secs as number) ?? 0,
+      memoryScope: parsed.memory_scope as string,
+      chainPath: (parsed.chain_path as readonly string[]) ?? null,
+      purpose: (parsed.purpose as string) ?? null,
+      discoveryMethod: (parsed.discovery_method as DiscoveryMethod) ?? "None",
+      paymentAmount: (parsed.payment_amount as number) ?? null,
+      paymentAdapter: (parsed.payment_adapter as string) ?? null,
+      paymentReceiptId: (parsed.payment_receipt_id as string) ?? null,
+    };
     return record;
   } catch (error) {
     throw mapBridgeError(error);

@@ -162,7 +162,10 @@ interface WasmModule {
     memoryScope: string,
     membersJson: string,
     targetContextId: string,
-    existingChainDepth: number | undefined,
+    existingChainDepth: number,
+    existingChainPathJson: string,
+    discoveryMethod: string | undefined,
+    purpose: string | undefined,
   ) => string;
   provenance_check_chain_depth: (chainDepth: number, maxDepth: number | undefined) => boolean;
   // Sync
@@ -929,15 +932,24 @@ export function createWasmBridge(): Bridge {
       members: string[],
       targetContextId: string,
       existingChainDepth: number | undefined,
+      discoveryMethod: string | undefined,
+      purpose: string | undefined,
+      _counterpartyPolicy: string | undefined,
     ) {
       const wasm = getWasm();
+      // WASM bridge uses f64 for existing_chain_depth (-1 means first hop)
+      // and a separate existing_chain_path_json parameter.
+      const depth = existingChainDepth !== undefined ? existingChainDepth : -1;
       return wasm.provenance_attach(
         sourceContextId,
         sourceType,
         memoryScope,
         JSON.stringify(members),
         targetContextId,
-        existingChainDepth,
+        depth,
+        "[]",
+        discoveryMethod ?? undefined,
+        purpose ?? undefined,
       );
     },
 

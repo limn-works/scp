@@ -69,6 +69,7 @@ pub async fn evaluate_provenance_quality(
 /// Returns a JSON string with the attached provenance record.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
 pub fn provenance_attach(
     source_context_id: String,
     source_type: String,
@@ -76,19 +77,24 @@ pub fn provenance_attach(
     members: Vec<String>,
     target_context_id: String,
     existing_chain_depth: Option<u32>,
+    discovery_method: Option<String>,
+    purpose: Option<String>,
+    counterparty_policy: Option<String>,
 ) -> napi::Result<String> {
     let st = parse_source_type(&source_type)?;
     let ms = parse_memory_scope(&memory_scope)?;
+    let dm = parse_discovery_method(discovery_method.as_deref())?;
+    let cp = parse_counterparty_policy(counterparty_policy.as_deref())?;
 
     let source_info = SourceContextInfo {
         context_id: source_context_id,
         source_type: st,
         memory_scope: ms,
         members: members.into_iter().map(scp_identity::DID::from).collect(),
-        discovery_method: DiscoveryMethod::None,
+        discovery_method: dm,
         data_age: std::time::Duration::from_secs(0),
-        purpose: None,
-        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
+        purpose,
+        counterparty_policy: cp,
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -115,6 +121,16 @@ pub fn provenance_attach(
         None,
     );
 
+    let discovery_method_str = match &prov.discovery_method {
+        DiscoveryMethod::SharedContext(ctx_id) => {
+            serde_json::json!({"SharedContext": ctx_id})
+        }
+        DiscoveryMethod::Registry(ctx_id) => {
+            serde_json::json!({"Registry": ctx_id})
+        }
+        DiscoveryMethod::None => serde_json::json!("None"),
+    };
+
     let result = serde_json::json!({
         "source_context": prov.source_context,
         "source_type": format!("{:?}", prov.source_type),
@@ -124,6 +140,10 @@ pub fn provenance_attach(
         "memory_scope": format!("{:?}", prov.memory_scope),
         "chain_path": prov.chain_path,
         "purpose": prov.purpose,
+        "discovery_method": discovery_method_str,
+        "payment_amount": prov.payment_amount.map(|a| a.0),
+        "payment_adapter": prov.payment_adapter,
+        "payment_receipt_id": prov.payment_receipt_id.map(hex::encode),
     });
 
     serde_json::to_string(&result).map_err(|e| {
@@ -213,6 +233,59 @@ fn parse_memory_scope(s: &str) -> napi::Result<MemoryScope> {
                 "invalid memory_scope '{other}': expected 'full', 'summary', or 'ephemeral'"
             ),
             code: "SCP-VALID-7001".to_owned(),
+        }
+        .into()),
+    }
+}
+
+/// Parses a discovery method string into a `DiscoveryMethod` enum (§24.2.3).
+///
+/// Accepted formats:
+/// - `None` or absent → `DiscoveryMethod::None`
+/// - `shared_context:<context_id>` → `DiscoveryMethod::SharedContext(context_id)`
+/// - `registry:<context_id>` → `DiscoveryMethod::Registry(context_id)`
+fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
+    let Some(s) = s else {
+        return Ok(DiscoveryMethod::None);
+    };
+    match s {
+        "none" | "None" => Ok(DiscoveryMethod::None),
+        _ if s.starts_with("shared_context:") => {
+            let ctx_id = &s["shared_context:".len()..];
+            Ok(DiscoveryMethod::SharedContext(ctx_id.to_owned()))
+        }
+        _ if s.starts_with("registry:") => {
+            let ctx_id = &s["registry:".len()..];
+            Ok(DiscoveryMethod::Registry(ctx_id.to_owned()))
+        }
+        other => Err(ScpNapiError::Validation {
+            message: format!(
+                "invalid discovery_method '{other}': expected 'none', \
+                 'shared_context:<context_id>', or 'registry:<context_id>'"
+            ),
+            code: "SCP-VALID-7003".to_owned(),
+        }
+        .into()),
+    }
+}
+
+/// Parses a counterparty policy string into a `CounterpartyPolicy` enum (§7.7.1).
+fn parse_counterparty_policy(
+    s: Option<&str>,
+) -> napi::Result<scp_core::provenance::CounterpartyPolicy> {
+    let Some(s) = s else {
+        return Ok(scp_core::provenance::CounterpartyPolicy::default());
+    };
+    match s {
+        "full" => Ok(scp_core::provenance::CounterpartyPolicy::Full),
+        "pseudonymized" => Ok(scp_core::provenance::CounterpartyPolicy::Pseudonymized),
+        "redacted" => Ok(scp_core::provenance::CounterpartyPolicy::Redacted),
+        other => Err(ScpNapiError::Validation {
+            message: format!(
+                "invalid counterparty_policy '{other}': expected 'full', \
+                 'pseudonymized', or 'redacted'"
+            ),
+            code: "SCP-VALID-7004".to_owned(),
         }
         .into()),
     }

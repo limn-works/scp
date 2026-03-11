@@ -240,6 +240,9 @@ export interface Bridge {
     members: string[],
     targetContextId: string,
     existingChainDepth: number | undefined,
+    discoveryMethod: string | undefined,
+    purpose: string | undefined,
+    counterpartyPolicy: string | undefined,
   ): string;
   provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined): boolean;
 
