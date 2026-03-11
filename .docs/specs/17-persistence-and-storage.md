@@ -534,7 +534,7 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 
 ### 17.9.1 MLS Crypto State Snapshot
 
-`MlsStorageBridge` (§17.9) persists individual MLS storage items (group state, tree nodes, key schedules, proposals) under the `mls/{context_id}/...` key prefix. However, a complete MLS crypto context also includes state managed by the `ContextCryptoProvider` that lives outside the OpenMLS `StorageProvider` contract:
+`MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix, but is **not currently wired into the runtime `MlsCryptoProvider`** — the runtime uses `InMemoryMlsProvider` instead. A complete MLS crypto context also includes state managed by `ContextCryptoProvider` that lives outside the OpenMLS `StorageProvider` contract:
 
 - **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
 - **X25519 wrapping keypair** — HPKE encapsulation key for sender key distribution
@@ -550,12 +550,12 @@ To persist all of this atomically, `ContextCryptoProvider` exposes two methods:
 
 The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On `restore_context`, the blob is restored before constructing `PerContextState` so that the crypto provider has MLS group and sender keys available for subsequent encrypt/decrypt operations.
 
-**Relationship to `MlsStorageBridge`.** The two mechanisms are complementary:
+**Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. `MlsCryptoProvider` uses an `InMemoryMlsProvider` at runtime; `MlsStorageBridge` (§17.9) is implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
 
-- **`MlsStorageBridge`** provides fine-grained, per-item MLS storage that OpenMLS uses internally during group operations (processing commits, creating proposals, etc.). It is the OpenMLS `StorageProvider` implementation.
-- **The blob snapshot** captures the complete crypto provider state atomically for crash recovery. It re-populates the same in-memory structures that `MlsStorageBridge` would have populated during normal operation, plus the SCP-layer state (sender keys, wrapping keys, signer) that `MlsStorageBridge` does not manage.
+- **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, wrapping keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
+- **`MlsStorageBridge`** (not currently instantiated) provides the OpenMLS `StorageProvider` trait implementation for fine-grained, per-item MLS storage. If activated in a future iteration, it would allow OpenMLS to persist individual items incrementally rather than relying on full-state snapshots.
 
-The snapshot approach ensures that all crypto state — both the OpenMLS-managed portion and the SCP-managed portion — is persisted and restored as a single atomic unit. Without it, a crash between persisting MLS state and persisting sender key state would leave the context in an inconsistent state where MLS decryption succeeds but sender key decryption fails (or vice versa).
+The snapshot approach ensures atomicity: all crypto state is persisted and restored as a single unit. Without it, a crash between persisting MLS state and persisting sender key state would leave the context in an inconsistent state where MLS decryption succeeds but sender key decryption fails (or vice versa).
 
 ## 17.10 Migration Strategy
 
