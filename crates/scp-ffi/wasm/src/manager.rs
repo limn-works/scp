@@ -666,20 +666,26 @@ impl WasmContextManager {
                     code: "SCP-CTX-2015".to_owned(),
                 });
             }
-            let req_major = u8::try_from(
-                min_ver
-                    .first()
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(1),
-            )
-            .unwrap_or(u8::MAX);
-            let req_minor = u8::try_from(
-                min_ver
-                    .get(1)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-            .unwrap_or(u8::MAX);
+            let raw_major = min_ver
+                .first()
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            let req_major = u8::try_from(raw_major).map_err(|_| ScpWasmError::Context {
+                message: format!(
+                    "malformed minProtocolVersion: major version {raw_major} exceeds u8 range"
+                ),
+                code: "SCP-CTX-2015".to_owned(),
+            })?;
+            let raw_minor = min_ver
+                .get(1)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let req_minor = u8::try_from(raw_minor).map_err(|_| ScpWasmError::Context {
+                message: format!(
+                    "malformed minProtocolVersion: minor version {raw_minor} exceeds u8 range"
+                ),
+                code: "SCP-CTX-2015".to_owned(),
+            })?;
             let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
             let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
 
