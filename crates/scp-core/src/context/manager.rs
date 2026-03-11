@@ -2091,6 +2091,14 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(&context_id);
         let member_did = key_package.owner_did.clone();
 
+        // Fast-fail: reject obviously incompatible versions before expensive
+        // crypto ops (MLS group join, sender key derivation). Uses the caller's
+        // handle params for the early check; the authoritative check against
+        // the stored context params still runs inside the lock below.
+        handle
+            .params()
+            .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+
         // Crypto operations -- no lock held, no TOCTOU concern for these
         // provider calls since they are idempotent or externally consistent.
         let kp_bytes = key_package.mls_key_package_bytes.as_deref();
@@ -7248,6 +7256,51 @@ mod tests {
             result.unwrap_err(),
             ContextError::ContextNotActive
         ));
+    }
+
+    /// Regression test for #715: version check must run BEFORE crypto ops.
+    /// When the handle's `min_protocol_version` is incompatible, `join_context`
+    /// must reject without calling `add_member` (no orphaned MLS state).
+    #[tokio::test]
+    async fn join_version_check_rejects_before_crypto_ops() {
+        let (manager, _handle) = setup_active_context().await;
+
+        // Build a handle whose params require major version 2 — incompatible
+        // with SCP_PROTOCOL_VERSION (1.0). The context "test-ctx" already
+        // exists in the manager with compatible params; the fast-fail check
+        // uses handle.params(), which is the *caller-supplied* handle, not
+        // the stored one.
+        let incompatible_params = ContextParams {
+            min_protocol_version: Some((2, 0)),
+            ..ContextParams::default()
+        };
+        let bad_handle = ContextHandle::new("test-ctx".into(), incompatible_params);
+        // Transition to Active so require_active() would pass if reached.
+        bad_handle
+            .transition_to(&ContextState::Active)
+            .await
+            .unwrap();
+
+        let kp = KeyPackage::mock("did:key:bob".into());
+        let result = manager.join_context(&bad_handle, kp).await;
+
+        // Must fail with VersionIncompatible — the early check rejects
+        // before any crypto operations (validate_key_package, add_member,
+        // distribute_sender_key) execute.
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ContextError::VersionIncompatible { .. }
+            ),
+            "expected VersionIncompatible error"
+        );
+
+        // bob must NOT be a member — no membership state was created because
+        // the version check short-circuited before crypto ops and the locked
+        // membership mutation section.
+        assert!(!manager.is_member("test-ctx", "did:key:bob").await);
+        assert_eq!(manager.member_count("test-ctx").await, Some(1));
     }
 
     // -----------------------------------------------------------------------
