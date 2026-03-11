@@ -210,7 +210,7 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
 
 /// Returns the current Merkle root hash.
 ///
-/// - If the log is empty, returns `[0u8; 32]`.
+/// - If the log is empty, returns `SHA-256("")` per spec §25.8 Vector 15.
 /// - If the log has one leaf, the root is that leaf hash.
 /// - Otherwise, the root is the single element at the top interior layer.
 ///
@@ -220,7 +220,7 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
 #[must_use]
 pub fn root(log: &EventLog) -> [u8; 32] {
     if log.leaves.is_empty() {
-        return [0u8; 32];
+        return empty_tree_root();
     }
 
     if log.tree.is_empty() {
@@ -261,6 +261,19 @@ pub(crate) fn recompute_raw(log: &mut EventLog) {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Returns `SHA-256("")` -- the Merkle root for an empty event log.
+///
+/// Per spec §25.8 Vector 15, the empty tree root is the hash of the empty
+/// string, NOT `[0u8; 32]`. This distinguishes "empty log" from the genesis
+/// `prev_hash` sentinel (`GENESIS_PREV_HASH = [0u8; 32]`).
+#[must_use]
+pub(crate) fn empty_tree_root() -> [u8; 32] {
+    let hash = Sha256::digest(b"");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    out
+}
 
 /// Serializes the full event (including signature) for Merkle leaf hashing.
 ///
@@ -777,8 +790,8 @@ mod tests {
         let did = did_from_pubkey(&verifying_key);
         let mut log = EventLog::new("ctx-test".to_owned());
 
-        // Empty log root.
-        assert_eq!(root(&log), [0u8; 32]);
+        // Empty log root is SHA-256(""), not [0u8; 32] (spec §25.8 Vector 15).
+        assert_eq!(root(&log), empty_tree_root());
 
         let mut prev_hash = GENESIS_PREV_HASH;
         let mut leaf_hashes: Vec<[u8; 32]> = Vec::new();
@@ -1009,7 +1022,7 @@ mod tests {
 
     fn compute_root_manually(leaves: &[[u8; 32]]) -> [u8; 32] {
         if leaves.is_empty() {
-            return [0u8; 32];
+            return empty_tree_root();
         }
         if leaves.len() == 1 {
             return leaves[0];
@@ -1210,5 +1223,33 @@ mod tests {
             result.unwrap_err(),
             EventLogError::PrevHashMismatch { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // empty tree root matches spec §25.8 Vector 15: SHA-256("")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_tree_root_is_sha256_of_empty_string() {
+        let log = EventLog::new("ctx-empty-root".to_owned());
+        let r = root(&log);
+
+        // Spec §25.8 Vector 15: SHA-256("") =
+        // e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        let expected =
+            hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                .unwrap();
+
+        assert_eq!(
+            r.as_slice(),
+            expected.as_slice(),
+            "empty Merkle root must be SHA-256(\"\"), not [0u8; 32]"
+        );
+
+        // Must differ from GENESIS_PREV_HASH (which stays [0u8; 32]).
+        assert_ne!(
+            r, GENESIS_PREV_HASH,
+            "empty root and genesis prev_hash must be distinct values"
+        );
     }
 }
