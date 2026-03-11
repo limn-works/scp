@@ -979,90 +979,108 @@ mod tests {
     #[test]
     fn validate_min_protocol_version_rejects_string() {
         let params = serde_json::json!({ "minProtocolVersion": "1.0" });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_number() {
         let params = serde_json::json!({ "minProtocolVersion": 42 });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_short_array() {
         let params = serde_json::json!({ "minProtocolVersion": [1] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_empty_array() {
         let params = serde_json::json!({ "minProtocolVersion": [] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_string_elements() {
         let params = serde_json::json!({ "minProtocolVersion": ["1", "0"] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_string_minor() {
         let params = serde_json::json!({ "minProtocolVersion": [1, "0"] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_major_overflow() {
         let params = serde_json::json!({ "minProtocolVersion": [256, 0] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_minor_overflow() {
         let params = serde_json::json!({ "minProtocolVersion": [1, 256] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 
     #[test]
     fn validate_min_protocol_version_rejects_negative() {
         let params = serde_json::json!({ "minProtocolVersion": [-1, 0] });
-        let err = validate_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Validation { ref code, .. } if code == "SCP-VALID-7002"),
-            "expected SCP-VALID-7002, got: {err:?}"
+            matches!(
+                validate_min_protocol_version(&params),
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+            ),
+            "expected SCP-VALID-7002 validation error"
         );
     }
 }
