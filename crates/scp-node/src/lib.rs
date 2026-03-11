@@ -2122,7 +2122,13 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
 ) -> Result<ApplicationNode<S>, NodeError> {
-    let tier = nat_strategy.select_tier(bound_addr.port()).await?;
+    // Resolve the HTTP bind address first — NAT strategy needs the public-facing
+    // HTTP port, not the internal relay port (which is bound to loopback and
+    // unreachable externally). UPnP maps this port on the router and the relay
+    // URL uses it. See #641.
+    let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
+
+    let tier = nat_strategy.select_tier(http_bind_addr.port()).await?;
 
     let relay_url = match &tier {
         ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
@@ -2154,8 +2160,6 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
-
     // 5. Spawn periodic tier re-evaluation (§10.12.1, SCP-243).
     let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
         inner: Arc::clone(&did_method),
@@ -2176,7 +2180,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         publisher,
         bg_identity,
         document.clone(),
-        bound_addr.port(),
+        http_bind_addr.port(),
         relay_url.clone(),
         Some(tier_event_tx),
         TIER_REEVALUATION_INTERVAL,
