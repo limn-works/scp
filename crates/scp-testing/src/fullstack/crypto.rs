@@ -277,6 +277,18 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         groups.insert(*context_id, group);
+
+        // Track the creator as a member so commits from add_member are
+        // deposited for them in the exchange.
+        let mut members = self
+            .members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        members
+            .entry(*context_id)
+            .or_default()
+            .push(self.local_did.clone());
+
         Ok(())
     }
 

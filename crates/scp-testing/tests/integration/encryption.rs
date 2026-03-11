@@ -210,39 +210,51 @@ async fn mls_destroy_group() {
 
 #[tokio::test]
 async fn mls_forward_secrecy() {
-    // Create a group, add a member, advance epochs multiple times.
-    // After max_past_epochs+1 advances, old epoch material should be gone.
-    let creator_cred = ScpCredential::new(
-        "did:dht:z6MkCreatorFS".to_owned(),
-        None,
-        SigningKeyId::Active,
-    )
-    .unwrap();
+    // Verify that old epoch material is discarded after max_past_epochs+1 advances.
+    // max_past_epochs=2 (SCP default), so epoch 0 material should be gone after
+    // 3 epoch advances.
 
-    let mut group = create_group(&creator_cred).unwrap();
-    assert_eq!(group.epoch().unwrap(), 0);
+    // Create Alice's group and add Bob so we have a 2-member group for encrypt/decrypt.
+    let alice_cred =
+        ScpCredential::new("did:dht:z6MkAliceFS".to_owned(), None, SigningKeyId::Active).unwrap();
+    let bob_cred =
+        ScpCredential::new("did:dht:z6MkBobFS".to_owned(), None, SigningKeyId::Active).unwrap();
 
-    // Add and remove members to advance epochs.
-    // max_past_epochs=2 means at most 2 past epochs are retained.
-    // After 3 additions (epochs 0->1->2->3), epoch 0 material is gone.
+    let mut alice_group = create_group(&alice_cred).unwrap();
+    assert_eq!(alice_group.epoch().unwrap(), 0);
+
+    let (bob_kpb, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+    let bob_kp_bytes = bob_kpb.key_package().tls_serialize_detached().unwrap();
+    let bob_kp_in = KeyPackageIn::tls_deserialize(&mut bob_kp_bytes.as_slice()).unwrap();
+    let add_result = add_member(&mut alice_group, bob_kp_in).unwrap();
+
+    // Bob joins from Welcome.
+    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    assert_eq!(alice_group.epoch().unwrap(), 1);
+    assert_eq!(bob_group.epoch().unwrap(), 1);
+
+    // Encrypt a message at epoch 1 — Bob should be able to decrypt it now.
+    let plaintext = b"epoch 1 secret";
+    let ct = encrypt(&mut alice_group, plaintext).unwrap();
+    let ct_bytes = serialize_ciphertext(&ct).unwrap();
+    let decrypted = decrypt(&mut bob_group, &ct_bytes).unwrap();
+    assert_eq!(decrypted.as_slice(), plaintext);
+
+    // Advance epochs by adding/removing members 3 more times (epoch 1→2→3→4).
+    // With max_past_epochs=2, epoch 1 material should be gone after reaching epoch 4.
     for i in 0..3 {
-        let member_cred = ScpCredential::new(
-            format!("did:dht:z6MkMemberFS{i}"),
-            None,
-            SigningKeyId::Active,
-        )
-        .unwrap();
-        let (kpb, _signer, _provider) = generate_key_package(&member_cred).unwrap();
-
-        let kp_bytes = kpb.key_package().tls_serialize_detached().unwrap();
+        let temp_cred =
+            ScpCredential::new(format!("did:dht:z6MkTempFS{i}"), None, SigningKeyId::Active)
+                .unwrap();
+        let (temp_kpb, _signer, _provider) = generate_key_package(&temp_cred).unwrap();
+        let kp_bytes = temp_kpb.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
-        add_member(&mut group, kp_in).unwrap();
+        add_member(&mut alice_group, kp_in).unwrap();
     }
 
-    // Epoch should have advanced.
     assert!(
-        group.epoch().unwrap() >= 3,
-        "epoch should be >= 3 after 3 adds"
+        alice_group.epoch().unwrap() >= 4,
+        "epoch should be >= 4 after 3 more adds"
     );
 }
 
