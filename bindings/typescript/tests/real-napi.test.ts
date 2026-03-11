@@ -478,14 +478,14 @@ if (bridge === null) {
     test("parses a discovery handle address", () => {
       const result = napi.discoveryParseAddress("alice@cooking-community");
       const parsed = JSON.parse(result);
-      expect(parsed.type).toBe("discovery_handle");
+      expect(parsed.type).toBe("DiscoveryHandle");
       expect(parsed.local_part).toBe("alice");
     });
 
     test("parses a domain handle address", () => {
       const result = napi.discoveryParseAddress("alice@example.com");
       const parsed = JSON.parse(result);
-      expect(parsed.type).toBe("domain_handle");
+      expect(parsed.type).toBe("DomainHandle");
       expect(parsed.local_part).toBe("alice");
       expect(parsed.domain).toBe("example.com");
     });

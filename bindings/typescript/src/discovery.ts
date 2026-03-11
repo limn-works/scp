@@ -19,7 +19,7 @@ import type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } f
 
 /** A parsed SCP address. */
 export interface ParsedAddress {
-  /** Address type: `"discovery_handle"`, `"domain_handle"`, `"attestation_handle"`, or `"unscoped"`. */
+  /** Address type: `"DiscoveryHandle"`, `"DomainHandle"`, `"AttestationHandle"`, or `"Unscoped"` (PascalCase per §22.11.3). */
   readonly type: string;
   /** Additional fields depend on the address type. */
   readonly [key: string]: unknown;
