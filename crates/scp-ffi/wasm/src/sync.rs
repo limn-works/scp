@@ -257,4 +257,20 @@ mod tests {
         let result = sync_classify_offline_custom(0.0, 100.0, -3600.0, 259_200.0);
         assert!(result.is_err(), "negative threshold should error");
     }
+
+    #[test]
+    fn classify_f64_min_boundary_errors() {
+        let result = sync_classify_offline(f64::MIN, 1_000_000.0);
+        assert!(result.is_err(), "f64::MIN should error");
+        let result2 = sync_classify_offline(0.0, f64::MIN);
+        assert!(result2.is_err(), "f64::MIN as now should error");
+    }
+
+    #[test]
+    fn classify_neg_infinity_boundary_errors() {
+        let result = sync_classify_offline(f64::NEG_INFINITY, 1_000_000.0);
+        assert!(result.is_err(), "NEG_INFINITY should error");
+        let result2 = sync_classify_offline(0.0, f64::NEG_INFINITY);
+        assert!(result2.is_err(), "NEG_INFINITY as now should error");
+    }
 }

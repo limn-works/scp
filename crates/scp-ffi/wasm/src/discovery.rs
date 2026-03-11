@@ -225,8 +225,16 @@ pub fn discovery_create_query(
         ));
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let max = max_results.map_or(20, |v| v.max(0.0) as u64);
+    let max = match max_results {
+        Some(v) if v < 0.0 => {
+            return Err(JsError::new(
+                "[SCP-VALID-7040] max_results must be non-negative",
+            ));
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(v) => v as u64,
+        None => 20,
+    };
 
     let result = serde_json::json!({
         "handle": handle,
@@ -402,5 +410,27 @@ mod tests {
     #[test]
     fn parse_scope_zero_width_space_fails() {
         assert!(discovery_parse_address("alice@scope\u{200B}zwsp".to_owned()).is_err());
+    }
+
+    #[test]
+    fn create_query_negative_max_results_errors() {
+        let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(-1.0));
+        assert!(result.is_err(), "negative max_results should error");
+    }
+
+    #[test]
+    fn create_query_neg_infinity_max_results_errors() {
+        let result = discovery_create_query(
+            Some("alice@photo".to_owned()),
+            None,
+            Some(f64::NEG_INFINITY),
+        );
+        assert!(result.is_err(), "NEG_INFINITY max_results should error");
+    }
+
+    #[test]
+    fn create_query_f64_min_max_results_errors() {
+        let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::MIN));
+        assert!(result.is_err(), "f64::MIN max_results should error");
     }
 }
