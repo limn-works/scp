@@ -1263,9 +1263,9 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use crate::runtime::context_manager;
+    use scp_core::context::ContextParams;
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
-    use scp_core::context::ContextParams;
     use scp_identity::DID;
 
     /// Verifies that `ContextManager::member_count` returns the live member
@@ -1288,7 +1288,10 @@ mod tests {
             .expect("create_context should succeed");
 
         let count = manager.member_count(&ctx_id).await.unwrap();
-        assert_eq!(count, 1, "newly created context should have exactly 1 member");
+        assert_eq!(
+            count, 1,
+            "newly created context should have exactly 1 member"
+        );
 
         let kp = KeyPackage::mock(DID("did:key:z6MkJoiner".to_owned()));
         manager
