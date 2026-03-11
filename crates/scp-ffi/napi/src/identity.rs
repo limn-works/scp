@@ -249,7 +249,7 @@ impl NapiIdentity {
     ///   crypto state).
     /// - `SCP-IDENT-1001`: Key generation or DHT publishing failed.
     ///
-    /// See §3.3 Key Rotation, ADR-006 Key Management.
+    /// See §3.9 Key Lifecycle, ADR-003 DID Creation.
     #[napi]
     pub async fn rotate_key(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
@@ -955,7 +955,7 @@ pub async fn identity_verify_device_attestation(
 
 #[cfg(test)]
 #[cfg(feature = "allow_in_memory_custody")]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1111,6 +1111,113 @@ mod tests {
             rotated.custody_type(),
             "in_memory",
             "custody type must remain in_memory after rotation"
+        );
+    }
+
+    #[test]
+    fn rotate_key_errors_without_retained_crypto_state() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        // Construct a NapiIdentity with no scp_identity and no in_memory_custody,
+        // simulating an externally loaded identity with no retained key material.
+        let identity = NapiIdentity {
+            inner: Arc::new(NapiIdentityInner {
+                did: "did:dht:z6MkTest".to_owned(),
+                custody_type: "external".to_owned(),
+                scp_identity: None,
+                in_memory_custody: None,
+                document: None,
+            }),
+        };
+        increment_handle_count();
+
+        let Err(err) = rt.block_on(identity.rotate_key()) else {
+            panic!("rotate_key must fail without retained crypto state")
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1007"),
+            "error must contain SCP-IDENT-1007, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rotate_key_twice_produces_two_retired_keys_and_distinct_active_keys() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, initial_active_key) = rt.block_on(create_test_identity());
+
+        // First rotation.
+        let rotated_1 = rt
+            .block_on(identity.rotate_key())
+            .expect("first rotate_key must succeed");
+
+        let doc_1 = rotated_1
+            .inner
+            .document
+            .as_ref()
+            .expect("first rotated identity must have a document");
+        let active_key_1 = doc_1
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.ends_with("#active"))
+            .expect("first rotated document must have #active")
+            .public_key_multibase
+            .clone();
+
+        // Second rotation — uses the Arc-shared custody from the first rotation.
+        let rotated_2 = rt
+            .block_on(rotated_1.rotate_key())
+            .expect("second rotate_key must succeed");
+
+        let doc_2 = rotated_2
+            .inner
+            .document
+            .as_ref()
+            .expect("second rotated identity must have a document");
+        let active_key_2 = doc_2
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.ends_with("#active"))
+            .expect("second rotated document must have #active")
+            .public_key_multibase
+            .clone();
+
+        // All three active keys must be distinct.
+        assert_ne!(
+            initial_active_key, active_key_1,
+            "first rotation must produce a new active key"
+        );
+        assert_ne!(
+            active_key_1, active_key_2,
+            "second rotation must produce a new active key"
+        );
+        assert_ne!(
+            initial_active_key, active_key_2,
+            "second rotation active key must differ from initial"
+        );
+
+        // Two retired keys must be present after two rotations.
+        let retired_keys: Vec<_> = doc_2
+            .verification_method
+            .iter()
+            .filter(|vm| vm.id.contains("#retired-"))
+            .collect();
+        assert_eq!(
+            retired_keys.len(),
+            2,
+            "two rotations must produce exactly 2 retired keys, got {}",
+            retired_keys.len()
+        );
+
+        // Verify Arc custody sharing: both rotated identities share the same
+        // underlying InMemoryKeyCustody instance via Arc.
+        assert!(
+            Arc::ptr_eq(
+                rotated_1.inner.in_memory_custody.as_ref().expect("custody"),
+                rotated_2.inner.in_memory_custody.as_ref().expect("custody"),
+            ),
+            "rotated identities must share the same Arc<InMemoryKeyCustody>"
         );
     }
 }
