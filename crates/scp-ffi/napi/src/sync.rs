@@ -12,6 +12,8 @@ use napi_derive::napi;
 
 use scp_core::sync::{OfflineTier, SyncPolicy, classify_offline_duration};
 
+use crate::error::ScpNapiError;
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
@@ -38,21 +40,37 @@ pub struct NapiSyncPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Validates that an i64 timestamp is non-negative and returns it as u64.
+fn validate_non_negative_timestamp(value: i64, name: &str) -> napi::Result<u64> {
+    if value < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("{name} must be non-negative, got {value}"),
+            code: "SCP-VALID-7040".to_owned(),
+        }));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Ok(value as u64)
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
 /// Classifies an offline duration into the appropriate recovery tier.
 ///
 /// Returns `"short"`, `"extended"`, or `"long"`.
-#[must_use]
 #[napi]
-pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> String {
-    #[allow(clippy::cast_sign_loss)]
-    match classify_offline_duration(last_relay_contact as u64, now as u64) {
+pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> napi::Result<String> {
+    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
+    let current = validate_non_negative_timestamp(now, "now")?;
+    Ok(match classify_offline_duration(last, current) {
         OfflineTier::Short => "short".to_string(),
         OfflineTier::Extended => "extended".to_string(),
         OfflineTier::Long => "long".to_string(),
-    }
+    })
 }
 
 /// Returns the default sync policy parameters.
@@ -77,25 +95,27 @@ pub fn sync_get_policy() -> NapiSyncPolicy {
 /// Classifies an offline duration using custom policy thresholds.
 ///
 /// Returns `"short"`, `"extended"`, or `"long"`.
-#[must_use]
 #[napi]
 pub fn sync_classify_offline_custom(
     last_relay_contact: i64,
     now: i64,
     tier_1_threshold_secs: i64,
     tier_2_threshold_secs: i64,
-) -> String {
-    #[allow(clippy::cast_sign_loss)]
-    let policy = SyncPolicy::default()
-        .with_tier_1_threshold_secs(tier_1_threshold_secs as u64)
-        .with_tier_2_threshold_secs(tier_2_threshold_secs as u64);
+) -> napi::Result<String> {
+    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
+    let current = validate_non_negative_timestamp(now, "now")?;
+    let t1 = validate_non_negative_timestamp(tier_1_threshold_secs, "tier_1_threshold_secs")?;
+    let t2 = validate_non_negative_timestamp(tier_2_threshold_secs, "tier_2_threshold_secs")?;
 
-    #[allow(clippy::cast_sign_loss)]
-    match policy.classify_offline_duration(last_relay_contact as u64, now as u64) {
+    let policy = SyncPolicy::default()
+        .with_tier_1_threshold_secs(t1)
+        .with_tier_2_threshold_secs(t2);
+
+    Ok(match policy.classify_offline_duration(last, current) {
         OfflineTier::Short => "short".to_string(),
         OfflineTier::Extended => "extended".to_string(),
         OfflineTier::Long => "long".to_string(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -109,17 +129,23 @@ mod tests {
 
     #[test]
     fn classify_short_offline() {
-        assert_eq!(sync_classify_offline(1_000_000, 1_003_600), "short");
+        assert_eq!(
+            sync_classify_offline(1_000_000, 1_003_600).unwrap(),
+            "short"
+        );
     }
 
     #[test]
     fn classify_extended_offline() {
-        assert_eq!(sync_classify_offline(1_000_000, 1_100_000), "extended");
+        assert_eq!(
+            sync_classify_offline(1_000_000, 1_100_000).unwrap(),
+            "extended"
+        );
     }
 
     #[test]
     fn classify_long_offline() {
-        assert_eq!(sync_classify_offline(1_000_000, 2_000_000), "long");
+        assert_eq!(sync_classify_offline(1_000_000, 2_000_000).unwrap(), "long");
     }
 
     #[test]
@@ -127,5 +153,31 @@ mod tests {
         let policy = sync_get_policy();
         assert_eq!(policy.tier_1_threshold_secs, 14_400);
         assert_eq!(policy.tier_2_threshold_secs, 604_800);
+    }
+
+    #[test]
+    fn classify_negative_last_relay_contact_errors() {
+        let result = sync_classify_offline(-1, 1_000_000);
+        assert!(result.is_err(), "negative last_relay_contact should error");
+    }
+
+    #[test]
+    fn classify_negative_now_errors() {
+        let result = sync_classify_offline(0, -1);
+        assert!(result.is_err(), "negative now should error");
+    }
+
+    #[test]
+    fn classify_i64_min_boundary_errors() {
+        let result = sync_classify_offline(i64::MIN, 1_000_000);
+        assert!(result.is_err(), "i64::MIN should error");
+        let result2 = sync_classify_offline(0, i64::MIN);
+        assert!(result2.is_err(), "i64::MIN as now should error");
+    }
+
+    #[test]
+    fn classify_custom_negative_threshold_errors() {
+        let result = sync_classify_offline_custom(0, 100, -3600, 259_200);
+        assert!(result.is_err(), "negative tier_1_threshold should error");
     }
 }

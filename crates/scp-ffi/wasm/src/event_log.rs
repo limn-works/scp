@@ -17,6 +17,27 @@ use crate::error::ScpWasmError;
 use crate::manager::with_manager;
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Validates that an f64 epoch value is non-negative and finite, returning it as u64.
+///
+/// Returns a [`ScpWasmError`] with `SCP-VALID-7040` if the value is negative, NaN,
+/// or infinite. Call sites convert to `JsValue` via `.map_err(|e| e.into_js().into())`.
+/// This separation allows native-target tests to exercise the validation logic
+/// without invoking wasm-bindgen.
+fn validate_non_negative_epoch(value: f64) -> Result<u64, ScpWasmError> {
+    if value < 0.0 || !value.is_finite() {
+        return Err(ScpWasmError::Validation {
+            message: format!("epoch must be non-negative, got {value}"),
+            code: "SCP-VALID-7040".to_owned(),
+        });
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(value as u64)
+}
+
+// ---------------------------------------------------------------------------
 // WasmEvent
 // ---------------------------------------------------------------------------
 
@@ -316,8 +337,8 @@ pub fn event_log_checkpoint(
         let (event_count, merkle_root_hex) =
             with_manager(|mgr| mgr.event_log_query(&context_id)).map_err(ScpWasmError::into_js)?;
 
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let epoch_u64 = epoch as u64;
+        let epoch_u64 =
+            validate_non_negative_epoch(epoch).map_err(|e| JsValue::from(e.into_js()))?;
 
         let timestamp_secs = crate::time::now_secs();
 
@@ -387,4 +408,69 @@ pub fn event_log_checkpoint(
             signing_payload_hash: payload_hex,
         }))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // validate_non_negative_epoch — returns ScpWasmError (no JsValue)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_epoch_accepts_zero() {
+        assert_eq!(validate_non_negative_epoch(0.0).unwrap(), 0);
+    }
+
+    #[test]
+    fn validate_epoch_accepts_positive() {
+        assert_eq!(validate_non_negative_epoch(42.0).unwrap(), 42);
+    }
+
+    #[test]
+    fn validate_epoch_rejects_negative() {
+        let result = validate_non_negative_epoch(-1.0);
+        assert!(result.is_err(), "negative epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_negative_infinity() {
+        let result = validate_non_negative_epoch(f64::NEG_INFINITY);
+        assert!(result.is_err(), "NEG_INFINITY epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_f64_min() {
+        let result = validate_non_negative_epoch(f64::MIN);
+        assert!(result.is_err(), "f64::MIN epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_nan() {
+        let result = validate_non_negative_epoch(f64::NAN);
+        assert!(result.is_err(), "NaN epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_positive_infinity() {
+        let result = validate_non_negative_epoch(f64::INFINITY);
+        assert!(result.is_err(), "INFINITY epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_error_contains_code() {
+        let result = validate_non_negative_epoch(-42.0);
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SCP-VALID-7040"),
+            "error should contain SCP-VALID-7040, got: {msg}"
+        );
+    }
 }

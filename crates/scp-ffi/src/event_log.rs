@@ -360,15 +360,35 @@ fn parse_event_query_filter(
             query_filter.sequence_end = Some(v.extract::<u64>()?);
         }
         if let Some(v) = f.get_item("after_timestamp")? {
+            let ts = v.extract::<f64>()?;
+            if ts < 0.0 || !ts.is_finite() {
+                return Err(ScpPyError::ValidationError {
+                    message: format!(
+                        "after_timestamp must be a finite non-negative value, got {ts}"
+                    ),
+                    code: "SCP-VALID-7040".to_owned(),
+                }
+                .into());
+            }
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             {
-                query_filter.timestamp_start = Some(v.extract::<f64>()? as u64);
+                query_filter.timestamp_start = Some(ts as u64);
             }
         }
         if let Some(v) = f.get_item("before_timestamp")? {
+            let ts = v.extract::<f64>()?;
+            if ts < 0.0 || !ts.is_finite() {
+                return Err(ScpPyError::ValidationError {
+                    message: format!(
+                        "before_timestamp must be a finite non-negative value, got {ts}"
+                    ),
+                    code: "SCP-VALID-7040".to_owned(),
+                }
+                .into());
+            }
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             {
-                query_filter.timestamp_end = Some(v.extract::<f64>()? as u64);
+                query_filter.timestamp_end = Some(ts as u64);
             }
         }
         if let Some(v) = f.get_item("limit")? {

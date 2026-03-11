@@ -42,7 +42,6 @@ use super::attestation::IdentityLinkAttestation;
 ///
 /// Controls who can see the identity's connections (contexts, contacts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub enum GraphVisibility {
     /// Graph is visible to anyone who resolves the identity's DID.
     Public,
@@ -58,7 +57,6 @@ pub enum GraphVisibility {
 ///
 /// Specifies what portion of the graph is visible to the granted DID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub enum VisibilityScope {
     /// Full graph — all contexts and contacts.
     Full,
@@ -72,7 +70,6 @@ pub enum VisibilityScope {
 ///
 /// Notifications can be configured globally, per-context, or per-DID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub enum NotificationScope {
     /// Global notification preference — applies to all contexts and DIDs
     /// unless overridden by a more specific scope.
@@ -87,7 +84,6 @@ pub enum NotificationScope {
 ///
 /// Controls the verbosity/urgency of notifications for a given scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub enum NotificationLevel {
     /// All notifications delivered.
     All,
@@ -103,7 +99,6 @@ pub enum NotificationLevel {
 ///
 /// Petnames can be assigned to either DIDs or context IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub enum PetnameTarget {
     /// A DID (person or agent).
     Did(DID),
@@ -125,7 +120,6 @@ pub enum PetnameTarget {
 /// **Serialization:** `MessagePack` (§17) with serde tagging. All timestamps
 /// are Unix milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub enum IdentityPrivateStateEvent {
     // -------------------------------------------------------------------
     // Block/Mute events (8)
@@ -845,6 +839,140 @@ mod tests {
             let decoded: NotificationScope = serde_json::from_str(&json).unwrap();
             assert_eq!(&decoded, scope);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // -----------------------------------------------------------------------
+
+    /// For unit-variant enums (`GraphVisibility`, `VisibilityScope`,
+    /// `NotificationLevel`), forward compatibility means the known variants
+    /// still deserialize correctly. Unknown variants are a breaking change
+    /// handled by version negotiation, not field tolerance.
+    #[test]
+    fn graph_visibility_known_variants_deserialize() {
+        for (json_str, expected) in [
+            ("\"Public\"", GraphVisibility::Public),
+            ("\"Contacts\"", GraphVisibility::Contacts),
+            ("\"Private\"", GraphVisibility::Private),
+        ] {
+            let decoded: GraphVisibility = serde_json::from_str(json_str).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn visibility_scope_known_variants_deserialize() {
+        for (json_str, expected) in [
+            ("\"Full\"", VisibilityScope::Full),
+            ("\"ContactsOnly\"", VisibilityScope::ContactsOnly),
+            ("\"ContextsOnly\"", VisibilityScope::ContextsOnly),
+        ] {
+            let decoded: VisibilityScope = serde_json::from_str(json_str).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn notification_level_known_variants_deserialize() {
+        for (json_str, expected) in [
+            ("\"All\"", NotificationLevel::All),
+            ("\"MentionsOnly\"", NotificationLevel::MentionsOnly),
+            ("\"DirectOnly\"", NotificationLevel::DirectOnly),
+            ("\"None\"", NotificationLevel::None),
+        ] {
+            let decoded: NotificationLevel = serde_json::from_str(json_str).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    /// `NotificationScope` has data variants (`PerContext`, `PerDID`). The
+    /// inner data of these variants must ignore unknown fields.
+    #[test]
+    fn notification_scope_per_context_ignores_unknown_fields() {
+        let scope = NotificationScope::PerContext("ctx-1".to_owned());
+        let json = serde_json::to_value(&scope).unwrap();
+        // Externally tagged: {"PerContext": "ctx-1"} — newtype, no inner object to inject into.
+        // Test that it still deserializes successfully.
+        let decoded: NotificationScope = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, scope);
+    }
+
+    /// `PetnameTarget` has data variants (`Did`, `Context`). These are
+    /// newtypes wrapping a single value, so there's no inner object to
+    /// inject extra fields into. Verify known variants still deserialize.
+    #[test]
+    fn petname_target_variants_deserialize() {
+        let did_target = PetnameTarget::Did(did("did:dht:z6MkA"));
+        let ctx_target = PetnameTarget::Context("ctx-1".to_owned());
+        for target in [&did_target, &ctx_target] {
+            let json = serde_json::to_value(target).unwrap();
+            let decoded: PetnameTarget = serde_json::from_value(json).unwrap();
+            assert_eq!(&decoded, target);
+        }
+    }
+
+    /// `IdentityPrivateStateEvent` has struct variants with named fields.
+    /// Unknown fields inside the variant's inner object must be ignored.
+    #[test]
+    fn identity_private_state_event_ignores_unknown_fields_in_variant() {
+        // BlockDID variant: {"BlockDID": {"target_did": "...", "timestamp": 1000}}
+        let event = IdentityPrivateStateEvent::BlockDID {
+            target_did: did("did:dht:z6MkA"),
+            timestamp: 1000,
+        };
+        let mut json = serde_json::to_value(&event).unwrap();
+        // Inject unknown field into the variant's inner object.
+        json.as_object_mut()
+            .unwrap()
+            .get_mut("BlockDID")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("future_field".into(), serde_json::json!("v2-data"));
+
+        let result = serde_json::from_value::<IdentityPrivateStateEvent>(json);
+        assert!(
+            result.is_ok(),
+            "variant inner data must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.event_type_name(), "BlockDID");
+        assert_eq!(decoded.timestamp(), 1000);
+    }
+
+    /// Test a second variant (`EnrollDevice`) to confirm the pattern holds
+    /// across the enum — different field shapes, same tolerance.
+    #[test]
+    fn identity_private_state_event_enroll_device_ignores_unknown_fields() {
+        let event = IdentityPrivateStateEvent::EnrollDevice {
+            device_id: "dev-001".to_owned(),
+            device_x25519_pubkey: vec![0xAA; 32],
+            device_name: "Test Device".to_owned(),
+            enrolled_at: 22000,
+        };
+        let mut json = serde_json::to_value(&event).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .get_mut("EnrollDevice")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "future_biometric_hash".into(),
+                serde_json::json!("sha256:abc"),
+            );
+
+        let result = serde_json::from_value::<IdentityPrivateStateEvent>(json);
+        assert!(
+            result.is_ok(),
+            "variant inner data must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.event_type_name(), "EnrollDevice");
+        assert_eq!(decoded.timestamp(), 22000);
     }
 
     // -----------------------------------------------------------------------

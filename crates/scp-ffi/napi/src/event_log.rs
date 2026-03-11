@@ -414,8 +414,7 @@ pub fn event_log_checkpoint(
 
         let context_id = handle.context_id();
         let sender_did = scp_identity::DID(identity.inner.did.clone());
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let epoch_u64 = epoch as u64;
+        let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(&context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
@@ -458,6 +457,20 @@ pub fn event_log_checkpoint(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Validates that an f64 epoch value is non-negative and returns it as u64.
+///
+/// Returns `napi::Error` with `SCP-VALID-7040` if the value is negative.
+fn validate_non_negative_epoch(epoch: f64) -> napi::Result<u64> {
+    if epoch < 0.0 || !epoch.is_finite() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("epoch must be non-negative, got {epoch}"),
+            code: "SCP-VALID-7040".to_owned(),
+        }));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(epoch as u64)
+}
 
 /// Decodes a hex string into a 32-byte hash.
 ///
@@ -558,5 +571,62 @@ mod tests {
     fn decode_hex_hash_rejects_empty_input() {
         let result = decode_hex_hash("");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_non_negative_epoch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_epoch_accepts_zero() {
+        assert_eq!(validate_non_negative_epoch(0.0).unwrap(), 0);
+    }
+
+    #[test]
+    fn validate_epoch_accepts_positive() {
+        assert_eq!(validate_non_negative_epoch(42.0).unwrap(), 42);
+    }
+
+    #[test]
+    fn validate_epoch_rejects_negative() {
+        let result = validate_non_negative_epoch(-1.0);
+        assert!(result.is_err(), "negative epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_negative_infinity() {
+        let result = validate_non_negative_epoch(f64::NEG_INFINITY);
+        assert!(result.is_err(), "NEG_INFINITY epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_f64_min() {
+        let result = validate_non_negative_epoch(f64::MIN);
+        assert!(result.is_err(), "f64::MIN epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_negative_error_contains_code() {
+        let result = validate_non_negative_epoch(-42.0);
+        let err = result.unwrap_err();
+        // The napi::Error's Display impl includes the reason string, which
+        // contains the SCP-VALID-7040 code from ScpNapiError::Validation.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SCP-VALID-7040"),
+            "error should contain SCP-VALID-7040, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_epoch_rejects_nan() {
+        let result = validate_non_negative_epoch(f64::NAN);
+        assert!(result.is_err(), "NaN epoch should error");
+    }
+
+    #[test]
+    fn validate_epoch_rejects_positive_infinity() {
+        let result = validate_non_negative_epoch(f64::INFINITY);
+        assert!(result.is_err(), "INFINITY epoch should error");
     }
 }

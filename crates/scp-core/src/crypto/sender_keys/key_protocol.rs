@@ -109,7 +109,6 @@ const NONCE_DEDUP_CAPACITY: usize = 10_000;
 ///
 /// Signature payload: `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE || signer_key_ref)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SenderKeyEpochAdvance {
     /// The DID of the sender who rotated their key.
     pub sender_did: String,
@@ -135,7 +134,6 @@ pub struct SenderKeyEpochAdvance {
 /// The responder rejects requests with duplicate nonces within a 5-minute
 /// window and echoes the nonce in the response for binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SenderKeyRequest {
     /// The DID of the member requesting the key.
     pub requester_did: String,
@@ -167,7 +165,6 @@ pub struct SenderKeyRequest {
 /// nonce from the corresponding [`SenderKeyRequest`] to bind the response to
 /// the originating request and prevent response substitution attacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SenderKeyResponse {
     /// The DID of the sender whose key is being distributed.
     pub sender_did: String,
@@ -195,7 +192,6 @@ pub struct SenderKeyResponse {
 /// Signature payload (via canonical hash):
 /// `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || context_id || blocker_did || blocked_did || signing_key_id || timestamp_BE)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BlockNotification {
     /// The type discriminator for deserialization.
     #[serde(rename = "type")]
@@ -3515,5 +3511,104 @@ mod tests {
         let store = SenderKeyStore::new();
         let dids = list_shadow_sender_key_dids(&store, "ctx-empty", "shadow:");
         assert!(dids.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sender_key_epoch_advance_ignores_unknown_fields() {
+        let advance = SenderKeyEpochAdvance {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 42,
+            signer_key_ref: SigningKeyId::Active,
+            signature: [0xAB; 64],
+        };
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&advance).unwrap()).unwrap();
+        map.insert("future_field".into(), "v2-data".into());
+        let result =
+            serde_json::from_value::<SenderKeyEpochAdvance>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.sender_did, "did:dht:alice");
+        assert_eq!(decoded.epoch, 42);
+    }
+
+    #[test]
+    fn sender_key_request_ignores_unknown_fields() {
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 7,
+            wrapping_pubkey: [0x11; 32],
+            nonce: [0x22; REQUEST_NONCE_SIZE],
+            timestamp: 1_700_000_000,
+            signature: [0x33; 64],
+        };
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        map.insert("future_field".into(), 42.into());
+        let result = serde_json::from_value::<SenderKeyRequest>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.requester_did, "did:dht:bob");
+        assert_eq!(decoded.epoch, 7);
+    }
+
+    #[test]
+    fn sender_key_response_ignores_unknown_fields() {
+        let response = SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 3,
+            hpke_sealed_key: [0x44; 60],
+            ephemeral_pubkey: [0x55; 32],
+            request_nonce: [0x66; REQUEST_NONCE_SIZE],
+        };
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        map.insert("future_field".into(), serde_json::json!({"nested": true}));
+        let result = serde_json::from_value::<SenderKeyResponse>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.sender_did, "did:dht:alice");
+        assert_eq!(decoded.epoch, 3);
+    }
+
+    #[test]
+    fn block_notification_ignores_unknown_fields() {
+        let notification = BlockNotification {
+            notification_type: "block_notification".to_owned(),
+            blocker: "did:dht:alice".to_owned(),
+            blocked: "did:dht:dave".to_owned(),
+            signing_key_id: SigningKeyId::Active,
+            timestamp: 1_700_000_000_000,
+            signature: [0x77; 64],
+        };
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&notification).unwrap()).unwrap();
+        map.insert("future_field".into(), "v2-data".into());
+        let result = serde_json::from_value::<BlockNotification>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.blocker, "did:dht:alice");
+        assert_eq!(decoded.blocked, "did:dht:dave");
     }
 }

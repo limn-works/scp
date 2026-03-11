@@ -17,6 +17,8 @@
 //!
 //! See ADR-002 in `.docs/adrs/phase-1.md` for the full outer envelope design.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -45,7 +47,6 @@ const fn default_outer_version() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
     /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.
     /// Used for deserialization routing — tells the recipient which version's
@@ -70,8 +71,22 @@ pub struct OuterEnvelope {
 
     /// The MLS-encrypted blob containing the serialized inner envelope.
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    ///
+    /// **Interaction with `#[serde(flatten)]` on `extensions`:** When
+    /// `flatten` is present, serde buffers all map entries before dispatching
+    /// to field deserializers. This means `serde_bounded_bytes` fires *after*
+    /// the full input has been buffered into memory. The pre-deserialization
+    /// `MAX_ENVELOPE_SIZE` check in [`OuterEnvelope::from_bytes`] is the
+    /// primary defense against oversized inputs; `serde_bounded_bytes` acts
+    /// as defense-in-depth for the individual field.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_blob: Vec<u8>,
+
+    /// Unknown fields from newer protocol versions, preserved for
+    /// forward compatibility per spec §13.5.1. Intermediaries (relays,
+    /// bridges) MUST NOT strip fields they do not recognize.
+    #[serde(flatten)]
+    pub extensions: HashMap<String, serde_json::Value>,
 }
 
 /// Constructs an outer envelope from its components.
@@ -113,6 +128,7 @@ pub fn create_outer_envelope(
         recipient_hint: recipient_hint.map(<[u8]>::to_vec),
         blob_ttl,
         encrypted_blob,
+        extensions: HashMap::new(),
     })
 }
 
@@ -132,7 +148,9 @@ impl OuterEnvelope {
     /// [`MAX_ENVELOPE_SIZE`] to reject obviously oversized inputs before the
     /// deserializer allocates memory (#347). Individual fields are further
     /// bounded by serde-level helpers (e.g., `serde_bounded_bytes` for
-    /// `encrypted_blob`).
+    /// `encrypted_blob`). Unknown extension fields are preserved
+    /// unconditionally per spec §13.5.1 (relays MUST NOT strip unknown
+    /// fields from outer envelopes).
     ///
     /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
     ///
@@ -517,6 +535,249 @@ mod tests {
         assert!(
             err_msg.contains("DeserializationFailed"),
             "should be DeserializationFailed at the limit, got: {err_msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn outer_envelope_ignores_unknown_fields() {
+        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        map.insert("future_protocol_field".into(), "v2-data".into());
+        let result = serde_json::from_value::<OuterEnvelope>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.routing_id, envelope.routing_id);
+        assert_eq!(decoded.blob_ttl, envelope.blob_ttl);
+    }
+
+    /// §13.5.1: `OuterEnvelope` MUST preserve unknown fields so intermediaries
+    /// (relays, bridges) don't strip fields from newer protocol versions.
+    #[test]
+    fn outer_envelope_preserves_unknown_fields_roundtrip() {
+        let envelope =
+            create_outer_envelope(&[0xBB; 32], Some(&[0xCC; 32]), 7200, vec![0xDE, 0xAD]).unwrap();
+
+        // Serialize to JSON, inject an unknown field.
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        map.insert(
+            "v2_routing_priority".into(),
+            serde_json::json!({"level": "high", "ttl_override": 9000}),
+        );
+
+        // Deserialize back — the unknown field should land in `extensions`.
+        let decoded: OuterEnvelope =
+            serde_json::from_value(serde_json::Value::Object(map)).unwrap();
+        assert_eq!(decoded.routing_id, envelope.routing_id);
+        assert_eq!(decoded.blob_ttl, 7200);
+        assert_eq!(decoded.encrypted_blob, vec![0xDE, 0xAD]);
+
+        // Verify the injected field survived in extensions.
+        assert!(
+            decoded.extensions.contains_key("v2_routing_priority"),
+            "unknown field must be preserved in extensions"
+        );
+        let ext = &decoded.extensions["v2_routing_priority"];
+        assert_eq!(ext["level"], "high");
+        assert_eq!(ext["ttl_override"], 9000);
+
+        // Re-serialize and verify the field is still present.
+        let reserialized: serde_json::Value = serde_json::to_value(&decoded).unwrap();
+        let reserialized_map = reserialized.as_object().unwrap();
+        assert!(
+            reserialized_map.contains_key("v2_routing_priority"),
+            "unknown field must survive serialize → deserialize → serialize roundtrip"
+        );
+    }
+
+    /// Finding 2: Full roundtrip — serialize → inject unknown → deserialize →
+    /// compare key fields.
+    #[test]
+    fn outer_envelope_roundtrip_with_unknown_field() {
+        let original =
+            create_outer_envelope(&[0xAA; 32], Some(&[0xDD; 32]), 3600, vec![0x42; 16]).unwrap();
+
+        // Serialize to JSON Value.
+        let mut json = serde_json::to_value(&original).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("future_version_hint".into(), serde_json::json!("scp/2.0"));
+
+        // Deserialize back.
+        let decoded: OuterEnvelope = serde_json::from_value(json).unwrap();
+
+        // Key fields match the original.
+        assert_eq!(decoded.version, original.version);
+        assert_eq!(decoded.routing_id, original.routing_id);
+        assert_eq!(decoded.recipient_hint, original.recipient_hint);
+        assert_eq!(decoded.blob_ttl, original.blob_ttl);
+        assert_eq!(decoded.encrypted_blob, original.encrypted_blob);
+
+        // Unknown field preserved.
+        assert_eq!(
+            decoded.extensions.get("future_version_hint"),
+            Some(&serde_json::json!("scp/2.0")),
+        );
+    }
+
+    /// #593-F1: Extensions must survive a `MessagePack` roundtrip — the actual wire
+    /// format. Previous tests only exercised JSON. This test proves that
+    /// `#[serde(flatten)]` extensions survive `rmp_serde` encode → decode.
+    #[test]
+    fn outer_envelope_extensions_survive_msgpack_roundtrip() {
+        // A wrapper struct that has all OuterEnvelope fields plus one extra.
+        // Serializing this to MessagePack simulates a newer protocol version
+        // adding a field that older versions don't know about.
+        #[derive(serde::Serialize)]
+        struct ExtendedOuterEnvelope {
+            version: u16,
+            #[serde(with = "serde_bytes")]
+            routing_id: Vec<u8>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            recipient_hint: Option<Vec<u8>>,
+            blob_ttl: u32,
+            #[serde(with = "serde_bytes")]
+            encrypted_blob: Vec<u8>,
+            /// Field unknown to the current `OuterEnvelope` definition.
+            v2_routing_priority: serde_json::Value,
+        }
+
+        let extended = ExtendedOuterEnvelope {
+            version: SCP_OUTER_ENVELOPE_VERSION,
+            routing_id: vec![0xBB; 32],
+            recipient_hint: Some(vec![0xCC; 32]),
+            blob_ttl: 7200,
+            encrypted_blob: vec![0xDE, 0xAD],
+            v2_routing_priority: serde_json::json!({"level": "high", "ttl_override": 9000}),
+        };
+
+        // Step 1: Serialize the extended struct to MessagePack (named fields).
+        let msgpack_bytes = rmp_serde::to_vec_named(&extended).unwrap();
+
+        // Step 2: Deserialize as the standard OuterEnvelope.
+        let decoded: OuterEnvelope = rmp_serde::from_slice(&msgpack_bytes).unwrap();
+
+        // Step 3: Known fields must be correct.
+        assert_eq!(decoded.version, SCP_OUTER_ENVELOPE_VERSION);
+        assert_eq!(decoded.routing_id, vec![0xBB; 32]);
+        assert_eq!(
+            decoded.recipient_hint.as_deref(),
+            Some(vec![0xCC; 32].as_slice())
+        );
+        assert_eq!(decoded.blob_ttl, 7200);
+        assert_eq!(decoded.encrypted_blob, vec![0xDE, 0xAD]);
+
+        // Step 4: The unknown field must survive in extensions.
+        assert!(
+            decoded.extensions.contains_key("v2_routing_priority"),
+            "unknown field must be preserved in extensions after msgpack roundtrip, got: {:?}",
+            decoded.extensions
+        );
+        let ext = &decoded.extensions["v2_routing_priority"];
+        assert_eq!(ext["level"], "high");
+        assert_eq!(ext["ttl_override"], 9000);
+
+        // Step 5: Re-serialize and re-deserialize — the extension must persist.
+        let re_encoded = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: OuterEnvelope = rmp_serde::from_slice(&re_encoded).unwrap();
+        assert!(
+            re_decoded.extensions.contains_key("v2_routing_priority"),
+            "unknown field must survive msgpack serialize → deserialize → serialize → deserialize"
+        );
+    }
+
+    /// §13.5.1: `from_bytes` preserves many extension keys unconditionally.
+    /// Relays MUST NOT strip unknown fields from outer envelopes.
+    #[test]
+    fn from_bytes_preserves_many_extension_keys() {
+        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+        let map = json.as_object_mut().unwrap();
+        for i in 0..64 {
+            map.insert(format!("ext_key_{i}"), serde_json::json!(i));
+        }
+
+        let tweaked: OuterEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(tweaked.extensions.len(), 64);
+        let bytes = tweaked.to_bytes().unwrap();
+
+        let result = OuterEnvelope::from_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "should preserve all extension keys per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let recovered = result.unwrap();
+        assert_eq!(
+            recovered.extensions.len(),
+            64,
+            "all 64 extension keys must survive roundtrip"
+        );
+    }
+
+    /// #593-F4: `serde_bounded_bytes` still fires on `encrypted_blob` even
+    /// when `#[serde(flatten)]` on `extensions` causes serde to buffer all
+    /// fields. Crafts a `MessagePack` map with `encrypted_blob` exceeding
+    /// `BOUNDED_BYTES_MAX` but within `MAX_ENVELOPE_SIZE`, verifying that
+    /// the per-field guard still rejects it.
+    #[test]
+    fn serde_bounded_bytes_fires_with_flatten_present() {
+        use crate::serde_util::{BOUNDED_BYTES_MAX, MAX_ENVELOPE_SIZE};
+
+        // Construct a valid msgpack map with the oversized blob.
+        // We use a helper struct to ensure correct serde_bytes encoding.
+        #[derive(serde::Serialize)]
+        struct OversizedEnvelope {
+            version: u16,
+            #[serde(with = "serde_bytes")]
+            routing_id: Vec<u8>,
+            blob_ttl: u32,
+            #[serde(with = "serde_bytes")]
+            encrypted_blob: Vec<u8>,
+        }
+
+        // Build a struct with an oversized encrypted_blob that's still
+        // within MAX_ENVELOPE_SIZE. BOUNDED_BYTES_MAX = 512 KiB,
+        // MAX_ENVELOPE_SIZE = 576 KiB. Use BOUNDED_BYTES_MAX + 1 bytes
+        // for the blob.
+        let oversized_blob = vec![0xAAu8; BOUNDED_BYTES_MAX + 1];
+
+        let crafted = OversizedEnvelope {
+            version: SCP_OUTER_ENVELOPE_VERSION,
+            routing_id: vec![0xBB; 32],
+            blob_ttl: 3600,
+            encrypted_blob: oversized_blob,
+        };
+        let bytes = rmp_serde::to_vec_named(&crafted).unwrap();
+
+        // Sanity: total size is within MAX_ENVELOPE_SIZE (the oversized blob
+        // is just over 512 KiB, but the total is under 576 KiB).
+        assert!(
+            bytes.len() <= MAX_ENVELOPE_SIZE,
+            "test expects total size within MAX_ENVELOPE_SIZE, got {}",
+            bytes.len()
+        );
+
+        // from_bytes should fail because serde_bounded_bytes rejects the
+        // oversized encrypted_blob.
+        let result = OuterEnvelope::from_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "serde_bounded_bytes should reject blob > BOUNDED_BYTES_MAX even with flatten"
+        );
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("DeserializationFailed"),
+            "should be DeserializationFailed from serde_bounded_bytes, got: {err_msg}"
         );
     }
 }
