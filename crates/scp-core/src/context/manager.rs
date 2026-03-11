@@ -6247,9 +6247,13 @@ impl ContextManager {
                     executor_did: executor_did.clone(),
                     resulting_epoch: *resulting_epoch,
                 },
-                // ProposalCreated and VoteCast are not expected from
-                // timeout processing; skip them if they appear.
-                _ => continue,
+                // These variants are not expected from timeout processing;
+                // listed explicitly so the compiler warns on new variants.
+                GovernanceEvent::ProposalCreated { .. }
+                | GovernanceEvent::VoteCast { .. }
+                | GovernanceEvent::DeadlockRecovery { .. }
+                | GovernanceEvent::ConflictDetected { .. }
+                | GovernanceEvent::ConflictResolved { .. } => continue,
             };
             ctx_events.push(ctx_event);
         }
