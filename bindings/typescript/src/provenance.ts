@@ -9,6 +9,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { safeJsonParse } from "./internal/json-utils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -86,7 +87,7 @@ export async function provenanceAttach(
       targetContextId,
       existingChainDepth,
     );
-    const record: ProvenanceRecord = JSON.parse(raw);
+    const record = safeJsonParse(raw, "provenanceAttach") as ProvenanceRecord;
     return record;
   } catch (error) {
     throw mapBridgeError(error);

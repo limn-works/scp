@@ -37,6 +37,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
+import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
 // Platform detection
@@ -557,7 +558,7 @@ export function createNativeBridge(): Bridge {
         eventType: e.eventType,
         actorDid: e.actorDid,
         timestamp: e.timestamp,
-        payload: JSON.parse(e.payloadJson) as Readonly<Record<string, unknown>>,
+        payload: safeJsonParse(e.payloadJson, "eventLogQuery") as Readonly<Record<string, unknown>>,
         sequence: e.sequence,
       }));
     },
@@ -578,7 +579,9 @@ export function createNativeBridge(): Bridge {
       return {
         verified: raw.verified,
         proofType: raw.proofType as "inclusion" | "absence",
-        details: JSON.parse(raw.detailsJson) as Readonly<Record<string, unknown>>,
+        details: safeJsonParse(raw.detailsJson, "eventLogVerify") as Readonly<
+          Record<string, unknown>
+        >,
       };
     },
 

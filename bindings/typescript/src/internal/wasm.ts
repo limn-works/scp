@@ -12,7 +12,7 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { TransportError, ValidationError } from "../errors";
+import { TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -35,6 +35,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
+import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
 // WASM module types
@@ -339,29 +340,6 @@ function getWasm(): WasmModule {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Safely parses a JSON string returned from the WASM bridge.
- *
- * Wraps `JSON.parse` in a try/catch so that malformed JSON from the WASM
- * layer produces a descriptive `ValidationError` instead of a raw
- * `SyntaxError`.
- *
- * @param json - The JSON string to parse.
- * @param functionName - The WASM bridge function that produced the JSON
- *   (used in the error message for debuggability).
- * @returns The parsed value.
- */
-function safeJsonParse(json: string, functionName: string): unknown {
-  try {
-    return JSON.parse(json);
-  } catch (err) {
-    throw new ValidationError(
-      `WASM bridge ${functionName} returned malformed JSON: ${err instanceof Error ? err.message : String(err)}`,
-      "SCP-VALID-7001",
-    );
-  }
-}
 
 /** Converts a Uint8Array to a base64 string for WASM boundary crossing. */
 function uint8ToBase64(bytes: Uint8Array): string {

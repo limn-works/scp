@@ -15,6 +15,7 @@ import { ContextError, mapBridgeError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
+import { safeJsonParse } from "./internal/json-utils";
 import type {
   BroadcastAdmissionPolicy,
   ContextParams,
@@ -237,7 +238,7 @@ export class Context implements AsyncDisposable {
         JSON.stringify(input),
         identity.did,
       );
-      return JSON.parse(resultJson) as unknown;
+      return safeJsonParse(resultJson, "toolInvoke") as unknown;
     } catch (error) {
       throw mapBridgeError(error);
     }
