@@ -257,7 +257,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                     message:
                         "invalid discovery_method 'shared_context:': context ID must not be empty"
                             .to_owned(),
-                    code: "SCP-VALID-7003".to_owned(),
+                    code: "SCP-VALID-7216".to_owned(),
                 }
                 .into());
             }
@@ -269,7 +269,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                 return Err(ScpNapiError::Validation {
                     message: "invalid discovery_method 'registry:': context ID must not be empty"
                         .to_owned(),
-                    code: "SCP-VALID-7003".to_owned(),
+                    code: "SCP-VALID-7216".to_owned(),
                 }
                 .into());
             }
@@ -280,7 +280,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                 "invalid discovery_method '{other}': expected 'none', \
                  'shared_context:<context_id>', or 'registry:<context_id>'"
             ),
-            code: "SCP-VALID-7003".to_owned(),
+            code: "SCP-VALID-7216".to_owned(),
         }
         .into()),
     }
