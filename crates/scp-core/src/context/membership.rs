@@ -345,6 +345,22 @@ pub enum ContextEvent {
         /// The MLS epoch after execution, if applicable.
         resulting_epoch: Option<u64>,
     },
+    /// A ceiling change notification was emitted (§5.3.2).
+    ///
+    /// All current members receive this when a `ModifyCeiling` governance
+    /// action is approved. The notification period must expire before the
+    /// new ceiling takes effect. Members may leave during the notification
+    /// period if they disagree with the proposed changes.
+    CeilingChangeNotification {
+        /// The capabilities in the proposed new ceiling.
+        new_capabilities: Vec<super::roles::Capability>,
+        /// Unix timestamp (seconds) when the notification period started.
+        notified_at: u64,
+        /// Unix timestamp (seconds) when the new ceiling takes effect.
+        effective_at: u64,
+        /// The governance proposal ID that approved this modification.
+        proposal_id: [u8; 32],
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
