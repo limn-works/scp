@@ -14,7 +14,7 @@
 #
 # Required repository secrets:
 #   CRATES_IO_TOKEN        — crates.io API token for publishing Rust crates
-#   NPM_TOKEN              — npm automation token for @scp/sdk and @scp/sdk-node
+#   NPM_TOKEN              — npm automation token for @limn-works/scp-ts
 #   APPLE_CERTIFICATE      — Base64-encoded Apple Developer ID certificate (.p12)
 #   APPLE_CERTIFICATE_PWD  — Password for the Apple certificate
 #   APPLE_TEAM_ID          — Apple Developer Team ID
@@ -34,7 +34,7 @@
 #
 # Required GitHub environment:
 #   PyPI uses Trusted Publishers (GitHub Actions OIDC) — no token needed.
-#   Configure at: https://pypi.org/manage/project/scp-sdk/settings/publishing/
+#   Configure at: https://pypi.org/manage/project/scp-python/settings/publishing/
 
 name: Release
 
@@ -92,7 +92,7 @@ jobs:
           restore-keys: conformance-
 
       - name: Run all workspace tests
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing
 
       # Conformance test suite runs against JSON fixtures.
       # When tests/conformance/ exists, run the dedicated conformance runner.
@@ -168,14 +168,13 @@ jobs:
             "scp-transport@${{ env.VERSION }}"
             "scp-platform@${{ env.VERSION }}"
             "scp-mcp@${{ env.VERSION }}"
-            "scp-sdk-python@${{ env.VERSION }}"
-            "scp-sdk-typescript@${{ env.VERSION }}"
-            "scp-sdk-node@${{ env.VERSION }}"
-            "scp-sdk-swift@${{ env.VERSION }}"
-            "scp-sdk-kotlin@${{ env.VERSION }}"
-            "scp-sdk-go@${{ env.VERSION }}"
-            "scp-sdk-csharp@${{ env.VERSION }}"
-            "scp-sdk-java@${{ env.VERSION }}"
+            "scp-python@${{ env.VERSION }}"
+            "scp-ts@${{ env.VERSION }}"
+            "scp-swift@${{ env.VERSION }}"
+            "scp-kt@${{ env.VERSION }}"
+            "scp-go@${{ env.VERSION }}"
+            "scp-csharp@${{ env.VERSION }}"
+            "scp-java@${{ env.VERSION }}"
           )
 
           for tag in "${TAGS[@]}"; do
@@ -380,7 +379,7 @@ jobs:
     # Uses Trusted Publishers (OIDC) — no token required
     environment:
       name: pypi
-      url: https://pypi.org/project/scp-sdk/${{ inputs.version }}/
+      url: https://pypi.org/project/scp-python/${{ inputs.version }}/
     steps:
       - name: Download all Python wheels
         uses: actions/download-artifact@v4
@@ -421,8 +420,8 @@ jobs:
           name: typescript-wasm
           path: bindings/typescript/pkg/
 
-      # @scp/sdk — WASM bundle for browsers
-      - name: Prepare @scp/sdk package
+      # @limn-works/scp-ts — WASM bundle for browsers
+      - name: Prepare @limn-works/scp-ts package
         run: |
           cd bindings/typescript/pkg
           # Inject version and scp-core pin into package.json
@@ -433,14 +432,14 @@ jobs:
                package.json > package.json.tmp && mv package.json.tmp package.json
           fi
 
-      - name: Publish @scp/sdk
+      - name: Publish @limn-works/scp-ts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd bindings/typescript/pkg
           npm publish --access public
 
-      # @scp/sdk-node — napi-rs native addon
+      # @limn-works/scp-ts-node — napi-rs native addon
       - name: Download napi artifacts
         uses: actions/download-artifact@v4
         with:
@@ -448,14 +447,14 @@ jobs:
           path: bindings/typescript-node/
           merge-multiple: true
 
-      - name: Prepare @scp/sdk-node package
+      - name: Prepare @limn-works/scp-ts-node package
         run: |
           cd bindings/typescript-node
           # Create package.json if build didn't generate one
           if [ ! -f package.json ]; then
             cat > package.json <<PKGJSON
           {
-            "name": "@scp/sdk-node",
+            "name": "@limn-works/scp-ts-node",
             "version": "${{ env.VERSION }}",
             "description": "SCP Protocol SDK — Node.js/Bun native addon (napi-rs)",
             "main": "index.js",
@@ -477,7 +476,7 @@ jobs:
           PKGJSON
           fi
 
-      - name: Publish @scp/sdk-node
+      - name: Publish @limn-works/scp-ts-node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -508,7 +507,7 @@ jobs:
           name: kotlin-aar
           path: kotlin-artifacts/
 
-      # Kotlin JVM JAR: com.limn:scp-sdk-kotlin
+      # Kotlin JVM JAR: works.limn:scp-kt
       - name: Publish Kotlin JVM JAR to Maven Central
         working-directory: bindings/kotlin
         env:
@@ -518,9 +517,9 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          ./gradlew :scp-sdk-kotlin:publishMavenJavaPublicationToSonatypeStagingRepository
+          ./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository
 
-      # Kotlin Android AAR: com.limn:scp-sdk-kotlin-android
+      # Kotlin Android AAR: works.limn:scp-kt-android
       - name: Publish Kotlin Android AAR to Maven Central
         working-directory: bindings/kotlin
         env:
@@ -530,7 +529,7 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          ./gradlew :scp-sdk-kotlin-android:publishReleasePublicationToSonatypeStagingRepository
+          ./gradlew :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository
 
   publish-spm:
     name: "Step 6f: Publish Swift Package (SPM)"
@@ -551,7 +550,7 @@ jobs:
             echo "::error::bindings/swift/Package.swift not found"
             exit 1
           fi
-          echo "SPM package will be available at tag scp-sdk-swift@${{ env.VERSION }}"
+          echo "SPM package will be available at tag scp-swift@${{ env.VERSION }}"
           echo "Consumers add: .package(url: \"https://github.com/limn/scp\", from: \"${{ env.VERSION }}\")"
 
   # ===========================================================================
@@ -654,11 +653,10 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
           echo "- crates.io: scp-platform, scp-core, scp-transport, scp-mcp" >> $GITHUB_STEP_SUMMARY
-          echo "- PyPI: scp-sdk" >> $GITHUB_STEP_SUMMARY
-          echo "- npm: @scp/sdk, @scp/sdk-node" >> $GITHUB_STEP_SUMMARY
-          echo "- Maven Central: com.limn:scp-sdk-kotlin, com.limn:scp-sdk-java" >> $GITHUB_STEP_SUMMARY
-          echo "- NuGet: Limn.Scp" >> $GITHUB_STEP_SUMMARY
+          echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
+          echo "- npm: @limn-works/scp-ts" >> $GITHUB_STEP_SUMMARY
+          echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY
           echo "- SPM: SCP (via GitHub Release)" >> $GITHUB_STEP_SUMMARY
-          echo "- Go: github.com/limn/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
+          echo "- Go: github.com/limn-works/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Re-run without dry-run to publish." >> $GITHUB_STEP_SUMMARY
