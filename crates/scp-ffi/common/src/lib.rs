@@ -20,3 +20,7 @@ mod resolvers;
 
 #[cfg(feature = "resolvers")]
 pub use resolvers::*;
+
+// Shared test helpers for FFI bridge tests (behind the `testing` feature).
+#[cfg(feature = "testing")]
+pub mod test_helpers;
