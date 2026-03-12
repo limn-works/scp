@@ -307,6 +307,9 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, "active");
         assert_eq!(result.platform, "discord");
+        // bridge_id must be a 64-char hex string (SHA-256 output per §12.2.1)
+        assert_eq!(result.bridge_id.len(), 64);
+        assert!(result.bridge_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
