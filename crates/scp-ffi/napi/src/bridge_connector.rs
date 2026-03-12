@@ -126,6 +126,14 @@ pub fn bridge_evaluate_trust(
 ///
 /// The `governance_did` must differ from `operator_did` — self-approval is
 /// forbidden per ADR-023.
+///
+/// # Errors
+///
+/// Returns a validation error if `operator_did` or `governance_did` is not a
+/// valid DID string (empty, missing `did:{method}:{id}` structure, or
+/// contains control characters), or if `mode` is not a recognized bridge mode.
+/// Returns a context error if the governance DID matches the operator DID
+/// (self-approval) or if registration fails.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bridge_register(
