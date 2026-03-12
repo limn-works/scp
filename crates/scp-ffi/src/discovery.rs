@@ -59,6 +59,24 @@ fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
     REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Removes a specific owner's petname map. Test-only — ensures each test starts
+/// with clean state even if a previous test panicked before manual cleanup.
+#[cfg(test)]
+fn reset_petname_map_for(owner_did: &str) {
+    if let Ok(mut guard) = petname_maps().lock() {
+        guard.remove(owner_did);
+    }
+}
+
+/// Removes a specific context's handle registry. Test-only — ensures each test starts
+/// with clean state even if a previous test panicked before manual cleanup.
+#[cfg(test)]
+fn reset_handle_registry_for(context_id: &str) {
+    if let Ok(mut guard) = handle_registries().lock() {
+        guard.remove(context_id);
+    }
+}
+
 /// A `HandleQuerier` implementation that queries the global in-memory handle registries.
 /// Used by `address_resolve` for the discovery context handle lookup layer.
 struct LocalHandleQuerier;
@@ -1400,50 +1418,45 @@ mod tests {
     #[test]
     fn petname_set_and_resolve_did() {
         let owner = "did:dht:zTestOwner1";
+        reset_petname_map_for(owner);
         let target = "did:dht:zAlice";
         py_petname_set(owner, target, "alice").unwrap();
 
         let dids = py_petname_resolve_did(owner, "alice").unwrap();
         assert_eq!(dids.len(), 1);
         assert_eq!(dids[0], target);
-
-        // Clean up global state
-        py_petname_remove(owner, target).unwrap();
     }
 
     #[test]
     fn petname_get_for_did_returns_name() {
         let owner = "did:dht:zTestOwner2";
+        reset_petname_map_for(owner);
         let target = "did:dht:zBob";
         py_petname_set(owner, target, "bob").unwrap();
 
         let name = py_petname_get_for_did(owner, target).unwrap();
         assert_eq!(name, Some("bob".to_owned()));
-
-        py_petname_remove(owner, target).unwrap();
     }
 
     #[test]
     fn petname_set_context_and_resolve() {
         let owner = "did:dht:zTestOwner3";
+        reset_petname_map_for(owner);
         py_petname_set_context(owner, "ctx-recipes", "recipes").unwrap();
 
         let ids = py_petname_resolve_context(owner, "recipes").unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "ctx-recipes");
-
-        py_petname_remove_context(owner, "ctx-recipes").unwrap();
     }
 
     #[test]
     fn petname_get_for_context_returns_name() {
         let owner = "did:dht:zTestOwner4";
+        reset_petname_map_for(owner);
         py_petname_set_context(owner, "ctx-work", "work").unwrap();
 
         let name = py_petname_get_for_context(owner, "ctx-work").unwrap();
         assert_eq!(name, Some("work".to_owned()));
-
-        py_petname_remove_context(owner, "ctx-work").unwrap();
     }
 
     #[test]
@@ -1457,6 +1470,7 @@ mod tests {
     #[test]
     fn handle_register_and_lookup() {
         let ctx = "ctx-handle-test-1";
+        reset_handle_registry_for(ctx);
         let target_json = r#"{"type": "identity", "did": "did:dht:zAlice"}"#;
         let result =
             py_handle_register(ctx, "alice", target_json, "did:dht:zAlice", None, None).unwrap();
@@ -1467,14 +1481,12 @@ mod tests {
         let lookup = py_handle_lookup(ctx, "alice", None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
-
-        // Clean up
-        py_handle_deregister(ctx, "alice", "did:dht:zAlice").unwrap();
     }
 
     #[test]
     fn handle_register_conflict() {
         let ctx = "ctx-handle-test-2";
+        reset_handle_registry_for(ctx);
         let target1 = r#"{"type": "identity", "did": "did:dht:zAlice"}"#;
         let target2 = r#"{"type": "identity", "did": "did:dht:zBob"}"#;
         py_handle_register(ctx, "alice", target1, "did:dht:zAlice", None, None).unwrap();
@@ -1482,14 +1494,12 @@ mod tests {
         let result = py_handle_register(ctx, "alice", target2, "did:dht:zBob", None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "conflict");
-
-        // Clean up
-        py_handle_deregister(ctx, "alice", "did:dht:zAlice").unwrap();
     }
 
     #[test]
     fn handle_deregister_removes_entry() {
         let ctx = "ctx-handle-test-3";
+        reset_handle_registry_for(ctx);
         let target = r#"{"type": "identity", "did": "did:dht:zCharlie"}"#;
         py_handle_register(ctx, "charlie", target, "did:dht:zCharlie", None, None).unwrap();
 
@@ -1505,6 +1515,7 @@ mod tests {
     #[test]
     fn handle_lookup_with_type_filter() {
         let ctx = "ctx-handle-test-4";
+        reset_handle_registry_for(ctx);
         let target = r#"{"type": "context", "context_id": "ctx-abc", "relay_urls": ["wss://relay.example.com"]}"#;
         py_handle_register(ctx, "recipes", target, "did:dht:zAdmin", None, None).unwrap();
 
@@ -1515,8 +1526,6 @@ mod tests {
         let context_lookup = py_handle_lookup(ctx, "recipes", Some("context")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context_lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
-
-        py_handle_deregister(ctx, "recipes", "did:dht:zAdmin").unwrap();
     }
 
     #[test]
@@ -1528,10 +1537,10 @@ mod tests {
 
     #[test]
     fn address_resolve_via_petname() {
+        let owner = "did:dht:zTestResolver1";
+        reset_petname_map_for(owner);
         // Initialize the tokio runtime required by PyO3 bridge functions
         crate::init_runtime().ok();
-
-        let owner = "did:dht:zTestResolver1";
         py_petname_set(owner, "did:dht:zAlice", "alice").unwrap();
 
         let result = py_address_resolve(owner, "alice", None).unwrap();
@@ -1540,8 +1549,6 @@ mod tests {
         assert_eq!(parsed[0]["type"], "Identity");
         assert_eq!(parsed[0]["did"], "did:dht:zAlice");
         assert_eq!(parsed[0]["trust_level"]["kind"], "LocalPetname");
-
-        py_petname_remove(owner, "did:dht:zAlice").unwrap();
     }
 
     // -- JSON conversion helper tests ----------------------------------------
