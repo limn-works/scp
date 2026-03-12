@@ -83,14 +83,16 @@ impl ZeroizingSigner {
         self.0.as_ref()
     }
 
-    /// Takes the inner `SignatureKeyPair` out, leaving `None`. The taken
-    /// value is wrapped in a local `ZeroizeOnDropGuard` so that zeroization
-    /// happens when the guard is dropped. Used by `destroy_group` for
+    /// Takes the inner `SignatureKeyPair` out, leaving `None`. Before
+    /// returning, the private key bytes are zeroized in-place via
+    /// [`zeroize_signature_key_pair`]. Used by `destroy_group` for
     /// eager cleanup.
     pub(crate) fn take(&mut self) -> Option<SignatureKeyPair> {
-        self.0.take().inspect(|skp| {
+        // Zeroize the private key bytes in-place before moving the value out.
+        if let Some(ref mut skp) = self.0 {
             zeroize_signature_key_pair(skp);
-        })
+        }
+        self.0.take()
     }
 }
 
@@ -104,7 +106,7 @@ impl Deref for ZeroizingSigner {
 
 impl Drop for ZeroizingSigner {
     fn drop(&mut self) {
-        if let Some(ref skp) = self.0 {
+        if let Some(ref mut skp) = self.0 {
             zeroize_signature_key_pair(skp);
         }
     }
@@ -132,24 +134,33 @@ impl Drop for ZeroizingSigner {
 ///
 /// This is the sole `unsafe` exception in `scp-core`. See issue #601 and the
 /// `#![deny(unsafe_code)]` comment in `lib.rs`.
+///
+/// # Why not a separate release-mode test?
+///
+/// The `zeroize` crate's `Zeroize` impl for `[u8]` uses `volatile_set` (which
+/// compiles to `write_volatile` + a compiler fence). This prevents the compiler
+/// from eliding the zeroing write regardless of optimization level. A separate
+/// `--release` test would assert the same thing the `zeroize` crate already
+/// guarantees and tests upstream. The existing debug-mode test validates our
+/// offset assumption and that zeroization occurs; `write_volatile` guarantees
+/// it survives optimization.
 #[allow(unsafe_code)]
-fn zeroize_signature_key_pair(skp: &SignatureKeyPair) {
-    // SAFETY: We cast the `&SignatureKeyPair` to a pointer to its first field,
-    // `private: Vec<u8>`. The field layout is verified by tests. We obtain a
-    // mutable slice to the Vec's heap buffer and overwrite it with zeros.
-    // This is safe because:
+fn zeroize_signature_key_pair(skp: &mut SignatureKeyPair) {
+    // SAFETY: We cast the `&mut SignatureKeyPair` to a pointer to its first
+    // field, `private: Vec<u8>`. The field layout is verified by tests. We
+    // obtain a mutable slice to the Vec's heap buffer and overwrite it with
+    // zeros. This is safe because:
     //   1. The `Vec<u8>` at offset 0 is valid and initialized (struct is alive).
     //   2. We only write zeros — no reads of uninitialized memory.
-    //   3. The borrow of `skp` prevents concurrent access.
+    //   3. The `&mut` borrow guarantees exclusive access.
     //   4. We zeroize before `Vec::drop` deallocates the buffer.
     unsafe {
-        let private_ptr: *const Vec<u8> =
-            std::ptr::from_ref::<SignatureKeyPair>(skp).cast::<Vec<u8>>();
+        let private_ptr: *mut Vec<u8> =
+            std::ptr::from_mut::<SignatureKeyPair>(skp).cast::<Vec<u8>>();
         // Get the Vec's buffer pointer and length without taking ownership.
         let buf_ptr = (*private_ptr).as_ptr();
         let buf_len = (*private_ptr).len();
         if buf_len > 0 {
-            // Cast to *mut and overwrite with zeros.
             let buf_mut = buf_ptr.cast_mut();
             let slice = core::slice::from_raw_parts_mut(buf_mut, buf_len);
             slice.zeroize();
@@ -971,7 +982,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used, unsafe_code)]
     fn zeroize_offset_is_correct_and_zeroes_private_key() {
-        let skp = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let mut skp = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
 
         // Via the test-utils accessor, confirm the private key is non-zero.
         let private_bytes = skp.private().to_vec();
@@ -993,7 +1004,7 @@ mod tests {
         );
 
         // Now zeroize and verify the private key bytes are all zeros.
-        zeroize_signature_key_pair(&skp);
+        zeroize_signature_key_pair(&mut skp);
 
         let after_zeroize = skp.private().to_vec();
         assert!(
