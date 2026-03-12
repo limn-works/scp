@@ -2000,7 +2000,18 @@ impl WasmContextManager {
         if let Some(bc) = ctx.broadcast.as_mut() {
             bc.subscribers.remove(did);
             // Governance ban (§5.14.8 step 3): add to ALL authors' block lists.
-            for block_list in bc.authors.values_mut() {
+            // Enforce the same per-author cap as individual blocking to prevent
+            // unbounded memory growth via repeated governance bans.
+            for (author_did, block_list) in &mut bc.authors {
+                if block_list.len() >= WASM_BLOCK_LIST_CAP {
+                    return Err(ScpWasmError::Validation {
+                        message: format!(
+                            "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
+                             for author '{author_did}' during governance ban"
+                        ),
+                        code: "SCP-VALID-7301".to_owned(),
+                    });
+                }
                 block_list.insert(did.to_owned());
             }
             // §5.14.8 step 4: mandatory key rotation — increment ALL authors'
@@ -3367,7 +3378,7 @@ pub struct ContextMetadata {
 // ---------------------------------------------------------------------------
 
 /// Current version of the WASM context export format.
-const WASM_EXPORT_VERSION: u32 = 1;
+const WASM_EXPORT_VERSION: u32 = 2;
 
 /// Versioned envelope for context exports.
 ///
@@ -3460,6 +3471,9 @@ struct WasmExportMember {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmExportBroadcast {
     /// Author DIDs mapped to their per-author block lists (§5.14.8).
+    /// Defaults to empty map for backward compat with v1 exports that used
+    /// flat `authors: Vec<String>` (per-author blocking did not exist in v1).
+    #[serde(default)]
     author_block_lists: HashMap<String, Vec<String>>,
     /// Per-author key epochs (§5.14.8). Tracks how many times each author
     /// has rotated their broadcast key due to block events.
@@ -4090,6 +4104,23 @@ mod tests {
         assert!(export.key_epochs.is_empty());
     }
 
+    #[test]
+    fn export_broadcast_defaults_missing_author_block_lists() {
+        // v1 exports did not have `author_block_lists` (they had a flat
+        // `authors: Vec<String>` and `blocked_subscribers`). Verify that
+        // deserializing without `author_block_lists` yields an empty map
+        // via #[serde(default)].
+        let json = r#"{"subscribers":["sub1"],"admission":"open"}"#;
+        let export: WasmExportBroadcast = serde_json::from_str(json).unwrap();
+        assert!(export.author_block_lists.is_empty());
+        assert_eq!(export.subscribers, vec!["sub1"]);
+    }
+
+    #[test]
+    fn export_version_is_two() {
+        assert_eq!(WASM_EXPORT_VERSION, 2);
+    }
+
     // -----------------------------------------------------------------------
     // Key epoch tests (§5.14.8)
     //
@@ -4221,6 +4252,54 @@ mod tests {
         assert_eq!(json["type"], "keyEpochAdvance");
         assert_eq!(json["sender_did"], "did:dht:zauthor");
         assert_eq!(json["epoch"], 42);
+    }
+
+    #[test]
+    fn governance_ban_enforces_block_list_cap() {
+        let mut bc = make_broadcast(&["author-a", "author-b"], &[]);
+
+        // Fill author-a's block list to exactly WASM_BLOCK_LIST_CAP.
+        for i in 0..WASM_BLOCK_LIST_CAP {
+            bc.authors
+                .get_mut("author-a")
+                .unwrap()
+                .insert(format!("did:dht:zfiller{i}"));
+        }
+        assert_eq!(bc.authors["author-a"].len(), WASM_BLOCK_LIST_CAP);
+        // author-b is still empty.
+        assert!(bc.authors["author-b"].is_empty());
+
+        // Simulate governance ban with cap enforcement (mirrors
+        // dispatch_revoke_read_access). The ban should fail because
+        // author-a's block list is at capacity.
+        let result: Result<(), ScpWasmError> = (|| {
+            for (author_did, block_list) in &mut bc.authors {
+                if block_list.len() >= WASM_BLOCK_LIST_CAP {
+                    return Err(ScpWasmError::Validation {
+                        message: format!(
+                            "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
+                             for author '{author_did}' during governance ban"
+                        ),
+                        code: "SCP-VALID-7301".to_owned(),
+                    });
+                }
+                block_list.insert("did:dht:zbanned".to_owned());
+            }
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            ScpWasmError::Validation { code, message } => {
+                assert_eq!(code, "SCP-VALID-7301");
+                assert!(
+                    message.contains("during governance ban"),
+                    "expected 'during governance ban' in message, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
     }
 
     #[test]
