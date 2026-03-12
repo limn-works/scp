@@ -1993,6 +1993,57 @@ mod wasm_ucan_mirror {
             });
         format!("did:key:{hex_str}")
     }
+
+    // -----------------------------------------------------------------------
+    // Nonce format validation (verbatim from scp-ffi-wasm/src/ucan.rs)
+    //
+    // Mirrors `validate_nonce_format_and_freshness`. The WASM bridge validates
+    // format and freshness inline (steps 1-2 of ADR-016 §7.2 nonce validation).
+    // Uniqueness (step 3) is handled separately by WasmContextManager.
+    // -----------------------------------------------------------------------
+
+    /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+    /// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
+    const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+
+    /// Validates UCAN nonce format and freshness, matching scp-core's
+    /// `NonceTracker::check_and_record` (steps 1-2).
+    ///
+    /// Format: `{unix_millis_timestamp}-{32_hex_chars}` (ADR-016 §7.2).
+    /// Freshness: timestamp within now +/- 5 minutes (spec §9.14).
+    ///
+    /// Verbatim from `scp-ffi-wasm/src/ucan.rs`.
+    pub fn validate_nonce_format_and_freshness(nonce: &str, now_millis: u64) -> Result<(), String> {
+        if nonce.is_empty() {
+            return Err("nonce is empty".to_owned());
+        }
+
+        // 1. Format: split into timestamp and hex suffix.
+        let (ts_part, hex_part) = nonce
+            .split_once('-')
+            .ok_or_else(|| format!("nonce format invalid: missing '-' separator in '{nonce}'"))?;
+
+        let nonce_millis: u64 = ts_part
+            .parse()
+            .map_err(|_| format!("nonce format invalid: non-numeric timestamp in '{ts_part}'"))?;
+
+        if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "nonce format invalid: expected 32 hex chars suffix, got '{hex_part}'"
+            ));
+        }
+
+        // 2. Freshness: timestamp within now +/- 5 minutes.
+        if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now_millis {
+            return Err(format!("nonce too old: {nonce}"));
+        }
+
+        if nonce_millis > now_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
+            return Err(format!("nonce too far in the future: {nonce}"));
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2966,6 +3017,408 @@ fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
         "core and WASM produce different revocation CIDs for the same JWT string \
          — cross-bridge revocation will fail silently"
     );
+}
+
+// ===========================================================================
+// UCAN nonce format validation conformance (#785)
+//
+// The WASM bridge's `validate_nonce_format_and_freshness` in `ucan.rs`
+// re-implements scp-core's `NonceTracker::check_and_record` nonce format and
+// freshness checks (steps 1-2 of ADR-016 §7.2). These tests cross-validate
+// that both implementations accept and reject identical inputs identically.
+//
+// Spec: ADR-016 step 9, spec §9.14
+// ===========================================================================
+
+/// Helper: create a nonce string with given millis timestamp and hex suffix.
+fn make_nonce(millis: u64, hex: &str) -> String {
+    format!("{millis}-{hex}")
+}
+
+/// Runs a nonce through both the WASM mirror and scp-core's NonceTracker,
+/// returning (wasm_result, core_result) for comparison.
+fn validate_nonce_both(
+    nonce: &str,
+    now_secs: u64,
+    token_expiry: u64,
+) -> (
+    Result<(), String>,
+    Result<(), scp_core::crypto::ucan::UcanError>,
+) {
+    use scp_identity::cache::TestClock;
+    use std::sync::Arc;
+
+    let now_millis = u64::from(now_secs) * 1000;
+
+    // WASM mirror: validate format and freshness.
+    let wasm_result = wasm_ucan_mirror::validate_nonce_format_and_freshness(nonce, now_millis);
+
+    // scp-core: validate via NonceTracker::check_and_record.
+    let clock = Arc::new(TestClock::new(now_secs));
+    let mut tracker =
+        scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-conformance".to_owned(), clock);
+    let core_result = tracker.check_and_record(nonce, token_expiry);
+
+    (wasm_result, core_result)
+}
+
+// ---------------------------------------------------------------------------
+// Format validation: both reject the same malformed nonces
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_format_missing_separator_rejected_by_both() {
+    let (wasm, core) = validate_nonce_both("noseparator", 1_704_067_200, 0);
+    assert!(wasm.is_err(), "WASM should reject nonce without separator");
+    assert!(core.is_err(), "core should reject nonce without separator");
+}
+
+#[test]
+fn nonce_format_empty_rejected_by_both() {
+    let (wasm, core) = validate_nonce_both("", 1_704_067_200, 0);
+    assert!(wasm.is_err(), "WASM should reject empty nonce");
+    // scp-core: empty string has no '-' separator → NonceFormatInvalid.
+    assert!(core.is_err(), "core should reject empty nonce");
+}
+
+#[test]
+fn nonce_format_non_numeric_timestamp_rejected_by_both() {
+    let nonce = "notanumber-aabbccdd11223344aabbccdd11223344";
+    let (wasm, core) = validate_nonce_both(nonce, 1_704_067_200, 0);
+    assert!(wasm.is_err(), "WASM should reject non-numeric timestamp");
+    assert!(core.is_err(), "core should reject non-numeric timestamp");
+}
+
+#[test]
+fn nonce_format_hex_too_short_rejected_by_both() {
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(now_secs * 1000, "aabbccdd112233"); // 14 hex chars
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_err(), "WASM should reject hex suffix too short");
+    assert!(core.is_err(), "core should reject hex suffix too short");
+}
+
+#[test]
+fn nonce_format_hex_too_long_rejected_by_both() {
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(now_secs * 1000, "aabbccdd11223344aabbccdd11223344ff"); // 34 hex chars
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_err(), "WASM should reject hex suffix too long");
+    assert!(core.is_err(), "core should reject hex suffix too long");
+}
+
+#[test]
+fn nonce_format_non_hex_chars_rejected_by_both() {
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(now_secs * 1000, "gghhiidd11223344aabbccdd11223344"); // 'g','h','i' not hex
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_err(), "WASM should reject non-hex chars");
+    assert!(core.is_err(), "core should reject non-hex chars");
+}
+
+#[test]
+fn nonce_format_multiple_hyphens_rejected_by_both() {
+    // Multiple hyphens: split_once takes the first, leaving extra in hex_part.
+    // Result: hex_part = "extra-aabbccdd11223344aabbccdd11223344" (37 chars) → format error.
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = format!("{}-extra-aabbccdd11223344aabbccdd11223344", now_secs * 1000);
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_err(), "WASM should reject multi-hyphen nonce");
+    assert!(core.is_err(), "core should reject multi-hyphen nonce");
+}
+
+// ---------------------------------------------------------------------------
+// Valid nonce format: both accept
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_valid_format_accepted_by_both() {
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(now_secs * 1000, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_ok(), "WASM should accept valid nonce: {wasm:?}");
+    assert!(core.is_ok(), "core should accept valid nonce: {core:?}");
+}
+
+#[test]
+fn nonce_uppercase_hex_accepted_by_both() {
+    // Both use is_ascii_hexdigit which accepts upper and lower case.
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(now_secs * 1000, "AABBCCDD11223344AABBCCDD11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_ok(), "WASM should accept uppercase hex: {wasm:?}");
+    assert!(core.is_ok(), "core should accept uppercase hex: {core:?}");
+}
+
+#[test]
+fn nonce_mixed_case_hex_accepted_by_both() {
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(now_secs * 1000, "AaBbCcDd11223344aAbBcCdD11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_ok(), "WASM should accept mixed-case hex: {wasm:?}");
+    assert!(core.is_ok(), "core should accept mixed-case hex: {core:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Freshness: boundary conditions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_exactly_at_past_boundary_accepted_by_both() {
+    // Exactly 5 minutes (300_000ms) in the past — should be accepted.
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis - 5 * 60 * 1000; // exactly at boundary
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(
+        wasm.is_ok(),
+        "WASM should accept nonce at exact past boundary: {wasm:?}"
+    );
+    assert!(
+        core.is_ok(),
+        "core should accept nonce at exact past boundary: {core:?}"
+    );
+}
+
+#[test]
+fn nonce_exactly_at_future_boundary_accepted_by_both() {
+    // Exactly 5 minutes (300_000ms) in the future — should be accepted.
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis + 5 * 60 * 1000; // exactly at boundary
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(
+        wasm.is_ok(),
+        "WASM should accept nonce at exact future boundary: {wasm:?}"
+    );
+    assert!(
+        core.is_ok(),
+        "core should accept nonce at exact future boundary: {core:?}"
+    );
+}
+
+#[test]
+fn nonce_just_past_past_boundary_rejected_by_both() {
+    // 5 minutes + 1 second (301_000ms) in the past — should be rejected.
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis - (5 * 60 * 1000 + 1000);
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(
+        wasm.is_err(),
+        "WASM should reject nonce just past 5-min boundary"
+    );
+    assert!(
+        core.is_err(),
+        "core should reject nonce just past 5-min boundary"
+    );
+}
+
+#[test]
+fn nonce_just_past_future_boundary_rejected_by_both() {
+    // 5 minutes + 1 second (301_000ms) in the future — should be rejected.
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis + (5 * 60 * 1000 + 1000);
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(
+        wasm.is_err(),
+        "WASM should reject nonce just past future 5-min boundary"
+    );
+    assert!(
+        core.is_err(),
+        "core should reject nonce just past future 5-min boundary"
+    );
+}
+
+#[test]
+fn nonce_way_too_old_rejected_by_both() {
+    // 6 minutes in the past (> 5 minute tolerance).
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis - 6 * 60 * 1000;
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, 0);
+    assert!(wasm.is_err(), "WASM should reject nonce 6 min old");
+    assert!(core.is_err(), "core should reject nonce 6 min old");
+}
+
+#[test]
+fn nonce_way_in_future_rejected_by_both() {
+    // 6 minutes in the future (> 5 minute tolerance).
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis + 6 * 60 * 1000;
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, 0);
+    assert!(wasm.is_err(), "WASM should reject nonce 6 min in future");
+    assert!(core.is_err(), "core should reject nonce 6 min in future");
+}
+
+#[test]
+fn nonce_within_tolerance_4_min_past_accepted_by_both() {
+    // 4 minutes in the past (within 5 minute tolerance).
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis - 4 * 60 * 1000;
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_ok(), "WASM should accept nonce 4 min old: {wasm:?}");
+    assert!(core.is_ok(), "core should accept nonce 4 min old: {core:?}");
+}
+
+#[test]
+fn nonce_within_tolerance_4_min_future_accepted_by_both() {
+    // 4 minutes in the future (within 5 minute tolerance).
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce_millis = now_millis + 4 * 60 * 1000;
+    let nonce = make_nonce(nonce_millis, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(
+        wasm.is_ok(),
+        "WASM should accept nonce 4 min in future: {wasm:?}"
+    );
+    assert!(
+        core.is_ok(),
+        "core should accept nonce 4 min in future: {core:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Replay detection: both reject duplicate nonces
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_replay_rejected_by_core_tracker() {
+    use scp_identity::cache::TestClock;
+    use std::sync::Arc;
+
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let nonce = make_nonce(now_millis, "aabbccdd11223344aabbccdd11223344");
+
+    // scp-core: first use succeeds, second fails.
+    let clock = Arc::new(TestClock::new(now_secs));
+    let mut tracker =
+        scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-replay".to_owned(), clock);
+    let first = tracker.check_and_record(&nonce, now_secs + 3600);
+    assert!(
+        first.is_ok(),
+        "core should accept nonce on first use: {first:?}"
+    );
+    let second = tracker.check_and_record(&nonce, now_secs + 3600);
+    assert!(second.is_err(), "core should reject nonce on second use");
+
+    // The WASM bridge delegates replay detection to WasmContextManager.ucan_record_nonce
+    // which uses a HashMap (seen_nonces). We validate the equivalent logic here:
+    // the WASM format check passes (no replay state), but a HashMap-based check
+    // would reject the duplicate.
+    let wasm_format = wasm_ucan_mirror::validate_nonce_format_and_freshness(&nonce, now_millis);
+    assert!(
+        wasm_format.is_ok(),
+        "WASM format check passes (replay is state-managed): {wasm_format:?}"
+    );
+
+    // Simulate WASM replay detection via HashMap (mirrors WasmContextManager logic).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert!(seen.insert(nonce.clone()), "first insert succeeds");
+    assert!(!seen.insert(nonce), "second insert detects replay");
+}
+
+// ---------------------------------------------------------------------------
+// Freshness tolerance constant parity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_freshness_tolerance_constant_matches() {
+    // The WASM bridge uses NONCE_FRESHNESS_TOLERANCE_MS = 5 * 60 * 1000 = 300_000.
+    // scp-core uses NONCE_FRESHNESS_TOLERANCE_MS = 5 * 60 * 1000 = 300_000 (as u128).
+    // Since these are private constants, we validate behaviorally: a nonce at
+    // exactly 300_000ms offset should pass, and at 300_001ms should fail.
+    let now_secs: u64 = 1_704_067_200;
+    let now_millis = now_secs * 1000;
+    let tolerance_ms: u64 = 5 * 60 * 1000;
+
+    // Exactly at tolerance: should pass.
+    let nonce_at_boundary = make_nonce(
+        now_millis - tolerance_ms,
+        "aabbccdd11223344aabbccdd11223344",
+    );
+    let (wasm_ok, core_ok) = validate_nonce_both(&nonce_at_boundary, now_secs, now_secs + 3600);
+    assert!(
+        wasm_ok.is_ok(),
+        "WASM should accept nonce at exactly tolerance boundary: {wasm_ok:?}"
+    );
+    assert!(
+        core_ok.is_ok(),
+        "core should accept nonce at exactly tolerance boundary: {core_ok:?}"
+    );
+
+    // 1ms past tolerance: should fail. Since scp-core works in seconds (converts
+    // now_secs to millis internally), we need a difference that survives the
+    // seconds→millis conversion. 1001ms (just over 1 second past) is the minimum
+    // reliable difference.
+    let nonce_past_boundary = make_nonce(
+        now_millis - tolerance_ms - 1001,
+        "bbccddee11223344aabbccdd11223344",
+    );
+    let (wasm_err, core_err) = validate_nonce_both(&nonce_past_boundary, now_secs, now_secs + 3600);
+    assert!(
+        wasm_err.is_err(),
+        "WASM should reject nonce 1001ms past tolerance"
+    );
+    assert!(
+        core_err.is_err(),
+        "core should reject nonce 1001ms past tolerance"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: zero timestamp
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_zero_timestamp_at_epoch_accepted_by_both() {
+    // Clock at epoch (0), nonce timestamp also 0 — within tolerance.
+    let now_secs: u64 = 0;
+    let nonce = make_nonce(0, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, 3600);
+    assert!(
+        wasm.is_ok(),
+        "WASM should accept zero-timestamp nonce at epoch: {wasm:?}"
+    );
+    assert!(
+        core.is_ok(),
+        "core should accept zero-timestamp nonce at epoch: {core:?}"
+    );
+}
+
+#[test]
+fn nonce_zero_timestamp_at_modern_time_rejected_by_both() {
+    // Clock at 2024, nonce at epoch 0 — way too old.
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = make_nonce(0, "aabbccdd11223344aabbccdd11223344");
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, 0);
+    assert!(wasm.is_err(), "WASM should reject epoch nonce in 2024");
+    assert!(core.is_err(), "core should reject epoch nonce in 2024");
+}
+
+// ---------------------------------------------------------------------------
+// Edge case: only timestamp, no hex suffix
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nonce_timestamp_with_empty_hex_rejected_by_both() {
+    let now_secs: u64 = 1_704_067_200;
+    let nonce = format!("{}-", now_secs * 1000); // timestamp followed by empty hex
+    let (wasm, core) = validate_nonce_both(&nonce, now_secs, now_secs + 3600);
+    assert!(wasm.is_err(), "WASM should reject empty hex suffix");
+    assert!(core.is_err(), "core should reject empty hex suffix");
 }
 
 // ===========================================================================
