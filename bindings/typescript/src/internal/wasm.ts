@@ -151,6 +151,36 @@ interface WasmModule {
   ) => string;
   discovery_normalize_address: (address: string) => string;
   context_discover: (query: string) => Promise<string>;
+  // Petnames (§22.4)
+  petname_set: (ownerDid: string, targetDid: string, name: string) => void;
+  petname_remove: (ownerDid: string, targetDid: string) => void;
+  petname_set_context: (ownerDid: string, contextId: string, name: string) => void;
+  petname_remove_context: (ownerDid: string, contextId: string) => void;
+  petname_resolve_did: (ownerDid: string, name: string) => string;
+  petname_resolve_context: (ownerDid: string, name: string) => string;
+  petname_get_for_did: (ownerDid: string, targetDid: string) => unknown;
+  petname_get_for_context: (ownerDid: string, contextId: string) => unknown;
+  // Handle Registry (§22.3.1)
+  handle_register: (
+    discoveryContextId: string,
+    handle: string,
+    targetJson: string,
+    registrantDid: string,
+    description: string | undefined,
+    tagsJson: string | undefined,
+  ) => string;
+  handle_lookup: (
+    discoveryContextId: string,
+    handle: string,
+    typeFilter: string | undefined,
+  ) => string;
+  handle_deregister: (discoveryContextId: string, handle: string, did: string) => string;
+  // Address Resolution (§22.8)
+  address_resolve: (
+    ownerDid: string,
+    address: string,
+    knownContextsJson: string | undefined,
+  ) => string;
   // Provenance
   evaluate_provenance_quality: (
     sourceContext: string | undefined,
@@ -1019,6 +1049,95 @@ export function createWasmBridge(): Bridge {
     async contextDiscover(query: string): Promise<string> {
       const wasm = getWasm();
       return await wasm.context_discover(query);
+    },
+
+    // Petnames (§22.4)
+    petnameSet(ownerDid: string, targetDid: string, name: string): void {
+      const wasm = getWasm();
+      wasm.petname_set(ownerDid, targetDid, name);
+    },
+
+    petnameRemove(ownerDid: string, targetDid: string): void {
+      const wasm = getWasm();
+      wasm.petname_remove(ownerDid, targetDid);
+    },
+
+    petnameSetContext(ownerDid: string, contextId: string, name: string): void {
+      const wasm = getWasm();
+      wasm.petname_set_context(ownerDid, contextId, name);
+    },
+
+    petnameRemoveContext(ownerDid: string, contextId: string): void {
+      const wasm = getWasm();
+      wasm.petname_remove_context(ownerDid, contextId);
+    },
+
+    petnameResolveDid(ownerDid: string, name: string): string {
+      const wasm = getWasm();
+      return wasm.petname_resolve_did(ownerDid, name);
+    },
+
+    petnameResolveContext(ownerDid: string, name: string): string {
+      const wasm = getWasm();
+      return wasm.petname_resolve_context(ownerDid, name);
+    },
+
+    petnameGetForDid(ownerDid: string, targetDid: string): string | null {
+      const wasm = getWasm();
+      const result = wasm.petname_get_for_did(ownerDid, targetDid);
+      if (result == null || result === undefined) return null;
+      return result as string;
+    },
+
+    petnameGetForContext(ownerDid: string, contextId: string): string | null {
+      const wasm = getWasm();
+      const result = wasm.petname_get_for_context(ownerDid, contextId);
+      if (result == null || result === undefined) return null;
+      return result as string;
+    },
+
+    // Handle Registry (§22.3.1)
+    handleRegister(
+      discoveryContextId: string,
+      handle: string,
+      targetJson: string,
+      registrantDid: string,
+      description: string | undefined,
+      tags: string[] | undefined,
+    ): string {
+      const wasm = getWasm();
+      return wasm.handle_register(
+        discoveryContextId,
+        handle,
+        targetJson,
+        registrantDid,
+        description,
+        tags ? JSON.stringify(tags) : undefined,
+      );
+    },
+
+    handleLookup(
+      discoveryContextId: string,
+      handle: string,
+      typeFilter: string | undefined,
+    ): string {
+      const wasm = getWasm();
+      return wasm.handle_lookup(discoveryContextId, handle, typeFilter);
+    },
+
+    handleDeregister(discoveryContextId: string, handle: string, did: string): string {
+      const wasm = getWasm();
+      return wasm.handle_deregister(discoveryContextId, handle, did);
+    },
+
+    // Address Resolution (§22.8)
+    async addressResolve(
+      ownerDid: string,
+      address: string,
+      knownContextsJson: string | undefined,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.address_resolve(ownerDid, address, knownContextsJson);
     },
 
     // Provenance

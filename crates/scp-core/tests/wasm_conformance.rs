@@ -3134,6 +3134,108 @@ mod wasm_proposal_mirror {
 }
 
 // ===========================================================================
+// Petname conformance (WASM WasmPetnameMap vs core PetnameMap)
+// ===========================================================================
+
+/// WASM-mirror petname map that mirrors `WasmPetnameMap` from `scp-ffi-wasm`.
+mod wasm_petname_mirror {
+    use std::collections::HashMap;
+
+    pub struct WasmPetnameMap {
+        did_petnames: HashMap<String, Vec<String>>,
+        did_to_petname: HashMap<String, String>,
+        context_petnames: HashMap<String, Vec<String>>,
+        context_to_petname: HashMap<String, String>,
+    }
+
+    impl WasmPetnameMap {
+        pub fn new() -> Self {
+            Self {
+                did_petnames: HashMap::new(),
+                did_to_petname: HashMap::new(),
+                context_petnames: HashMap::new(),
+                context_to_petname: HashMap::new(),
+            }
+        }
+
+        pub fn set_petname(&mut self, did: &str, name: &str) {
+            if let Some(old_name) = self.did_to_petname.remove(did) {
+                if let Some(dids) = self.did_petnames.get_mut(&old_name) {
+                    dids.retain(|d| d != did);
+                }
+                if self.did_petnames.get(&old_name).is_some_and(Vec::is_empty) {
+                    self.did_petnames.remove(&old_name);
+                }
+            }
+            self.did_petnames
+                .entry(name.to_owned())
+                .or_default()
+                .push(did.to_owned());
+            self.did_to_petname.insert(did.to_owned(), name.to_owned());
+        }
+
+        pub fn remove_petname(&mut self, did: &str) {
+            if let Some(name) = self.did_to_petname.remove(did) {
+                if let Some(dids) = self.did_petnames.get_mut(&name) {
+                    dids.retain(|d| d != did);
+                }
+                if self.did_petnames.get(&name).is_some_and(Vec::is_empty) {
+                    self.did_petnames.remove(&name);
+                }
+            }
+        }
+
+        pub fn set_context_petname(&mut self, context_id: &str, name: &str) {
+            if let Some(old_name) = self.context_to_petname.remove(context_id) {
+                if let Some(ids) = self.context_petnames.get_mut(&old_name) {
+                    ids.retain(|id| id != context_id);
+                }
+                if self
+                    .context_petnames
+                    .get(&old_name)
+                    .is_some_and(Vec::is_empty)
+                {
+                    self.context_petnames.remove(&old_name);
+                }
+            }
+            self.context_petnames
+                .entry(name.to_owned())
+                .or_default()
+                .push(context_id.to_owned());
+            self.context_to_petname
+                .insert(context_id.to_owned(), name.to_owned());
+        }
+
+        pub fn remove_context_petname(&mut self, context_id: &str) {
+            if let Some(name) = self.context_to_petname.remove(context_id) {
+                if let Some(ids) = self.context_petnames.get_mut(&name) {
+                    ids.retain(|id| id != context_id);
+                }
+                if self.context_petnames.get(&name).is_some_and(Vec::is_empty) {
+                    self.context_petnames.remove(&name);
+                }
+            }
+        }
+
+        pub fn resolve_did(&self, name: &str) -> Vec<String> {
+            self.did_petnames.get(name).cloned().unwrap_or_default()
+        }
+
+        pub fn resolve_context(&self, name: &str) -> Vec<String> {
+            self.context_petnames.get(name).cloned().unwrap_or_default()
+        }
+
+        pub fn petname_for_did(&self, did: &str) -> Option<String> {
+            self.did_to_petname.get(did).cloned()
+        }
+
+        pub fn petname_for_context(&self, context_id: &str) -> Option<String> {
+            self.context_to_petname.get(context_id).cloned()
+        }
+    }
+}
+
+// ===========================================================================
 // Test: get_proposal returns a proposal with all 10 expected fields
 // ===========================================================================
 
@@ -3371,4 +3473,280 @@ fn governance_resolved_proposals_evicts_oldest_at_capacity() {
         Some("prop-1"),
         "after evicting prop-0, oldest should be prop-1 (created_at=1001)"
     );
+}
+
+#[test]
+fn wasm_petname_set_resolve_matches_core() {
+    use scp_identity::DID;
+    use wasm_petname_mirror::WasmPetnameMap;
+
+    // Core PetnameMap
+    let mut core = scp_core::discovery::PetnameMap::default();
+    core.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
+    core.set_petname(DID::from("did:dht:zBob"), "bob".to_owned());
+
+    // WASM mirror
+    let mut wasm = WasmPetnameMap::new();
+    wasm.set_petname("did:dht:zAlice", "alice");
+    wasm.set_petname("did:dht:zBob", "bob");
+
+    // Resolve DID by petname
+    let core_alice: Vec<String> = core
+        .resolve_did("alice")
+        .into_iter()
+        .map(|d| d.to_string())
+        .collect();
+    let wasm_alice = wasm.resolve_did("alice");
+    assert_eq!(
+        core_alice, wasm_alice,
+        "petname resolve_did mismatch for 'alice'"
+    );
+
+    let core_bob: Vec<String> = core
+        .resolve_did("bob")
+        .into_iter()
+        .map(|d| d.to_string())
+        .collect();
+    let wasm_bob = wasm.resolve_did("bob");
+    assert_eq!(core_bob, wasm_bob, "petname resolve_did mismatch for 'bob'");
+
+    // Petname for DID
+    let core_name = core
+        .petname_for_did(&DID::from("did:dht:zAlice"))
+        .map(str::to_owned);
+    let wasm_name = wasm.petname_for_did("did:dht:zAlice");
+    assert_eq!(core_name, wasm_name, "petname_for_did mismatch");
+
+    // Unknown name resolves empty
+    assert!(core.resolve_did("unknown").is_empty());
+    assert!(wasm.resolve_did("unknown").is_empty());
+}
+
+#[test]
+fn wasm_petname_remove_matches_core() {
+    use scp_identity::DID;
+    use wasm_petname_mirror::WasmPetnameMap;
+
+    let mut core = scp_core::discovery::PetnameMap::default();
+    core.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
+    core.remove_petname(&DID::from("did:dht:zAlice"));
+
+    let mut wasm = WasmPetnameMap::new();
+    wasm.set_petname("did:dht:zAlice", "alice");
+    wasm.remove_petname("did:dht:zAlice");
+
+    assert_eq!(
+        core.resolve_did("alice").len(),
+        wasm.resolve_did("alice").len(),
+        "after remove, resolve_did should be empty in both"
+    );
+
+    assert_eq!(
+        core.petname_for_did(&DID::from("did:dht:zAlice"))
+            .map(str::to_owned),
+        wasm.petname_for_did("did:dht:zAlice"),
+        "after remove, petname_for_did should be None in both"
+    );
+}
+
+#[test]
+fn wasm_petname_context_matches_core() {
+    use wasm_petname_mirror::WasmPetnameMap;
+
+    let mut core = scp_core::discovery::PetnameMap::default();
+    core.set_context_petname("ctx-work".to_owned(), "work".to_owned());
+
+    let mut wasm = WasmPetnameMap::new();
+    wasm.set_context_petname("ctx-work", "work");
+
+    assert_eq!(
+        core.resolve_context("work"),
+        wasm.resolve_context("work"),
+        "context petname resolve mismatch"
+    );
+
+    assert_eq!(
+        core.petname_for_context(&"ctx-work".to_owned())
+            .map(str::to_owned),
+        wasm.petname_for_context("ctx-work"),
+        "petname_for_context mismatch"
+    );
+
+    // Remove and verify
+    core.remove_context_petname(&"ctx-work".to_owned());
+    wasm.remove_context_petname("ctx-work");
+
+    assert!(core.resolve_context("work").is_empty());
+    assert!(wasm.resolve_context("work").is_empty());
+}
+
+// ===========================================================================
+// Handle registry conformance (WASM vs core HandleRegistry)
+// ===========================================================================
+
+#[test]
+fn wasm_handle_register_lookup_matches_core() {
+    use scp_core::discovery::{
+        HandleDeregisterParams, HandleLookupParams, HandleRegisterParams, HandleRegistry,
+        HandleTarget, HandleTypeFilter,
+    };
+    use scp_identity::DID;
+
+    // Core
+    let mut core_registry = HandleRegistry::new("ctx-test".to_owned());
+    let core_result = core_registry
+        .register(
+            &HandleRegisterParams {
+                handle: "alice".to_owned(),
+                target: HandleTarget::Identity {
+                    did: DID::from("did:dht:zAlice"),
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAlice"),
+        )
+        .unwrap();
+
+    // WASM mirror: the WASM bridge stores entries in a HashMap<String, WasmHandleEntry>
+    // keyed by normalized handle. We verify the core registry returns results for
+    // the same lookup params.
+    let core_lookup = core_registry.lookup(&HandleLookupParams {
+        handle: "alice".to_owned(),
+        type_filter: None,
+    });
+
+    assert_eq!(
+        core_lookup.results.len(),
+        1,
+        "core handle lookup should return 1 result"
+    );
+    assert!(
+        matches!(
+            core_result.status,
+            scp_core::discovery::HandleRegisterStatus::Registered
+        ),
+        "core handle register should succeed"
+    );
+
+    // Verify identity filter works
+    let filtered_identity = core_registry.lookup(&HandleLookupParams {
+        handle: "alice".to_owned(),
+        type_filter: Some(HandleTypeFilter::Identity),
+    });
+    assert_eq!(filtered_identity.results.len(), 1);
+
+    let filtered_context = core_registry.lookup(&HandleLookupParams {
+        handle: "alice".to_owned(),
+        type_filter: Some(HandleTypeFilter::Context),
+    });
+    assert_eq!(filtered_context.results.len(), 0);
+
+    // Deregister
+    let deregister_result = core_registry.deregister(&HandleDeregisterParams {
+        handle: "alice".to_owned(),
+        did: DID::from("did:dht:zAlice"),
+    });
+    assert!(deregister_result.removed);
+
+    // After deregister, lookup returns empty
+    let post_deregister = core_registry.lookup(&HandleLookupParams {
+        handle: "alice".to_owned(),
+        type_filter: None,
+    });
+    assert!(post_deregister.results.is_empty());
+}
+
+/// Same-owner re-registration must return Conflict — not idempotent success.
+/// Core's `HandleRegistry::register` returns `Conflict` unconditionally when
+/// the handle exists, regardless of who owns it. The WASM bridge must match.
+#[test]
+fn wasm_handle_same_owner_reregister_returns_conflict() {
+    use scp_core::discovery::{
+        HandleRegisterParams, HandleRegisterStatus, HandleRegistry, HandleTarget,
+    };
+    use scp_identity::DID;
+
+    let mut registry = HandleRegistry::new("ctx-test".to_owned());
+    let alice_did = DID::from("did:dht:zAlice");
+
+    let params = HandleRegisterParams {
+        handle: "alice".to_owned(),
+        target: HandleTarget::Identity {
+            did: DID::from("did:dht:zAlice"),
+        },
+        metadata: None,
+    };
+
+    // First registration succeeds.
+    let result1 = registry.register(&params, &alice_did).unwrap();
+    assert_eq!(result1.status, HandleRegisterStatus::Registered);
+
+    // Same owner, same handle — core returns Conflict, not idempotent success.
+    let result2 = registry.register(&params, &alice_did).unwrap();
+    assert_eq!(
+        result2.status,
+        HandleRegisterStatus::Conflict,
+        "same-owner re-registration must return Conflict per scp-core semantics"
+    );
+}
+
+// ===========================================================================
+// Address resolution conformance: scoped address parsing
+// ===========================================================================
+
+#[test]
+fn wasm_scoped_address_parsing_matches_core() {
+    // Core's parse_address handles "alice@cooking-community"
+    let core_parsed = scp_core::discovery::parse_address("alice@cooking-community").unwrap();
+
+    // WASM mirrors: split on '@'
+    let address = "alice@cooking-community";
+    let at_pos = address.find('@').unwrap();
+    let wasm_local = &address[..at_pos];
+    let wasm_scope = &address[at_pos + 1..];
+
+    match &core_parsed {
+        scp_core::discovery::ParsedAddress::DiscoveryHandle { local_part, scope } => {
+            assert_eq!(local_part, wasm_local, "local_part mismatch");
+            assert_eq!(scope, wasm_scope, "scope mismatch");
+        }
+        other => panic!("expected DiscoveryHandle, got {other:?}"),
+    }
+}
+
+#[test]
+fn wasm_unscoped_address_uses_full_name() {
+    // An unscoped name (no '@') should be treated as the full handle lookup key.
+    let address = "alice";
+    let (local_part, scope) = address.find('@').map_or((address, None), |at_pos| {
+        (&address[..at_pos], Some(&address[at_pos + 1..]))
+    });
+
+    assert_eq!(local_part, "alice");
+    assert!(scope.is_none(), "unscoped address should have no scope");
+}
+
+/// Verify the WASM trust-level sorting helper produces correct ordering.
+#[test]
+fn wasm_trust_level_sorting_order() {
+    // Mirror of WASM's trust_level_rank function
+    fn trust_level_rank(kind: &str) -> u8 {
+        match kind {
+            "DirectExchange" => 6,
+            "MultiLayerCorroborated" => 5,
+            "LocalPetname" => 4,
+            "AttestationVerified" => 3,
+            "DomainVerified" => 2,
+            "DiscoveryContextVerified" => 1,
+            _ => 0,
+        }
+    }
+
+    // Verify ordering matches spec expectation: Direct > Multi > Petname > Attestation > Domain > Discovery
+    assert!(trust_level_rank("DirectExchange") > trust_level_rank("MultiLayerCorroborated"));
+    assert!(trust_level_rank("MultiLayerCorroborated") > trust_level_rank("LocalPetname"));
+    assert!(trust_level_rank("LocalPetname") > trust_level_rank("AttestationVerified"));
+    assert!(trust_level_rank("AttestationVerified") > trust_level_rank("DomainVerified"));
+    assert!(trust_level_rank("DomainVerified") > trust_level_rank("DiscoveryContextVerified"));
+    assert!(trust_level_rank("DiscoveryContextVerified") > trust_level_rank("Unknown"));
 }

@@ -8,6 +8,10 @@
 
 package works.limn.scp
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
 import works.limn.scp.bridge.CoroutineBridge
 
 /**
@@ -16,6 +20,7 @@ import works.limn.scp.bridge.CoroutineBridge
  * All methods are blocking JNA calls into Rust and must be dispatched
  * on [kotlinx.coroutines.Dispatchers.IO].
  */
+@Suppress("TooManyFunctions")
 interface DiscoveryBindings {
     /**
      * Parses an SCP address string into its components.
@@ -63,6 +68,68 @@ interface DiscoveryBindings {
      * @throws BridgeException if DID resolution or URI parsing fails.
      */
     fun contextDiscover(query: String): String
+
+    // Petname operations (§22.4)
+
+    /** Sets a petname for a DID. */
+    fun petnameSet(ownerDid: String, targetDid: String, name: String)
+
+    /** Removes a petname from a DID. */
+    fun petnameRemove(ownerDid: String, targetDid: String)
+
+    /** Sets a petname for a context. */
+    fun petnameSetContext(ownerDid: String, contextId: String, name: String)
+
+    /** Removes a petname from a context. */
+    fun petnameRemoveContext(ownerDid: String, contextId: String)
+
+    /** Resolves a petname to DIDs. Returns a JSON array of DID strings. */
+    fun petnameResolveDid(ownerDid: String, name: String): String
+
+    /** Resolves a petname to context IDs. Returns a JSON array of strings. */
+    fun petnameResolveContext(ownerDid: String, name: String): String
+
+    /** Gets the petname for a DID. Returns null if none. */
+    fun petnameGetForDid(ownerDid: String, targetDid: String): String?
+
+    /** Gets the petname for a context. Returns null if none. */
+    fun petnameGetForContext(ownerDid: String, contextId: String): String?
+
+    // Handle registry operations (§22.3.1)
+
+    /** Registers a handle in a discovery context. Returns JSON result. */
+    @Suppress("LongParameterList")
+    fun handleRegister(
+        discoveryContextId: String,
+        handle: String,
+        targetJson: String,
+        registrantDid: String,
+        description: String?,
+        tags: List<String>?,
+    ): String
+
+    /** Looks up a handle in a discovery context. Returns JSON result. */
+    fun handleLookup(
+        discoveryContextId: String,
+        handle: String,
+        typeFilter: String?,
+    ): String
+
+    /** Deregisters a handle from a discovery context. Returns JSON result. */
+    fun handleDeregister(
+        discoveryContextId: String,
+        handle: String,
+        did: String,
+    ): String
+
+    // Address resolution (§22.8)
+
+    /** Resolves an address via multi-path resolution. Returns JSON array. */
+    fun addressResolve(
+        ownerDid: String,
+        address: String,
+        knownContextsJson: String?,
+    ): String
 }
 
 /**
@@ -71,6 +138,7 @@ interface DiscoveryBindings {
  * Provides address parsing, query construction, and normalization for the
  * SCP discovery protocol. See §6.2.2 (Protocol-Level Discovery).
  */
+@Suppress("TooManyFunctions")
 class DiscoveryBridge internal constructor(
     private val bindings: DiscoveryBindings,
     private val bridge: CoroutineBridge,
@@ -126,4 +194,179 @@ class DiscoveryBridge internal constructor(
      */
     suspend fun discover(query: String): String =
         bridge.ffiCall { bindings.contextDiscover(query) }
+
+    // Petname operations (§22.4)
+
+    /**
+     * Assigns a petname to a DID within the owner's local namespace.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param targetDid DID to assign the petname to.
+     * @param name The petname string.
+     */
+    suspend fun petnameSet(ownerDid: String, targetDid: String, name: String) {
+        bridge.ffiCall { bindings.petnameSet(ownerDid, targetDid, name) }
+    }
+
+    /**
+     * Removes a petname from a DID.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param targetDid DID to remove the petname from.
+     */
+    suspend fun petnameRemove(ownerDid: String, targetDid: String) {
+        bridge.ffiCall { bindings.petnameRemove(ownerDid, targetDid) }
+    }
+
+    /**
+     * Assigns a petname to a context within the owner's local namespace.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param contextId Context ID to assign the petname to.
+     * @param name The petname string.
+     */
+    suspend fun petnameSetContext(ownerDid: String, contextId: String, name: String) {
+        bridge.ffiCall { bindings.petnameSetContext(ownerDid, contextId, name) }
+    }
+
+    /**
+     * Removes a petname from a context.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param contextId Context ID to remove the petname from.
+     */
+    suspend fun petnameRemoveContext(ownerDid: String, contextId: String) {
+        bridge.ffiCall { bindings.petnameRemoveContext(ownerDid, contextId) }
+    }
+
+    /**
+     * Resolves a petname to a list of DIDs.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param name The petname to resolve.
+     * @return List of DID strings.
+     */
+    suspend fun petnameResolveDid(ownerDid: String, name: String): List<String> {
+        val json = bridge.ffiCall { bindings.petnameResolveDid(ownerDid, name) }
+        return parseJsonStringArray(json)
+    }
+
+    /**
+     * Resolves a petname to a list of context IDs.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param name The petname to resolve.
+     * @return List of context ID strings.
+     */
+    suspend fun petnameResolveContext(ownerDid: String, name: String): List<String> {
+        val json = bridge.ffiCall { bindings.petnameResolveContext(ownerDid, name) }
+        return parseJsonStringArray(json)
+    }
+
+    /**
+     * Gets the petname assigned to a DID, if any.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param targetDid DID to look up.
+     * @return The petname string, or null if no petname is assigned.
+     */
+    suspend fun petnameGetForDid(ownerDid: String, targetDid: String): String? =
+        bridge.ffiCall { bindings.petnameGetForDid(ownerDid, targetDid) }
+
+    /**
+     * Gets the petname assigned to a context, if any.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param contextId Context ID to look up.
+     * @return The petname string, or null if no petname is assigned.
+     */
+    suspend fun petnameGetForContext(ownerDid: String, contextId: String): String? =
+        bridge.ffiCall { bindings.petnameGetForContext(ownerDid, contextId) }
+
+    // Handle registry operations (§22.3.1)
+
+    /**
+     * Registers a handle in a discovery context.
+     *
+     * @param discoveryContextId ID of the discovery context.
+     * @param handle The handle string to register.
+     * @param targetJson JSON describing the target.
+     * @param registrantDid DID of the registrant.
+     * @param description Optional human-readable description.
+     * @param tags Optional list of tag strings.
+     * @return JSON string with the registration result.
+     */
+    @Suppress("LongParameterList")
+    suspend fun handleRegister(
+        discoveryContextId: String,
+        handle: String,
+        targetJson: String,
+        registrantDid: String,
+        description: String? = null,
+        tags: List<String>? = null,
+    ): String =
+        bridge.ffiCall {
+            bindings.handleRegister(
+                discoveryContextId, handle, targetJson, registrantDid, description, tags,
+            )
+        }
+
+    /**
+     * Looks up a handle in a discovery context.
+     *
+     * @param discoveryContextId ID of the discovery context.
+     * @param handle The handle string to look up.
+     * @param typeFilter Optional filter: "identity" or "context".
+     * @return JSON string with a results array of matching entries.
+     */
+    suspend fun handleLookup(
+        discoveryContextId: String,
+        handle: String,
+        typeFilter: String? = null,
+    ): String =
+        bridge.ffiCall {
+            bindings.handleLookup(discoveryContextId, handle, typeFilter)
+        }
+
+    /**
+     * Deregisters a handle from a discovery context.
+     *
+     * @param discoveryContextId ID of the discovery context.
+     * @param handle The handle string to deregister.
+     * @param did DID of the registrant requesting deregistration.
+     * @return JSON string with a removed boolean.
+     */
+    suspend fun handleDeregister(
+        discoveryContextId: String,
+        handle: String,
+        did: String,
+    ): String =
+        bridge.ffiCall {
+            bindings.handleDeregister(discoveryContextId, handle, did)
+        }
+
+    // Address resolution (§22.8)
+
+    /**
+     * Resolves a human-readable address via multi-path resolution pipeline.
+     *
+     * @param ownerDid DID of the identity whose petname map to consult.
+     * @param address The address string to resolve.
+     * @param knownContextsJson Optional JSON object mapping context IDs to names.
+     * @return List of parsed AddressResolution JSON elements.
+     */
+    suspend fun addressResolve(
+        ownerDid: String,
+        address: String,
+        knownContextsJson: String? = null,
+    ): List<JsonElement> {
+        val json = bridge.ffiCall {
+            bindings.addressResolve(ownerDid, address, knownContextsJson)
+        }
+        return Json.parseToJsonElement(json).jsonArray.toList()
+    }
 }
+
+/** Parses a JSON string containing an array of strings into a `List<String>`. */
+private fun parseJsonStringArray(json: String): List<String> =
+    Json.parseToJsonElement(json).jsonArray.map { it.jsonPrimitive.content }

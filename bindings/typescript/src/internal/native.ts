@@ -809,6 +809,101 @@ export function createNativeBridge(): Bridge {
       return await (addon.contextDiscover as (q: string) => Promise<string>)(query);
     },
 
+    // Petnames (§22.4)
+    petnameSet(ownerDid: string, targetDid: string, name: string): void {
+      (addon.petnameSet as (o: string, t: string, n: string) => void)(ownerDid, targetDid, name);
+    },
+
+    petnameRemove(ownerDid: string, targetDid: string): void {
+      (addon.petnameRemove as (o: string, t: string) => void)(ownerDid, targetDid);
+    },
+
+    petnameSetContext(ownerDid: string, contextId: string, name: string): void {
+      (addon.petnameSetContext as (o: string, c: string, n: string) => void)(
+        ownerDid,
+        contextId,
+        name,
+      );
+    },
+
+    petnameRemoveContext(ownerDid: string, contextId: string): void {
+      (addon.petnameRemoveContext as (o: string, c: string) => void)(ownerDid, contextId);
+    },
+
+    petnameResolveDid(ownerDid: string, name: string): string {
+      return (addon.petnameResolveDid as (o: string, n: string) => string)(ownerDid, name);
+    },
+
+    petnameResolveContext(ownerDid: string, name: string): string {
+      return (addon.petnameResolveContext as (o: string, n: string) => string)(ownerDid, name);
+    },
+
+    petnameGetForDid(ownerDid: string, targetDid: string): string | null {
+      return (addon.petnameGetForDid as (o: string, t: string) => string | null)(
+        ownerDid,
+        targetDid,
+      );
+    },
+
+    petnameGetForContext(ownerDid: string, contextId: string): string | null {
+      return (addon.petnameGetForContext as (o: string, c: string) => string | null)(
+        ownerDid,
+        contextId,
+      );
+    },
+
+    // Handle Registry (§22.3.1)
+    handleRegister(
+      discoveryContextId: string,
+      handle: string,
+      targetJson: string,
+      registrantDid: string,
+      description: string | undefined,
+      tags: string[] | undefined,
+    ): string {
+      return (
+        addon.handleRegister as (
+          d: string,
+          h: string,
+          t: string,
+          r: string,
+          desc: string | undefined,
+          tags: string[] | undefined,
+        ) => string
+      )(discoveryContextId, handle, targetJson, registrantDid, description, tags);
+    },
+
+    handleLookup(
+      discoveryContextId: string,
+      handle: string,
+      typeFilter: string | undefined,
+    ): string {
+      return (addon.handleLookup as (d: string, h: string, f: string | undefined) => string)(
+        discoveryContextId,
+        handle,
+        typeFilter,
+      );
+    },
+
+    handleDeregister(discoveryContextId: string, handle: string, did: string): string {
+      return (addon.handleDeregister as (d: string, h: string, did: string) => string)(
+        discoveryContextId,
+        handle,
+        did,
+      );
+    },
+
+    // Address Resolution (§22.8)
+    async addressResolve(
+      ownerDid: string,
+      address: string,
+      knownContextsJson: string | undefined,
+    ): Promise<string> {
+      return await (
+        addon.addressResolve as (o: string, a: string, k: string | undefined) => Promise<string>
+      )(ownerDid, address, knownContextsJson);
+    },
+
     // Provenance
     async evaluateProvenanceQuality(
       sourceContext: string | undefined,

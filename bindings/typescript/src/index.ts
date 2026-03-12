@@ -89,12 +89,30 @@ export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridg
 // Discovery
 // ---------------------------------------------------------------------------
 
-export type { DiscoveryResult, ParsedAddress } from "./discovery";
+export type {
+  DiscoveryResult,
+  HandleDeregisterResult,
+  HandleLookupResult,
+  HandleRegisterResult,
+  ParsedAddress,
+} from "./discovery";
 export {
+  addressResolve,
   createQuery,
   discoverContexts,
+  handleDeregister,
+  handleLookup,
+  handleRegister,
   normalizeAddress,
   parseAddress,
+  petnameGetForContext,
+  petnameGetForDid,
+  petnameRemove,
+  petnameRemoveContext,
+  petnameResolveContext,
+  petnameResolveDid,
+  petnameSet,
+  petnameSetContext,
   resolveAddress,
 } from "./discovery";
 

@@ -6,15 +6,241 @@
 //! - [`discovery_create_query`] -- Create a discovery query.
 //! - [`discovery_normalize_address`] -- Normalize an address string.
 //! - [`context_discover`] -- Discover contexts from a DID or `scp://` URI.
+//! - [`petname_set`] -- Set a petname for a DID.
+//! - [`petname_remove`] -- Remove a petname from a DID.
+//! - [`petname_set_context`] -- Set a petname for a context.
+//! - [`petname_remove_context`] -- Remove a petname from a context.
+//! - [`petname_resolve_did`] -- Resolve a petname to DIDs.
+//! - [`petname_resolve_context`] -- Resolve a petname to context IDs.
+//! - [`petname_get_for_did`] -- Get the petname for a DID.
+//! - [`petname_get_for_context`] -- Get the petname for a context.
+//! - [`handle_register`] -- Register a handle in a discovery context.
+//! - [`handle_lookup`] -- Look up a handle in a discovery context.
+//! - [`handle_deregister`] -- Deregister a handle from a discovery context.
+//! - [`address_resolve`] -- Resolve an address via multi-path resolution.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use napi_derive::napi;
 
-use scp_core::discovery::addressing::ParsedAddress;
+use scp_core::discovery::addressing::{
+    AddressResolution, AddressType, HandleQuerier, HandleTarget, ParsedAddress, ResolutionLayer,
+    ResolutionPath, TrustLevel,
+};
+use scp_core::discovery::handles::{
+    HandleDeregisterParams, HandleEntry, HandleLookupParams, HandleMetadata, HandleRegisterParams,
+    HandleRegistry, HandleTypeFilter,
+};
+use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
+use scp_identity::DID;
 
 use crate::error::ScpNapiError;
+
+// ---------------------------------------------------------------------------
+// Global state for petnames and handles
+// ---------------------------------------------------------------------------
+
+fn petname_maps() -> &'static Mutex<HashMap<String, PetnameMap>> {
+    static MAPS: OnceLock<Mutex<HashMap<String, PetnameMap>>> = OnceLock::new();
+    MAPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
+    static REGISTRIES: OnceLock<Mutex<HashMap<String, HandleRegistry>>> = OnceLock::new();
+    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct LocalHandleQuerier;
+
+impl HandleQuerier for LocalHandleQuerier {
+    async fn lookup_handle(
+        &self,
+        context_id: &String,
+        handle: &str,
+        type_filter: Option<AddressType>,
+    ) -> Vec<AddressResolution> {
+        let Ok(guard) = handle_registries().lock() else {
+            return Vec::new();
+        };
+        let Some(registry) = guard.get(context_id.as_str()) else {
+            return Vec::new();
+        };
+        let filter = type_filter.map(|tf| match tf {
+            AddressType::Identity => HandleTypeFilter::Identity,
+            AddressType::Context => HandleTypeFilter::Context,
+        });
+        let result = registry.lookup(&HandleLookupParams {
+            handle: handle.to_owned(),
+            type_filter: filter,
+        });
+        let now = scp_core::time::now_secs().unwrap_or(0);
+        result
+            .results
+            .into_iter()
+            .map(|entry| handle_entry_to_resolution(&entry, context_id, now))
+            .collect()
+    }
+
+    async fn lookup_domain_handle(&self, _domain: &str, _handle: &str) -> Vec<AddressResolution> {
+        Vec::new()
+    }
+
+    async fn lookup_attestation_handle(
+        &self,
+        _handle: &str,
+        _platform: Option<&str>,
+    ) -> Vec<AddressResolution> {
+        Vec::new()
+    }
+}
+
+fn handle_entry_to_resolution(
+    entry: &HandleEntry,
+    context_id: &str,
+    now: u64,
+) -> AddressResolution {
+    let resolution_path = ResolutionPath {
+        layer: ResolutionLayer::DiscoveryContext,
+        source: "local_registry".to_owned(),
+        source_id: Some(context_id.to_owned()),
+        resolved_at: now,
+    };
+    let trust_level = TrustLevel::DiscoveryContextVerified;
+    match &entry.target {
+        HandleTarget::Identity { did } => AddressResolution::Identity {
+            did: did.clone(),
+            trust_level,
+            resolution_path,
+        },
+        HandleTarget::Context {
+            context_id: ctx_id,
+            relay_urls,
+        } => AddressResolution::Context {
+            context_id: ctx_id.clone(),
+            relay_urls: relay_urls.clone(),
+            mode: None,
+            trust_level,
+            resolution_path,
+        },
+    }
+}
+
+fn address_resolution_to_json(resolution: &AddressResolution) -> serde_json::Value {
+    match resolution {
+        AddressResolution::Identity {
+            did,
+            trust_level,
+            resolution_path,
+        } => serde_json::json!({
+            "type": "Identity",
+            "did": did.to_string(),
+            "trust_level": trust_level_to_json(trust_level),
+            "resolution_path": resolution_path_to_json(resolution_path),
+        }),
+        AddressResolution::Context {
+            context_id,
+            relay_urls,
+            mode,
+            trust_level,
+            resolution_path,
+        } => serde_json::json!({
+            "type": "Context",
+            "context_id": context_id,
+            "relay_urls": relay_urls,
+            "mode": mode,
+            "trust_level": trust_level_to_json(trust_level),
+            "resolution_path": resolution_path_to_json(resolution_path),
+        }),
+    }
+}
+
+fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
+    match trust_level {
+        TrustLevel::DirectExchange => serde_json::json!({"kind": "DirectExchange"}),
+        TrustLevel::LocalPetname => serde_json::json!({"kind": "LocalPetname"}),
+        TrustLevel::MultiLayerCorroborated { sources } => serde_json::json!({
+            "kind": "MultiLayerCorroborated",
+            "sources": sources.iter().map(resolution_path_to_json).collect::<Vec<_>>(),
+        }),
+        TrustLevel::DomainVerified => serde_json::json!({"kind": "DomainVerified"}),
+        TrustLevel::AttestationVerified => serde_json::json!({"kind": "AttestationVerified"}),
+        TrustLevel::DiscoveryContextVerified => {
+            serde_json::json!({"kind": "DiscoveryContextVerified"})
+        }
+    }
+}
+
+fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
+    let layer = match path.layer {
+        ResolutionLayer::Petname => "Petname",
+        ResolutionLayer::DiscoveryContext => "DiscoveryContext",
+        ResolutionLayer::Attestation => "Attestation",
+        ResolutionLayer::Domain => "Domain",
+        ResolutionLayer::MultiLayerCorroborated => "MultiLayerCorroborated",
+    };
+    serde_json::json!({
+        "layer": layer,
+        "source": path.source,
+        "source_id": path.source_id,
+        "resolved_at": path.resolved_at,
+    })
+}
+
+fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
+    let val: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid target_json: {e}"),
+            code: "SCP-VALID-7126".to_owned(),
+        })
+    })?;
+    let target_type = val["type"].as_str().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: "target_json must have a 'type' field ('identity' or 'context')".to_owned(),
+            code: "SCP-VALID-7126".to_owned(),
+        })
+    })?;
+    match target_type {
+        "identity" => {
+            let did = val["did"].as_str().ok_or_else(|| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: "identity target must have a 'did' field".to_owned(),
+                    code: "SCP-VALID-7126".to_owned(),
+                })
+            })?;
+            Ok(HandleTarget::Identity {
+                did: DID::from(did),
+            })
+        }
+        "context" => {
+            let ctx_id = val["context_id"].as_str().ok_or_else(|| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: "context target must have a 'context_id' field".to_owned(),
+                    code: "SCP-VALID-7126".to_owned(),
+                })
+            })?;
+            let relay_urls = val["relay_urls"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(HandleTarget::Context {
+                context_id: ctx_id.to_owned(),
+                relay_urls,
+            })
+        }
+        other => Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid target type '{other}': expected 'identity' or 'context'"),
+            code: "SCP-VALID-7126".to_owned(),
+        })),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -245,6 +471,412 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Petname bridge functions (§22.4)
+// ---------------------------------------------------------------------------
+
+/// Sets a petname for a DID.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_set(owner_did: String, target_did: String, name: String) -> napi::Result<()> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    if target_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "target_did must not be empty".to_owned(),
+            code: "SCP-VALID-7111".to_owned(),
+        }));
+    }
+    let mut guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    let map = guard.entry(owner_did).or_default();
+    map.set_petname(DID::from(target_did.as_str()), name);
+    Ok(())
+}
+
+/// Removes a petname from a DID.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_remove(owner_did: String, target_did: String) -> napi::Result<()> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let mut guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    if let Some(map) = guard.get_mut(&owner_did) {
+        map.remove_petname(&DID::from(target_did.as_str()));
+    }
+    Ok(())
+}
+
+/// Sets a petname for a context.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_set_context(
+    owner_did: String,
+    context_id: String,
+    name: String,
+) -> napi::Result<()> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    if context_id.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "context_id must not be empty".to_owned(),
+            code: "SCP-VALID-7113".to_owned(),
+        }));
+    }
+    let mut guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    let map = guard.entry(owner_did).or_default();
+    map.set_context_petname(context_id, name);
+    Ok(())
+}
+
+/// Removes a petname from a context.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_remove_context(owner_did: String, context_id: String) -> napi::Result<()> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let mut guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    if let Some(map) = guard.get_mut(&owner_did) {
+        map.remove_context_petname(&context_id);
+    }
+    Ok(())
+}
+
+/// Resolves a petname to DIDs. Returns a JSON array of DID strings.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<String> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    let dids: Vec<String> = guard
+        .get(&owner_did)
+        .map(|map| {
+            map.resolve_did(&name)
+                .into_iter()
+                .map(|d| d.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&dids).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize petname resolve result: {e}"),
+            code: "SCP-VALID-7114".to_owned(),
+        })
+    })
+}
+
+/// Resolves a petname to context IDs. Returns a JSON array of strings.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<String> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    let ids: Vec<String> = guard
+        .get(&owner_did)
+        .map(|map| map.resolve_context(&name))
+        .unwrap_or_default();
+    serde_json::to_string(&ids).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize petname resolve result: {e}"),
+            code: "SCP-VALID-7114".to_owned(),
+        })
+    })
+}
+
+/// Gets the petname for a DID. Returns `null` if none.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_get_for_did(owner_did: String, target_did: String) -> napi::Result<Option<String>> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    Ok(guard.get(&owner_did).and_then(|map| {
+        map.petname_for_did(&DID::from(target_did.as_str()))
+            .map(str::to_owned)
+    }))
+}
+
+/// Gets the petname for a context. Returns `null` if none.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn petname_get_for_context(
+    owner_did: String,
+    context_id: String,
+) -> napi::Result<Option<String>> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let guard = petname_maps().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7112".to_owned(),
+        })
+    })?;
+    Ok(guard
+        .get(&owner_did)
+        .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
+}
+
+// ---------------------------------------------------------------------------
+// Handle registry bridge functions (§22.3.1)
+// ---------------------------------------------------------------------------
+
+/// Registers a handle in a discovery context. Returns JSON result.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn handle_register(
+    discovery_context_id: String,
+    handle: String,
+    target_json: String,
+    registrant_did: String,
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+) -> napi::Result<String> {
+    let target = parse_handle_target(&target_json)?;
+    let params = HandleRegisterParams {
+        handle,
+        target,
+        metadata: Some(HandleMetadata { description, tags }),
+    };
+    let mut guard = handle_registries().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("handle registry lock poisoned: {e}"),
+            code: "SCP-VALID-7120".to_owned(),
+        })
+    })?;
+    let registry = guard
+        .entry(discovery_context_id.clone())
+        .or_insert_with(|| HandleRegistry::new(discovery_context_id));
+    let result = registry
+        .register(&params, &DID::from(registrant_did.as_str()))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("clock error during handle registration: {e}"),
+                code: "SCP-VALID-7121".to_owned(),
+            })
+        })?;
+    serde_json::to_string(&result).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize handle register result: {e}"),
+            code: "SCP-VALID-7122".to_owned(),
+        })
+    })
+}
+
+/// Looks up a handle in a discovery context. Returns JSON result.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn handle_lookup(
+    discovery_context_id: String,
+    handle: String,
+    type_filter: Option<String>,
+) -> napi::Result<String> {
+    let filter = match type_filter.as_deref() {
+        Some("identity") => Some(HandleTypeFilter::Identity),
+        Some("context") => Some(HandleTypeFilter::Context),
+        Some(other) => {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
+                code: "SCP-VALID-7123".to_owned(),
+            }));
+        }
+        None => None,
+    };
+    let guard = handle_registries().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("handle registry lock poisoned: {e}"),
+            code: "SCP-VALID-7120".to_owned(),
+        })
+    })?;
+    let result = guard.get(&discovery_context_id).map_or_else(
+        || scp_core::discovery::HandleLookupResult {
+            results: Vec::new(),
+        },
+        |registry| {
+            registry.lookup(&HandleLookupParams {
+                handle,
+                type_filter: filter,
+            })
+        },
+    );
+    serde_json::to_string(&result).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize handle lookup result: {e}"),
+            code: "SCP-VALID-7124".to_owned(),
+        })
+    })
+}
+
+/// Deregisters a handle from a discovery context. Returns JSON result.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn handle_deregister(
+    discovery_context_id: String,
+    handle: String,
+    did: String,
+) -> napi::Result<String> {
+    let mut guard = handle_registries().lock().map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("handle registry lock poisoned: {e}"),
+            code: "SCP-VALID-7120".to_owned(),
+        })
+    })?;
+    let result = guard.get_mut(&discovery_context_id).map_or_else(
+        || scp_core::discovery::HandleDeregisterResult { removed: false },
+        |registry| {
+            registry.deregister(&HandleDeregisterParams {
+                handle,
+                did: DID::from(did.as_str()),
+            })
+        },
+    );
+    serde_json::to_string(&result).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize handle deregister result: {e}"),
+            code: "SCP-VALID-7125".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Address resolve (§22.8)
+// ---------------------------------------------------------------------------
+
+/// Resolves a human-readable address via multi-path resolution.
+/// Returns a JSON array of `AddressResolution` objects.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn address_resolve(
+    owner_did: String,
+    address: String,
+    known_contexts_json: Option<String>,
+) -> napi::Result<String> {
+    if owner_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    let known_contexts: HashMap<String, String> = if let Some(ref json) = known_contexts_json {
+        serde_json::from_str(json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid known_contexts_json: {e}"),
+                code: "SCP-VALID-7090".to_owned(),
+            })
+        })?
+    } else {
+        let guard = handle_registries().lock().map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("handle registry lock poisoned: {e}"),
+                code: "SCP-VALID-7120".to_owned(),
+            })
+        })?;
+        guard.keys().map(|k| (k.clone(), k.clone())).collect()
+    };
+    let known_domains: Vec<&str> = Vec::new();
+    let petname_map = {
+        let guard = petname_maps().lock().map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: "SCP-VALID-7112".to_owned(),
+            })
+        })?;
+        guard.get(&owner_did).cloned().unwrap_or_default()
+    };
+    let mut resolver = scp_core::discovery::AddressResolver::new();
+    let querier = LocalHandleQuerier;
+    let results = resolver
+        .resolve(
+            &address,
+            &petname_map,
+            &querier,
+            &known_contexts,
+            &known_domains,
+        )
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("address resolution failed: {e}"),
+                code: "SCP-VALID-7091".to_owned(),
+            })
+        })?;
+    let json_results: Vec<serde_json::Value> =
+        results.iter().map(address_resolution_to_json).collect();
+    serde_json::to_string(&json_results).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize address resolution results: {e}"),
+            code: "SCP-VALID-7092".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -342,5 +974,76 @@ mod tests {
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");
+    }
+
+    // -- Petname bridge tests ------------------------------------------------
+
+    #[test]
+    fn petname_set_and_resolve() {
+        let owner = "did:dht:zNapiTest1".to_owned();
+        petname_set(
+            owner.clone(),
+            "did:dht:zAlice".to_owned(),
+            "alice".to_owned(),
+        )
+        .unwrap();
+        let json = petname_resolve_did(owner.clone(), "alice".to_owned()).unwrap();
+        let dids: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(dids.len(), 1);
+        assert_eq!(dids[0], "did:dht:zAlice");
+        petname_remove(owner, "did:dht:zAlice".to_owned()).unwrap();
+    }
+
+    #[test]
+    fn petname_context_set_and_resolve() {
+        let owner = "did:dht:zNapiTest2".to_owned();
+        petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
+        let json = petname_resolve_context(owner.clone(), "work".to_owned()).unwrap();
+        let ids: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "ctx-napi-1");
+        petname_remove_context(owner, "ctx-napi-1".to_owned()).unwrap();
+    }
+
+    // -- Handle bridge tests -------------------------------------------------
+
+    #[test]
+    fn handle_register_and_lookup_napi() {
+        let ctx = "ctx-napi-handle-1".to_owned();
+        let target = r#"{"type": "identity", "did": "did:dht:zNapiAlice"}"#.to_owned();
+        let result = handle_register(
+            ctx.clone(),
+            "alice".to_owned(),
+            target,
+            "did:dht:zNapiAlice".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "registered");
+
+        let lookup = handle_lookup(ctx.clone(), "alice".to_owned(), None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
+
+        handle_deregister(ctx, "alice".to_owned(), "did:dht:zNapiAlice".to_owned()).unwrap();
+    }
+
+    // -- Parse handle target tests -------------------------------------------
+
+    #[test]
+    fn parse_handle_target_identity_napi() {
+        let target = parse_handle_target(r#"{"type": "identity", "did": "did:dht:z1"}"#).unwrap();
+        assert!(matches!(target, HandleTarget::Identity { .. }));
+    }
+
+    #[test]
+    fn parse_handle_target_context_napi() {
+        let target = parse_handle_target(
+            r#"{"type": "context", "context_id": "abc", "relay_urls": ["wss://r.example.com"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(target, HandleTarget::Context { .. }));
     }
 }

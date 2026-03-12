@@ -532,6 +532,683 @@ pub fn context_discover(query: String) -> Promise {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Petname bridge (§22.4) — local reimplementation per ADR-034
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// In-memory petname map (mirrors scp-core `PetnameMap`).
+struct WasmPetnameMap {
+    /// petname -> list of DIDs
+    did_petnames: HashMap<String, Vec<String>>,
+    /// DID -> petname (reverse)
+    did_to_petname: HashMap<String, String>,
+    /// petname -> list of context IDs
+    context_petnames: HashMap<String, Vec<String>>,
+    /// context ID -> petname (reverse)
+    context_to_petname: HashMap<String, String>,
+}
+
+impl WasmPetnameMap {
+    fn new() -> Self {
+        Self {
+            did_petnames: HashMap::new(),
+            did_to_petname: HashMap::new(),
+            context_petnames: HashMap::new(),
+            context_to_petname: HashMap::new(),
+        }
+    }
+
+    fn set_petname(&mut self, did: &str, name: &str) {
+        // Remove old petname for this DID if any.
+        if let Some(old_name) = self.did_to_petname.remove(did) {
+            if let Some(dids) = self.did_petnames.get_mut(&old_name) {
+                dids.retain(|d| d != did);
+            }
+            if self.did_petnames.get(&old_name).is_some_and(Vec::is_empty) {
+                self.did_petnames.remove(&old_name);
+            }
+        }
+        self.did_petnames
+            .entry(name.to_owned())
+            .or_default()
+            .push(did.to_owned());
+        self.did_to_petname.insert(did.to_owned(), name.to_owned());
+    }
+
+    fn remove_petname(&mut self, did: &str) {
+        if let Some(name) = self.did_to_petname.remove(did) {
+            if let Some(dids) = self.did_petnames.get_mut(&name) {
+                dids.retain(|d| d != did);
+            }
+            if self.did_petnames.get(&name).is_some_and(Vec::is_empty) {
+                self.did_petnames.remove(&name);
+            }
+        }
+    }
+
+    fn set_context_petname(&mut self, context_id: &str, name: &str) {
+        if let Some(old_name) = self.context_to_petname.remove(context_id) {
+            if let Some(ids) = self.context_petnames.get_mut(&old_name) {
+                ids.retain(|id| id != context_id);
+            }
+            if self
+                .context_petnames
+                .get(&old_name)
+                .is_some_and(Vec::is_empty)
+            {
+                self.context_petnames.remove(&old_name);
+            }
+        }
+        self.context_petnames
+            .entry(name.to_owned())
+            .or_default()
+            .push(context_id.to_owned());
+        self.context_to_petname
+            .insert(context_id.to_owned(), name.to_owned());
+    }
+
+    fn remove_context_petname(&mut self, context_id: &str) {
+        if let Some(name) = self.context_to_petname.remove(context_id) {
+            if let Some(ids) = self.context_petnames.get_mut(&name) {
+                ids.retain(|id| id != context_id);
+            }
+            if self.context_petnames.get(&name).is_some_and(Vec::is_empty) {
+                self.context_petnames.remove(&name);
+            }
+        }
+    }
+
+    fn resolve_did(&self, name: &str) -> Vec<String> {
+        self.did_petnames.get(name).cloned().unwrap_or_default()
+    }
+
+    fn resolve_context(&self, name: &str) -> Vec<String> {
+        self.context_petnames.get(name).cloned().unwrap_or_default()
+    }
+
+    fn petname_for_did(&self, did: &str) -> Option<String> {
+        self.did_to_petname.get(did).cloned()
+    }
+
+    fn petname_for_context(&self, context_id: &str) -> Option<String> {
+        self.context_to_petname.get(context_id).cloned()
+    }
+}
+
+/// Global petname maps keyed by owner DID.
+fn wasm_petname_maps() -> &'static Mutex<HashMap<String, WasmPetnameMap>> {
+    use std::sync::OnceLock;
+    static MAPS: OnceLock<Mutex<HashMap<String, WasmPetnameMap>>> = OnceLock::new();
+    MAPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Sets a petname for a DID.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_set(owner_did: String, target_did: String, name: String) -> Result<(), JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    if target_did.is_empty() {
+        return Err(JsError::new(
+            "[SCP-VALID-7111] target_did must not be empty",
+        ));
+    }
+    wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .entry(owner_did)
+        .or_insert_with(WasmPetnameMap::new)
+        .set_petname(&target_did, &name);
+    Ok(())
+}
+
+/// Removes a petname from a DID.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    if let Some(map) = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .get_mut(&owner_did)
+    {
+        map.remove_petname(&target_did);
+    }
+    Ok(())
+}
+
+/// Sets a petname for a context.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_set_context(
+    owner_did: String,
+    context_id: String,
+    name: String,
+) -> Result<(), JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    if context_id.is_empty() {
+        return Err(JsError::new(
+            "[SCP-VALID-7113] context_id must not be empty",
+        ));
+    }
+    wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .entry(owner_did)
+        .or_insert_with(WasmPetnameMap::new)
+        .set_context_petname(&context_id, &name);
+    Ok(())
+}
+
+/// Removes a petname from a context.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(), JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    if let Some(map) = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .get_mut(&owner_did)
+    {
+        map.remove_context_petname(&context_id);
+    }
+    Ok(())
+}
+
+/// Resolves a petname to DIDs. Returns a JSON array of DID strings.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    let dids = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .get(&owner_did)
+        .map(|map| map.resolve_did(&name))
+        .unwrap_or_default();
+    Ok(serde_json::to_string(&dids).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+/// Resolves a petname to context IDs. Returns a JSON array of strings.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String, JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    let ids = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .get(&owner_did)
+        .map(|map| map.resolve_context(&name))
+        .unwrap_or_default();
+    Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+/// Gets the petname for a DID. Returns the name or `null`.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_get_for_did(owner_did: String, target_did: String) -> Result<JsValue, JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    let name = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .get(&owner_did)
+        .and_then(|map| map.petname_for_did(&target_did));
+    name.map_or_else(|| Ok(JsValue::NULL), |n| Ok(JsValue::from_str(&n)))
+}
+
+/// Gets the petname for a context. Returns the name or `null`.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_get_for_context(owner_did: String, context_id: String) -> Result<JsValue, JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+    let name = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+        .get(&owner_did)
+        .and_then(|map| map.petname_for_context(&context_id));
+    name.map_or_else(|| Ok(JsValue::NULL), |n| Ok(JsValue::from_str(&n)))
+}
+
+// ---------------------------------------------------------------------------
+// Handle registry bridge (§22.3.1) — local reimplementation per ADR-034
+// ---------------------------------------------------------------------------
+
+/// In-memory handle entry.
+#[derive(Clone, serde::Serialize)]
+struct WasmHandleEntry {
+    handle: String,
+    target: serde_json::Value,
+    owner_did: String,
+    registered_at: u64,
+    metadata: serde_json::Value,
+    entry_id: String,
+}
+
+/// In-memory handle registry for one discovery context.
+struct WasmHandleRegistry {
+    entries: HashMap<String, WasmHandleEntry>,
+    next_id: u64,
+}
+
+impl WasmHandleRegistry {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_id: 1,
+        }
+    }
+}
+
+fn wasm_handle_registries() -> &'static Mutex<HashMap<String, WasmHandleRegistry>> {
+    use std::sync::OnceLock;
+    static REGISTRIES: OnceLock<Mutex<HashMap<String, WasmHandleRegistry>>> = OnceLock::new();
+    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Registers a handle in a discovery context. Returns JSON result.
+///
+/// # Errors
+///
+/// Returns `JsError` if `target_json` is malformed or the lock is poisoned.
+#[wasm_bindgen]
+#[allow(clippy::significant_drop_tightening)]
+pub fn handle_register(
+    discovery_context_id: String,
+    handle: String,
+    target_json: String,
+    registrant_did: String,
+    description: Option<String>,
+    tags_json: Option<String>,
+) -> Result<String, JsError> {
+    let target: serde_json::Value = serde_json::from_str(&target_json)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid target_json: {e}")))?;
+
+    // Ownership check for identity targets.
+    if target["type"].as_str() == Some("identity")
+        && target["did"]
+            .as_str()
+            .is_some_and(|target_did| target_did != registrant_did)
+    {
+        let result = serde_json::json!({"status": "ownership_mismatch", "entry_id": null});
+        return Ok(result.to_string());
+    }
+
+    let normalized = handle.to_lowercase();
+    let now = crate::time::now_secs();
+
+    let tags: Option<Vec<String>> = tags_json
+        .as_deref()
+        .map(|s| serde_json::from_str(s).unwrap_or_default());
+
+    let entry_id = {
+        let mut guard = wasm_handle_registries()
+            .lock()
+            .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?;
+        let registry = guard
+            .entry(discovery_context_id)
+            .or_insert_with(WasmHandleRegistry::new);
+
+        if registry.entries.contains_key(&normalized) {
+            let result = serde_json::json!({"status": "conflict", "entry_id": null});
+            return Ok(result.to_string());
+        }
+
+        let eid = format!("handle-{}", registry.next_id);
+        registry.next_id += 1;
+
+        let entry = WasmHandleEntry {
+            handle: normalized.clone(),
+            target,
+            owner_did: registrant_did,
+            registered_at: now,
+            metadata: serde_json::json!({"description": description, "tags": tags}),
+            entry_id: eid.clone(),
+        };
+
+        registry.entries.insert(normalized, entry);
+        eid
+    };
+
+    let result = serde_json::json!({"status": "registered", "entry_id": entry_id});
+    Ok(result.to_string())
+}
+
+/// Looks up a handle in a discovery context. Returns JSON result.
+///
+/// # Errors
+///
+/// Returns `JsError` if the lock is poisoned.
+#[wasm_bindgen]
+pub fn handle_lookup(
+    discovery_context_id: String,
+    handle: String,
+    type_filter: Option<String>,
+) -> Result<String, JsError> {
+    let normalized = handle.to_lowercase();
+    let results: Vec<serde_json::Value> = wasm_handle_registries()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
+        .get(&discovery_context_id)
+        .and_then(|registry| registry.entries.get(&normalized))
+        .filter(|entry| match type_filter.as_deref() {
+            Some("identity") => entry.target["type"].as_str() == Some("identity"),
+            Some("context") => entry.target["type"].as_str() == Some("context"),
+            _ => true,
+        })
+        .map(|entry| serde_json::to_value(entry).unwrap_or_default())
+        .into_iter()
+        .collect();
+
+    let result = serde_json::json!({"results": results});
+    Ok(result.to_string())
+}
+
+/// Deregisters a handle from a discovery context. Returns JSON result.
+///
+/// # Errors
+///
+/// Returns `JsError` if the lock is poisoned.
+#[wasm_bindgen]
+pub fn handle_deregister(
+    discovery_context_id: String,
+    handle: String,
+    did: String,
+) -> Result<String, JsError> {
+    let normalized = handle.to_lowercase();
+    let removed = wasm_handle_registries()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
+        .get_mut(&discovery_context_id)
+        .is_some_and(|registry| {
+            if registry
+                .entries
+                .get(&normalized)
+                .is_some_and(|entry| entry.owner_did == did)
+            {
+                registry.entries.remove(&normalized);
+                true
+            } else {
+                false
+            }
+        });
+
+    let result = serde_json::json!({"removed": removed});
+    Ok(result.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Address resolve (§22.8) — WASM reimplementation per ADR-034
+// ---------------------------------------------------------------------------
+
+/// Resolves a human-readable address via multi-path resolution.
+///
+/// In WASM, resolution uses the local petname map and handle registries.
+/// Domain and attestation handle resolution require network I/O and are
+/// not available in WASM (empty results for those layers).
+///
+/// Returns a JSON array of resolution result objects.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty, address is empty, or the
+/// address cannot be resolved.
+#[wasm_bindgen]
+pub fn address_resolve(
+    owner_did: String,
+    address: String,
+    known_contexts_json: Option<String>,
+) -> Result<String, JsError> {
+    if owner_did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
+    }
+
+    let normalized = address.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7091] address must not be empty"));
+    }
+
+    let now = crate::time::now_secs();
+
+    // Try petnames first (instant, no network).
+    let petname_results = resolve_via_petnames(&owner_did, &normalized, now)?;
+    if !petname_results.is_empty() {
+        return Ok(serde_json::to_string(&petname_results).unwrap_or_else(|_| "[]".to_owned()));
+    }
+
+    // Try handle registries for unscoped or scoped addresses.
+    let handle_results = resolve_via_handles(&normalized, known_contexts_json.as_deref(), now)?;
+    if handle_results.is_empty() {
+        return Err(JsError::new(&format!(
+            "[SCP-VALID-7091] address not found: {address}"
+        )));
+    }
+
+    Ok(serde_json::to_string(&handle_results).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn resolve_via_petnames(
+    owner_did: &str,
+    normalized: &str,
+    now: u64,
+) -> Result<Vec<serde_json::Value>, JsError> {
+    let mut results = Vec::new();
+    let guard = wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] lock poisoned: {e}")))?;
+    if let Some(map) = guard.get(owner_did) {
+        for did in map.resolve_did(normalized) {
+            results.push(serde_json::json!({
+                "type": "Identity",
+                "did": did,
+                "trust_level": {"kind": "LocalPetname"},
+                "resolution_path": {
+                    "layer": "Petname",
+                    "source": "local",
+                    "source_id": null,
+                    "resolved_at": now,
+                },
+            }));
+        }
+        for ctx_id in map.resolve_context(normalized) {
+            results.push(serde_json::json!({
+                "type": "Context",
+                "context_id": ctx_id,
+                "relay_urls": [],
+                "mode": null,
+                "trust_level": {"kind": "LocalPetname"},
+                "resolution_path": {
+                    "layer": "Petname",
+                    "source": "local",
+                    "source_id": null,
+                    "resolved_at": now,
+                },
+            }));
+        }
+    }
+    Ok(results)
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn resolve_via_handles(
+    normalized: &str,
+    known_contexts_json: Option<&str>,
+    now: u64,
+) -> Result<Vec<serde_json::Value>, JsError> {
+    // Parse scoped addresses: "alice@cooking-community" → local_part="alice", scope="cooking-community"
+    let (local_part, scope) = normalized.find('@').map_or((normalized, None), |at_pos| {
+        (&normalized[..at_pos], Some(&normalized[at_pos + 1..]))
+    });
+
+    let known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
+        serde_json::from_str(json).map_err(|e| {
+            JsError::new(&format!(
+                "[SCP-VALID-7090] invalid known_contexts_json: {e}"
+            ))
+        })?
+    } else {
+        wasm_handle_registries()
+            .lock()
+            .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
+            .keys()
+            .map(|k| (k.clone(), k.clone()))
+            .collect()
+    };
+
+    let mut results = Vec::new();
+    let guard = wasm_handle_registries()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?;
+    for (scope_name, ctx_id) in &known_contexts {
+        // If a scope is specified, only search in contexts whose scope name matches.
+        if scope.is_some_and(|s| scope_name != s) {
+            continue;
+        }
+        let resolution = guard
+            .get(ctx_id)
+            .and_then(|r| r.entries.get(local_part))
+            .and_then(|entry| entry_to_resolution(entry, ctx_id, now));
+        if let Some(r) = resolution {
+            results.push(r);
+        }
+    }
+
+    // W1: Sort by trust level (descending rank) and deduplicate.
+    sort_and_deduplicate_results(&mut results);
+
+    Ok(results)
+}
+
+fn entry_to_resolution(
+    entry: &WasmHandleEntry,
+    ctx_id: &str,
+    now: u64,
+) -> Option<serde_json::Value> {
+    let target_type = entry.target["type"].as_str()?;
+    match target_type {
+        "identity" => {
+            let did = entry.target["did"].as_str().unwrap_or("");
+            Some(serde_json::json!({
+                "type": "Identity",
+                "did": did,
+                "trust_level": {"kind": "DiscoveryContextVerified"},
+                "resolution_path": {
+                    "layer": "DiscoveryContext",
+                    "source": "local_registry",
+                    "source_id": ctx_id,
+                    "resolved_at": now,
+                },
+            }))
+        }
+        "context" => {
+            let cid = entry.target["context_id"].as_str().unwrap_or("");
+            let relay_urls = entry.target["relay_urls"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Some(serde_json::json!({
+                "type": "Context",
+                "context_id": cid,
+                "relay_urls": relay_urls,
+                "mode": null,
+                "trust_level": {"kind": "DiscoveryContextVerified"},
+                "resolution_path": {
+                    "layer": "DiscoveryContext",
+                    "source": "local_registry",
+                    "source_id": ctx_id,
+                    "resolved_at": now,
+                },
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Returns a numeric rank for a trust level kind string (higher = more trusted).
+fn trust_level_rank(kind: &str) -> u8 {
+    match kind {
+        "DirectExchange" => 6,
+        "MultiLayerCorroborated" => 5,
+        "LocalPetname" => 4,
+        "AttestationVerified" => 3,
+        "DomainVerified" => 2,
+        "DiscoveryContextVerified" => 1,
+        _ => 0,
+    }
+}
+
+/// Sorts results by trust level (descending) and deduplicates by
+/// (DID or `context_id`), keeping the highest-trust entry for each.
+fn sort_and_deduplicate_results(results: &mut Vec<serde_json::Value>) {
+    // Sort descending by trust rank.
+    results.sort_by(|a, b| {
+        let rank_a = a["trust_level"]["kind"]
+            .as_str()
+            .map_or(0, trust_level_rank);
+        let rank_b = b["trust_level"]["kind"]
+            .as_str()
+            .map_or(0, trust_level_rank);
+        rank_b.cmp(&rank_a)
+    });
+
+    // Deduplicate: keep the first (highest trust) entry for each unique key.
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|r| {
+        let key = match r["type"].as_str() {
+            Some("Identity") => r["did"].as_str().unwrap_or("").to_owned(),
+            Some("Context") => r["context_id"].as_str().unwrap_or("").to_owned(),
+            _ => return true,
+        };
+        seen.insert(key)
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 /// Pure helper tests — no wasm-bindgen dependency, run on all targets.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -688,6 +1365,63 @@ mod tests {
         // Incomplete percent sequence at end — treated literally.
         assert_eq!(percent_decode("test%2"), "test%2");
         assert_eq!(percent_decode("test%"), "test%");
+    }
+
+    // -- WasmPetnameMap unit tests -------------------------------------------
+
+    #[test]
+    fn wasm_petname_map_set_and_resolve() {
+        let mut map = WasmPetnameMap::new();
+        map.set_petname("did:dht:zAlice", "alice");
+        let dids = map.resolve_did("alice");
+        assert_eq!(dids.len(), 1);
+        assert_eq!(dids[0], "did:dht:zAlice");
+    }
+
+    #[test]
+    fn wasm_petname_map_remove() {
+        let mut map = WasmPetnameMap::new();
+        map.set_petname("did:dht:zAlice", "alice");
+        map.remove_petname("did:dht:zAlice");
+        assert!(map.resolve_did("alice").is_empty());
+    }
+
+    #[test]
+    fn wasm_petname_map_context() {
+        let mut map = WasmPetnameMap::new();
+        map.set_context_petname("ctx-1", "work");
+        let ids = map.resolve_context("work");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "ctx-1");
+        assert_eq!(map.petname_for_context("ctx-1"), Some("work".to_owned()));
+
+        map.remove_context_petname("ctx-1");
+        assert!(map.resolve_context("work").is_empty());
+    }
+
+    #[test]
+    fn wasm_petname_map_reverse_lookup() {
+        let mut map = WasmPetnameMap::new();
+        map.set_petname("did:dht:zBob", "bob");
+        assert_eq!(map.petname_for_did("did:dht:zBob"), Some("bob".to_owned()));
+        assert_eq!(map.petname_for_did("did:dht:zNonExistent"), None);
+    }
+
+    // -- WasmHandleRegistry unit tests ---------------------------------------
+
+    #[test]
+    fn wasm_handle_registry_basic() {
+        let mut registry = WasmHandleRegistry::new();
+        let entry = WasmHandleEntry {
+            handle: "alice".to_owned(),
+            target: serde_json::json!({"type": "identity", "did": "did:dht:zAlice"}),
+            owner_did: "did:dht:zAlice".to_owned(),
+            registered_at: 0,
+            metadata: serde_json::json!({}),
+            entry_id: "handle-1".to_owned(),
+        };
+        registry.entries.insert("alice".to_owned(), entry);
+        assert!(registry.entries.contains_key("alice"));
     }
 }
 
