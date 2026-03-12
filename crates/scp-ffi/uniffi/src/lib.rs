@@ -410,11 +410,30 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// directly. Platform implementations using software-backed Ed25519 storage
     /// (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
     ///
+    /// # Default
+    ///
+    /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
+    /// implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
+    /// `AndroidKeyCustody`) override this with real implementations. Third-party
+    /// `KeyCustodyProvider` implementations that do not need governance vote
+    /// signing may rely on the default until they add support.
+    ///
+    /// **Note:** `UniFFI` callback interfaces require foreign implementations to
+    /// define all methods. The generated Swift protocol / Kotlin interface will
+    /// include this method. The default here applies only to Rust-side callers.
+    ///
     /// # Errors
     ///
     /// Returns `ScpError` if the key is not found, not exportable, or not
     /// an Ed25519 key.
-    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
+    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
+        let _ = key_id;
+        Err(ScpError::Context {
+            message: "export_signing_key_bytes not implemented by this KeyCustodyProvider"
+                .to_owned(),
+            code: "SCP-CTX-2050".to_owned(),
+        })
+    }
 
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
     /// `"in_memory"`. Stays sync — no I/O required.

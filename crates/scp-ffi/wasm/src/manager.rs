@@ -278,6 +278,12 @@ struct WasmProposal {
     rejections: Vec<String>,
     /// Voting deadline (ms since epoch). Default 1 hour from creation.
     voting_deadline_ms: f64,
+    /// Context ID this proposal belongs to.
+    context_id: String,
+    /// Unix timestamp (seconds) when the proposal was created.
+    created_at: u64,
+    /// Lifecycle status: "Pending", "Approved", or "Rejected".
+    status: String,
 }
 
 /// Maximum number of pending proposals per context.
@@ -407,6 +413,11 @@ struct PerContextState {
     /// Multi-party governance models accumulate votes here until quorum
     /// is reached or the deadline expires (#621).
     pending_proposals: HashMap<String, WasmProposal>,
+    /// Resolved (approved/rejected) governance proposals keyed by proposal ID.
+    /// Proposals move here from `pending_proposals` when quorum is reached or
+    /// the proposal is definitively rejected. This allows retrieval of resolved
+    /// proposals via `get_proposal` and `list_proposals` (#621 F4).
+    resolved_proposals: HashMap<String, WasmProposal>,
     /// Pruning policy JSON string (ADR-030 §6).
     pruning_policy: Option<String>,
     /// Whether the economic policy is locked (§19.3, ADR-033).
@@ -784,6 +795,7 @@ impl WasmContextManager {
             tool_interfaces: Vec::new(),
             governance_freeze: false,
             pending_proposals: HashMap::new(),
+            resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
         };
@@ -2514,10 +2526,12 @@ impl WasmContextManager {
             }
         }
 
-        // Check for duplicate proposal ID.
+        // Check for duplicate proposal ID (pending or resolved).
         {
             let ctx = self.require_active_context_mut(context_id)?;
-            if ctx.pending_proposals.contains_key(proposal_id) {
+            if ctx.pending_proposals.contains_key(proposal_id)
+                || ctx.resolved_proposals.contains_key(proposal_id)
+            {
                 return Err(ScpWasmError::Context {
                     message: format!("proposal {proposal_id} already exists"),
                     code: "SCP-CTX-2041".to_owned(),
@@ -2544,12 +2558,17 @@ impl WasmContextManager {
 
         // Multi-admin: create pending proposal. Proposer's vote counts as first approval.
         let now = crate::time::now_ms();
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let now_secs = (now / 1000.0) as u64;
         let proposal = WasmProposal {
             proposer_did: proposer_did.to_owned(),
             action: action.clone(),
             approvals: vec![proposer_did.to_owned()],
             rejections: Vec::new(),
             voting_deadline_ms: now + WASM_PROPOSAL_DEADLINE_MS,
+            context_id: context_id.to_owned(),
+            created_at: now_secs,
+            status: "Pending".to_owned(),
         };
 
         let ctx = self.require_active_context_mut(context_id)?;
@@ -2581,9 +2600,14 @@ impl WasmContextManager {
                 .contexts
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
-            if let Some(p) = proposal {
+            if let Some(mut p) = proposal {
                 let result =
                     self.execute_governance_action(context_id, proposer_did, &pid, &p.action)?;
+                // Move to resolved_proposals for later retrieval.
+                "Approved".clone_into(&mut p.status);
+                if let Some(ctx) = self.contexts.get_mut(context_id) {
+                    ctx.resolved_proposals.insert(pid.clone(), p);
+                }
                 return Ok(serde_json::json!({
                     "proposal_id": pid,
                     "status": "Approved",
@@ -2677,9 +2701,14 @@ impl WasmContextManager {
                 .contexts
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
-            if let Some(p) = proposal {
+            if let Some(mut p) = proposal {
                 let result =
                     self.execute_governance_action(context_id, &p.proposer_did, &pid, &p.action)?;
+                // Move to resolved_proposals for later retrieval.
+                "Approved".clone_into(&mut p.status);
+                if let Some(ctx) = self.contexts.get_mut(context_id) {
+                    ctx.resolved_proposals.insert(pid.clone(), p);
+                }
                 return Ok(serde_json::json!({
                     "status": "Approved",
                     "execution_result": result,
@@ -2765,9 +2794,12 @@ impl WasmContextManager {
         };
 
         if !can_still_reach_quorum {
-            // Proposal is dead — remove it.
-            if let Some(ctx3) = self.contexts.get_mut(context_id) {
-                ctx3.pending_proposals.remove(proposal_id);
+            // Proposal is dead — move to resolved_proposals for later retrieval.
+            if let Some(ctx3) = self.contexts.get_mut(context_id)
+                && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
+            {
+                "Rejected".clone_into(&mut p.status);
+                ctx3.resolved_proposals.insert(proposal_id.to_owned(), p);
             }
             return Ok(serde_json::json!({ "status": "Rejected" }));
         }
@@ -2819,11 +2851,11 @@ impl WasmContextManager {
         Ok(serde_json::json!({ "status": "Pending" }))
     }
 
-    /// Retrieves a single pending governance proposal by ID.
+    /// Retrieves a governance proposal by ID from pending or resolved maps.
     ///
     /// # Errors
     ///
-    /// Returns an error if the proposal is not found.
+    /// Returns an error if the proposal is not found in either map.
     pub fn get_proposal(
         &self,
         context_id: &str,
@@ -2837,24 +2869,19 @@ impl WasmContextManager {
                 code: "SCP-CTX-2045".to_owned(),
             })?;
 
-        let proposal =
-            ctx.pending_proposals
-                .get(proposal_id)
-                .ok_or_else(|| ScpWasmError::Context {
-                    message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-CTX-2045".to_owned(),
-                })?;
+        let proposal = ctx
+            .pending_proposals
+            .get(proposal_id)
+            .or_else(|| ctx.resolved_proposals.get(proposal_id))
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("proposal {proposal_id} not found"),
+                code: "SCP-CTX-2045".to_owned(),
+            })?;
 
-        Ok(serde_json::json!({
-            "proposal_id": proposal_id,
-            "proposer_did": proposal.proposer_did,
-            "approvals": proposal.approvals,
-            "rejections": proposal.rejections,
-            "voting_deadline_ms": proposal.voting_deadline_ms,
-        }))
+        Ok(Self::proposal_to_json(proposal_id, proposal))
     }
 
-    /// Lists all pending governance proposals for a context.
+    /// Lists all governance proposals (pending and resolved) for a context.
     ///
     /// # Errors
     ///
@@ -2871,18 +2898,62 @@ impl WasmContextManager {
         let proposals: Vec<serde_json::Value> = ctx
             .pending_proposals
             .iter()
-            .map(|(id, p)| {
+            .chain(ctx.resolved_proposals.iter())
+            .map(|(id, p)| Self::proposal_to_json(id, p))
+            .collect();
+
+        Ok(serde_json::json!(proposals))
+    }
+
+    /// Serializes a `WasmProposal` to the full JSON response shape matching
+    /// native bridges' `GovernanceProposal` serialization.
+    ///
+    /// Fields: `proposal_id`, `context_id`, `proposer_did`, `action`,
+    /// `status`, `created_at` (ISO 8601), `created_at_epoch` (seconds),
+    /// `voting_deadline` (seconds), `approvals` (with `voter_did` and
+    /// `vote` fields), `rejections` (same shape).
+    fn proposal_to_json(proposal_id: &str, proposal: &WasmProposal) -> serde_json::Value {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let voting_deadline_secs = (proposal.voting_deadline_ms / 1000.0) as u64;
+
+        let approvals: Vec<serde_json::Value> = proposal
+            .approvals
+            .iter()
+            .map(|did| {
                 serde_json::json!({
-                    "proposal_id": id,
-                    "proposer_did": p.proposer_did,
-                    "approvals": p.approvals,
-                    "rejections": p.rejections,
-                    "voting_deadline_ms": p.voting_deadline_ms,
+                    "voter_did": did,
+                    "vote": "Approve",
+                    "timestamp": proposal.created_at,
+                    "signature": [],
                 })
             })
             .collect();
 
-        Ok(serde_json::json!(proposals))
+        let rejections: Vec<serde_json::Value> = proposal
+            .rejections
+            .iter()
+            .map(|did| {
+                serde_json::json!({
+                    "voter_did": did,
+                    "vote": "Reject",
+                    "timestamp": proposal.created_at,
+                    "signature": [],
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "proposal_id": proposal_id,
+            "context_id": proposal.context_id,
+            "proposer_did": proposal.proposer_did,
+            "action": proposal.action,
+            "status": proposal.status,
+            "created_at": proposal.created_at,
+            "voting_deadline": voting_deadline_secs,
+            "approvals": approvals,
+            "rejections": rejections,
+            "created_at_epoch": null,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3809,6 +3880,7 @@ impl WasmContextManager {
             tool_interfaces: snap.tool_interfaces.clone(),
             governance_freeze: snap.governance_freeze,
             pending_proposals: HashMap::new(),
+            resolved_proposals: HashMap::new(),
             pruning_policy: snap.pruning_policy.clone(),
             economic_policy_locked: snap.economic_policy_locked,
         };

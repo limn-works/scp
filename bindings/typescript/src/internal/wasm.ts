@@ -412,6 +412,22 @@ function base64ToUint8(base64: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * Generates a 64-character hex-encoded proposal ID (256-bit random).
+ *
+ * Native bridges receive hex-encoded SHA-256 hashes (64-char hex) from
+ * scp-core's `compute_proposal_id()`. This function produces a 256-bit
+ * random value in the same format for cross-bridge interop.
+ */
+function generateProposalIdHex(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+  let hex = "";
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
 // ---------------------------------------------------------------------------
 // Bridge factory
 // ---------------------------------------------------------------------------
@@ -652,10 +668,9 @@ export function createWasmBridge(): Bridge {
       proposerDid: string,
     ): Promise<string> {
       const wasm = getWasm();
-      // Generate a unique proposal ID for replay protection. The WASM manager
-      // uses this as a HashMap key — empty string causes all subsequent
-      // governance actions to fail as "already executed".
-      const proposalId = globalThis.crypto.randomUUID();
+      // Generate a 64-char hex proposal ID (256-bit) matching native bridge
+      // format (SHA-256 hex from scp-core's compute_proposal_id).
+      const proposalId = generateProposalIdHex();
       return await wasm.context_execute_governance(handle, proposerDid, proposalId, actionJson);
     },
 
@@ -666,7 +681,7 @@ export function createWasmBridge(): Bridge {
       proposerDid: string,
     ): Promise<string> {
       const wasm = getWasm();
-      const proposalId = globalThis.crypto.randomUUID();
+      const proposalId = generateProposalIdHex();
       return await wasm.context_governance_propose(handle, proposerDid, proposalId, actionJson);
     },
     async contextGovernanceApprove(
