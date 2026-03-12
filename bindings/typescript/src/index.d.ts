@@ -133,7 +133,8 @@ export interface VerificationMethod {
 }
 
 export interface UcanToken {
-  readonly tokenId: string;
+  readonly id: string;
+  readonly encoded: string;
   readonly issuer: string;
   readonly audience: string;
   readonly capabilities: string[];

@@ -36,6 +36,8 @@ use scp_identity::cache::SystemClock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
+#[cfg(feature = "allow_in_memory_custody")]
+use crate::identity::OpaqueInMemoryKeyCustody;
 
 /// A tool handler is a closure that takes validated JSON input and returns
 /// JSON output or an error string. Registered via [`register_tool_handler`].
@@ -107,6 +109,102 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             noop_key_resolver(),
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Global identity registry — retained identity state for UCAN delegation
+//
+// The NAPI bridge stores key custody on the NapiIdentity JS object, but
+// bridge functions like `ucan_delegate` need to look up the *delegator's*
+// key, not the context creator's key. This registry provides that lookup.
+// ---------------------------------------------------------------------------
+
+/// Retained identity state for a single DID in the NAPI bridge.
+///
+/// Stores the `ScpIdentity` (key handles) and `InMemoryKeyCustody` (key
+/// material) so that bridge functions can look up any registered identity
+/// by DID.
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) struct NapiIdentityEntry {
+    /// The scp-core identity handle (DID string, key handles).
+    pub(crate) identity: scp_identity::ScpIdentity,
+    /// The key custody provider holding the actual key material.
+    pub(crate) custody: Arc<OpaqueInMemoryKeyCustody>,
+}
+
+/// Global registry of identity state, keyed by DID string.
+#[cfg(feature = "allow_in_memory_custody")]
+static IDENTITY_REGISTRY: OnceLock<DashMap<String, NapiIdentityEntry>> = OnceLock::new();
+
+/// Returns a reference to the global identity registry.
+#[cfg(feature = "allow_in_memory_custody")]
+fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
+    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Registers an identity in the global identity registry.
+///
+/// Called by `identity_create` and `identity_create_with_agent_key` after
+/// successfully creating an identity. Bridge functions (`ucan_delegate`)
+/// look up the retained `InMemoryKeyCustody` and `KeyHandle`s via
+/// [`with_identity`].
+///
+/// Overwrites any existing entry for the same DID (idempotent — supports
+/// key rotation where the same DID gets new key material).
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) fn register_identity(did: &str, entry: NapiIdentityEntry) {
+    identity_registry().insert(did.to_owned(), entry);
+}
+
+/// Removes an identity from the global identity registry.
+///
+/// Called when an identity is migrated to a new DID or during cleanup.
+/// The old entry is removed and its key material is dropped.
+///
+/// Idempotent: no-op if the DID is not present.
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) fn remove_identity(did: &str) {
+    identity_registry().remove(did);
+}
+
+/// Removes an identity from the global identity registry if present.
+///
+/// Returns `true` if the identity was found and removed, `false` if the
+/// DID was not in the registry.
+///
+/// Provided as a cleanup mechanism for long-running processes alongside
+/// [`remove_identity`] which is unconditional.
+#[cfg(feature = "allow_in_memory_custody")]
+#[must_use]
+pub(crate) fn remove_identity_if_present(did: &str) -> bool {
+    identity_registry().remove(did).is_some()
+}
+
+/// Executes a closure with a reference to an identity's retained state.
+///
+/// Looks up the identity by DID in the global registry and calls `f` with
+/// a reference to the [`NapiIdentityEntry`].
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Permission` if the DID is not found (the identity
+/// was not created via `identity_create` in this process).
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpNapiError>
+where
+    F: FnOnce(&NapiIdentityEntry) -> Result<T, ScpNapiError>,
+{
+    let entry = identity_registry()
+        .get(did)
+        .ok_or_else(|| ScpNapiError::Permission {
+            message: format!(
+                "identity '{did}' not found in registry — was it created with \
+                 identityCreate(\"in_memory\") in this process?"
+            ),
+            code: "SCP-PERM-3023".to_owned(),
+        })?;
+
+    f(entry.value())
 }
 
 // ---------------------------------------------------------------------------
