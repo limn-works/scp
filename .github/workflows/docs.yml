@@ -14,6 +14,7 @@
 #   Rust       — rustdoc (cargo doc)
 #   Python     — sphinx (autodoc + napoleon)
 #   TypeScript — typedoc
+#   Swift      — DocC (runs in build-matrix.yml; requires XCFramework binary)
 #   Kotlin     — Dokka (./gradlew dokkaHtml)
 
 name: SDK Docs
@@ -187,6 +188,7 @@ jobs:
             <li><a href="docs-rust/scp_core/">Rust (scp-core)</a></li>
             <li><a href="docs-python/">Python (scp-python)</a></li>
             <li><a href="docs-typescript/">TypeScript (@limn-works/scp-ts)</a></li>
+            <li><a href="docs-swift/">Swift (SCP)</a></li>
             <li><a href="docs-kotlin/">Kotlin (scp-kt)</a></li>
           </ul>
           </body>
