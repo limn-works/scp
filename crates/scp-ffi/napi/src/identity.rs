@@ -9,6 +9,11 @@
 //! - [`identity_load`] — Loads an existing identity by DID string.
 //! - [`identity_resolve`] — Resolves a DID to its document.
 //!
+//! Identity migration (spec §9.12):
+//!
+//! - [`NapiIdentity::migrate`] — Performs Layer 2 DID rotation, creating a new
+//!   DID with a pre-rotation key while preserving identity continuity.
+//!
 //! Agent key management (ADR-039):
 //!
 //! - [`NapiIdentity::add_agent_key`] — Adds an agent signing key.
@@ -465,6 +470,111 @@ impl NapiIdentity {
             let handle = Self {
                 inner: Arc::new(NapiIdentityInner {
                     did: new_identity.did.clone(),
+                    custody_type: self.inner.custody_type.clone(),
+                    scp_identity: Some(new_identity),
+                    in_memory_custody: self.inner.in_memory_custody.clone(),
+                    document: Some(new_document),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
+    }
+
+    /// Migrates this identity to a new DID (Layer 2 DID rotation, spec §9.12).
+    ///
+    /// Creates a new DID with a pre-rotation key, preserving identity
+    /// continuity. The old DID's key material is removed from the registry
+    /// and replaced with the new DID's state.
+    ///
+    /// This is a full DID migration — the returned `NapiIdentity` has a
+    /// **different** DID string from the original. The old identity is
+    /// invalidated (removed from the registry). Callers must use the returned
+    /// handle for all subsequent operations.
+    ///
+    /// # Returns
+    ///
+    /// A new `NapiIdentity` with the migrated DID. The original identity's
+    /// key material is dropped from the registry.
+    ///
+    /// # Errors
+    ///
+    /// - `SCP-IDENT-1007`: The identity was externally loaded (no retained
+    ///   crypto state).
+    /// - `SCP-IDENT-1009`: Key generation or DHT publishing failed during
+    ///   migration.
+    ///
+    /// See ADR-003 acceptance criterion 4b, spec §9.12, and SCP-214 criterion 10.
+    #[napi]
+    pub async fn migrate(&self) -> napi::Result<Self> {
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            let _ = self;
+            return Err(ScpNapiError::Identity {
+                message: "identity migration requires in-memory custody -- \
+                          enable allow_in_memory_custody"
+                    .to_owned(),
+                code: "SCP-IDENT-1007".to_owned(),
+            }
+            .into());
+        }
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
+
+            // Spec §9.12 (Compromise Recovery Protocol) requires using the
+            // pre-rotation key from cold storage — the pre-rotation commitment
+            // in the old DID document proves the legitimate owner is rotating,
+            // not an attacker. In-memory custody does not persist keys across
+            // sessions, so no cold storage key exists. Generate a fresh
+            // pre-rotation key instead; `migrate_identity` uses it as the new
+            // Identity Key. Production custody providers (platform/HSM) must
+            // retrieve the original pre-rotation key from durable storage.
+            let pre_rotation_key = custody
+                .0
+                .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+                .await
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Identity {
+                        message: format!("key generation failed during migration: {e}"),
+                        code: "SCP-IDENT-1009".to_owned(),
+                    })
+                })?;
+
+            let rotated_at = scp_core::time::now_secs().map_err(|e| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!("failed to get current time: {e}"),
+                    code: "SCP-IDENT-1009".to_owned(),
+                })
+            })?;
+
+            let dht = make_dht_with_signer(&custody);
+            let (new_identity, new_document, _rotation_event) = dht
+                .migrate_identity(
+                    &scp_identity,
+                    &document,
+                    &pre_rotation_key,
+                    &custody.0,
+                    rotated_at,
+                )
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            let new_did = new_identity.did.clone();
+
+            // Remove the old identity and register the new one.
+            crate::runtime::remove_identity(&self.inner.did);
+            crate::runtime::register_identity(
+                &new_did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: new_identity.clone(),
+                    custody: Arc::clone(&custody),
+                },
+            );
+
+            let handle = Self {
+                inner: Arc::new(NapiIdentityInner {
+                    did: new_did,
                     custody_type: self.inner.custody_type.clone(),
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
@@ -1439,6 +1549,149 @@ mod tests {
             napi_doc.verification_methods.len(),
             document.verification_method.len(),
             "NapiDIDDocument verification_methods count must match source document"
+        );
+    }
+
+    #[test]
+    fn migrate_returns_new_did() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+        let original_did = identity.did();
+
+        let migrated = rt
+            .block_on(identity.migrate())
+            .expect("migrate must succeed");
+
+        assert_ne!(
+            migrated.did(),
+            original_did,
+            "migrated identity must have a different DID"
+        );
+        assert!(
+            migrated.did().starts_with("did:dht:"),
+            "migrated DID must be a did:dht DID"
+        );
+    }
+
+    #[test]
+    fn migrate_preserves_custody_type() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+
+        let migrated = rt
+            .block_on(identity.migrate())
+            .expect("migrate must succeed");
+
+        assert_eq!(
+            migrated.custody_type(),
+            "in_memory",
+            "custody type must remain in_memory after migration"
+        );
+    }
+
+    #[test]
+    fn migrate_retains_scp_identity_and_document() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+
+        let migrated = rt
+            .block_on(identity.migrate())
+            .expect("migrate must succeed");
+
+        assert!(
+            migrated.inner.scp_identity.is_some(),
+            "migrated identity must retain ScpIdentity"
+        );
+        assert!(
+            migrated.inner.document.is_some(),
+            "migrated identity must retain DidDocument"
+        );
+        assert!(
+            migrated.inner.in_memory_custody.is_some(),
+            "migrated identity must retain InMemoryKeyCustody"
+        );
+    }
+
+    #[test]
+    fn migrate_removes_old_identity_from_registry() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+        let old_did = identity.did();
+
+        // Register the identity in the runtime (simulating what identity_create does).
+        crate::runtime::register_identity(
+            &old_did,
+            crate::runtime::NapiIdentityEntry {
+                identity: identity.inner.scp_identity.clone().expect("scp_identity"),
+                custody: identity
+                    .inner
+                    .in_memory_custody
+                    .as_ref()
+                    .expect("custody")
+                    .clone(),
+            },
+        );
+
+        let migrated = rt
+            .block_on(identity.migrate())
+            .expect("migrate must succeed");
+
+        // Old DID should be removed from the registry.
+        let old_lookup = crate::runtime::with_identity(&old_did, |_| Ok(()));
+        assert!(
+            old_lookup.is_err(),
+            "old DID must be removed from identity registry after migration"
+        );
+
+        // New DID should be in the registry.
+        let new_lookup = crate::runtime::with_identity(&migrated.did(), |_| Ok(()));
+        assert!(
+            new_lookup.is_ok(),
+            "new DID must be registered in identity registry after migration"
+        );
+    }
+
+    #[test]
+    fn migrate_errors_without_retained_crypto_state() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        let identity = NapiIdentity {
+            inner: Arc::new(NapiIdentityInner {
+                did: "did:dht:z6MkTest".to_owned(),
+                custody_type: "external".to_owned(),
+                scp_identity: None,
+                in_memory_custody: None,
+                document: None,
+            }),
+        };
+        increment_handle_count();
+
+        let Err(err) = rt.block_on(identity.migrate()) else {
+            panic!("migrate must fail without retained crypto state")
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1007"),
+            "error must contain SCP-IDENT-1007, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn migrate_shares_custody_arc() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (identity, _) = rt.block_on(create_test_identity());
+
+        let migrated = rt
+            .block_on(identity.migrate())
+            .expect("migrate must succeed");
+
+        assert!(
+            Arc::ptr_eq(
+                identity.inner.in_memory_custody.as_ref().expect("custody"),
+                migrated.inner.in_memory_custody.as_ref().expect("custody"),
+            ),
+            "original and migrated identities must share the same Arc<InMemoryKeyCustody>"
         );
     }
 }
