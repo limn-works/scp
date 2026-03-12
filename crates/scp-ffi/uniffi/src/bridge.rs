@@ -7526,7 +7526,8 @@ pub struct ShadowIdentityResult {
 /// # Errors
 ///
 /// Returns `ScpError::Validation` if `operator_did` or `governance_did`
-/// has an invalid DID format, or if `mode` is not recognized.  Returns
+/// is not a valid DID string (empty, missing `did:{method}:{id}` structure,
+/// or contains control characters), or if `mode` is not recognized. Returns
 /// `ScpError::Context` if registration or approval fails (including
 /// self-approval).
 ///
