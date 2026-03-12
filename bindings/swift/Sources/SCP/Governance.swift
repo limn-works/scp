@@ -180,9 +180,88 @@ public enum GovernanceBridge {
         _ proposalJson: String
     ) async throws -> String
 
+    /// Propose a governance action for voting (#621).
+    public typealias ProposeFn = @Sendable (
+        _ handle: ContextHandle,
+        _ proposerDid: String,
+        _ actionJson: String
+    ) async throws -> String
+
+    /// Approve a pending governance proposal (#621).
+    public typealias ApproveFn = @Sendable (
+        _ handle: ContextHandle,
+        _ voterDid: String,
+        _ proposalIdHex: String
+    ) async throws -> String
+
+    /// Reject a pending governance proposal (#621).
+    public typealias RejectFn = @Sendable (
+        _ handle: ContextHandle,
+        _ voterDid: String,
+        _ proposalIdHex: String
+    ) async throws -> String
+
+    /// Withdraw a vote on a pending governance proposal (#621).
+    public typealias WithdrawFn = @Sendable (
+        _ handle: ContextHandle,
+        _ voterDid: String,
+        _ proposalIdHex: String
+    ) async throws -> String
+
     /// Default execute function that delegates to the UniFFI-generated binding.
     public static let defaultExecute: ExecuteFn = { handle, proposalJson in
         try await governanceExecute(handle: handle, proposalJson: proposalJson)
+    }
+
+    /// Default propose function that delegates to the UniFFI-generated binding.
+    public static let defaultPropose: ProposeFn = { handle, proposerDid, actionJson in
+        try await governancePropose(
+            handle: handle, proposerDid: proposerDid, actionJson: actionJson
+        )
+    }
+
+    /// Default approve function that delegates to the UniFFI-generated binding.
+    public static let defaultApprove: ApproveFn = { handle, voterDid, proposalIdHex in
+        try await governanceApprove(
+            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
+        )
+    }
+
+    /// Default reject function that delegates to the UniFFI-generated binding.
+    public static let defaultReject: RejectFn = { handle, voterDid, proposalIdHex in
+        try await governanceReject(
+            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
+        )
+    }
+
+    /// Default withdraw function that delegates to the UniFFI-generated binding.
+    public static let defaultWithdraw: WithdrawFn = { handle, voterDid, proposalIdHex in
+        try await governanceWithdraw(
+            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
+        )
+    }
+
+    /// Retrieve a single governance proposal by hex-encoded ID (#621).
+    public typealias GetProposalFn = @Sendable (
+        _ handle: ContextHandle,
+        _ proposalIdHex: String
+    ) async throws -> String
+
+    /// List all governance proposals for a context (#621).
+    public typealias ListProposalsFn = @Sendable (
+        _ handle: ContextHandle
+    ) async throws -> String
+
+    /// Default get proposal function that delegates to the UniFFI-generated binding.
+    public static let defaultGetProposal: GetProposalFn = { handle, proposalIdHex in
+        try await governanceGetProposal(
+            handle: handle, proposalIdHex: proposalIdHex
+        )
+    }
+
+    /// Default list proposals function that delegates to the UniFFI-generated binding.
+    public static let defaultListProposals: ListProposalsFn = { handle in
+        try await governanceListProposals(handle: handle)
     }
 }
 
@@ -357,6 +436,178 @@ public extension Context {
         }
         let raw = try await executeFn(contextHandle, proposalJson)
         return GovernanceActionResult(rawValue: raw) ?? .executed
+    }
+}
+
+// MARK: - Context Governance Proposal Lifecycle Extensions (#621)
+
+public extension Context {
+    /// Proposes a governance action for voting.
+    ///
+    /// For `SingleAdmin` contexts, the proposal is auto-approved and executed
+    /// immediately. For multi-admin models (Threshold, Majority, Unanimity),
+    /// the proposal enters `Pending` status and must accumulate votes.
+    ///
+    /// - Parameters:
+    ///   - actionJson: JSON-serialized ``GovernanceAction``.
+    ///   - proposerDid: DID of the proposer.
+    ///   - proposeFn: Bridge function override for testing.
+    /// - Returns: JSON string with `proposal_id`, `status`, and `execution_result`.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    ///   active or the proposal fails.
+    func proposeGovernanceAction(
+        actionJson: String,
+        proposerDid: String,
+        proposeFn: GovernanceBridge.ProposeFn = GovernanceBridge.defaultPropose
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2041"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await proposeFn(contextHandle, proposerDid, actionJson)
+    }
+
+    /// Casts an approval vote on a pending governance proposal.
+    ///
+    /// If the vote pushes the proposal past quorum, the action is auto-executed.
+    ///
+    /// - Parameters:
+    ///   - proposalIdHex: Hex-encoded 32-byte proposal ID.
+    ///   - voterDid: DID of the voter.
+    ///   - approveFn: Bridge function override for testing.
+    /// - Returns: JSON string with `status`.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the vote fails.
+    func approveGovernanceProposal(
+        proposalIdHex: String,
+        voterDid: String,
+        approveFn: GovernanceBridge.ApproveFn = GovernanceBridge.defaultApprove
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2042"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await approveFn(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /// Casts a rejection vote on a pending governance proposal.
+    ///
+    /// - Parameters:
+    ///   - proposalIdHex: Hex-encoded 32-byte proposal ID.
+    ///   - voterDid: DID of the voter.
+    ///   - rejectFn: Bridge function override for testing.
+    /// - Returns: JSON string with `status`.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the vote fails.
+    func rejectGovernanceProposal(
+        proposalIdHex: String,
+        voterDid: String,
+        rejectFn: GovernanceBridge.RejectFn = GovernanceBridge.defaultReject
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2043"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await rejectFn(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /// Withdraws a previously cast vote on a pending governance proposal.
+    ///
+    /// - Parameters:
+    ///   - proposalIdHex: Hex-encoded 32-byte proposal ID.
+    ///   - voterDid: DID of the voter.
+    ///   - withdrawFn: Bridge function override for testing.
+    /// - Returns: JSON string with `status`.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the withdrawal fails.
+    func withdrawGovernanceVote(
+        proposalIdHex: String,
+        voterDid: String,
+        withdrawFn: GovernanceBridge.WithdrawFn = GovernanceBridge.defaultWithdraw
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2044"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await withdrawFn(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /// Retrieves a governance proposal by hex-encoded ID.
+    ///
+    /// - Parameters:
+    ///   - proposalIdHex: Hex-encoded 32-byte proposal ID.
+    ///   - getProposalFn: Bridge function override for testing.
+    /// - Returns: JSON string with proposal details.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the proposal is not found.
+    func getGovernanceProposal(
+        proposalIdHex: String,
+        getProposalFn: GovernanceBridge.GetProposalFn = GovernanceBridge.defaultGetProposal
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2045"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await getProposalFn(contextHandle, proposalIdHex)
+    }
+
+    /// Lists all governance proposals for this context.
+    ///
+    /// - Parameter listProposalsFn: Bridge function override for testing.
+    /// - Returns: JSON array of proposals.
+    /// - Throws: ``ScpError/Context(message:code:)`` if listing fails.
+    func listGovernanceProposals(
+        listProposalsFn: GovernanceBridge.ListProposalsFn = GovernanceBridge.defaultListProposals
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2046"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await listProposalsFn(contextHandle)
     }
 }
 

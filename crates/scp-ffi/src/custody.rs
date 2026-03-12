@@ -125,6 +125,31 @@ impl KeyCustody for FfiKeyCustody {
     }
 }
 
+impl FfiKeyCustody {
+    /// Exports the raw Ed25519 signing key for the given handle.
+    ///
+    /// Required by the governance lifecycle bridge functions
+    /// (`propose_governance_action`, `approve_governance_proposal`,
+    /// `reject_governance_proposal`) which delegate to core functions
+    /// that accept `&ed25519_dalek::SigningKey` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
+    /// X25519 key.
+    pub async fn export_ed25519_signing_key(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.export_ed25519_signing_key(handle).await,
+            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

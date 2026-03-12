@@ -630,6 +630,133 @@ export class Context implements AsyncDisposable {
     }
   }
 
+  /**
+   * Proposes a governance action for voting.
+   *
+   * For `SingleAdmin` contexts, the proposal is auto-approved and executed
+   * immediately. For multi-admin models (Threshold, Majority, Unanimity),
+   * the proposal enters `Pending` status and must accumulate votes.
+   *
+   * @param actionJson - JSON-serialized `GovernanceAction`.
+   * @param proposerDid - DID of the proposer. Defaults to context identity.
+   * @returns JSON string with `proposal_id`, `status`, and `execution_result`.
+   * @throws {ContextError} If the context is not active or the proposal fails.
+   */
+  async proposeGovernanceAction(actionJson: string, proposerDid?: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernancePropose(
+        this._handle,
+        actionJson,
+        proposerDid ?? this._identityDid,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Casts an approval vote on a pending governance proposal.
+   *
+   * If the vote pushes the proposal past quorum, the action is auto-executed.
+   *
+   * @param proposalIdHex - Hex-encoded 32-byte proposal ID.
+   * @param voterDid - DID of the voter. Defaults to context identity.
+   * @returns JSON string with `status`.
+   * @throws {ContextError} If the vote fails.
+   */
+  async approveGovernanceProposal(proposalIdHex: string, voterDid?: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceApprove(
+        this._handle,
+        proposalIdHex,
+        voterDid ?? this._identityDid,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Casts a rejection vote on a pending governance proposal.
+   *
+   * @param proposalIdHex - Hex-encoded 32-byte proposal ID.
+   * @param voterDid - DID of the voter. Defaults to context identity.
+   * @returns JSON string with `status`.
+   * @throws {ContextError} If the vote fails.
+   */
+  async rejectGovernanceProposal(proposalIdHex: string, voterDid?: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceReject(
+        this._handle,
+        proposalIdHex,
+        voterDid ?? this._identityDid,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Withdraws a previously cast vote on a pending governance proposal.
+   *
+   * @param proposalIdHex - Hex-encoded 32-byte proposal ID.
+   * @param voterDid - DID of the voter. Defaults to context identity.
+   * @returns JSON string with `status`.
+   * @throws {ContextError} If the withdrawal fails.
+   */
+  async withdrawGovernanceVote(proposalIdHex: string, voterDid?: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceWithdraw(
+        this._handle,
+        proposalIdHex,
+        voterDid ?? this._identityDid,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Retrieves a single governance proposal by its hex-encoded ID.
+   *
+   * @param proposalIdHex - Hex-encoded 32-byte proposal ID.
+   * @returns JSON string with proposal details.
+   * @throws {ContextError} If the proposal is not found (SCP-CTX-2045).
+   */
+  async getGovernanceProposal(proposalIdHex: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceGetProposal(this._handle, proposalIdHex);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Lists all governance proposals for this context.
+   *
+   * @returns JSON array of proposals.
+   * @throws {ContextError} If listing fails (SCP-CTX-2046).
+   */
+  async listGovernanceProposals(): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceListProposals(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // TTL
   // ---------------------------------------------------------------------------

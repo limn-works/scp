@@ -152,6 +152,36 @@ impl InMemoryKeyCustody {
         store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
         handle
     }
+
+    /// Exports a clone of the Ed25519 signing key for the given handle.
+    ///
+    /// Required by FFI bridges that need the raw `ed25519_dalek::SigningKey`
+    /// for core governance functions (`propose_governance_action`,
+    /// `approve_governance_proposal`, etc.) which take `&SigningKey` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
+    /// X25519 key.
+    pub async fn export_ed25519_signing_key(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<SigningKey, PlatformError> {
+        let store = self.store.lock().await;
+        let key_type = store.lookup_type(*handle)?;
+        if key_type != StoredKeyType::Ed25519 {
+            return Err(PlatformError::WrongKeyType {
+                expected: KeyType::Ed25519,
+                actual: KeyType::X25519,
+            });
+        }
+        store
+            .ed25519_keys
+            .get(&handle.id())
+            .cloned()
+            .ok_or(PlatformError::KeyNotFound)
+    }
 }
 
 impl Default for InMemoryKeyCustody {

@@ -621,6 +621,17 @@ class StubNativeBindings : NativeBindings {
     // GovernanceBindings
     override fun governanceExecute(contextHandle: Long, proposalJson: String): String =
         """{"status":"executed"}"""
+    override fun governancePropose(contextHandle: Long, proposerDid: String, actionJson: String): String =
+        """{"proposal_id":"0000","status":"Pending","execution_result":null}"""
+    override fun governanceApprove(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
+        """{"status":"Pending"}"""
+    override fun governanceReject(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
+        """{"status":"Pending"}"""
+    override fun governanceWithdraw(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
+        """{"status":"Pending"}"""
+    override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
+        """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
+    override fun governanceListProposals(contextHandle: Long): String = "[]"
 
     // BroadcastBindings
     var broadcastBlockCalled = false

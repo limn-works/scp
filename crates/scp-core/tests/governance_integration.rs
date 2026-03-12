@@ -2039,3 +2039,106 @@ fn ac14_deadlock_justification_from_conditions() {
     assert!(justification.unavailable_dids.contains(&carol()));
     assert_eq!(justification.detected_at, 1_000_000);
 }
+
+// =========================================================================
+// Multi-party governance lifecycle (F4 — PR #788)
+//
+// Demonstrates the full propose → vote → execute cycle with 3 members
+// in a Threshold(2-of-3) context. Verifies:
+//   1. Context creation with 3 signers
+//   2. Alice proposes an AddMember action (auto-votes, 1/2 threshold)
+//   3. Bob approves → threshold met, proposal auto-executes
+//   4. The proposal is retrievable via `get_proposal` with Approved status
+//   5. All proposals are listed via `list_proposals`
+//   6. The added member appears in the membership list
+// =========================================================================
+
+#[tokio::test]
+async fn multi_party_threshold_propose_approve_verify() {
+    let manager = new_manager();
+    let ctx_id = "ctx-multi-party-f4";
+
+    // Create a Threshold(2-of-3) context with Alice, Bob, Carol as signers.
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![alice(), bob(), carol()],
+        },
+        ..ContextParams::default()
+    };
+    let _handle = manager
+        .create_context(ctx_id.into(), params, alice())
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let sk_bob = signing_key_for_did(&bob());
+
+    // Step 1: Alice proposes adding Dave as a member.
+    // In Threshold(2), the proposer auto-votes → 1/2 threshold, stays Pending.
+    let (proposal, creation_events) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: dave(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+    assert!(
+        creation_events
+            .iter()
+            .any(|e| matches!(e, GovernanceEvent::ProposalCreated { .. })),
+        "expected ProposalCreated event from proposal submission"
+    );
+
+    // Step 2: Bob approves → 2/2 threshold met, auto-executes.
+    let (final_status, vote_events) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .unwrap();
+    assert_eq!(final_status, ProposalStatus::Approved);
+    assert!(
+        vote_events
+            .iter()
+            .any(|e| matches!(e, GovernanceEvent::VoteCast { .. })),
+        "expected VoteCast event from Bob's approval"
+    );
+    assert!(
+        vote_events.iter().any(|e| matches!(
+            e,
+            GovernanceEvent::ProposalResolved {
+                status: ProposalStatus::Approved,
+                ..
+            }
+        )),
+        "expected ProposalResolved(Approved) after quorum"
+    );
+
+    // Step 3: Verify the proposal is retrievable and marked Approved.
+    let fetched = manager
+        .get_proposal(ctx_id, &proposal.proposal_id)
+        .await
+        .unwrap();
+    assert_eq!(fetched.status, ProposalStatus::Approved);
+
+    // Step 4: Verify list_proposals returns at least our proposal.
+    let all_proposals = manager.list_proposals(ctx_id).await.unwrap();
+    assert!(
+        all_proposals
+            .iter()
+            .any(|p| p.proposal_id == proposal.proposal_id),
+        "expected the proposal to appear in list_proposals"
+    );
+
+    // Step 5: Verify Dave was actually added as a member.
+    assert!(
+        manager.is_member(ctx_id, dave().as_ref()).await,
+        "expected Dave to be a member after AddMember execution"
+    );
+}

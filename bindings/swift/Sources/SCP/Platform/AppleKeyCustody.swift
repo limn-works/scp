@@ -840,6 +840,40 @@ public extension AppleKeyCustody {
         }
     }
 
+    // MARK: exportSigningKeyBytes
+
+    /// Exports the raw 32-byte Ed25519 private key bytes for governance vote
+    /// signing.
+    ///
+    /// Software-backed Keychain keys can export their private key bytes.
+    /// Hardware-backed keys (e.g., Secure Enclave P-256 keys) cannot be
+    /// exported, but SCP Ed25519 keys on Apple platforms are always
+    /// Keychain-backed (software) because the Secure Enclave only supports
+    /// P-256. See ADR-025 Rationale.
+    ///
+    /// - Parameter keyId: The UUID handle returned by
+    ///   ``generateKeypair(keyType:)``.
+    /// - Returns: 32-byte raw Ed25519 private key bytes.
+    /// - Throws: ``PlatformError/wrongKeyType(_:)`` if the key is X25519,
+    ///   ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
+    ///   ``PlatformError/custodyError(_:)`` if the key type is
+    ///   hardware-backed and non-extractable.
+    @concurrent
+    func exportSigningKeyBytes(_ keyId: String) async throws -> Data {
+        let storedType = try fetchKeyType(for: keyId)
+        guard storedType == .ed25519 else {
+            throw PlatformError.wrongKeyType(
+                "exportSigningKeyBytes requires an Ed25519 key; handle '\(keyId)' is X25519"
+            )
+        }
+
+        var privateKeyBytes = try fetchPrivateKeyBytes(for: keyId)
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
+
+        // Return a copy of the private key bytes (the defer zeroes the local copy).
+        return Data(privateKeyBytes)
+    }
+
     // MARK: custodyType
 
     /// Returns the custody type for any key handle managed by this instance.

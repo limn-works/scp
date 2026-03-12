@@ -170,6 +170,43 @@ interface GovernanceBindings {
         contextHandle: Long,
         proposalJson: String,
     ): String
+
+    /** Propose a governance action for voting (#621). */
+    fun governancePropose(
+        contextHandle: Long,
+        proposerDid: String,
+        actionJson: String,
+    ): String
+
+    /** Approve a pending governance proposal (#621). */
+    fun governanceApprove(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String
+
+    /** Reject a pending governance proposal (#621). */
+    fun governanceReject(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String
+
+    /** Withdraw a vote on a pending governance proposal (#621). */
+    fun governanceWithdraw(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String
+
+    /** Retrieve a single governance proposal by hex ID (#621). */
+    fun governanceGetProposal(
+        contextHandle: Long,
+        proposalIdHex: String,
+    ): String
+
+    /** List all governance proposals for a context (#621). */
+    fun governanceListProposals(contextHandle: Long): String
 }
 
 /**
@@ -877,6 +914,97 @@ class GovernanceBridgeOps internal constructor(
         contextHandle: Long,
         proposalJson: String,
     ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalJson) }
+
+    /**
+     * Propose a governance action for voting (#621).
+     *
+     * For `SingleAdmin` contexts, the proposal is auto-approved and executed
+     * immediately. For multi-admin models, the proposal enters `Pending` status.
+     *
+     * @param contextHandle Handle from context create.
+     * @param proposerDid DID of the proposer.
+     * @param actionJson JSON-serialized governance action.
+     * @return JSON string with `proposal_id`, `status`, and `execution_result`.
+     */
+    suspend fun propose(
+        contextHandle: Long,
+        proposerDid: String,
+        actionJson: String,
+    ): String = bridge.ffiCall {
+        bindings.governancePropose(contextHandle, proposerDid, actionJson)
+    }
+
+    /**
+     * Cast an approval vote on a pending governance proposal (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @param voterDid DID of the voter.
+     * @param proposalIdHex Hex-encoded 32-byte proposal ID.
+     * @return JSON string with `status`.
+     */
+    suspend fun approve(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = bridge.ffiCall {
+        bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /**
+     * Cast a rejection vote on a pending governance proposal (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @param voterDid DID of the voter.
+     * @param proposalIdHex Hex-encoded 32-byte proposal ID.
+     * @return JSON string with `status`.
+     */
+    suspend fun reject(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = bridge.ffiCall {
+        bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /**
+     * Withdraw a previously cast vote on a pending governance proposal (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @param voterDid DID of the voter.
+     * @param proposalIdHex Hex-encoded 32-byte proposal ID.
+     * @return JSON string with `status`.
+     */
+    suspend fun withdraw(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = bridge.ffiCall {
+        bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /**
+     * Retrieve a single governance proposal by hex-encoded ID (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @param proposalIdHex Hex-encoded 32-byte proposal ID.
+     * @return JSON string with proposal details.
+     */
+    suspend fun getProposal(
+        contextHandle: Long,
+        proposalIdHex: String,
+    ): String = bridge.ffiCall {
+        bindings.governanceGetProposal(contextHandle, proposalIdHex)
+    }
+
+    /**
+     * List all governance proposals for a context (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @return JSON array of proposals.
+     */
+    suspend fun listProposals(contextHandle: Long): String = bridge.ffiCall {
+        bindings.governanceListProposals(contextHandle)
+    }
 }
 
 /**

@@ -43,10 +43,16 @@ from scp_sdk.errors import (
 from scp_sdk.event_log import Checkpoint, Event, EventLog, Proof
 from scp_sdk.governance import (
     GovernanceActionResult,
+    approve_governance_proposal,
     execute_governance_action,
+    get_governance_proposal,
     handle_ttl_expiry,
+    list_governance_proposals,
+    propose_governance_action,
     propose_ttl_extension,
+    reject_governance_proposal,
     reset_ttl_timer,
+    withdraw_governance_vote,
 )
 from scp_sdk.identity import DIDDocument, Identity
 from scp_sdk.mcp import (
@@ -162,6 +168,7 @@ __all__ = [
     "UcanToken",
     "ValidationError",
     "__version__",
+    "approve_governance_proposal",
     "bridge_evaluate_trust",
     "bridge_register",
     "check_chain_depth",
@@ -176,17 +183,21 @@ __all__ = [
     "evaluate_provenance_quality",
     "evaluate_trust",
     "execute_governance_action",
+    "get_governance_proposal",
     "get_policy",
     "get_stdio_allowlist",
     "handle_ttl_expiry",
+    "list_governance_proposals",
     "mint",
     "normalize_address",
     "parse_address",
+    "propose_governance_action",
     "propose_ttl_extension",
     "provenance_attach",
     "register_tool_handler",
     "registry_cleanup",
     "registry_stats",
+    "reject_governance_proposal",
     "relay_status",
     "reset_stdio_allowlist",
     "reset_ttl_timer",
@@ -195,4 +206,5 @@ __all__ = [
     "serve_mcp",
     "validate",
     "verify_participation_requirements",
+    "withdraw_governance_vote",
 ]

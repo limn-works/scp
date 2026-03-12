@@ -1181,6 +1181,377 @@ pub async fn context_execute_governance_action(
 }
 
 // ---------------------------------------------------------------------------
+// Bridge functions — governance proposal lifecycle (#621)
+// ---------------------------------------------------------------------------
+
+/// Resolves the raw Ed25519 signing key from the context handle's custody.
+///
+/// The NAPI handle retains `in_memory_custody` and `signing_key` (`KeyHandle`)
+/// from the creating identity. This function exports the raw key bytes.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn resolve_napi_signing_key(
+    handle: &NapiContextHandle,
+) -> napi::Result<ed25519_dalek::SigningKey> {
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no custody provider on context handle — governance lifecycle \
+                      requires an identity created with custody"
+                .to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+    let key_handle = handle.signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no signing key on context handle — governance lifecycle \
+                      requires an identity with an active signing key"
+                .to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+    custody
+        .0
+        .export_ed25519_signing_key(&key_handle)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("failed to export signing key for governance: {e}"),
+                code: "SCP-CTX-2040".to_owned(),
+            })
+        })
+}
+
+/// Parses a hex-encoded proposal ID into a 32-byte array.
+fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid proposal ID hex: {e}"),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("proposal ID must be 32 bytes, got {}", v.len()),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+    Ok(arr)
+}
+
+/// Proposes a governance action for voting.
+///
+/// Delegates to [`ContextManager::propose_governance_action_checked`].
+/// For `SingleAdmin` contexts, the proposal is auto-approved and executed.
+/// For multi-admin models (Threshold, Majority, Unanimity), the proposal
+/// enters `Pending` status.
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `action_json` — JSON-encoded governance action.
+/// * `proposer_did` — DID of the proposer.
+///
+/// # Returns
+///
+/// JSON string: `{ "proposal_id": hex, "status": string, "execution_result": string | null }`.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2041` if the proposal fails.
+#[napi(js_name = "contextGovernancePropose")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_governance_propose(
+    handle: &NapiContextHandle,
+    action_json: String,
+    proposer_did: String,
+) -> napi::Result<String> {
+    let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid governance action JSON: {e}"),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let signing_key = resolve_napi_signing_key(handle).await?;
+
+        let did = DID(proposer_did);
+        let manager = context_manager();
+        let context_id = handle.context_id.clone();
+
+        let outcome = manager
+            .propose_governance_action_checked(&context_id, &did, action, &signing_key)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance proposal failed: {e}"),
+                    code: "SCP-CTX-2041".to_owned(),
+                })
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance proposal"
+            );
+        }
+
+        let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
+
+        let response = serde_json::json!({
+            "proposal_id": hex::encode(outcome.proposal.proposal_id),
+            "status": format!("{:?}", outcome.status),
+            "execution_result": result_str,
+        });
+        return Ok(response.to_string());
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (handle, action, proposer_did);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "governance proposal requires key custody — in_memory custody feature \
+                      is not enabled"
+                .to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(String::new())
+}
+
+/// Casts an approval vote on a pending governance proposal.
+///
+/// Delegates to [`ContextManager::approve_governance_proposal`].
+/// If the vote pushes the proposal past quorum, the action is auto-executed.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2042` if the vote fails.
+#[napi(js_name = "contextGovernanceApprove")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_governance_approve(
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+    voter_did: String,
+) -> napi::Result<String> {
+    let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let signing_key = resolve_napi_signing_key(handle).await?;
+
+        let did = DID(voter_did);
+        let manager = context_manager();
+        let context_id = handle.context_id.clone();
+
+        let status = manager
+            .approve_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance approval failed: {e}"),
+                    code: "SCP-CTX-2042".to_owned(),
+                })
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance approval"
+            );
+        }
+
+        return Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string());
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (handle, proposal_id, voter_did);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "governance approval requires key custody — in_memory custody feature \
+                      is not enabled"
+                .to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(String::new())
+}
+
+/// Casts a rejection vote on a pending governance proposal.
+///
+/// Delegates to [`ContextManager::reject_governance_proposal`].
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2043` if the vote fails.
+#[napi(js_name = "contextGovernanceReject")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_governance_reject(
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+    voter_did: String,
+) -> napi::Result<String> {
+    let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let signing_key = resolve_napi_signing_key(handle).await?;
+
+        let did = DID(voter_did);
+        let manager = context_manager();
+        let context_id = handle.context_id.clone();
+
+        let status = manager
+            .reject_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance rejection failed: {e}"),
+                    code: "SCP-CTX-2043".to_owned(),
+                })
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance rejection"
+            );
+        }
+
+        return Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string());
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (handle, proposal_id, voter_did);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "governance rejection requires key custody — in_memory custody feature \
+                      is not enabled"
+                .to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(String::new())
+}
+
+/// Withdraws a previously cast vote on a pending governance proposal.
+///
+/// Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+/// key is required.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2044` if the withdrawal fails.
+#[napi(js_name = "contextGovernanceWithdraw")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_governance_withdraw(
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+    voter_did: String,
+) -> napi::Result<String> {
+    let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
+    let did = DID(voter_did);
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+
+    let status = manager
+        .withdraw_governance_vote(&context_id, &proposal_id, &did)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("governance vote withdrawal failed: {e}"),
+                code: "SCP-CTX-2044".to_owned(),
+            })
+        })?;
+
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to sync role state after governance withdrawal"
+        );
+    }
+
+    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — governance queries (#621)
+// ---------------------------------------------------------------------------
+
+/// Retrieves a single governance proposal by hex-encoded ID.
+///
+/// Returns the full proposal as a JSON string, or rejects if not found.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2045` if the proposal is not found.
+#[napi(js_name = "contextGovernanceGetProposal")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_governance_get_proposal(
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+) -> napi::Result<String> {
+    let context_id = handle.context_id.clone();
+    let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
+    let manager = context_manager();
+
+    let proposal = manager
+        .get_proposal(&context_id, &proposal_id)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("get proposal failed: {e}"),
+                code: "SCP-CTX-2045".to_owned(),
+            })
+        })?;
+
+    serde_json::to_string(&proposal).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2045".to_owned(),
+        })
+    })
+}
+
+/// Lists all governance proposals for a context.
+///
+/// Returns a JSON array of proposals, or an empty array if the context
+/// has no pending proposals.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2046` if listing fails.
+#[napi(js_name = "contextGovernanceListProposals")]
+pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager();
+
+    let proposals = manager.list_proposals(&context_id).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("list proposals failed: {e}"),
+            code: "SCP-CTX-2046".to_owned(),
+        })
+    })?;
+
+    serde_json::to_string(&proposals).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2046".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions — TTL (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 

@@ -5103,13 +5103,25 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * The bridge unpacks this into a `PseudonymKeypair`.
      */
     func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
-    
+
+    /**
+     * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
+     *
+     * Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
+     * directly. Platform implementations using software-backed Ed25519 storage
+     * (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+     *
+     * Returns `ScpError` if the key is not found, not exportable (hardware-backed
+     * TEE keys are non-extractable), or not an Ed25519 key.
+     */
+    func exportSigningKeyBytes(keyId: String) async throws  -> Data
+
     /**
      * Return the custody type for `key_id`: `"hardware"`, `"software"`, or
      * `"in_memory"`. Stays sync — no I/O required.
      */
     func custodyType(keyId: String)  -> String
-    
+
 }
 
 
@@ -5384,6 +5396,49 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             )
             uniffiOutReturn.pointee = uniffiForeignFuture
         },
+        exportSigningKeyBytes: { (
+            uniffiHandle: UInt64,
+            keyId: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> Data in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.exportSigningKeyBytes(
+                     keyId: try FfiConverterString.lift(keyId)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Data) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
         custodyType: { (
             uniffiHandle: UInt64,
             keyId: RustBuffer,
@@ -5400,7 +5455,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            
+
             let writeReturn = { uniffiOutReturn.pointee = FfiConverterString.lower($0) }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
