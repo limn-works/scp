@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::{
     ContextId, Ed25519Signature, EquivocationAlert, SyncError, SyncEvent, SyncOutcome, SyncPolicy,
@@ -798,7 +799,7 @@ pub fn detect_device_divergence(
     device_a: &DeviceSyncState,
     device_b: &DeviceSyncState,
 ) -> DeviceDivergence {
-    if device_a.local_merkle_root == device_b.local_merkle_root
+    if bool::from(device_a.local_merkle_root.ct_eq(&device_b.local_merkle_root))
         && device_a.local_event_count == device_b.local_event_count
     {
         return DeviceDivergence::Consistent;

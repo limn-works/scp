@@ -42,6 +42,7 @@ pub mod weeks_offline;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_identity::DID;
@@ -691,7 +692,7 @@ pub fn compare_checkpoints(
     if local.event_count != remote.event_count {
         return None;
     }
-    if local.merkle_root == remote.merkle_root {
+    if bool::from(local.merkle_root.ct_eq(&remote.merkle_root)) {
         return None;
     }
     Some(EquivocationAlert {

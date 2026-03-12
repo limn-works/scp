@@ -16,6 +16,7 @@
 //! See ADR-011 in `.docs/adrs/phase-2.md`.
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::{Event, EventLog, EventLogError, EventType};
 use crate::crypto::verify_ed25519_signature;
@@ -69,7 +70,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
         log.leaves[log.leaves.len() - 1]
     };
 
-    if event.prev_hash != expected_prev_hash {
+    if !bool::from(event.prev_hash.ct_eq(&expected_prev_hash)) {
         return Err(EventLogError::PrevHashMismatch {
             sequence: event.sequence,
         });
@@ -181,7 +182,7 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
         log.leaves[log.leaves.len() - 1]
     };
 
-    if event.prev_hash != expected_prev_hash {
+    if !bool::from(event.prev_hash.ct_eq(&expected_prev_hash)) {
         return Err(EventLogError::PrevHashMismatch {
             sequence: event.sequence,
         });

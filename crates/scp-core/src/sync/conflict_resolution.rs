@@ -29,6 +29,7 @@
 //! See ADR-029 in `.docs/adrs/phase-6.md` and ADR-031 section 7.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::ContextId;
 use crate::context::governance::{GovernanceAction, GovernanceModelConfig, ProposalId};
@@ -543,7 +544,7 @@ pub fn fork_context(
     fork_point: &MerkleRoot,
 ) -> Result<ContextFork, ConflictResolutionError> {
     // Sanity check: the fork point must match the snapshot's Merkle root.
-    if original.merkle_root != *fork_point {
+    if !bool::from(original.merkle_root.ct_eq(fork_point)) {
         return Err(ConflictResolutionError::ForkPointNotFound);
     }
 
