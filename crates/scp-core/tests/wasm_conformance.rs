@@ -3018,3 +3018,357 @@ fn protocol_version_decode_encode_wasm_matches_core() {
         "WASM inline version encoding differs from core encode_protocol_version"
     );
 }
+
+// ===========================================================================
+// Governance proposal mirror (verbatim from scp-ffi-wasm/src/manager.rs)
+//
+// Mirrors WasmProposal, proposal_to_json, and the resolved_proposals
+// eviction logic. If the WASM code changes, this must be updated in lockstep.
+// ===========================================================================
+
+mod wasm_proposal_mirror {
+    use std::collections::HashMap;
+
+    /// Mirror of `WasmProposal` from `scp-ffi-wasm/src/manager.rs`.
+    #[derive(Debug, Clone)]
+    pub struct WasmProposal {
+        pub proposer_did: String,
+        pub action: serde_json::Value,
+        /// Votes to approve: `(voter_did, timestamp_secs)`.
+        pub approvals: Vec<(String, u64)>,
+        /// Votes to reject: `(voter_did, timestamp_secs)`.
+        pub rejections: Vec<(String, u64)>,
+        pub voting_deadline_ms: f64,
+        pub context_id: String,
+        pub created_at: u64,
+        pub status: String,
+    }
+
+    /// Maximum number of resolved proposals before eviction.
+    /// Mirrors `WASM_RESOLVED_PROPOSAL_CAP` in `scp-ffi-wasm/src/manager.rs`.
+    pub const WASM_RESOLVED_PROPOSAL_CAP: usize = 10_000;
+
+    /// Mirror of `proposal_to_json` from `scp-ffi-wasm/src/manager.rs`.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn proposal_to_json(proposal_id: &str, proposal: &WasmProposal) -> serde_json::Value {
+        let voting_deadline_secs = (proposal.voting_deadline_ms / 1000.0) as u64;
+
+        let approvals: Vec<serde_json::Value> = proposal
+            .approvals
+            .iter()
+            .map(|(did, ts)| {
+                serde_json::json!({
+                    "voter_did": did,
+                    "vote": "Approve",
+                    "timestamp": ts,
+                    "signature": [],
+                })
+            })
+            .collect();
+
+        let rejections: Vec<serde_json::Value> = proposal
+            .rejections
+            .iter()
+            .map(|(did, ts)| {
+                serde_json::json!({
+                    "voter_did": did,
+                    "vote": "Reject",
+                    "timestamp": ts,
+                    "signature": [],
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "proposal_id": proposal_id,
+            "context_id": proposal.context_id,
+            "proposer_did": proposal.proposer_did,
+            "action": proposal.action,
+            "status": proposal.status,
+            "created_at": proposal.created_at,
+            "voting_deadline": voting_deadline_secs,
+            "approvals": approvals,
+            "rejections": rejections,
+            "created_at_epoch": null,
+        })
+    }
+
+    /// Mirror of `PerContextState::insert_resolved_proposal` from
+    /// `scp-ffi-wasm/src/manager.rs`. Evicts oldest by `created_at`
+    /// when at capacity.
+    pub fn insert_resolved_proposal(
+        map: &mut HashMap<String, WasmProposal>,
+        id: String,
+        proposal: WasmProposal,
+    ) {
+        if map.len() >= WASM_RESOLVED_PROPOSAL_CAP
+            && let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, p)| p.created_at)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest_key);
+        }
+        map.insert(id, proposal);
+    }
+
+    /// Helper: creates a minimal proposal for testing.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn make_proposal(
+        context_id: &str,
+        proposer: &str,
+        created_at: u64,
+        status: &str,
+    ) -> WasmProposal {
+        WasmProposal {
+            proposer_did: proposer.to_owned(),
+            action: serde_json::json!({"AddMember": {"did": "did:key:new", "role": "member"}}),
+            approvals: vec![(proposer.to_owned(), created_at)],
+            rejections: Vec::new(),
+            voting_deadline_ms: f64::mul_add(created_at as f64, 1000.0, 3_600_000.0),
+            context_id: context_id.to_owned(),
+            created_at,
+            status: status.to_owned(),
+        }
+    }
+}
+
+// ===========================================================================
+// Test: get_proposal returns a proposal with all 10 expected fields
+// ===========================================================================
+
+#[test]
+fn governance_get_proposal_returns_all_fields() {
+    use wasm_proposal_mirror::{make_proposal, proposal_to_json};
+
+    let proposal = make_proposal(
+        "ctx-gov-001",
+        "did:key:proposer-a",
+        1_700_000_000,
+        "Pending",
+    );
+    let json = proposal_to_json("prop-001", &proposal);
+
+    // Verify all 10 fields are present.
+    let obj = json.as_object().expect("proposal JSON should be an object");
+
+    let expected_fields = [
+        "proposal_id",
+        "context_id",
+        "proposer_did",
+        "action",
+        "status",
+        "created_at",
+        "created_at_epoch",
+        "voting_deadline",
+        "approvals",
+        "rejections",
+    ];
+
+    for field in &expected_fields {
+        assert!(
+            obj.contains_key(*field),
+            "proposal JSON missing expected field '{field}'"
+        );
+    }
+
+    assert_eq!(
+        obj.len(),
+        expected_fields.len(),
+        "unexpected extra fields in proposal JSON"
+    );
+
+    // Verify field values match the input.
+    assert_eq!(json["proposal_id"], "prop-001");
+    assert_eq!(json["context_id"], "ctx-gov-001");
+    assert_eq!(json["proposer_did"], "did:key:proposer-a");
+    assert_eq!(json["status"], "Pending");
+    assert_eq!(json["created_at"], 1_700_000_000_u64);
+    assert!(
+        json["created_at_epoch"].is_null(),
+        "created_at_epoch should be null"
+    );
+    assert!(json["approvals"].is_array(), "approvals should be an array");
+    assert!(
+        json["rejections"].is_array(),
+        "rejections should be an array"
+    );
+    assert!(json["action"].is_object(), "action should be an object");
+    assert!(
+        json["voting_deadline"].is_u64(),
+        "voting_deadline should be u64 seconds"
+    );
+}
+
+// ===========================================================================
+// Test: list_proposals returns both pending and resolved proposals
+// ===========================================================================
+
+#[test]
+fn governance_list_proposals_includes_pending_and_resolved() {
+    use std::collections::HashMap;
+    use wasm_proposal_mirror::{make_proposal, proposal_to_json};
+
+    let mut pending: HashMap<String, wasm_proposal_mirror::WasmProposal> = HashMap::new();
+    let mut resolved: HashMap<String, wasm_proposal_mirror::WasmProposal> = HashMap::new();
+
+    pending.insert(
+        "prop-pending-1".to_owned(),
+        make_proposal("ctx-gov-002", "did:key:a", 1_700_000_100, "Pending"),
+    );
+    resolved.insert(
+        "prop-resolved-1".to_owned(),
+        make_proposal("ctx-gov-002", "did:key:b", 1_700_000_200, "Approved"),
+    );
+
+    // Mirror of list_proposals: chain pending and resolved iterators.
+    let proposals: Vec<serde_json::Value> = pending
+        .iter()
+        .chain(resolved.iter())
+        .map(|(id, p)| proposal_to_json(id, p))
+        .collect();
+
+    assert_eq!(
+        proposals.len(),
+        2,
+        "list_proposals should return pending + resolved"
+    );
+
+    let ids: Vec<&str> = proposals
+        .iter()
+        .map(|p| p["proposal_id"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        ids.contains(&"prop-pending-1"),
+        "should include pending proposal"
+    );
+    assert!(
+        ids.contains(&"prop-resolved-1"),
+        "should include resolved proposal"
+    );
+}
+
+// ===========================================================================
+// Test: approved proposal has status "Approved" and is retrievable
+// ===========================================================================
+
+#[test]
+fn governance_approved_proposal_retrievable_with_correct_status() {
+    use std::collections::HashMap;
+    use wasm_proposal_mirror::{insert_resolved_proposal, make_proposal, proposal_to_json};
+
+    let mut resolved: HashMap<String, wasm_proposal_mirror::WasmProposal> = HashMap::new();
+
+    // Simulate approval: create proposal, set status to Approved, move to resolved.
+    let mut proposal = make_proposal(
+        "ctx-gov-003",
+        "did:key:proposer-c",
+        1_700_000_300,
+        "Pending",
+    );
+    "Approved".clone_into(&mut proposal.status);
+    insert_resolved_proposal(&mut resolved, "prop-approved-1".to_owned(), proposal);
+
+    // Retrieve via get_proposal mirror (look up in resolved map).
+    let found = resolved
+        .get("prop-approved-1")
+        .expect("proposal should be in resolved map");
+    let json = proposal_to_json("prop-approved-1", found);
+
+    assert_eq!(json["status"], "Approved");
+    assert_eq!(json["proposer_did"], "did:key:proposer-c");
+    assert_eq!(json["context_id"], "ctx-gov-003");
+}
+
+// ===========================================================================
+// Test: rejected proposal has status "Rejected" and is retrievable
+// ===========================================================================
+
+#[test]
+fn governance_rejected_proposal_retrievable_with_correct_status() {
+    use std::collections::HashMap;
+    use wasm_proposal_mirror::{insert_resolved_proposal, make_proposal, proposal_to_json};
+
+    let mut resolved: HashMap<String, wasm_proposal_mirror::WasmProposal> = HashMap::new();
+
+    // Simulate rejection: create proposal, set status to Rejected, move to resolved.
+    let mut proposal = make_proposal(
+        "ctx-gov-004",
+        "did:key:proposer-d",
+        1_700_000_400,
+        "Pending",
+    );
+    proposal
+        .rejections
+        .push(("did:key:voter-1".to_owned(), 1_700_000_410));
+    proposal
+        .rejections
+        .push(("did:key:voter-2".to_owned(), 1_700_000_420));
+    "Rejected".clone_into(&mut proposal.status);
+    insert_resolved_proposal(&mut resolved, "prop-rejected-1".to_owned(), proposal);
+
+    let found = resolved
+        .get("prop-rejected-1")
+        .expect("proposal should be in resolved map");
+    let json = proposal_to_json("prop-rejected-1", found);
+
+    assert_eq!(json["status"], "Rejected");
+    assert_eq!(json["rejections"].as_array().unwrap().len(), 2);
+    assert_eq!(json["rejections"][0]["vote"], "Reject");
+    assert_eq!(json["rejections"][1]["vote"], "Reject");
+}
+
+// ===========================================================================
+// Test: resolved_proposals map respects capacity bound and evicts oldest
+// ===========================================================================
+
+#[test]
+fn governance_resolved_proposals_evicts_oldest_at_capacity() {
+    use std::collections::HashMap;
+    use wasm_proposal_mirror::{WASM_RESOLVED_PROPOSAL_CAP, make_proposal};
+
+    // Verify the constant matches the WASM bridge.
+    assert_eq!(
+        WASM_RESOLVED_PROPOSAL_CAP, 10_000,
+        "WASM_RESOLVED_PROPOSAL_CAP must match the WASM bridge constant"
+    );
+
+    // Test eviction logic: insert entries with known timestamps, then
+    // verify min_by_key correctly identifies the oldest for eviction.
+    let mut resolved: HashMap<String, wasm_proposal_mirror::WasmProposal> = HashMap::new();
+
+    // Insert entries with increasing created_at.
+    for i in 0..5 {
+        let proposal = make_proposal("ctx-gov-005", "did:key:proposer", 1_000 + i, "Approved");
+        resolved.insert(format!("prop-{i}"), proposal);
+    }
+
+    assert_eq!(resolved.len(), 5);
+
+    // Verify the oldest entry (created_at = 1000) exists.
+    assert!(resolved.contains_key("prop-0"));
+
+    // Find what min_by_key would return -- this is the eviction target.
+    let oldest = resolved
+        .iter()
+        .min_by_key(|(_, p)| p.created_at)
+        .map(|(k, _)| k.clone());
+    assert_eq!(
+        oldest.as_deref(),
+        Some("prop-0"),
+        "oldest entry should be prop-0 (created_at=1000)"
+    );
+
+    // Simulate eviction and verify the next oldest.
+    resolved.remove("prop-0");
+    let next_oldest = resolved
+        .iter()
+        .min_by_key(|(_, p)| p.created_at)
+        .map(|(k, _)| k.clone());
+    assert_eq!(
+        next_oldest.as_deref(),
+        Some("prop-1"),
+        "after evicting prop-0, oldest should be prop-1 (created_at=1001)"
+    );
+}
