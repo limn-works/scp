@@ -400,10 +400,6 @@ const WASM_NONCE_CAP: usize = 10_000;
 /// Nonce TTL in milliseconds (24 hours — UCAN max lifetime per ADR-016 step 11).
 const WASM_NONCE_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
 
-/// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
-/// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
-const WASM_NONCE_FRESHNESS_TOLERANCE_MS: f64 = 5.0 * 60.0 * 1000.0;
-
 /// Maximum number of revoked token CIDs per context.
 const WASM_REVOKED_TOKENS_CAP: usize = 100_000;
 
@@ -1527,65 +1523,24 @@ impl WasmContextManager {
 
     /// Records a nonce as seen (for replay prevention).
     ///
-    /// Performs the same validation as native `NonceTracker::check_and_record`:
-    /// 1. **Format** — nonce must match `{unix_millis}-{32_hex_chars}`.
-    /// 2. **Freshness** — timestamp must be within +/- 5 minutes of now
-    ///    (matching spec section 9.14 clock skew tolerance).
-    /// 3. **Uniqueness** — nonce must not have been seen before.
+    /// Records a nonce for replay detection.
     ///
-    /// When the nonce map exceeds [`WASM_NONCE_CAP`], evicts entries older than
-    /// [`WASM_NONCE_TTL_MS`] (24 hours — UCAN max lifetime per ADR-016 step 11).
+    /// Format and freshness validation is performed upstream in
+    /// `ucan.rs::validate_nonce_format_and_freshness` (step 9 of the UCAN
+    /// pipeline). This method is responsible only for:
+    /// 1. **Uniqueness** — nonce must not have been seen before.
+    /// 2. **Capacity management** — evicts entries older than
+    ///    [`WASM_NONCE_TTL_MS`] when the map exceeds [`WASM_NONCE_CAP`].
     ///
     /// # Errors
     ///
-    /// Returns [`ScpWasmError::Permission`] if format is invalid, nonce is
-    /// stale/future, or was already seen.
+    /// Returns [`ScpWasmError::Permission`] if the nonce was already seen or
+    /// the tracker is at capacity after eviction.
     pub fn ucan_record_nonce(&mut self, context_id: &str, nonce: &str) -> Result<(), ScpWasmError> {
-        // 1. Validate nonce format: {unix_millis}-{32_hex_chars}
-        let (ts_part, hex_part) =
-            nonce
-                .split_once('-')
-                .ok_or_else(|| ScpWasmError::Permission {
-                    message: format!(
-                        "nonce format invalid: missing '-' separator in nonce: {nonce}"
-                    ),
-                    code: "SCP-PERM-3000".to_owned(),
-                })?;
-
-        let nonce_millis: f64 = ts_part.parse().map_err(|_| ScpWasmError::Permission {
-            message: format!("nonce format invalid: non-numeric timestamp in nonce: {ts_part}"),
-            code: "SCP-PERM-3000".to_owned(),
-        })?;
-
-        if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(ScpWasmError::Permission {
-                message: format!(
-                    "nonce format invalid: expected 32 hex chars suffix, got: {hex_part}"
-                ),
-                code: "SCP-PERM-3000".to_owned(),
-            });
-        }
-
-        // 2. Freshness check: timestamp within now +/- 5 minutes.
         let now = crate::time::now_ms();
-
-        if nonce_millis + WASM_NONCE_FRESHNESS_TOLERANCE_MS < now {
-            return Err(ScpWasmError::Permission {
-                message: format!("nonce too old: {nonce}"),
-                code: "SCP-PERM-3000".to_owned(),
-            });
-        }
-
-        if nonce_millis > now + WASM_NONCE_FRESHNESS_TOLERANCE_MS {
-            return Err(ScpWasmError::Permission {
-                message: format!("nonce too far in the future: {nonce}"),
-                code: "SCP-PERM-3000".to_owned(),
-            });
-        }
-
-        // 3. Replay check.
         let ctx = self.require_context_mut(context_id)?;
 
+        // 1. Replay check.
         if ctx.seen_nonces.contains_key(nonce) {
             return Err(ScpWasmError::Permission {
                 message: format!("nonce reused: {nonce}"),
@@ -1593,10 +1548,20 @@ impl WasmContextManager {
             });
         }
 
-        // Evict expired nonces when over capacity.
+        // 2. Evict expired nonces when over capacity, then reject if still full.
+        // Matches scp-core's `NonceTracker::check_and_record` capacity behavior.
         if ctx.seen_nonces.len() >= WASM_NONCE_CAP {
             let cutoff = now - WASM_NONCE_TTL_MS;
             ctx.seen_nonces.retain(|_, ts| *ts > cutoff);
+
+            if ctx.seen_nonces.len() >= WASM_NONCE_CAP {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "nonce tracker full: capacity {WASM_NONCE_CAP} reached and no expired entries to evict"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
         }
 
         ctx.seen_nonces.insert(nonce.to_owned(), now);

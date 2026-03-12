@@ -28,6 +28,10 @@ use crate::manager::with_manager;
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
+/// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+/// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
+const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+
 /// Maximum delegation chain depth to prevent infinite loops.
 const MAX_CHAIN_DEPTH: usize = 32;
 
@@ -411,10 +415,13 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
         return Err(format!("capability outside ceiling: {cap_name}"));
     }
 
-    // Step 9: Nonce replay detection — delegated to WasmContextManager.
-    if token.payload.nnc.is_empty() {
-        return Err("nonce is empty".to_owned());
-    }
+    // Step 9: Nonce validation and replay detection.
+    //
+    // Mirrors scp-core's `NonceTracker::check_and_record` (ADR-016 §7.2):
+    //   1. Format: `{unix_millis}-{32_hex_chars}`
+    //   2. Freshness: timestamp within now +/- 5 minutes (spec §9.14)
+    //   3. Uniqueness: not previously seen (delegated to WasmContextManager)
+    validate_nonce_format_and_freshness(&token.payload.nnc)?;
     with_manager(|mgr| mgr.ucan_record_nonce(context_id, &token.payload.nnc))
         .map_err(|e| e.to_string())?;
 
@@ -599,6 +606,47 @@ fn compute_token_cid(encoded: &str) -> String {
 
 fn now_secs() -> u64 {
     crate::time::now_secs()
+}
+
+/// Validates UCAN nonce format and freshness, matching scp-core's
+/// `NonceTracker::check_and_record` (steps 1–2).
+///
+/// Format: `{unix_millis_timestamp}-{32_hex_chars}` (ADR-016 §7.2).
+/// Freshness: timestamp within now +/- 5 minutes (spec §9.14).
+///
+/// Uniqueness (step 3) is handled separately by `WasmContextManager::ucan_record_nonce`.
+fn validate_nonce_format_and_freshness(nonce: &str) -> Result<(), String> {
+    if nonce.is_empty() {
+        return Err("nonce is empty".to_owned());
+    }
+
+    // 1. Format: split into timestamp and hex suffix.
+    let (ts_part, hex_part) = nonce
+        .split_once('-')
+        .ok_or_else(|| format!("nonce format invalid: missing '-' separator in '{nonce}'"))?;
+
+    let nonce_millis: u64 = ts_part
+        .parse()
+        .map_err(|_| format!("nonce format invalid: non-numeric timestamp in '{ts_part}'"))?;
+
+    if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "nonce format invalid: expected 32 hex chars suffix, got '{hex_part}'"
+        ));
+    }
+
+    // 2. Freshness: timestamp within now +/- 5 minutes.
+    let now = crate::time::now_ms_u64();
+
+    if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now {
+        return Err(format!("nonce too old: {nonce}"));
+    }
+
+    if nonce_millis > now.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
+        return Err(format!("nonce too far in the future: {nonce}"));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
