@@ -2175,7 +2175,7 @@ impl WasmContextManager {
         // This prevents partial corruption if a cap check fails mid-loop.
         if let Some(bc) = ctx.broadcast.as_ref() {
             for (author_did, block_list) in &bc.authors {
-                if block_list.len() >= WASM_BLOCK_LIST_CAP {
+                if block_list.len() >= WASM_BLOCK_LIST_CAP && !block_list.contains(did) {
                     return Err(ScpWasmError::Validation {
                         message: format!(
                             "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
@@ -3265,7 +3265,7 @@ impl WasmContextManager {
                         code: "SCP-CTX-2001".to_owned(),
                     })?;
 
-            if block_list.len() >= WASM_BLOCK_LIST_CAP {
+            if block_list.len() >= WASM_BLOCK_LIST_CAP && !block_list.contains(subscriber_did) {
                 return Err(ScpWasmError::Validation {
                     message: format!(
                         "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
@@ -5033,6 +5033,92 @@ mod tests {
             bc.authors["author-b"].is_empty(),
             "author-b's block list should be empty — pre-validation must prevent partial mutation"
         );
+    }
+
+    #[test]
+    fn governance_ban_allows_idempotent_ban_at_capacity() {
+        let mut mgr =
+            make_manager_with_broadcast("ctx-1", "author-a", &["author-a", "author-b"], &[]);
+
+        let target_did = "did:dht:zbanned";
+
+        // Fill BOTH authors' block lists to exactly WASM_BLOCK_LIST_CAP,
+        // including the target DID in every list (idempotent ban scenario).
+        {
+            let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
+            let bc = ctx.broadcast.as_mut().unwrap();
+            for author_list in bc.authors.values_mut() {
+                // Fill to capacity minus 1, then insert the target DID.
+                for i in 0..(WASM_BLOCK_LIST_CAP - 1) {
+                    author_list.insert(format!("did:dht:zfiller{i}"));
+                }
+                author_list.insert(target_did.to_owned());
+                assert_eq!(author_list.len(), WASM_BLOCK_LIST_CAP);
+            }
+        }
+
+        // Banning an already-blocked DID when block lists are at capacity
+        // must succeed — HashSet::insert is a no-op for existing entries.
+        let result = mgr.dispatch_revoke_read_access("ctx-1", target_did, "full");
+        assert!(
+            result.is_ok(),
+            "idempotent governance ban at capacity should succeed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn block_broadcast_subscriber_allows_idempotent_block_at_capacity() {
+        let mut mgr = make_manager_with_broadcast("ctx-1", "author-a", &["author-a"], &["sub1"]);
+
+        let target_did = "sub1";
+
+        // Fill author-a's block list to capacity, including the target DID.
+        {
+            let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
+            let bc = ctx.broadcast.as_mut().unwrap();
+            let block_list = bc.authors.get_mut("author-a").unwrap();
+            for i in 0..(WASM_BLOCK_LIST_CAP - 1) {
+                block_list.insert(format!("did:dht:zfiller{i}"));
+            }
+            block_list.insert(target_did.to_owned());
+            assert_eq!(block_list.len(), WASM_BLOCK_LIST_CAP);
+        }
+
+        // Blocking an already-blocked subscriber when at capacity must succeed.
+        let result = mgr.block_broadcast_subscriber("ctx-1", target_did, "author-a");
+        assert!(
+            result.is_ok(),
+            "idempotent per-author block at capacity should succeed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn block_broadcast_subscriber_rejects_new_did_at_capacity() {
+        let mut mgr =
+            make_manager_with_broadcast("ctx-1", "author-a", &["author-a"], &["sub1", "sub2"]);
+
+        // Fill author-a's block list to capacity (without sub2).
+        {
+            let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
+            let bc = ctx.broadcast.as_mut().unwrap();
+            let block_list = bc.authors.get_mut("author-a").unwrap();
+            for i in 0..WASM_BLOCK_LIST_CAP {
+                block_list.insert(format!("did:dht:zfiller{i}"));
+            }
+            assert_eq!(block_list.len(), WASM_BLOCK_LIST_CAP);
+        }
+
+        // Blocking a NEW DID when at capacity must fail.
+        let err = mgr
+            .block_broadcast_subscriber("ctx-1", "sub2", "author-a")
+            .unwrap_err();
+
+        match &err {
+            ScpWasmError::Validation { code, .. } => {
+                assert_eq!(code, "SCP-VALID-7301");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
     }
 
     #[test]
