@@ -487,6 +487,9 @@ const WASM_EVENT_BUFFER_CAP: usize = 1000;
 /// Maximum entries per author's block list in broadcast contexts (§5.14.8).
 const WASM_BLOCK_LIST_CAP: usize = 10_000;
 
+/// Maximum members per context. Prevents unbounded growth of the membership map.
+const WASM_MEMBER_CAP: usize = 10_000;
+
 impl PerContextState {
     /// Pushes an event to the receive buffer, evicting the oldest if at capacity.
     fn push_event(&mut self, event: WasmContextEvent) {
@@ -499,9 +502,14 @@ impl PerContextState {
     /// Returns `true` if the member has the given capability string.
     ///
     /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
-    /// default role system:
-    /// - "admin" role members have all capabilities in the ceiling.
-    /// - "member" role members have `messages:read` and `messages:write` only.
+    /// default role system (see `builtin_*` functions in scp-core roles.rs):
+    /// - "admin" — all capabilities in the ceiling.
+    /// - "moderator" — messages:read, messages:write, `tool:invoke:*`,
+    ///   member:remove, governance:propose (§5.9 elected moderators pattern).
+    /// - "member" — messages:read, messages:write, `tool:invoke:*`.
+    /// - "author" — messages:write, messages:read, `tool:invoke:*`.
+    /// - "observer" — messages:read only.
+    /// - "subscriber" — messages:read only (broadcast contexts).
     ///
     /// Capability strings use the format `"{resource}:{action}"` (e.g.
     /// `"context:close"`, `"messages:write"`).
@@ -510,18 +518,55 @@ impl PerContextState {
             return false;
         };
 
+        // Helper: check that the capability is within the context ceiling.
+        let in_ceiling = |cap: &str| -> bool {
+            let (resource, _action) = cap.rsplit_once(':').unwrap_or((cap, "*"));
+            let wildcard = format!("{resource}:*");
+            self.ceiling_strings.contains(cap) || self.ceiling_strings.contains(&wildcard)
+        };
+
         match member.role.as_str() {
             "admin" => {
                 // Admins have all capabilities in the ceiling.
-                // Check the ceiling_strings set for the capability or a wildcard.
-                let (resource, _action) = capability.rsplit_once(':').unwrap_or((capability, "*"));
-                let wildcard = format!("{resource}:*");
-                self.ceiling_strings.contains(capability)
-                    || self.ceiling_strings.contains(&wildcard)
+                in_ceiling(capability)
+            }
+            "moderator" => {
+                // Moderators: messages r/w, tool invoke, member remove,
+                // governance propose — intersected with ceiling (§5.9).
+                let role_grants = matches!(
+                    capability,
+                    "messages:read"
+                        | "messages:write"
+                        | "tool:invoke:*"
+                        | "member:remove"
+                        | "governance:propose"
+                );
+                role_grants && in_ceiling(capability)
+            }
+            "author" => {
+                // Authors: messages r/w, tool invoke — intersected with ceiling.
+                let role_grants = matches!(
+                    capability,
+                    "messages:write" | "messages:read" | "tool:invoke:*"
+                );
+                role_grants && in_ceiling(capability)
             }
             "member" => {
-                // Default member capabilities: messages:read, messages:write.
-                matches!(capability, "messages:read" | "messages:write")
+                // Default member capabilities: messages:read, messages:write,
+                // tool:invoke:* — intersected with ceiling.
+                let role_grants = matches!(
+                    capability,
+                    "messages:read" | "messages:write" | "tool:invoke:*"
+                );
+                role_grants && in_ceiling(capability)
+            }
+            "subscriber" => {
+                // Subscribers can only read messages (broadcast contexts).
+                capability == "messages:read" && in_ceiling(capability)
+            }
+            "observer" => {
+                // Observers can only read messages.
+                capability == "messages:read" && in_ceiling(capability)
             }
             _ => false,
         }
@@ -1845,7 +1890,7 @@ impl WasmContextManager {
 
     /// Dispatches a governance action to its handler.
     ///
-    /// Split into two methods to satisfy the 100-line function limit.
+    /// Split into multiple methods to satisfy the 100-line function limit.
     fn dispatch_governance_action(
         &mut self,
         context_id: &str,
@@ -1853,33 +1898,10 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         match action {
             WasmGovernanceAction::AddMember { did, role } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                ctx.members.insert(
-                    did.clone(),
-                    MemberEntry {
-                        did: did.clone(),
-                        role: role.clone(),
-                        sequence_number: 0,
-                    },
-                );
-                ctx.push_event(WasmContextEvent::MemberJoined {
-                    member_did: did.clone(),
-                    role_name: role.clone(),
-                });
-                Ok(serde_json::json!({"action": "AddMember", "did": did}))
+                self.dispatch_add_member(context_id, did, role)
             }
             WasmGovernanceAction::RemoveMember { did, .. } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                if ctx.members.remove(did).is_none() {
-                    return Err(ScpWasmError::Context {
-                        message: format!("member '{did}' not found"),
-                        code: "SCP-CTX-2015".to_owned(),
-                    });
-                }
-                ctx.push_event(WasmContextEvent::MemberLeft {
-                    member_did: did.clone(),
-                });
-                Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
+                self.dispatch_remove_member(context_id, did)
             }
             WasmGovernanceAction::ChangeRole { did, new_role } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1887,7 +1909,18 @@ impl WasmContextManager {
                     message: format!("member '{did}' not found"),
                     code: "SCP-CTX-2015".to_owned(),
                 })?;
+                let old_role = member.role.clone();
                 new_role.clone_into(&mut member.role);
+                // Sync broadcast state when role transitions to/from "author".
+                if let Some(ref mut bc) = ctx.broadcast {
+                    if old_role == "author" && new_role != "author" {
+                        bc.authors.remove(did);
+                        bc.key_epochs.remove(did);
+                    } else if new_role == "author" && old_role != "author" {
+                        bc.authors.insert(did.to_owned(), HashSet::new());
+                        bc.key_epochs.insert(did.to_owned(), 0);
+                    }
+                }
                 Ok(serde_json::json!({"action": "ChangeRole", "did": did, "newRole": new_role}))
             }
             WasmGovernanceAction::RegisterTool {
@@ -1949,6 +1982,80 @@ impl WasmContextManager {
             | WasmGovernanceAction::ApproveSpend { .. }
             | WasmGovernanceAction::LockEconomicPolicy => self.dispatch_governance_action_ext(context_id, action),
         }
+    }
+
+    /// Handles `AddMember` governance action: inserts the member and, for
+    /// broadcast contexts, registers author state when the role is "author".
+    fn dispatch_add_member(
+        &mut self,
+        context_id: &str,
+        did: &str,
+        role: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.members.len() >= WASM_MEMBER_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "member list has reached capacity ({WASM_MEMBER_CAP}) — \
+                     cannot add additional members"
+                ),
+                code: "SCP-VALID-7302".to_owned(),
+            });
+        }
+
+        ctx.members.insert(
+            did.to_owned(),
+            MemberEntry {
+                did: did.to_owned(),
+                role: role.to_owned(),
+                sequence_number: 0,
+            },
+        );
+        // If the new member is an author in a broadcast context, register
+        // them in the broadcast state with an empty block list and
+        // initialize their key epoch (§5.14.8).
+        if role == "author"
+            && let Some(ref mut bc) = ctx.broadcast
+        {
+            bc.authors.insert(did.to_owned(), HashSet::new());
+            bc.key_epochs.insert(did.to_owned(), 0);
+        }
+        ctx.push_event(WasmContextEvent::MemberJoined {
+            member_did: did.to_owned(),
+            role_name: role.to_owned(),
+        });
+        Ok(serde_json::json!({"action": "AddMember", "did": did}))
+    }
+
+    /// Handles `RemoveMember` governance action: removes the member and, for
+    /// broadcast contexts, cleans up author state when the removed member had
+    /// the "author" role.
+    fn dispatch_remove_member(
+        &mut self,
+        context_id: &str,
+        did: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        let removed = ctx
+            .members
+            .remove(did)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("member '{did}' not found"),
+                code: "SCP-CTX-2015".to_owned(),
+            })?;
+        // If the removed member was an author in a broadcast context,
+        // clean up their broadcast state (block list + key epoch).
+        if removed.role == "author"
+            && let Some(ref mut bc) = ctx.broadcast
+        {
+            bc.authors.remove(did);
+            bc.key_epochs.remove(did);
+        }
+        ctx.push_event(WasmContextEvent::MemberLeft {
+            member_did: did.to_owned(),
+        });
+        Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
     }
 
     /// Handles governance actions that don't fit in the primary dispatch.

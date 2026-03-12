@@ -3750,3 +3750,409 @@ fn wasm_trust_level_sorting_order() {
     assert!(trust_level_rank("DomainVerified") > trust_level_rank("DiscoveryContextVerified"));
     assert!(trust_level_rank("DiscoveryContextVerified") > trust_level_rank("Unknown"));
 }
+
+// ===========================================================================
+// Governance role/broadcast mirror (verbatim from scp-ffi-wasm/src/manager.rs)
+//
+// Mirrors member_has_capability, MemberEntry, BroadcastState, and
+// ChangeRole broadcast-sync logic. If the WASM code changes, this must be
+// updated in lockstep.
+// ===========================================================================
+
+mod wasm_role_broadcast_mirror {
+    use std::collections::{HashMap, HashSet};
+
+    /// Mirror of `MemberEntry` from `scp-ffi-wasm/src/manager.rs`.
+    #[derive(Debug, Clone)]
+    pub struct MemberEntry {
+        pub did: String,
+        pub role: String,
+        #[allow(dead_code)]
+        pub sequence_number: u64,
+    }
+
+    /// Mirror of `BroadcastState` from `scp-ffi-wasm/src/manager.rs`.
+    #[derive(Debug)]
+    pub struct BroadcastState {
+        pub authors: HashMap<String, HashSet<String>>,
+        pub key_epochs: HashMap<String, u64>,
+    }
+
+    impl BroadcastState {
+        pub fn new() -> Self {
+            Self {
+                authors: HashMap::new(),
+                key_epochs: HashMap::new(),
+            }
+        }
+    }
+
+    /// Minimal subset of `PerContextState` for testing role capabilities and
+    /// broadcast-state synchronization.
+    pub struct PerContextState {
+        pub members: HashMap<String, MemberEntry>,
+        pub ceiling_strings: HashSet<String>,
+        pub broadcast: Option<BroadcastState>,
+    }
+
+    impl PerContextState {
+        /// Creates a new state with the default WASM capability ceiling.
+        pub fn new_with_default_ceiling(broadcast: Option<BroadcastState>) -> Self {
+            let ceiling_strings: HashSet<String> = [
+                "messages:read",
+                "messages:write",
+                "tool:register",
+                "tool:invoke:*",
+                "role:assign",
+                "member:invite",
+                "member:remove",
+                "governance:propose",
+                "governance:vote",
+                "context:close",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            Self {
+                members: HashMap::new(),
+                ceiling_strings,
+                broadcast,
+            }
+        }
+
+        /// Mirror of `PerContextState::member_has_capability` from
+        /// `scp-ffi-wasm/src/manager.rs` (verbatim).
+        pub fn member_has_capability(&self, member_did: &str, capability: &str) -> bool {
+            let Some(member) = self.members.get(member_did) else {
+                return false;
+            };
+
+            let in_ceiling = |cap: &str| -> bool {
+                let (resource, _action) = cap.rsplit_once(':').unwrap_or((cap, "*"));
+                let wildcard = format!("{resource}:*");
+                self.ceiling_strings.contains(cap) || self.ceiling_strings.contains(&wildcard)
+            };
+
+            match member.role.as_str() {
+                "admin" => in_ceiling(capability),
+                "moderator" => {
+                    let role_grants = matches!(
+                        capability,
+                        "messages:read"
+                            | "messages:write"
+                            | "tool:invoke:*"
+                            | "member:remove"
+                            | "governance:propose"
+                    );
+                    role_grants && in_ceiling(capability)
+                }
+                "author" => {
+                    let role_grants = matches!(
+                        capability,
+                        "messages:write" | "messages:read" | "tool:invoke:*"
+                    );
+                    role_grants && in_ceiling(capability)
+                }
+                "member" => {
+                    let role_grants = matches!(
+                        capability,
+                        "messages:read" | "messages:write" | "tool:invoke:*"
+                    );
+                    role_grants && in_ceiling(capability)
+                }
+                "subscriber" | "observer" => {
+                    capability == "messages:read" && in_ceiling(capability)
+                }
+                _ => false,
+            }
+        }
+
+        /// Mirror of `ChangeRole` broadcast-sync logic from
+        /// `dispatch_governance_action` in `scp-ffi-wasm/src/manager.rs`.
+        pub fn change_role(&mut self, did: &str, new_role: &str) {
+            if let Some(member) = self.members.get_mut(did) {
+                let old_role = member.role.clone();
+                new_role.clone_into(&mut member.role);
+                if let Some(ref mut bc) = self.broadcast {
+                    if old_role == "author" && new_role != "author" {
+                        bc.authors.remove(did);
+                        bc.key_epochs.remove(did);
+                    } else if new_role == "author" && old_role != "author" {
+                        bc.authors.insert(did.to_owned(), HashSet::new());
+                        bc.key_epochs.insert(did.to_owned(), 0);
+                    }
+                }
+            }
+        }
+
+        /// Inserts a member (mirrors `AddMember` logic).
+        pub fn add_member(&mut self, did: &str, role: &str) {
+            self.members.insert(
+                did.to_owned(),
+                MemberEntry {
+                    did: did.to_owned(),
+                    role: role.to_owned(),
+                    sequence_number: 0,
+                },
+            );
+            if role == "author"
+                && let Some(ref mut bc) = self.broadcast
+            {
+                bc.authors.insert(did.to_owned(), HashSet::new());
+                bc.key_epochs.insert(did.to_owned(), 0);
+            }
+        }
+
+        /// Removes a member (mirrors `RemoveMember` logic).
+        pub fn remove_member(&mut self, did: &str) -> Option<MemberEntry> {
+            let removed = self.members.remove(did)?;
+            if removed.role == "author"
+                && let Some(ref mut bc) = self.broadcast
+            {
+                bc.authors.remove(did);
+                bc.key_epochs.remove(did);
+            }
+            Some(removed)
+        }
+    }
+}
+
+// ===========================================================================
+// Test: AddMember with author role populates broadcast state
+// ===========================================================================
+
+#[test]
+fn add_member_author_role_populates_broadcast_state() {
+    use wasm_role_broadcast_mirror::{BroadcastState, PerContextState};
+
+    let mut ctx = PerContextState::new_with_default_ceiling(Some(BroadcastState::new()));
+    let author_did = "did:key:author-001";
+
+    ctx.add_member(author_did, "author");
+
+    // Member should exist with the author role.
+    assert_eq!(ctx.members[author_did].role, "author");
+
+    // Broadcast state should have the author registered.
+    let bc = ctx.broadcast.as_ref().unwrap();
+    assert!(
+        bc.authors.contains_key(author_did),
+        "AddMember with author role should insert into bc.authors"
+    );
+    assert!(
+        bc.authors[author_did].is_empty(),
+        "new author should have an empty block list"
+    );
+    assert_eq!(
+        bc.key_epochs[author_did], 0,
+        "new author should start at key epoch 0"
+    );
+}
+
+// ===========================================================================
+// Test: RemoveMember of author cleans up broadcast state
+// ===========================================================================
+
+#[test]
+fn remove_member_author_cleans_broadcast_state() {
+    use wasm_role_broadcast_mirror::{BroadcastState, PerContextState};
+
+    let mut ctx = PerContextState::new_with_default_ceiling(Some(BroadcastState::new()));
+    let author_did = "did:key:author-002";
+
+    // Add an author, then remove them.
+    ctx.add_member(author_did, "author");
+    assert!(
+        ctx.broadcast
+            .as_ref()
+            .unwrap()
+            .authors
+            .contains_key(author_did)
+    );
+
+    let removed = ctx.remove_member(author_did);
+    assert!(removed.is_some());
+    assert_eq!(removed.unwrap().role, "author");
+
+    // Broadcast state should be cleaned up.
+    let bc = ctx.broadcast.as_ref().unwrap();
+    assert!(
+        !bc.authors.contains_key(author_did),
+        "RemoveMember should remove author from bc.authors"
+    );
+    assert!(
+        !bc.key_epochs.contains_key(author_did),
+        "RemoveMember should remove author from bc.key_epochs"
+    );
+}
+
+// ===========================================================================
+// Test: ChangeRole updates broadcast state when transitioning to/from author
+// ===========================================================================
+
+#[test]
+fn change_role_author_to_member_removes_broadcast_state() {
+    use wasm_role_broadcast_mirror::{BroadcastState, PerContextState};
+
+    let mut ctx = PerContextState::new_with_default_ceiling(Some(BroadcastState::new()));
+    let did = "did:key:role-change-001";
+
+    // Add as author, verify broadcast state.
+    ctx.add_member(did, "author");
+    assert!(ctx.broadcast.as_ref().unwrap().authors.contains_key(did));
+
+    // Change to member — should remove from broadcast state.
+    ctx.change_role(did, "member");
+    assert_eq!(ctx.members[did].role, "member");
+    let bc = ctx.broadcast.as_ref().unwrap();
+    assert!(
+        !bc.authors.contains_key(did),
+        "ChangeRole from author to member should remove from bc.authors"
+    );
+    assert!(
+        !bc.key_epochs.contains_key(did),
+        "ChangeRole from author to member should remove from bc.key_epochs"
+    );
+}
+
+#[test]
+fn change_role_member_to_author_adds_broadcast_state() {
+    use wasm_role_broadcast_mirror::{BroadcastState, PerContextState};
+
+    let mut ctx = PerContextState::new_with_default_ceiling(Some(BroadcastState::new()));
+    let did = "did:key:role-change-002";
+
+    // Add as member — no broadcast state.
+    ctx.add_member(did, "member");
+    assert!(!ctx.broadcast.as_ref().unwrap().authors.contains_key(did));
+
+    // Change to author — should add to broadcast state.
+    ctx.change_role(did, "author");
+    assert_eq!(ctx.members[did].role, "author");
+    let bc = ctx.broadcast.as_ref().unwrap();
+    assert!(
+        bc.authors.contains_key(did),
+        "ChangeRole from member to author should insert into bc.authors"
+    );
+    assert_eq!(
+        bc.key_epochs[did], 0,
+        "ChangeRole from member to author should initialize key epoch to 0"
+    );
+}
+
+// ===========================================================================
+// Test: member_has_capability for moderator with governance:propose
+// ===========================================================================
+
+#[test]
+fn moderator_has_governance_propose_capability() {
+    use wasm_role_broadcast_mirror::PerContextState;
+
+    let mut ctx = PerContextState::new_with_default_ceiling(None);
+    let did = "did:key:moderator-001";
+
+    ctx.add_member(did, "moderator");
+
+    // Moderators should have governance:propose.
+    assert!(
+        ctx.member_has_capability(did, "governance:propose"),
+        "moderator should have governance:propose capability"
+    );
+    // And member:remove.
+    assert!(
+        ctx.member_has_capability(did, "member:remove"),
+        "moderator should have member:remove capability"
+    );
+    // And the standard messaging + tool capabilities.
+    assert!(ctx.member_has_capability(did, "messages:read"));
+    assert!(ctx.member_has_capability(did, "messages:write"));
+    assert!(ctx.member_has_capability(did, "tool:invoke:*"));
+    // But NOT admin-only capabilities.
+    assert!(
+        !ctx.member_has_capability(did, "context:close"),
+        "moderator should NOT have context:close"
+    );
+}
+
+// ===========================================================================
+// Test: member_has_capability for subscriber with messages:read
+// ===========================================================================
+
+#[test]
+fn subscriber_has_messages_read_only() {
+    use wasm_role_broadcast_mirror::PerContextState;
+
+    let mut ctx = PerContextState::new_with_default_ceiling(None);
+    let did = "did:key:subscriber-001";
+
+    ctx.add_member(did, "subscriber");
+
+    // Subscriber should have messages:read.
+    assert!(
+        ctx.member_has_capability(did, "messages:read"),
+        "subscriber should have messages:read capability"
+    );
+    // But NOT messages:write.
+    assert!(
+        !ctx.member_has_capability(did, "messages:write"),
+        "subscriber should NOT have messages:write"
+    );
+    // And NOT tool:invoke:*.
+    assert!(
+        !ctx.member_has_capability(did, "tool:invoke:*"),
+        "subscriber should NOT have tool:invoke:*"
+    );
+}
+
+// ===========================================================================
+// Test: member role includes tool:invoke:* (intersected with ceiling)
+// ===========================================================================
+
+#[test]
+fn member_has_tool_invoke_all_capability() {
+    use wasm_role_broadcast_mirror::PerContextState;
+
+    let mut ctx = PerContextState::new_with_default_ceiling(None);
+    let did = "did:key:member-001";
+
+    ctx.add_member(did, "member");
+
+    assert!(ctx.member_has_capability(did, "messages:read"));
+    assert!(ctx.member_has_capability(did, "messages:write"));
+    assert!(
+        ctx.member_has_capability(did, "tool:invoke:*"),
+        "member should have tool:invoke:* capability"
+    );
+    // But NOT governance:propose (that's moderator+).
+    assert!(
+        !ctx.member_has_capability(did, "governance:propose"),
+        "member should NOT have governance:propose"
+    );
+}
+
+// ===========================================================================
+// Test: member role respects ceiling — removing tool:invoke:* from ceiling
+// should deny tool:invoke:*
+// ===========================================================================
+
+#[test]
+fn member_capability_ceiling_intersection() {
+    use wasm_role_broadcast_mirror::PerContextState;
+
+    let mut ctx = PerContextState::new_with_default_ceiling(None);
+    let did = "did:key:member-002";
+
+    // Remove tool:invoke:* from ceiling.
+    ctx.ceiling_strings.remove("tool:invoke:*");
+
+    ctx.add_member(did, "member");
+
+    // messages:read/write should still work.
+    assert!(ctx.member_has_capability(did, "messages:read"));
+    assert!(ctx.member_has_capability(did, "messages:write"));
+    // tool:invoke:* should be denied (not in ceiling).
+    assert!(
+        !ctx.member_has_capability(did, "tool:invoke:*"),
+        "member should NOT have tool:invoke:* when tool:invoke:* is removed from ceiling"
+    );
+}
