@@ -51,8 +51,9 @@ use crate::error::ScpPyError;
 /// # Errors
 ///
 /// Raises `ValidationError` if `operator_did` or `governance_did` is not a
-/// valid DID string (empty, missing `did:{method}:{id}` structure, or
-/// contains control characters), or if `mode` is not recognized.
+/// valid DID string (empty, exceeds 512 bytes, missing `did:{method}:{id}`
+/// structure, method not lowercase alphanumeric, or contains control
+/// characters), or if `mode` is not recognized.
 /// Raises `ContextError` if the governance DID matches the operator DID
 /// (self-approval) or if registration fails.
 #[pyfunction]

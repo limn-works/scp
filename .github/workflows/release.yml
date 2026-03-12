@@ -27,7 +27,6 @@
 #   GPG_PASSPHRASE         — Passphrase for GPG private key
 #   MAVEN_USERNAME         — Sonatype OSSRH username (Maven Central)
 #   MAVEN_PASSWORD         — Sonatype OSSRH password
-#   NUGET_API_KEY          — NuGet.org API key for Limn.Scp
 #
 # Required repository variables:
 #   (none — all configuration is derived from the version input)

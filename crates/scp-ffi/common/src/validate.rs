@@ -168,16 +168,17 @@ pub fn validate_context_id(context_id: &str) -> Result<(), ValidationError> {
 /// DIDs must match the `did:{method}:{id}` format per the W3C DID Core
 /// specification. Validation enforces:
 /// - Non-empty
-/// - Length <= [`MAX_DID_LEN`]
+/// - Length <= [`MAX_DID_LEN`] (512 bytes)
 /// - Starts with `did:`
 /// - Contains at least two `:` separators (method + id)
+/// - Method is non-empty lowercase alphanumeric
 /// - No control characters
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the DID is empty, too long,
-/// missing the `did:` prefix, missing the method or ID, or contains
-/// control characters.
+/// Returns [`ValidationError`] if the DID is empty, exceeds 512 bytes,
+/// missing the `did:` prefix, missing the method or ID, method is not
+/// lowercase alphanumeric, or contains control characters.
 pub fn validate_did(did: &str) -> Result<(), ValidationError> {
     validate_non_empty(did, "DID", MAX_DID_LEN)?;
     reject_control_chars(did, "DID")?;
