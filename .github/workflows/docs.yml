@@ -11,14 +11,11 @@
 # Story: SCP-139
 #
 # Doc generators per language:
-#   Rust     — rustdoc (cargo doc)
-#   Python   — sphinx (autodoc + napoleon)
+#   Rust       — rustdoc (cargo doc)
+#   Python     — sphinx (autodoc + napoleon)
 #   TypeScript — typedoc
-#   Swift    — DocC (runs in build-matrix.yml; requires XCFramework binary)
-#   Kotlin   — Dokka (./gradlew dokkaHtml)
-#   Go       — godoc / pkgsite
-#   C#       — xmldoc (dotnet build /p:GenerateDocumentationFile=true)
-#   Java     — javadoc (./gradlew javadoc)
+#   Swift      — DocC (runs in build-matrix.yml; requires XCFramework binary)
+#   Kotlin     — Dokka (./gradlew dokkaHtml)
 
 name: SDK Docs
 

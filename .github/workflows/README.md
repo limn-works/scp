@@ -22,7 +22,7 @@ Overview of all GitHub Actions workflows in this repository.
 
 **Story:** SCP-139 | **Source:** `.docs/scaffold/shared.md` "SDK Documentation Requirements", `.docs/specs/21-documentation.md` &sect;21.10
 
-API reference docs are generated for all 8 language SDKs. Most generators run from source alone in `docs.yml`. Swift DocC is the exception -- it requires a compiled binary and runs in `build-matrix.yml` instead.
+API reference docs are generated for all 5 language SDKs. Most generators run from source alone in `docs.yml`. Swift DocC is the exception -- it requires a compiled binary and runs in `build-matrix.yml` instead.
 
 ### Where each language's docs are generated
 
@@ -33,9 +33,6 @@ API reference docs are generated for all 8 language SDKs. Most generators run fr
 | TypeScript | typedoc | `docs.yml` | `typescript-docs` | `docs-typescript` | `ubuntu-latest` |
 | Swift | DocC | `build-matrix.yml` | `swift-xcframework` | `docs-swift` | `macos-26` |
 | Kotlin | Dokka | `docs.yml` | `kotlin-docs` | `docs-kotlin` | `ubuntu-latest` |
-| Go | godoc | `docs.yml` | `go-docs` | *(validation only)* | `ubuntu-latest` |
-| C# | xmldoc | `docs.yml` | `csharp-docs` | *(validation only)* | `ubuntu-latest` |
-| Java | javadoc | `docs.yml` | `java-docs` | `docs-java` | `ubuntu-latest` |
 
 ### Why Swift DocC lives in build-matrix.yml
 
