@@ -890,7 +890,13 @@ pub fn handle_register(
             .entry(discovery_context_id)
             .or_insert_with(WasmHandleRegistry::new);
 
-        if registry.entries.contains_key(&normalized) {
+        if let Some(existing) = registry.entries.get(&normalized) {
+            if existing.owner_did == registrant_did {
+                // Same owner re-registering — idempotent success per core HandleRegistry semantics.
+                let result =
+                    serde_json::json!({"status": "registered", "entry_id": existing.entry_id});
+                return Ok(result.to_string());
+            }
             let result = serde_json::json!({"status": "conflict", "entry_id": null});
             return Ok(result.to_string());
         }

@@ -369,7 +369,7 @@ public func resolvePetnameDid(
     petnameResolveDidFn: DiscoveryBridge.PetnameResolveDidFn = DiscoveryBridge.defaultPetnameResolveDid
 ) throws -> [String] {
     let json = try petnameResolveDidFn(ownerDid, name)
-    return parseJsonStringArray(json)
+    return try parseJsonStringArray(json)
 }
 
 /// Resolves a petname to a list of context IDs.
@@ -386,7 +386,7 @@ public func resolvePetnameContext(
     petnameResolveContextFn: DiscoveryBridge.PetnameResolveContextFn = DiscoveryBridge.defaultPetnameResolveContext
 ) throws -> [String] {
     let json = try petnameResolveContextFn(ownerDid, name)
-    return parseJsonStringArray(json)
+    return try parseJsonStringArray(json)
 }
 
 /// Gets the petname assigned to a DID, if any.
@@ -502,11 +502,18 @@ public func resolveDiscoveryAddress(
     addressResolveFn: DiscoveryBridge.AddressResolveFn = DiscoveryBridge.defaultAddressResolve
 ) throws -> [[String: Any]] {
     let json = try addressResolveFn(ownerDid, address, knownContextsJson)
-    guard let data = json.data(using: .utf8),
-          let parsed = try? JSONSerialization.jsonObject(with: data, options: []),
-          let array = parsed as? [[String: Any]]
-    else {
-        return []
+    guard let data = json.data(using: .utf8) else {
+        throw ScpError.validation(
+            message: "Invalid UTF-8 in bridge response",
+            code: "SCP-VALID-7200"
+        )
+    }
+    let parsed = try JSONSerialization.jsonObject(with: data, options: [])
+    guard let array = parsed as? [[String: Any]] else {
+        throw ScpError.validation(
+            message: "Expected JSON array of objects from bridge",
+            code: "SCP-VALID-7200"
+        )
     }
     return array
 }
@@ -514,12 +521,22 @@ public func resolveDiscoveryAddress(
 // MARK: - JSON parsing helpers
 
 /// Parses a JSON string containing an array of strings into `[String]`.
-private func parseJsonStringArray(_ json: String) -> [String] {
-    guard let data = json.data(using: .utf8),
-          let parsed = try? JSONSerialization.jsonObject(with: data, options: []),
-          let array = parsed as? [String]
-    else {
-        return []
+///
+/// - Throws: ``ScpError/Validation(message:code:)`` if the JSON is
+///   not valid UTF-8 or does not decode as an array of strings.
+private func parseJsonStringArray(_ json: String) throws -> [String] {
+    guard let data = json.data(using: .utf8) else {
+        throw ScpError.validation(
+            message: "Invalid UTF-8 in bridge response",
+            code: "SCP-VALID-7200"
+        )
+    }
+    let parsed = try JSONSerialization.jsonObject(with: data, options: [])
+    guard let array = parsed as? [String] else {
+        throw ScpError.validation(
+            message: "Expected JSON array of strings from bridge",
+            code: "SCP-VALID-7200"
+        )
     }
     return array
 }
