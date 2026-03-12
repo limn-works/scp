@@ -412,6 +412,17 @@ class Context:
         ``tool_invoke:*`` capability scoped to this context.  See
         spec section 6.2, section 8, and ADR-016 for UCAN enforcement.
 
+        .. versionchanged:: 0.2.0
+            ``ucan_token`` is now a required positional parameter
+            (previously tool invocation did not require UCAN
+            authorization).  This is a **breaking change** -- callers
+            that previously used ``Context.invoke(tool, input)`` or
+            ``Context.invoke(tool, input, identity=...)`` must now
+            pass the UCAN token as the third positional argument:
+            ``Context.invoke(tool, input, ucan_token)``.
+            ``proof_tokens`` was also added as an optional keyword
+            argument for delegation chain resolution.
+
         Args:
             tool: The tool identifier.
             input: Input data as a JSON-compatible dict.
