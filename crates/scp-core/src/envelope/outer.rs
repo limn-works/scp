@@ -388,8 +388,12 @@ pub fn open_envelope(
     let stripped_payload = strip_padding(&inner.payload)?;
 
     // 6. Verify content integrity: payload_hash == SHA-256(stripped_payload).
+    //    Constant-time comparison to prevent timing side-channels.
     let computed_hash = Sha256::digest(&stripped_payload);
-    if computed_hash.as_slice() != &inner.payload_hash[..] {
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        computed_hash.as_slice(),
+        &inner.payload_hash[..],
+    )) {
         return Err(EnvelopeError::ContentIntegrityFailed);
     }
 

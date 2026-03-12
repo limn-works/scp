@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 z-base-32 = { workspace = true }
 hex = { workspace = true }
 async-trait = { workspace = true }
+subtle = { workspace = true }
 rand = { workspace = true, optional = true }
 
 [dev-dependencies]

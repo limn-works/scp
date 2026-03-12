@@ -35,6 +35,7 @@ use aes_gcm::Nonce;
 use aes_gcm::aead::{Aead, Payload};
 use rand::RngCore;
 use rand::rngs::OsRng;
+use subtle::ConstantTimeEq;
 
 use super::{
     AccessKey, AccessKeyError, ContentEncryptionKey, WrappedCek, WrappedContent, compute_member_id,
@@ -164,8 +165,8 @@ pub fn unwrap_cek(
         }
     }
 
-    // Verify integrity check value
-    if a != AES_KW_IV {
+    // Verify integrity check value (constant-time to prevent timing oracle)
+    if !bool::from(a.ct_eq(&AES_KW_IV)) {
         return Err(AccessKeyError::KeyUnwrapFailed);
     }
 

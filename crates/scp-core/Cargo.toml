@@ -51,6 +51,7 @@ jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
 lru = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

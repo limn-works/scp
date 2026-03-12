@@ -33,6 +33,7 @@
 //! See ADR-030 in `.docs/adrs/phase-6.md` for pruning and checkpointing.
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::{ContextId, DID, Ed25519Signature, EventLog, EventLogError, EventLogSigner};
 use crate::proof::{self, Direction, InclusionProof, ProofStep};
@@ -688,7 +689,8 @@ pub fn verify_pruned_inclusion(proof: &PrunedInclusionProof) -> bool {
         };
     }
 
-    current_hash == proof.checkpoint_root
+    // Constant-time comparison to prevent timing side-channels.
+    current_hash.ct_eq(&proof.checkpoint_root).into()
 }
 
 /// Verifies a checkpointed proof (pruned proof + checkpoint).
@@ -705,7 +707,13 @@ pub fn verify_pruned_inclusion(proof: &PrunedInclusionProof) -> bool {
 #[must_use]
 pub fn verify_checkpointed_proof(proof: &CheckpointedProof) -> bool {
     // Verify the pruned proof's checkpoint_root matches the checkpoint.
-    if proof.pruned_proof.checkpoint_root != proof.checkpoint.merkle_root {
+    // Constant-time comparison to prevent timing side-channels.
+    if !bool::from(
+        proof
+            .pruned_proof
+            .checkpoint_root
+            .ct_eq(&proof.checkpoint.merkle_root),
+    ) {
         return false;
     }
 
@@ -779,7 +787,8 @@ pub fn cross_checkpoint_verify(
     }
 
     if older.event_count == newer.event_count {
-        return if older.merkle_root == newer.merkle_root {
+        // Constant-time comparison to prevent timing side-channels.
+        return if older.merkle_root.ct_eq(&newer.merkle_root).into() {
             CrossCheckpointResult::Consistent
         } else {
             CrossCheckpointResult::Divergent
@@ -823,7 +832,8 @@ pub fn verify_cross_checkpoint_with_leaves(
     }
 
     if older.event_count == newer.event_count {
-        return if older.merkle_root == newer.merkle_root {
+        // Constant-time comparison to prevent timing side-channels.
+        return if older.merkle_root.ct_eq(&newer.merkle_root).into() {
             CrossCheckpointResult::Consistent
         } else {
             CrossCheckpointResult::Divergent
@@ -836,7 +846,8 @@ pub fn verify_cross_checkpoint_with_leaves(
     let older_leaves = &newer_leaves[..older.event_count as usize];
     let computed_root = compute_root_from_leaves(older_leaves);
 
-    if computed_root == older.merkle_root {
+    // Constant-time comparison to prevent timing side-channels.
+    if computed_root.ct_eq(&older.merkle_root).into() {
         CrossCheckpointResult::Consistent
     } else {
         CrossCheckpointResult::Divergent
@@ -922,7 +933,8 @@ pub fn compare_checkpoint(
 
     // Counts match -- compare Merkle roots.
     let local_root = tree::root(local_log);
-    if local_root == remote_checkpoint.merkle_root {
+    // Constant-time comparison to prevent timing side-channels.
+    if local_root.ct_eq(&remote_checkpoint.merkle_root).into() {
         CheckpointComparison::Consistent
     } else {
         CheckpointComparison::Divergent {
