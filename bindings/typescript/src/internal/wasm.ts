@@ -139,7 +139,7 @@ interface WasmModule {
     bridgeId: string,
     platformHandle: string,
     bridgeMode: BridgeMode,
-    contextId: string,
+    contextId: string | undefined,
   ) => ReturnType<Bridge["bridgeCreateShadow"]>;
   // Discovery
   discovery_parse_address: (address: string) => string;
@@ -894,12 +894,7 @@ export function createWasmBridge(): Bridge {
       contextId: string | undefined,
     ) {
       const wasm = getWasm();
-      return wasm.bridge_create_shadow(
-        bridgeId,
-        platformHandle,
-        bridgeMode,
-        contextId ?? "ctx-shadow",
-      );
+      return wasm.bridge_create_shadow(bridgeId, platformHandle, bridgeMode, contextId);
     },
 
     // Discovery
