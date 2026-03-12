@@ -5149,8 +5149,7 @@ mod tests {
             .collect();
         assert_eq!(revoked.len(), WASM_REVOKED_TOKENS_CAP);
 
-        let mut mgr =
-            make_manager_with_revoked_tokens("ctx-1", "did:dht:zcreator", revoked);
+        let mut mgr = make_manager_with_revoked_tokens("ctx-1", "did:dht:zcreator", revoked);
 
         // Revoking a genuinely new token at capacity must fail.
         let err = mgr.ucan_revoke("ctx-1", "cid-brand-new").unwrap_err();
