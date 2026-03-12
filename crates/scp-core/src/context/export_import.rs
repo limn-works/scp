@@ -140,6 +140,16 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 ///
 /// Returns all zeros for empty data.
 ///
+/// # Pruning tolerance
+///
+/// The first entry's `prev_hash` linkage is **not** validated. If the log was
+/// pruned, `entries[0].prev_hash` references a discarded predecessor that
+/// cannot be checked. A non-genesis `prev_hash` on the first entry is therefore
+/// accepted — the log is treated as a pruned suffix. Hash-chain verification
+/// begins at the link between the first and second entries; each subsequent
+/// entry's `prev_hash` must match its predecessor's `hash`. Self-hash
+/// correctness is still verified for every entry, including the first.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
