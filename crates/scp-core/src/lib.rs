@@ -15,7 +15,11 @@
 //!
 //! See `.docs/architecture.md` for the full crate layout and build phases.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) to allow a narrow `#[allow(unsafe_code)]` exception
+// in `crypto::mls::group::zeroize_signature_key_pair`, which must use unsafe
+// pointer access to zeroize private key bytes inside an upstream type whose
+// private field has no public accessor. See issue #601.
+#![deny(unsafe_code)]
 
 pub mod bridge;
 pub mod context;

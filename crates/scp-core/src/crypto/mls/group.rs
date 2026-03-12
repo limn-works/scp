@@ -26,6 +26,7 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use zeroize::Zeroize;
 
 /// The single ciphersuite used by all SCP MLS groups.
 ///
@@ -40,28 +41,34 @@ use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTra
 pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 // ---------------------------------------------------------------------------
-// ZeroizingSigner — defense-in-depth wrapper for upstream SignatureKeyPair
+// ZeroizingSigner — zeroizing wrapper for upstream SignatureKeyPair
 // ---------------------------------------------------------------------------
 
-/// Wrapper around `openmls_basic_credential::SignatureKeyPair` that documents
-/// the zeroization gap and ensures eager drop semantics.
+/// Wrapper around `openmls_basic_credential::SignatureKeyPair` that zeroizes
+/// private key bytes before deallocation.
 ///
-/// `SignatureKeyPair` stores its Ed25519 private key in a plain `Vec<u8>` and
-/// does not implement [`Zeroize`] or [`ZeroizeOnDrop`](zeroize::ZeroizeOnDrop).
-/// The `private` field is not publicly accessible (only available behind the
-/// `test-utils` feature), so we cannot zeroize it from outside the crate
-/// without `unsafe` code.
+/// `SignatureKeyPair` stores its Ed25519 private key in a plain `Vec<u8>`
+/// (first field in the struct) and does not implement `Zeroize` or
+/// `ZeroizeOnDrop`. Standard `Vec<u8>` drop deallocates without zeroing,
+/// leaving private key bytes in freed heap memory.
 ///
 /// This wrapper provides:
-/// 1. **Documentation of the gap** — future upstream support for `Zeroize` on
-///    `SignatureKeyPair` would close this.
+/// 1. **Real zeroization** — on `Drop`, the private key's heap buffer is
+///    overwritten with zeros via `unsafe` access to the `Vec<u8>` field
+///    before `SignatureKeyPair`'s own `Drop` deallocates it.
 /// 2. **Eager drop via [`ZeroizingSigner::take`]** — `destroy_group` uses
-///    `take()` to drop the key material as early as possible.
+///    `take()` to trigger zeroization immediately rather than waiting for
+///    the struct to go out of scope.
 /// 3. **Centralized ownership** — all `SignatureKeyPair` storage in
 ///    `ScpMlsGroup` goes through this type.
 ///
-/// **Upstream limitation:** Full zeroization requires `openmls_basic_credential`
-/// to implement `Zeroize` on `SignatureKeyPair`. See issue #82.
+/// # Safety invariant
+///
+/// The `unsafe` zeroization relies on `SignatureKeyPair`'s struct layout
+/// having `private: Vec<u8>` as its first field. This is verified by a
+/// `#[cfg(test)]` assertion using the `test-utils` feature (which exposes
+/// the `private()` accessor). If `openmls_basic_credential` reorders its
+/// fields, the test will catch it.
 pub(crate) struct ZeroizingSigner(Option<SignatureKeyPair>);
 
 impl ZeroizingSigner {
@@ -76,9 +83,15 @@ impl ZeroizingSigner {
         self.0.as_ref()
     }
 
-    /// Takes the inner `SignatureKeyPair` out, leaving `None`. Used by
-    /// `destroy_group` for eager cleanup.
-    const fn take(&mut self) -> Option<SignatureKeyPair> {
+    /// Takes the inner `SignatureKeyPair` out, leaving `None`. Before
+    /// returning, the private key bytes are zeroized in-place via
+    /// [`zeroize_signature_key_pair`]. Used by `destroy_group` for
+    /// eager cleanup.
+    pub(crate) fn take(&mut self) -> Option<SignatureKeyPair> {
+        // Zeroize the private key bytes in-place before moving the value out.
+        if let Some(ref mut skp) = self.0 {
+            zeroize_signature_key_pair(skp);
+        }
         self.0.take()
     }
 }
@@ -88,6 +101,62 @@ impl Deref for ZeroizingSigner {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl Drop for ZeroizingSigner {
+    fn drop(&mut self) {
+        if let Some(ref mut skp) = self.0 {
+            zeroize_signature_key_pair(skp);
+        }
+    }
+}
+
+/// Zeroizes the private key bytes inside a `SignatureKeyPair`.
+///
+/// # Safety rationale
+///
+/// `SignatureKeyPair` in `openmls_basic_credential` v0.5.0 is defined as:
+/// ```ignore
+/// pub struct SignatureKeyPair {
+///     private: Vec<u8>,   // offset 0
+///     public: Vec<u8>,
+///     signature_scheme: SignatureScheme,
+/// }
+/// ```
+///
+/// The `private` field is not publicly accessible (gated behind `test-utils`).
+/// We use `unsafe` to obtain a mutable pointer to the `Vec<u8>` at offset 0
+/// and zeroize its heap buffer. The offset assumption is validated by a
+/// runtime test (`zeroize_offset_is_correct_and_zeroes_private_key`) that
+/// uses the `test-utils` feature to compare the offset-0 bytes against the
+/// `private()` accessor.
+///
+/// This is the sole `unsafe` exception in `scp-core`. See issue #601 and the
+/// `#![deny(unsafe_code)]` comment in `lib.rs`.
+///
+/// # Why not a separate release-mode test?
+///
+/// The `zeroize` crate's `Zeroize` impl for `[u8]` uses `volatile_set` (which
+/// compiles to `write_volatile` + a compiler fence). This prevents the compiler
+/// from eliding the zeroing write regardless of optimization level. A separate
+/// `--release` test would assert the same thing the `zeroize` crate already
+/// guarantees and tests upstream. The existing debug-mode test validates our
+/// offset assumption and that zeroization occurs; `write_volatile` guarantees
+/// it survives optimization.
+#[allow(unsafe_code)]
+fn zeroize_signature_key_pair(skp: &mut SignatureKeyPair) {
+    // SAFETY: We cast the `&mut SignatureKeyPair` to a pointer to its first
+    // field, `private: Vec<u8>`. The field layout is verified by tests. We
+    // obtain a mutable slice via `as_mut_slice()` and zeroize it. Safe because:
+    //   1. The `Vec<u8>` at offset 0 is valid and initialized (struct is alive).
+    //   2. We only write zeros — no reads of uninitialized memory.
+    //   3. The `&mut` borrow guarantees exclusive access.
+    //   4. We zeroize before `Vec::drop` deallocates the buffer.
+    unsafe {
+        let private_ptr: *mut Vec<u8> =
+            std::ptr::from_mut::<SignatureKeyPair>(skp).cast::<Vec<u8>>();
+        (*private_ptr).as_mut_slice().zeroize();
     }
 }
 
@@ -111,9 +180,9 @@ pub struct ScpMlsGroup {
     /// The MLS provider (crypto + storage) for this group.
     pub(crate) provider: InMemoryMlsProvider,
     /// The local member's Ed25519 signing key pair, wrapped in
-    /// [`ZeroizingSigner`] for best-effort zeroization on drop.
-    /// Inner `Option` is `None` after [`destroy_group`] drops the
-    /// private key material.
+    /// [`ZeroizingSigner`] which zeroizes private key bytes before
+    /// deallocation. Inner `Option` is `None` after [`destroy_group`]
+    /// zeroizes and drops the private key material.
     pub(crate) signer: ZeroizingSigner,
     /// Whether the group has been destroyed.
     pub(crate) destroyed: bool,
@@ -502,7 +571,8 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // leaving `None`, and the taken value is dropped at the end of the
     // statement. This releases:
     //   - MlsGroup: tree secrets, epoch key schedules, ratchet state
-    //   - SignatureKeyPair: Ed25519 private key (Vec<u8>)
+    //   - SignatureKeyPair: Ed25519 private key (Vec<u8>), zeroized by
+    //     `ZeroizingSigner::take` before deallocation
     drop(group.group.take());
     drop(group.signer.take());
 
@@ -895,5 +965,72 @@ mod tests {
             SCP_CIPHERSUITE,
             "key package must use SCP ciphersuite"
         );
+    }
+
+    /// Validates that `zeroize_signature_key_pair` correctly zeroes the
+    /// private key bytes by comparing the unsafe offset-0 access against
+    /// the `private()` accessor (available via `test-utils` feature in
+    /// dev-dependencies).
+    #[test]
+    #[allow(clippy::unwrap_used, unsafe_code)]
+    fn zeroize_offset_is_correct_and_zeroes_private_key() {
+        let mut skp = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+
+        // Via the test-utils accessor, confirm the private key is non-zero.
+        let private_bytes = skp.private().to_vec();
+        assert!(
+            private_bytes.iter().any(|&b| b != 0),
+            "freshly generated private key must contain non-zero bytes"
+        );
+
+        // Verify our unsafe offset-0 assumption: the bytes at offset 0
+        // (interpreted as a Vec<u8>) must match what private() returns.
+        let offset_bytes = unsafe {
+            let ptr: *const Vec<u8> =
+                std::ptr::from_ref::<SignatureKeyPair>(&skp).cast::<Vec<u8>>();
+            (*ptr).clone()
+        };
+        assert_eq!(
+            offset_bytes, private_bytes,
+            "offset-0 Vec<u8> must match private() — struct layout may have changed"
+        );
+
+        // Now zeroize and verify the private key bytes are all zeros.
+        zeroize_signature_key_pair(&mut skp);
+
+        let after_zeroize = skp.private().to_vec();
+        assert!(
+            after_zeroize.iter().all(|&b| b == 0),
+            "private key bytes must be all zeros after zeroization, got: {after_zeroize:?}"
+        );
+    }
+
+    /// `ZeroizingSigner::take` must zeroize the private key before returning it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn zeroizing_signer_take_zeroes_private_key() {
+        let skp = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let mut wrapper = ZeroizingSigner::new(skp);
+
+        let taken = wrapper.take().unwrap();
+        // After take, private key bytes should be zeroed.
+        let private = taken.private();
+        assert!(
+            private.iter().all(|&b| b == 0),
+            "taken signer must have zeroed private key"
+        );
+    }
+
+    /// `ZeroizingSigner::drop` must zeroize the private key — verified by
+    /// confirming that the `Drop` impl runs without panicking. Actual
+    /// memory content after deallocation cannot be safely inspected.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn zeroizing_signer_drop_runs_without_panic() {
+        let skp = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        // Wrap in ZeroizingSigner and immediately drop.
+        let _wrapper = ZeroizingSigner::new(skp);
+        // If Drop panicked, the test would fail. The zeroization logic is
+        // proven correct by `zeroize_offset_is_correct_and_zeroes_private_key`.
     }
 }
