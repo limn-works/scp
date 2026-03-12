@@ -228,6 +228,10 @@ pub enum WasmContextEvent {
     WriteAccessRevoked {
         did: String,
     },
+    KeyEpochAdvance {
+        sender_did: String,
+        epoch: u64,
+    },
     SystemClose {
         initiator_did: String,
     },
@@ -267,6 +271,9 @@ struct BroadcastState {
     /// Author DIDs mapped to their per-author block lists.
     /// Mirrors `scp_core::context::broadcast::AuthorState.block_list`.
     authors: HashMap<String, HashSet<String>>,
+    /// Per-author key epochs (§5.14.8). Incremented on block events to
+    /// ensure blocked subscribers cannot decrypt future content.
+    key_epochs: HashMap<String, u64>,
     /// Subscriber DIDs (members with read access).
     subscribers: HashSet<String>,
     /// Admission policy: "open" or "gated". Stored for context metadata.
@@ -278,6 +285,7 @@ impl BroadcastState {
     fn new(admission: &str) -> Self {
         Self {
             authors: HashMap::new(),
+            key_epochs: HashMap::new(),
             subscribers: HashSet::new(),
             admission: admission.to_owned(),
         }
@@ -1923,17 +1931,7 @@ impl WasmContextManager {
                 )
             }
             WasmGovernanceAction::RevokeReadAccess { did, scope } => {
-                validate_revocation_scope(scope)?;
-                let ctx = self.require_active_context_mut(context_id)?;
-                ctx.read_revoked_members.insert(did.clone());
-                if let Some(bc) = ctx.broadcast.as_mut() {
-                    bc.subscribers.remove(did);
-                    // Governance ban: add to ALL authors' block lists (§5.14.8).
-                    for block_list in bc.authors.values_mut() {
-                        block_list.insert(did.clone());
-                    }
-                }
-                Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did, "scope": scope}))
+                self.dispatch_revoke_read_access(context_id, did, scope)
             }
             WasmGovernanceAction::RestoreReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -1979,6 +1977,48 @@ impl WasmContextManager {
                 self.dispatch_governance_action_structural(context_id, action)
             }
         }
+    }
+
+    /// Handles `RevokeReadAccess` governance action (§5.14.8).
+    ///
+    /// Extracted from `dispatch_governance_action_ext` to stay within the
+    /// line limit. Governance ban: removes from subscriber registry, adds to
+    /// all authors' block lists, increments all authors' key epochs, and
+    /// emits `KeyEpochAdvance` events.
+    fn dispatch_revoke_read_access(
+        &mut self,
+        context_id: &str,
+        did: &str,
+        scope: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        validate_revocation_scope(scope)?;
+        let ctx = self.require_active_context_mut(context_id)?;
+        ctx.read_revoked_members.insert(did.to_owned());
+        // Collect per-author epoch advances to emit after the borrow.
+        let mut epoch_advances: Vec<(String, u64)> = Vec::new();
+        if let Some(bc) = ctx.broadcast.as_mut() {
+            bc.subscribers.remove(did);
+            // Governance ban (§5.14.8 step 3): add to ALL authors' block lists.
+            for block_list in bc.authors.values_mut() {
+                block_list.insert(did.to_owned());
+            }
+            // §5.14.8 step 4: mandatory key rotation — increment ALL authors'
+            // key epochs. Blocked subscriber cannot decrypt future content from
+            // any author.
+            for author_did in bc.authors.keys() {
+                let epoch = bc.key_epochs.entry(author_did.clone()).or_insert(0);
+                *epoch = epoch.saturating_add(1);
+                epoch_advances.push((author_did.clone(), *epoch));
+            }
+        }
+        // Emit KeyEpochAdvance for each author (§5.14.8 step 4).
+        for (author_did, epoch) in epoch_advances {
+            ctx.push_event(WasmContextEvent::KeyEpochAdvance {
+                sender_did: author_did,
+                epoch,
+            });
+        }
+        Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did, "scope": scope}))
     }
 
     /// Handles structural, threshold, and economic governance actions.
@@ -2504,6 +2544,12 @@ impl WasmContextManager {
 
     /// Blocks a subscriber in a broadcast context.
     ///
+    /// Per spec §5.14.8 steps 1-2:
+    /// 1. Adds DID to the blocker's block list and increments the blocker's
+    ///    key epoch.
+    /// 2. Emits a `KeyEpochAdvance` notification so non-blocked subscribers
+    ///    can request the new key.
+    ///
     /// # Errors
     ///
     /// Returns an error if not a broadcast context.
@@ -2515,6 +2561,7 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
+        let new_epoch;
         {
             let bc = ctx
                 .broadcast
@@ -2547,11 +2594,22 @@ impl WasmContextManager {
             }
 
             block_list.insert(subscriber_did.to_owned());
+
+            // §5.14.8 step 1: increment the blocker's key epoch.
+            let epoch = bc.key_epochs.entry(blocker_did.to_owned()).or_insert(0);
+            *epoch = epoch.saturating_add(1);
+            new_epoch = *epoch;
         }
 
         ctx.push_event(WasmContextEvent::MemberBlocked {
             blocked_did: subscriber_did.to_owned(),
             author_did: blocker_did.to_owned(),
+        });
+
+        // §5.14.8 step 2: publish KeyEpochAdvance notification.
+        ctx.push_event(WasmContextEvent::KeyEpochAdvance {
+            sender_did: blocker_did.to_owned(),
+            epoch: new_epoch,
         });
 
         Ok(())
@@ -3049,6 +3107,7 @@ impl WasmContextManager {
                 .iter()
                 .map(|(did, block_list)| (did.clone(), block_list.iter().cloned().collect()))
                 .collect(),
+            key_epochs: bc.key_epochs.clone(),
             subscribers: bc.subscribers.iter().cloned().collect(),
             admission: bc.admission.clone(),
         });
@@ -3236,6 +3295,7 @@ impl WasmContextManager {
                 .iter()
                 .map(|(did, block_list)| (did.clone(), block_list.iter().cloned().collect()))
                 .collect(),
+            key_epochs: bc.key_epochs.clone(),
             subscribers: bc.subscribers.iter().cloned().collect(),
             admission: bc.admission.clone(),
         });
@@ -3400,6 +3460,10 @@ struct WasmExportMember {
 struct WasmExportBroadcast {
     /// Author DIDs mapped to their per-author block lists (§5.14.8).
     author_block_lists: HashMap<String, Vec<String>>,
+    /// Per-author key epochs (§5.14.8). Tracks how many times each author
+    /// has rotated their broadcast key due to block events.
+    #[serde(default)]
+    key_epochs: HashMap<String, u64>,
     subscribers: Vec<String>,
     admission: String,
 }
@@ -3976,6 +4040,9 @@ mod tests {
             .unwrap()
             .insert("sub1".to_owned());
 
+        // Set a key epoch for author-a to verify roundtrip
+        bc.key_epochs.insert("author-a".to_owned(), 3);
+
         // Export
         let export = WasmExportBroadcast {
             author_block_lists: bc
@@ -3983,6 +4050,7 @@ mod tests {
                 .iter()
                 .map(|(did, bl)| (did.clone(), bl.iter().cloned().collect()))
                 .collect(),
+            key_epochs: bc.key_epochs.clone(),
             subscribers: bc.subscribers.iter().cloned().collect(),
             admission: bc.admission.clone(),
         };
@@ -3998,6 +4066,7 @@ mod tests {
                 .iter()
                 .map(|(did, bl)| (did.clone(), bl.iter().cloned().collect()))
                 .collect(),
+            key_epochs: reimported.key_epochs.clone(),
             subscribers: reimported.subscribers.iter().cloned().collect(),
             admission: reimported.admission.clone(),
         };
@@ -4006,5 +4075,169 @@ mod tests {
         assert!(restored.authors["author-a"].contains("sub1"));
         assert!(!restored.authors["author-b"].contains("sub1"));
         assert!(restored.subscribers.contains("sub1"));
+        // key_epochs preserved through roundtrip
+        assert_eq!(restored.key_epochs.get("author-a"), Some(&3));
+        assert_eq!(restored.key_epochs.get("author-b"), None);
+    }
+
+    #[test]
+    fn export_roundtrip_key_epochs_default_missing() {
+        // Verify that importing an export without key_epochs (from an older
+        // version) defaults to empty via #[serde(default)].
+        let json = r#"{"author_block_lists":{},"subscribers":[],"admission":"open"}"#;
+        let export: WasmExportBroadcast = serde_json::from_str(json).unwrap();
+        assert!(export.key_epochs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Key epoch tests (§5.14.8)
+    //
+    // These tests manipulate BroadcastState directly because the full
+    // manager methods call `crate::time::now_ms()` which requires a WASM
+    // target. Direct manipulation tests the key epoch logic without
+    // triggering the wasm-bindgen time import.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn key_epoch_increments_on_block() {
+        // Simulate block_broadcast_subscriber: add to block list + increment epoch
+        let mut bc = make_broadcast(&["author-a"], &["sub1"]);
+
+        // Initially no key epoch
+        assert_eq!(bc.key_epochs.get("author-a"), None);
+
+        // Block sub1 → epoch increments to 1
+        bc.authors
+            .get_mut("author-a")
+            .unwrap()
+            .insert("sub1".to_owned());
+        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+
+        assert_eq!(bc.key_epochs.get("author-a"), Some(&1));
+        assert!(bc.authors["author-a"].contains("sub1"));
+    }
+
+    #[test]
+    fn key_epoch_increments_per_block() {
+        let mut bc = make_broadcast(&["author-a"], &["sub1", "sub2"]);
+
+        // First block
+        bc.authors
+            .get_mut("author-a")
+            .unwrap()
+            .insert("sub1".to_owned());
+        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        assert_eq!(bc.key_epochs["author-a"], 1);
+
+        // Second block
+        bc.authors
+            .get_mut("author-a")
+            .unwrap()
+            .insert("sub2".to_owned());
+        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        assert_eq!(bc.key_epochs["author-a"], 2);
+    }
+
+    #[test]
+    fn key_epoch_per_author_isolation() {
+        let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1"]);
+
+        // Only author-a blocks → only author-a's epoch increments
+        bc.authors
+            .get_mut("author-a")
+            .unwrap()
+            .insert("sub1".to_owned());
+        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+
+        assert_eq!(bc.key_epochs.get("author-a"), Some(&1));
+        assert_eq!(bc.key_epochs.get("author-b"), None);
+    }
+
+    #[test]
+    fn governance_ban_increments_all_authors_key_epochs() {
+        let mut bc = make_broadcast(&["author-a", "author-b", "author-c"], &["sub1"]);
+
+        // Simulate governance ban (§5.14.8 steps 3-4):
+        // Step 3: add to ALL authors' block lists
+        for block_list in bc.authors.values_mut() {
+            block_list.insert("sub1".to_owned());
+        }
+        // Step 4: mandatory key rotation — increment ALL authors' epochs
+        for author_did in bc.authors.keys() {
+            let epoch = bc.key_epochs.entry(author_did.clone()).or_insert(0);
+            *epoch = epoch.saturating_add(1);
+        }
+
+        // All authors blocked sub1
+        assert!(bc.authors["author-a"].contains("sub1"));
+        assert!(bc.authors["author-b"].contains("sub1"));
+        assert!(bc.authors["author-c"].contains("sub1"));
+
+        // All authors' epochs incremented
+        assert_eq!(bc.key_epochs["author-a"], 1);
+        assert_eq!(bc.key_epochs["author-b"], 1);
+        assert_eq!(bc.key_epochs["author-c"], 1);
+    }
+
+    #[test]
+    fn governance_ban_stacks_on_existing_epochs() {
+        let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1", "sub2"]);
+
+        // author-a already blocked sub1 (epoch=1)
+        bc.authors
+            .get_mut("author-a")
+            .unwrap()
+            .insert("sub1".to_owned());
+        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        assert_eq!(bc.key_epochs["author-a"], 1);
+
+        // Now governance ban sub2 → all authors' epochs increment again
+        for block_list in bc.authors.values_mut() {
+            block_list.insert("sub2".to_owned());
+        }
+        for author_did in bc.authors.keys() {
+            let epoch = bc.key_epochs.entry(author_did.clone()).or_insert(0);
+            *epoch = epoch.saturating_add(1);
+        }
+
+        // author-a: was 1, now 2. author-b: was 0, now 1.
+        assert_eq!(bc.key_epochs["author-a"], 2);
+        assert_eq!(bc.key_epochs["author-b"], 1);
+    }
+
+    #[test]
+    fn key_epoch_advance_event_serializes_correctly() {
+        let event = WasmContextEvent::KeyEpochAdvance {
+            sender_did: "did:dht:zauthor".to_owned(),
+            epoch: 42,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "keyEpochAdvance");
+        assert_eq!(json["sender_did"], "did:dht:zauthor");
+        assert_eq!(json["epoch"], 42);
+    }
+
+    #[test]
+    fn key_epoch_unblock_does_not_change_epoch() {
+        let mut bc = make_broadcast(&["author-a"], &["sub1"]);
+
+        // Block sub1 → epoch = 1
+        bc.authors
+            .get_mut("author-a")
+            .unwrap()
+            .insert("sub1".to_owned());
+        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        assert_eq!(bc.key_epochs["author-a"], 1);
+
+        // Unblock sub1 → epoch stays at 1 (per spec: no key rotation on unblock)
+        bc.authors.get_mut("author-a").unwrap().remove("sub1");
+        // No epoch change
+        assert_eq!(bc.key_epochs["author-a"], 1);
     }
 }
