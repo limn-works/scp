@@ -503,14 +503,14 @@ public func resolveDiscoveryAddress(
 ) throws -> [[String: Any]] {
     let json = try addressResolveFn(ownerDid, address, knownContextsJson)
     guard let data = json.data(using: .utf8) else {
-        throw ScpError.validation(
+        throw ScpError.Validation(
             message: "Invalid UTF-8 in bridge response",
             code: "SCP-VALID-7200"
         )
     }
     let parsed = try JSONSerialization.jsonObject(with: data, options: [])
     guard let array = parsed as? [[String: Any]] else {
-        throw ScpError.validation(
+        throw ScpError.Validation(
             message: "Expected JSON array of objects from bridge",
             code: "SCP-VALID-7200"
         )
@@ -526,14 +526,14 @@ public func resolveDiscoveryAddress(
 ///   not valid UTF-8 or does not decode as an array of strings.
 private func parseJsonStringArray(_ json: String) throws -> [String] {
     guard let data = json.data(using: .utf8) else {
-        throw ScpError.validation(
+        throw ScpError.Validation(
             message: "Invalid UTF-8 in bridge response",
             code: "SCP-VALID-7200"
         )
     }
     let parsed = try JSONSerialization.jsonObject(with: data, options: [])
     guard let array = parsed as? [String] else {
-        throw ScpError.validation(
+        throw ScpError.Validation(
             message: "Expected JSON array of strings from bridge",
             code: "SCP-VALID-7200"
         )
