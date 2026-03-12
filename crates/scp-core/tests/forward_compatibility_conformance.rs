@@ -1,15 +1,13 @@
 //! Forward compatibility conformance tests per spec §13.5.1 and §13.9 items 3/5.
 //!
-//! §13.5.1 requires: "Implementations MUST ignore unknown fields in `MessagePack`
-//! maps." This applies to all wire-format types. These tests verify that every
-//! wire-format struct can be deserialized from bytes that contain extra fields
-//! not present in the struct definition.
+//! §13.5.1 requires that unknown fields in MessagePack maps are handled
+//! according to the type:
+//! - **OuterEnvelope / InnerEnvelope:** unknown fields MUST be preserved for
+//!   forward-compatible roundtripping (via their `extensions` `HashMap`).
+//! - **All other wire types:** unknown fields MUST be ignored.
 //!
 //! §13.9 item 3: "Ignore unknown fields in all deserialized structures."
 //! §13.9 item 5: "Preserve unknown fields when forwarding (relays only)."
-//!
-//! The `OuterEnvelope` and `InnerEnvelope` additionally test preservation via their
-//! `extensions` `HashMap`.
 
 #![allow(
     clippy::unwrap_used,
@@ -114,13 +112,84 @@ fn inject_unknown_json_fields(
     serde_json::to_string(&val).expect("re-encode to JSON")
 }
 
-/// Standard set of unknown fields simulating a future SCP/1.2 protocol version.
+/// Standard set of unknown string-valued fields simulating a future SCP/1.2
+/// protocol version. Used by types that only need to verify ignore-on-deser.
 fn future_msgpack_fields() -> Vec<(&'static str, &'static str)> {
     vec![
         ("v2_routing_priority", "42"),
         ("future_capability_flags", "extended"),
         ("scp_1_2_metadata", "nested_value"),
     ]
+}
+
+/// Injects unknown fields with diverse MessagePack value types (integer,
+/// boolean, nested map, array) into a named-map msgpack blob. This exercises
+/// the `#[serde(flatten)]` `extensions` `HashMap<String, serde_json::Value>`
+/// path more thoroughly than string-only injection.
+fn inject_diverse_unknown_msgpack_fields(original: &[u8]) -> Vec<u8> {
+    assert!(!original.is_empty(), "original bytes must not be empty");
+
+    let extras: &[(&str, &[u8])] = &[
+        // string value
+        ("v2_routing_priority", &{
+            let mut buf = Vec::new();
+            encode_msgpack_str(&mut buf, "high");
+            buf
+        }),
+        // positive fixint (42)
+        ("future_int_field", &[0x2A]),
+        // boolean true (0xC3)
+        ("future_bool_field", &[0xC3]),
+        // nested fixmap {\"nested_key\": true} — fixmap(1) + fixstr(10) + true
+        ("future_nested_obj", &{
+            let mut buf = Vec::new();
+            // fixmap with 1 entry
+            buf.push(0x81);
+            encode_msgpack_str(&mut buf, "nested_key");
+            buf.push(0xC3); // true
+            buf
+        }),
+        // fixarray [1, 2, 3] — fixarray(3) + fixint(1) + fixint(2) + fixint(3)
+        ("future_array_field", &[0x93, 0x01, 0x02, 0x03]),
+    ];
+
+    // Parse the map header.
+    let first = original[0];
+    let (old_count, body_offset) = if first & 0b1111_0000 == 0x80 {
+        (u32::from(first & 0x0F), 1)
+    } else if first == 0xDE {
+        let count = u32::from(u16::from_be_bytes([original[1], original[2]]));
+        (count, 3)
+    } else if first == 0xDF {
+        let count = u32::from_be_bytes([original[1], original[2], original[3], original[4]]);
+        (count, 5)
+    } else {
+        panic!("expected msgpack map header, got 0x{first:02X}");
+    };
+
+    let new_count = old_count + extras.len() as u32;
+
+    let mut result = Vec::with_capacity(original.len() + extras.len() * 40);
+    if new_count <= 15 {
+        result.push(0x80 | (new_count as u8));
+    } else if new_count <= 0xFFFF {
+        result.push(0xDE);
+        result.extend_from_slice(&(new_count as u16).to_be_bytes());
+    } else {
+        result.push(0xDF);
+        result.extend_from_slice(&new_count.to_be_bytes());
+    }
+
+    // Copy the original map body (everything after the old header).
+    result.extend_from_slice(&original[body_offset..]);
+
+    // Append extra key-value pairs with diverse value types.
+    for (key, value_bytes) in extras {
+        encode_msgpack_str(&mut result, key);
+        result.extend_from_slice(value_bytes);
+    }
+
+    result
 }
 
 fn future_json_fields() -> Vec<(&'static str, serde_json::Value)> {
@@ -205,14 +274,15 @@ mod outer_envelope {
 }
 
 // ===========================================================================
-// §13.5.1 — InnerEnvelope: unknown fields MUST be preserved
+// §13.5.1 — InnerEnvelope: unknown fields MUST be preserved for roundtripping
 // ===========================================================================
 
 mod inner_envelope {
     use super::*;
     use scp_core::envelope::inner::InnerEnvelope;
 
-    /// §13.5.1, §13.9 item 5: `InnerEnvelope` MUST preserve unknown fields.
+    /// §13.5.1: `InnerEnvelope` MUST preserve unknown fields for
+    /// forward-compatible roundtripping.
     #[test]
     fn unknown_fields_are_preserved_msgpack() {
         // Build a valid InnerEnvelope, serialize to msgpack, inject extra fields.
@@ -263,8 +333,9 @@ mod inner_envelope {
         );
     }
 
-    /// §13.9 item 5: Unknown fields in `InnerEnvelope` MUST survive roundtrip.
-    /// Verify that serialize -> deserialize -> serialize -> deserialize preserves extensions.
+    /// §13.5.1: Unknown fields in `InnerEnvelope` MUST survive roundtrip
+    /// for forward-compatible preservation. Verify serialize -> deserialize ->
+    /// serialize -> deserialize preserves extensions.
     #[test]
     fn unknown_fields_survive_roundtrip() {
         let inner = InnerEnvelope {
@@ -302,6 +373,73 @@ mod inner_envelope {
                 "extension key '{key}' lost during roundtrip"
             );
         }
+    }
+
+    /// §13.5.1: Diverse value types (integer, boolean, nested object, array)
+    /// must be preserved, not just strings.
+    #[test]
+    fn diverse_value_types_are_preserved() {
+        let inner = InnerEnvelope {
+            version: 256,
+            context_id: "ctx-diverse".to_string(),
+            sender_did: "did:dht:diverse".to_string(),
+            epoch: 1,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            message_type: scp_core::envelope::inner::MessageType::Content,
+            payload_hash: [0xAA; 32],
+            payload: vec![0x01, 0x02],
+            provenance: None,
+            provenance_hash: [0xBB; 32],
+            signing_key_id: scp_identity::SigningKeyId::Active,
+            signature: [0xCC; 64],
+            extensions: std::collections::HashMap::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&inner).unwrap();
+        let with_extras = inject_diverse_unknown_msgpack_fields(&bytes);
+
+        let decoded: InnerEnvelope = rmp_serde::from_slice(&with_extras)
+            .expect("InnerEnvelope must accept diverse value types");
+
+        // String value
+        assert_eq!(
+            decoded.extensions.get("v2_routing_priority"),
+            Some(&serde_json::json!("high")),
+            "string extension value must be preserved"
+        );
+        // Integer value
+        assert_eq!(
+            decoded.extensions.get("future_int_field"),
+            Some(&serde_json::json!(42)),
+            "integer extension value must be preserved"
+        );
+        // Boolean value
+        assert_eq!(
+            decoded.extensions.get("future_bool_field"),
+            Some(&serde_json::json!(true)),
+            "boolean extension value must be preserved"
+        );
+        // Nested object
+        assert_eq!(
+            decoded.extensions.get("future_nested_obj"),
+            Some(&serde_json::json!({"nested_key": true})),
+            "nested object extension value must be preserved"
+        );
+        // Array value
+        assert_eq!(
+            decoded.extensions.get("future_array_field"),
+            Some(&serde_json::json!([1, 2, 3])),
+            "array extension value must be preserved"
+        );
+
+        // Roundtrip: re-serialize and re-deserialize must preserve all types
+        let re_bytes = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: InnerEnvelope = rmp_serde::from_slice(&re_bytes).unwrap();
+        assert_eq!(
+            re_decoded.extensions, decoded.extensions,
+            "diverse extension values must survive roundtrip"
+        );
     }
 }
 

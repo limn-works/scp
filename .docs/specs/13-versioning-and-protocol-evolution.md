@@ -183,8 +183,8 @@ These rules define how implementations handle messages from higher minor version
 
 Implementations MUST ignore unknown fields in MessagePack maps. This is already required by ADR-004 for relay protocol messages and is extended to all SCP wire structures:
 
-- **InnerEnvelope:** Unknown fields after deserialization of known fields MUST be ignored. The signature covers only the fields defined in the signed structure (§13.2.1). Unknown fields are not part of the signature commitment and MUST NOT cause signature verification failure.
-- **BroadcastEnvelope:** Same rule.
+- **InnerEnvelope:** Unknown fields MUST be preserved for forward-compatible roundtripping. The signature covers only the fields defined in the signed structure (§13.2.1). Unknown fields are not part of the signature commitment and MUST NOT cause signature verification failure. Intermediaries and SDK storage layers that deserialize and re-serialize inner envelopes MUST NOT strip fields they do not recognize.
+- **BroadcastEnvelope:** Same rule as InnerEnvelope — unknown fields MUST be ignored during processing but need not be preserved (broadcast envelopes are not forwarded by intermediaries).
 - **OuterEnvelope:** Unknown fields MUST be preserved during relay forwarding. Relays MUST NOT strip unknown fields from outer envelopes.
 - **Relay protocol messages:** Unknown fields MUST be ignored (existing ADR-004 rule).
 - **ContextParams:** Unknown fields in context metadata MUST be ignored during join evaluation. An SCP/1.0 client encountering a context with SCP/1.2 fields it doesn't recognize proceeds with the fields it understands.
@@ -216,7 +216,7 @@ When an implementation encounters a context or peer using a higher minor version
 
 | Situation | Behavior |
 |-----------|----------|
-| Unknown fields in InnerEnvelope | Ignore. Process known fields normally. |
+| Unknown fields in InnerEnvelope | Preserve for roundtrip forwarding. Process known fields normally. |
 | Unknown fields in ContextParams | Ignore. Join and participate using known parameters. |
 | Unknown relay EVENT type | Ignore. Continue normal operation. |
 | Context `min_protocol_version` exceeds SDK version | Refuse to join. Report to application layer. |

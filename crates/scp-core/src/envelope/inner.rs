@@ -147,6 +147,14 @@ pub struct InnerEnvelope {
 
     /// The message payload (after bucket padding).
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    ///
+    /// **Interaction with `#[serde(flatten)]` on `extensions`:** When
+    /// `flatten` is present, serde buffers all map entries before dispatching
+    /// to field deserializers. This means `serde_bounded_bytes` fires *after*
+    /// the full input has been buffered into memory. Callers that deserialize
+    /// untrusted bytes should apply an upfront size check before calling
+    /// `rmp_serde::from_slice`; `serde_bounded_bytes` acts as
+    /// defense-in-depth for the individual field.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub payload: Vec<u8>,
 
@@ -169,7 +177,9 @@ pub struct InnerEnvelope {
     pub signature: [u8; 64],
 
     /// Forward-compatibility extensions — unknown fields from future protocol
-    /// versions are preserved here for intermediary forwarding (§13.5.1).
+    /// versions are preserved here for forward-compatible roundtripping
+    /// (§13.5.1). Intermediaries and SDK storage layers that deserialize and
+    /// re-serialize inner envelopes MUST NOT strip unrecognized fields.
     /// Excluded from canonical hash computation and signing.
     #[serde(flatten)]
     pub extensions: HashMap<String, serde_json::Value>,
