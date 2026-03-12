@@ -494,7 +494,12 @@ class TestContextSend:
 
 
 class TestContextInvoke:
-    """Tests for Context.invoke() (AC 3, 12)."""
+    """Tests for Context.invoke() (AC 3, 12).
+
+    The PyO3 bridge ``tool_invoke`` requires a mandatory ``ucan_token``
+    parameter (5th positional) and an optional ``proof_tokens`` (6th).
+    See spec section 6.2, section 8, ADR-016, and issue #517.
+    """
 
     async def test_invoke_with_explicit_identity(self) -> None:
         mock_bridge = MagicMock()
@@ -503,7 +508,12 @@ class TestContextInvoke:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = _make_context(creator_did="did:dht:z6MkAlice")
             identity = _MockIdentity(did="did:dht:z6MkBob")
-            result = await ctx.invoke("calculator", {"op": "add"}, identity=identity)
+            result = await ctx.invoke(
+                "calculator",
+                {"op": "add"},
+                ucan_token="eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test",
+                identity=identity,
+            )
 
         assert result == {"result": "42"}
         call_args = mock_bridge.tool_invoke.call_args[0]
@@ -511,6 +521,8 @@ class TestContextInvoke:
         assert call_args[1] == "calculator"
         assert call_args[2] == {"op": "add"}
         assert call_args[3] == "did:dht:z6MkBob"
+        assert call_args[4] == "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test"
+        assert call_args[5] is None
 
     async def test_invoke_defaults_to_creator(self) -> None:
         mock_bridge = MagicMock()
@@ -518,10 +530,54 @@ class TestContextInvoke:
 
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = _make_context(creator_did="did:dht:z6MkAlice")
-            await ctx.invoke("tool_name", {})
+            await ctx.invoke("tool_name", {}, ucan_token="tok")
 
         call_args = mock_bridge.tool_invoke.call_args[0]
         assert call_args[3] == "did:dht:z6MkAlice"
+        assert call_args[4] == "tok"
+
+    async def test_invoke_passes_ucan_token(self) -> None:
+        """ucan_token is forwarded as the 5th positional arg (#517)."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        ucan = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.payload.signature"
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke("tool", {"key": "val"}, ucan_token=ucan)
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        assert call_args[4] == ucan
+
+    async def test_invoke_passes_proof_tokens(self) -> None:
+        """proof_tokens is forwarded as the 6th positional arg (#517)."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        proofs = ["proof-a", "proof-b"]
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke(
+                "tool",
+                {},
+                ucan_token="tok",
+                proof_tokens=proofs,
+            )
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        assert call_args[5] == ["proof-a", "proof-b"]
+
+    async def test_invoke_proof_tokens_defaults_to_none(self) -> None:
+        """proof_tokens defaults to None when not provided."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke("tool", {}, ucan_token="tok")
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        assert call_args[5] is None
 
     async def test_invoke_returns_dict(self) -> None:
         mock_bridge = MagicMock()
@@ -530,7 +586,11 @@ class TestContextInvoke:
 
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = _make_context()
-            result = await ctx.invoke("recipe_search", {"query": "dessert"})
+            result = await ctx.invoke(
+                "recipe_search",
+                {"query": "dessert"},
+                ucan_token="tok",
+            )
 
         assert result == expected
         assert isinstance(result, dict)
@@ -539,7 +599,7 @@ class TestContextInvoke:
         with patch.dict("sys.modules", {"_scp_core": None}):
             ctx = _make_context()
             with pytest.raises(ContextError, match="_scp_core"):
-                await ctx.invoke("tool", {})
+                await ctx.invoke("tool", {}, ucan_token="tok")
 
 
 class TestContextReceive:
