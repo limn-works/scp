@@ -153,16 +153,21 @@ async def invoke_cross_context(
         ValidationError: If input validation fails (schema mismatch,
             invalid parameters).
     """
+    if (
+        isinstance(chain_depth, bool)
+        or not isinstance(chain_depth, int)
+        or chain_depth < 0
+        or chain_depth > 255
+    ):
+        raise ValidationError(
+            f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+            code="SCP-VALID-7002",
+        )
+
     if _scp_core is None:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
-        )
-
-    if not isinstance(chain_depth, int) or chain_depth < 0 or chain_depth > 255:
-        raise ValidationError(
-            f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
-            code="SCP-VALID-7002",
         )
 
     try:
@@ -216,16 +221,16 @@ async def session_create(
             found, or the per-caller session cap is exceeded.
         ValidationError: If input validation fails (invalid parameters).
     """
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds < 0:
+        raise ValidationError(
+            f"ttl_seconds must be a non-negative integer, got {ttl_seconds!r}",
+            code="SCP-VALID-7002",
+        )
+
     if _scp_core is None:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
-        )
-
-    if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
-        raise ValidationError(
-            f"ttl_seconds must be a non-negative integer, got {ttl_seconds!r}",
-            code="SCP-VALID-7002",
         )
 
     try:

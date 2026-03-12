@@ -659,8 +659,8 @@ def tool_invoke_cross_context(
 ) -> Any:
     """Invoke a tool across context boundaries.
 
-    The source context exposes the tool and the target context accepts the
-    interface. Both contexts must have approved the interface before calls
+    The source context initiates the call and the target context contains
+    the tool. Both contexts must have approved the interface before calls
     are permitted. Rate limits and chain depth are enforced per spec
     section 6.2.
 

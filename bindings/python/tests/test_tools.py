@@ -1,12 +1,13 @@
 """Tests for SCP Python SDK tool wrappers (cross-context invocation and sessions).
 
 Covers:
+- ``_translate_bridge_error`` mapping from bridge exceptions to SDK types.
 - ``_scp_core is None`` guard -- all 4 functions raise ``ContextError``
   with code ``SCP-CTX-2001``.
 - ``chain_depth`` validation in ``invoke_cross_context`` -- boundary
-  values (0 OK, 255 OK, -1 error, 256 error, float error).
+  values (0 OK, 255 OK, -1 error, 256 error, float error, bool rejected).
 - ``ttl_seconds`` validation in ``session_create`` -- boundary values
-  (0 OK, -1 error, float error).
+  (0 OK, -1 error, float error, bool rejected).
 - ``__all__`` exports -- all 4 async wrappers are present.
 
 Tests mock ``scp_sdk.tools._scp_core``; no Rust extension required.
@@ -20,8 +21,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scp_sdk.errors import ContextError, ValidationError
+from scp_sdk.errors import (
+    ContextError,
+    CryptoError,
+    IdentityError,
+    ScpError,
+    ToolError,
+    TransportError,
+    UcanPermissionError,
+    ValidationError,
+)
 from scp_sdk.tools import (
+    _translate_bridge_error,
     invoke_cross_context,
     session_close,
     session_create,
@@ -37,6 +48,52 @@ _DUMMY_CTX_TGT = "ctx-target-002"
 _DUMMY_TOOL = "calculator"
 _DUMMY_DID = "did:dht:z6MkAlice"
 _DUMMY_UCAN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test"
+
+
+# ---------------------------------------------------------------------------
+# _translate_bridge_error tests
+# ---------------------------------------------------------------------------
+
+
+class TestTranslateBridgeError:
+    """Tests for the bridge-to-SDK exception translator."""
+
+    @pytest.mark.parametrize(
+        ("bridge_name", "expected_sdk_cls"),
+        [
+            ("IdentityError", IdentityError),
+            ("ContextError", ContextError),
+            ("UcanError", UcanPermissionError),
+            ("CryptoError", CryptoError),
+            ("TransportError", TransportError),
+            ("ToolError", ToolError),
+            ("ValidationError", ValidationError),
+        ],
+    )
+    def test_known_bridge_errors_map_to_sdk_types(
+        self,
+        bridge_name: str,
+        expected_sdk_cls: type[ScpError],
+    ) -> None:
+        """Each bridge error variant in BRIDGE_ERROR_MAP produces the correct SDK type."""
+        # Dynamically create a class with the given name to simulate a bridge exception.
+        bridge_cls = type(bridge_name, (Exception,), {})
+        bridge_exc = bridge_cls("something went wrong")
+
+        result = _translate_bridge_error(bridge_exc)
+
+        assert isinstance(result, expected_sdk_cls)
+        assert result.message == "something went wrong"
+
+    def test_unknown_bridge_error_falls_back_to_context_error(self) -> None:
+        """An unmapped bridge exception class name falls back to ContextError."""
+        bridge_cls = type("SomeUnknownBridgeError", (Exception,), {})
+        bridge_exc = bridge_cls("unexpected failure")
+
+        result = _translate_bridge_error(bridge_exc)
+
+        assert isinstance(result, ContextError)
+        assert "unexpected failure" in result.message
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +234,36 @@ class TestChainDepthValidation:
                 )
             assert exc_info.value.code == "SCP-VALID-7002"
 
+    async def test_chain_depth_bool_true_rejected(self) -> None:
+        mock_bridge = MagicMock()
+        with patch("scp_sdk.tools._scp_core", mock_bridge):
+            with pytest.raises(ValidationError, match="chain_depth") as exc_info:
+                await invoke_cross_context(
+                    source_context_id=_DUMMY_CTX_SRC,
+                    target_context_id=_DUMMY_CTX_TGT,
+                    tool_id=_DUMMY_TOOL,
+                    input={},
+                    invoker_did=_DUMMY_DID,
+                    ucan_token=_DUMMY_UCAN,
+                    chain_depth=True,  # type: ignore[arg-type]
+                )
+            assert exc_info.value.code == "SCP-VALID-7002"
+
+    async def test_chain_depth_bool_false_rejected(self) -> None:
+        mock_bridge = MagicMock()
+        with patch("scp_sdk.tools._scp_core", mock_bridge):
+            with pytest.raises(ValidationError, match="chain_depth") as exc_info:
+                await invoke_cross_context(
+                    source_context_id=_DUMMY_CTX_SRC,
+                    target_context_id=_DUMMY_CTX_TGT,
+                    tool_id=_DUMMY_TOOL,
+                    input={},
+                    invoker_did=_DUMMY_DID,
+                    ucan_token=_DUMMY_UCAN,
+                    chain_depth=False,  # type: ignore[arg-type]
+                )
+            assert exc_info.value.code == "SCP-VALID-7002"
+
 
 # ---------------------------------------------------------------------------
 # ttl_seconds validation tests (session_create)
@@ -219,6 +306,30 @@ class TestTtlSecondsValidation:
                     tool_id=_DUMMY_TOOL,
                     source_context_id=_DUMMY_CTX_TGT,
                     ttl_seconds=3.14,  # type: ignore[arg-type]
+                )
+            assert exc_info.value.code == "SCP-VALID-7002"
+
+    async def test_ttl_bool_true_rejected(self) -> None:
+        mock_bridge = MagicMock()
+        with patch("scp_sdk.tools._scp_core", mock_bridge):
+            with pytest.raises(ValidationError, match="ttl_seconds") as exc_info:
+                await session_create(
+                    context_id=_DUMMY_CTX_SRC,
+                    tool_id=_DUMMY_TOOL,
+                    source_context_id=_DUMMY_CTX_TGT,
+                    ttl_seconds=True,  # type: ignore[arg-type]
+                )
+            assert exc_info.value.code == "SCP-VALID-7002"
+
+    async def test_ttl_bool_false_rejected(self) -> None:
+        mock_bridge = MagicMock()
+        with patch("scp_sdk.tools._scp_core", mock_bridge):
+            with pytest.raises(ValidationError, match="ttl_seconds") as exc_info:
+                await session_create(
+                    context_id=_DUMMY_CTX_SRC,
+                    tool_id=_DUMMY_TOOL,
+                    source_context_id=_DUMMY_CTX_TGT,
+                    ttl_seconds=False,  # type: ignore[arg-type]
                 )
             assert exc_info.value.code == "SCP-VALID-7002"
 
