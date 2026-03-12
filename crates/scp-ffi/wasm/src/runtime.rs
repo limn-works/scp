@@ -118,7 +118,7 @@ pub struct ToolRegistration {
     pub operator_did: String,
     /// Optional economic metadata for per-invocation costs (spec section 19.3).
     pub economic_metadata: Option<ToolEconomicMetadata>,
-    /// Unix timestamp (milliseconds) when the tool was registered.
+    /// Unix timestamp (seconds) when the tool was registered.
     pub registered_at: u64,
     /// Ed25519 signature over the canonical registration bytes.
     pub signature: Vec<u8>,
