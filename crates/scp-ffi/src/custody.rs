@@ -7,7 +7,7 @@
 //!
 //! # Variants
 //!
-//! - [`InMemoryKeyCustody`] — Test/development only. Keys exist only in memory
+//! - `InMemoryKeyCustody` — Test/development only. Keys exist only in memory
 //!   and are lost when the process exits. Available because `scp-ffi` enables
 //!   `scp-platform/testing`.
 //! - [`FileKeyCustody`] — Encrypted-at-rest key storage using Argon2id +

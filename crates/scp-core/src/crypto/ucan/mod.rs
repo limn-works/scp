@@ -301,12 +301,12 @@ impl UcanHeader {
         }
     }
 
-    /// Returns the [`SigningKeyId`] corresponding to this header's `kid` field.
+    /// Returns the `SigningKeyId` corresponding to this header's `kid` field.
     ///
-    /// Returns [`SigningKeyId::Active`] when `kid` is `None` or `"#active"`,
-    /// [`SigningKeyId::Agent`] when `kid` is `"#agent"`.
+    /// Returns `SigningKeyId::Active` when `kid` is `None` or `"#active"`,
+    /// `SigningKeyId::Agent` when `kid` is `"#agent"`.
     ///
-    /// Unknown `kid` values default to [`SigningKeyId::Active`] for backward
+    /// Unknown `kid` values default to `SigningKeyId::Active` for backward
     /// compatibility (fail-open on identification, fail-closed on enforcement).
     #[must_use]
     pub fn signing_key_id(&self) -> crate::identity::SigningKeyId {

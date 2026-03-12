@@ -1,11 +1,11 @@
 //! `wasm-bindgen` bridge for identity operations.
 //!
-//! Exposes [`WasmIdentity`] and [`WasmDIDDocument`] as opaque JS objects with
+//! Exposes `WasmIdentity` and `WasmDIDDocument` as opaque JS objects with
 //! getter properties, plus three bridge functions for identity lifecycle:
 //!
-//! - [`identity_create`] — Creates a new DID identity (returns `Promise<WasmIdentity>`).
-//! - [`identity_load`] — Loads an existing identity by DID string.
-//! - [`identity_resolve`] — Resolves a DID to its document.
+//! - `identity_create` — Creates a new DID identity (returns `Promise<WasmIdentity>`).
+//! - `identity_load` — Loads an existing identity by DID string.
+//! - `identity_resolve` — Resolves a DID to its document.
 //!
 //! All async operations use [`wasm_bindgen_futures::future_to_promise`] to
 //! return JS `Promise` objects. No Tokio runtime is used — the browser event
@@ -18,7 +18,7 @@
 //! tokio's multi-thread runtime. Therefore, this bridge does NOT directly call
 //! `scp-core` identity functions. Instead, it:
 //!
-//! 1. Provides the correct opaque types ([`WasmIdentity`], [`WasmDIDDocument`])
+//! 1. Provides the correct opaque types (`WasmIdentity`, `WasmDIDDocument`)
 //!    that the TypeScript SDK wrapper consumes.
 //! 2. Returns typed errors signalling which operations require JS-side
 //!    implementation (`WebCrypto` for key ops, DHT HTTP gateway for resolution).
@@ -30,11 +30,11 @@
 //!
 //! # Opaque types
 //!
-//! [`WasmIdentity`] stores the DID string and custody type — NOT raw key
-//! material. Key operations are delegated to the JS-injected [`JsKeyCustody`]
+//! `WasmIdentity` stores the DID string and custody type — NOT raw key
+//! material. Key operations are delegated to the JS-injected `JsKeyCustody`
 //! (see `custody.rs`), backed by `SubtleCrypto`.
 //!
-//! [`WasmDIDDocument`] exposes all document fields as JSON strings for
+//! `WasmDIDDocument` exposes all document fields as JSON strings for
 //! ergonomic TypeScript consumption.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.

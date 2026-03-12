@@ -1,8 +1,8 @@
 //! Network simulator for orchestrating multi-relay, multi-identity test
 //! scenarios.
 //!
-//! Combines [`SimulatedClock`](crate::clock::SimulatedClock),
-//! [`InMemoryRelay`](crate::relay::InMemoryRelay), [`SimulatedIdentity`], and
+//! Combines [`SimulatedClock`],
+//! [`InMemoryRelay`], [`SimulatedIdentity`], and
 //! [`NetworkTopology`] into a single coordinator that can model partitions,
 //! delays, fault injection, and time advancement.
 

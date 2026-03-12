@@ -105,6 +105,11 @@ const fn default_inner_version() -> u16 {
     SCP_INNER_ENVELOPE_VERSION
 }
 
+/// The authenticated inner envelope visible only to MLS group members.
+///
+/// Carries the sender's DID, sequence numbers, timestamp, padded payload,
+/// provenance metadata, and an Ed25519 signature over a canonical hash of
+/// all critical fields (spec §13.2.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InnerEnvelope {
     /// Protocol version (§13.2.1). SCP/1.0 = `0x0100`.
@@ -507,7 +512,8 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], 
 /// to prevent type-flipping attacks (issue #290).
 ///
 /// ```text
-/// SHA-256(DOMAIN_SEPARATOR || message_type_byte
+/// SHA-256(DOMAIN_SEPARATOR || version_BE
+///         || message_type_byte
 ///         || len(context_id) || context_id
 ///         || len(sender_did) || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE

@@ -310,7 +310,7 @@ pub fn py_ucan_mint(
 /// Delegates a UCAN token to another member.
 ///
 /// Creates a delegated UCAN from an existing parent token, signed with the
-/// delegator's Ed25519 key via the retained [`KeyCustody`] provider.
+/// delegator's Ed25519 key via the retained `KeyCustody` provider.
 /// Delegation enforces attenuation (capabilities can only narrow, never
 /// widen).
 ///

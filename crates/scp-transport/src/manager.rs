@@ -1159,7 +1159,7 @@ impl TransportManager {
     }
 
     /// Proactively sheds connections for contexts that have been idle longer
-    /// than [`MOBILE_IDLE_THRESHOLD`] (5 minutes).
+    /// than `MOBILE_IDLE_THRESHOLD` (5 minutes).
     ///
     /// **Only operates when `profile` is [`TransportProfile::Mobile`].** For
     /// all other profiles this is a no-op returning an empty `Vec`.
@@ -1171,7 +1171,7 @@ impl TransportManager {
     /// Subscriptions on shed connections are migrated to a surviving adapter
     /// that shares at least one context relay set with the evicted adapter,
     /// following the same migration logic as
-    /// [`evict_lru_connection`](Self::evict_lru_connection).
+    /// `evict_lru_connection`.
     ///
     /// The caller is expected to rely on the push notification bridge (§10.7)
     /// to wake connections on new messages for shed contexts.

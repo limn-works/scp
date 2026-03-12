@@ -46,12 +46,12 @@
 //!
 //! napi-rs registered cleanup hooks block the Node.js process from exiting
 //! until all outstanding JavaScript references to Rust objects are released.
-//! A global [`HANDLE_COUNT`] tracks live opaque handle objects; all four
+//! A global `HANDLE_COUNT` tracks live opaque handle objects; all four
 //! opaque types (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
 //! `NapiTransportManager`) decrement it in their `Drop` impl.
 //!
 //! [`scp_shutdown`] waits (with a configurable timeout, default 5 seconds)
-//! for [`HANDLE_COUNT`] to reach zero before allowing the tokio runtime to
+//! for `HANDLE_COUNT` to reach zero before allowing the tokio runtime to
 //! be dropped. See `sdk-common.md` "FFI Async Bridging Risks" rule 4.
 //!
 //! # Direct `scp-core` calls
@@ -60,7 +60,7 @@
 //! multi-thread runtime constraint on `wasm32-unknown-unknown`), this bridge
 //! calls `scp-core` directly. The `"in_memory"` custody path in
 //! [`identity_create`](identity::identity_create) uses a real
-//! [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody) to
+//! `InMemoryKeyCustody` to
 //! generate a live `did:dht` identity.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.

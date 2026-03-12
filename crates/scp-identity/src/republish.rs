@@ -335,9 +335,9 @@ pub type RelayWarningCallback = Arc<dyn Fn(RelayPublishDegraded) + Send + Sync>;
 ///
 /// # Type Parameters
 ///
-/// * `D` — The DHT client implementation. Use [`InMemoryDhtClient`] for
+/// * `D` — The DHT client implementation. Use `InMemoryDhtClient` for
 ///   testing, or a production pkarr-based client for real DHT access.
-/// * `R` — The relay publisher implementation. Use [`InMemoryRelayPublisher`]
+/// * `R` — The relay publisher implementation. Use `InMemoryRelayPublisher`
 ///   for testing, or a production relay client for real relay access.
 pub struct RepublishManager<D: DhtClient, R: RelayPublisher = InMemoryRelayPublisher> {
     dht_client: Arc<D>,
@@ -450,7 +450,7 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
     /// Sets the relay warning callback for degraded relay publish events.
     ///
     /// The callback is invoked when relay publishing has failed at least
-    /// [`DEGRADED_THRESHOLD`] consecutive times.
+    /// `DEGRADED_THRESHOLD` consecutive times.
     #[must_use]
     pub fn with_relay_warning_callback(mut self, callback: RelayWarningCallback) -> Self {
         self.relay_warning_callback = Some(callback);

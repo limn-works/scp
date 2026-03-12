@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 //! Application node for SCP deployments.
 //!
 //! `scp-node` provides [`ApplicationNode`], a concrete SDK type that composes
@@ -298,7 +299,7 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// # Limits
     ///
-    /// A maximum of [`MAX_BROADCAST_CONTEXTS`] simultaneous broadcast
+    /// A maximum of `MAX_BROADCAST_CONTEXTS` simultaneous broadcast
     /// contexts may be registered per node.
     ///
     /// # Errors
@@ -471,17 +472,17 @@ impl<S: Storage> ApplicationNode<S> {
     /// Propagates rotated broadcast keys to the projection registry after a
     /// governance ban.
     ///
-    /// After [`ContextManager::execute_governance_action`] returns
-    /// [`GovernanceActionResult::ReadAccessRevoked`], call this method with
-    /// the `context_id` and the [`GovernanceBanResult`] to ensure the
+    /// After `ContextManager::execute_governance_action` returns
+    /// `GovernanceActionResult::ReadAccessRevoked`, call this method with
+    /// the `context_id` and the `GovernanceBanResult` to ensure the
     /// projection endpoint can decrypt content encrypted under the new
     /// post-rotation keys.
     ///
     /// For each rotated author, inserts the new-epoch key into the
     /// [`ProjectedContext`] key registry. If the context is not projected
-    /// (not registered via [`enable_broadcast_projection`]), this is a no-op.
+    /// (not registered via `enable_broadcast_projection`), this is a no-op.
     ///
-    /// When the ban's [`RevocationScope`] is `Full`, old-epoch keys are
+    /// When the ban's `RevocationScope` is `Full`, old-epoch keys are
     /// purged from the projection registry so historical content encrypted
     /// under pre-ban keys is no longer served. `FutureOnly` retains old
     /// keys (historical content remains accessible).
@@ -670,7 +671,7 @@ const DEFAULT_STUN_ENDPOINTS: &[(&str, &str)] = &[
 ///
 /// Implements the tier selection algorithm from spec 10.12.8:
 /// 1. Probe NAT type via STUN.
-/// 2. Attempt Tier 1 (UPnP/NAT-PMP) if a [`PortMapper`] is configured.
+/// 2. Attempt Tier 1 (UPnP/NAT-PMP) if a `PortMapper` is configured.
 ///    Run reachability self-test on the mapped address (spec 10.12.2 step 4).
 /// 3. If Tier 1 fails and NAT is non-symmetric, attempt Tier 2 (STUN address).
 ///    Run reachability self-test on the STUN-discovered address (spec 10.12.3).
@@ -1479,9 +1480,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
     /// trigger immediate re-evaluation of the reachability tier. Without a
     /// detector, only the periodic 30-minute timer triggers re-evaluation.
     ///
-    /// Use [`ChannelNetworkChangeDetector`](scp_transport::nat::ChannelNetworkChangeDetector)
+    /// Use `ChannelNetworkChangeDetector`
     /// for channel-based event injection, or implement
-    /// [`NetworkChangeDetector`](scp_transport::nat::NetworkChangeDetector)
+    /// [`NetworkChangeDetector`]
     /// for platform-specific detection.
     #[must_use]
     pub fn network_detector(mut self, detector: Arc<dyn NetworkChangeDetector>) -> Self {
@@ -1741,7 +1742,7 @@ impl<S: Storage + 'static, Dom>
     /// 3. **Not found:** Call `did_method.create(custody)`, persist the
     ///    result to storage, then continue.
     ///
-    /// [`KeyHandle`] indices remain valid across restarts because the custody
+    /// `KeyHandle` indices remain valid across restarts because the custody
     /// backend (e.g., `FileKeyCustody`) reloads the same keyring from disk.
     ///
     /// # Requirements

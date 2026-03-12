@@ -8,13 +8,13 @@
 //! The manager is initialized once (via `OnceLock`) with lightweight provider
 //! implementations suitable for the Node.js/Bun FFI environment:
 //!
-//! - [`NapiBridgeCryptoProvider`] — No-op MLS/sender-key operations. Real
+//! - `NapiBridgeCryptoProvider` — No-op MLS/sender-key operations. Real
 //!   encryption is handled at the SDK layer above the FFI bridge.
-//! - [`NapiBridgeTransportProvider`] — Reports connected, no-op send/publish.
+//! - `NapiBridgeTransportProvider` — Reports connected, no-op send/publish.
 //!   Real transport is handled via `NapiTransportManager`.
-//! - [`NapiBridgeEventLogProvider`] — Delegates to `scp_event_log::EventLog`
+//! - `NapiBridgeEventLogProvider` — Delegates to `scp_event_log::EventLog`
 //!   for Merkle tree operations.
-//! - [`NapiBridgePersistence`] — In-memory persistence via `DashMap`.
+//! - `NapiBridgePersistence` — In-memory persistence via `DashMap`.
 //!
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 

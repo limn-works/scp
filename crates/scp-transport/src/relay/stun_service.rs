@@ -58,7 +58,12 @@ const MAX_STUN_MSG: usize = 576;
 pub enum StunServiceError {
     /// Failed to bind the UDP socket.
     #[error("failed to bind UDP socket on port {port}: {source}")]
-    BindFailed { port: u16, source: std::io::Error },
+    BindFailed {
+        /// The port that could not be bound.
+        port: u16,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
 
     /// An I/O error occurred while receiving or sending a datagram.
     #[error("I/O error: {0}")]

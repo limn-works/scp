@@ -190,7 +190,7 @@ impl<S: EncryptedStorage> ProtocolStore<S> {
     /// [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter).
     ///
     /// For testing with unencrypted backends (`InMemoryStorage`), use
-    /// [`new_for_testing`](Self::new_for_testing) (requires the
+    /// `new_for_testing` (requires the
     /// `allow_unencrypted_storage` feature).
     #[must_use]
     pub const fn new(storage: S) -> Self {

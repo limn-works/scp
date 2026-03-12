@@ -1,6 +1,6 @@
 //! Protocol-specific error types for the SCP native relay.
 //!
-//! Defines [`ProtocolErrorCode`] constants covering client errors (4xxx) and
+//! Defines `ProtocolErrorCode` constants covering client errors (4xxx) and
 //! server errors (5xxx), plus the [`NativeProtocolError`] type for protocol
 //! violations detected during serialization, deserialization, or validation.
 //!

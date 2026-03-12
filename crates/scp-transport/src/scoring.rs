@@ -225,7 +225,7 @@ pub fn get_score<'a, S: ::std::hash::BuildHasher>(
 /// relays trigger a suppression warning.
 ///
 /// Uses LRU eviction to bound memory usage to at most
-/// [`DEFAULT_SUPPRESSION_CAPACITY`] (10,000) entries. When the tracker is full,
+/// `DEFAULT_SUPPRESSION_CAPACITY` (10,000) entries. When the tracker is full,
 /// the least-recently-used blob entry is evicted.
 ///
 /// See ADR-012 acceptance criterion 7 (spec section 9.9.2).

@@ -33,18 +33,21 @@ pub struct WasmToolVerificationResult {
 
 #[wasm_bindgen]
 impl WasmToolVerificationResult {
+    /// Returns the ID of the tool that was verified.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "toolId")]
     pub fn tool_id(&self) -> String {
         self.tool_id.clone()
     }
 
+    /// Returns whether all test vectors passed.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn passed(&self) -> bool {
         self.passed
     }
 
+    /// Returns the verification failures as a JSON string (empty array if all passed).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "failuresJson")]
     pub fn failures_json(&self) -> String {

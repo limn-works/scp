@@ -147,7 +147,7 @@ impl Capability {
     /// Returns the canonical string name of this capability.
     ///
     /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
-    /// (e.g. `"tool:invoke:my_tool"`), matching the [`Display`] impl.
+    /// (e.g. `"tool:invoke:my_tool"`), matching the `Display` impl.
     #[must_use]
     pub fn name(&self) -> std::borrow::Cow<'_, str> {
         match self {

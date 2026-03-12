@@ -48,6 +48,7 @@ pub const BOUNDED_STRING_MAX: usize = 1024;
 pub mod serde_signature_64 {
     use serde::{self, Deserializer, Serializer};
 
+    /// Serializes a 64-byte array as compact binary via `serde_bytes`.
     pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -55,6 +56,7 @@ pub mod serde_signature_64 {
         serde_bytes::serialize(bytes.as_slice(), serializer)
     }
 
+    /// Deserializes exactly 64 bytes, rejecting any other length.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
     where
         D: Deserializer<'de>,
@@ -73,6 +75,7 @@ pub mod serde_signature_64 {
 pub mod serde_hash_32 {
     use serde::{self, Deserializer, Serializer};
 
+    /// Serializes a 32-byte array as compact binary via `serde_bytes`.
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -80,6 +83,7 @@ pub mod serde_hash_32 {
         serde_bytes::serialize(bytes.as_slice(), serializer)
     }
 
+    /// Deserializes exactly 32 bytes, rejecting any other length.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
     where
         D: Deserializer<'de>,
@@ -98,6 +102,7 @@ pub mod serde_hash_32 {
 pub mod serde_pubkey_32 {
     use serde::{self, Deserializer, Serializer};
 
+    /// Serializes a 32-byte public key as compact binary via `serde_bytes`.
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -105,6 +110,7 @@ pub mod serde_pubkey_32 {
         serde_bytes::serialize(bytes.as_slice(), serializer)
     }
 
+    /// Deserializes exactly 32 bytes as a public key, rejecting any other length.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
     where
         D: Deserializer<'de>,
@@ -128,6 +134,7 @@ pub mod serde_pubkey_32 {
 pub mod serde_hpke_sealed_60 {
     use serde::{self, Deserializer, Serializer};
 
+    /// Serializes a 60-byte HPKE-sealed sender key as compact binary.
     pub fn serialize<S>(bytes: &[u8; 60], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -135,6 +142,7 @@ pub mod serde_hpke_sealed_60 {
         serde_bytes::serialize(bytes.as_slice(), serializer)
     }
 
+    /// Deserializes exactly 60 bytes as an HPKE-sealed sender key.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 60], D::Error>
     where
         D: Deserializer<'de>,
@@ -161,6 +169,7 @@ pub mod serde_bounded_bytes {
 
     use super::BOUNDED_BYTES_MAX;
 
+    /// Serializes a byte slice as compact binary via `serde_bytes`.
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -168,6 +177,7 @@ pub mod serde_bounded_bytes {
         serde_bytes::serialize(bytes, serializer)
     }
 
+    /// Deserializes variable-length binary, rejecting payloads exceeding 512 KiB.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
     where
         D: Deserializer<'de>,
@@ -245,6 +255,7 @@ pub mod serde_bounded_string {
 
     use super::BOUNDED_STRING_MAX;
 
+    /// Serializes a string using the default string serializer.
     pub fn serialize<S>(s: &str, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -252,6 +263,7 @@ pub mod serde_bounded_string {
         serializer.serialize_str(s)
     }
 
+    /// Deserializes a string, rejecting values exceeding 1 KiB.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
     where
         D: Deserializer<'de>,
@@ -303,6 +315,7 @@ pub mod serde_bounded_string_opt {
 
     use super::BOUNDED_STRING_MAX;
 
+    /// Serializes an optional string, preserving `None` as absent.
     pub fn serialize<S>(s: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -313,6 +326,7 @@ pub mod serde_bounded_string_opt {
         }
     }
 
+    /// Deserializes an optional string, rejecting values exceeding 1 KiB.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
     where
         D: Deserializer<'de>,

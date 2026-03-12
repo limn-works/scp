@@ -2,9 +2,9 @@
 //!
 //! Exposes provenance evaluation and attachment to JavaScript (browser target):
 //!
-//! - [`provenance_check_chain_depth`] — Check if chain depth is within limits.
-//! - [`evaluate_provenance_quality`] — Evaluate provenance quality tier.
-//! - [`provenance_attach`] — Attach provenance metadata for cross-context data flow.
+//! - `provenance_check_chain_depth` — Check if chain depth is within limits.
+//! - `evaluate_provenance_quality` — Evaluate provenance quality tier.
+//! - `provenance_attach` — Attach provenance metadata for cross-context data flow.
 //!
 //! # WASM constraints
 //!

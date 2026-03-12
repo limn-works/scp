@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 //! Standalone SCP native relay server.
 //!
 //! Reads configuration from environment variables, starts the relay, and

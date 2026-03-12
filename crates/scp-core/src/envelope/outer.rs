@@ -46,6 +46,11 @@ const fn default_outer_version() -> u16 {
     super::SCP_PROTOCOL_VERSION
 }
 
+/// The unauthenticated outer envelope used for relay routing.
+///
+/// Wraps an MLS-encrypted ciphertext blob with routing metadata visible to
+/// untrusted relays. Fields are unsigned — authenticity is provided by MLS
+/// at the inner layer (spec §13.2.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OuterEnvelope {
     /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.

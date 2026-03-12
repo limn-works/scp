@@ -147,7 +147,7 @@ fn parse_version(s: &str) -> Result<u32, CapabilityUriError> {
 /// - [`DidScoped`](CapabilityUri::DidScoped): `did:{method}:{id}:capability:{name}/v{N}`
 /// - [`System`](CapabilityUri::System): `scp:system:{name}`
 ///
-/// Implements [`FromStr`] for parsing, [`Display`] for round-trip serialization,
+/// Implements [`FromStr`] for parsing, `Display` for round-trip serialization,
 /// and serde `Serialize`/`Deserialize` via the string representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CapabilityUri {

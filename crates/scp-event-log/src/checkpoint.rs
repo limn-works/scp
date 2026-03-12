@@ -152,8 +152,8 @@ impl CheckpointScheduler {
     /// Returns `true` if a checkpoint should be generated now.
     ///
     /// A checkpoint is due when either:
-    /// - [`CHECKPOINT_EVENT_INTERVAL`] events have been appended, or
-    /// - [`CHECKPOINT_TIME_INTERVAL_SECS`] seconds have elapsed.
+    /// - `CHECKPOINT_EVENT_INTERVAL` events have been appended, or
+    /// - `CHECKPOINT_TIME_INTERVAL_SECS` seconds have elapsed.
     #[must_use]
     pub const fn is_checkpoint_due(&self, current_timestamp: u64) -> bool {
         if self.events_since_last >= CHECKPOINT_EVENT_INTERVAL {
@@ -724,7 +724,7 @@ pub fn verify_checkpointed_proof(proof: &CheckpointedProof) -> bool {
 /// Verifies the Ed25519 signature on a consistency checkpoint (M17).
 ///
 /// Recomputes the canonical hash from the checkpoint fields (same computation
-/// used during creation in [`generate_checkpoint_at`]) and verifies the
+/// used during creation in `generate_checkpoint_at`) and verifies the
 /// signature against the provided public key. The public key should be the
 /// signing key of the checkpoint's `sender_did`.
 ///

@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 //! MCP (Model Context Protocol) adapter for SCP.
 //!
 //! This crate provides the translation layer between MCP-compatible AI models
