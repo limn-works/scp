@@ -929,7 +929,7 @@ pub async fn send_block_notification(
         .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
 
     let notification = BlockNotification {
-        notification_type: "block_notification".to_owned(),
+        notification_type: "block".to_owned(),
         blocker: blocker_did.to_owned(),
         blocked: blocked_did.to_owned(),
         signing_key_id,
@@ -2188,7 +2188,7 @@ mod tests {
         .unwrap();
 
         let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
-        assert_eq!(notification.notification_type, "block_notification");
+        assert_eq!(notification.notification_type, "block");
         assert_eq!(notification.blocker, "did:dht:alice");
         assert_eq!(notification.blocked, "did:dht:dave");
         assert_eq!(notification.signing_key_id, SigningKeyId::Active);
@@ -3262,7 +3262,7 @@ mod tests {
     #[test]
     fn block_notification_msgpack_roundtrip() {
         let notification = BlockNotification {
-            notification_type: "block_notification".to_owned(),
+            notification_type: "block".to_owned(),
             blocker: "did:dht:alice".to_owned(),
             blocked: "did:dht:dave".to_owned(),
             signing_key_id: SigningKeyId::Active,
@@ -3355,7 +3355,7 @@ mod tests {
     #[test]
     fn distribution_message_block_notification_roundtrip() {
         let notification = BlockNotification {
-            notification_type: "block_notification".to_owned(),
+            notification_type: "block".to_owned(),
             blocker: "did:dht:alice".to_owned(),
             blocked: "did:dht:dave".to_owned(),
             signing_key_id: SigningKeyId::Active,
@@ -3400,7 +3400,7 @@ mod tests {
             request_nonce: [0; REQUEST_NONCE_SIZE],
         });
         let block = SenderKeyDistributionMessage::BlockNotification(BlockNotification {
-            notification_type: "block_notification".to_owned(),
+            notification_type: "block".to_owned(),
             blocker: "did:dht:alice".to_owned(),
             blocked: "did:dht:dave".to_owned(),
             signing_key_id: SigningKeyId::Active,
@@ -3589,7 +3589,7 @@ mod tests {
     #[test]
     fn block_notification_ignores_unknown_fields() {
         let notification = BlockNotification {
-            notification_type: "block_notification".to_owned(),
+            notification_type: "block".to_owned(),
             blocker: "did:dht:alice".to_owned(),
             blocked: "did:dht:dave".to_owned(),
             signing_key_id: SigningKeyId::Active,
