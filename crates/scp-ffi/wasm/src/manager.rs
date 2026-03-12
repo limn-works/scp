@@ -259,14 +259,18 @@ struct MemberEntry {
 /// Broadcast-specific state for a context.
 ///
 /// Mirrors the relevant fields from `scp_core::context::broadcast::BroadcastContext`.
+/// Blocking is per-author per spec §5.14.8: Author A blocking a subscriber does not
+/// affect the subscriber's access to Author B's content.
 #[derive(Debug)]
 struct BroadcastState {
     /// Author DIDs (members with write access).
     authors: HashSet<String>,
     /// Subscriber DIDs (members with read access).
     subscribers: HashSet<String>,
-    /// Blocked subscriber DIDs.
-    blocked_subscribers: HashSet<String>,
+    /// Per-author block lists. Each author maintains an independent set of blocked
+    /// subscriber DIDs, matching scp-core's `AuthorState.block_list` pattern.
+    /// Key: author DID, Value: set of blocked subscriber DIDs for that author.
+    per_author_block_lists: HashMap<String, HashSet<String>>,
     /// Admission policy: "open" or "gated". Stored for context metadata.
     #[allow(dead_code)]
     admission: String,
@@ -277,9 +281,24 @@ impl BroadcastState {
         Self {
             authors: HashSet::new(),
             subscribers: HashSet::new(),
-            blocked_subscribers: HashSet::new(),
+            per_author_block_lists: HashMap::new(),
             admission: admission.to_owned(),
         }
+    }
+
+    /// Returns `true` if the subscriber is blocked by ANY author (governance ban check).
+    /// Used to prevent re-subscription of governance-banned subscribers.
+    fn is_blocked_by_any_author(&self, subscriber_did: &str) -> bool {
+        self.per_author_block_lists
+            .values()
+            .any(|block_list| block_list.contains(subscriber_did))
+    }
+
+    /// Returns `true` if the subscriber is blocked by the given author.
+    fn is_blocked_by(&self, author_did: &str, subscriber_did: &str) -> bool {
+        self.per_author_block_lists
+            .get(author_did)
+            .is_some_and(|block_list| block_list.contains(subscriber_did))
     }
 }
 
@@ -1911,7 +1930,14 @@ impl WasmContextManager {
                 ctx.read_revoked_members.insert(did.clone());
                 if let Some(bc) = ctx.broadcast.as_mut() {
                     bc.subscribers.remove(did);
-                    bc.blocked_subscribers.insert(did.clone());
+                    // Governance ban: add to ALL authors' block lists (§5.14.8).
+                    // Unlike per-author blocking, governance bans are context-wide.
+                    for author_did in &bc.authors.clone() {
+                        bc.per_author_block_lists
+                            .entry(author_did.clone())
+                            .or_default()
+                            .insert(did.clone());
+                    }
                 }
                 Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did, "scope": scope}))
             }
@@ -1925,7 +1951,10 @@ impl WasmContextManager {
                 }
                 ctx.read_exclusion_list.remove(did);
                 if let Some(bc) = ctx.broadcast.as_mut() {
-                    bc.blocked_subscribers.remove(did);
+                    // Governance unban: remove from ALL authors' block lists (§5.14.8).
+                    for block_list in bc.per_author_block_lists.values_mut() {
+                        block_list.remove(did.as_str());
+                    }
                 }
                 Ok(serde_json::json!({"action": "RestoreReadAccess", "did": did}))
             }
@@ -2374,7 +2403,10 @@ impl WasmContextManager {
                 code: "SCP-CTX-2001".to_owned(),
             })?;
 
-        if bc.blocked_subscribers.contains(subscriber_did) {
+        // Governance bans add a subscriber to ALL authors' block lists.
+        // If the subscriber is blocked by any author, they were governance-banned
+        // and cannot re-subscribe (§5.14.8).
+        if bc.is_blocked_by_any_author(subscriber_did) {
             return Err(ScpWasmError::Permission {
                 message: format!("subscriber '{subscriber_did}' is blocked"),
                 code: "SCP-PERM-3000".to_owned(),
@@ -2488,9 +2520,14 @@ impl WasmContextManager {
 
     /// Blocks a subscriber in a broadcast context.
     ///
+    /// Blocking is per-author per spec §5.14.8: the subscriber is added to the
+    /// blocker's (author's) block list only. The subscriber retains access to
+    /// other authors' content. Does NOT remove from the subscriber roster —
+    /// only governance bans remove from roster (§5.14.8).
+    ///
     /// # Errors
     ///
-    /// Returns an error if not a broadcast context.
+    /// Returns an error if not a broadcast context or the blocker is not an author.
     pub fn block_broadcast_subscriber(
         &mut self,
         context_id: &str,
@@ -2508,8 +2545,19 @@ impl WasmContextManager {
                     code: "SCP-CTX-2001".to_owned(),
                 })?;
 
-            bc.subscribers.remove(subscriber_did);
-            bc.blocked_subscribers.insert(subscriber_did.to_owned());
+            if !bc.authors.contains(blocker_did) {
+                return Err(ScpWasmError::Context {
+                    message: format!("blocker '{blocker_did}' is not an author"),
+                    code: "SCP-CTX-2001".to_owned(),
+                });
+            }
+
+            // Per-author blocking: add to the blocker's block list only.
+            // Does NOT remove from subscriber roster (§5.14.8).
+            bc.per_author_block_lists
+                .entry(blocker_did.to_owned())
+                .or_default()
+                .insert(subscriber_did.to_owned());
         }
 
         ctx.push_event(WasmContextEvent::MemberBlocked {
@@ -2523,15 +2571,17 @@ impl WasmContextManager {
     /// Unblocks a previously blocked subscriber in a broadcast context
     /// (§9.16.8 — forward-only restoration).
     ///
-    /// Removes the subscriber DID from the blocked set. Does NOT restore
-    /// historical access — the subscriber can request the current key on
-    /// next pull but cannot decrypt content from the block period.
+    /// Removes the subscriber DID from the unblocker's (author's) block list.
+    /// Does NOT restore historical access — the subscriber can request the
+    /// current key on next pull but cannot decrypt content from the block period.
+    /// Per §9.16.8, no key rotation on unblock.
     ///
     /// # Errors
     ///
     /// - [`ScpWasmError::Context`] if the context is not active or not
     ///   a broadcast context.
-    /// - [`ScpWasmError::Context`] if the subscriber is not blocked.
+    /// - [`ScpWasmError::Context`] if the unblocker is not an author.
+    /// - [`ScpWasmError::Context`] if the subscriber is not blocked by this author.
     pub fn unblock_broadcast_subscriber(
         &mut self,
         context_id: &str,
@@ -2549,17 +2599,25 @@ impl WasmContextManager {
                     code: "SCP-CTX-2001".to_owned(),
                 })?;
 
-            if !bc.blocked_subscribers.remove(subscriber_did) {
+            if !bc.authors.contains(unblocker_did) {
                 return Err(ScpWasmError::Context {
-                    message: format!("subscriber not blocked: {subscriber_did}"),
+                    message: format!("unblocker '{unblocker_did}' is not an author"),
                     code: "SCP-CTX-2001".to_owned(),
                 });
             }
 
-            // Re-add to subscribers so handle_broadcast_key_request recognises
-            // the DID. Without this the subscriber is in neither set after
-            // block+unblock.
-            bc.subscribers.insert(subscriber_did.to_owned());
+            // Per-author unblock: remove from the unblocker's block list only.
+            let removed = bc
+                .per_author_block_lists
+                .get_mut(unblocker_did)
+                .is_some_and(|block_list| block_list.remove(subscriber_did));
+
+            if !removed {
+                return Err(ScpWasmError::Context {
+                    message: format!("subscriber not blocked by {unblocker_did}: {subscriber_did}"),
+                    code: "SCP-CTX-2001".to_owned(),
+                });
+            }
         }
 
         ctx.push_event(WasmContextEvent::MemberUnblocked {
@@ -2644,8 +2702,8 @@ impl WasmContextManager {
             );
         }
 
-        // Requester must not be blocked.
-        if bc.blocked_subscribers.contains(requester_did) {
+        // Requester must not be blocked by THIS author (per-author blocking, §5.14.8).
+        if bc.is_blocked_by(author_did, requester_did) {
             return Ok(
                 serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
             );
@@ -3003,7 +3061,11 @@ impl WasmContextManager {
         let broadcast = ctx.broadcast.as_ref().map(|bc| WasmExportBroadcast {
             authors: bc.authors.iter().cloned().collect(),
             subscribers: bc.subscribers.iter().cloned().collect(),
-            blocked_subscribers: bc.blocked_subscribers.iter().cloned().collect(),
+            per_author_block_lists: bc
+                .per_author_block_lists
+                .iter()
+                .map(|(author, blocked)| (author.clone(), blocked.iter().cloned().collect()))
+                .collect(),
             admission: bc.admission.clone(),
         });
 
@@ -3187,7 +3249,11 @@ impl WasmContextManager {
         let broadcast = snap.broadcast.as_ref().map(|bc| BroadcastState {
             authors: bc.authors.iter().cloned().collect(),
             subscribers: bc.subscribers.iter().cloned().collect(),
-            blocked_subscribers: bc.blocked_subscribers.iter().cloned().collect(),
+            per_author_block_lists: bc
+                .per_author_block_lists
+                .iter()
+                .map(|(author, blocked)| (author.clone(), blocked.iter().cloned().collect()))
+                .collect(),
             admission: bc.admission.clone(),
         });
 
@@ -3347,11 +3413,16 @@ struct WasmExportMember {
 }
 
 /// Serializable broadcast state for export.
+///
+/// `per_author_block_lists` maps author DID to the list of subscriber DIDs
+/// blocked by that author, matching the per-author blocking semantics of
+/// spec §5.14.8.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmExportBroadcast {
     authors: Vec<String>,
     subscribers: Vec<String>,
-    blocked_subscribers: Vec<String>,
+    /// Per-author block lists: author DID -> list of blocked subscriber DIDs.
+    per_author_block_lists: HashMap<String, Vec<String>>,
     admission: String,
 }
 
