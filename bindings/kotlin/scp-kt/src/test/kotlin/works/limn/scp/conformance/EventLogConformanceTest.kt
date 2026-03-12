@@ -138,6 +138,54 @@ class EventLogConformanceTest {
     }
 
     @Nested
+    inner class EventLogCheckpoint {
+        @Test
+        fun `event_log_checkpoint returns signed checkpoint`() =
+            runTest(testDispatcher) {
+                @Suppress("MaxLineLength")
+                stubBindings.eventLogCheckpointResult =
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+                val result = dispatcher.dispatch(
+                    "event_log_checkpoint",
+                    mapOf(
+                        "context_handle" to "1",
+                        "identity_handle" to "2",
+                        "epoch" to "5",
+                    ),
+                )
+                assertTrue(result["checkpoint"]?.contains("merkle_root") == true)
+                assertTrue(result["checkpoint"]?.contains("ctx-1") == true)
+            }
+
+        @Test
+        fun `event_log_checkpoint propagates error`() =
+            runTest(testDispatcher) {
+                stubBindings.eventLogCheckpointError =
+                    BridgeException("Key custody unavailable", "SCP-CTX-2028")
+                val result = dispatcher.dispatch(
+                    "event_log_checkpoint",
+                    mapOf(
+                        "context_handle" to "1",
+                        "identity_handle" to "2",
+                        "epoch" to "5",
+                    ),
+                )
+                assertEquals("SCP-CTX-2028", result["error"])
+            }
+
+        @Test
+        fun `event_log_checkpoint via direct bridge call`() =
+            runTest(testDispatcher) {
+                @Suppress("MaxLineLength")
+                stubBindings.eventLogCheckpointResult =
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+                val result = bridge.infra.eventLogCheckpoint(1L, 2L, 5L)
+                assertTrue(result.contains("merkle_root"))
+                assertTrue(result.contains("event_count"))
+            }
+    }
+
+    @Nested
     inner class FixtureIntegration {
         @Test
         fun `event log query fixture matches dispatcher result`() =

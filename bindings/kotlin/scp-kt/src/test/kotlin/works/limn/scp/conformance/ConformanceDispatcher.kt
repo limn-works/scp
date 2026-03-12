@@ -55,6 +55,7 @@ class ConformanceDispatcher(
         "transport_status" -> dispatchTransportStatus(input)
         "event_log_query" -> dispatchEventLogQuery(input)
         "event_log_verify" -> dispatchEventLogVerify(input)
+        "event_log_checkpoint" -> dispatchEventLogCheckpoint(input)
         else -> mapOf("error" to "unsupported_operation")
     }
 
@@ -242,6 +243,16 @@ class ConformanceDispatcher(
         val proof = input["proof"] ?: "{}"
         val valid = bridge.infra.eventLogVerify(contextId, proof)
         mapOf("is_valid" to valid.toString())
+    }
+
+    private suspend fun dispatchEventLogCheckpoint(
+        input: Map<String, String>,
+    ): Map<String, String> = catchBridge {
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
+        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
+        val epoch = input["epoch"]?.toLongOrNull() ?: 0L
+        val result = bridge.infra.eventLogCheckpoint(contextHandle, identityHandle, epoch)
+        mapOf("checkpoint" to result)
     }
 
     private suspend fun catchBridge(

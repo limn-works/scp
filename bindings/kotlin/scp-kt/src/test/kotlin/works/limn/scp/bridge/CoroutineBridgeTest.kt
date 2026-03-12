@@ -214,6 +214,17 @@ class CoroutineBridgeTest {
             }
 
         @Test
+        fun `eventLogCheckpoint dispatches on IO`() =
+            runTest(ioDispatcher) {
+                @Suppress("MaxLineLength")
+                val checkpointJson =
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+                stubBindings.eventLogCheckpointResult = checkpointJson
+                val result = bridge.infra.eventLogCheckpoint(1L, 2L, 5L)
+                assertEquals(checkpointJson, result)
+            }
+
+        @Test
         fun `transportConnect dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.transportConnectResult = 99L
@@ -547,6 +558,7 @@ class StubNativeBindings : NativeBindings {
     var ucanDelegateResult = ""
     var eventLogQueryResult = ""
     var eventLogVerifyResult = false
+    var eventLogCheckpointResult = ""
     var transportConnectResult = 0L
     var transportConnectBlocking = false
     var transportStatusResult = ""
@@ -719,6 +731,12 @@ class StubNativeBindings : NativeBindings {
         contextId: String,
         proofJson: String,
     ): Boolean = eventLogVerifyResult
+
+    override fun eventLogCheckpoint(
+        contextHandle: Long,
+        identityHandle: Long,
+        epoch: Long,
+    ): String = eventLogCheckpointResult
 
     override fun transportConnect(
         configJson: String,

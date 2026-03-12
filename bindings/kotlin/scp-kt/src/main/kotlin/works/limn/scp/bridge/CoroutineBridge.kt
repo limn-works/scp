@@ -332,6 +332,12 @@ interface InfraBindings {
         proofJson: String,
     ): Boolean
 
+    fun eventLogCheckpoint(
+        contextHandle: Long,
+        identityHandle: Long,
+        epoch: Long,
+    ): String
+
     fun transportConnect(
         configJson: String,
         cancellationHandle: CancellationHandle?,
@@ -1164,6 +1170,31 @@ class InfraBridge internal constructor(
         contextId: String,
         proofJson: String,
     ): Boolean = bridge.ffiCall { bindings.eventLogVerify(contextId, proofJson) }
+
+    /**
+     * Generate a signed consistency checkpoint for equivocation detection.
+     *
+     * Creates a signed snapshot of the event log's Merkle root at the given
+     * epoch. Members exchange checkpoints to detect relay equivocation: if
+     * two members have different Merkle roots for the same event count, the
+     * relay is showing different histories to different members.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param identityHandle Handle from identity create or load.
+     * @param epoch The MLS epoch to checkpoint at.
+     * @return JSON-encoded [Checkpoint] containing context_id, sender_did,
+     *   event_count, merkle_root, epoch, signature, and timestamp.
+     * @see <a href="https://github.com/limn-works/scp/blob/main/.docs/adrs/phase-2.md">ADR-011</a>
+     *   acceptance criterion 8
+     * @see <a href="https://github.com/limn-works/scp/blob/main/.docs/adrs/phase-4.md">ADR-030</a>
+     */
+    suspend fun eventLogCheckpoint(
+        contextHandle: Long,
+        identityHandle: Long,
+        epoch: Long,
+    ): String = bridge.ffiCall {
+        bindings.eventLogCheckpoint(contextHandle, identityHandle, epoch)
+    }
 
     /**
      * Connect to a transport relay.
