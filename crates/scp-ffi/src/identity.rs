@@ -1043,7 +1043,15 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 did: old_did.clone(),
             };
 
-            let did_method = DidDht::new();
+            let sign_fn =
+                DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    Arc::clone(&custody),
+                );
+            let did_method = DidDht::with_client_and_signer(
+                Arc::new(InMemoryDhtClient::new()),
+                Arc::new(DidCache::new()),
+                sign_fn,
+            );
             let (new_identity, new_document, _rotation_event) = did_method
                 .migrate_identity(
                     &old_identity,
