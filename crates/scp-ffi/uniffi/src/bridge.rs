@@ -2830,23 +2830,39 @@ pub async fn tool_register(
             drop(state);
 
             let input_schema: serde_json::Value =
-                serde_json::from_str(&definition.input_schema_json)
-                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+                serde_json::from_str(&definition.input_schema_json).map_err(|e| {
+                    ScpError::Validation {
+                        message: format!("invalid input_schema_json: {e}"),
+                        code: "SCP-VALID-7035".to_owned(),
+                    }
+                })?;
             let output_schema: serde_json::Value =
-                serde_json::from_str(&definition.output_schema_json)
-                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+                serde_json::from_str(&definition.output_schema_json).map_err(|e| {
+                    ScpError::Validation {
+                        message: format!("invalid output_schema_json: {e}"),
+                        code: "SCP-VALID-7036".to_owned(),
+                    }
+                })?;
 
-            let test_vectors: Vec<scp_core::context::tools::TestVector> = definition
-                .test_vectors_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok())
-                .unwrap_or_default();
+            let test_vectors: Vec<scp_core::context::tools::TestVector> =
+                match definition.test_vectors_json.as_deref() {
+                    None => Vec::new(),
+                    Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                        message: format!("invalid test_vectors_json: {e}"),
+                        code: "SCP-VALID-7037".to_owned(),
+                    })?,
+                };
 
-            let implementation_hash: [u8; 32] = definition
-                .implementation_hash
-                .as_deref()
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                .unwrap_or([0u8; 32]);
+            let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+                None => [0u8; 32],
+                Some(bytes) => <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+                    message: format!(
+                        "implementation_hash must be exactly 32 bytes, got {}",
+                        bytes.len()
+                    ),
+                    code: "SCP-VALID-7038".to_owned(),
+                })?,
+            };
 
             let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
