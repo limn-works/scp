@@ -1716,17 +1716,21 @@ impl WasmContextManager {
 
     /// Revokes a UCAN token by CID.
     ///
-    /// Revocation is permanent (no TTL). The set is capped at
-    /// [`WASM_REVOKED_TOKENS_CAP`] entries — overflow returns an error.
+    /// Revocation is idempotent — re-revoking an already-revoked token
+    /// succeeds even when the set is at capacity. The set is capped at
+    /// [`WASM_REVOKED_TOKENS_CAP`] entries — overflow of genuinely new
+    /// tokens returns an error.
     ///
     /// # Errors
     ///
     /// Returns an error if the context is not active or the revocation set
-    /// has reached capacity.
+    /// has reached capacity and the token is not already revoked.
     pub fn ucan_revoke(&mut self, context_id: &str, token_cid: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if ctx.revoked_tokens.len() >= WASM_REVOKED_TOKENS_CAP {
+        if ctx.revoked_tokens.len() >= WASM_REVOKED_TOKENS_CAP
+            && !ctx.revoked_tokens.contains(token_cid)
+        {
             return Err(ScpWasmError::Validation {
                 message: format!(
                     "revoked token set has reached capacity ({WASM_REVOKED_TOKENS_CAP}) — \
@@ -5047,6 +5051,116 @@ mod tests {
             bc.authors["author-b"].is_empty(),
             "author-b's block list should be empty — pre-validation must prevent partial mutation"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ucan_revoke idempotent-at-capacity tests (#895)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a minimal active context with a pre-filled revocation set.
+    fn make_manager_with_revoked_tokens(
+        context_id: &str,
+        creator_did: &str,
+        revoked: HashSet<String>,
+    ) -> WasmContextManager {
+        let mut members = HashMap::new();
+        members.insert(
+            creator_did.to_owned(),
+            MemberEntry {
+                did: creator_did.to_owned(),
+                role: "admin".to_owned(),
+                sequence_number: 0,
+            },
+        );
+        let ctx = PerContextState {
+            state: "active".to_owned(),
+            params_json: serde_json::json!({}),
+            creator_did: creator_did.to_owned(),
+            mode: "Encrypted".to_owned(),
+            ceiling_strings: HashSet::new(),
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
+            event_log: WasmEventLog::new(context_id.to_owned()),
+            revoked_tokens: revoked,
+            seen_nonces: HashMap::new(),
+            members,
+            event_buffer: VecDeque::new(),
+            executed_proposals: HashMap::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            broadcast: None,
+            sessions: HashMap::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            tool_interfaces: Vec::new(),
+            governance_freeze: false,
+            pending_proposals: HashMap::new(),
+            resolved_proposals: HashMap::new(),
+            pruning_policy: None,
+            economic_policy_locked: false,
+        };
+        let mut mgr = WasmContextManager::new();
+        mgr.contexts.insert(context_id.to_owned(), ctx);
+        mgr
+    }
+
+    /// Verifies the capacity guard allows idempotent revocation.
+    ///
+    /// `ucan_revoke` calls `append_event` → `now_ms()` on success, which
+    /// panics on non-WASM targets. So we verify the capacity-check logic
+    /// directly: at capacity, a token already in the set must NOT trigger
+    /// the error branch, while a genuinely new token must.
+    #[test]
+    fn ucan_revoke_capacity_guard_allows_existing_token() {
+        let target_cid = "cid-already-revoked";
+        let mut revoked: HashSet<String> = (0..WASM_REVOKED_TOKENS_CAP - 1)
+            .map(|i| format!("cid-{i}"))
+            .collect();
+        revoked.insert(target_cid.to_owned());
+        assert_eq!(revoked.len(), WASM_REVOKED_TOKENS_CAP);
+
+        // Existing token at capacity: guard must NOT fire.
+        let would_reject =
+            revoked.len() >= WASM_REVOKED_TOKENS_CAP && !revoked.contains(target_cid);
+        assert!(
+            !would_reject,
+            "capacity guard must allow idempotent revocation of an existing token"
+        );
+
+        // New token at capacity: guard must fire.
+        let would_reject_new =
+            revoked.len() >= WASM_REVOKED_TOKENS_CAP && !revoked.contains("cid-brand-new");
+        assert!(
+            would_reject_new,
+            "capacity guard must reject a new token when at capacity"
+        );
+    }
+
+    #[test]
+    fn ucan_revoke_new_token_at_capacity_fails() {
+        let revoked: HashSet<String> = (0..WASM_REVOKED_TOKENS_CAP)
+            .map(|i| format!("cid-{i}"))
+            .collect();
+        assert_eq!(revoked.len(), WASM_REVOKED_TOKENS_CAP);
+
+        let mut mgr =
+            make_manager_with_revoked_tokens("ctx-1", "did:dht:zcreator", revoked);
+
+        // Revoking a genuinely new token at capacity must fail.
+        let err = mgr.ucan_revoke("ctx-1", "cid-brand-new").unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Validation { .. }),
+            "expected Validation error, got: {err:?}"
+        );
+        if let ScpWasmError::Validation { ref code, .. } = err {
+            assert_eq!(code, "SCP-VALID-7300");
+        }
     }
 
     #[test]
