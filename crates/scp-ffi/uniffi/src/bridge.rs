@@ -901,7 +901,7 @@ impl DataProvenance {
                         "payment_receipt_id must be exactly 32 bytes, got {}",
                         v.len()
                     ),
-                    code: "SCP-VALID-7050".to_owned(),
+                    code: "SCP-VALID-7080".to_owned(),
                 })?;
                 Some(arr)
             }
