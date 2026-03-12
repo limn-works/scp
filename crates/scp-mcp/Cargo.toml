@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["mcp", "context-protocol", "json-rpc", "ai-agents"]
+keywords = ["mcp", "model", "context", "protocol", "json-rpc"]
 categories = ["network-programming", "web-programming"]
 
 [dependencies]
