@@ -3365,7 +3365,7 @@ pub async fn tool_session_create(
     handle: Arc<ContextHandle>,
     tool_id: String,
     source_context_id: String,
-    ttl_seconds: u64,
+    ttl_seconds: Option<u64>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -3409,7 +3409,7 @@ pub async fn tool_session_create(
                 source_context: source_context_id,
                 state: serde_json::Value::Null,
                 created_at: now_ms,
-                ttl: std::time::Duration::from_secs(ttl_seconds),
+                ttl: ttl_seconds.map(std::time::Duration::from_secs),
                 call_count: 0,
             };
 

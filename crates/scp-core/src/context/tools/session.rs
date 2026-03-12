@@ -49,7 +49,8 @@ use crate::context::{ContextHandle, ContextState};
 ///
 /// Session state lives in the tool's context, not the caller's. Each call
 /// within a session is individually governed via UCAN capability checks.
-/// Sessions have TTLs to prevent resource leaks.
+/// Sessions have an optional TTL. Sessions without a TTL persist for
+/// the lifetime of the context (spec section 6.2.1).
 ///
 /// See spec section 6.2.1 and ADR-010.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +65,11 @@ pub struct ToolSession {
     pub state: serde_json::Value,
     /// Unix timestamp (milliseconds since epoch) when the session was created.
     pub created_at: u64,
-    /// Time-to-live for this session. Sessions past their TTL are cleaned up.
-    pub ttl: Duration,
+    /// Optional time-to-live for this session. `None` means the session
+    /// persists for the lifetime of the context and is never expired by
+    /// TTL cleanup. `Some(duration)` means the session expires after the
+    /// given duration.
+    pub ttl: Option<Duration>,
     /// Number of invocations made within this session.
     pub call_count: u64,
 }
@@ -73,16 +77,21 @@ pub struct ToolSession {
 impl ToolSession {
     /// Returns `true` if this session has expired based on the given current
     /// timestamp (milliseconds since epoch).
+    ///
+    /// Sessions with `ttl: None` never expire (they persist for the
+    /// lifetime of the context, per spec section 6.2.1).
     #[must_use]
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        let ttl_ms = self.ttl.as_millis();
+        let Some(ttl) = self.ttl else {
+            return false;
+        };
+        let ttl_ms = ttl.as_millis();
         // Saturating arithmetic to avoid overflow.
         if ttl_ms > u128::from(u64::MAX) {
             return false;
         }
         // ttl_ms is a small positive duration; fits in u64.
-        #[allow(clippy::cast_possible_truncation)]
-        let ttl_ms_u64 = ttl_ms as u64;
+        let ttl_ms_u64 = u64::try_from(ttl_ms).unwrap_or(u64::MAX);
         now_ms.saturating_sub(self.created_at) >= ttl_ms_u64
     }
 }
@@ -182,7 +191,8 @@ impl SessionStore {
 /// * `context` -- The context handle (must be in Active state).
 /// * `tool_id` -- The tool to create a session for.
 /// * `source_context` -- The context that initiated this session.
-/// * `ttl` -- Time-to-live for the session.
+/// * `ttl` -- Optional time-to-live for the session. `None` means the
+///   session persists for the lifetime of the context.
 ///
 /// # Returns
 ///
@@ -198,7 +208,7 @@ pub async fn create_session(
     context: &ContextHandle,
     tool_id: &ToolId,
     source_context: &ContextId,
-    ttl: Duration,
+    ttl: Option<Duration>,
 ) -> Result<String, ToolError> {
     // Validate context is Active.
     let state = context.state().await;
@@ -503,7 +513,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(60),
+            ttl: Some(Duration::from_secs(60)),
             call_count: 0,
         };
         // 30 seconds later -- should not be expired.
@@ -518,7 +528,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(60),
+            ttl: Some(Duration::from_secs(60)),
             call_count: 0,
         };
         // 61 seconds later -- should be expired.
@@ -533,11 +543,26 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(60),
+            ttl: Some(Duration::from_secs(60)),
             call_count: 0,
         };
         // Exactly at TTL boundary -- should be expired (>= check).
         assert!(session.is_expired(61_000));
+    }
+
+    #[test]
+    fn session_with_none_ttl_never_expires() {
+        let session = ToolSession {
+            session_id: "sess-1".to_owned(),
+            tool_id: "tool-1".to_owned(),
+            source_context: "ctx-src".to_owned(),
+            state: serde_json::Value::Null,
+            created_at: 1000,
+            ttl: None,
+            call_count: 0,
+        };
+        // Even far in the future -- should never expire.
+        assert!(!session.is_expired(u64::MAX));
     }
 
     // -----------------------------------------------------------------------
@@ -568,7 +593,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(60),
+            ttl: Some(Duration::from_secs(60)),
             call_count: 0,
         });
 
@@ -579,7 +604,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(10),
+            ttl: Some(Duration::from_secs(10)),
             call_count: 0,
         });
 
@@ -611,7 +636,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await;
 
@@ -628,7 +653,7 @@ mod tests {
         assert_eq!(session.tool_id, "calculator");
         assert_eq!(session.source_context, "ctx-source");
         assert_eq!(session.call_count, 0);
-        assert_eq!(session.ttl, Duration::from_secs(300));
+        assert_eq!(session.ttl, Some(Duration::from_secs(300)));
         assert!(session.state.is_null());
     }
 
@@ -646,7 +671,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await;
 
@@ -671,7 +696,7 @@ mod tests {
             &context,
             &"nonexistent-tool".to_owned(),
             &"ctx-source".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await;
 
@@ -703,7 +728,7 @@ mod tests {
                 &context,
                 &"calculator".to_owned(),
                 &source_ctx,
-                Duration::from_secs(300),
+                Some(Duration::from_secs(300)),
             )
             .await;
             assert!(
@@ -721,7 +746,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &source_ctx,
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await;
 
@@ -756,7 +781,7 @@ mod tests {
                 &context,
                 &"calculator".to_owned(),
                 &"ctx-caller-a".to_owned(),
-                Duration::from_secs(300),
+                Some(Duration::from_secs(300)),
             )
             .await
             .unwrap();
@@ -769,7 +794,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-caller-b".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await;
 
@@ -798,7 +823,7 @@ mod tests {
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
             created_at: 0,
-            ttl: Duration::from_secs(0),
+            ttl: Some(Duration::from_secs(0)),
             call_count: 0,
         });
 
@@ -840,7 +865,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(10), // Expires at 11000ms
+            ttl: Some(Duration::from_secs(10)), // Expires at 11000ms
             call_count: 0,
         });
         store.insert(ToolSession {
@@ -849,7 +874,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(30), // Expires at 31000ms
+            ttl: Some(Duration::from_secs(30)), // Expires at 31000ms
             call_count: 0,
         });
         store.insert(ToolSession {
@@ -858,7 +883,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Duration::from_secs(120), // Expires at 121000ms
+            ttl: Some(Duration::from_secs(120)), // Expires at 121000ms
             call_count: 0,
         });
 
@@ -902,7 +927,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await
         .unwrap();
@@ -994,7 +1019,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await
         .unwrap();
@@ -1058,7 +1083,7 @@ mod tests {
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
             created_at: crate::time::now_millis().unwrap(),
-            ttl: Duration::from_secs(300),
+            ttl: Some(Duration::from_secs(300)),
             call_count: 0,
         });
 
@@ -1093,7 +1118,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::json!({"key": "value"}),
             created_at: 1_000_000,
-            ttl: Duration::from_secs(600),
+            ttl: Some(Duration::from_secs(600)),
             call_count: 42,
         };
         let json = serde_json::to_string(&session).unwrap();
@@ -1122,7 +1147,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Duration::from_secs(300),
+            Some(Duration::from_secs(300)),
         )
         .await
         .unwrap();

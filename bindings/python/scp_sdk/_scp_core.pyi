@@ -693,20 +693,25 @@ def tool_session_create(
     context_id: str,
     tool_id: str,
     source_context_id: str,
-    ttl_seconds: int,
+    ttl_seconds: int | None = None,
 ) -> str:
     """Create a stateful tool session.
 
     Sessions enable multi-turn workflows with state preservation across
-    invocations. Each session has a TTL and is subject to per-caller caps
-    (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+    invocations. Each session is subject to per-caller caps (default: 5
+    concurrent sessions per caller, per spec section 6.2.1).
+
+    Sessions without a TTL persist for the lifetime of the context
+    (spec section 6.2.1).
 
     Args:
         context_id: The context containing the tool.
         tool_id: The tool to create a session for.
         source_context_id: The calling context (session cap tracked per
             caller).
-        ttl_seconds: Time-to-live for the session, in seconds.
+        ttl_seconds: Optional time-to-live for the session, in seconds.
+            ``None`` means the session persists for the lifetime of the
+            context.
 
     Returns:
         The session ID (UUID string).

@@ -651,7 +651,7 @@ pub async fn tool_session_create(
     handle: &NapiContextHandle,
     tool_id: String,
     source_context_id: String,
-    ttl_seconds: u32,
+    ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -694,7 +694,7 @@ pub async fn tool_session_create(
             source_context: source_context_id,
             state: serde_json::Value::Null,
             created_at: now_ms,
-            ttl: std::time::Duration::from_secs(u64::from(ttl_seconds)),
+            ttl: ttl_seconds.map(|s| std::time::Duration::from_secs(u64::from(s))),
             call_count: 0,
         };
 

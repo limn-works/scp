@@ -569,7 +569,7 @@ pub fn tool_session_create(
     context: &WasmContextHandle,
     tool_id: String,
     source_context_id: String,
-    ttl_seconds: u32,
+    ttl_seconds: Option<u32>,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
@@ -578,7 +578,7 @@ pub fn tool_session_create(
                 &context_id,
                 &tool_id,
                 &source_context_id,
-                u64::from(ttl_seconds),
+                ttl_seconds.map(u64::from),
             )
         })
         .map_err(ScpWasmError::into_js)?;

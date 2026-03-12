@@ -196,22 +196,26 @@ async def session_create(
     context_id: str,
     tool_id: str,
     source_context_id: str,
-    ttl_seconds: int,
+    ttl_seconds: int | None = None,
 ) -> str:
     """Create a stateful tool session.
 
     Sessions enable multi-turn workflows with state preservation across
-    invocations.  Each session has a TTL and is subject to per-caller
-    caps (default: 5 concurrent sessions per caller, per spec section
-    6.2.1).
+    invocations.  Each session is subject to per-caller caps (default: 5
+    concurrent sessions per caller, per spec section 6.2.1).
+
+    Sessions without a TTL persist for the lifetime of the context
+    (spec section 6.2.1).
 
     Args:
         context_id: The context containing the tool.
         tool_id: The tool to create a session for.
         source_context_id: The calling context (session cap tracked per
             caller).
-        ttl_seconds: Time-to-live for the session, in seconds.  Must be
-            a non-negative integer (u64 on the bridge side).
+        ttl_seconds: Optional time-to-live for the session, in seconds.
+            Must be a non-negative integer (u64 on the bridge side) or
+            ``None`` for a session that persists for the lifetime of the
+            context.
 
     Returns:
         The session ID (UUID string).
@@ -221,11 +225,12 @@ async def session_create(
             found, or the per-caller session cap is exceeded.
         ValidationError: If input validation fails (invalid parameters).
     """
-    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds < 0:
-        raise ValidationError(
-            f"ttl_seconds must be a non-negative integer, got {ttl_seconds!r}",
-            code="SCP-VALID-7002",
-        )
+    if ttl_seconds is not None:
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds < 0:
+            raise ValidationError(
+                f"ttl_seconds must be a non-negative integer, got {ttl_seconds!r}",
+                code="SCP-VALID-7002",
+            )
 
     if _scp_core is None:
         raise ContextError(

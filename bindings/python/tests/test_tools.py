@@ -271,7 +271,23 @@ class TestChainDepthValidation:
 
 
 class TestTtlSecondsValidation:
-    """ttl_seconds must be a non-negative int."""
+    """ttl_seconds must be a non-negative int or None."""
+
+    async def test_ttl_none_accepted(self) -> None:
+        """None passes validation (session persists for context lifetime per spec 6.2.1).
+
+        Since ``_scp_core`` is patched to None, a ``ContextError`` is
+        expected from the bridge guard — not a ``ValidationError``.
+        """
+        with patch("scp_sdk.tools._scp_core", None):
+            with pytest.raises(ContextError, match="_scp_core") as exc_info:
+                await session_create(
+                    context_id=_DUMMY_CTX_SRC,
+                    tool_id=_DUMMY_TOOL,
+                    source_context_id=_DUMMY_CTX_TGT,
+                    ttl_seconds=None,
+                )
+            assert exc_info.value.code == "SCP-CTX-2001"
 
     async def test_ttl_zero_accepted(self) -> None:
         mock_bridge = MagicMock()
