@@ -799,8 +799,11 @@ pub fn detect_device_divergence(
     device_a: &DeviceSyncState,
     device_b: &DeviceSyncState,
 ) -> DeviceDivergence {
-    if bool::from(device_a.local_merkle_root.ct_eq(&device_b.local_merkle_root))
-        && device_a.local_event_count == device_b.local_event_count
+    if bool::from(
+        device_a
+            .local_merkle_root
+            .ct_eq(&device_b.local_merkle_root),
+    ) && device_a.local_event_count == device_b.local_event_count
     {
         return DeviceDivergence::Consistent;
     }
