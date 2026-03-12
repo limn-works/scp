@@ -566,12 +566,12 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
         _ => return Ok([0u8; 32]),
     };
 
-    let hex_str: String = hash_obj.extract().map_err(|_| {
-        ScpPyError::ValidationError {
+    let hex_str: String = hash_obj
+        .extract()
+        .map_err(|_| ScpPyError::ValidationError {
             message: "'implementation_hash' must be a hex string".to_owned(),
             code: "SCP-VALID-7038".to_owned(),
-        }
-    })?;
+        })?;
 
     if hex_str.len() != 64 {
         return Err(ScpPyError::ValidationError {
@@ -586,20 +586,13 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
 
     let mut hash = [0u8; 32];
     for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
-        let byte_str = std::str::from_utf8(chunk).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: "invalid UTF-8 in implementation_hash".to_owned(),
-                code: "SCP-VALID-7038".to_owned(),
-            }
+        let byte_str = std::str::from_utf8(chunk).map_err(|_| ScpPyError::ValidationError {
+            message: "invalid UTF-8 in implementation_hash".to_owned(),
+            code: "SCP-VALID-7038".to_owned(),
         })?;
-        hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "invalid hex in implementation_hash at position {}",
-                    i * 2
-                ),
-                code: "SCP-VALID-7038".to_owned(),
-            }
+        hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| ScpPyError::ValidationError {
+            message: format!("invalid hex in implementation_hash at position {}", i * 2),
+            code: "SCP-VALID-7038".to_owned(),
         })?;
     }
 
@@ -661,12 +654,13 @@ fn extract_test_vectors(
         _ => return Ok(Vec::new()),
     };
 
-    let vectors_list = vectors_obj
-        .downcast::<pyo3::types::PyList>()
-        .map_err(|_| ScpPyError::ValidationError {
-            message: "'test_vectors' must be a list".to_owned(),
-            code: "SCP-VALID-7037".to_owned(),
-        })?;
+    let vectors_list =
+        vectors_obj
+            .downcast::<pyo3::types::PyList>()
+            .map_err(|_| ScpPyError::ValidationError {
+                message: "'test_vectors' must be a list".to_owned(),
+                code: "SCP-VALID-7037".to_owned(),
+            })?;
 
     let mut result = Vec::with_capacity(vectors_list.len());
     for item in vectors_list.iter() {
