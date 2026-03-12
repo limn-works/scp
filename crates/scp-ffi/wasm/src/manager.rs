@@ -509,6 +509,7 @@ impl PerContextState {
     /// - "member" — messages:read, messages:write, `tool:invoke:*`.
     /// - "author" — messages:write, messages:read, `tool:invoke:*`.
     /// - "observer" — messages:read only.
+    /// - "subscriber" — messages:read only (broadcast contexts).
     ///
     /// Capability strings use the format `"{resource}:{action}"` (e.g.
     /// `"context:close"`, `"messages:write"`).
