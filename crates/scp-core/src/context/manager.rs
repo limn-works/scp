@@ -4717,10 +4717,9 @@ impl ContextManager {
                     "proposal_id": hex::encode(proposal_id),
                     "rejecting_members": rejecting_members,
                 });
-                let _ = self.event_log.append_context_event(
-                    &context_id_bytes,
-                    &rejected_payload.to_string(),
-                );
+                let _ = self
+                    .event_log
+                    .append_context_event(&context_id_bytes, &rejected_payload.to_string());
                 return Err(ContextError::PermissionDenied(format!(
                     "TTL extension requires unanimous consent — {} of {} members have not approved",
                     missing.len(),
@@ -4730,8 +4729,7 @@ impl ContextManager {
 
             // Collect consenting member DIDs for the structured event
             // payload (§5.10.1 step 5).
-            let consenting: Vec<String> =
-                approval_dids.iter().map(|d| (*d).to_owned()).collect();
+            let consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
 
             // Cancel the existing TTL timer task so it does not fire at
             // the original deadline.
