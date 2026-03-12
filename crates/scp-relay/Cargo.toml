@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["relay", "server", "websocket"]
+keywords = ["scp", "relay", "server", "websocket"]
 categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
