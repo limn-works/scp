@@ -28,7 +28,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
-use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
+use scp_identity::{DidCache, InMemoryDhtClient};
+#[cfg(feature = "allow_in_memory_custody")]
+use scp_identity::IdentityError;
 use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -6953,7 +6955,14 @@ mod tests {
         let roundtripped = ffi.to_core().unwrap();
         assert_eq!(roundtripped.source_context, core_prov.source_context);
         assert_eq!(roundtripped.source_type, core_prov.source_type);
-        assert_eq!(roundtripped.counterparties.len(), 2);
+        assert_eq!(
+            roundtripped.counterparties,
+            vec![
+                scp_identity::DID::from("did:dht:z6MkAlice"),
+                scp_identity::DID::from("did:dht:z6MkBob"),
+            ]
+        );
+        assert_eq!(roundtripped.discovery_method, core_prov.discovery_method);
         assert_eq!(roundtripped.purpose, core_prov.purpose);
         assert_eq!(roundtripped.age.as_secs(), 42);
         assert_eq!(roundtripped.memory_scope, core_prov.memory_scope);
@@ -7031,5 +7040,35 @@ mod tests {
             roundtripped.discovery_method,
             scp_core::provenance::DiscoveryMethod::Registry(_)
         ));
+    }
+
+    #[test]
+    fn data_provenance_payment_receipt_id_wrong_length() {
+        let ffi = DataProvenance {
+            source_context: "ctx-bad".to_string(),
+            source_type: SourceType::Persistent,
+            counterparties: vec![],
+            purpose: None,
+            discovery_method: DiscoveryMethod::None,
+            age_secs: 0,
+            memory_scope: MemoryScope::Ephemeral,
+            chain_depth: 0,
+            chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: Some(vec![0xAA; 16]), // 16 bytes, not 32
+        };
+
+        let err = ffi.to_core().unwrap_err();
+        match err {
+            ScpError::Validation { code, message } => {
+                assert_eq!(code, "SCP-VALID-7080");
+                assert!(
+                    message.contains("32 bytes"),
+                    "expected '32 bytes' in message, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
     }
 }
