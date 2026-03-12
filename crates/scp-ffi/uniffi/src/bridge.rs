@@ -3901,8 +3901,8 @@ pub async fn ucan_validate(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Validation` if `member_did` fails [`validate_did`]
-/// (empty, malformed `did:{method}:{id}` format, or control characters).
+/// Returns `ScpError::Validation` if `member_did` is not a valid DID string
+/// (empty, missing `did:{method}:{id}` structure, or contains control characters).
 ///
 /// Returns `ScpError::Permission` if the context does not have key custody
 /// (created from an `identity_load` handle without key material) or if
@@ -4077,11 +4077,11 @@ pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<()
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Validation` if `delegator_did` or `delegatee_did`
-/// fails [`validate_did`] (empty, malformed `did:{method}:{id}` format,
-/// or control characters), if `parent_token` fails
-/// [`validate_ucan_token`], or if any capability URI fails
-/// [`validate_capability_uri`].
+/// Returns `ScpError::Validation` if `delegator_did` or `delegatee_did` is
+/// not a valid DID string (empty, missing `did:{method}:{id}` structure, or
+/// contains control characters), if `parent_token` is empty or contains
+/// control characters, or if any capability URI in `capabilities` is empty
+/// or contains control characters.
 ///
 /// Returns `ScpError::Permission` if delegation fails: delegator not matching
 /// parent audience, capabilities wider than parent, signing failure, etc.

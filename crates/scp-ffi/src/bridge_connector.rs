@@ -50,9 +50,11 @@ use crate::error::ScpPyError;
 ///
 /// # Errors
 ///
-/// Raises `ValidationError` if `mode` is not recognized or registration fails.
+/// Raises `ValidationError` if `operator_did` or `governance_did` is not a
+/// valid DID string (empty, missing `did:{method}:{id}` structure, or
+/// contains control characters), or if `mode` is not recognized.
 /// Raises `ContextError` if the governance DID matches the operator DID
-/// (self-approval).
+/// (self-approval) or if registration fails.
 #[pyfunction]
 #[pyo3(name = "bridge_register")]
 pub fn py_bridge_register(
