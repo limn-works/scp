@@ -3179,31 +3179,7 @@ mod tests {
     // Role state sync after governance (#560)
     // -----------------------------------------------------------------------
 
-    fn approved_proposal(
-        pid: [u8; 32],
-        context_id: &str,
-        action: scp_core::context::governance::GovernanceAction,
-        approver_did: &str,
-    ) -> scp_core::context::governance::GovernanceProposal {
-        use scp_core::context::governance::{SignedVote, VoteType};
-        scp_core::context::governance::GovernanceProposal {
-            proposal_id: pid,
-            context_id: context_id.into(),
-            proposer_did: scp_identity::DID(approver_did.to_owned()),
-            action,
-            status: scp_core::context::governance::ProposalStatus::Approved,
-            created_at: 1000,
-            voting_deadline: 2000,
-            approvals: vec![SignedVote {
-                voter_did: scp_identity::DID(approver_did.to_owned()),
-                vote: VoteType::Approve,
-                timestamp: 1000,
-                signature: vec![0u8; 64],
-            }],
-            rejections: Vec::new(),
-            created_at_epoch: None,
-        }
-    }
+    use scp_ffi_common::test_helpers::approved_proposal;
 
     #[test]
     fn role_state_syncs_after_change_role() {
