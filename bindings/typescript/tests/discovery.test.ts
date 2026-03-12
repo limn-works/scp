@@ -21,14 +21,14 @@ describe("DiscoveryResult type (§22.2.1)", () => {
       metadataSummary: null,
       trustLevel: { kind: "DomainVerified" },
       resolutionPath: {
-        layer: "domain",
+        layer: "Domain",
         source: "dht",
         sourceId: null,
         resolvedAt: 1700000000,
       },
     };
     expect(result.trustLevel.kind).toBe("DomainVerified");
-    expect(result.resolutionPath.layer).toBe("domain");
+    expect(result.resolutionPath.layer).toBe("Domain");
     expect(result.resolutionPath.source).toBe("dht");
     expect(result.resolutionPath.sourceId).toBeNull();
     expect(result.resolutionPath.resolvedAt).toBe(1700000000);
@@ -44,7 +44,7 @@ describe("DiscoveryResult type (§22.2.1)", () => {
       metadataSummary: null,
       trustLevel: { kind: "DiscoveryContextVerified" },
       resolutionPath: {
-        layer: "discovery_context",
+        layer: "DiscoveryContext",
         source: "discovery_context",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,
@@ -64,14 +64,14 @@ describe("DiscoveryResult type (§22.2.1)", () => {
       metadataSummary: null,
       trustLevel: { kind: "DirectExchange" },
       resolutionPath: {
-        layer: "domain",
+        layer: "Domain",
         source: "context_uri",
         sourceId: null,
         resolvedAt: 1700000000,
       },
     };
     expect(result.trustLevel.kind).toBe("DirectExchange");
-    expect(result.resolutionPath.layer).toBe("domain");
+    expect(result.resolutionPath.layer).toBe("Domain");
   });
 });
 
@@ -83,7 +83,7 @@ describe("AddressResolution discriminated union", () => {
         did: "did:dht:z6MkAlice",
         trustLevel: { kind: "LocalPetname" },
         resolutionPath: {
-          layer: "petname",
+          layer: "Petname",
           source: "local",
           sourceId: null,
           resolvedAt: 1700000000,
@@ -96,7 +96,7 @@ describe("AddressResolution discriminated union", () => {
         mode: "broadcast",
         trustLevel: { kind: "DomainVerified" },
         resolutionPath: {
-          layer: "domain",
+          layer: "Domain",
           source: "dht",
           sourceId: null,
           resolvedAt: 1700000000,
@@ -131,7 +131,7 @@ describe("AddressResolution discriminated union", () => {
         did: "did:dht:zTest",
         trustLevel: level,
         resolutionPath: {
-          layer: "domain",
+          layer: "Domain",
           source: "test",
           sourceId: null,
           resolvedAt: 0,
@@ -145,8 +145,8 @@ describe("AddressResolution discriminated union", () => {
     const level: TrustLevel = {
       kind: "MultiLayerCorroborated",
       sources: [
-        { layer: "petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
-        { layer: "domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
+        { layer: "Petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
+        { layer: "Domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
       ],
     };
     const resolution: AddressResolution = {
@@ -154,7 +154,7 @@ describe("AddressResolution discriminated union", () => {
       did: "did:dht:zTest",
       trustLevel: level,
       resolutionPath: {
-        layer: "domain",
+        layer: "Domain",
         source: "test",
         sourceId: null,
         resolvedAt: 0,
@@ -163,16 +163,17 @@ describe("AddressResolution discriminated union", () => {
     expect(resolution.trustLevel.kind).toBe("MultiLayerCorroborated");
     if (resolution.trustLevel.kind === "MultiLayerCorroborated") {
       expect(resolution.trustLevel.sources).toHaveLength(2);
-      expect(resolution.trustLevel.sources[0].layer).toBe("petname");
+      expect(resolution.trustLevel.sources[0].layer).toBe("Petname");
     }
   });
 
-  it("all ResolutionLayer values are assignable (exactly 4 per §22.7)", () => {
+  it("all ResolutionLayer values are assignable (5 per §22.11.3)", () => {
     const layers: ResolutionPath["layer"][] = [
-      "petname",
-      "discovery_context",
-      "attestation",
-      "domain",
+      "Petname",
+      "DiscoveryContext",
+      "Attestation",
+      "Domain",
+      "MultiLayerCorroborated",
     ];
     for (const layer of layers) {
       const path: ResolutionPath = {

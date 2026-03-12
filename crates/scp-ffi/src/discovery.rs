@@ -138,7 +138,8 @@ pub fn py_discovery_normalize_address(address: &str) -> String {
 /// Converts a [`ContextDiscoveryResult`] into a Python dict.
 ///
 /// Returns a dict with keys: `context_id`, `relay_urls`, `publisher_did`,
-/// `discovery_source`, `mode`, `metadata_summary`.
+/// `discovery_source`, `mode`, `metadata_summary`, `trust_level`,
+/// `resolution_path`.
 fn discovery_result_to_dict<'py>(
     py: Python<'py>,
     result: &scp_core::discovery::ContextDiscoveryResult,
@@ -148,18 +149,54 @@ fn discovery_result_to_dict<'py>(
     dict.set_item("relay_urls", &result.relay_urls)?;
     dict.set_item("publisher_did", &*result.publisher_did)?;
 
-    let source_str = match &result.discovery_source {
-        scp_core::discovery::ContextDiscoverySource::DhtDidDocument => "dht_did_document",
-        scp_core::discovery::ContextDiscoverySource::WellKnown => "well_known",
-        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => {
-            dict.set_item("discovery_context_id", context_id)?;
-            "discovery_context"
-        }
-        scp_core::discovery::ContextDiscoverySource::ContextUri => "context_uri",
-    };
+    let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
+        match &result.discovery_source {
+            scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
+                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
+            }
+            scp_core::discovery::ContextDiscoverySource::WellKnown => {
+                ("well_known", "DomainVerified", "Domain", "well-known", None)
+            }
+            scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => {
+                dict.set_item("discovery_context_id", context_id)?;
+                (
+                    "discovery_context",
+                    "DiscoveryContextVerified",
+                    "DiscoveryContext",
+                    "discovery_context",
+                    Some(context_id.as_str()),
+                )
+            }
+            // §22.7: An scp:// URI is shared out-of-band, so the trust level is
+            // DirectExchange and the resolution layer is "Domain" (closest match
+            // for URI-based resolution — no discovery context is involved).
+            scp_core::discovery::ContextDiscoverySource::ContextUri => (
+                "context_uri",
+                "DirectExchange",
+                "Domain",
+                "context_uri",
+                None,
+            ),
+        };
     dict.set_item("discovery_source", source_str)?;
     dict.set_item("mode", result.mode.as_deref())?;
     dict.set_item("metadata_summary", result.metadata_summary.as_deref())?;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let trust_level = PyDict::new(py);
+    trust_level.set_item("kind", trust_level_kind)?;
+    dict.set_item("trust_level", trust_level)?;
+
+    let resolution_path = PyDict::new(py);
+    resolution_path.set_item("layer", resolution_layer)?;
+    resolution_path.set_item("source", resolution_source)?;
+    resolution_path.set_item("source_id", resolution_source_id)?;
+    resolution_path.set_item("resolved_at", now_secs)?;
+    dict.set_item("resolution_path", resolution_path)?;
 
     Ok(dict)
 }
@@ -195,6 +232,9 @@ fn discovery_result_to_dict<'py>(
 ///   `"discovery_context"`, `"context_uri"`.
 /// - `mode` (str | None): Advisory context mode (e.g., `"broadcast"`).
 /// - `metadata_summary` (str | None): Human-readable summary.
+/// - `trust_level` (dict): `{"kind": str}` per §22.7.
+/// - `resolution_path` (dict): `{"layer": str, "source": str, "source_id": str | None, "resolved_at": int}`
+///   per §22.11.3. Layer values use `PascalCase`: `"Domain"`, `"DiscoveryContext"`, etc.
 ///
 /// # Errors
 ///

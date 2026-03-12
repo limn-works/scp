@@ -6587,15 +6587,43 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
 }
 
 /// Converts a `ContextDiscoveryResult` into a JSON value (helper).
+///
+/// Includes `trust_level` and `resolution_path` per §22.2.1.
+/// `ResolutionLayer` values use `PascalCase` per §22.11.3.
 fn discovery_result_to_json(
     result: &scp_core::discovery::ContextDiscoveryResult,
 ) -> serde_json::Value {
-    let source_str = match &result.discovery_source {
-        scp_core::discovery::ContextDiscoverySource::DhtDidDocument => "dht_did_document",
-        scp_core::discovery::ContextDiscoverySource::WellKnown => "well_known",
-        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { .. } => "discovery_context",
-        scp_core::discovery::ContextDiscoverySource::ContextUri => "context_uri",
-    };
+    let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
+        match &result.discovery_source {
+            scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
+                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
+            }
+            scp_core::discovery::ContextDiscoverySource::WellKnown => {
+                ("well_known", "DomainVerified", "Domain", "well-known", None)
+            }
+            scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
+                "discovery_context",
+                "DiscoveryContextVerified",
+                "DiscoveryContext",
+                "discovery_context",
+                Some(context_id.as_str()),
+            ),
+            // §22.7: An scp:// URI is shared out-of-band, so the trust level is
+            // DirectExchange and the resolution layer is "Domain" (closest match
+            // for URI-based resolution — no discovery context is involved).
+            scp_core::discovery::ContextDiscoverySource::ContextUri => (
+                "context_uri",
+                "DirectExchange",
+                "Domain",
+                "context_uri",
+                None,
+            ),
+        };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     let mut obj = serde_json::json!({
         "context_id": result.context_id,
@@ -6604,8 +6632,18 @@ fn discovery_result_to_json(
         "discovery_source": source_str,
         "mode": result.mode,
         "metadata_summary": result.metadata_summary,
+        "trust_level": {
+            "kind": trust_level_kind,
+        },
+        "resolution_path": {
+            "layer": resolution_layer,
+            "source": resolution_source,
+            "source_id": resolution_source_id,
+            "resolved_at": now_secs,
+        },
     });
 
+    // Add discovery_context_id if applicable.
     if let scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } =
         &result.discovery_source
     {
