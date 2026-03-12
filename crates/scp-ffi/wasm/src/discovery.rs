@@ -1343,9 +1343,136 @@ mod tests {
         assert_eq!(json["name"], "alice");
     }
 
-    // Error-path tests for discovery_parse_address are in the wasm_tests
-    // module below (target_arch = "wasm32"), because JsError::new() panics
-    // on non-wasm targets.
+    // -- validate_local_part error-path tests --------------------------------
+    // These exercise the validation logic that discovery_parse_address
+    // delegates to. JsError::new() panics on non-wasm, so we test the
+    // underlying helpers directly.
+
+    #[test]
+    fn validate_local_part_empty() {
+        let err = validate_local_part("").unwrap_err();
+        assert!(
+            err.contains("must not be empty"),
+            "expected empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_invalid_uppercase() {
+        let err = validate_local_part("Alice").unwrap_err();
+        assert!(
+            err.contains("invalid character 'A'"),
+            "expected uppercase error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_invalid_special_char() {
+        let err = validate_local_part("alice!bob").unwrap_err();
+        assert!(
+            err.contains("invalid character '!'"),
+            "expected special char error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_space() {
+        let err = validate_local_part("alice bob").unwrap_err();
+        assert!(
+            err.contains("invalid character ' '"),
+            "expected space error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_leading_dash() {
+        let err = validate_local_part("-alice").unwrap_err();
+        assert!(
+            err.contains("must not start or end with"),
+            "expected leading dash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_trailing_dash() {
+        let err = validate_local_part("alice-").unwrap_err();
+        assert!(
+            err.contains("must not start or end with"),
+            "expected trailing dash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_leading_dot() {
+        let err = validate_local_part(".alice").unwrap_err();
+        assert!(
+            err.contains("must not start or end with"),
+            "expected leading dot error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_trailing_dot() {
+        let err = validate_local_part("alice.").unwrap_err();
+        assert!(
+            err.contains("must not start or end with"),
+            "expected trailing dot error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_consecutive_dots() {
+        let err = validate_local_part("al..ice").unwrap_err();
+        assert!(
+            err.contains("consecutive dots"),
+            "expected consecutive dots error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_local_part_at_max_length() {
+        // Exactly 64 chars should be valid.
+        let at_limit = "a".repeat(MAX_LOCAL_PART_LENGTH);
+        assert!(validate_local_part(&at_limit).is_ok());
+    }
+
+    // -- validate_scope error-path tests (complement existing tests) --------
+
+    #[test]
+    fn validate_scope_control_char_null() {
+        let err = validate_scope("scope\x00bad").unwrap_err();
+        assert!(
+            err.contains("control character"),
+            "expected control char error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_scope_zero_width_space_message() {
+        let err = validate_scope("scope\u{200B}zwsp").unwrap_err();
+        assert!(
+            err.contains("U+200B"),
+            "expected U+200B in error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_scope_bom_message() {
+        let err = validate_scope("\u{FEFF}scope").unwrap_err();
+        assert!(
+            err.contains("U+FEFF"),
+            "expected U+FEFF in error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_scope_word_joiner_message() {
+        let err = validate_scope("scope\u{2060}wj").unwrap_err();
+        assert!(
+            err.contains("U+2060"),
+            "expected U+2060 in error message, got: {err}"
+        );
+    }
 
     // -- scp:// URI parsing tests -------------------------------------------
 
