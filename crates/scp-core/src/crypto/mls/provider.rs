@@ -946,7 +946,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let scp_group = ScpMlsGroup {
             group: Some(mls_group),
             provider,
-            signer: super::group::ZeroizingSigner::new(signer),
+            signer: super::group::EagerDropSigner::new(signer),
             destroyed: false,
         };
 
