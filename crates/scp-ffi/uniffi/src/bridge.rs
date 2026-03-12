@@ -7540,10 +7540,20 @@ pub fn bridge_register(
 
     let mut registry = scp_core::bridge::registration::BridgeRegistry::new(context_id.clone());
 
-    let bridge_id = format!(
-        "bridge-{platform}-{}",
-        context_id.chars().take(8).collect::<String>()
-    );
+    // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bridge_id = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(context_id.as_bytes());
+        hasher.update(operator_did.as_bytes());
+        hasher.update(platform.as_bytes());
+        hasher.update(now_secs.to_be_bytes());
+        hex::encode(hasher.finalize())
+    };
     let request = scp_core::bridge::registration::BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),

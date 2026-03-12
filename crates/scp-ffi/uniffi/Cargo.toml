@@ -34,6 +34,7 @@ scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
 hex = { workspace = true }
+sha2 = { workspace = true }
 # Only `software_platform` is enabled by default — provides crypto primitives
 # (Ed25519, X25519) without pulling in the insecure in-memory adapters.
 # The `allow_in_memory_custody` feature above adds `scp-platform/testing`
