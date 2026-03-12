@@ -3656,6 +3656,40 @@ fn wasm_handle_register_lookup_matches_core() {
     assert!(post_deregister.results.is_empty());
 }
 
+/// Same-owner re-registration must return Conflict — not idempotent success.
+/// Core's `HandleRegistry::register` returns `Conflict` unconditionally when
+/// the handle exists, regardless of who owns it. The WASM bridge must match.
+#[test]
+fn wasm_handle_same_owner_reregister_returns_conflict() {
+    use scp_core::discovery::{
+        HandleRegisterParams, HandleRegisterStatus, HandleRegistry, HandleTarget,
+    };
+    use scp_identity::DID;
+
+    let mut registry = HandleRegistry::new("ctx-test".to_owned());
+    let alice_did = DID::from("did:dht:zAlice");
+
+    let params = HandleRegisterParams {
+        handle: "alice".to_owned(),
+        target: HandleTarget::Identity {
+            did: DID::from("did:dht:zAlice"),
+        },
+        metadata: None,
+    };
+
+    // First registration succeeds.
+    let result1 = registry.register(&params, &alice_did).unwrap();
+    assert_eq!(result1.status, HandleRegisterStatus::Registered);
+
+    // Same owner, same handle — core returns Conflict, not idempotent success.
+    let result2 = registry.register(&params, &alice_did).unwrap();
+    assert_eq!(
+        result2.status,
+        HandleRegisterStatus::Conflict,
+        "same-owner re-registration must return Conflict per scp-core semantics"
+    );
+}
+
 // ===========================================================================
 // Address resolution conformance: scoped address parsing
 // ===========================================================================
