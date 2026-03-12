@@ -1994,15 +1994,11 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         validate_revocation_scope(scope)?;
         let ctx = self.require_active_context_mut(context_id)?;
-        ctx.read_revoked_members.insert(did.to_owned());
-        // Collect per-author epoch advances to emit after the borrow.
-        let mut epoch_advances: Vec<(String, u64)> = Vec::new();
-        if let Some(bc) = ctx.broadcast.as_mut() {
-            bc.subscribers.remove(did);
-            // Governance ban (§5.14.8 step 3): add to ALL authors' block lists.
-            // Enforce the same per-author cap as individual blocking to prevent
-            // unbounded memory growth via repeated governance bans.
-            for (author_did, block_list) in &mut bc.authors {
+
+        // Pre-validate: check ALL authors' block lists before any mutation.
+        // This prevents partial corruption if a cap check fails mid-loop.
+        if let Some(bc) = ctx.broadcast.as_ref() {
+            for (author_did, block_list) in &bc.authors {
                 if block_list.len() >= WASM_BLOCK_LIST_CAP {
                     return Err(ScpWasmError::Validation {
                         message: format!(
@@ -2012,6 +2008,16 @@ impl WasmContextManager {
                         code: "SCP-VALID-7301".to_owned(),
                     });
                 }
+            }
+        }
+
+        // All caps validated — now commit mutations atomically.
+        ctx.read_revoked_members.insert(did.to_owned());
+        let mut epoch_advances: Vec<(String, u64)> = Vec::new();
+        if let Some(bc) = ctx.broadcast.as_mut() {
+            bc.subscribers.remove(did);
+            // Governance ban (§5.14.8 step 3): add to ALL authors' block lists.
+            for block_list in bc.authors.values_mut() {
                 block_list.insert(did.to_owned());
             }
             // §5.14.8 step 4: mandatory key rotation — increment ALL authors'
@@ -3496,7 +3502,7 @@ struct WasmExportBroadcast {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
