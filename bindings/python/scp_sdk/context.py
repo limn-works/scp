@@ -401,15 +401,27 @@ class Context:
         self,
         tool: str,
         input: dict[str, Any],
+        ucan_token: str,
         identity: Identity | None = None,
+        proof_tokens: list[str] | None = None,
     ) -> dict[str, Any]:
         """Invoke a tool registered in this context.
+
+        Requires a valid UCAN token authorizing the invocation.  The
+        token must contain a ``tool_invoke:{tool_id}`` or
+        ``tool_invoke:*`` capability scoped to this context.  See
+        spec section 6.2, section 8, and ADR-016 for UCAN enforcement.
 
         Args:
             tool: The tool identifier.
             input: Input data as a JSON-compatible dict.
+            ucan_token: JWT-encoded UCAN token authorizing the
+                invocation.  Validated using the full 11-step ADR-016
+                pipeline.
             identity: The invoking identity.  Defaults to the context
                 creator if not specified.
+            proof_tokens: Optional list of additional UCAN proof
+                tokens for delegation chain resolution.
 
         Returns:
             The tool's output as a JSON-compatible dict.
@@ -418,6 +430,8 @@ class Context:
             ContextError: If the context is not active or the tool is
                 not found.
             ToolError: If tool execution fails.
+            UcanError: If the UCAN token is invalid, expired, revoked,
+                or lacks the required tool invocation capability.
         """
         try:
             import _scp_core
@@ -433,6 +447,8 @@ class Context:
             tool,
             input,
             invoker_did,
+            ucan_token,
+            proof_tokens,
         )
         return result
 
