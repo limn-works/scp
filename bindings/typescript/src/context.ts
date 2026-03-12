@@ -724,6 +724,39 @@ export class Context implements AsyncDisposable {
     }
   }
 
+  /**
+   * Retrieves a single governance proposal by its hex-encoded ID.
+   *
+   * @param proposalIdHex - Hex-encoded 32-byte proposal ID.
+   * @returns JSON string with proposal details.
+   * @throws {ContextError} If the proposal is not found (SCP-CTX-2045).
+   */
+  async getGovernanceProposal(proposalIdHex: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceGetProposal(this._handle, proposalIdHex);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Lists all governance proposals for this context.
+   *
+   * @returns JSON array of proposals.
+   * @throws {ContextError} If listing fails (SCP-CTX-2046).
+   */
+  async listGovernanceProposals(): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGovernanceListProposals(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // TTL
   // ---------------------------------------------------------------------------

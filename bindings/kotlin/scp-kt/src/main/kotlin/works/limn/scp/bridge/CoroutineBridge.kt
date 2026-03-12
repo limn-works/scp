@@ -198,6 +198,15 @@ interface GovernanceBindings {
         voterDid: String,
         proposalIdHex: String,
     ): String
+
+    /** Retrieve a single governance proposal by hex ID (#621). */
+    fun governanceGetProposal(
+        contextHandle: Long,
+        proposalIdHex: String,
+    ): String
+
+    /** List all governance proposals for a context (#621). */
+    fun governanceListProposals(contextHandle: Long): String
 }
 
 /**
@@ -971,6 +980,30 @@ class GovernanceBridgeOps internal constructor(
         proposalIdHex: String,
     ): String = bridge.ffiCall {
         bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /**
+     * Retrieve a single governance proposal by hex-encoded ID (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @param proposalIdHex Hex-encoded 32-byte proposal ID.
+     * @return JSON string with proposal details.
+     */
+    suspend fun getProposal(
+        contextHandle: Long,
+        proposalIdHex: String,
+    ): String = bridge.ffiCall {
+        bindings.governanceGetProposal(contextHandle, proposalIdHex)
+    }
+
+    /**
+     * List all governance proposals for a context (#621).
+     *
+     * @param contextHandle Handle from context create.
+     * @return JSON array of proposals.
+     */
+    suspend fun listProposals(contextHandle: Long): String = bridge.ffiCall {
+        bindings.governanceListProposals(contextHandle)
     }
 }
 

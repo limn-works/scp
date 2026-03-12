@@ -144,6 +144,8 @@ export interface Bridge {
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string>;
+  contextGovernanceGetProposal(handle: BridgeContextHandle, proposalIdHex: string): Promise<string>;
+  contextGovernanceListProposals(handle: BridgeContextHandle): Promise<string>;
 
   // TTL operations
   contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null>;

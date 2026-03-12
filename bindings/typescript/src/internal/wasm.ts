@@ -266,6 +266,11 @@ interface WasmModule {
     proposalId: string,
     voterDid: string,
   ) => Promise<string>;
+  context_governance_get_proposal: (
+    handle: BridgeContextHandle,
+    proposalId: string,
+  ) => Promise<string>;
+  context_governance_list_proposals: (handle: BridgeContextHandle) => Promise<string>;
   // Event log checkpoint
   event_log_checkpoint: (
     handle: BridgeContextHandle,
@@ -687,6 +692,17 @@ export function createWasmBridge(): Bridge {
     ): Promise<string> {
       const wasm = getWasm();
       return await wasm.context_governance_withdraw(handle, proposalIdHex, voterDid);
+    },
+    async contextGovernanceGetProposal(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_governance_get_proposal(handle, proposalIdHex);
+    },
+    async contextGovernanceListProposals(handle: BridgeContextHandle): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_governance_list_proposals(handle);
     },
 
     // TTL operations

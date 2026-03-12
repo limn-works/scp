@@ -436,6 +436,19 @@ export function createNativeBridge(): Bridge {
         ) => Promise<string>
       )(handle, proposalIdHex, voterDid);
     },
+    async contextGovernanceGetProposal(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+    ): Promise<string> {
+      return await (
+        addon.contextGovernanceGetProposal as (h: BridgeContextHandle, p: string) => Promise<string>
+      )(handle, proposalIdHex);
+    },
+    async contextGovernanceListProposals(handle: BridgeContextHandle): Promise<string> {
+      return await (
+        addon.contextGovernanceListProposals as (h: BridgeContextHandle) => Promise<string>
+      )(handle);
+    },
 
     // TTL operations
     async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {

@@ -186,6 +186,9 @@ private class TestNativeBindings : NativeBindings {
         """{"status":"Pending"}"""
     override fun governanceWithdraw(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
         """{"status":"Pending"}"""
+    override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
+        """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
+    override fun governanceListProposals(contextHandle: Long): String = "[]"
 
     // BroadcastBindings
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit

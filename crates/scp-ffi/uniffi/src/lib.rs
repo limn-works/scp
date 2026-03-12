@@ -132,6 +132,8 @@ pub use bridge::{
     // Free functions — governance (#387)
     governance_execute,
     // Free functions — governance proposal lifecycle (#621)
+    governance_get_proposal,
+    governance_list_proposals,
     governance_propose,
     governance_reject,
     governance_withdraw,
