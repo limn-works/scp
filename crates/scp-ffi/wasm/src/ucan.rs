@@ -904,8 +904,10 @@ pub fn ucan_mint(
 ///
 /// Returns `SCP-VALID-7000` if `delegator_did` or `delegatee_did` fails
 /// [`validate_did`] (empty, malformed `did:{method}:{id}` format, or
-/// control characters), or if `parent_token` fails
-/// [`validate_ucan_token`] (empty, too long, or control characters).
+/// control characters), if `parent_token` fails
+/// [`validate_ucan_token`] (empty, too long, or control characters),
+/// or if `capabilities_json` is not a valid JSON array of capability URI
+/// strings (parsed via [`CapabilityUri::parse`]).
 ///
 /// Returns `SCP-PERM-3000` since UCAN delegation requires JS-side key custody.
 ///
