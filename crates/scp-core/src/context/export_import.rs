@@ -5,7 +5,10 @@
 //! [`StoredValue<T>`](crate::store::StoredValue) envelopes (spec §17.5).
 //!
 //! Import verifies Merkle chain integrity of the event log entries before
-//! restoring context state, ensuring tamper detection.
+//! restoring context state, ensuring tamper detection. Pruned event logs
+//! (where the first entry's `prev_hash` references a discarded predecessor)
+//! are accepted — only inter-entry linkage within the provided entries is
+//! validated.
 //!
 //! See GitHub issue #363.
 
@@ -45,6 +48,10 @@ pub const CURRENT_EXPORT_VERSION: u32 = 1;
 /// `prev_hash` must match the preceding entry's `hash`, and each entry's
 /// `hash` must be correctly computed. The Merkle root (hash of the last entry)
 /// is stored in `merkle_root` at export time and compared on import.
+///
+/// Pruned event logs are supported: the first entry's `prev_hash` is not
+/// validated, so exports from logs where earlier entries have been discarded
+/// will pass verification.
 ///
 /// # Privacy
 ///
@@ -138,6 +145,10 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 /// Recomputes the Merkle chain hash for a set of serialized event log entries
 /// and returns the root hash (the hash of the last entry).
 ///
+/// The first entry's `prev_hash` is not validated, so pruned event logs
+/// (where earlier entries have been discarded) are accepted. Only
+/// inter-entry linkage for entries at index 1+ is checked.
+///
 /// Returns all zeros for empty data.
 ///
 /// # Errors
@@ -212,6 +223,9 @@ fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8;
 /// 1. Export version is supported (`<= CURRENT_EXPORT_VERSION`).
 /// 2. Merkle chain integrity of event log entries.
 /// 3. Merkle root matches the stored root hash.
+///
+/// Pruned event logs (where the first entry is not the genesis entry) are
+/// accepted — the first entry's `prev_hash` is not validated.
 ///
 /// # Errors
 ///
