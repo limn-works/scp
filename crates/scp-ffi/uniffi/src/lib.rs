@@ -128,8 +128,13 @@ pub use bridge::{
     // Free functions — event log
     event_log_query,
     event_log_verify,
+    governance_approve,
     // Free functions — governance (#387)
     governance_execute,
+    // Free functions — governance proposal lifecycle (#621)
+    governance_propose,
+    governance_reject,
+    governance_withdraw,
     // Free functions — identity
     identity_create,
     identity_create_with_custody,
@@ -396,6 +401,18 @@ pub trait KeyCustodyProvider: Send + Sync {
         key_id: String,
         context_id: Vec<u8>,
     ) -> Result<Vec<u8>, ScpError>;
+
+    /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
+    ///
+    /// Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
+    /// directly. Platform implementations using software-backed Ed25519 storage
+    /// (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` if the key is not found, not exportable, or not
+    /// an Ed25519 key.
+    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
 
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
     /// `"in_memory"`. Stays sync — no I/O required.

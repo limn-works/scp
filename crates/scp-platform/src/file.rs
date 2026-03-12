@@ -449,6 +449,25 @@ impl FileKeyCustody {
         let signing_key = SigningKey::from_bytes(&key_bytes);
         Ok((key_bytes, signing_key))
     }
+
+    /// Exports a clone of the Ed25519 signing key for the given handle.
+    ///
+    /// Required by FFI bridges that need the raw `ed25519_dalek::SigningKey`
+    /// for core governance functions (`propose_governance_action`,
+    /// `approve_governance_proposal`, etc.) which take `&SigningKey` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
+    /// X25519 key.
+    pub async fn export_ed25519_signing_key(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<SigningKey, PlatformError> {
+        let (_key_bytes, signing_key) = self.decrypt_ed25519_key(handle).await?;
+        Ok(signing_key)
+    }
 }
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait

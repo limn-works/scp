@@ -244,6 +244,28 @@ interface WasmModule {
     proposalId: string,
     actionJson: string,
   ) => Promise<string>;
+  // Governance proposal lifecycle (#621)
+  context_governance_propose: (
+    handle: BridgeContextHandle,
+    proposerDid: string,
+    proposalId: string,
+    actionJson: string,
+  ) => Promise<string>;
+  context_governance_approve: (
+    handle: BridgeContextHandle,
+    proposalId: string,
+    voterDid: string,
+  ) => Promise<string>;
+  context_governance_reject: (
+    handle: BridgeContextHandle,
+    proposalId: string,
+    voterDid: string,
+  ) => Promise<string>;
+  context_governance_withdraw: (
+    handle: BridgeContextHandle,
+    proposalId: string,
+    voterDid: string,
+  ) => Promise<string>;
   // Event log checkpoint
   event_log_checkpoint: (
     handle: BridgeContextHandle,
@@ -630,6 +652,41 @@ export function createWasmBridge(): Bridge {
       // governance actions to fail as "already executed".
       const proposalId = globalThis.crypto.randomUUID();
       return await wasm.context_execute_governance(handle, proposerDid, proposalId, actionJson);
+    },
+
+    // Governance proposal lifecycle (#621)
+    async contextGovernancePropose(
+      handle: BridgeContextHandle,
+      actionJson: string,
+      proposerDid: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      const proposalId = globalThis.crypto.randomUUID();
+      return await wasm.context_governance_propose(handle, proposerDid, proposalId, actionJson);
+    },
+    async contextGovernanceApprove(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+      voterDid: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_governance_approve(handle, proposalIdHex, voterDid);
+    },
+    async contextGovernanceReject(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+      voterDid: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_governance_reject(handle, proposalIdHex, voterDid);
+    },
+    async contextGovernanceWithdraw(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+      voterDid: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_governance_withdraw(handle, proposalIdHex, voterDid);
     },
 
     // TTL operations

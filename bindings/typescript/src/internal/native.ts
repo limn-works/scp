@@ -383,6 +383,60 @@ export function createNativeBridge(): Bridge {
       )(handle, actionJson, proposerDid);
     },
 
+    // Governance proposal lifecycle (#621)
+    async contextGovernancePropose(
+      handle: BridgeContextHandle,
+      actionJson: string,
+      proposerDid: string,
+    ): Promise<string> {
+      return await (
+        addon.contextGovernancePropose as (
+          h: BridgeContextHandle,
+          a: string,
+          p: string,
+        ) => Promise<string>
+      )(handle, actionJson, proposerDid);
+    },
+    async contextGovernanceApprove(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+      voterDid: string,
+    ): Promise<string> {
+      return await (
+        addon.contextGovernanceApprove as (
+          h: BridgeContextHandle,
+          p: string,
+          v: string,
+        ) => Promise<string>
+      )(handle, proposalIdHex, voterDid);
+    },
+    async contextGovernanceReject(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+      voterDid: string,
+    ): Promise<string> {
+      return await (
+        addon.contextGovernanceReject as (
+          h: BridgeContextHandle,
+          p: string,
+          v: string,
+        ) => Promise<string>
+      )(handle, proposalIdHex, voterDid);
+    },
+    async contextGovernanceWithdraw(
+      handle: BridgeContextHandle,
+      proposalIdHex: string,
+      voterDid: string,
+    ): Promise<string> {
+      return await (
+        addon.contextGovernanceWithdraw as (
+          h: BridgeContextHandle,
+          p: string,
+          v: string,
+        ) => Promise<string>
+      )(handle, proposalIdHex, voterDid);
+    },
+
     // TTL operations
     async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {
       // The NAPI bridge does not export contextTtlRemaining — scp-core's

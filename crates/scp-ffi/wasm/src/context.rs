@@ -517,6 +517,191 @@ pub fn context_execute_governance(
 }
 
 // ---------------------------------------------------------------------------
+// Governance proposal lifecycle bridge functions (#621)
+// ---------------------------------------------------------------------------
+
+/// Proposes a governance action for voting.
+///
+/// Delegates to `WasmContextManager::propose_governance_action`.
+/// For `single_admin` contexts, the proposal is auto-approved and executed.
+/// For multi-admin models (threshold, majority, unanimity), the proposal
+/// enters `Pending` status.
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `proposer_did` — DID of the proposer.
+/// * `proposal_id` — Unique proposal ID for replay protection.
+/// * `action_json` — JSON-encoded governance action.
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with `proposal_id`, `status`, `execution_result`.
+#[wasm_bindgen]
+pub fn context_governance_propose(
+    handle: &WasmContextHandle,
+    proposer_did: String,
+    proposal_id: String,
+    action_json: String,
+) -> Promise {
+    if let Err(e) = validate_did(&proposer_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let action: crate::manager::WasmGovernanceAction = serde_json::from_str(&action_json)
+            .map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("action_json is not valid: {e}"),
+                    code: "SCP-GOV-5000".to_owned(),
+                }
+                .into_js()
+            })?;
+
+        let result = with_manager(|mgr| {
+            mgr.propose_governance_action(&context_id, &proposer_did, &proposal_id, &action)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("failed to serialize proposal result: {e}"),
+                code: "SCP-GOV-5001".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Casts an approval vote on a pending governance proposal.
+///
+/// Delegates to `WasmContextManager::approve_governance_proposal`.
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `proposal_id` — The proposal to vote on.
+/// * `voter_did` — DID of the voter.
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with `status`.
+#[wasm_bindgen]
+pub fn context_governance_approve(
+    handle: &WasmContextHandle,
+    proposal_id: String,
+    voter_did: String,
+) -> Promise {
+    if let Err(e) = validate_did(&voter_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result = with_manager(|mgr| {
+            mgr.approve_governance_proposal(&context_id, &proposal_id, &voter_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("failed to serialize approval result: {e}"),
+                code: "SCP-GOV-5002".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Casts a rejection vote on a pending governance proposal.
+///
+/// Delegates to `WasmContextManager::reject_governance_proposal`.
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `proposal_id` — The proposal to vote on.
+/// * `voter_did` — DID of the voter.
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with `status`.
+#[wasm_bindgen]
+pub fn context_governance_reject(
+    handle: &WasmContextHandle,
+    proposal_id: String,
+    voter_did: String,
+) -> Promise {
+    if let Err(e) = validate_did(&voter_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result = with_manager(|mgr| {
+            mgr.reject_governance_proposal(&context_id, &proposal_id, &voter_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("failed to serialize rejection result: {e}"),
+                code: "SCP-GOV-5003".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Withdraws a previously cast vote on a pending governance proposal.
+///
+/// Delegates to `WasmContextManager::withdraw_governance_vote`.
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `proposal_id` — The proposal to withdraw from.
+/// * `voter_did` — DID of the voter.
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with `status`.
+#[wasm_bindgen]
+pub fn context_governance_withdraw(
+    handle: &WasmContextHandle,
+    proposal_id: String,
+    voter_did: String,
+) -> Promise {
+    if let Err(e) = validate_did(&voter_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result =
+            with_manager(|mgr| mgr.withdraw_governance_vote(&context_id, &proposal_id, &voter_did))
+                .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("failed to serialize withdrawal result: {e}"),
+                code: "SCP-GOV-5004".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast bridge functions
 // ---------------------------------------------------------------------------
 

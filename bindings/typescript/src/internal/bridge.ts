@@ -123,6 +123,28 @@ export interface Bridge {
     proposerDid: string,
   ): Promise<string>;
 
+  // Governance proposal lifecycle (#621)
+  contextGovernancePropose(
+    handle: BridgeContextHandle,
+    actionJson: string,
+    proposerDid: string,
+  ): Promise<string>;
+  contextGovernanceApprove(
+    handle: BridgeContextHandle,
+    proposalIdHex: string,
+    voterDid: string,
+  ): Promise<string>;
+  contextGovernanceReject(
+    handle: BridgeContextHandle,
+    proposalIdHex: string,
+    voterDid: string,
+  ): Promise<string>;
+  contextGovernanceWithdraw(
+    handle: BridgeContextHandle,
+    proposalIdHex: string,
+    voterDid: string,
+  ): Promise<string>;
+
   // TTL operations
   contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null>;
   contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<boolean>;

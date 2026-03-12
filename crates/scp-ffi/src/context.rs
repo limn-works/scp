@@ -1737,6 +1737,289 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
 }
 
 // ---------------------------------------------------------------------------
+// Governance proposal lifecycle (#621)
+// ---------------------------------------------------------------------------
+
+/// Helper: resolve the raw Ed25519 signing key for an identity DID.
+///
+/// Looks up the identity in the global registry, retrieves the custody
+/// provider and active signing key handle, and exports the raw
+/// `ed25519_dalek::SigningKey`. Required because the core governance
+/// lifecycle functions take `&SigningKey` directly.
+fn resolve_signing_key(identity_did: &str) -> PyResult<ed25519_dalek::SigningKey> {
+    let rt = crate::runtime()?;
+    crate::runtime::with_identity(identity_did, |entry| {
+        let handle = entry.identity.active_signing_key;
+        let custody = entry.custody.clone();
+        rt.block_on(async move { custody.export_ed25519_signing_key(&handle).await })
+            .map_err(|e| {
+                crate::error::ScpPyError::context(format!(
+                    "failed to export signing key for governance: {e}"
+                ))
+            })
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Proposes a governance action for voting.
+///
+/// Delegates to [`ContextManager::propose_governance_action_checked`],
+/// which validates the proposer's `GovernancePropose` capability before
+/// submitting the proposal to the governance engine.
+///
+/// For `SingleAdmin` contexts, the proposal is auto-approved and executed
+/// immediately. For multi-admin models (Threshold, Majority, Unanimity),
+/// the proposal enters `Pending` status and must accumulate votes.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `identity_did` -- DID of the proposer.
+/// * `action_json` -- JSON-serialized `GovernanceAction`.
+///
+/// # Returns
+///
+/// JSON string with `{ "proposal_id": hex, "status": string,
+/// "execution_result": string | null }`.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-GOV-5000) if the context manager is not
+/// initialized, the action JSON is invalid, or the proposal fails.
+#[pyfunction]
+#[pyo3(signature = (handle, identity_did, action_json))]
+fn py_governance_propose(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    action_json: &str,
+) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let action_json_owned = action_json.to_owned();
+    let signing_key = resolve_signing_key(identity_did)?;
+    let proposer_did = scp_identity::DID(identity_did.to_owned());
+
+    rt.block_on(async move {
+        let action: scp_core::context::governance::GovernanceAction =
+            serde_json::from_str(&action_json_owned).map_err(|e| {
+                PyValueError::new_err(format!("SCP-GOV-5000: invalid governance action JSON: {e}"))
+            })?;
+
+        let outcome = mgr
+            .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-GOV-5001: governance proposal failed: {e}"))
+            })?;
+
+        // Re-sync local role state cache from ContextManager after any
+        // governance action that may have modified roles/membership (#560).
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance proposal — \
+                 local capability checks may be stale"
+            );
+        }
+
+        let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
+
+        let response = serde_json::json!({
+            "proposal_id": hex::encode(outcome.proposal.proposal_id),
+            "status": format!("{:?}", outcome.status),
+            "execution_result": result_str,
+        });
+        Ok(response.to_string())
+    })
+}
+
+/// Casts an approval vote on a pending governance proposal.
+///
+/// Delegates to [`ContextManager::approve_governance_proposal`], which
+/// validates the voter's `GovernanceVote` capability before casting the
+/// vote. If the vote pushes the proposal past quorum, the action is
+/// auto-executed.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `identity_did` -- DID of the voter.
+/// * `proposal_id_hex` -- Hex-encoded 32-byte proposal ID.
+///
+/// # Returns
+///
+/// JSON string with `{ "status": string }` (Pending, Approved, Rejected,
+/// etc.).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-GOV-5002) if the vote fails.
+#[pyfunction]
+#[pyo3(signature = (handle, identity_did, proposal_id_hex))]
+fn py_governance_approve(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    proposal_id_hex: &str,
+) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let signing_key = resolve_signing_key(identity_did)?;
+    let voter_did = scp_identity::DID(identity_did.to_owned());
+    let proposal_id = parse_proposal_id(proposal_id_hex)?;
+
+    rt.block_on(async move {
+        let status = mgr
+            .approve_governance_proposal(&context_id, &proposal_id, &voter_did, &signing_key)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-GOV-5002: governance approval failed: {e}"))
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance approval"
+            );
+        }
+
+        Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    })
+}
+
+/// Casts a rejection vote on a pending governance proposal.
+///
+/// Delegates to [`ContextManager::reject_governance_proposal`], which
+/// validates the voter's `GovernanceVote` capability before casting the
+/// vote.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `identity_did` -- DID of the voter.
+/// * `proposal_id_hex` -- Hex-encoded 32-byte proposal ID.
+///
+/// # Returns
+///
+/// JSON string with `{ "status": string }`.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-GOV-5003) if the vote fails.
+#[pyfunction]
+#[pyo3(signature = (handle, identity_did, proposal_id_hex))]
+fn py_governance_reject(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    proposal_id_hex: &str,
+) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let signing_key = resolve_signing_key(identity_did)?;
+    let voter_did = scp_identity::DID(identity_did.to_owned());
+    let proposal_id = parse_proposal_id(proposal_id_hex)?;
+
+    rt.block_on(async move {
+        let status = mgr
+            .reject_governance_proposal(&context_id, &proposal_id, &voter_did, &signing_key)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-GOV-5003: governance rejection failed: {e}"))
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance rejection"
+            );
+        }
+
+        Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    })
+}
+
+/// Withdraws a previously cast vote on a pending governance proposal.
+///
+/// Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+/// key is required -- withdrawal is the voter's privileged operation on
+/// their own vote.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `identity_did` -- DID of the voter.
+/// * `proposal_id_hex` -- Hex-encoded 32-byte proposal ID.
+///
+/// # Returns
+///
+/// JSON string with `{ "status": string }`.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-GOV-5004) if the withdrawal fails.
+#[pyfunction]
+#[pyo3(signature = (handle, identity_did, proposal_id_hex))]
+fn py_governance_withdraw(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    proposal_id_hex: &str,
+) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let voter_did = scp_identity::DID(identity_did.to_owned());
+    let proposal_id = parse_proposal_id(proposal_id_hex)?;
+
+    rt.block_on(async move {
+        let status = mgr
+            .withdraw_governance_vote(&context_id, &proposal_id, &voter_did)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-GOV-5004: governance vote withdrawal failed: {e}"
+                ))
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to sync role state after governance withdrawal"
+            );
+        }
+
+        Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    })
+}
+
+/// Parses a hex-encoded proposal ID into a 32-byte array.
+fn parse_proposal_id(hex_str: &str) -> PyResult<[u8; 32]> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        PyValueError::new_err(format!("SCP-GOV-5000: invalid proposal ID hex: {e}"))
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        PyValueError::new_err(format!(
+            "SCP-GOV-5000: proposal ID must be 32 bytes, got {}",
+            v.len()
+        ))
+    })?;
+    Ok(arr)
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast bridge (#369)
 // ---------------------------------------------------------------------------
 
@@ -2202,6 +2485,11 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_context_import, m)?)?;
     // Governance (#369)
     m.add_function(wrap_pyfunction!(py_governance_execute, m)?)?;
+    // Governance proposal lifecycle (#621)
+    m.add_function(wrap_pyfunction!(py_governance_propose, m)?)?;
+    m.add_function(wrap_pyfunction!(py_governance_approve, m)?)?;
+    m.add_function(wrap_pyfunction!(py_governance_reject, m)?)?;
+    m.add_function(wrap_pyfunction!(py_governance_withdraw, m)?)?;
     // Broadcast (#369)
     m.add_function(wrap_pyfunction!(py_broadcast_subscribe, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;
