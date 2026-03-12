@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const ucan = await mintUcan(ctx, identity.did, ["tool_invoke:*"]);
 
   // Invoke the tool with the UCAN token
-  const result = await ctx.invokeTool("weather", { city: "Berlin" }, identity, ucan.tokenId);
+  const result = await ctx.invokeTool("weather", { city: "Berlin" }, identity, ucan.id);
   console.log("Weather result:", result);
 
   await ctx.close();
