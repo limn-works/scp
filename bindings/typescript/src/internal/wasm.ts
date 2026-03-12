@@ -127,6 +127,7 @@ interface WasmModule {
   bridge_register: (
     contextId: string,
     operatorDid: string,
+    governanceDid: string,
     platform: string,
     mode: BridgeMode,
   ) => ReturnType<Bridge["bridgeRegister"]>;
@@ -876,14 +877,12 @@ export function createWasmBridge(): Bridge {
     bridgeRegister(
       contextId: string,
       operatorDid: string,
-      _governanceDid: string,
+      governanceDid: string,
       platform: string,
       mode: BridgeMode,
     ) {
-      // WASM bridge does not use the registry/approval flow (per ADR-034),
-      // so governance_did is accepted for interface compatibility but unused.
       const wasm = getWasm();
-      return wasm.bridge_register(contextId, operatorDid, platform, mode);
+      return wasm.bridge_register(contextId, operatorDid, governanceDid, platform, mode);
     },
 
     bridgeEvaluateTrust(

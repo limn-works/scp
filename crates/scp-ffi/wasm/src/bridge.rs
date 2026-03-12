@@ -285,30 +285,36 @@ pub fn bridge_evaluate_trust(
 ///
 /// Creates a bridge registration with a deterministic bridge ID derived from
 /// the platform name and context ID. The bridge is immediately approved
-/// (matching the NAPI bridge's behavior of creating + auto-approving).
+/// using the provided governance DID (matching the NAPI bridge's behavior
+/// of creating + auto-approving).
 ///
 /// # Arguments
 ///
 /// - `context_id` — Context to register the bridge in.
 /// - `operator_did` — DID of the bridge operator.
+/// - `governance_did` — DID of the governance authority approving the
+///   registration. Must differ from `operator_did` (self-approval is
+///   forbidden per ADR-023).
 /// - `platform` — External platform name (e.g., `"discord"`, `"slack"`).
 /// - `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `mode` is invalid or inputs are empty.
+/// Returns `JsError` if `mode` is invalid, inputs are empty, or
+/// `governance_did` equals `operator_did` (self-approval).
 ///
 /// # JS usage
 ///
 /// ```js
-/// const reg = bridge_register("ctx-1", "did:key:op", "discord", "relay");
-/// console.log(reg.bridge_id); // "bridge-discord-ctx-1"
+/// const reg = bridge_register("ctx-1", "did:key:op", "did:key:gov", "discord", "relay");
+/// console.log(reg.bridge_id); // deterministic SHA-256 hex
 /// console.log(reg.status);    // "active"
 /// ```
 #[wasm_bindgen]
 pub fn bridge_register(
     context_id: String,
     operator_did: String,
+    governance_did: String,
     platform: String,
     mode: String,
 ) -> Result<WasmBridgeRegistration, JsError> {
@@ -326,10 +332,27 @@ pub fn bridge_register(
         }
         .into_js());
     }
+    if governance_did.is_empty() {
+        return Err(ScpWasmError::Validation {
+            message: "governance_did must not be empty".to_owned(),
+            code: "SCP-VALID-7012".to_owned(),
+        }
+        .into_js());
+    }
     if platform.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform must not be empty".to_owned(),
             code: "SCP-VALID-7012".to_owned(),
+        }
+        .into_js());
+    }
+
+    // Self-approval check: the governance approver must differ from the
+    // bridge operator (ADR-023 acceptance criterion 2).
+    if governance_did == operator_did {
+        return Err(ScpWasmError::Context {
+            message: "approver cannot be the same DID as the operator (self-approval is forbidden per ADR-023)".to_owned(),
+            code: "SCP-CTX-2101".to_owned(),
         }
         .into_js());
     }
@@ -549,6 +572,7 @@ mod wasm_tests {
         let result = bridge_register(
             "ctx-test".to_owned(),
             "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
         )
@@ -556,7 +580,6 @@ mod wasm_tests {
         assert_eq!(result.status(), "active");
         assert_eq!(result.platform(), "discord");
         assert_eq!(result.mode(), "relay");
-        assert!(result.bridge_id().starts_with("bridge-discord-"));
     }
 
     #[test]
@@ -565,6 +588,7 @@ mod wasm_tests {
             bridge_register(
                 "ctx-test".to_owned(),
                 "did:key:operator".to_owned(),
+                "did:key:governance".to_owned(),
                 "discord".to_owned(),
                 "invalid".to_owned(),
             )
@@ -578,10 +602,28 @@ mod wasm_tests {
             bridge_register(
                 String::new(),
                 "did:key:operator".to_owned(),
+                "did:key:governance".to_owned(),
                 "discord".to_owned(),
                 "relay".to_owned(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn register_self_approval_errors() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:operator".to_owned(),
+            "discord".to_owned(),
+            "relay".to_owned(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("self-approval"),
+            "expected self-approval error, got: {err}"
         );
     }
 
@@ -667,6 +709,7 @@ mod wasm_tests {
             let result = bridge_register(
                 "ctx-test".to_owned(),
                 "did:key:op".to_owned(),
+                "did:key:gov".to_owned(),
                 "slack".to_owned(),
                 mode.to_owned(),
             )
