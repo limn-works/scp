@@ -413,11 +413,15 @@ pub fn context_subscribe(
 ///
 /// Delegates to `WasmContextManager::member_count`.
 #[wasm_bindgen]
-pub fn context_member_count(handle: &WasmContextHandle) -> Option<u64> {
+pub fn context_member_count(handle: &WasmContextHandle) -> Option<u32> {
     let context_id = handle.context_id();
-    with_manager(|mgr| Ok(mgr.member_count(&context_id).map(|c| c as u64)))
-        .ok()
-        .flatten()
+    with_manager(|mgr| {
+        Ok(mgr
+            .member_count(&context_id)
+            .map(|c| u32::try_from(c).unwrap_or(u32::MAX)))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Returns `true` if the DID is a member of the context.
@@ -1051,22 +1055,27 @@ pub fn context_import(data: Vec<u8>) -> Promise {
 
 /// Returns the remaining TTL in seconds, or `null` if no TTL.
 #[wasm_bindgen]
-pub fn context_ttl_remaining(handle: &WasmContextHandle) -> Option<u64> {
+pub fn context_ttl_remaining(handle: &WasmContextHandle) -> Option<u32> {
     let context_id = handle.context_id();
-    with_manager(|mgr| Ok(mgr.ttl_remaining(&context_id)))
-        .ok()
-        .flatten()
+    with_manager(|mgr| {
+        Ok(mgr
+            .ttl_remaining(&context_id)
+            .map(|t| u32::try_from(t).unwrap_or(u32::MAX)))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Extends the TTL by the given number of seconds.
 ///
 /// Returns `true` if the extension was applied.
 #[wasm_bindgen]
-pub fn context_extend_ttl(handle: &WasmContextHandle, additional_secs: u64) -> Promise {
+pub fn context_extend_ttl(handle: &WasmContextHandle, additional_secs: u32) -> Promise {
     let context_id = handle.context_id();
+    let additional_secs_u64 = u64::from(additional_secs);
 
     future_to_promise(async move {
-        let applied = with_manager(|mgr| mgr.extend_ttl(&context_id, additional_secs))
+        let applied = with_manager(|mgr| mgr.extend_ttl(&context_id, additional_secs_u64))
             .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::from_bool(applied))
     })
@@ -1095,16 +1104,17 @@ pub fn context_handle_ttl_expiry(handle: &WasmContextHandle) -> Promise {
 pub fn context_propose_ttl_extension(
     handle: &WasmContextHandle,
     proposer_did: String,
-    extension_secs: u64,
+    extension_secs: u32,
 ) -> Promise {
     if let Err(e) = validate_did(&proposer_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
+    let extension_secs_u64 = u64::from(extension_secs);
 
     future_to_promise(async move {
         let applied = with_manager(|mgr| {
-            mgr.propose_ttl_extension(&context_id, &proposer_did, extension_secs)
+            mgr.propose_ttl_extension(&context_id, &proposer_did, extension_secs_u64)
         })
         .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::from_bool(applied))
@@ -1115,11 +1125,12 @@ pub fn context_propose_ttl_extension(
 ///
 /// Replaces the context's TTL with the given value.
 #[wasm_bindgen]
-pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u64) -> Promise {
+pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u32) -> Promise {
     let context_id = handle.context_id();
+    let new_duration_secs_u64 = u64::from(new_duration_secs);
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.reset_ttl_timer(&context_id, new_duration_secs))
+        with_manager(|mgr| mgr.reset_ttl_timer(&context_id, new_duration_secs_u64))
             .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
