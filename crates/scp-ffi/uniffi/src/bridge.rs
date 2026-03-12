@@ -4743,13 +4743,15 @@ pub async fn governance_execute(
     handle: Arc<ContextHandle>,
     proposal_json: String,
 ) -> Result<String, ScpError> {
-    runtime()
+    let context_id = handle.context_id.clone();
+
+    let result = runtime()
         .spawn(async move {
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
             let manager = crate::runtime::context_manager();
             let result = manager
-                .execute_governance_action(&handle.context_id, &proposal)
+                .execute_governance_action(&context_id, &proposal)
                 .await
                 .map_err(ScpError::from)?;
             // Serialize the result variant name for the caller.
@@ -4790,7 +4792,19 @@ pub async fn governance_execute(
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance execution: {e}"),
             code: "SCP-CTX-2032".to_owned(),
-        })?
+        })?;
+
+    // Re-sync role state from ContextManager after governance execution (#796).
+    // Governance actions may modify roles/membership; without this sync the
+    // Swift/Kotlin SDKs see stale role state for UCAN/tool capability checks.
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        tracing::warn!(
+            context_id = %handle.context_id,
+            "failed to sync role state after governance execution: {e}"
+        );
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
