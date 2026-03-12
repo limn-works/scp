@@ -80,8 +80,8 @@ impl WasmEvent {
 
     #[must_use]
     #[wasm_bindgen(getter)]
-    pub fn sequence(&self) -> u64 {
-        self.sequence
+    pub fn sequence(&self) -> u32 {
+        u32::try_from(self.sequence).unwrap_or(u32::MAX)
     }
 }
 
@@ -158,8 +158,8 @@ impl WasmCheckpoint {
 
     #[must_use]
     #[wasm_bindgen(getter, js_name = "eventCount")]
-    pub fn event_count(&self) -> u64 {
-        self.event_count
+    pub fn event_count(&self) -> u32 {
+        u32::try_from(self.event_count).unwrap_or(u32::MAX)
     }
 
     #[must_use]
@@ -170,8 +170,8 @@ impl WasmCheckpoint {
 
     #[must_use]
     #[wasm_bindgen(getter)]
-    pub fn epoch(&self) -> Option<u64> {
-        self.epoch
+    pub fn epoch(&self) -> Option<u32> {
+        self.epoch.map(|e| u32::try_from(e).unwrap_or(u32::MAX))
     }
 
     #[must_use]
