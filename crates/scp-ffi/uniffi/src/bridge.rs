@@ -27,10 +27,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
-use scp_identity::{DidCache, InMemoryDhtClient};
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::IdentityError;
+use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
+use scp_identity::{DidCache, InMemoryDhtClient};
 use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 #[cfg(feature = "allow_in_memory_custody")]
