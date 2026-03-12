@@ -106,34 +106,50 @@ fn parse_test_vectors(def: &serde_json::Value) -> Result<Vec<runtime::TestVector
     Ok(vectors)
 }
 
+/// Parsed provenance fields: `(implementation_hash, signature, economic_metadata, registered_at)`.
+type ProvenanceFields = ([u8; 32], Vec<u8>, Option<runtime::ToolEconomicMetadata>, u64);
+
 /// Parses optional provenance and economic fields from the definition JSON.
 ///
-/// Returns `(implementation_hash, signature, economic_metadata, registered_at)`.
-fn parse_provenance_fields(
-    def: &serde_json::Value,
-) -> (
-    [u8; 32],
-    Vec<u8>,
-    Option<runtime::ToolEconomicMetadata>,
-    u64,
-) {
-    let implementation_hash = def
-        .get("implementationHash")
-        .and_then(|v| v.as_str())
-        .and_then(|hex_str| {
-            let bytes = hex::decode(hex_str).ok()?;
-            <[u8; 32]>::try_from(bytes.as_slice()).ok()
-        })
-        .unwrap_or([0u8; 32]);
+/// When a field is absent, a safe default is used. When a field is present but
+/// malformed, returns `SCP-VALID-7038`.
+fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, JsValue> {
+    let implementation_hash = match def.get("implementationHash").and_then(|v| v.as_str()) {
+        None => [0u8; 32],
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid 'implementationHash': invalid hex: {e}"),
+                    code: "SCP-VALID-7038".to_owned(),
+                }
+                .into_js()
+            })?;
+            <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                ScpWasmError::Validation {
+                    message: format!(
+                        "invalid 'implementationHash': must be exactly 32 bytes, got {}",
+                        bytes.len()
+                    ),
+                    code: "SCP-VALID-7038".to_owned(),
+                }
+                .into_js()
+            })?
+        }
+    };
 
-    let signature = def
-        .get("signature")
-        .and_then(|v| v.as_str())
-        .and_then(|b64| {
+    let signature = match def.get("signature").and_then(|v| v.as_str()) {
+        None => Vec::new(),
+        Some(b64) => {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.decode(b64).ok()
-        })
-        .unwrap_or_default();
+            base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid 'signature': invalid base64: {e}"),
+                    code: "SCP-VALID-7038".to_owned(),
+                }
+                .into_js()
+            })?
+        }
+    };
 
     let economic_metadata = def.get("economicMetadata").and_then(|em| {
         let cost_per_invoke = em.get("costPerInvoke")?.as_u64()?;
@@ -154,12 +170,12 @@ fn parse_provenance_fields(
     // crate::time module docs.
     let registered_at = crate::time::now_ms_u64();
 
-    (
+    Ok((
         implementation_hash,
         signature,
         economic_metadata,
         registered_at,
-    )
+    ))
 }
 
 /// Validates a required JSON Schema field from a definition object, returning
@@ -265,7 +281,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         let test_vectors = parse_test_vectors(&def)?;
         let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
         let (implementation_hash, signature, economic_metadata, registered_at) =
-            parse_provenance_fields(&def);
+            parse_provenance_fields(&def)?;
 
         let registration = runtime::ToolRegistration {
             tool_id: tool_id.clone(),
