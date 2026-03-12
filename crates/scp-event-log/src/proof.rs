@@ -13,6 +13,8 @@
 //!
 //! See ADR-011 in `.docs/adrs/phase-2.md` for the full design.
 
+use subtle::ConstantTimeEq;
+
 use super::{EventLog, EventLogError};
 use crate::tree;
 
@@ -345,7 +347,8 @@ pub fn verify_inclusion(proof: &InclusionProof) -> bool {
         };
     }
 
-    current_hash == proof.root
+    // Constant-time comparison to prevent timing side-channels.
+    current_hash.ct_eq(&proof.root).into()
 }
 
 /// Generates a consistency proof between two tree sizes (CT-style per RFC 6962).
@@ -429,13 +432,15 @@ pub fn verify_consistency(proof: &ConsistencyProof) -> bool {
     #[allow(clippy::cast_possible_truncation)]
     let old_end = proof.old_size as usize;
     let reconstructed_old = compute_root_from_leaves(&proof.leaf_hashes[..old_end]);
-    if reconstructed_old != proof.old_root {
+    // Constant-time comparison to prevent timing side-channels.
+    if !bool::from(reconstructed_old.ct_eq(&proof.old_root)) {
         return false;
     }
 
     // Reconstruct the new root from all new_size leaf hashes.
     let reconstructed_new = compute_root_from_leaves(&proof.leaf_hashes);
-    if reconstructed_new != proof.new_root {
+    // Constant-time comparison to prevent timing side-channels.
+    if !bool::from(reconstructed_new.ct_eq(&proof.new_root)) {
         return false;
     }
 

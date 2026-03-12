@@ -34,6 +34,7 @@ jsonschema = { workspace = true }
 hex = { workspace = true }
 scp-ffi-common = { path = "../common", default-features = false }
 zeroize = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

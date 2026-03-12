@@ -654,7 +654,8 @@ pub fn verify_inclusion(proof: &InclusionProof) -> bool {
         };
     }
 
-    current_hash == proof.root
+    // Constant-time comparison to prevent timing side-channels.
+    subtle::ConstantTimeEq::ct_eq(&current_hash[..], &proof.root[..]).into()
 }
 
 // ---------------------------------------------------------------------------

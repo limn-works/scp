@@ -28,6 +28,7 @@
 //! See ADR-030 in `.docs/adrs/phase-6.md`.
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::checkpoint::{ConsistencyCheckpoint, TruncatedEventLog};
 use super::proof::{Direction, ProofStep};
@@ -352,7 +353,8 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
         };
     }
 
-    current_hash == proof.checkpoint_merkle_root
+    // Constant-time comparison to prevent timing side-channels.
+    current_hash.ct_eq(&proof.checkpoint_merkle_root).into()
 }
 
 // ---------------------------------------------------------------------------
