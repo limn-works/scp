@@ -91,8 +91,7 @@ pub struct NapiUcanTokenData {
 pub struct NapiUcanToken {
     /// Stable token metadata.
     pub(crate) data: NapiUcanTokenData,
-    /// Raw encoded JWT string — retained for validation operations.
-    #[allow(dead_code)]
+    /// Raw encoded JWT string — retained for validation and delegation operations.
     encoded: String,
 }
 
@@ -112,10 +111,30 @@ impl NapiUcanToken {
     }
 
     /// Returns the token's unique ID.
+    ///
+    /// Exposed as both `id` (matching the SDK `UcanToken` interface) and
+    /// `tokenId` (legacy alias for backward compatibility).
+    #[napi(getter)]
+    #[must_use]
+    pub fn id(&self) -> String {
+        self.data.token_id.clone()
+    }
+
+    /// Returns the token's unique ID (legacy alias for `id`).
     #[napi(getter, js_name = "tokenId")]
     #[must_use]
     pub fn token_id(&self) -> String {
         self.data.token_id.clone()
+    }
+
+    /// Returns the encoded JWT string for this token.
+    ///
+    /// Needed for delegation (`delegateUcan` passes `originalToken.encoded`)
+    /// and revocation operations.
+    #[napi(getter)]
+    #[must_use]
+    pub fn encoded(&self) -> String {
+        self.encoded.clone()
     }
 
     /// Returns the issuer DID.
@@ -971,6 +990,200 @@ mod tests {
         assert!(
             checker_says_revoked,
             "token revoked via ucan_revoke must be detected by ucan_validate's revocation checker"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity registry — delegator != creator regression test (#771)
+    //
+    // The previous code used `handle.signing_key` (the context creator's key)
+    // for all UCAN delegation signing. When the delegator is different from the
+    // context creator, this produced tokens with invalid signatures. The fix
+    // (in this PR) looks up the delegator's identity via IDENTITY_REGISTRY.
+    // This test verifies the registry correctly distinguishes different DIDs.
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[test]
+    fn identity_registry_returns_correct_identity_for_different_dids() {
+        use std::sync::Arc;
+
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use crate::runtime;
+        use scp_identity::DidMethod;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        // Create two distinct identities (creator and delegator).
+        let custody_a = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody_b = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+
+        let dht_a = scp_identity::DidDht::new();
+        let dht_b = scp_identity::DidDht::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (identity_a, _doc_a) = rt.block_on(dht_a.create(&custody_a.0)).unwrap();
+        let (identity_b, _doc_b) = rt.block_on(dht_b.create(&custody_b.0)).unwrap();
+
+        // Verify different DIDs were generated.
+        assert_ne!(
+            identity_a.did, identity_b.did,
+            "two identities must have different DIDs"
+        );
+
+        let did_a = identity_a.did.clone();
+        let did_b = identity_b.did.clone();
+
+        // Register both in the global identity registry.
+        runtime::register_identity(
+            &did_a,
+            runtime::NapiIdentityEntry {
+                identity: identity_a,
+                custody: Arc::clone(&custody_a),
+            },
+        );
+        runtime::register_identity(
+            &did_b,
+            runtime::NapiIdentityEntry {
+                identity: identity_b,
+                custody: Arc::clone(&custody_b),
+            },
+        );
+
+        // Look up identity A — must get A's DID, not B's.
+        let looked_up_did_a = runtime::with_identity(&did_a, |entry| {
+            Ok(entry.identity.did.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            looked_up_did_a, did_a,
+            "registry must return identity A's DID for A's DID"
+        );
+
+        // Look up identity B — must get B's DID, not A's.
+        let looked_up_did_b = runtime::with_identity(&did_b, |entry| {
+            Ok(entry.identity.did.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            looked_up_did_b, did_b,
+            "registry must return identity B's DID for B's DID"
+        );
+
+        // Cross-check: the custody Arc pointers must be different,
+        // confirming different key material is returned for each DID.
+        let custody_ptr_a = runtime::with_identity(&did_a, |entry| {
+            Ok(Arc::as_ptr(&entry.custody) as usize)
+        })
+        .unwrap();
+        let custody_ptr_b = runtime::with_identity(&did_b, |entry| {
+            Ok(Arc::as_ptr(&entry.custody) as usize)
+        })
+        .unwrap();
+        assert_ne!(
+            custody_ptr_a, custody_ptr_b,
+            "different identities in the registry must have different custody providers — \
+             a mismatch here indicates the delegator != creator bug class"
+        );
+
+        // Clean up: remove both identities from the registry.
+        runtime::remove_identity(&did_a);
+        runtime::remove_identity(&did_b);
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_identity cleanup (#771 review finding 4)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[test]
+    fn remove_identity_cleans_up_registry() {
+        use std::sync::Arc;
+
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use crate::runtime;
+        use scp_identity::DidMethod;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let dht = scp_identity::DidDht::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (identity, _doc) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let did = identity.did.clone();
+
+        // Register the identity.
+        runtime::register_identity(
+            &did,
+            runtime::NapiIdentityEntry {
+                identity,
+                custody: Arc::clone(&custody),
+            },
+        );
+
+        // Verify it is present.
+        assert!(
+            runtime::with_identity(&did, |_| Ok(())).is_ok(),
+            "identity should be found after registration"
+        );
+
+        // Remove it.
+        runtime::remove_identity(&did);
+
+        // Verify it is gone.
+        assert!(
+            runtime::with_identity(&did, |_| Ok(())).is_err(),
+            "identity should not be found after remove_identity"
+        );
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[test]
+    fn remove_identity_if_present_returns_correct_bool() {
+        use std::sync::Arc;
+
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use crate::runtime;
+        use scp_identity::DidMethod;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let dht = scp_identity::DidDht::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (identity, _doc) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let did = identity.did.clone();
+
+        // Register the identity.
+        runtime::register_identity(
+            &did,
+            runtime::NapiIdentityEntry {
+                identity,
+                custody: Arc::clone(&custody),
+            },
+        );
+
+        // First removal should return true.
+        assert!(
+            runtime::remove_identity_if_present(&did),
+            "remove_identity_if_present should return true for present identity"
+        );
+
+        // Second removal should return false.
+        assert!(
+            !runtime::remove_identity_if_present(&did),
+            "remove_identity_if_present should return false for absent identity"
         );
     }
 }

@@ -332,6 +332,16 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Update the identity registry with the new key state so that
+            // bridge functions (ucan_delegate, etc.) see the updated identity.
+            crate::runtime::register_identity(
+                &new_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: new_identity.clone(),
+                    custody: Arc::clone(&custody),
+                },
+            );
+
             let handle = Self {
                 inner: Arc::new(NapiIdentityInner {
                     did: new_identity.did.clone(),
@@ -383,6 +393,15 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Update the identity registry with the rotated key state.
+            crate::runtime::register_identity(
+                &new_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: new_identity.clone(),
+                    custody: Arc::clone(&custody),
+                },
+            );
+
             let handle = Self {
                 inner: Arc::new(NapiIdentityInner {
                     did: new_identity.did.clone(),
@@ -433,6 +452,15 @@ impl NapiIdentity {
                 .remove_agent_key(&scp_identity, &document)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            // Update the identity registry with the post-removal key state.
+            crate::runtime::register_identity(
+                &new_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: new_identity.clone(),
+                    custody: Arc::clone(&custody),
+                },
+            );
 
             let handle = Self {
                 inner: Arc::new(NapiIdentityInner {
@@ -908,6 +936,53 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
         has_agent_key,
         agent_public_key,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Identity cleanup — remove_identity (#771 review finding 4)
+// ---------------------------------------------------------------------------
+
+/// Removes an identity from the global identity registry.
+///
+/// Drops the retained key material (`InMemoryKeyCustody`) and `ScpIdentity`
+/// for the specified DID. This is the NAPI equivalent of the `PyO3` bridge's
+/// `remove_identity` function.
+///
+/// Call this during DID migration (to clean up the old DID) or when an
+/// identity is no longer needed. Prevents memory leaks of private key
+/// material in long-running processes.
+///
+/// Idempotent: succeeds silently if the DID is not in the registry.
+///
+/// # Arguments
+///
+/// * `did` — The DID string to remove from the registry.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityRemove")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub fn identity_remove(did: String) {
+    crate::runtime::remove_identity(&did);
+}
+
+/// Removes an identity from the global identity registry if present.
+///
+/// Returns `true` if the identity was found and removed, `false` if the DID
+/// was not in the registry. Useful for conditional cleanup where callers need
+/// to know whether the identity existed.
+///
+/// # Arguments
+///
+/// * `did` — The DID string to remove from the registry.
+///
+/// # Returns
+///
+/// `true` if the identity was present and removed, `false` otherwise.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityRemoveIfPresent")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub fn identity_remove_if_present(did: String) -> bool {
+    crate::runtime::remove_identity_if_present(&did)
 }
 
 // ---------------------------------------------------------------------------

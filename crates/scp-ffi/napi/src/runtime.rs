@@ -156,6 +156,30 @@ pub(crate) fn register_identity(did: &str, entry: NapiIdentityEntry) {
     identity_registry().insert(did.to_owned(), entry);
 }
 
+/// Removes an identity from the global identity registry.
+///
+/// Called when an identity is migrated to a new DID or during cleanup.
+/// The old entry is removed and its key material is dropped.
+///
+/// Idempotent: no-op if the DID is not present.
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) fn remove_identity(did: &str) {
+    identity_registry().remove(did);
+}
+
+/// Removes an identity from the global identity registry if present.
+///
+/// Returns `true` if the identity was found and removed, `false` if the
+/// DID was not in the registry.
+///
+/// Provided as a cleanup mechanism for long-running processes alongside
+/// [`remove_identity`] which is unconditional.
+#[cfg(feature = "allow_in_memory_custody")]
+#[must_use]
+pub(crate) fn remove_identity_if_present(did: &str) -> bool {
+    identity_registry().remove(did).is_some()
+}
+
 /// Executes a closure with a reference to an identity's retained state.
 ///
 /// Looks up the identity by DID in the global registry and calls `f` with
