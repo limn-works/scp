@@ -1,7 +1,7 @@
 //! Storage conformance test macro.
 //!
-//! The [`storage_conformance`] macro generates 13 test cases that validate
-//! any [`Storage`](scp_platform::Storage) implementation against the protocol
+//! The `storage_conformance` macro generates 13 test cases that validate
+//! any `Storage` implementation against the protocol
 //! specification (sections 17.11, 17.13):
 //!
 //! 1. Store/retrieve roundtrip
@@ -21,13 +21,13 @@
 //! See spec sections 17.11 (Custom Storage Adapters), 17.13 (Storage
 //! Conformance Extensions), and ADR-006.
 
-/// Generates 13 conformance tests for a [`Storage`](scp_platform::Storage)
+/// Generates 13 conformance tests for a `Storage`
 /// implementation.
 ///
 /// # Arguments
 ///
 /// The macro takes a single expression that evaluates to an instance of a type
-/// implementing [`Storage`]. This expression is called once per test to create
+/// implementing `Storage`. This expression is called once per test to create
 /// a fresh storage instance with no pre-existing data.
 ///
 /// # Example

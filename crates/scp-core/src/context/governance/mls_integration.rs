@@ -217,7 +217,7 @@ pub fn generate_mls_operations(
 /// # Concurrency
 ///
 /// The coordinator is intentionally not `Arc<Mutex<_>>` -- it does not hold
-/// locks across async boundaries. The [`ContextManager`] serializes governance
+/// locks across async boundaries. The [`crate::context::manager::ContextManager`] serializes governance
 /// and MLS operations through its own lock, calling into the coordinator
 /// synchronously within that scope. This avoids deadlock between governance
 /// and MLS state machines.

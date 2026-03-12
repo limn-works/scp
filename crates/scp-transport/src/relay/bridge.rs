@@ -120,7 +120,7 @@ pub struct BridgeRegistration {
     pub signature: [u8; 64],
 
     /// Unix timestamp (seconds since epoch) included in the signed payload.
-    /// Must be within [`BRIDGE_REGISTER_REPLAY_WINDOW_SECS`] of the server's
+    /// Must be within `BRIDGE_REGISTER_REPLAY_WINDOW_SECS` of the server's
     /// current time to prevent replay attacks.
     pub timestamp: u64,
 }
@@ -324,7 +324,7 @@ impl BridgeRegistry {
     ///
     /// Returns [`TransportError::ProtocolError`] if:
     /// - The authentication proof is missing or invalid (SCP-247).
-    /// - The connection has exceeded [`MAX_REGISTRATIONS_PER_CONNECTION`].
+    /// - The connection has exceeded `MAX_REGISTRATIONS_PER_CONNECTION`.
     /// - The global `max_registrations` limit has been reached.
     pub async fn register(
         &self,

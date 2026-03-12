@@ -138,7 +138,7 @@ pub struct MlsStorageBridge<S: Storage> {
 impl<S: Storage> MlsStorageBridge<S> {
     /// Creates a new `MlsStorageBridge` for the given context.
     ///
-    /// Validates the `context_id` via [`sanitize_key_component`] to prevent
+    /// Validates the `context_id` via [`crate::store::sanitize_key_component`] to prevent
     /// namespace escape in storage keys. All storage keys will be prefixed
     /// with `mls/{context_id}/`.
     ///

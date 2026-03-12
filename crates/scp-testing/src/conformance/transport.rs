@@ -1,7 +1,7 @@
 //! Transport adapter conformance test macro.
 //!
-//! The [`transport_conformance`] macro generates 6 test cases that validate
-//! any [`TransportAdapter`](scp_transport::TransportAdapter) implementation
+//! The `transport_conformance` macro generates 6 test cases that validate
+//! any `TransportAdapter` implementation
 //! against the protocol specification (ADR-005, spec section 16.12.1):
 //!
 //! 1. `send_subscribe_roundtrip` — send an envelope, subscribe to its `routing_id`, verify delivery
@@ -13,12 +13,12 @@
 //!
 //! See ADR-005 in `.docs/adrs/phase-1.md` for transport abstraction design.
 
-/// Generates 6 conformance tests for a [`TransportAdapter`] implementation.
+/// Generates 6 conformance tests for a `TransportAdapter` implementation.
 ///
 /// # Arguments
 ///
 /// The macro takes a single expression that evaluates to an instance of a type
-/// implementing [`TransportAdapter`]. This expression is called once per test
+/// implementing `TransportAdapter`. This expression is called once per test
 /// to create a fresh adapter with no pre-existing state.
 ///
 /// # Example

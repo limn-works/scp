@@ -44,12 +44,12 @@
 //! tokio's multi-thread runtime. Therefore, this bridge does NOT directly
 //! depend on `scp-core`. Instead:
 //!
-//! 1. Opaque JS handle types ([`WasmIdentity`], [`WasmContextHandle`], etc.)
+//! 1. Opaque JS handle types ([`identity::WasmIdentity`], `WasmContextHandle`, etc.)
 //!    establish the stable ABI boundary.
 //! 2. Bridge stub functions return typed errors documenting the JS-side
 //!    implementation pattern (`WebCrypto`, Fetch API, WebSocket).
-//! 3. JS callback injection types ([`JsKeyCustody`], [`JsStorage`],
-//!    [`JsMessageCallback`]) define the TypeScript wrapper's responsibility.
+//! 3. JS callback injection types ([`custody::JsKeyCustody`], [`storage::JsStorage`],
+//!    `JsMessageCallback`) define the TypeScript wrapper's responsibility.
 //!
 //! The JS callback injection pattern is the permanent WASM architecture per
 //! ADR-022: browser-native APIs (`WebCrypto`, OPFS, WebSocket) are injected from
@@ -72,22 +72,39 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.
 
+/// Bridge connector operations (registration, trust evaluation, shadow identities).
 pub mod bridge;
+/// Context lifecycle and messaging (create, join, leave, close, send, subscribe).
 pub mod context;
+/// JS-injected key custody callback types (`WebCrypto` integration).
 pub mod custody;
+/// Context discovery operations.
 pub mod discovery;
+/// Error hierarchy and `ScpWasmError` to `JsError` mapping.
 pub mod error;
+/// Event log queries, Merkle proofs, and consistency checkpoints.
 pub mod event_log;
+/// Identity lifecycle (create, load, resolve, agent key management).
 pub mod identity;
+/// Centralized context state manager (`WasmContextManager`).
 pub mod manager;
+/// Provenance metadata operations.
 pub mod provenance;
+/// WASM-local runtime registry (tool registry, event log, schema validation).
 pub mod runtime;
+/// JS-injected storage callback types (OPFS / `IndexedDB` integration).
 pub mod storage;
+/// State synchronization operations.
 pub mod sync;
+/// Platform-agnostic time utilities for WASM.
 pub mod time;
+/// Tool registration, invocation, and verification.
 pub mod tools;
+/// Transport connection and status operations.
 pub mod transport;
+/// Trust engine operations (attestation, challenge, verification).
 pub mod trust;
+/// UCAN token management (validate, mint, revoke, delegate).
 pub mod ucan;
 
 use wasm_bindgen::prelude::*;

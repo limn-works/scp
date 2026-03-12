@@ -41,7 +41,7 @@ const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
 /// Default clock skew tolerance: 5 minutes in seconds (spec section 9.14).
 ///
-/// Applied to `exp` and `nbf` checks in [`verify_expiry`] to accommodate
+/// Applied to `exp` and `nbf` checks in `verify_expiry` to accommodate
 /// NTP desynchronization between issuer and validator in distributed
 /// deployments.
 pub const DEFAULT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5 * 60;
@@ -85,7 +85,7 @@ pub trait DidResolver {
     /// verification method matching this fragment on the DID document and
     /// return its Ed25519 public key bytes.
     ///
-    /// The default implementation falls back to [`resolve_public_key`] when
+    /// The default implementation falls back to [`DidResolver::resolve_public_key`] when
     /// `kid` is `"#active"` (the default key), making this backward-compatible
     /// with existing implementations that only support single-key DIDs.
     ///
@@ -158,7 +158,7 @@ pub struct InMemoryDidResolver {
     pub keys: std::collections::HashMap<String, [u8; 32]>,
     /// Map of `(DID, kid)` to 32-byte Ed25519 public key for specific
     /// verification methods (e.g., `#agent`). Used by
-    /// [`resolve_public_key_by_kid`] when `kid` is not `#active`.
+    /// [`DidResolver::resolve_public_key_by_kid`] when `kid` is not `#active`.
     pub kid_keys: std::collections::HashMap<(String, String), [u8; 32]>,
 }
 

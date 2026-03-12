@@ -124,7 +124,7 @@ impl NatStrategy for FailingNatStrategy {
 /// Creates a domain-mode [`ApplicationNodeBuilder`] with all required fields set.
 ///
 /// Uses [`SucceedingTlsProvider`] and in-memory backends, suitable for most
-/// integration tests that need a running [`ApplicationNode`].
+/// integration tests that need a running `ApplicationNode`.
 #[must_use]
 pub fn test_builder()
 -> ApplicationNodeBuilder<InMemoryKeyCustody, TestDidDht, InMemoryStorage, HasDomain, HasIdentity> {

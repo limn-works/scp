@@ -774,7 +774,7 @@ pub fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
 /// Queries event counts for trust scoring within a context.
 ///
 /// Returns `(message_count, governance_count)` derived from the context's
-/// event log via [`WasmContextManager`]. Returns `(0, 0)` if context not found.
+/// event log via [`crate::manager::WasmContextManager`]. Returns `(0, 0)` if context not found.
 ///
 /// WASM bridge limitation: the event log is a Merkle tree of hashes only
 /// (no per-DID event attribution). Returns total leaf count as

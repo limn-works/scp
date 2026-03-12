@@ -1676,7 +1676,7 @@ impl WasmContextManager {
     /// pipeline). This method is responsible only for:
     /// 1. **Uniqueness** — nonce must not have been seen before.
     /// 2. **Capacity management** — evicts entries older than
-    ///    [`WASM_NONCE_TTL_MS`] when the map exceeds [`WASM_NONCE_CAP`].
+    ///    `WASM_NONCE_TTL_MS` when the map exceeds `WASM_NONCE_CAP`.
     ///
     /// # Errors
     ///
@@ -1718,7 +1718,7 @@ impl WasmContextManager {
     ///
     /// Revocation is idempotent — re-revoking an already-revoked token
     /// succeeds even when the set is at capacity. The set is capped at
-    /// [`WASM_REVOKED_TOKENS_CAP`] entries — overflow of genuinely new
+    /// `WASM_REVOKED_TOKENS_CAP` entries — overflow of genuinely new
     /// tokens returns an error.
     ///
     /// # Errors
@@ -3921,7 +3921,7 @@ impl WasmContextManager {
         Ok(envelope)
     }
 
-    /// Imports a context from serialized JSON bytes produced by [`export_context`].
+    /// Imports a context from serialized JSON bytes produced by `export_context`.
     ///
     /// Deserializes the envelope, validates the version and integrity MAC,
     /// then reconstructs the context state in the manager.

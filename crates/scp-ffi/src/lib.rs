@@ -17,7 +17,7 @@
 //!
 //! # Async runtime
 //!
-//! A single tokio [`Runtime`] is created at module import time and stored in a
+//! A single tokio `Runtime` is created at module import time and stored in a
 //! [`OnceLock`]. Most async bridge functions use synchronous `#[pyfunction]`
 //! with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while
 //! releasing the Python GIL.

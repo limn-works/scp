@@ -105,6 +105,11 @@ const fn default_inner_version() -> u16 {
     SCP_INNER_ENVELOPE_VERSION
 }
 
+/// The authenticated inner envelope visible only to MLS group members.
+///
+/// Carries the sender's DID, sequence numbers, timestamp, padded payload,
+/// provenance metadata, and an Ed25519 signature over a canonical hash of
+/// all critical fields (spec §13.2.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InnerEnvelope {
     /// Protocol version (§13.2.1). SCP/1.0 = `0x0100`.

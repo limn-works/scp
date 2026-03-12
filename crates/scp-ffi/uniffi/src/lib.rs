@@ -54,7 +54,7 @@
 //!
 //! SCP opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
 //! `TransportManager`) track their lifetime via a global reference counter,
-//! [`HANDLE_COUNT`]. Call [`scp_shutdown`] before dropping the tokio runtime
+//! `HANDLE_COUNT`. Call [`scp_shutdown`] before dropping the tokio runtime
 //! to ensure all outstanding FFI handles are released first (see ADR-021
 //! acceptance criterion 1 and sdk-common.md §FFI Async Bridging Risks #4).
 

@@ -42,7 +42,7 @@ use scp_identity::DID;
 /// Policy controlling what happens when the summary verification window TTL
 /// expires before all members have verified.
 ///
-/// Set at context creation in [`ContextParams`] and consumed by the close
+/// Set at context creation in [`super::params::ContextParams`] and consumed by the close
 /// orchestrator. Defaults to [`Proceed`](IncompleteVerificationPolicy::Proceed)
 /// if not specified.
 ///

@@ -1,7 +1,7 @@
 //! Blob store conformance test macro.
 //!
-//! The [`blob_store_conformance`] macro generates 19 test cases that validate
-//! any [`BlobStorage`](scp_transport::native::storage::BlobStorage)
+//! The `blob_store_conformance` macro generates 19 test cases that validate
+//! any `BlobStorage`
 //! implementation against the spec (section 17.11, 17.13):
 //!
 //! 1. `roundtrip` — store/get roundtrip preserves all fields
@@ -26,7 +26,7 @@
 //!
 //! See spec section 17.11 "Custom `BlobStore` Adapters" and 17.13 "Conformance Testing".
 
-/// Generates 19 conformance tests for a [`BlobStorage`] implementation.
+/// Generates 19 conformance tests for a `BlobStorage` implementation.
 ///
 /// # Arguments
 ///

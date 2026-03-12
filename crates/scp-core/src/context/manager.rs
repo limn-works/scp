@@ -2,7 +2,7 @@
 //!
 //! The [`ContextManager`] owns the provider implementations and exposes the
 //! public API for context creation, membership, and messaging. It delegates
-//! to [`builder::create_context`] for the two-phase commit flow.
+//! to [`super::builder::create_context`] for the two-phase commit flow.
 //!
 //! Providers are injected through the constructor, making the manager fully
 //! testable with mock implementations. See ADR-008 in
@@ -1546,7 +1546,7 @@ impl ContextManager {
 
     /// Exports the full state of a context for backup or migration.
     ///
-    /// Returns a [`ContextExport`] containing the context snapshot, serialized
+    /// Returns a [`super::export_import::ContextExport`] containing the context snapshot, serialized
     /// event log entries, and an opaque MLS state blob (empty until MLS
     /// integration lands via #333).
     ///
@@ -1724,7 +1724,7 @@ impl ContextManager {
 
     /// Creates a new SCP context with the two-phase commit pattern.
     ///
-    /// Delegates to [`builder::create_context`] which validates all
+    /// Delegates to [`super::builder::create_context`] which validates all
     /// preconditions (Phase 1), then executes creation steps with ordered
     /// rollback on failure (Phase 2).
     ///
@@ -6459,7 +6459,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError`] wrapping the underlying [`TrustError`] if
+    /// Returns [`ContextError`] wrapping the underlying [`crate::trust::TrustError`] if
     /// signature verification, expiry checks, or revocation checks fail.
     pub fn verify_attestation(
         &self,
@@ -6512,7 +6512,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError`] wrapping the underlying [`TrustError`] if
+    /// Returns [`ContextError`] wrapping the underlying [`crate::trust::TrustError`] if
     /// verification fails.
     pub fn verify_challenge_response(
         &self,

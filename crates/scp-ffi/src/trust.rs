@@ -85,7 +85,7 @@ pub fn py_trust_query_score(py: Python<'_>, did: &str, context_id: &str) -> PyRe
 /// - `error` (Optional[str]): Error message if verification failed, `None`
 ///   if valid.
 ///
-/// Uses the production [`IdentityDidPublicKeyResolver`] for DID key
+/// Uses the production `IdentityDidPublicKeyResolver` for DID key
 /// resolution.
 ///
 /// # Errors
@@ -191,7 +191,7 @@ pub fn py_trust_create_challenge(py: Python<'_>, target_did: &str) -> PyResult<P
 /// if the response is valid (correct responder, within timeout, valid
 /// signature), `False` otherwise.
 ///
-/// Uses the production [`IdentityDidPublicKeyResolver`] for DID key
+/// Uses the production `IdentityDidPublicKeyResolver` for DID key
 /// resolution.
 ///
 /// # Errors
@@ -242,8 +242,8 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 /// Verifies participation profiles against admission requirements.
 ///
 /// Both inputs are JSON strings:
-/// - `profile_json`: JSON array of [`ParticipationProfile`] objects.
-/// - `requirements_json`: JSON array of [`RequireParticipation`] objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
+/// - `requirements_json`: JSON array of `RequireParticipation` objects.
 ///
 /// Uses the current system time for freshness checks. Returns `True` if all
 /// requirements are satisfied, raises `ScpError` with a diagnostic message
@@ -255,7 +255,7 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 ///
 /// Returns `PyValueError` if JSON parsing fails, or `PyRuntimeError` if
 /// participation admission verification fails (with the specific failure
-/// reason from [`ParticipationAdmissionError`]).
+/// reason from `ParticipationAdmissionError`).
 #[pyfunction]
 #[pyo3(name = "verify_participation_requirements")]
 pub fn py_verify_participation_requirements(

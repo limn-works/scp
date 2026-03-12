@@ -2,9 +2,9 @@
 //!
 //! Exposes SCP bridge connector operations to JavaScript (browser target):
 //!
-//! - [`bridge_register`] -- Register a bridge connector with a context.
-//! - [`bridge_evaluate_trust`] -- Evaluate trust level for a bridge action.
-//! - [`bridge_create_shadow`] -- Create a shadow identity.
+//! - `bridge_register` -- Register a bridge connector with a context.
+//! - `bridge_evaluate_trust` -- Evaluate trust level for a bridge action.
+//! - `bridge_create_shadow` -- Create a shadow identity.
 //!
 //! # WASM constraints
 //!
@@ -41,36 +41,42 @@ pub struct WasmBridgeRegistration {
 
 #[wasm_bindgen]
 impl WasmBridgeRegistration {
+    /// Returns the deterministic bridge ID (SHA-256 hex).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "bridge_id")]
     pub fn bridge_id(&self) -> String {
         self.bridge_id.clone()
     }
 
+    /// Returns the DID of the bridge operator.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "operator_did")]
     pub fn operator_did(&self) -> String {
         self.operator_did.clone()
     }
 
+    /// Returns the external platform name (e.g., `"discord"`).
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn platform(&self) -> String {
         self.platform.clone()
     }
 
+    /// Returns the bridge operating mode (e.g., `"relay"`, `"puppet"`).
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn mode(&self) -> String {
         self.mode.clone()
     }
 
+    /// Returns the bridge registration status (e.g., `"active"`).
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn status(&self) -> String {
         self.status.clone()
     }
 
+    /// Returns the context ID the bridge is registered in.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "context_id")]
     pub fn context_id(&self) -> String {
@@ -94,36 +100,42 @@ pub struct WasmShadowIdentity {
 
 #[wasm_bindgen]
 impl WasmShadowIdentity {
+    /// Returns the deterministic shadow identity ID.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "shadow_id")]
     pub fn shadow_id(&self) -> String {
         self.shadow_id.clone()
     }
 
+    /// Returns the external platform handle (e.g., `"@user#1234"`).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "platform_handle")]
     pub fn platform_handle(&self) -> String {
         self.platform_handle.clone()
     }
 
+    /// Returns the bridge ID that created this shadow identity.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "bridge_id")]
     pub fn bridge_id(&self) -> String {
         self.bridge_id.clone()
     }
 
+    /// Returns the context ID for this shadow identity.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "context_id")]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
     }
 
+    /// Returns the attributed role (always `"observer"` for shadows).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "attributed_role")]
     pub fn attributed_role(&self) -> String {
         self.attributed_role.clone()
     }
 
+    /// Returns the provenance status (`"Shadow"` or `"Claimed"`).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "provenance_status")]
     pub fn provenance_status(&self) -> String {

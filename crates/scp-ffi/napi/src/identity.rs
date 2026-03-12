@@ -736,7 +736,7 @@ pub struct NapiDIDDocument {
 /// Creates a new DID identity with the specified custody method.
 ///
 /// For `"in_memory"` custody, this function calls `scp-core` directly using
-/// [`InMemoryKeyCustody`] to generate a real `did:dht` identity on the tokio
+/// `InMemoryKeyCustody` to generate a real `did:dht` identity on the tokio
 /// runtime. The key material is retained inside the returned [`NapiIdentity`]
 /// handle.
 ///

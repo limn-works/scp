@@ -577,7 +577,7 @@ impl PyMessage {
 /// Wraps a `tokio::sync::mpsc::Receiver<PyMessage>` and bridges to Python's
 /// asyncio via the shared tokio runtime.
 ///
-/// Created by [`py_context_receive`] -- not directly constructible from Python.
+/// Created by `py_context_receive` -- not directly constructible from Python.
 ///
 /// # Lifecycle (ADR-014)
 ///

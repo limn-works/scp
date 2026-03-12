@@ -5,8 +5,8 @@
 //! Follows the same synchronous-trait-with-async-bridge pattern used by
 //! `ContextPersistence` in `scp-core`.
 //!
-//! The canonical implementation [`StorageRelayPersistence`] wraps any
-//! [`Storage`](scp_platform::Storage) implementation.
+//! The canonical implementation `StorageRelayPersistence` wraps any
+//! `Storage` implementation.
 
 use std::fmt;
 

@@ -1,7 +1,7 @@
 //! Push notification conformance test macro.
 //!
-//! The [`push_conformance`] macro generates 2 test cases that validate
-//! any [`Push`](scp_platform::Push) implementation against the protocol
+//! The `push_conformance` macro generates 2 test cases that validate
+//! any `Push` implementation against the protocol
 //! specification (ADR-006):
 //!
 //! 1. `register_returns_token` — `register()` returns a non-empty push token
@@ -9,12 +9,12 @@
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
-/// Generates 2 conformance tests for a [`Push`] implementation.
+/// Generates 2 conformance tests for a `Push` implementation.
 ///
 /// # Arguments
 ///
 /// The macro takes a single expression that evaluates to an instance of a type
-/// implementing [`Push`]. This expression is called once per test to create a
+/// implementing `Push`. This expression is called once per test to create a
 /// fresh push notification provider.
 ///
 /// # Example

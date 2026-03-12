@@ -3,29 +3,29 @@
 //! Exposes [`PyIdentity`] and [`PyDIDDocument`] as opaque Python objects with
 //! attribute access, plus bridge functions for identity lifecycle:
 //!
-//! - [`py_identity_create`] — creates a new DID identity.
-//! - [`py_identity_create_with_agent_key`] — creates a new DID identity with
+//! - `py_identity_create` — creates a new DID identity.
+//! - `py_identity_create_with_agent_key` — creates a new DID identity with
 //!   an agent signing key.
-//! - [`py_identity_load`] — loads an existing identity from storage.
-//! - [`py_identity_resolve`] — resolves a DID to its document.
-//! - [`py_identity_rotate_key`] — rotates the identity's active signing key.
-//! - [`py_identity_add_agent_key`] — adds an agent signing key to an identity.
-//! - [`py_identity_rotate_agent_key`] — rotates the agent signing key.
-//! - [`py_identity_remove_agent_key`] — removes the agent signing key.
+//! - `py_identity_load` — loads an existing identity from storage.
+//! - `py_identity_resolve` — resolves a DID to its document.
+//! - `py_identity_rotate_key` — rotates the identity's active signing key.
+//! - `py_identity_add_agent_key` — adds an agent signing key to an identity.
+//! - `py_identity_rotate_agent_key` — rotates the agent signing key.
+//! - `py_identity_remove_agent_key` — removes the agent signing key.
 //!
 //! All async operations run on the shared tokio runtime via
-//! [`crate::runtime()`]. The GIL is released during Rust async execution
+//! `crate::runtime()`. The GIL is released during Rust async execution
 //! via `py.allow_threads()` so Python threads are not blocked.
 //!
 //! # Opaque types
 //!
 //! [`PyIdentity`] stores the DID string and custody type — NOT the raw
-//! [`ScpIdentity`](scp_identity::ScpIdentity), which contains
-//! [`KeyHandle`](scp_platform::KeyHandle)s that are not safe to hold across
+//! [`ScpIdentity`], which contains
+//! `KeyHandle`s that are not safe to hold across
 //! Python GIL boundaries. Crypto operations reconstruct state from stored
 //! metadata when the full runtime is wired.
 //!
-//! [`PyDIDDocument`] wraps [`DidDocument`](scp_identity::DidDocument)
+//! [`PyDIDDocument`] wraps [`DidDocument`]
 //! and exposes safe getters for the document's public fields.
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` and ADR-039 for the full
@@ -90,7 +90,7 @@ fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) {
 ///
 /// Stores the DID string and custody type as safe, cloneable metadata.
 /// Internal key material is NOT stored here — it remains within the
-/// [`KeyCustody`](scp_platform::KeyCustody) boundary. Python code accesses
+/// [`KeyCustody`] boundary. Python code accesses
 /// identity state through getter methods only.
 ///
 /// # Python usage

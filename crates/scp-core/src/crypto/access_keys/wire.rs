@@ -226,8 +226,8 @@ pub fn verify_access_key_request(
 /// Validates that an [`AccessKeyRequest`] timestamp is within the
 /// freshness window.
 ///
-/// Requests older than [`REQUEST_FRESHNESS_SECS`] or more than
-/// [`REQUEST_FRESHNESS_SECS`] in the future are rejected to prevent
+/// Requests older than `REQUEST_FRESHNESS_SECS` or more than
+/// `REQUEST_FRESHNESS_SECS` in the future are rejected to prevent
 /// replay attacks and clock manipulation per spec §9.17.1.
 ///
 /// # Errors

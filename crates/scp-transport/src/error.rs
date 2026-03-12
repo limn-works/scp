@@ -54,7 +54,7 @@ pub enum TransportError {
 
     /// The requested operation is not supported by this transport adapter.
     ///
-    /// Some adapters do not support all five [`TransportAdapter`] methods.
+    /// Some adapters do not support all five `TransportAdapter` methods.
     /// For example, UDP/DTLS (section 10.16.1) cannot maintain long-lived
     /// subscription streams — callers should poll via `query()` instead.
     ///

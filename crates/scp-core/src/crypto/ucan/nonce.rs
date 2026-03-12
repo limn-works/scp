@@ -94,7 +94,7 @@ pub fn generate_nonce() -> Result<String, crate::time::ClockError> {
 /// # Capacity
 ///
 /// The tracker enforces a configurable maximum capacity (default:
-/// [`DEFAULT_MAX_CAPACITY`] = 100 000). When at capacity, a prune pass runs
+/// `DEFAULT_MAX_CAPACITY` = 100 000). When at capacity, a prune pass runs
 /// before inserting; if no entries can be pruned, the tracker returns
 /// [`UcanError::NonceTrackerFull`].
 ///
@@ -105,7 +105,7 @@ pub fn generate_nonce() -> Result<String, crate::time::ClockError> {
 /// now > max(token_expiry + 300, first_seen + 86400)
 /// ```
 ///
-/// Pruning runs automatically every 1000 calls to [`check_and_record`] or
+/// Pruning runs automatically every 1000 calls to `check_and_record` or
 /// every 10 minutes, whichever comes first. It also runs when the tracker
 /// reaches capacity.
 ///
@@ -132,7 +132,7 @@ pub struct NonceTracker<C: Clock> {
 
 impl<C: Clock> NonceTracker<C> {
     /// Creates a new nonce tracker for the given context with the default
-    /// capacity limit ([`DEFAULT_MAX_CAPACITY`]).
+    /// capacity limit (`DEFAULT_MAX_CAPACITY`).
     ///
     /// The tracker starts empty with zero checks and the prune timer set to
     /// the current clock time.
