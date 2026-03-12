@@ -71,26 +71,15 @@ pub fn py_bridge_register(
     let mut registry = BridgeRegistry::new(context_id.to_string());
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bridge_id = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(context_id.as_bytes());
-        hasher.update(operator_did.as_bytes());
-        hasher.update(platform.as_bytes());
-        hasher.update(now_secs.to_be_bytes());
-        hex::encode(hasher.finalize())
-    };
+    let (bridge_id, now_secs) =
+        scp_ffi_common::generate_bridge_id(context_id, operator_did, platform);
     let request = BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.into(),
         platform: platform.to_string(),
         mode: bridge_mode,
         context_id: context_id.to_string(),
-        requested_at: 0,
+        requested_at: now_secs,
         self_hosted: false,
     };
 
@@ -371,5 +360,49 @@ mod tests {
     fn evaluate_trust_claimed_bridged() {
         let result = py_bridge_evaluate_trust(true, false, "claimed").unwrap();
         assert_eq!(result, BridgeTrustLevel::ClaimedBridged as u8);
+    }
+
+    #[test]
+    fn register_bridge_returns_active_with_valid_bridge_id() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let result = py_bridge_register(
+                py,
+                "ctx-test",
+                "did:key:operator",
+                "did:key:governance",
+                "discord",
+                "relay",
+            )
+            .unwrap();
+            let dict = result.bind(py);
+            let status: String = dict.get_item("status").unwrap().unwrap().extract().unwrap();
+            assert_eq!(status, "active");
+            let bridge_id: String = dict
+                .get_item("bridge_id")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            // bridge_id must be a 64-char hex string (SHA-256 output per §12.2.1)
+            assert_eq!(bridge_id.len(), 64);
+            assert!(bridge_id.chars().all(|c| c.is_ascii_hexdigit()));
+        });
+    }
+
+    #[test]
+    fn register_bridge_rejects_self_approval() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let result = py_bridge_register(
+                py,
+                "ctx-test",
+                "did:key:operator",
+                "did:key:operator",
+                "discord",
+                "relay",
+            );
+            assert!(result.is_err());
+        });
     }
 }

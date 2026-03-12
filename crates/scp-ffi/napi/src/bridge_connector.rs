@@ -145,26 +145,15 @@ pub fn bridge_register(
     let mut registry = BridgeRegistry::new(context_id.clone());
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bridge_id = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(context_id.as_bytes());
-        hasher.update(operator_did.as_bytes());
-        hasher.update(platform.as_bytes());
-        hasher.update(now_secs.to_be_bytes());
-        hex::encode(hasher.finalize())
-    };
+    let (bridge_id, now_secs) =
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
     let request = BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
         platform: platform.clone(),
         mode: bridge_mode,
         context_id: context_id.clone(),
-        requested_at: 0,
+        requested_at: now_secs,
         self_hosted: false,
     };
 
