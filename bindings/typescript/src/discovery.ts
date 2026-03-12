@@ -48,11 +48,11 @@ export interface DiscoveryResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Parses a `ResolutionPath` from a snake_case bridge JSON object.
+ * Parses a `ResolutionPath` from a bridge JSON object.
  */
 function parseResolutionPath(raw: Record<string, unknown>): ResolutionPath {
   return {
-    layer: (raw.layer as ResolutionLayer) ?? "domain",
+    layer: (raw.layer as ResolutionLayer) ?? "Domain",
     source: (raw.source as string) ?? "unknown",
     sourceId: (raw.source_id ?? raw.sourceId ?? null) as string | null,
     resolvedAt: (raw.resolved_at ?? raw.resolvedAt ?? 0) as number,
