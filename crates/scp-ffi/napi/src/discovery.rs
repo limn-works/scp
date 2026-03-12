@@ -194,13 +194,13 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
     let val: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid target_json: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: "SCP-VALID-7086".to_owned(),
         })
     })?;
     let target_type = val["type"].as_str().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Validation {
             message: "target_json must have a 'type' field ('identity' or 'context')".to_owned(),
-            code: "SCP-VALID-7050".to_owned(),
+            code: "SCP-VALID-7086".to_owned(),
         })
     })?;
     match target_type {
@@ -208,7 +208,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
             let did = val["did"].as_str().ok_or_else(|| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: "identity target must have a 'did' field".to_owned(),
-                    code: "SCP-VALID-7050".to_owned(),
+                    code: "SCP-VALID-7086".to_owned(),
                 })
             })?;
             Ok(HandleTarget::Identity {
@@ -219,7 +219,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
             let ctx_id = val["context_id"].as_str().ok_or_else(|| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: "context target must have a 'context_id' field".to_owned(),
-                    code: "SCP-VALID-7050".to_owned(),
+                    code: "SCP-VALID-7086".to_owned(),
                 })
             })?;
             let relay_urls = val["relay_urls"]
@@ -237,7 +237,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
         }
         other => Err(napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid target type '{other}': expected 'identity' or 'context'"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: "SCP-VALID-7086".to_owned(),
         })),
     }
 }
@@ -481,13 +481,19 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> napi:
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    if target_did.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "target_did must not be empty".to_owned(),
+            code: "SCP-VALID-7111".to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     let map = guard.entry(owner_did).or_default();
@@ -502,13 +508,13 @@ pub fn petname_remove(owner_did: String, target_did: String) -> napi::Result<()>
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     if let Some(map) = guard.get_mut(&owner_did) {
@@ -528,13 +534,19 @@ pub fn petname_set_context(
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        }));
+    }
+    if context_id.is_empty() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: "context_id must not be empty".to_owned(),
+            code: "SCP-VALID-7113".to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     let map = guard.entry(owner_did).or_default();
@@ -549,13 +561,13 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> napi::Re
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     if let Some(map) = guard.get_mut(&owner_did) {
@@ -571,13 +583,13 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<Stri
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     let dids: Vec<String> = guard
@@ -592,7 +604,7 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<Stri
     serde_json::to_string(&dids).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize petname resolve result: {e}"),
-            code: "SCP-VALID-7074".to_owned(),
+            code: "SCP-VALID-7114".to_owned(),
         })
     })
 }
@@ -604,13 +616,13 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     let ids: Vec<String> = guard
@@ -620,7 +632,7 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<
     serde_json::to_string(&ids).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize petname resolve result: {e}"),
-            code: "SCP-VALID-7074".to_owned(),
+            code: "SCP-VALID-7114".to_owned(),
         })
     })
 }
@@ -632,13 +644,13 @@ pub fn petname_get_for_did(owner_did: String, target_did: String) -> napi::Resul
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     Ok(guard.get(&owner_did).and_then(|map| {
@@ -657,13 +669,13 @@ pub fn petname_get_for_context(
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })
     })?;
     Ok(guard
@@ -808,7 +820,7 @@ pub async fn address_resolve(
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }));
     }
     let known_contexts: HashMap<String, String> = if let Some(ref json) = known_contexts_json {
@@ -832,7 +844,7 @@ pub async fn address_resolve(
         let guard = petname_maps().lock().map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
-                code: "SCP-VALID-7072".to_owned(),
+                code: "SCP-VALID-7112".to_owned(),
             })
         })?;
         guard.get(&owner_did).cloned().unwrap_or_default()

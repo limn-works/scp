@@ -361,14 +361,15 @@ public func removeContextPetname(
 ///   - ownerDid: DID of the identity that owns this petname map.
 ///   - name: The petname to resolve.
 ///   - petnameResolveDidFn: Bridge function override for testing.
-/// - Returns: A JSON string containing an array of DID strings.
+/// - Returns: An array of DID strings.
 /// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
 public func resolvePetnameDid(
     ownerDid: String,
     name: String,
     petnameResolveDidFn: DiscoveryBridge.PetnameResolveDidFn = DiscoveryBridge.defaultPetnameResolveDid
-) throws -> String {
-    try petnameResolveDidFn(ownerDid, name)
+) throws -> [String] {
+    let json = try petnameResolveDidFn(ownerDid, name)
+    return parseJsonStringArray(json)
 }
 
 /// Resolves a petname to a list of context IDs.
@@ -377,14 +378,15 @@ public func resolvePetnameDid(
 ///   - ownerDid: DID of the identity that owns this petname map.
 ///   - name: The petname to resolve.
 ///   - petnameResolveContextFn: Bridge function override for testing.
-/// - Returns: A JSON string containing an array of context ID strings.
+/// - Returns: An array of context ID strings.
 /// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
 public func resolvePetnameContext(
     ownerDid: String,
     name: String,
     petnameResolveContextFn: DiscoveryBridge.PetnameResolveContextFn = DiscoveryBridge.defaultPetnameResolveContext
-) throws -> String {
-    try petnameResolveContextFn(ownerDid, name)
+) throws -> [String] {
+    let json = try petnameResolveContextFn(ownerDid, name)
+    return parseJsonStringArray(json)
 }
 
 /// Gets the petname assigned to a DID, if any.
@@ -491,13 +493,33 @@ public func deregisterHandle(
 ///   - address: The address string to resolve.
 ///   - knownContextsJson: Optional JSON object mapping context IDs to names.
 ///   - addressResolveFn: Bridge function override for testing.
-/// - Returns: A JSON string with an array of ``AddressResolution`` objects.
+/// - Returns: An array of ``AddressResolution`` dictionaries.
 /// - Throws: ``ScpError/Validation(message:code:)`` if resolution fails.
 public func resolveDiscoveryAddress(
     ownerDid: String,
     address: String,
     knownContextsJson: String? = nil,
     addressResolveFn: DiscoveryBridge.AddressResolveFn = DiscoveryBridge.defaultAddressResolve
-) throws -> String {
-    try addressResolveFn(ownerDid, address, knownContextsJson)
+) throws -> [[String: Any]] {
+    let json = try addressResolveFn(ownerDid, address, knownContextsJson)
+    guard let data = json.data(using: .utf8),
+          let parsed = try? JSONSerialization.jsonObject(with: data, options: []),
+          let array = parsed as? [[String: Any]]
+    else {
+        return []
+    }
+    return array
+}
+
+// MARK: - JSON parsing helpers
+
+/// Parses a JSON string containing an array of strings into `[String]`.
+private func parseJsonStringArray(_ json: String) -> [String] {
+    guard let data = json.data(using: .utf8),
+          let parsed = try? JSONSerialization.jsonObject(with: data, options: []),
+          let array = parsed as? [String]
+    else {
+        return []
+    }
+    return array
 }

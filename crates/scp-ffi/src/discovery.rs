@@ -504,14 +504,14 @@ pub fn py_petname_set(owner_did: &str, target_did: &str, name: &str) -> PyResult
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
     if target_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "target_did must not be empty".to_owned(),
-            code: "SCP-VALID-7071".to_owned(),
+            code: "SCP-VALID-7111".to_owned(),
         }
         .into());
     }
@@ -519,7 +519,7 @@ pub fn py_petname_set(owner_did: &str, target_did: &str, name: &str) -> PyResult
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let map = guard.entry(owner_did.to_owned()).or_default();
     map.set_petname(DID::from(target_did), name.to_owned());
@@ -542,7 +542,7 @@ pub fn py_petname_remove(owner_did: &str, target_did: &str) -> PyResult<()> {
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -550,7 +550,7 @@ pub fn py_petname_remove(owner_did: &str, target_did: &str) -> PyResult<()> {
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     if let Some(map) = guard.get_mut(owner_did) {
         map.remove_petname(&DID::from(target_did));
@@ -575,14 +575,14 @@ pub fn py_petname_set_context(owner_did: &str, context_id: &str, name: &str) -> 
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
     if context_id.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7073".to_owned(),
+            code: "SCP-VALID-7113".to_owned(),
         }
         .into());
     }
@@ -590,7 +590,7 @@ pub fn py_petname_set_context(owner_did: &str, context_id: &str, name: &str) -> 
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let map = guard.entry(owner_did.to_owned()).or_default();
     map.set_context_petname(context_id.to_owned(), name.to_owned());
@@ -613,7 +613,7 @@ pub fn py_petname_remove_context(owner_did: &str, context_id: &str) -> PyResult<
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -621,7 +621,7 @@ pub fn py_petname_remove_context(owner_did: &str, context_id: &str) -> PyResult<
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     if let Some(map) = guard.get_mut(owner_did) {
         map.remove_context_petname(&context_id.to_owned());
@@ -652,7 +652,7 @@ pub fn py_petname_resolve_did(owner_did: &str, name: &str) -> PyResult<Vec<Strin
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -660,7 +660,7 @@ pub fn py_petname_resolve_did(owner_did: &str, name: &str) -> PyResult<Vec<Strin
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let dids = guard
         .get(owner_did)
@@ -696,7 +696,7 @@ pub fn py_petname_resolve_context(owner_did: &str, name: &str) -> PyResult<Vec<S
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -704,7 +704,7 @@ pub fn py_petname_resolve_context(owner_did: &str, name: &str) -> PyResult<Vec<S
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let ids = guard
         .get(owner_did)
@@ -733,7 +733,7 @@ pub fn py_petname_get_for_did(owner_did: &str, target_did: &str) -> PyResult<Opt
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -741,7 +741,7 @@ pub fn py_petname_get_for_did(owner_did: &str, target_did: &str) -> PyResult<Opt
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let name = guard.get(owner_did).and_then(|map| {
         map.petname_for_did(&DID::from(target_did))
@@ -770,7 +770,7 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -778,7 +778,7 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let name = guard.get(owner_did).and_then(|map| {
         map.petname_for_context(&context_id.to_owned())
@@ -1064,7 +1064,7 @@ pub fn py_address_resolve(
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         }
         .into());
     }
@@ -1095,7 +1095,7 @@ pub fn py_address_resolve(
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("petname lock poisoned: {e}"),
-                code: "SCP-VALID-7072".to_owned(),
+                code: "SCP-VALID-7112".to_owned(),
             })?;
         guard.get(owner_did).cloned().unwrap_or_default()
     };

@@ -8,6 +8,10 @@
 
 package works.limn.scp
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
 import works.limn.scp.bridge.CoroutineBridge
 
 /**
@@ -240,20 +244,24 @@ class DiscoveryBridge internal constructor(
      *
      * @param ownerDid DID of the identity that owns this petname map.
      * @param name The petname to resolve.
-     * @return JSON string containing an array of DID strings.
+     * @return List of DID strings.
      */
-    suspend fun petnameResolveDid(ownerDid: String, name: String): String =
-        bridge.ffiCall { bindings.petnameResolveDid(ownerDid, name) }
+    suspend fun petnameResolveDid(ownerDid: String, name: String): List<String> {
+        val json = bridge.ffiCall { bindings.petnameResolveDid(ownerDid, name) }
+        return parseJsonStringArray(json)
+    }
 
     /**
      * Resolves a petname to a list of context IDs.
      *
      * @param ownerDid DID of the identity that owns this petname map.
      * @param name The petname to resolve.
-     * @return JSON string containing an array of context ID strings.
+     * @return List of context ID strings.
      */
-    suspend fun petnameResolveContext(ownerDid: String, name: String): String =
-        bridge.ffiCall { bindings.petnameResolveContext(ownerDid, name) }
+    suspend fun petnameResolveContext(ownerDid: String, name: String): List<String> {
+        val json = bridge.ffiCall { bindings.petnameResolveContext(ownerDid, name) }
+        return parseJsonStringArray(json)
+    }
 
     /**
      * Gets the petname assigned to a DID, if any.
@@ -345,14 +353,20 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity whose petname map to consult.
      * @param address The address string to resolve.
      * @param knownContextsJson Optional JSON object mapping context IDs to names.
-     * @return JSON string with an array of AddressResolution objects.
+     * @return List of parsed AddressResolution JSON elements.
      */
     suspend fun addressResolve(
         ownerDid: String,
         address: String,
         knownContextsJson: String? = null,
-    ): String =
-        bridge.ffiCall {
+    ): List<JsonElement> {
+        val json = bridge.ffiCall {
             bindings.addressResolve(ownerDid, address, knownContextsJson)
         }
+        return Json.parseToJsonElement(json).jsonArray.toList()
+    }
 }
+
+/** Parses a JSON string containing an array of strings into a `List<String>`. */
+private fun parseJsonStringArray(json: String): List<String> =
+    Json.parseToJsonElement(json).jsonArray.map { it.jsonPrimitive.content }

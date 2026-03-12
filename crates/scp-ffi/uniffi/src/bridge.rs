@@ -6526,14 +6526,20 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        });
+    }
+    if target_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "target_did must not be empty".to_owned(),
+            code: "SCP-VALID-7111".to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let map = guard.entry(owner_did).or_default();
     map.set_petname(scp_identity::DID::from(target_did.as_str()), name);
@@ -6546,14 +6552,14 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpEr
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     if let Some(map) = guard.get_mut(&owner_did) {
         map.remove_petname(&scp_identity::DID::from(target_did.as_str()));
@@ -6571,14 +6577,20 @@ pub fn petname_set_context(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
+        });
+    }
+    if context_id.is_empty() {
+        return Err(ScpError::Validation {
+            message: "context_id must not be empty".to_owned(),
+            code: "SCP-VALID-7113".to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let map = guard.entry(owner_did).or_default();
     map.set_context_petname(context_id, name);
@@ -6591,14 +6603,14 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     if let Some(map) = guard.get_mut(&owner_did) {
         map.remove_context_petname(&context_id);
@@ -6612,14 +6624,14 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let dids: Vec<String> = guard
         .get(&owner_did)
@@ -6632,7 +6644,7 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
         .unwrap_or_default();
     serde_json::to_string(&dids).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize petname resolve result: {e}"),
-        code: "SCP-VALID-7074".to_owned(),
+        code: "SCP-VALID-7114".to_owned(),
     })
 }
 
@@ -6642,14 +6654,14 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     let ids: Vec<String> = guard
         .get(&owner_did)
@@ -6657,7 +6669,7 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
         .unwrap_or_default();
     serde_json::to_string(&ids).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize petname resolve result: {e}"),
-        code: "SCP-VALID-7074".to_owned(),
+        code: "SCP-VALID-7114".to_owned(),
     })
 }
 
@@ -6670,14 +6682,14 @@ pub fn petname_get_for_did(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     Ok(guard.get(&owner_did).and_then(|map| {
         map.petname_for_did(&scp_identity::DID::from(target_did.as_str()))
@@ -6694,14 +6706,14 @@ pub fn petname_get_for_context(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7072".to_owned(),
+            code: "SCP-VALID-7112".to_owned(),
         })?;
     Ok(guard
         .get(&owner_did)
@@ -6835,7 +6847,7 @@ pub fn address_resolve(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: "SCP-VALID-7110".to_owned(),
         });
     }
 
@@ -6933,7 +6945,7 @@ pub fn address_resolve(
             .lock()
             .map_err(|e| ScpError::Validation {
                 message: format!("petname lock poisoned: {e}"),
-                code: "SCP-VALID-7072".to_owned(),
+                code: "SCP-VALID-7112".to_owned(),
             })?;
         guard.get(&owner_did).cloned().unwrap_or_default()
     };
