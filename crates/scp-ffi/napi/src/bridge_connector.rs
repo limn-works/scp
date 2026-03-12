@@ -135,6 +135,11 @@ pub fn bridge_register(
     platform: String,
     mode: String,
 ) -> napi::Result<NapiBridgeRegistration> {
+    scp_ffi_common::validate::validate_did(&operator_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_did(&governance_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let bridge_mode = parse_bridge_mode(&mode)?;
 
     let mut registry = BridgeRegistry::new(context_id.clone());
@@ -154,9 +159,9 @@ pub fn bridge_register(
     };
 
     let _event = register_bridge(&mut registry, request).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
+        napi::Error::from(ScpNapiError::Context {
             message: format!("bridge registration failed: {e}"),
-            code: "SCP-VALID-7012".to_owned(),
+            code: "SCP-CTX-2100".to_owned(),
         })
     })?;
 

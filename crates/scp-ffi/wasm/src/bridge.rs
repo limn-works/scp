@@ -10,14 +10,16 @@
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
 //! with `wasm32-unknown-unknown`). Bridge connector operations are
-//! re-implemented locally with algorithm-identical logic mirroring the NAPI
-//! bridge (`crates/scp-ffi/napi/src/bridge_connector.rs`).
+//! re-implemented locally with algorithm-identical logic matching the
+//! PyO3/NAPI/UniFFI bridges — including governance DID validation and the
+//! self-approval invariant (ADR-023).
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 
 use wasm_bindgen::prelude::*;
 
 use crate::error::ScpWasmError;
+use scp_ffi_common::validate::validate_did;
 
 // ---------------------------------------------------------------------------
 // Result types — wasm_bindgen structs returned to JS
@@ -325,19 +327,11 @@ pub fn bridge_register(
         }
         .into_js());
     }
-    if operator_did.is_empty() {
-        return Err(ScpWasmError::Validation {
-            message: "operator_did must not be empty".to_owned(),
-            code: "SCP-VALID-7012".to_owned(),
-        }
-        .into_js());
+    if let Err(e) = validate_did(&operator_did) {
+        return Err(ScpWasmError::from(e).into_js());
     }
-    if governance_did.is_empty() {
-        return Err(ScpWasmError::Validation {
-            message: "governance_did must not be empty".to_owned(),
-            code: "SCP-VALID-7012".to_owned(),
-        }
-        .into_js());
+    if let Err(e) = validate_did(&governance_did) {
+        return Err(ScpWasmError::from(e).into_js());
     }
     if platform.is_empty() {
         return Err(ScpWasmError::Validation {

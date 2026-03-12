@@ -63,6 +63,9 @@ pub fn py_bridge_register(
     platform: &str,
     mode: &str,
 ) -> PyResult<Py<PyDict>> {
+    crate::validate::validate_did(operator_did)?;
+    crate::validate::validate_did(governance_did)?;
+
     let bridge_mode = parse_bridge_mode(mode)?;
 
     let mut registry = BridgeRegistry::new(context_id.to_string());
