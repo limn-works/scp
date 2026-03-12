@@ -175,12 +175,12 @@ impl NapiContextHandle {
     ///
     /// The `Result` return type is required by napi-rs. This getter is infallible.
     #[napi(getter, js_name = "memberCount")]
-    pub fn member_count(&self) -> napi::Result<u64> {
+    pub fn member_count(&self) -> napi::Result<u32> {
         let manager = context_manager();
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))
             .unwrap_or(0);
-        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Returns the optional economic policy string.
@@ -668,10 +668,10 @@ pub fn context_subscribe(
 ///
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberCount")]
-pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u64> {
+pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
     let manager = context_manager();
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
-    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// Returns whether a DID is a member of the context.
