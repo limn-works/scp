@@ -120,10 +120,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - name: Install typedoc
+      - name: Install dependencies
         working-directory: bindings/typescript
-        run: |
-          bun add --dev typedoc typedoc-plugin-markdown
+        run: bun install
       - name: Generate docs
         working-directory: bindings/typescript
         run: bunx typedoc
