@@ -127,6 +127,7 @@ pub struct ToolRegistration {
 /// A known input-output pair for tool verification.
 ///
 /// Mirrors `scp_core::context::tools::TestVector`.
+#[derive(Debug)]
 pub struct TestVector {
     /// Input value.
     pub input: serde_json::Value,

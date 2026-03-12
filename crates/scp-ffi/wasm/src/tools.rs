@@ -56,55 +56,115 @@ impl WasmToolVerificationResult {
 // Validation helpers for tool registration inputs
 // ---------------------------------------------------------------------------
 
-/// Parses test vectors from the definition JSON.
+/// Validates a required JSON Schema field from a definition object, returning
+/// the extracted value or a typed `ScpWasmError`.
 ///
-/// Returns an empty `Vec` when the `testVectors` field is absent. Returns
-/// `SCP-VALID-7037` when the field is present but not a valid array of
-/// `{input, expectedOutput}` objects.
-fn parse_test_vectors(def: &serde_json::Value) -> Result<Vec<runtime::TestVector>, JsValue> {
-    let Some(tv_value) = def.get("testVectors") else {
-        return Ok(Vec::new());
+/// Returns `SCP-VALID-7035` for `"schema"` (input) or `SCP-VALID-7036` for
+/// `"outputSchema"` (output) when the field is missing or not a JSON object.
+fn validate_schema_field(
+    def: &serde_json::Value,
+    field_name: &str,
+) -> Result<serde_json::Value, ScpWasmError> {
+    let code = match field_name {
+        "schema" => "SCP-VALID-7035",
+        _ => "SCP-VALID-7036",
     };
-    let arr = tv_value.as_array().ok_or_else(|| {
-        ScpWasmError::Validation {
+
+    let schema = def
+        .get(field_name)
+        .cloned()
+        .ok_or_else(|| ScpWasmError::Validation {
             message: format!(
-                "invalid 'testVectors': expected an array, got {}",
-                json_value_type_name(tv_value)
+                "missing '{field_name}' field in definition — a JSON Schema object is required"
             ),
-            code: "SCP-VALID-7037".to_owned(),
-        }
-        .into_js()
-    })?;
-    let mut vectors = Vec::with_capacity(arr.len());
-    for (i, entry) in arr.iter().enumerate() {
-        let input = entry.get("input").ok_or_else(|| {
-            ScpWasmError::Validation {
-                message: format!("test vector at index {i} is missing required 'input' field"),
-                code: "SCP-VALID-7037".to_owned(),
-            }
-            .into_js()
+            code: code.to_owned(),
         })?;
-        let expected_output = entry.get("expectedOutput").ok_or_else(|| {
-            ScpWasmError::Validation {
-                message: format!(
-                    "test vector at index {i} is missing required 'expectedOutput' field"
-                ),
-                code: "SCP-VALID-7037".to_owned(),
-            }
-            .into_js()
-        })?;
-        vectors.push(runtime::TestVector {
-            input: input.clone(),
-            expected_output: expected_output.clone(),
-            description: entry
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .to_owned(),
+
+    if !schema.is_object() {
+        return Err(ScpWasmError::Validation {
+            message: format!(
+                "invalid '{field_name}': expected a JSON object, got {}",
+                json_value_type_name(&schema)
+            ),
+            code: code.to_owned(),
         });
     }
-    Ok(vectors)
+
+    runtime::validate_schema(&schema).map_err(|e| ScpWasmError::Validation {
+        message: format!("invalid {field_name}: {e}"),
+        code: code.to_owned(),
+    })?;
+
+    Ok(schema)
 }
+
+// ---------------------------------------------------------------------------
+// Test vector validation (extracted for testability on native targets)
+// ---------------------------------------------------------------------------
+
+/// Validates and parses optional test vectors from a JSON definition.
+///
+/// Returns `Ok(Vec<TestVector>)` when `testVectors` is absent or is a valid
+/// array with every entry containing `input`, `expectedOutput`, and
+/// `description` fields. Returns `Err(ScpWasmError::Validation)` with code
+/// `SCP-VALID-7037` on any structural violation.
+fn validate_test_vectors(
+    def: &serde_json::Value,
+) -> Result<Vec<runtime::TestVector>, ScpWasmError> {
+    let Some(tv_val) = def.get("testVectors") else {
+        return Ok(Vec::new());
+    };
+
+    let arr = tv_val.as_array().ok_or_else(|| ScpWasmError::Validation {
+        message: "testVectors must be an array".to_owned(),
+        code: "SCP-VALID-7037".to_owned(),
+    })?;
+
+    arr.iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let input = v.get("input").ok_or_else(|| ScpWasmError::Validation {
+                message: format!("testVectors[{i}] missing required 'input' field"),
+                code: "SCP-VALID-7037".to_owned(),
+            })?;
+            let expected_output =
+                v.get("expectedOutput")
+                    .ok_or_else(|| ScpWasmError::Validation {
+                        message: format!(
+                            "testVectors[{i}] missing required 'expectedOutput' field"
+                        ),
+                        code: "SCP-VALID-7037".to_owned(),
+                    })?;
+            let description = match v.get("description") {
+                Some(d) => d
+                    .as_str()
+                    .ok_or_else(|| ScpWasmError::Validation {
+                        message: format!(
+                            "testVectors[{i}] invalid 'description': expected a string, got {}",
+                            json_value_type_name(d)
+                        ),
+                        code: "SCP-VALID-7037".to_owned(),
+                    })?
+                    .to_owned(),
+                None => {
+                    return Err(ScpWasmError::Validation {
+                        message: format!("testVectors[{i}] missing required 'description' field"),
+                        code: "SCP-VALID-7037".to_owned(),
+                    });
+                }
+            };
+            Ok(runtime::TestVector {
+                input: input.clone(),
+                expected_output: expected_output.clone(),
+                description,
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Provenance field parsing
+// ---------------------------------------------------------------------------
 
 /// Parsed provenance fields: `(implementation_hash, signature, economic_metadata, registered_at)`.
 type ProvenanceFields = (
@@ -210,56 +270,6 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
     ))
 }
 
-/// Validates a required JSON Schema field from a definition object, returning
-/// the extracted value or a typed `ScpWasmError`.
-///
-/// Returns `SCP-VALID-7035` for `"schema"` (input) or `SCP-VALID-7036` for
-/// `"outputSchema"` (output) when the field is missing or not a JSON object.
-fn validate_schema_field(
-    def: &serde_json::Value,
-    field_name: &str,
-) -> Result<serde_json::Value, ScpWasmError> {
-    let code = match field_name {
-        "schema" => "SCP-VALID-7035",
-        _ => "SCP-VALID-7036",
-    };
-
-    let schema = def
-        .get(field_name)
-        .cloned()
-        .ok_or_else(|| ScpWasmError::Validation {
-            message: format!(
-                "missing '{field_name}' field in definition — a JSON Schema object is required"
-            ),
-            code: code.to_owned(),
-        })?;
-
-    if !schema.is_object() {
-        return Err(ScpWasmError::Validation {
-            message: format!(
-                "invalid '{field_name}': expected a JSON object, got {}",
-                json_value_type_name(&schema)
-            ),
-            code: code.to_owned(),
-        });
-    }
-
-    runtime::validate_schema(&schema).map_err(|e| ScpWasmError::Validation {
-        message: format!("invalid {field_name}: {e}"),
-        code: code.to_owned(),
-    })?;
-
-    Ok(schema)
-}
-
-/// Bridge-layer wrapper: extracts a schema field, converting errors to `JsValue`.
-fn extract_schema_field(
-    def: &serde_json::Value,
-    field_name: &str,
-) -> Result<serde_json::Value, JsValue> {
-    validate_schema_field(def, field_name).map_err(|e| e.into_js().into())
-}
-
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
@@ -304,14 +314,35 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 
         validate_tool_name(&name).map_err(|e| ScpWasmError::from(e).into_js())?;
 
-        let description = def["description"].as_str().unwrap_or("").to_owned();
+        let description = match def.get("description") {
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "invalid 'description': expected a string, got {}",
+                            json_value_type_name(v)
+                        ),
+                        code: "SCP-VALID-7000".to_owned(),
+                    }
+                    .into_js()
+                })?
+                .to_owned(),
+            None => String::new(),
+        };
 
-        let input_schema = extract_schema_field(&def, "schema")?;
-        let output_schema = extract_schema_field(&def, "outputSchema")?;
+        let input_schema = validate_schema_field(&def, "schema").map_err(ScpWasmError::into_js)?;
+        let output_schema =
+            validate_schema_field(&def, "outputSchema").map_err(ScpWasmError::into_js)?;
 
         let operator_did = def["operatorDid"].as_str().unwrap_or("").to_owned();
-        let test_vectors = parse_test_vectors(&def)?;
+
+        // Parse test vectors — reject malformed input instead of silently
+        // dropping entries (aligned with NAPI bridge SCP-VALID-7037).
+        let test_vectors = validate_test_vectors(&def).map_err(ScpWasmError::into_js)?;
+
         let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+
         let (implementation_hash, signature, economic_metadata, registered_at) =
             parse_provenance_fields(&def)?;
 
@@ -647,9 +678,9 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Tests for `validate_schema_field`. These test the pure-Rust validation
-/// function which delegates to `runtime::validate_schema` — no wasm-bindgen
-/// imports are called, safe on native targets.
+/// Tests for schema and test vector validation helpers. These test the
+/// pure-Rust validation functions which return `Result<_, ScpWasmError>` —
+/// no wasm-bindgen calls, safe on native targets.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -817,5 +848,171 @@ mod tests {
         let schema = result.unwrap();
         assert!(schema.is_object());
         assert_eq!(schema["type"], "object");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_test_vectors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_test_vectors_absent() {
+        let def = serde_json::json!({});
+        let result = validate_test_vectors(&def);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_test_vectors_accepts_valid() {
+        let def = serde_json::json!({
+            "testVectors": [
+                {
+                    "input": {"x": 1},
+                    "expectedOutput": {"y": 2},
+                    "description": "adds one"
+                }
+            ]
+        });
+        let result = validate_test_vectors(&def);
+        assert!(result.is_ok());
+        let vecs = result.unwrap();
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(vecs[0].description, "adds one");
+    }
+
+    #[test]
+    fn validate_test_vectors_rejects_non_array() {
+        let def = serde_json::json!({
+            "testVectors": "not an array"
+        });
+        let result = validate_test_vectors(&def);
+        assert!(
+            matches!(
+                result,
+                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7037"
+            ),
+            "expected SCP-VALID-7037, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_rejects_missing_input() {
+        let def = serde_json::json!({
+            "testVectors": [
+                {
+                    "expectedOutput": {"y": 2},
+                    "description": "no input"
+                }
+            ]
+        });
+        let result = validate_test_vectors(&def);
+        assert!(
+            matches!(
+                result,
+                Err(ScpWasmError::Validation { ref code, ref message, .. })
+                    if code == "SCP-VALID-7037" && message.contains("'input'")
+            ),
+            "expected SCP-VALID-7037 mentioning 'input', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_rejects_missing_expected_output() {
+        let def = serde_json::json!({
+            "testVectors": [
+                {
+                    "input": {"x": 1},
+                    "description": "no output"
+                }
+            ]
+        });
+        let result = validate_test_vectors(&def);
+        assert!(
+            matches!(
+                result,
+                Err(ScpWasmError::Validation { ref code, ref message, .. })
+                    if code == "SCP-VALID-7037" && message.contains("'expectedOutput'")
+            ),
+            "expected SCP-VALID-7037 mentioning 'expectedOutput', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_rejects_missing_description() {
+        let def = serde_json::json!({
+            "testVectors": [
+                {
+                    "input": {"x": 1},
+                    "expectedOutput": {"y": 2}
+                }
+            ]
+        });
+        let result = validate_test_vectors(&def);
+        assert!(
+            matches!(
+                result,
+                Err(ScpWasmError::Validation { ref code, ref message, .. })
+                    if code == "SCP-VALID-7037" && message.contains("'description'")
+            ),
+            "expected SCP-VALID-7037 mentioning 'description', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_rejects_non_string_description() {
+        let def = serde_json::json!({
+            "testVectors": [
+                {
+                    "input": {"x": 1},
+                    "expectedOutput": {"y": 2},
+                    "description": 42
+                }
+            ]
+        });
+        let result = validate_test_vectors(&def);
+        assert!(
+            matches!(
+                result,
+                Err(ScpWasmError::Validation { ref code, ref message, .. })
+                    if code == "SCP-VALID-7037"
+                        && message.contains("'description'")
+                        && message.contains("number")
+            ),
+            "expected SCP-VALID-7037 mentioning 'description' and type 'number', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_rejects_boolean_description() {
+        let def = serde_json::json!({
+            "testVectors": [
+                {
+                    "input": {"x": 1},
+                    "expectedOutput": {"y": 2},
+                    "description": true
+                }
+            ]
+        });
+        let result = validate_test_vectors(&def);
+        assert!(
+            matches!(
+                result,
+                Err(ScpWasmError::Validation { ref code, ref message, .. })
+                    if code == "SCP-VALID-7037"
+                        && message.contains("'description'")
+                        && message.contains("boolean")
+            ),
+            "expected SCP-VALID-7037 mentioning 'description' and type 'boolean', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_accepts_empty_array() {
+        let def = serde_json::json!({
+            "testVectors": []
+        });
+        let result = validate_test_vectors(&def);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }

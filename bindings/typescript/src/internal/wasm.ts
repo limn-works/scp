@@ -830,6 +830,7 @@ export function createWasmBridge(): Bridge {
         testVectors: definition.testVectors?.map((tv) => ({
           input: tv.input,
           expectedOutput: tv.expectedOutput,
+          description: tv.description,
         })),
       });
       return await wasm.tool_register(handle, definitionJson);
