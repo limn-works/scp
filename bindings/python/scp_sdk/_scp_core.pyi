@@ -1002,6 +1002,7 @@ def py_mcp_serve(
     identity_did: str,
     context_ids: list[str],
     transport: str,
+    ucan_token: str | None = None,
 ) -> str:
     """Start an MCP server exposing SCP contexts.
 
@@ -1012,6 +1013,9 @@ def py_mcp_serve(
         identity_did: The DID of the serving identity.
         context_ids: List of context IDs to expose via MCP.
         transport: Transport mode -- ``"stdio"`` or ``"sse"``.
+        ucan_token: Optional UCAN token (JWT) authorizing the server
+            to act on behalf of the identity. Passed through to the
+            MCP server provider for tool invocation authorization.
 
     Returns:
         An opaque server handle string.
