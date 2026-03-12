@@ -1923,6 +1923,7 @@ impl WasmContextManager {
                 let ctx = self.require_active_context_mut(context_id)?;
                 if let Some(ref mut bc) = ctx.broadcast {
                     bc.authors.remove(did);
+                    bc.key_epochs.remove(did);
                 }
                 ctx.write_revoked_members.insert(did.clone());
                 ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
