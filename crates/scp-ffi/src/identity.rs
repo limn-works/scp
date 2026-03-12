@@ -1043,7 +1043,15 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 did: old_did.clone(),
             };
 
-            let did_method = DidDht::new();
+            let sign_fn =
+                DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    Arc::clone(&custody),
+                );
+            let did_method = DidDht::with_client_and_signer(
+                Arc::new(InMemoryDhtClient::new()),
+                Arc::new(DidCache::new()),
+                sign_fn,
+            );
             let (new_identity, new_document, _rotation_event) = did_method
                 .migrate_identity(
                     &old_identity,
@@ -1228,4 +1236,62 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_identity_verify_device_attestation, m)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    static TEST_INIT: Once = Once::new();
+
+    fn setup() {
+        TEST_INIT.call_once(|| {
+            pyo3::prepare_freethreaded_python();
+            crate::init_runtime().unwrap();
+        });
+    }
+
+    /// Verifies that `py_identity_migrate` succeeds end-to-end.
+    ///
+    /// Before the fix (#777), `py_identity_migrate` used `DidDht::new()`
+    /// which has no signer, causing DHT publish to fail. The fix wires
+    /// `DidDht::with_client_and_signer` with `make_sign_fn` from the
+    /// retained custody. This test calls the actual bridge function to
+    /// confirm the signer is properly wired and migration produces a
+    /// valid new identity.
+    #[test]
+    fn py_identity_migrate_succeeds_with_signer() {
+        setup();
+
+        Python::with_gil(|py| {
+            // Create an identity via the actual bridge function.
+            let original = py_identity_create(py, "in_memory").unwrap();
+            let old_did = original.did.clone();
+            assert!(old_did.starts_with("did:dht:"));
+            assert!(crate::runtime::identity_registry_contains(&old_did));
+
+            // Migrate to a new DID via the actual bridge function.
+            let migrated = py_identity_migrate(py, &original).unwrap();
+            let new_did = migrated.did.clone();
+
+            // New DID is a valid, distinct did:dht.
+            assert!(new_did.starts_with("did:dht:"));
+            assert_ne!(old_did, new_did);
+
+            // Custody type is preserved.
+            assert_eq!(migrated.custody, "in_memory");
+
+            // Old identity removed from registry, new one registered.
+            assert!(!crate::runtime::identity_registry_contains(&old_did));
+            assert!(crate::runtime::identity_registry_contains(&new_did));
+
+            // New identity's registry entry has a valid document.
+            let doc_did =
+                crate::runtime::with_identity(&new_did, |entry| Ok(entry.document.id.clone()))
+                    .unwrap();
+            assert_eq!(doc_did, new_did);
+        });
+    }
 }
