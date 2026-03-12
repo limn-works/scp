@@ -107,7 +107,7 @@ pub enum ScpUriError {
 ///
 /// # Serialization
 ///
-/// [`Display`] always emits the canonical universal format
+/// `Display` always emits the canonical universal format
 /// (`scp://context/...`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScpUri {

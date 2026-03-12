@@ -344,7 +344,7 @@ pub enum ContextEvent {
     /// Emitted after every successful governance action execution so SDK
     /// consumers can observe governance outcomes through the receive buffer.
     /// The `action_summary` is a human-readable description (e.g.,
-    /// `"AddMember"`, `"UpdateParams"`) since the full [`GovernanceAction`]
+    /// `"AddMember"`, `"UpdateParams"`) since the full [`super::governance::GovernanceAction`]
     /// type lives in the governance module.
     GovernanceActionExecuted {
         /// The proposal ID that was executed (SHA-256 hash).

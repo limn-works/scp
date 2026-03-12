@@ -508,7 +508,7 @@ pub fn collect_active_voters(engine: &dyn GovernanceEngine) -> Vec<DID> {
 
 /// Check whether a fallback quorum (majority-of-active) is achievable.
 ///
-/// Requires at least [`MIN_ACTIVE_VOTERS_FOR_FALLBACK`] (2) active voters.
+/// Requires at least `MIN_ACTIVE_VOTERS_FOR_FALLBACK` (2) active voters.
 /// If only 1 remains, returns `false` and the caller should log single-admin
 /// authority (ADR-031 §10).
 #[must_use]

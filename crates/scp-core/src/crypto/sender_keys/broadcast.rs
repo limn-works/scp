@@ -403,9 +403,9 @@ pub struct SigningPayloadFields<'a> {
 
 /// Constructs the canonical signing payload for a `BroadcastEnvelope`.
 ///
-/// Uses [`canonical_hash`] with domain separator `"SCP-BROADCAST-ENVELOPE-V1:"`
+/// Uses `canonical_hash` with domain separator `"SCP-BROADCAST-ENVELOPE-V1:"`
 /// and length-prefixed variable-length fields, matching the pattern used by
-/// [`compute_block_notification_hash`] in `key_protocol.rs`.
+/// `compute_block_notification_hash` in `key_protocol.rs`.
 ///
 /// Field order per §5.14.5 (lines 987-988):
 /// `version`, `context_id`, `author_did`, `sequence`, `key_epoch`, `timestamp`,
@@ -692,7 +692,7 @@ const REPLAY_DETECTOR_MAX_AUTHORS: usize = 10_000;
 /// Maintains the last-seen sequence number per author DID. Messages with
 /// `sequence <= last_seen` are rejected as replays (§5.14.5).
 ///
-/// Bounded to [`REPLAY_DETECTOR_MAX_AUTHORS`] entries. When full, the entry
+/// Bounded to `REPLAY_DETECTOR_MAX_AUTHORS` entries. When full, the entry
 /// with the lowest timestamp is evicted (oldest-first).
 #[derive(Debug, Default)]
 pub struct BroadcastReplayDetector {

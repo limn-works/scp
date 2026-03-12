@@ -151,7 +151,7 @@ pub struct AdapterCredential {
     /// format is adapter-specific and opaque to the protocol.
     ///
     /// Wrapped in [`EncryptedBlob`] to enforce at the type level that the
-    /// data has been encrypted. See [`EncryptedBlob::from_encrypted`].
+    /// data has been encrypted. See `EncryptedBlob::from_encrypted`.
     pub encrypted_data: EncryptedBlob,
     /// Unix timestamp (seconds) when this credential was stored.
     pub created_at: u64,

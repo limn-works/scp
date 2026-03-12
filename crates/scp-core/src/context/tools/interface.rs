@@ -350,7 +350,7 @@ const MAX_TRACKED_CALLERS: usize = 10_000;
 /// Default: 10 calls/minute per caller. Prevents a single caller from
 /// monopolizing an interface. Expired entries are periodically evicted
 /// and the total number of tracked callers is capped at
-/// [`MAX_TRACKED_CALLERS`] to prevent unbounded memory growth.
+/// `MAX_TRACKED_CALLERS` to prevent unbounded memory growth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerCallerRateLimit {
     /// Maximum calls per caller within the window.
@@ -387,7 +387,7 @@ impl PerCallerRateLimit {
     /// Checks whether a specific caller is within their per-caller rate limit.
     ///
     /// Periodically evicts expired entries to prevent unbounded memory growth.
-    /// If the caller map is at capacity ([`MAX_TRACKED_CALLERS`]) after
+    /// If the caller map is at capacity (`MAX_TRACKED_CALLERS`) after
     /// eviction, new callers are rejected with a rate-limit error.
     ///
     /// Returns `true` if the call is permitted, `false` if the caller has

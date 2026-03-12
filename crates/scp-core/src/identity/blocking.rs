@@ -4,7 +4,7 @@
 //! §3.6, §9.16.3, and §9.16.7. Each block executes a three-layer protocol:
 //!
 //! - **Layer 1:** Sender key rotation excluding the target via
-//!   [`rotate_sender_key_for_block`](crate::crypto::sender_keys::rotate_sender_key_for_block).
+//!   [`crate::crypto::sender_keys::key_protocol::rotate_sender_key_for_block`].
 //! - **Layer 2:** SDK-mandated state destruction event emitted so the
 //!   target's SDK destroys cached material (§9.16.7).
 //! - **Layer 3:** Target's access key deleted from the blocker's key store

@@ -329,7 +329,7 @@ pub struct UnsubscribeResult {
 // AuthorBlockResult
 // ---------------------------------------------------------------------------
 
-/// Result returned by [`BroadcastContext::block_author`].
+/// Result returned by `BroadcastContext::block_author`.
 ///
 /// Contains the blocked author's DID for event emission. The author's sender
 /// key is destroyed (removed from state), so subscribers who cached that key
@@ -368,7 +368,7 @@ pub struct GovernanceBanResult {
 ///
 /// Includes the new [`BroadcastKey`] so callers can propagate it to
 /// downstream consumers (e.g., projection endpoints via
-/// [`ProjectedContext::insert_key`]).
+/// `ProjectedContext::insert_key`).
 #[derive(Debug, Clone)]
 pub struct AuthorKeyRotation {
     /// The author whose key was rotated.
@@ -1162,9 +1162,9 @@ impl BroadcastContext {
     /// * `payload` -- The plaintext content to encrypt.
     /// * `timestamp` -- Unix timestamp in milliseconds.
     /// * `signature` -- Pre-computed Ed25519 signature over the canonical
-    ///   signing payload (see [`build_broadcast_signing_payload`]).
+    ///   signing payload (see [`crate::crypto::sender_keys::broadcast::build_broadcast_signing_payload`]).
     /// * `nonce` -- Random 12-byte AES-256-GCM nonce (from
-    ///   [`generate_broadcast_nonce`]).
+    ///   [`crate::crypto::sender_keys::broadcast::generate_broadcast_nonce`]).
     /// * `provenance` -- Optional provenance metadata (§7.7.1).
     ///
     /// # Errors

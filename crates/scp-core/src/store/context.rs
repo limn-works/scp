@@ -163,7 +163,7 @@ fn context_prefix(context_id: &str) -> Result<String, super::StoreError> {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// Returns [`super::StoreError::InvalidKey`] if `context_id`
 /// contains invalid key characters.
 pub fn governance_config_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -177,7 +177,7 @@ pub fn governance_config_key(context_id: &str) -> Result<String, super::StoreErr
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// Returns [`super::StoreError::InvalidKey`] if `context_id`
 /// contains invalid key characters.
 pub fn governance_proposal_key(
     context_id: &str,
@@ -195,7 +195,7 @@ pub fn governance_proposal_key(
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// Returns [`super::StoreError::InvalidKey`] if `context_id`
 /// contains invalid key characters.
 pub fn governance_pending_index_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -209,7 +209,7 @@ pub fn governance_pending_index_key(context_id: &str) -> Result<String, super::S
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// Returns [`super::StoreError::InvalidKey`] if `context_id`
 /// contains invalid key characters.
 pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -223,7 +223,7 @@ pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// Returns [`super::StoreError::InvalidKey`] if `context_id`
 /// contains invalid key characters.
 pub fn governance_deadlock_state_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -378,7 +378,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Scans for keys matching `context/*/full_snapshot` by listing all keys
     /// with the `context/` prefix and filtering for snapshot keys. Used by
     /// [`ProtocolStorePersistence`] to implement
-    /// [`ContextPersistence::list_persisted_contexts`].
+    /// [`crate::context::manager::ContextPersistence::list_persisted_contexts`].
     ///
     /// The returned list is a point-in-time snapshot. In a concurrent
     /// environment, contexts may be created or deleted between the list
@@ -407,7 +407,7 @@ impl<S: Storage> ProtocolStore<S> {
 
     /// Stores a full context snapshot for persistence across restarts.
     ///
-    /// Serializes the [`ContextSnapshot`] under
+    /// Serializes the [`crate::context::manager::ContextSnapshot`] under
     /// `context/{context_id}/full_snapshot` as a single atomic blob.
     /// Buffer zeroization is applied after write (defense-in-depth for
     /// any key material that may be referenced in the snapshot).
@@ -438,7 +438,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Loads a full context snapshot from persistence.
     ///
     /// Returns `None` if no full snapshot has been persisted for the given
-    /// context. The caller should use the returned [`ContextSnapshot`] to
+    /// context. The caller should use the returned [`crate::context::manager::ContextSnapshot`] to
     /// reconstruct `PerContextState` during restart.
     ///
     /// See SCP-PERSIST-021 and spec section 17.4.
@@ -667,7 +667,7 @@ impl<S: Storage> ProtocolStore<S> {
 
     /// Stores the full broadcast context state for persistence across restarts.
     ///
-    /// Serializes the [`BroadcastContextSnapshot`] under
+    /// Serializes the [`crate::context::broadcast::BroadcastContextSnapshot`] under
     /// `context/{context_id}/broadcast_state`. The snapshot contains the
     /// admission policy, subscriber roster, and per-author key state
     /// (including key material, epochs, and block lists).
@@ -697,7 +697,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// context (either the context is not broadcast, or it has not been
     /// persisted yet). The caller should reconstruct a `BroadcastContext`
     /// from the returned snapshot using
-    /// [`BroadcastContext::from_snapshot`].
+    /// [`crate::context::broadcast::BroadcastContext::from_snapshot`].
     ///
     /// See spec section 5.14 and §17.3.
     ///
@@ -802,7 +802,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// `context/{context_id}/grace/{epoch:020d}`.
     ///
     /// **Note:** The primary production persistence path for grace entries is
-    /// the [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob,
+    /// the [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot) blob,
     /// which persists grace entries atomically alongside all other context
     /// state (membership, roles, governance, TTL, etc.) to ensure
     /// transactional consistency (§23.11 step 2). This individual CRUD method
@@ -829,7 +829,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns entries sorted by epoch number.
     ///
     /// **Note:** The primary production persistence path loads grace entries
-    /// from the [`ContextSnapshot`](crate::context::manager::ContextSnapshot)
+    /// from the [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot)
     /// blob (see `restore_context` in `context/manager.rs`). This method
     /// loads from individual storage keys and is available for direct-access
     /// patterns (e.g., recovery, diagnostics, testing) but is not called in
@@ -864,7 +864,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// **Note:** The primary production persistence path manages grace
     /// entries atomically within the
-    /// [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
     /// This individual CRUD method is available for direct-access patterns
     /// (e.g., targeted cleanup during recovery or testing) but expired
     /// entries are normally excluded at snapshot creation time rather than
@@ -884,7 +884,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// **Note:** The primary production persistence path manages grace
     /// entries atomically within the
-    /// [`ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
     /// This method is available for bulk cleanup of individually-stored
     /// grace entries (e.g., during the inconsistent state fallback §23.11
     /// or migration from individual keys to the snapshot path).
@@ -907,7 +907,7 @@ impl<S: Storage> ProtocolStore<S> {
 /// `ProtocolStore<S>`.
 ///
 /// Wraps `Arc<ProtocolStore<S>>` and implements the synchronous
-/// [`ContextPersistence`] trait by blocking on the async `ProtocolStore`
+/// [`crate::context::manager::ContextPersistence`] trait by blocking on the async `ProtocolStore`
 /// methods via `tokio::task::block_in_place` + `Handle::block_on`. This is
 /// safe because `ContextPersistence` methods are always called from within a
 /// tokio runtime context (after the `contexts` mutex is released).
@@ -1018,11 +1018,11 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
 // ProtocolStoreEventLogPersistence — event log bridge (#636)
 // ---------------------------------------------------------------------------
 
-/// Canonical bridge from [`EventLogPersistence`] (synchronous) to the async
+/// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] (synchronous) to the async
 /// `ProtocolStore` event log methods.
 ///
 /// Wraps `Arc<ProtocolStore<S>>` and implements the synchronous
-/// [`EventLogPersistence`] trait by blocking on async methods via
+/// [`crate::context::providers::event_log::EventLogPersistence`] trait by blocking on async methods via
 /// `tokio::task::block_in_place` + `Handle::block_on`.
 ///
 /// See GitHub issue #636.

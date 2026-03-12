@@ -26,7 +26,7 @@ pub use super::close::IncompleteVerificationPolicy;
 // Capability (unified type from roles module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the unified [`Capability`](super::roles::Capability) type.
+/// Re-export of the unified [`Capability`] type.
 ///
 /// This was previously a separate `Capability(String)` newtype. It is now the
 /// same enum used in `roles.rs`, supporting well-known variants (e.g.,
@@ -38,7 +38,7 @@ pub use super::roles::Capability;
 // RoleDefinition (re-export from roles module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`RoleDefinition`](super::roles::RoleDefinition) type.
+/// Re-export of the full [`RoleDefinition`] type.
 ///
 /// Previously a name-only placeholder. Now re-exports the full type from
 /// `roles.rs` which includes `name` and `capabilities: HashSet<Capability>`.
@@ -49,8 +49,7 @@ pub use super::roles::RoleDefinition;
 // ToolRegistration (re-export from tools/registry module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`ToolRegistration`](super::tools::ToolRegistration)
-/// type.
+/// Re-export of the full [`ToolRegistration`] type.
 ///
 /// Previously a name-only placeholder. Now re-exports the full type from
 /// `tools/registry.rs` which includes `tool_id`, `name`, `description`,
@@ -691,7 +690,7 @@ pub struct ContextParams {
 
     /// Participation admission requirements (spec §7.3.2.1).
     ///
-    /// When non-empty, joining members must present [`ParticipationProfile`]
+    /// When non-empty, joining members must present [`crate::trust::participation::ParticipationProfile`]
     /// attestations satisfying every entry. Empty means no participation
     /// requirements (the default).
     #[serde(default)]
