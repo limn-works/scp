@@ -99,78 +99,104 @@ fn validate_scope(scope: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Determines the address type from the scope part per spec §22.2.
-///
-/// - Scope contains `.` => `"domain_handle"` (e.g., `alice@example.com`)
-/// - Otherwise => `"discovery_handle"` (e.g., `alice@photography`)
-///
-/// Note: `Unscoped` (bare name, no `@`) and `AttestationHandle` (platform-
-/// prefixed) are distinguished at the address parsing level in scp-core,
-/// not by scope string inspection. The WASM bridge only handles the two
-/// scope-based types that the spec's §22.2 disambiguation table defines.
-fn classify_scope(scope: &str) -> &'static str {
-    if scope.contains('.') {
-        "domain_handle"
-    } else {
-        "discovery_handle"
-    }
-}
-
 // ---------------------------------------------------------------------------
 // discovery_parse_address
 // ---------------------------------------------------------------------------
 
-/// Parses a `local@scope` address into its components.
+/// Parses an SCP address string into its components per spec §22.11.3.
 ///
-/// Returns a JSON string with `type`, `local_part`, `scope`, and `raw` fields,
-/// matching the NAPI bridge's `discovery_parse_address` output format.
+/// Supports all 4 `ParsedAddress` variants:
+/// - `DiscoveryHandle`: `alice@cooking-community` (scoped, no `.` in scope)
+/// - `DomainHandle`: `alice@example.com` (scoped, `.` in scope)
+/// - `AttestationHandle`: `@alice_cooks` or `@alice_cooks:x` (leading `@`)
+/// - `Unscoped`: `alice` (bare name, no `@`)
+///
+/// Returns a JSON string with `type` tag in `PascalCase` plus variant-specific
+/// fields, matching the NAPI/PyO3 bridges and the spec's `ParsedAddress` enum.
 ///
 /// # Errors
 ///
-/// Returns `JsError` if the address is empty, missing `@`, or the local-part is invalid.
+/// Returns `JsError` if the address is empty or the local-part is invalid.
 ///
 /// # JS usage
 ///
 /// ```js
 /// const parsed = discovery_parse_address("alice@photography");
 /// const obj = JSON.parse(parsed);
-/// console.log(obj.type);       // "discovery_handle"
+/// console.log(obj.type);       // "DiscoveryHandle"
 /// console.log(obj.local_part); // "alice"
 /// console.log(obj.scope);      // "photography"
 /// ```
 #[wasm_bindgen]
 pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
-    if address.is_empty() {
+    let normalized = address.trim().to_lowercase();
+    if normalized.is_empty() {
         return Err(JsError::new("[SCP-VALID-7100] address must not be empty"));
     }
 
-    let Some(at_pos) = address.find('@') else {
-        return Err(JsError::new(
-            "[SCP-VALID-7101] address must contain '@' separator",
-        ));
-    };
-
-    let local = &address[..at_pos];
-    let scope = &address[at_pos + 1..];
-
-    if scope.is_empty() {
-        return Err(JsError::new(
-            "[SCP-VALID-7102] scope part must not be empty",
-        ));
+    // Attestation-backed handle: starts with `@`, no scoped `@` separator.
+    if let Some(rest) = normalized.strip_prefix('@') {
+        if rest.is_empty() {
+            return Err(JsError::new("[SCP-VALID-7100] address must not be empty"));
+        }
+        // Check for platform qualifier: `@handle:platform`
+        if let Some(colon_pos) = rest.find(':') {
+            let handle = &rest[..colon_pos];
+            let platform = &rest[colon_pos + 1..];
+            if handle.is_empty() || platform.is_empty() {
+                return Err(JsError::new("[SCP-VALID-7100] address must not be empty"));
+            }
+            let result = serde_json::json!({
+                "type": "AttestationHandle",
+                "handle": handle,
+                "platform": platform,
+            });
+            return Ok(result.to_string());
+        }
+        let result = serde_json::json!({
+            "type": "AttestationHandle",
+            "handle": rest,
+            "platform": null,
+        });
+        return Ok(result.to_string());
     }
 
-    validate_local_part(local).map_err(|e| JsError::new(&format!("[SCP-VALID-7103] {e}")))?;
-    validate_scope(scope).map_err(|e| JsError::new(&format!("[SCP-VALID-7104] {e}")))?;
+    // Scoped address: contains `@`
+    if let Some(at_pos) = normalized.find('@') {
+        let local = &normalized[..at_pos];
+        let scope = &normalized[at_pos + 1..];
 
-    let address_type = classify_scope(scope);
+        if scope.is_empty() {
+            return Err(JsError::new(
+                "[SCP-VALID-7102] scope part must not be empty",
+            ));
+        }
 
+        validate_local_part(local).map_err(|e| JsError::new(&format!("[SCP-VALID-7103] {e}")))?;
+        validate_scope(scope).map_err(|e| JsError::new(&format!("[SCP-VALID-7104] {e}")))?;
+
+        if scope.contains('.') {
+            let result = serde_json::json!({
+                "type": "DomainHandle",
+                "local_part": local,
+                "domain": scope,
+            });
+            return Ok(result.to_string());
+        }
+
+        let result = serde_json::json!({
+            "type": "DiscoveryHandle",
+            "local_part": local,
+            "scope": scope,
+        });
+        return Ok(result.to_string());
+    }
+
+    // Bare name: unscoped
     let result = serde_json::json!({
-        "type": address_type,
-        "local_part": local,
-        "scope": scope,
-        "raw": address,
+        "type": "Unscoped",
+        "name": normalized,
     });
-
     Ok(result.to_string())
 }
 
@@ -1256,16 +1282,6 @@ mod tests {
         assert!(validate_scope("_").is_ok());
     }
 
-    #[test]
-    fn classify_scope_types() {
-        // Only two scope-based types per spec §22.2: domain (has `.`) or discovery
-        assert_eq!(classify_scope("example.com"), "domain_handle");
-        assert_eq!(classify_scope("photography"), "discovery_handle");
-        // "_" and "did:" scopes are regular scopes — not special-cased
-        assert_eq!(classify_scope("_"), "discovery_handle");
-        assert_eq!(classify_scope("did:key:z6MkTest"), "discovery_handle");
-    }
-
     // -- scp:// URI parsing tests -------------------------------------------
 
     #[test]
@@ -1435,7 +1451,7 @@ mod wasm_tests {
     fn parse_discovery_handle() {
         let result = discovery_parse_address("alice@photography".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["type"], "discovery_handle");
+        assert_eq!(json["type"], "DiscoveryHandle");
         assert_eq!(json["local_part"], "alice");
         assert_eq!(json["scope"], "photography");
     }
@@ -1444,31 +1460,40 @@ mod wasm_tests {
     fn parse_domain_handle() {
         let result = discovery_parse_address("alice@example.com".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["type"], "domain_handle");
+        assert_eq!(json["type"], "DomainHandle");
+        assert_eq!(json["local_part"], "alice");
+        assert_eq!(json["domain"], "example.com");
     }
 
     #[test]
-    fn parse_attestation_handle() {
-        let result = discovery_parse_address("alice@did:key:z6MkTest".to_owned()).unwrap();
+    fn parse_attestation_handle_with_platform() {
+        let result = discovery_parse_address("@alice_cooks:x".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["type"], "attestation_handle");
+        assert_eq!(json["type"], "AttestationHandle");
+        assert_eq!(json["handle"], "alice_cooks");
+        assert_eq!(json["platform"], "x");
+    }
+
+    #[test]
+    fn parse_attestation_handle_without_platform() {
+        let result = discovery_parse_address("@alice_cooks".to_owned()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["type"], "AttestationHandle");
+        assert_eq!(json["handle"], "alice_cooks");
+        assert!(json["platform"].is_null());
     }
 
     #[test]
     fn parse_unscoped() {
-        let result = discovery_parse_address("alice@_".to_owned()).unwrap();
+        let result = discovery_parse_address("alice".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["type"], "unscoped");
+        assert_eq!(json["type"], "Unscoped");
+        assert_eq!(json["name"], "alice");
     }
 
     #[test]
     fn parse_empty_address_fails() {
         assert!(discovery_parse_address(String::new()).is_err());
-    }
-
-    #[test]
-    fn parse_no_at_sign_fails() {
-        assert!(discovery_parse_address("alice".to_owned()).is_err());
     }
 
     #[test]
@@ -1478,7 +1503,9 @@ mod wasm_tests {
 
     #[test]
     fn parse_invalid_local_part_fails() {
-        assert!(discovery_parse_address("ALICE@scope".to_owned()).is_err());
+        // Uppercase in scoped address local-part is normalized (lowercased),
+        // so it no longer errors. Test with a truly invalid character.
+        assert!(discovery_parse_address("alice!@scope".to_owned()).is_err());
     }
 
     #[test]
