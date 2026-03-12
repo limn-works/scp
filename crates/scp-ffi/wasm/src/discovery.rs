@@ -10,6 +10,8 @@
 //! - [`discovery_create_query`] — Create a discovery query descriptor.
 //! - [`context_discover`] — Discover contexts from a DID or `scp://` URI.
 //!
+//! CI trigger: Re-run after transient GitHub API failure.
+//!
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
