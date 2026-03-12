@@ -113,8 +113,9 @@ impl WasmContextHandle {
     /// Returns the context TTL in seconds, or `undefined` if no TTL is set.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "ttlSeconds")]
-    pub fn ttl_seconds(&self) -> Option<u64> {
+    pub fn ttl_seconds(&self) -> Option<u32> {
         self.ttl_seconds
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
     }
 
     /// Returns the promotion policy, or `undefined` if unset.
@@ -134,8 +135,8 @@ impl WasmContextHandle {
     /// Returns the current number of context members.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "memberCount")]
-    pub fn member_count(&self) -> u64 {
-        self.member_count
+    pub fn member_count(&self) -> u32 {
+        u32::try_from(self.member_count).unwrap_or(u32::MAX)
     }
 
     /// Returns the economic policy as a JSON string, or `undefined` if unset.
