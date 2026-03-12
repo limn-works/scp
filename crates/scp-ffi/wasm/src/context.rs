@@ -1047,23 +1047,29 @@ pub fn context_import(data: Vec<u8>) -> Promise {
 // ---------------------------------------------------------------------------
 
 /// Returns the remaining TTL in seconds, or `null` if no TTL.
+///
+/// Saturates at `u32::MAX` to avoid returning `BigInt` to JavaScript.
 #[wasm_bindgen]
-pub fn context_ttl_remaining(handle: &WasmContextHandle) -> Option<u64> {
+pub fn context_ttl_remaining(handle: &WasmContextHandle) -> Option<u32> {
     let context_id = handle.context_id();
     with_manager(|mgr| Ok(mgr.ttl_remaining(&context_id)))
         .ok()
         .flatten()
+        .map(|secs| u32::try_from(secs).unwrap_or(u32::MAX))
 }
 
 /// Extends the TTL by the given number of seconds.
 ///
+/// Accepts `u32` at the boundary to avoid `BigInt` in JavaScript; widens
+/// to `u64` internally for the manager.
+///
 /// Returns `true` if the extension was applied.
 #[wasm_bindgen]
-pub fn context_extend_ttl(handle: &WasmContextHandle, additional_secs: u64) -> Promise {
+pub fn context_extend_ttl(handle: &WasmContextHandle, additional_secs: u32) -> Promise {
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        let applied = with_manager(|mgr| mgr.extend_ttl(&context_id, additional_secs))
+        let applied = with_manager(|mgr| mgr.extend_ttl(&context_id, u64::from(additional_secs)))
             .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::from_bool(applied))
     })
@@ -1085,6 +1091,9 @@ pub fn context_handle_ttl_expiry(handle: &WasmContextHandle) -> Promise {
 
 /// Proposes a TTL extension from a specific member.
 ///
+/// Accepts `u32` at the boundary to avoid `BigInt` in JavaScript; widens
+/// to `u64` internally for the manager.
+///
 /// Returns `true` if the extension was applied. In the WASM bridge, TTL
 /// extension is immediate (no multi-member unanimity — the TypeScript SDK
 /// coordinates consensus).
@@ -1092,7 +1101,7 @@ pub fn context_handle_ttl_expiry(handle: &WasmContextHandle) -> Promise {
 pub fn context_propose_ttl_extension(
     handle: &WasmContextHandle,
     proposer_did: String,
-    extension_secs: u64,
+    extension_secs: u32,
 ) -> Promise {
     if let Err(e) = validate_did(&proposer_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
@@ -1101,7 +1110,7 @@ pub fn context_propose_ttl_extension(
 
     future_to_promise(async move {
         let applied = with_manager(|mgr| {
-            mgr.propose_ttl_extension(&context_id, &proposer_did, extension_secs)
+            mgr.propose_ttl_extension(&context_id, &proposer_did, u64::from(extension_secs))
         })
         .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::from_bool(applied))
@@ -1110,13 +1119,16 @@ pub fn context_propose_ttl_extension(
 
 /// Resets the TTL timer to a new duration.
 ///
+/// Accepts `u32` at the boundary to avoid `BigInt` in JavaScript; widens
+/// to `u64` internally for the manager.
+///
 /// Replaces the context's TTL with the given value.
 #[wasm_bindgen]
-pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u64) -> Promise {
+pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u32) -> Promise {
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.reset_ttl_timer(&context_id, new_duration_secs))
+        with_manager(|mgr| mgr.reset_ttl_timer(&context_id, u64::from(new_duration_secs)))
             .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
