@@ -81,7 +81,7 @@ scp-testing = { path = "../scp-testing" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
-rmpv = { version = "1", features = ["with-serde"] }
+rmpv = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 rcgen = "0.13"
