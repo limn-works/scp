@@ -2,9 +2,9 @@
 //!
 //! Exposes SCP bridge connector operations to JavaScript (browser target):
 //!
-//! - [`bridge_register`] -- Register a bridge connector with a context.
-//! - [`bridge_evaluate_trust`] -- Evaluate trust level for a bridge action.
-//! - [`bridge_create_shadow`] -- Create a shadow identity.
+//! - `bridge_register` -- Register a bridge connector with a context.
+//! - `bridge_evaluate_trust` -- Evaluate trust level for a bridge action.
+//! - `bridge_create_shadow` -- Create a shadow identity.
 //!
 //! # WASM constraints
 //!

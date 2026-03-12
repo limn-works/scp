@@ -1,7 +1,7 @@
 //! Payment adapter conformance test macro.
 //!
-//! The [`payment_adapter_conformance`] macro generates 8 test cases that
-//! validate any [`PaymentAdapter`](scp_core::economy::PaymentAdapter)
+//! The `payment_adapter_conformance` macro generates 8 test cases that
+//! validate any `PaymentAdapter`
 //! implementation against the spec (section 19.2.6):
 //!
 //! 1. Authorize/capture roundtrip
@@ -15,12 +15,12 @@
 //!
 //! See spec section 19.2.6 and ADR-033 in `.docs/adrs/phase-3.md`.
 
-/// Generates 8 conformance tests for a [`PaymentAdapter`] implementation.
+/// Generates 8 conformance tests for a `PaymentAdapter` implementation.
 ///
 /// # Arguments
 ///
 /// The macro takes a single expression that evaluates to an instance of a type
-/// implementing [`PaymentAdapter`]. This expression is called once per test to
+/// implementing `PaymentAdapter`. This expression is called once per test to
 /// create a fresh adapter with a clean ledger.
 ///
 /// # Example

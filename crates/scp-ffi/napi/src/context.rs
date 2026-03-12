@@ -1,7 +1,7 @@
 //! napi-rs bridge for context lifecycle, messaging, governance, broadcast,
 //! membership queries, TTL, and events.
 //!
-//! All operations delegate to the shared [`ContextManager`] instance via
+//! All operations delegate to the shared `ContextManager` instance via
 //! [`crate::runtime::context_manager()`]. The `NapiContextHandle` is a thin
 //! handle carrying context metadata and a reference to the `ContextHandle`
 //! from `scp-core`.
@@ -38,7 +38,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 ///
 /// Stores context metadata and retains a reference to the `scp-core`
 /// [`ContextHandle`] for lifecycle operations via the shared
-/// [`ContextManager`].
+/// `ContextManager`.
 ///
 /// # JS usage
 ///
@@ -166,7 +166,7 @@ impl NapiContextHandle {
         self.governance.clone()
     }
 
-    /// Returns the current member count by querying the [`ContextManager`].
+    /// Returns the current member count by querying the `ContextManager`.
     ///
     /// This is a live query — the count always reflects the actual
     /// membership state, not a cached snapshot.
@@ -279,7 +279,7 @@ async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) {
 
 /// Creates a new SCP context.
 ///
-/// Delegates to [`ContextManager::create_context`] for two-phase commit
+/// Delegates to `ContextManager::create_context` for two-phase commit
 /// creation (ADR-008). Returns a handle with context metadata.
 ///
 /// # Errors
@@ -423,7 +423,7 @@ pub async fn context_create(
 
 /// Joins an existing SCP context.
 ///
-/// Delegates to [`ContextManager::join_context`] for MLS group membership
+/// Delegates to `ContextManager::join_context` for MLS group membership
 /// establishment.
 ///
 /// # Errors
@@ -460,7 +460,7 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
 
 /// Leaves an SCP context.
 ///
-/// Delegates to [`ContextManager::leave_context`] for MLS membership
+/// Delegates to `ContextManager::leave_context` for MLS membership
 /// removal.
 ///
 /// # Errors
@@ -494,7 +494,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 
 /// Closes an SCP context.
 ///
-/// Delegates to [`ContextManager::close_context`] for cooperative context
+/// Delegates to `ContextManager::close_context` for cooperative context
 /// closure. Transitions the context to `"closed"` state.
 ///
 /// # Errors
@@ -538,7 +538,7 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
 
 /// Sends a message to an SCP context.
 ///
-/// Delegates to [`ContextManager::send_message`] for MLS-encrypted,
+/// Delegates to `ContextManager::send_message` for MLS-encrypted,
 /// transport-delivered messaging.
 ///
 /// # Errors
@@ -658,7 +658,7 @@ pub fn context_subscribe(
 
 /// Returns the current member count for a context.
 ///
-/// Delegates to [`ContextManager::member_count`].
+/// Delegates to `ContextManager::member_count`.
 ///
 /// # Returns
 ///
@@ -676,7 +676,7 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 
 /// Returns whether a DID is a member of the context.
 ///
-/// Delegates to [`ContextManager::is_member`].
+/// Delegates to `ContextManager::is_member`.
 ///
 /// # Errors
 ///
@@ -690,7 +690,7 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 
 /// Returns all member DIDs for a context.
 ///
-/// Delegates to [`ContextManager::member_dids`].
+/// Delegates to `ContextManager::member_dids`.
 ///
 /// # Errors
 ///
@@ -703,7 +703,7 @@ pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec
 
 /// Returns the role assignment for a specific member in a context.
 ///
-/// Delegates to [`ContextManager::member_role`]. Returns the role name
+/// Delegates to `ContextManager::member_role`. Returns the role name
 /// as a string, or `null` if the member is not found.
 ///
 /// # Errors
@@ -728,7 +728,7 @@ pub async fn context_member_role(
 
 /// Drains all events from the receive buffer for a context.
 ///
-/// Delegates to [`ContextManager::drain_events`]. Returns events as JSON
+/// Delegates to `ContextManager::drain_events`. Returns events as JSON
 /// strings.
 ///
 /// # Errors
@@ -747,7 +747,7 @@ pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Ve
 
 /// Returns the number of subscribers in a broadcast context.
 ///
-/// Delegates to [`ContextManager::broadcast_subscriber_count`].
+/// Delegates to `ContextManager::broadcast_subscriber_count`.
 ///
 /// # Errors
 ///
@@ -766,7 +766,7 @@ pub async fn context_broadcast_subscriber_count(
 
 /// Returns whether a DID is a subscriber in a broadcast context.
 ///
-/// Delegates to [`ContextManager::is_broadcast_subscriber`].
+/// Delegates to `ContextManager::is_broadcast_subscriber`.
 ///
 /// # Errors
 ///
@@ -785,7 +785,7 @@ pub async fn context_is_broadcast_subscriber(
 
 /// Returns the admission policy for a broadcast context.
 ///
-/// Delegates to [`ContextManager::broadcast_admission`].
+/// Delegates to `ContextManager::broadcast_admission`.
 ///
 /// # Errors
 ///
@@ -870,7 +870,7 @@ impl scp_core::crypto::ucan::validate::ProofResolver for RejectAllProofResolver 
 
 /// Subscribes a DID to a broadcast context.
 ///
-/// Delegates to [`ContextManager::subscribe_broadcast`].
+/// Delegates to `ContextManager::subscribe_broadcast`.
 ///
 /// # Errors
 ///
@@ -908,7 +908,7 @@ pub async fn broadcast_subscribe(
 /// When `rotate_keys` is `true`, all authors rotate their broadcast keys
 /// for forward secrecy.
 ///
-/// Delegates to [`ContextManager::unsubscribe_broadcast`].
+/// Delegates to `ContextManager::unsubscribe_broadcast`.
 ///
 /// # Errors
 ///
@@ -1000,7 +1000,7 @@ pub async fn broadcast_publish(
 /// The subscriber is removed from the registry and added to all authors'
 /// block lists; all author keys are rotated.
 ///
-/// Delegates to [`ContextManager::block_broadcast_subscriber`].
+/// Delegates to `ContextManager::block_broadcast_subscriber`.
 ///
 /// # Errors
 ///
@@ -1031,7 +1031,7 @@ pub async fn broadcast_block_subscriber(
 /// Forward-only: the unblocked subscriber can request the current key on
 /// next pull but cannot decrypt content from the block period.
 ///
-/// Delegates to [`ContextManager::unblock_broadcast_subscriber`].
+/// Delegates to `ContextManager::unblock_broadcast_subscriber`.
 ///
 /// # Errors
 ///
@@ -1062,7 +1062,7 @@ pub async fn broadcast_unblock_subscriber(
 /// Validates the author DID is locally controlled and processes the key
 /// distribution request.
 ///
-/// Delegates to [`ContextManager::handle_broadcast_key_request`].
+/// Delegates to `ContextManager::handle_broadcast_key_request`.
 ///
 /// # Returns
 ///
@@ -1098,7 +1098,7 @@ pub async fn broadcast_handle_key_request(
 
 /// Executes an approved governance action on a context.
 ///
-/// Delegates to [`ContextManager::execute_governance_action`]. All 24
+/// Delegates to `ContextManager::execute_governance_action`. All 24
 /// `GovernanceAction` variants are dispatchable.
 ///
 /// # Arguments
@@ -1242,7 +1242,7 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
 
 /// Proposes a governance action for voting.
 ///
-/// Delegates to [`ContextManager::propose_governance_action_checked`].
+/// Delegates to `ContextManager::propose_governance_action_checked`.
 /// For `SingleAdmin` contexts, the proposal is auto-approved and executed.
 /// For multi-admin models (Threshold, Majority, Unanimity), the proposal
 /// enters `Pending` status.
@@ -1330,7 +1330,7 @@ pub async fn context_governance_propose(
 
 /// Casts an approval vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::approve_governance_proposal`].
+/// Delegates to `ContextManager::approve_governance_proposal`.
 /// If the vote pushes the proposal past quorum, the action is auto-executed.
 ///
 /// # Errors
@@ -1391,7 +1391,7 @@ pub async fn context_governance_approve(
 
 /// Casts a rejection vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::reject_governance_proposal`].
+/// Delegates to `ContextManager::reject_governance_proposal`.
 ///
 /// # Errors
 ///
@@ -1451,7 +1451,7 @@ pub async fn context_governance_reject(
 
 /// Withdraws a previously cast vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+/// Delegates to `ContextManager::withdraw_governance_vote`. No signing
 /// key is required.
 ///
 /// # Errors
@@ -1563,7 +1563,7 @@ pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> na
 
 /// Handles automatic TTL expiry for a context.
 ///
-/// Delegates to [`ContextManager::handle_ttl_expiry`].
+/// Delegates to `ContextManager::handle_ttl_expiry`.
 ///
 /// # Errors
 ///
@@ -1581,7 +1581,7 @@ pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Resu
 
 /// Proposes a TTL extension for a context.
 ///
-/// Delegates to [`ContextManager::propose_ttl_extension`]. Records consent
+/// Delegates to `ContextManager::propose_ttl_extension`. Records consent
 /// from the given member. Returns `true` if the extension was unanimously
 /// approved.
 ///
@@ -1607,7 +1607,7 @@ pub async fn context_propose_ttl_extension(
 
 /// Resets the TTL timer for a context.
 ///
-/// Delegates to [`ContextManager::reset_ttl_timer`]. Requires a core handle
+/// Delegates to `ContextManager::reset_ttl_timer`. Requires a core handle
 /// and a new duration.
 ///
 /// # Errors

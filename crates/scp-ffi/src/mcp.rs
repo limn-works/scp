@@ -24,16 +24,16 @@
 //!
 //! The bridge delegates to real `scp-mcp` implementations:
 //!
-//! - **Server side**: [`FfiBridgeProvider`] implements
+//! - **Server side**: `FfiBridgeProvider` implements
 //!   [`scp_mcp::server::ContextProvider`], reading tool registrations and
 //!   context state from the scp-ffi runtime registry. The MCP server is run
 //!   on the tokio runtime via [`scp_mcp::stdio::run_stdio`] or
 //!   [`scp_mcp::sse::run_sse`].
 //!
-//! - **Client side**: [`StdioClientTransport`] implements
+//! - **Client side**: `StdioClientTransport` implements
 //!   [`scp_mcp::client::McpTransport`] by spawning a subprocess and
 //!   communicating via line-delimited JSON-RPC over stdin/stdout. SSE
-//!   client transport is managed via [`SseClientTransport`].
+//!   client transport is managed via `SseClientTransport`.
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full MCP adapter design.
 
@@ -1100,7 +1100,7 @@ fn generate_handle_id(prefix: &str) -> String {
 
 /// Starts an MCP server that exposes SCP context tools.
 ///
-/// Creates an MCP server backed by a [`FfiBridgeProvider`] that reads tools
+/// Creates an MCP server backed by a `FfiBridgeProvider` that reads tools
 /// and context state from the scp-ffi runtime registry. For `"stdio"`
 /// transport, the server processes JSON-RPC messages via a tokio task. For
 /// `"sse"` transport, the server binds an HTTP server on a random port.

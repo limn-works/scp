@@ -2,11 +2,11 @@
 //!
 //! Exposes trust engine operations to JavaScript (browser target):
 //!
-//! - [`trust_query_score`] — Query participation-based trust data.
-//! - [`trust_verify_attestation`] — Verify an attestation (throws — requires `WebCrypto`).
-//! - [`trust_create_challenge`] — Create a challenge request.
-//! - [`trust_verify_response`] — Verify a challenge response (throws — requires `WebCrypto`).
-//! - [`verify_participation_requirements`] — Verify a DID meets participation requirements.
+//! - `trust_query_score` — Query participation-based trust data.
+//! - `trust_verify_attestation` — Verify an attestation (throws — requires `WebCrypto`).
+//! - `trust_create_challenge` — Create a challenge request.
+//! - `trust_verify_response` — Verify a challenge response (throws — requires `WebCrypto`).
+//! - `verify_participation_requirements` — Verify a DID meets participation requirements.
 //!
 //! # WASM constraints
 //!

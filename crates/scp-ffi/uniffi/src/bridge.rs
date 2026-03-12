@@ -1110,11 +1110,11 @@ pub struct TrustInput {
 /// Stores the DID string, custody type, and key custody provider so that
 /// key material remains live for the lifetime of the handle:
 ///
-/// - **In-memory custody** (dev/desktop): retained [`InMemoryKeyCustody`]
+/// - **In-memory custody** (dev/desktop): retained `InMemoryKeyCustody`
 ///   with key material in heap memory. Only available when the
 ///   `allow_in_memory_custody` feature is enabled.
 /// - **Platform/Software custody** (production mobile): retained
-///   [`CallbackKeyCustody`] adapter wrapping the injected
+///   `CallbackKeyCustody` adapter wrapping the injected
 ///   [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
 ///   key material stays in the platform TEE (Secure Enclave / Keystore).
 ///
@@ -2111,7 +2111,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
 
 /// Generates a device attestation token for an identity.
 ///
-/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
+/// Uses `InMemoryDeviceAttestation` to produce a synthetic attestation token,
 /// then attaches it to the identity's DID document.
 ///
 /// # Arguments
@@ -2181,7 +2181,7 @@ async fn identity_attest_device_impl(_identity: Arc<Identity>) -> Result<String,
 
 /// Verifies a device attestation token.
 ///
-/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+/// Uses `InMemoryDeviceAttestation` to check the token format.
 ///
 /// # Arguments
 ///
@@ -3611,7 +3611,7 @@ pub async fn tool_session_close(
 /// Connects to an SCP relay.
 ///
 /// Establishes a WebSocket connection to the specified relay URL using
-/// [`NativeRelayAdapter::connect_sourced`] with `Explicit` source
+/// `NativeRelayAdapter::connect_sourced` with `Explicit` source
 /// (requires `wss://`). The adapter is stored in the returned
 /// `TransportManager` handle.
 ///
@@ -4919,7 +4919,7 @@ fn parse_uniffi_proposal_id(hex_str: &str) -> Result<[u8; 32], ScpError> {
 
 /// Proposes a governance action for voting.
 ///
-/// Delegates to [`ContextManager::propose_governance_action_checked`].
+/// Delegates to `ContextManager::propose_governance_action_checked`.
 /// For `SingleAdmin` contexts, the proposal is auto-approved and executed.
 /// For multi-admin models (Threshold, Majority, Unanimity), the proposal
 /// enters `Pending` status.
@@ -4987,7 +4987,7 @@ pub async fn governance_propose(
 
 /// Casts an approval vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::approve_governance_proposal`].
+/// Delegates to `ContextManager::approve_governance_proposal`.
 ///
 /// # Errors
 ///
@@ -5032,7 +5032,7 @@ pub async fn governance_approve(
 
 /// Casts a rejection vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::reject_governance_proposal`].
+/// Delegates to `ContextManager::reject_governance_proposal`.
 ///
 /// # Errors
 ///
@@ -5077,7 +5077,7 @@ pub async fn governance_reject(
 
 /// Withdraws a previously cast vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+/// Delegates to `ContextManager::withdraw_governance_vote`. No signing
 /// key is required.
 ///
 /// # Errors
@@ -6077,8 +6077,8 @@ pub fn trust_verify_response(
 /// Verifies participation profiles against admission requirements.
 ///
 /// Both inputs are JSON strings:
-/// - `profile_json`: JSON array of [`ParticipationProfile`] objects.
-/// - `requirements_json`: JSON array of [`RequireParticipation`] objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
+/// - `requirements_json`: JSON array of `RequireParticipation` objects.
 ///
 /// Uses the current system time for freshness checks. Returns `true` if all
 /// requirements are satisfied, throws `ScpError` with a diagnostic message

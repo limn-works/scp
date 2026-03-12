@@ -44,12 +44,12 @@
 //! tokio's multi-thread runtime. Therefore, this bridge does NOT directly
 //! depend on `scp-core`. Instead:
 //!
-//! 1. Opaque JS handle types ([`WasmIdentity`], [`WasmContextHandle`], etc.)
+//! 1. Opaque JS handle types ([`identity::WasmIdentity`], `WasmContextHandle`, etc.)
 //!    establish the stable ABI boundary.
 //! 2. Bridge stub functions return typed errors documenting the JS-side
 //!    implementation pattern (`WebCrypto`, Fetch API, WebSocket).
-//! 3. JS callback injection types ([`JsKeyCustody`], [`JsStorage`],
-//!    [`JsMessageCallback`]) define the TypeScript wrapper's responsibility.
+//! 3. JS callback injection types ([`custody::JsKeyCustody`], [`storage::JsStorage`],
+//!    `JsMessageCallback`) define the TypeScript wrapper's responsibility.
 //!
 //! The JS callback injection pattern is the permanent WASM architecture per
 //! ADR-022: browser-native APIs (`WebCrypto`, OPFS, WebSocket) are injected from

@@ -3,12 +3,12 @@
 //! Exposes address parsing, normalization, and context discovery to JavaScript
 //! (browser target):
 //!
-//! - [`discovery_parse_address`] — Parse an SCP address string into components.
+//! - `discovery_parse_address` — Parse an SCP address string into components.
 //!   Supports all 4 variants: `DiscoveryHandle`, `DomainHandle`,
 //!   `AttestationHandle`, `Unscoped` per §22.11.3.
-//! - [`discovery_normalize_address`] — Normalize an address to canonical form.
-//! - [`discovery_create_query`] — Create a discovery query descriptor.
-//! - [`context_discover`] — Discover contexts from a DID or `scp://` URI.
+//! - `discovery_normalize_address` — Normalize an address to canonical form.
+//! - `discovery_create_query` — Create a discovery query descriptor.
+//! - `context_discover` — Discover contexts from a DID or `scp://` URI.
 //!
 //! CI trigger: Re-run after transient GitHub API failure.
 //!
