@@ -21,7 +21,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError
+from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ValidationError
 
 if TYPE_CHECKING:
     from scp_sdk.identity import Identity
@@ -110,8 +110,8 @@ class ToolDefinition:
 
 
 async def invoke_cross_context(
-    source_context: str,
-    target_context: str,
+    source_context_id: str,
+    target_context_id: str,
     tool_id: str,
     input: dict[str, Any],
     invoker_did: str,
@@ -127,8 +127,8 @@ async def invoke_cross_context(
     enforced per spec section 6.2.
 
     Args:
-        source_context: The ID of the calling context.
-        target_context: The ID of the context containing the tool.
+        source_context_id: The ID of the calling context.
+        target_context_id: The ID of the context containing the tool.
         tool_id: The ID of the tool to invoke.
         input: Input data as a JSON-compatible dict matching the tool's
             input schema.
@@ -160,16 +160,16 @@ async def invoke_cross_context(
         )
 
     if not isinstance(chain_depth, int) or chain_depth < 0 or chain_depth > 255:
-        raise ContextError(
+        raise ValidationError(
             f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
-            code="SCP-CTX-2002",
+            code="SCP-VALID-7002",
         )
 
     try:
         result = await asyncio.to_thread(
             _scp_core.tool_invoke_cross_context,
-            source_context,
-            target_context,
+            source_context_id,
+            target_context_id,
             tool_id,
             input,
             invoker_did,
@@ -188,7 +188,7 @@ async def invoke_cross_context(
 
 
 async def session_create(
-    context: str,
+    context_id: str,
     tool_id: str,
     source_context_id: str,
     ttl_seconds: int,
@@ -201,7 +201,7 @@ async def session_create(
     6.2.1).
 
     Args:
-        context: The context containing the tool.
+        context_id: The context containing the tool.
         tool_id: The tool to create a session for.
         source_context_id: The calling context (session cap tracked per
             caller).
@@ -223,15 +223,15 @@ async def session_create(
         )
 
     if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
-        raise ContextError(
+        raise ValidationError(
             f"ttl_seconds must be a non-negative integer, got {ttl_seconds!r}",
-            code="SCP-CTX-2002",
+            code="SCP-VALID-7002",
         )
 
     try:
         return await asyncio.to_thread(
             _scp_core.tool_session_create,
-            context,
+            context_id,
             tool_id,
             source_context_id,
             ttl_seconds,
@@ -241,7 +241,7 @@ async def session_create(
 
 
 async def session_invoke(
-    context: str,
+    context_id: str,
     session_id: str,
     input: dict[str, Any],
     invoker_did: str,
@@ -256,7 +256,7 @@ async def session_invoke(
     count is incremented on each successful invocation.
 
     Args:
-        context: The context containing the tool session.
+        context_id: The context containing the tool session.
         session_id: The session to invoke within.
         input: Input data as a JSON-compatible dict matching the tool's
             input schema.
@@ -288,7 +288,7 @@ async def session_invoke(
     try:
         result = await asyncio.to_thread(
             _scp_core.tool_session_invoke,
-            context,
+            context_id,
             session_id,
             input,
             invoker_did,
@@ -300,7 +300,7 @@ async def session_invoke(
     return result
 
 
-async def session_close(context: str, session_id: str) -> None:
+async def session_close(context_id: str, session_id: str) -> None:
     """Close a stateful tool session.
 
     Removes the session from the store, releasing the caller's session
@@ -308,7 +308,7 @@ async def session_close(context: str, session_id: str) -> None:
     will fail.
 
     Args:
-        context: The context containing the tool session.
+        context_id: The context containing the tool session.
         session_id: The session to close.
 
     Raises:
@@ -325,7 +325,7 @@ async def session_close(context: str, session_id: str) -> None:
     try:
         await asyncio.to_thread(
             _scp_core.tool_session_close,
-            context,
+            context_id,
             session_id,
         )
     except Exception as exc:
