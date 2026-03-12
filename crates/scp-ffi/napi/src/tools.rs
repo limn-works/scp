@@ -101,6 +101,68 @@ pub struct NapiToolVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
+// Validation helpers for tool registration inputs
+// ---------------------------------------------------------------------------
+
+/// Validates and parses a JSON schema string.
+///
+/// Returns an `SCP-VALID-7031` error for `input_schema_json` or
+/// `SCP-VALID-7032` for `output_schema_json` when the JSON is malformed.
+fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json::Value> {
+    let code = match field_name {
+        "input_schema_json" => "SCP-VALID-7031",
+        _ => "SCP-VALID-7032",
+    };
+    serde_json::from_str(json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid {field_name}: {e}"),
+            code: code.to_owned(),
+        })
+    })
+}
+
+/// Validates and parses optional test vectors JSON.
+///
+/// `None` is acceptable (no test vectors). A `Some` value that is not valid
+/// JSON returns `SCP-VALID-7033`.
+fn validate_test_vectors_json(
+    json: Option<&str>,
+) -> napi::Result<Vec<scp_core::context::tools::TestVector>> {
+    json.map_or_else(
+        || Ok(Vec::new()),
+        |s| {
+            serde_json::from_str(s).map_err(|e| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!("invalid test_vectors_json: {e}"),
+                    code: "SCP-VALID-7033".to_owned(),
+                })
+            })
+        },
+    )
+}
+
+/// Validates an optional implementation hash.
+///
+/// `None` is acceptable (defaults to zeroed hash). A `Some` value that is not
+/// exactly 32 bytes returns `SCP-VALID-7034`.
+fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> {
+    bytes.map_or_else(
+        || Ok([0u8; 32]),
+        |b| {
+            <[u8; 32]>::try_from(b).map_err(|_| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!(
+                        "implementation_hash must be exactly 32 bytes, got {}",
+                        b.len()
+                    ),
+                    code: "SCP-VALID-7034".to_owned(),
+                })
+            })
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -119,6 +181,10 @@ pub struct NapiToolVerificationResult {
 /// # Errors
 ///
 /// - Rejects with `SCP-TOOL-6003` if the context is not `"active"`.
+/// - Rejects with `SCP-VALID-7031` if `input_schema_json` is not valid JSON.
+/// - Rejects with `SCP-VALID-7032` if `output_schema_json` is not valid JSON.
+/// - Rejects with `SCP-VALID-7033` if `test_vectors_json` is provided but not valid JSON.
+/// - Rejects with `SCP-VALID-7034` if `implementation_hash` is provided but not exactly 32 bytes.
 /// - Rejects with `SCP-TOOL-6001` if registration fails (permission denied,
 ///   schema invalid, duplicate name, etc.) in the full runtime.
 #[napi]
@@ -148,22 +214,13 @@ pub async fn tool_register(
     // Build a scp-core ToolRegistration from the NAPI definition.
     let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
-    let input_schema: serde_json::Value = serde_json::from_str(&definition.input_schema_json)
-        .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
-    let output_schema: serde_json::Value = serde_json::from_str(&definition.output_schema_json)
-        .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+    let input_schema = validate_schema_json(&definition.input_schema_json, "input_schema_json")?;
+    let output_schema = validate_schema_json(&definition.output_schema_json, "output_schema_json")?;
 
-    let test_vectors: Vec<scp_core::context::tools::TestVector> = definition
-        .test_vectors_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_default();
+    let test_vectors = validate_test_vectors_json(definition.test_vectors_json.as_deref())?;
 
-    let implementation_hash: [u8; 32] = definition
-        .implementation_hash
-        .as_deref()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .unwrap_or([0u8; 32]);
+    let implementation_hash =
+        validate_implementation_hash(definition.implementation_hash.as_deref())?;
 
     let core_registration = scp_core::context::tools::ToolRegistration {
         tool_id,
@@ -819,4 +876,168 @@ pub async fn tool_session_close(
         Ok(())
     })
     .map_err(napi::Error::from)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // validate_schema_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_schema_json_accepts_valid_input_schema() {
+        let result = validate_schema_json(r#"{"type": "object"}"#, "input_schema_json");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), serde_json::json!({"type": "object"}));
+    }
+
+    #[test]
+    fn validate_schema_json_accepts_valid_output_schema() {
+        let result = validate_schema_json(r#"{"type": "string"}"#, "output_schema_json");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_schema_json_rejects_invalid_input_schema() {
+        let result = validate_schema_json("not valid json{{{", "input_schema_json");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("SCP-VALID-7031"),
+            "error should contain SCP-VALID-7031, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid input_schema_json"),
+            "error should reference field name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_schema_json_rejects_invalid_output_schema() {
+        let result = validate_schema_json("{broken", "output_schema_json");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("SCP-VALID-7032"),
+            "error should contain SCP-VALID-7032, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid output_schema_json"),
+            "error should reference field name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_schema_json_rejects_empty_string() {
+        let result = validate_schema_json("", "input_schema_json");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("SCP-VALID-7031"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_test_vectors_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_test_vectors_json_accepts_none() {
+        let result = validate_test_vectors_json(None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_test_vectors_json_accepts_valid_json() {
+        let result = validate_test_vectors_json(Some("[]"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_test_vectors_json_rejects_invalid_json() {
+        let result = validate_test_vectors_json(Some("not json"));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("SCP-VALID-7033"),
+            "error should contain SCP-VALID-7033, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid test_vectors_json"),
+            "error should reference field name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_test_vectors_json_rejects_wrong_type() {
+        // Valid JSON but not an array of TestVector.
+        let result = validate_test_vectors_json(Some(r#"{"not": "an array"}"#));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("SCP-VALID-7033"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_implementation_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_implementation_hash_accepts_none() {
+        let result = validate_implementation_hash(None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn validate_implementation_hash_accepts_32_bytes() {
+        let hash = [0xabu8; 32];
+        let result = validate_implementation_hash(Some(&hash));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), [0xab; 32]);
+    }
+
+    #[test]
+    fn validate_implementation_hash_rejects_short() {
+        let hash = [0u8; 16];
+        let result = validate_implementation_hash(Some(&hash));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("SCP-VALID-7034"),
+            "error should contain SCP-VALID-7034, got: {msg}"
+        );
+        assert!(
+            msg.contains("got 16"),
+            "error should report actual length, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_implementation_hash_rejects_long() {
+        let hash = [0u8; 64];
+        let result = validate_implementation_hash(Some(&hash));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("SCP-VALID-7034"));
+        assert!(
+            msg.contains("got 64"),
+            "error should report actual length, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_implementation_hash_rejects_empty() {
+        let result = validate_implementation_hash(Some(&[]));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("SCP-VALID-7034"));
+        assert!(msg.contains("got 0"));
+    }
 }
