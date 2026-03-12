@@ -54,6 +54,24 @@ fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
     REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Removes a specific owner's petname map. Test-only — ensures each test starts
+/// with clean state even if a previous test panicked before manual cleanup.
+#[cfg(test)]
+fn reset_petname_map_for(owner_did: &str) {
+    if let Ok(mut guard) = petname_maps().lock() {
+        guard.remove(owner_did);
+    }
+}
+
+/// Removes a specific context's handle registry. Test-only — ensures each test starts
+/// with clean state even if a previous test panicked before manual cleanup.
+#[cfg(test)]
+fn reset_handle_registry_for(context_id: &str) {
+    if let Ok(mut guard) = handle_registries().lock() {
+        guard.remove(context_id);
+    }
+}
+
 struct LocalHandleQuerier;
 
 impl HandleQuerier for LocalHandleQuerier {
@@ -981,28 +999,28 @@ mod tests {
     #[test]
     fn petname_set_and_resolve() {
         let owner = "did:dht:zNapiTest1".to_owned();
+        reset_petname_map_for(&owner);
         petname_set(
             owner.clone(),
             "did:dht:zAlice".to_owned(),
             "alice".to_owned(),
         )
         .unwrap();
-        let json = petname_resolve_did(owner.clone(), "alice".to_owned()).unwrap();
+        let json = petname_resolve_did(owner, "alice".to_owned()).unwrap();
         let dids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(dids.len(), 1);
         assert_eq!(dids[0], "did:dht:zAlice");
-        petname_remove(owner, "did:dht:zAlice".to_owned()).unwrap();
     }
 
     #[test]
     fn petname_context_set_and_resolve() {
         let owner = "did:dht:zNapiTest2".to_owned();
+        reset_petname_map_for(&owner);
         petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
-        let json = petname_resolve_context(owner.clone(), "work".to_owned()).unwrap();
+        let json = petname_resolve_context(owner, "work".to_owned()).unwrap();
         let ids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "ctx-napi-1");
-        petname_remove_context(owner, "ctx-napi-1".to_owned()).unwrap();
     }
 
     // -- Handle bridge tests -------------------------------------------------
@@ -1010,6 +1028,7 @@ mod tests {
     #[test]
     fn handle_register_and_lookup_napi() {
         let ctx = "ctx-napi-handle-1".to_owned();
+        reset_handle_registry_for(&ctx);
         let target = r#"{"type": "identity", "did": "did:dht:zNapiAlice"}"#.to_owned();
         let result = handle_register(
             ctx.clone(),
@@ -1023,11 +1042,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "registered");
 
-        let lookup = handle_lookup(ctx.clone(), "alice".to_owned(), None).unwrap();
+        let lookup = handle_lookup(ctx, "alice".to_owned(), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
-
-        handle_deregister(ctx, "alice".to_owned(), "did:dht:zNapiAlice".to_owned()).unwrap();
     }
 
     // -- Parse handle target tests -------------------------------------------
