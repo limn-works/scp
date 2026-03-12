@@ -4046,7 +4046,7 @@
         "rustTypes": {
           "DataProvenance": "pub struct DataProvenance { pub source_context: ContextId, pub source_type: SourceType, pub counterparties: Vec<DID>, pub purpose: Option<String>, pub discovery_method: DiscoveryMethod, pub age: Duration, pub memory_scope: MemoryScope, pub chain_depth: u8, pub chain_path: Option<Vec<ContextId>> }",
           "SourceType": "pub enum SourceType { Persistent, Ephemeral, Summary }",
-          "DiscoveryMethod": "pub enum DiscoveryMethod { SharedContext(ContextId), Registry(ContextId), None }",
+          "DiscoveryMethod": "pub enum DiscoveryMethod { SharedContext(ContextId), Registry(ContextId), OutOfBand }",
           "ProvenanceQuality": "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] pub enum ProvenanceQuality { NoProvenance, EphemeralKnownParties, SummaryVerified, PersistentVerifiable }"
         }
       },

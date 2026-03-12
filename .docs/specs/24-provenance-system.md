@@ -59,7 +59,7 @@ How the data source was discovered by the receiving party:
 |---------|---------|
 | **SharedContext(ContextId)** | Source was discovered through shared membership in the given context. |
 | **Registry(ContextId)** | Source was discovered through a discovery registry context. |
-| **None** | No protocol-level discovery path. Data was introduced outside of SCP discovery mechanisms. |
+| **OutOfBand** | No protocol-level discovery path. Data was introduced outside of SCP discovery mechanisms (out-of-band introduction). |
 
 ### 24.2.4 ProvenanceQuality
 

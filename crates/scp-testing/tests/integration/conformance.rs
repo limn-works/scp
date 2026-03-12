@@ -1659,7 +1659,7 @@ fn conf_038_bridged_provenance() {
         source_type: SourceType::Persistent,
         counterparties: vec![DID::from("did:dht:z6MkSource")],
         purpose: None,
-        discovery_method: DiscoveryMethod::None,
+        discovery_method: DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: MemoryScope::Ephemeral,
         chain_depth: 0,

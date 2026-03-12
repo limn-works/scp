@@ -4281,9 +4281,9 @@ public enum DiscoveryMethod {
     case registry(contextId: String
     )
     /**
-     * No protocol-level discovery path.
+     * No protocol-level discovery path (out-of-band introduction).
      */
-    case none
+    case outOfBand
 }
 
 
@@ -4307,7 +4307,7 @@ public struct FfiConverterTypeDiscoveryMethod: FfiConverterRustBuffer {
         case 2: return .registry(contextId: try FfiConverterString.read(from: &buf)
         )
         
-        case 3: return .none
+        case 3: return .outOfBand
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4327,7 +4327,7 @@ public struct FfiConverterTypeDiscoveryMethod: FfiConverterRustBuffer {
             FfiConverterString.write(contextId, into: &buf)
             
         
-        case .none:
+        case .outOfBand:
             writeInt(&buf, Int32(3))
         
         }

@@ -149,7 +149,7 @@ mod tests {
             source_type,
             counterparties,
             purpose: None,
-            discovery_method: DiscoveryMethod::None,
+            discovery_method: DiscoveryMethod::OutOfBand,
             age: Duration::from_secs(60),
             memory_scope: MemoryScope::Full,
             chain_depth: 0,

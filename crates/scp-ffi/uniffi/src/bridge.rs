@@ -811,8 +811,8 @@ pub enum DiscoveryMethod {
     SharedContext { context_id: String },
     /// Source was discovered through a discovery registry context.
     Registry { context_id: String },
-    /// No protocol-level discovery path.
-    None,
+    /// No protocol-level discovery path (out-of-band introduction).
+    OutOfBand,
 }
 
 /// Provenance metadata for cross-context data transfer (spec §24.2.1).
@@ -867,7 +867,7 @@ impl DataProvenance {
             scp_core::provenance::DiscoveryMethod::Registry(ctx) => DiscoveryMethod::Registry {
                 context_id: ctx.clone(),
             },
-            scp_core::provenance::DiscoveryMethod::None => DiscoveryMethod::None,
+            scp_core::provenance::DiscoveryMethod::OutOfBand => DiscoveryMethod::OutOfBand,
         };
 
         let memory_scope = match core.memory_scope {
@@ -911,7 +911,7 @@ impl DataProvenance {
             DiscoveryMethod::Registry { context_id } => {
                 scp_core::provenance::DiscoveryMethod::Registry(context_id.clone())
             }
-            DiscoveryMethod::None => scp_core::provenance::DiscoveryMethod::None,
+            DiscoveryMethod::OutOfBand => scp_core::provenance::DiscoveryMethod::OutOfBand,
         };
 
         let memory_scope = match self.memory_scope {
@@ -5856,7 +5856,7 @@ pub fn evaluate_provenance_quality(
             .map(scp_identity::DID::from)
             .collect(),
         purpose: None,
-        discovery_method: DiscoveryMethod::None,
+        discovery_method: DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: scp_core::context::MemoryScope::Full,
         chain_depth: 0,
@@ -6312,7 +6312,7 @@ pub fn provenance_attach(
         source_type: st,
         memory_scope: ms,
         members: members.into_iter().map(scp_identity::DID::from).collect(),
-        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
         data_age: std::time::Duration::from_secs(0),
         purpose: None,
         counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
@@ -6323,7 +6323,7 @@ pub fn provenance_attach(
         source_type: scp_core::provenance::SourceType::Persistent,
         counterparties: vec![],
         purpose: None,
-        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: scp_core::context::MemoryScope::Full,
         chain_depth: depth,
@@ -6368,7 +6368,7 @@ pub fn provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> b
         source_type: scp_core::provenance::SourceType::Persistent,
         counterparties: vec![],
         purpose: None,
-        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: scp_core::context::MemoryScope::Full,
         chain_depth,
@@ -6414,7 +6414,7 @@ pub fn bridge_evaluate_trust(
         source_type: scp_core::provenance::SourceType::Persistent,
         counterparties: vec![],
         purpose: None,
-        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: scp_core::context::MemoryScope::Full,
         chain_depth: 0,
@@ -7942,7 +7942,7 @@ mod tests {
             source_type: scp_core::provenance::SourceType::Ephemeral,
             counterparties: vec![],
             purpose: None,
-            discovery_method: scp_core::provenance::DiscoveryMethod::None,
+            discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
             age: std::time::Duration::from_secs(0),
             memory_scope: scp_core::context::MemoryScope::Ephemeral,
             chain_depth: 0,
@@ -7956,7 +7956,7 @@ mod tests {
         assert!(matches!(ffi.source_type, SourceType::Ephemeral));
         assert!(ffi.counterparties.is_empty());
         assert!(ffi.purpose.is_none());
-        assert!(matches!(ffi.discovery_method, DiscoveryMethod::None));
+        assert!(matches!(ffi.discovery_method, DiscoveryMethod::OutOfBand));
         assert!(matches!(ffi.memory_scope, MemoryScope::Ephemeral));
         assert_eq!(ffi.chain_depth, 0);
         assert!(ffi.chain_path.is_none());
@@ -8008,7 +8008,7 @@ mod tests {
             source_type: SourceType::Persistent,
             counterparties: vec![],
             purpose: None,
-            discovery_method: DiscoveryMethod::None,
+            discovery_method: DiscoveryMethod::OutOfBand,
             age_secs: 0,
             memory_scope: MemoryScope::Ephemeral,
             chain_depth: 0,
