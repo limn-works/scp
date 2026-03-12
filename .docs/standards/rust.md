@@ -20,12 +20,7 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 #![forbid(unsafe_code)]
 ```
 
-Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace with two categories of exception:
-
-1. **FFI bridge crates** (e.g., cbindgen C ABI) — `#![forbid(unsafe_code)]` is replaced with `#![deny(unsafe_code)]` at the crate root, and individual `unsafe` blocks use `#[allow(unsafe_code)]`.
-2. **Crypto zeroization in `scp-core`** — `scp-core` uses `#![deny(unsafe_code)]` (not `forbid`) to permit a single `#[allow(unsafe_code)]` on `zeroize_signature_key_pair` in `crypto::mls::group`. This function writes zeros through the private key `Vec<u8>` inside `openmls_basic_credential::SignatureKeyPair`, whose `private` field is not publicly accessible (gated behind the upstream `test-utils` feature). Without this, Ed25519 private key bytes survive in freed heap memory after drop. The offset-0 layout assumption is validated by a `#[cfg(test)]` assertion that compares the unsafe pointer access against the `private()` accessor. See issue #601.
-
-Every `unsafe` block must include a `// SAFETY:` comment explaining the invariant.
+Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace. If an FFI bridge crate requires unsafe (e.g., cbindgen C ABI), it is the sole exception and must document every `unsafe` block with a `// SAFETY:` comment explaining the invariant.
 
 Additional enforced rules:
 - No `unwrap()` or `expect()` in library code — use `?` with typed errors
