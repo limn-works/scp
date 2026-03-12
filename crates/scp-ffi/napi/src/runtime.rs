@@ -350,6 +350,17 @@ pub fn remove_context(context_id: &str) {
     ucan_registry().remove(context_id);
 }
 
+/// Inserts pre-built UCAN state for a context (test-only).
+///
+/// Used by tests that need to register state without constructing a full
+/// `NapiContextHandle` (whose fields are private to `context.rs`).
+#[cfg(test)]
+pub fn insert_test_state(context_id: &str, state: UcanContextState) {
+    ucan_registry()
+        .entry(context_id.to_owned())
+        .or_insert(state);
+}
+
 /// Re-syncs the `UcanContextState.role_state` for a context from the shared
 /// `ContextManager`.
 ///

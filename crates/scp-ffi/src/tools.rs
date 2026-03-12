@@ -1266,6 +1266,7 @@ mod tests {
         });
     }
 
+<<<<<<< HEAD
     // -----------------------------------------------------------------------
     // extract_test_vectors — SCP-VALID-7037
     // -----------------------------------------------------------------------
@@ -1508,19 +1509,67 @@ mod tests {
     // registered_at timestamp — #871
     // -----------------------------------------------------------------------
 
-    /// `registered_at` must be a seconds-epoch timestamp, not milliseconds
-    /// or hardcoded 0. Catches the original bug from issue #871.
+    /// `registered_at` on a tool registered via the `PyO3` bridge must be a
+    /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
+    /// Calls the actual `py_tool_register` bridge function and inspects the
+    /// stored `ToolRegistration`. Catches the original bug from issue #871.
     #[test]
     fn registered_at_is_seconds_epoch() {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        assert!(
-            ts > 1_700_000_000 && ts < 2_000_000_000,
-            "registered_at should be seconds-epoch (got {ts}); \
-             milliseconds would be ~1.7 trillion, hardcoded 0 would fail lower bound"
-        );
-    }
+        // Use a unique context ID to avoid collisions with concurrent tests.
+        let ctx_id = format!("ctx-ts-test-{}", std::process::id());
+        let creator_did = "did:dht:z6MkTestTimestamp";
+
+        // Register FFI state so the context exists in the runtime registry.
+        crate::runtime::register_ffi_state(&ctx_id, creator_did).unwrap();
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", "timestamp-probe").unwrap();
+            dict.set_item("description", "probes registered_at value")
+                .unwrap();
+            dict.set_item("operator_did", creator_did).unwrap();
+
+            // Schema must meet the specificity floor (>=2 properties on at
+            // least one side).
+            let schema = PyDict::new(py);
+            let input = PyDict::new(py);
+            input.set_item("type", "object").unwrap();
+            let props = PyDict::new(py);
+            let str_type = PyDict::new(py);
+            str_type.set_item("type", "string").unwrap();
+            props.set_item("a", str_type).unwrap();
+            let num_type = PyDict::new(py);
+            num_type.set_item("type", "number").unwrap();
+            props.set_item("b", num_type).unwrap();
+            input.set_item("properties", props).unwrap();
+            schema.set_item("input_schema", input).unwrap();
+            let output = PyDict::new(py);
+            output.set_item("type", "object").unwrap();
+            schema.set_item("output_schema", output).unwrap();
+            dict.set_item("schema", schema).unwrap();
+
+            let tool_id = py_tool_register(&ctx_id, &dict.as_borrowed())
+                .expect("py_tool_register should succeed");
+
+            // Read the stored registration back from the runtime registry.
+            let registered_at = crate::runtime::with_ffi_state(&ctx_id, |state| {
+                let reg = state
+                    .tool_registry
+                    .get(&tool_id)
+                    .expect("tool should exist in registry after successful registration");
+                Ok(reg.registered_at)
+            })
+            .unwrap();
+
+            assert!(
+                registered_at > 1_700_000_000 && registered_at < 2_000_000_000,
+                "registered_at should be seconds-epoch (got {registered_at}); \
+                 milliseconds would be ~1.7 trillion, hardcoded 0 would fail lower bound"
+            );
+        });
+
+        // Clean up global state.
+        crate::runtime::remove_ffi_state(&ctx_id);
     }
 }
