@@ -139,6 +139,7 @@ const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
     ("trust", "verify_participation_requirements", true),
     // Sync
     ("sync", "sync_classify_offline", true),
+    ("sync", "sync_classify_offline_custom", true),
     ("sync", "sync_get_policy", true),
     // Discovery
     ("discovery", "discovery_parse_address", true),
