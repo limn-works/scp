@@ -1,9 +1,9 @@
 //! Shared Ed25519 signature verification helpers.
 //!
-//! This module is the single source of truth for Ed25519 signature verification
-//! in SCP. All module-specific verification functions delegate to
-//! [`verify_ed25519_signature`] rather than inlining `VerifyingKey::from_bytes`
-//! + `Signature::from_bytes` + `verify_strict` sequences.
+//! Centralizes Ed25519 signature verification for SCP. Module-level wrappers
+//! delegate to [`verify_ed25519_signature`] rather than inlining
+//! `VerifyingKey::from_bytes` + `Signature::from_bytes` + `verify_strict`
+//! sequences.
 //!
 //! A single function is provided:
 //! - [`verify_ed25519_signature`] — strict verification (cofactorless, rejects

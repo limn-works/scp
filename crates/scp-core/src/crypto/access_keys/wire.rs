@@ -599,13 +599,10 @@ fn verify_ed25519_signature(
     match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
-            if reason.contains("must be 32 bytes")
-                || reason.contains("must be 64 bytes")
-                || reason.contains("invalid public key")
-            {
-                Err(AccessKeyError::VerificationFailed(reason))
-            } else {
+            if reason.starts_with("signature verification failed") {
                 Ok(false)
+            } else {
+                Err(AccessKeyError::VerificationFailed(reason))
             }
         }
     }

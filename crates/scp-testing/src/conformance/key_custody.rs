@@ -153,7 +153,7 @@ pub mod test_helpers {
     /// or the signature does not verify.
     #[allow(clippy::expect_used, clippy::panic)]
     pub fn verify_ed25519_signature(public_key: &[u8], message: &[u8], signature: &[u8]) {
-        use ed25519_dalek::{Verifier, VerifyingKey};
+        use ed25519_dalek::VerifyingKey;
 
         assert_eq!(
             public_key.len(),
@@ -171,7 +171,7 @@ pub mod test_helpers {
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
         verifying_key
-            .verify(message, &sig)
+            .verify_strict(message, &sig)
             .expect("signature verification should succeed");
     }
 }
