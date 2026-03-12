@@ -148,8 +148,7 @@ impl Drop for ZeroizingSigner {
 fn zeroize_signature_key_pair(skp: &mut SignatureKeyPair) {
     // SAFETY: We cast the `&mut SignatureKeyPair` to a pointer to its first
     // field, `private: Vec<u8>`. The field layout is verified by tests. We
-    // obtain a mutable slice to the Vec's heap buffer and overwrite it with
-    // zeros. This is safe because:
+    // obtain a mutable slice via `as_mut_slice()` and zeroize it. Safe because:
     //   1. The `Vec<u8>` at offset 0 is valid and initialized (struct is alive).
     //   2. We only write zeros — no reads of uninitialized memory.
     //   3. The `&mut` borrow guarantees exclusive access.
@@ -157,14 +156,7 @@ fn zeroize_signature_key_pair(skp: &mut SignatureKeyPair) {
     unsafe {
         let private_ptr: *mut Vec<u8> =
             std::ptr::from_mut::<SignatureKeyPair>(skp).cast::<Vec<u8>>();
-        // Get the Vec's buffer pointer and length without taking ownership.
-        let buf_ptr = (*private_ptr).as_ptr();
-        let buf_len = (*private_ptr).len();
-        if buf_len > 0 {
-            let buf_mut = buf_ptr.cast_mut();
-            let slice = core::slice::from_raw_parts_mut(buf_mut, buf_len);
-            slice.zeroize();
-        }
+        (*private_ptr).as_mut_slice().zeroize();
     }
 }
 
