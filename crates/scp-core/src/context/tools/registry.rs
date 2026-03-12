@@ -113,7 +113,7 @@ pub struct ToolRegistration {
     pub operator_did: DID,
     /// Optional economic metadata for per-invocation costs (spec section 19.3).
     pub economic_metadata: Option<ToolEconomicMetadata>,
-    /// Unix timestamp (milliseconds) when the tool was registered.
+    /// Unix timestamp (seconds) when the tool was registered.
     ///
     /// Provides temporal provenance for tool registrations. Defaults to 0 for
     /// backward compatibility with registrations created before this field
