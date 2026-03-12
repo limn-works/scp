@@ -3860,8 +3860,9 @@ mod wasm_role_broadcast_mirror {
                     );
                     role_grants && in_ceiling(capability)
                 }
-                "subscriber" => capability == "messages:read" && in_ceiling(capability),
-                "observer" => capability == "messages:read" && in_ceiling(capability),
+                "subscriber" | "observer" => {
+                    capability == "messages:read" && in_ceiling(capability)
+                }
                 _ => false,
             }
         }
@@ -3884,7 +3885,7 @@ mod wasm_role_broadcast_mirror {
             }
         }
 
-        /// Inserts a member (mirrors AddMember logic).
+        /// Inserts a member (mirrors `AddMember` logic).
         pub fn add_member(&mut self, did: &str, role: &str) {
             self.members.insert(
                 did.to_owned(),
@@ -3894,22 +3895,22 @@ mod wasm_role_broadcast_mirror {
                     sequence_number: 0,
                 },
             );
-            if role == "author" {
-                if let Some(ref mut bc) = self.broadcast {
-                    bc.authors.insert(did.to_owned(), HashSet::new());
-                    bc.key_epochs.insert(did.to_owned(), 0);
-                }
+            if role == "author"
+                && let Some(ref mut bc) = self.broadcast
+            {
+                bc.authors.insert(did.to_owned(), HashSet::new());
+                bc.key_epochs.insert(did.to_owned(), 0);
             }
         }
 
-        /// Removes a member (mirrors RemoveMember logic).
+        /// Removes a member (mirrors `RemoveMember` logic).
         pub fn remove_member(&mut self, did: &str) -> Option<MemberEntry> {
             let removed = self.members.remove(did)?;
-            if removed.role == "author" {
-                if let Some(ref mut bc) = self.broadcast {
-                    bc.authors.remove(did);
-                    bc.key_epochs.remove(did);
-                }
+            if removed.role == "author"
+                && let Some(ref mut bc) = self.broadcast
+            {
+                bc.authors.remove(did);
+                bc.key_epochs.remove(did);
             }
             Some(removed)
         }
