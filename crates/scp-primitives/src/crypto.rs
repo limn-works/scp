@@ -1,26 +1,25 @@
 //! Shared Ed25519 signature verification helpers.
 //!
-//! This module is the single source of truth for Ed25519 signature verification
-//! in SCP. All module-specific verification functions delegate to the helpers
-//! here rather than inlining `VerifyingKey::from_bytes` + `Signature::from_bytes`
-//! + `verify` sequences.
+//! Centralizes Ed25519 signature verification for SCP. Module-level wrappers
+//! delegate to [`verify_ed25519_signature`] rather than inlining
+//! `VerifyingKey::from_bytes` + `Signature::from_bytes` + `verify_strict`
+//! sequences.
 //!
-//! Two variants are provided:
-//! - [`verify_ed25519_signature`] — standard verification (cofactored).
-//! - [`verify_ed25519_signature_strict`] — strict verification (cofactorless,
-//!   rejects small-order points). Used for UCAN tokens and inner envelopes.
+//! A single function is provided:
+//! - [`verify_ed25519_signature`] — strict verification (cofactorless, rejects
+//!   small-order points).
 //!
-//! See GitHub issue #81.
+//! See GitHub issues #81, #509, #609.
 
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///
-/// This is the primary verification entry point for SCP. Module-specific
-/// verification functions should call this (or [`verify_ed25519_signature_strict`])
-/// and map the `Err(String)` to their local error type.
+/// This is the sole verification entry point for SCP. Module-specific
+/// verification functions should call this and map the `Err(String)` to
+/// their local error type.
 ///
-/// Uses cofactored verification (`verify`), which is the default for most
-/// SCP verification paths (event logs, attestations, challenges, sender keys,
-/// shadow claiming).
+/// Uses strict verification (`verify_strict`), which rejects signatures
+/// involving small-order points — the strongest verification mode provided
+/// by ed25519-dalek.
 ///
 /// # Errors
 ///
@@ -40,35 +39,9 @@ pub fn verify_ed25519_signature(
         .map_err(|e| format!("signature verification failed: {e}"))
 }
 
-/// Verifies an Ed25519 signature using strict verification.
-///
-/// Strict verification (`verify_strict`) additionally rejects signatures
-/// involving small-order points, providing stronger guarantees against
-/// certain cryptographic attacks. Used for UCAN tokens (ADR-016) and
-/// inner envelope verification (ADR-002).
-///
-/// # Errors
-///
-/// Returns `Err(String)` describing the failure if:
-/// - `public_key` is not exactly 32 bytes
-/// - `signature` is not exactly 64 bytes
-/// - The signature does not verify against the message
-pub fn verify_ed25519_signature_strict(
-    public_key: &[u8],
-    message: &[u8],
-    signature: &[u8],
-) -> Result<(), String> {
-    let (verifying_key, sig) = parse_key_and_signature(public_key, signature)?;
-
-    verifying_key
-        .verify_strict(message, &sig)
-        .map_err(|e| format!("signature verification failed: {e}"))
-}
-
 /// Parses a public key and signature from raw byte slices into typed values.
 ///
-/// Shared between [`verify_ed25519_signature`] and
-/// [`verify_ed25519_signature_strict`] to avoid duplicating the parsing logic.
+/// Internal helper for [`verify_ed25519_signature`].
 fn parse_key_and_signature(
     public_key: &[u8],
     signature: &[u8],
@@ -114,16 +87,6 @@ mod tests {
         let sig = sk.sign(message);
 
         let result = verify_ed25519_signature(vk.as_bytes(), message, &sig.to_bytes());
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-    }
-
-    #[test]
-    fn valid_signature_verifies_strict() {
-        let (vk, sk) = test_keypair();
-        let message = b"strict check";
-        let sig = sk.sign(message);
-
-        let result = verify_ed25519_signature_strict(vk.as_bytes(), message, &sig.to_bytes());
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 

@@ -332,21 +332,20 @@ pub fn verify_inner_signature(
     let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
 
     // Verify using strict mode (rejects small-order points).
-    match crate::crypto::ed25519::verify_ed25519_signature_strict(
+    match crate::crypto::ed25519::verify_ed25519_signature(
         sender_public_key,
         &canonical_hash,
         &inner.signature,
     ) {
         Ok(()) => Ok(true),
         Err(reason) => {
-            // Distinguish malformed inputs from valid-but-non-matching signatures.
-            if reason.contains("must be 32 bytes")
-                || reason.contains("must be 64 bytes")
-                || reason.contains("invalid public key")
-            {
-                Err(EnvelopeError::VerificationFailed(reason))
-            } else {
+            // Signature mismatch → Ok(false). Malformed inputs → Err.
+            // Match the known verification-failure prefix so unknown errors
+            // default to Err (safe) rather than Ok(false) (silent suppression).
+            if reason.starts_with("signature verification failed") {
                 Ok(false)
+            } else {
+                Err(EnvelopeError::VerificationFailed(reason))
             }
         }
     }
