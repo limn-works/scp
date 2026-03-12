@@ -1049,6 +1049,12 @@ mod tests {
     /// or hardcoded 0. Registers UCAN state and calls `register_tool` through
     /// `runtime::with_context` — the same code path `tool_register` uses
     /// internally. Catches the original bug from issue #871.
+    ///
+    /// Note: This test exercises the Rust-side registration logic directly
+    /// rather than calling the `#[napi]` `tool_register` function, because
+    /// napi-rs functions require a live Node.js/Bun JS runtime (`Env`) that
+    /// is not available in `cargo test`. The timestamp assignment and
+    /// `register_tool` call are identical to the bridge entry point.
     #[test]
     fn registered_at_is_seconds_epoch() {
         use scp_core::context::roles::{ContextRoleState, default_ceiling};
