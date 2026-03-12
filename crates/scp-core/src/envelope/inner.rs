@@ -181,8 +181,47 @@ pub struct InnerEnvelope {
     /// (§13.5.1). Intermediaries and SDK storage layers that deserialize and
     /// re-serialize inner envelopes MUST NOT strip unrecognized fields.
     /// Excluded from canonical hash computation and signing.
+    ///
+    /// Uses `rmpv::Value` (not `serde_json::Value`) to preserve `MessagePack`
+    /// type fidelity. A `MsgPack` Binary field roundtrips as Binary; with
+    /// `serde_json::Value` it would degrade to an Array of numbers — silent
+    /// data corruption.
+    ///
+    /// **Security note:** Extensions carry no authenticity guarantee. Fields
+    /// in this map are not covered by the envelope signature. Do not use
+    /// extension values for security-sensitive decisions.
     #[serde(flatten)]
-    pub extensions: HashMap<String, serde_json::Value>,
+    pub extensions: HashMap<String, rmpv::Value>,
+}
+
+impl InnerEnvelope {
+    /// Deserializes an `InnerEnvelope` from `MessagePack` bytes with a
+    /// pre-deserialization size check.
+    ///
+    /// The size check rejects inputs exceeding [`MAX_ENVELOPE_SIZE`] *before*
+    /// invoking the deserializer, preventing `serde`'s `#[serde(flatten)]`
+    /// buffering from allocating memory for oversized inputs. This mirrors
+    /// [`OuterEnvelope::from_bytes`](super::outer::OuterEnvelope::from_bytes).
+    ///
+    /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::EnvelopeTooLarge`] if `data.len()` exceeds
+    /// `MAX_ENVELOPE_SIZE`.
+    /// Returns [`EnvelopeError::DeserializationFailed`] if the bytes are not
+    /// a valid `MessagePack`-encoded `InnerEnvelope`.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, EnvelopeError> {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        if data.len() > MAX_ENVELOPE_SIZE {
+            return Err(EnvelopeError::EnvelopeTooLarge {
+                size: data.len(),
+                max: MAX_ENVELOPE_SIZE,
+            });
+        }
+        rmp_serde::from_slice(data).map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,16 +1674,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Serialize to JSON, inject an unknown field, deserialize back.
-        let mut map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
-        map.insert(
+        // Inject an unknown extension field directly and verify msgpack roundtrip.
+        let mut envelope_with_ext = envelope;
+        envelope_with_ext.extensions.insert(
             "future_protocol_extension".into(),
-            serde_json::json!({"nested": true, "version": 2}),
+            rmpv::Value::from("present"),
         );
 
-        let decoded: InnerEnvelope =
-            serde_json::from_value(serde_json::Value::Object(map)).unwrap();
+        let bytes = rmp_serde::to_vec_named(&envelope_with_ext).unwrap();
+        let decoded: InnerEnvelope = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.context_id, "ctx-fwd");
         assert_eq!(decoded.sender_did, "did:dht:fwd-compat");
 
@@ -1654,18 +1692,15 @@ mod tests {
             "unknown field must be preserved in extensions, got: {:?}",
             decoded.extensions
         );
-        let ext = &decoded.extensions["future_protocol_extension"];
-        assert_eq!(ext["nested"], true);
-        assert_eq!(ext["version"], 2);
 
         // Re-serialize and re-deserialize — extensions must persist.
-        let re_json = serde_json::to_value(&decoded).unwrap();
-        let re_decoded: InnerEnvelope = serde_json::from_value(re_json).unwrap();
+        let re_bytes = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: InnerEnvelope = rmp_serde::from_slice(&re_bytes).unwrap();
         assert!(
             re_decoded
                 .extensions
                 .contains_key("future_protocol_extension"),
-            "extensions must survive JSON roundtrip"
+            "extensions must survive msgpack roundtrip"
         );
     }
 
@@ -1696,8 +1731,13 @@ mod tests {
             #[serde(with = "crate::serde_util::serde_signature_64")]
             signature: [u8; 64],
             /// Field unknown to the current `InnerEnvelope` definition.
-            v2_sender_trust_score: serde_json::Value,
+            v2_sender_trust_score: rmpv::Value,
         }
+
+        let trust_map = rmpv::Value::Map(vec![
+            (rmpv::Value::from("score"), rmpv::Value::F64(0.95)),
+            (rmpv::Value::from("basis"), rmpv::Value::from("direct")),
+        ]);
 
         let extended = ExtendedInnerEnvelope {
             version: SCP_INNER_ENVELOPE_VERSION,
@@ -1714,7 +1754,7 @@ mod tests {
             provenance_hash: Sha256::digest([0x00]).into(),
             signing_key_id: SigningKeyId::Active,
             signature: [0x42; 64],
-            v2_sender_trust_score: serde_json::json!({"score": 0.95, "basis": "direct"}),
+            v2_sender_trust_score: trust_map,
         };
 
         // Serialize the extended struct to MessagePack.
@@ -1735,8 +1775,8 @@ mod tests {
             decoded.extensions
         );
         let ext = &decoded.extensions["v2_sender_trust_score"];
-        assert_eq!(ext["score"], 0.95);
-        assert_eq!(ext["basis"], "direct");
+        assert_eq!(ext["score"], rmpv::Value::F64(0.95));
+        assert_eq!(ext["basis"], rmpv::Value::from("direct"));
 
         // Re-serialize and re-deserialize — the extension must persist.
         let re_encoded = rmp_serde::to_vec_named(&decoded).unwrap();
@@ -1780,10 +1820,17 @@ mod tests {
         // Add extensions — signature must still verify.
         envelope
             .extensions
-            .insert("future_field".into(), serde_json::json!("future_value"));
+            .insert("future_field".into(), rmpv::Value::from("future_value"));
         envelope.extensions.insert(
             "another_future_field".into(),
-            serde_json::json!({"nested": [1, 2, 3]}),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::from("nested"),
+                rmpv::Value::Array(vec![
+                    rmpv::Value::from(1),
+                    rmpv::Value::from(2),
+                    rmpv::Value::from(3),
+                ]),
+            )]),
         );
 
         let still_valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();

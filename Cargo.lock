@@ -4825,6 +4825,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rmp-serde",
+ "rmpv",
  "scp-event-log",
  "scp-identity",
  "scp-media",

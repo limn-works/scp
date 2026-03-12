@@ -183,7 +183,7 @@ These rules define how implementations handle messages from higher minor version
 
 Implementations MUST ignore unknown fields in MessagePack maps. This is already required by ADR-004 for relay protocol messages and is extended to all SCP wire structures:
 
-- **InnerEnvelope:** Unknown fields MUST be preserved for forward-compatible roundtripping. The signature covers only the fields defined in the signed structure (§13.2.1). Unknown fields are not part of the signature commitment and MUST NOT cause signature verification failure. Intermediaries and SDK storage layers that deserialize and re-serialize inner envelopes MUST NOT strip fields they do not recognize.
+- **InnerEnvelope:** Unknown fields MUST be preserved for forward-compatible roundtripping. The signature covers only the fields defined in the signed structure (§13.2.1). Unknown fields are not part of the signature commitment and MUST NOT cause signature verification failure. Intermediaries and SDK storage layers that deserialize and re-serialize inner envelopes MUST NOT strip fields they do not recognize. Implementations MUST preserve the MessagePack type fidelity of unknown fields — a Binary field MUST roundtrip as Binary, not degrade to Array. Extensions carry no authenticity guarantee: fields in the extensions map are not covered by the envelope signature and MUST NOT be used for security-sensitive decisions.
 - **BroadcastEnvelope:** Same rule as InnerEnvelope — unknown fields MUST be ignored during processing but need not be preserved (broadcast envelopes are not forwarded by intermediaries).
 - **OuterEnvelope:** Unknown fields MUST be preserved during relay forwarding. Relays MUST NOT strip unknown fields from outer envelopes.
 - **Relay protocol messages:** Unknown fields MUST be ignored (existing ADR-004 rule).
@@ -310,9 +310,9 @@ An implementation claiming SCP/1.x conformance MUST:
 
 1. Include the `version` field as the first field in all wire structures (§13.2).
 2. Set `version` to `0x0100` (SCP/1.0) or the highest minor version it fully implements.
-3. Ignore unknown fields in all deserialized structures (§13.5.1).
+3. Ignore unknown fields in all deserialized structures, except `InnerEnvelope` and `OuterEnvelope` where unknown fields MUST be preserved for forward-compatible roundtripping with full type fidelity (§13.5.1).
 4. Handle unknown relay ops without disconnecting (§13.5.2).
-5. Preserve unknown fields when forwarding (relays only) (§13.5.1).
+5. Preserve unknown fields in `InnerEnvelope` and `OuterEnvelope` when forwarding or re-serializing — including intermediaries, SDK storage layers, and relays (§13.5.1).
 6. Refuse to join contexts with unrecognized `ContextMode` (§13.5.5).
 7. Refuse to join contexts with `min_protocol_version` higher than supported (§13.4).
 8. Report degraded-mode status to the application layer (§13.6.2).
