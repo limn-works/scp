@@ -507,7 +507,8 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], 
 /// to prevent type-flipping attacks (issue #290).
 ///
 /// ```text
-/// SHA-256(DOMAIN_SEPARATOR || message_type_byte
+/// SHA-256(DOMAIN_SEPARATOR || version_BE
+///         || message_type_byte
 ///         || len(context_id) || context_id
 ///         || len(sender_did) || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE

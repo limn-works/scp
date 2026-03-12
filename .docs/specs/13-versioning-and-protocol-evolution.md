@@ -26,17 +26,18 @@ The `version` field is added as the first field in the signed structure (§9.5.2
 | Order | Field | Encoding |
 |-------|-------|----------|
 | 1 | `version` | 2-byte BE u16 |
-| 2 | `context_id` | 4-byte BE length + UTF-8 bytes |
-| 3 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 4 | `epoch` | 8-byte BE u64 |
-| 5 | `generation_number` | 8-byte BE u64 |
-| 6 | `sequence_number` | 8-byte BE u64 |
-| 7 | `timestamp` | 8-byte BE u64 |
-| 8 | `payload_hash` | 4-byte BE length + 32 bytes |
-| 9 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
-| 10 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `message_type` | 1-byte U8 discriminator (0x00=Content, 0x01=Signaling, 0x02=KeyDistribution) |
+| 3 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 4 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 5 | `epoch` | 8-byte BE u64 |
+| 6 | `generation_number` | 8-byte BE u64 |
+| 7 | `sequence_number` | 8-byte BE u64 |
+| 8 | `timestamp` | 8-byte BE u64 |
+| 9 | `payload_hash` | 4-byte BE length + 32 bytes |
+| 10 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
+| 11 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
 
-Adding `version` as field 1 changes the field positions of all subsequent fields, which changes the signed bytes. This is intentional — the version field is part of the signature commitment. The domain separator is `"SCP-INNER-ENVELOPE-V1:"` for the initial protocol version (v1). Future protocol versions will increment the domain separator (e.g., `V2`) when the signed structure changes.
+Adding `version` as field 1 and `message_type` as field 2 changes the field positions of all subsequent fields, which changes the signed bytes. This is intentional — both fields are part of the signature commitment. The `message_type` discriminator byte prevents type-flipping attacks where an adversary replays a message under a different type semantics (#290). The domain separator is `"SCP-INNER-ENVELOPE-V1:"` for the initial protocol version (v1). Future protocol versions will increment the domain separator (e.g., `V2`) when the signed structure changes.
 
 The `InnerEnvelope` MessagePack serialization includes `version` as the first map key (or first positional field if using positional encoding — see §9.5.2 for the canonical field ordering).
 
