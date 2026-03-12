@@ -390,13 +390,13 @@ public extension Context {
     /// Creates a stateful tool session for repeated invocations.
     ///
     /// Delegates to the UniFFI ``toolSessionCreate`` bridge function.
-    /// Sessions have a TTL and a per-caller cap (5 concurrent).
+    /// Sessions have an optional TTL and a per-caller cap (5 concurrent).
     ///
     /// - Parameters:
     ///   - toolId: The tool ID to create a session for.
     ///   - sourceContextId: The context ID of the calling context.
     ///   - ttlSeconds: Time-to-live for the session in seconds, or `nil` for
-    ///     server-default TTL (spec section 6.2.1).
+    ///     a session that persists for the lifetime of the context (spec section 6.2.1).
     ///   - sessionCreateFn: Bridge function override for testing.
     /// - Returns: A ``ToolSessionResult`` containing the session ID.
     /// - Throws: ``ScpError/Tool(message:code:)`` if session creation fails.
