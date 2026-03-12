@@ -92,10 +92,49 @@ interface MessageCallback {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface IdentityBindings {
+    /**
+     * Creates a new DID identity with the specified custody method.
+     *
+     * Generates a new `did:dht` identity backed by the given custody type.
+     * The returned handle retains key material for the identity's lifetime.
+     *
+     * @param custody Key custody method: `"in_memory"` (dev/test only, feature-gated),
+     *   `"platform"` (Secure Enclave / Android Keystore), or `"software"`.
+     * @return Opaque identity handle for use in subsequent operations.
+     * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
+     *   but the `allow_in_memory_custody` feature is not enabled, or with
+     *   `SCP-IDENT-1003` if `"platform"`/`"software"` is requested without a
+     *   wired `KeyCustodyProvider`.
+     */
     fun identityCreate(custody: String): Long
 
+    /**
+     * Loads an existing identity from storage by DID string.
+     *
+     * Returns a DID-string-only handle without local key material.
+     * Key operations (signing, rotation) require a `KeyCustodyProvider`
+     * callback to be wired separately.
+     *
+     * @param did The DID string to load (e.g., `"did:dht:z6Mk..."`).
+     *   Only `did:dht` is currently supported.
+     * @return Opaque identity handle.
+     * @throws BridgeException with `SCP-IDENT-1004` if the DID method
+     *   is not supported.
+     */
     fun identityLoad(did: String): Long
 
+    /**
+     * Resolves a DID to its DID document via DHT lookup.
+     *
+     * Performs a network resolution of the given DID string and returns
+     * the full DID document including verification methods, authentication
+     * relationships, and service endpoints.
+     *
+     * @param did The DID string to resolve (e.g., `"did:dht:z6Mk..."`).
+     * @return JSON-encoded DID document.
+     * @throws BridgeException with `SCP-IDENT-1001` if resolution fails
+     *   (not found on DHT, invalid format, or verification failure).
+     */
     fun identityResolve(did: String): String
 }
 
@@ -105,37 +144,136 @@ interface IdentityBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface ContextBindings {
+    /**
+     * Creates a new SCP context with the given parameters.
+     *
+     * Registers the context in the shared `ContextManager`, derives a
+     * context-scoped pseudonym routing ID, and initializes per-context
+     * UCAN validation state (revocation list, nonce tracker, event log).
+     *
+     * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
+     *   or [IdentityBindings.identityLoad].
+     * @param paramsJson JSON-encoded context parameters (ceiling, governance
+     *   model, memory scope, TTL, promotability, min protocol version).
+     * @return Opaque context handle for use in subsequent context operations.
+     * @throws BridgeException with `SCP-CTX-2001` if context creation fails
+     *   or with `SCP-VALID-7000` if the identity DID is malformed.
+     */
     fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
     ): Long
 
+    /**
+     * Joins an existing SCP context by context ID.
+     *
+     * The context must be in `Active` state. Delegates to `ContextManager`
+     * which validates version compatibility and adds the member with a
+     * key package.
+     *
+     * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
+     *   or [IdentityBindings.identityLoad].
+     * @param contextId The unique identifier of the context to join.
+     * @return Opaque context handle.
+     * @throws BridgeException with `SCP-CTX-2013` if the context is not
+     *   in active state, or with `SCP-VALID-7000` if the DID is malformed.
+     */
     fun contextJoin(
         identityHandle: Long,
         contextId: String,
     ): Long
 
+    /**
+     * Leaves an SCP context gracefully (member-initiated).
+     *
+     * Removes the calling identity from the context's membership.
+     * The context remains active for other members.
+     *
+     * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @throws BridgeException with `SCP-CTX-2001` if the leave operation fails.
+     */
     fun contextLeave(contextHandle: Long)
 
+    /**
+     * Closes an SCP context (admin action).
+     *
+     * Terminates the context for all members. Authorization is enforced
+     * by the `ContextManager` via the `ContextClose` capability check.
+     *
+     * @param contextHandle Opaque handle from [contextCreate].
+     * @throws BridgeException with `SCP-CTX-2001` if the close operation
+     *   fails or the caller lacks the `ContextClose` capability.
+     */
     fun contextClose(contextHandle: Long)
 
+    /**
+     * Sends a message to an SCP context.
+     *
+     * Creates an inner envelope with an Ed25519 signature over the payload
+     * and delivers the message through the `ContextManager`'s transport
+     * provider. The context must be in `Active` state.
+     *
+     * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @param payload Raw message bytes (application content).
+     * @throws BridgeException with `SCP-CTX-2019` if the context is not
+     *   active, or with `SCP-CRYPTO-4001` if inner envelope signing fails.
+     */
     fun contextSend(
         contextHandle: Long,
         payload: ByteArray,
     )
 
+    /**
+     * Subscribes to incoming messages on a context via a callback listener.
+     *
+     * The Kotlin SDK converts this callback into a cold [kotlinx.coroutines.flow.Flow]
+     * via `callbackFlow`. The subscription starts when the flow is collected
+     * and stops when the collector cancels.
+     *
+     * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @param callback [MessageCallback] implementation invoked on message
+     *   arrival, error, or subscription completion.
+     * @return Opaque subscription handle for use with [contextUnsubscribe].
+     * @throws BridgeException with `SCP-CTX-2021` if the context is not
+     *   in active state.
+     */
     fun contextSubscribe(
         contextHandle: Long,
         callback: MessageCallback,
     ): Long
 
+    /**
+     * Cancels a message subscription previously created by [contextSubscribe].
+     *
+     * Releases the Rust-side subscription resources. Idempotent: calling
+     * this with an already-cancelled handle is a no-op.
+     *
+     * @param subscriptionHandle Handle returned by [contextSubscribe].
+     */
     fun contextUnsubscribe(subscriptionHandle: Long)
 
+    /**
+     * Sets the economic policy for a context (spec section 19.3).
+     *
+     * Configures payment requirements, fee schedules, and economic
+     * parameters for the context.
+     *
+     * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @param policyJson JSON-encoded economic policy document.
+     * @throws BridgeException if the policy JSON is invalid or the context
+     *   is not in a valid state.
+     */
     fun contextSetEconomicPolicy(
         contextHandle: Long,
         policyJson: String,
     )
 
+    /**
+     * Retrieves the current economic policy for a context.
+     *
+     * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @return JSON-encoded economic policy, or `null` if no policy is set.
+     */
     fun contextGetEconomicPolicy(contextHandle: Long): String?
 }
 
@@ -145,15 +283,43 @@ interface ContextBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface MembershipBindings {
+    /**
+     * Returns the number of members in a context.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @return The member count, or `null` if the context is not registered
+     *   in the `ContextManager`.
+     */
     fun contextMemberCount(contextHandle: Long): Long?
 
+    /**
+     * Checks whether a DID is a member of a context.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param did The DID string to check membership for.
+     * @return `true` if the DID is a current member of the context.
+     */
     fun contextIsMember(
         contextHandle: Long,
         did: String,
     ): Boolean
 
+    /**
+     * Returns all member DIDs in a context.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @return List of DID strings for all current members.
+     */
     fun contextMemberDids(contextHandle: Long): List<String>
 
+    /**
+     * Returns the role assigned to a member in a context.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param did The DID of the member to query.
+     * @return The role string (e.g., `"admin"`, `"member"`), or `null`
+     *   if the DID is not a member of the context.
+     */
     fun contextMemberRole(
         contextHandle: Long,
         did: String,
@@ -166,46 +332,116 @@ interface MembershipBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface GovernanceBindings {
+    /**
+     * Executes an approved governance action on a context.
+     *
+     * All 24 governance action variants (ADR-031) are supported. The
+     * proposal must have `Approved` status. Role state is re-synced
+     * from the `ContextManager` after execution.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param proposalJson JSON-serialized `GovernanceProposal` with
+     *   `Approved` status.
+     * @return JSON string describing the governance action result
+     *   (e.g., `"MemberAdded"`, `"RoleChanged"`, `"ContextClosed"`).
+     * @throws BridgeException with `SCP-PERM-3001` if the proposal is
+     *   not approved or targets the wrong context, or with `SCP-CTX-2001`
+     *   for other governance execution failures.
+     */
     fun governanceExecute(
         contextHandle: Long,
         proposalJson: String,
     ): String
 
-    /** Propose a governance action for voting (#621). */
+    /**
+     * Proposes a governance action for voting.
+     *
+     * For `SingleAdmin` contexts, the proposal is auto-approved and
+     * executed immediately. For multi-admin governance models, the
+     * proposal enters `Pending` status and requires approval votes.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param proposerDid DID of the member submitting the proposal.
+     * @param actionJson JSON-serialized governance action to propose.
+     * @return JSON string with `proposal_id`, `status`, and
+     *   `execution_result` (if auto-approved).
+     * @throws BridgeException if the proposer lacks permission or
+     *   the action JSON is malformed.
+     */
     fun governancePropose(
         contextHandle: Long,
         proposerDid: String,
         actionJson: String,
     ): String
 
-    /** Approve a pending governance proposal (#621). */
+    /**
+     * Casts an approval vote on a pending governance proposal.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param voterDid DID of the voting member.
+     * @param proposalIdHex Hex-encoded 32-byte proposal identifier.
+     * @return JSON string with updated proposal `status`.
+     * @throws BridgeException if the proposal is not found, is not
+     *   pending, or the voter lacks permission.
+     */
     fun governanceApprove(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String
 
-    /** Reject a pending governance proposal (#621). */
+    /**
+     * Casts a rejection vote on a pending governance proposal.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param voterDid DID of the voting member.
+     * @param proposalIdHex Hex-encoded 32-byte proposal identifier.
+     * @return JSON string with updated proposal `status`.
+     * @throws BridgeException if the proposal is not found, is not
+     *   pending, or the voter lacks permission.
+     */
     fun governanceReject(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String
 
-    /** Withdraw a vote on a pending governance proposal (#621). */
+    /**
+     * Withdraws a previously cast vote on a pending governance proposal.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param voterDid DID of the member withdrawing their vote.
+     * @param proposalIdHex Hex-encoded 32-byte proposal identifier.
+     * @return JSON string with updated proposal `status`.
+     * @throws BridgeException if the proposal is not found or the
+     *   voter has not voted on it.
+     */
     fun governanceWithdraw(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String
 
-    /** Retrieve a single governance proposal by hex ID (#621). */
+    /**
+     * Retrieves a single governance proposal by its hex-encoded ID.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param proposalIdHex Hex-encoded 32-byte proposal identifier.
+     * @return JSON string with full proposal details including action,
+     *   status, votes, and execution result.
+     * @throws BridgeException if the proposal is not found.
+     */
     fun governanceGetProposal(
         contextHandle: Long,
         proposalIdHex: String,
     ): String
 
-    /** List all governance proposals for a context (#621). */
+    /**
+     * Lists all governance proposals for a context.
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @return JSON array of proposal objects.
+     */
     fun governanceListProposals(contextHandle: Long): String
 }
 
@@ -215,48 +451,142 @@ interface GovernanceBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface BroadcastBindings {
+    /**
+     * Subscribes a DID to receive broadcast messages in a context.
+     *
+     * Adds the subscriber to the broadcast group, granting them access
+     * to the current sender key for decryption.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param subscriberDid DID of the entity subscribing to broadcasts.
+     * @throws BridgeException if subscription fails (e.g., admission
+     *   policy rejection, context not active).
+     */
     fun broadcastSubscribe(
         contextHandle: Long,
         subscriberDid: String,
     )
 
+    /**
+     * Unsubscribes a DID from a broadcast context.
+     *
+     * Removes the subscriber from the broadcast group. Optionally rotates
+     * the sender key so the unsubscribed party cannot decrypt future messages.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param subscriberDid DID of the entity to unsubscribe.
+     * @param rotateKeys Whether to rotate broadcast keys after removal.
+     *   Set to `true` when revoking access for security.
+     * @throws BridgeException if unsubscription fails.
+     */
     fun broadcastUnsubscribe(
         contextHandle: Long,
         subscriberDid: String,
         rotateKeys: Boolean,
     )
 
+    /**
+     * Publishes a message to all broadcast subscribers in a context.
+     *
+     * The message is encrypted with the current sender key so only
+     * active subscribers can decrypt it.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param authorDid DID of the author publishing the message.
+     * @param payload Raw message bytes to broadcast.
+     * @throws BridgeException if publishing fails (e.g., author is not
+     *   the broadcast owner, context not active).
+     */
     fun broadcastPublish(
         contextHandle: Long,
         authorDid: String,
         payload: ByteArray,
     )
 
+    /**
+     * Blocks a subscriber's read access in a broadcast context (spec section 9.16).
+     *
+     * The blocked subscriber can no longer decrypt new messages. The sender
+     * key is rotated so content published after the block is inaccessible
+     * to the blocked party.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param subscriberDid DID of the subscriber to block.
+     * @param blockerDid DID of the author performing the block.
+     * @throws BridgeException if the blocker lacks permission or the
+     *   subscriber is not found.
+     */
     fun broadcastBlockSubscriber(
         contextHandle: Long,
         subscriberDid: String,
         blockerDid: String,
     )
 
+    /**
+     * Unblocks a previously blocked subscriber in a broadcast context
+     * (spec section 9.16.8).
+     *
+     * Forward-only restoration: the unblocked subscriber can request the
+     * current key on the next pull but cannot decrypt content from the
+     * block period.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param subscriberDid DID of the subscriber to unblock.
+     * @param unblockerDid DID of the author performing the unblock.
+     * @throws BridgeException if the unblocker lacks permission.
+     */
     fun broadcastUnblockSubscriber(
         contextHandle: Long,
         subscriberDid: String,
         unblockerDid: String,
     )
 
+    /**
+     * Handles a broadcast key request from a subscriber.
+     *
+     * Evaluates whether the requester should receive the current sender
+     * key based on admission policy and block status.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param authorDid DID of the broadcast author handling the request.
+     * @param requesterDid DID of the subscriber requesting the key.
+     * @return JSON string describing the key request decision.
+     * @throws BridgeException if the request cannot be processed.
+     */
     fun broadcastHandleKeyRequest(
         contextHandle: Long,
         authorDid: String,
         requesterDid: String,
     ): String
 
+    /**
+     * Returns the number of active broadcast subscribers for a context.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @return The subscriber count, or `null` if this is not a broadcast
+     *   context or the context is not registered.
+     */
     fun broadcastSubscriberCount(contextHandle: Long): Long?
 
+    /**
+     * Checks whether a DID is an active broadcast subscriber.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param did The DID to check.
+     * @return `true` if the DID is a current broadcast subscriber.
+     */
     fun broadcastIsSubscriber(
         contextHandle: Long,
         did: String,
     ): Boolean
 
+    /**
+     * Returns the broadcast admission policy for a context.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @return The admission policy string (`"Open"` or `"Gated"`), or
+     *   `null` if this is not a broadcast context.
+     */
     fun broadcastAdmission(contextHandle: Long): String?
 }
 
@@ -266,17 +596,63 @@ interface BroadcastBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface ToolBindings {
+    /**
+     * Registers a tool in an SCP context.
+     *
+     * Validates the tool definition (name, input/output JSON schemas,
+     * test vectors, implementation hash) and adds it to the context's
+     * tool registry. The context must be in `Active` state.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param definitionJson JSON-encoded tool definition including `name`,
+     *   `description`, `input_schema_json`, `output_schema_json`,
+     *   `operator_did`, and optional `test_vectors_json` and
+     *   `implementation_hash`.
+     * @return The assigned tool ID string (derived from the tool name).
+     * @throws BridgeException with `SCP-TOOL-6003` if the context is not
+     *   active, with `SCP-VALID-7035`/`SCP-VALID-7036` if schemas are
+     *   invalid, or with `SCP-TOOL-6001` if registration fails.
+     */
     fun toolRegister(
         contextHandle: Long,
         definitionJson: String,
     ): String
 
+    /**
+     * Invokes a registered tool in an SCP context.
+     *
+     * Validates the input against the tool's JSON schema, checks UCAN
+     * authorization, and dispatches to the tool handler if one is
+     * registered. The context must be in `Active` state.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param toolId The tool's assigned ID from [toolRegister].
+     * @param inputJson JSON-encoded tool input matching the tool's
+     *   input schema.
+     * @return JSON-encoded tool output.
+     * @throws BridgeException with `SCP-TOOL-6005` if the context is not
+     *   active, with `SCP-TOOL-6002` if invocation fails, or with
+     *   `SCP-PERM-3001` if UCAN authorization fails.
+     */
     fun toolInvoke(
         contextHandle: Long,
         toolId: String,
         inputJson: String,
     ): String
 
+    /**
+     * Verifies a tool invocation's input/output pair against test vectors.
+     *
+     * Checks that the given input produces the expected output according
+     * to the tool's registered test vectors.
+     *
+     * @param toolId The tool's assigned ID.
+     * @param inputJson JSON-encoded tool input.
+     * @param outputJson JSON-encoded tool output to verify.
+     * @return `true` if verification passes (all test vectors satisfied).
+     * @throws BridgeException with `SCP-TOOL-6007` if the context is not
+     *   active or verification encounters an error.
+     */
     fun toolVerify(
         toolId: String,
         inputJson: String,
@@ -290,23 +666,88 @@ interface ToolBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface UcanBindings {
+    /**
+     * Validates a UCAN token for a specific capability in a context.
+     *
+     * Executes the full 11-step ADR-016 validation pipeline: JWT parsing,
+     * Ed25519 signature verification, time-bound checks, nonce replay
+     * prevention, revocation checking, delegation chain traversal, and
+     * capability ceiling enforcement.
+     *
+     * @param token The UCAN token string (JWT-encoded).
+     * @param capability The capability URI to validate against (e.g.,
+     *   `"scp:ctx:abc123/messages:write"`).
+     * @param contextId The context ID for scoping the validation.
+     * @throws BridgeException with `SCP-PERM-3002` if validation fails
+     *   (malformed token, expired, revoked, nonce replay, insufficient
+     *   capability, or invalid signature).
+     */
     fun ucanValidate(
         token: String,
         capability: String,
         contextId: String,
     )
 
+    /**
+     * Mints a new UCAN token delegating capabilities to a member DID.
+     *
+     * Uses the context creator's retained key custody and active signing
+     * key to produce a real Ed25519-signed UCAN token via
+     * `scp_core::crypto::ucan::mint::mint_ucan`. Capabilities are
+     * automatically scoped to the context. Enforces ceiling constraints.
+     *
+     * @param identityHandle Opaque handle from identity create or load.
+     * @param memberDid The DID of the member receiving the token.
+     * @param capabilitiesJson JSON-encoded list of capability URI strings
+     *   to grant (e.g., `["messages:write", "tool_invoke:*"]`).
+     * @return The minted UCAN token string (JWT-encoded).
+     * @throws BridgeException with `SCP-VALID-7000` if `memberDid` is
+     *   malformed, or with `SCP-PERM-3004` if the context lacks key
+     *   custody for signing.
+     */
     fun ucanMint(
         identityHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
     ): String
 
+    /**
+     * Revokes a previously minted UCAN token.
+     *
+     * Adds the token to the context's revocation list. Subsequent
+     * validation calls for this token will fail. Revocation is
+     * idempotent: revoking a non-existent or already-revoked token
+     * succeeds silently.
+     *
+     * @param identityHandle Opaque handle from identity create or load.
+     * @param token The full encoded JWT string of the token to revoke.
+     * @throws BridgeException if the revocation operation fails.
+     */
     fun ucanRevoke(
         identityHandle: Long,
         token: String,
     )
 
+    /**
+     * Delegates a UCAN token to another entity with attenuated capabilities.
+     *
+     * Creates a new UCAN derived from a parent token, signed with the
+     * delegator's Ed25519 key. Delegation enforces attenuation:
+     * capabilities can only narrow, never widen. The delegator must be
+     * the audience of the parent token.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param delegatorDid DID of the entity delegating (must match the
+     *   parent token's audience).
+     * @param delegateeDid DID of the entity receiving the delegation.
+     * @param parentToken The encoded parent UCAN token (JWT format).
+     * @param capabilitiesJson JSON-encoded list of capability URIs to
+     *   delegate (must be a subset of the parent's capabilities).
+     * @return The delegated UCAN token string (JWT-encoded).
+     * @throws BridgeException with `SCP-PERM-3001` if delegation fails
+     *   (capabilities wider than parent, invalid parent token, or
+     *   delegator is not the parent's audience).
+     */
     fun ucanDelegate(
         contextHandle: Long,
         delegatorDid: String,
@@ -322,29 +763,115 @@ interface UcanBindings {
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
 interface InfraBindings {
+    /**
+     * Queries the context event log with optional filters.
+     *
+     * Returns events from the Merkle-backed event log, filtered by
+     * event type, actor DID, sequence range, and/or result limit. If no
+     * stored events match, returns a `LogSummary` event with the current
+     * Merkle root and event count.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param filterJson JSON-encoded query filter with optional fields:
+     *   `event_type` (string), `actor_did` (string), `after_sequence`
+     *   (number), `before_sequence` (number), `limit` (number).
+     * @return JSON-encoded list of event log entries.
+     * @throws BridgeException with `SCP-CTX-2023` if the context is not
+     *   found or the filter JSON is invalid.
+     */
     fun eventLogQuery(
         contextHandle: Long,
         filterJson: String,
     ): String
 
+    /**
+     * Verifies a claim against the context event log using a Merkle proof.
+     *
+     * Generates and verifies an inclusion or absence proof for the given
+     * claim against the event log's Merkle tree.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param claimJson JSON-encoded claim with `type` (`"inclusion"` or
+     *   `"absence"`), `leaf_index` (for inclusion proofs), or
+     *   `event_hash` (hex-encoded, for absence proofs).
+     * @return `true` if the Merkle proof is valid.
+     * @throws BridgeException with `SCP-CTX-2025` if the claim JSON is
+     *   invalid, or with `SCP-CTX-2026` if verification fails (empty
+     *   log, invalid index, etc.).
+     */
     fun eventLogVerify(
         contextHandle: Long,
         claimJson: String,
     ): Boolean
 
+    /**
+     * Generates a signed consistency checkpoint for equivocation detection.
+     *
+     * Creates a signed snapshot of the event log's Merkle root at the
+     * given MLS epoch. Members exchange checkpoints to detect relay
+     * equivocation: differing Merkle roots for the same event count
+     * indicate the relay is showing different histories to different
+     * members.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param identityHandle Opaque handle from identity create or load.
+     *   Must have retained key custody for Ed25519 signing.
+     * @param epoch The MLS epoch to checkpoint at.
+     * @return JSON-encoded checkpoint containing `context_id`,
+     *   `sender_did`, `event_count`, `merkle_root`, `epoch`,
+     *   `signature`, and `timestamp`.
+     * @throws BridgeException with `SCP-PERM-3008` if the identity
+     *   lacks key custody, or with `SCP-CTX-2027` if checkpoint
+     *   generation fails.
+     */
     fun eventLogCheckpoint(
         contextHandle: Long,
         identityHandle: Long,
         epoch: Long,
     ): String
 
+    /**
+     * Connects to a transport relay.
+     *
+     * Establishes a WebSocket connection to an SCP relay at the URL
+     * specified in the configuration. This is a potentially long-running
+     * operation that supports cancellation via [CancellationHandle].
+     *
+     * @param configJson JSON-encoded transport configuration including
+     *   the relay URL.
+     * @param cancellationHandle Optional handle for propagating coroutine
+     *   cancellation to the Rust engine during connection establishment.
+     * @return Opaque transport handle for use with [transportStatus]
+     *   and [transportDisconnect].
+     * @throws BridgeException with `SCP-TRANS-5001` if connection fails
+     *   (invalid URL, network error, relay unreachable).
+     */
     fun transportConnect(
         configJson: String,
         cancellationHandle: CancellationHandle?,
     ): Long
 
+    /**
+     * Queries the status of a transport connection.
+     *
+     * Returns the current connection state including whether the
+     * transport is connected, the relay URL, and round-trip latency.
+     *
+     * @param transportHandle Opaque handle from [transportConnect].
+     * @return JSON-encoded transport status with `connected` (boolean),
+     *   `relay_url` (string or null), and `latency_ms` (number or null).
+     */
     fun transportStatus(transportHandle: Long): String
 
+    /**
+     * Disconnects from a transport relay.
+     *
+     * Clears the relay adapter and releases the WebSocket connection.
+     * After this call, the transport reports disconnected status.
+     * Idempotent: calling when already disconnected is a no-op.
+     *
+     * @param transportHandle Opaque handle from [transportConnect].
+     */
     fun transportDisconnect(transportHandle: Long)
 }
 
