@@ -139,7 +139,7 @@ pub fn py_discovery_normalize_address(address: &str) -> String {
 ///
 /// Returns `(source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id)`.
 /// Shared by both [`discovery_result_to_dict`] (Python) and [`discovery_result_to_json`] (tests).
-fn map_discovery_source(
+const fn map_discovery_source(
     source: &scp_core::discovery::ContextDiscoverySource,
 ) -> (
     &'static str,
