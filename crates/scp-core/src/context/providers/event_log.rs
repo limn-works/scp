@@ -38,6 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::context::builder::{ContextCreationError, ContextEventLogProvider};
 
@@ -350,13 +351,13 @@ impl MerkleEventLogProvider {
             // Skip prev_hash linkage check for the first entry: if the log
             // was pruned, entries[0].prev_hash references a discarded
             // predecessor and cannot be validated.
-            if i > 0 && entry.prev_hash != log.entries[i - 1].hash {
+            if i > 0 && !bool::from(entry.prev_hash.ct_eq(&log.entries[i - 1].hash)) {
                 return false;
             }
 
             // Check self-hash correctness.
             let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-            if entry.hash != expected_hash {
+            if !bool::from(entry.hash.ct_eq(&expected_hash)) {
                 return false;
             }
         }
@@ -601,13 +602,13 @@ fn verify_chain_integrity(entries: &[EventLogEntry]) -> Result<(), ContextCreati
         // Skip prev_hash linkage check for the first entry: if the log was
         // pruned, entries[0].prev_hash references a discarded predecessor
         // and cannot be validated.
-        if i > 0 && entry.prev_hash != entries[i - 1].hash {
+        if i > 0 && !bool::from(entry.prev_hash.ct_eq(&entries[i - 1].hash)) {
             return Err(ContextCreationError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
         }
         let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-        if entry.hash != expected_hash {
+        if !bool::from(entry.hash.ct_eq(&expected_hash)) {
             return Err(ContextCreationError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
             )));

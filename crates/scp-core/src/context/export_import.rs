@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::ContextError;
 use super::manager::ContextSnapshot;
@@ -165,7 +166,7 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
         // pruned, entries[0].prev_hash references a discarded predecessor and
         // cannot be validated. This matches the logic in
         // `providers::event_log::verify_chain_integrity`.
-        if i > 0 && entry.prev_hash != entries[i - 1].hash {
+        if i > 0 && !bool::from(entry.prev_hash.ct_eq(&entries[i - 1].hash)) {
             return Err(ContextError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
@@ -173,7 +174,7 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 
         // Verify self-hash correctness.
         let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-        if entry.hash != expected_hash {
+        if !bool::from(entry.hash.ct_eq(&expected_hash)) {
             return Err(ContextError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
             )));
@@ -228,8 +229,8 @@ pub fn validate_export_for_import(export: &ContextExport) -> Result<(), ContextE
     // 2. Merkle chain verification.
     let computed_root = verify_merkle_chain(&export.event_log_data)?;
 
-    // 3. Root hash comparison.
-    if computed_root != export.merkle_root {
+    // 3. Root hash comparison (constant-time to avoid timing side-channels).
+    if !bool::from(computed_root.ct_eq(&export.merkle_root)) {
         return Err(ContextError::EventLogFailed(
             "Merkle root mismatch: computed root does not match exported root — \
              event log data may have been tampered with"

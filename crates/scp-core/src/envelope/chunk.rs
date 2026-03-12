@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::EnvelopeError;
 use super::padding::BUCKET_SIZES;
@@ -249,7 +250,7 @@ pub fn reassemble_chunks(chunks: &[ChunkEnvelope]) -> Result<Vec<u8>, EnvelopeEr
                 chunk.total_chunks
             )));
         }
-        if chunk.payload_hash != payload_hash {
+        if !bool::from(chunk.payload_hash.ct_eq(&payload_hash)) {
             return Err(EnvelopeError::DeserializationFailed(
                 "mismatched payload_hash across chunks".into(),
             ));
@@ -285,7 +286,7 @@ pub fn reassemble_chunks(chunks: &[ChunkEnvelope]) -> Result<Vec<u8>, EnvelopeEr
 
     // Verify integrity.
     let actual_hash: [u8; 32] = Sha256::digest(&reassembled).into();
-    if actual_hash != payload_hash {
+    if !bool::from(actual_hash.ct_eq(&payload_hash)) {
         return Err(EnvelopeError::DeserializationFailed(
             "reassembled payload hash does not match payload_hash".into(),
         ));
