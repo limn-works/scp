@@ -304,6 +304,8 @@ pub async fn ucan_validate(
 ///
 /// # Errors
 ///
+/// - Rejects with `SCP-VALID-7000` if `member_did` fails [`validate_did`]
+///   (empty, malformed `did:{method}:{id}` format, or control characters).
 /// - Rejects with `SCP-PERM-3023` if the context does not have key custody
 ///   (created from an `identity_load` handle without key material).
 /// - Rejects with `SCP-PERM-3023` if signing or token construction fails.
@@ -430,6 +432,13 @@ pub async fn ucan_mint(
 ///
 /// # Errors
 ///
+/// - Rejects with `SCP-VALID-7000` if `delegator_did` or `delegatee_did`
+///   fails [`validate_did`] (empty, malformed `did:{method}:{id}` format,
+///   or control characters).
+/// - Rejects with `SCP-VALID-7000` if `parent_token` fails
+///   [`validate_ucan_token`] (empty, too long, or control characters).
+/// - Rejects with `SCP-VALID-7000` if any capability URI fails
+///   [`validate_capability_uri`] (empty, too long, or control characters).
 /// - Rejects with `SCP-PERM-3023` if the context does not have key custody.
 /// - Rejects with `SCP-PERM-3023` if delegation fails.
 ///

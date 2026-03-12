@@ -787,6 +787,17 @@ pub fn ucan_validate(
 /// Validates capability URIs and returns an error since UCAN minting
 /// requires key custody (`WebCrypto`), which is managed by the TypeScript SDK.
 /// The bridge validates inputs; the TS wrapper signs.
+///
+/// # Errors
+///
+/// Returns `SCP-VALID-7000` if `member_did` fails [`validate_did`]
+/// (empty, malformed `did:{method}:{id}` format, or control characters),
+/// or if `capabilities_json` is not a valid JSON array of capability URI
+/// strings.
+///
+/// Returns `SCP-CTX-2001` if the context is not found.
+///
+/// Returns `SCP-PERM-3000` since UCAN minting requires JS-side key custody.
 #[wasm_bindgen]
 pub fn ucan_mint(
     context: &WasmContextHandle,
@@ -890,6 +901,11 @@ pub fn ucan_mint(
 /// * `capabilities_json` — JSON array of capability URI strings to delegate.
 ///
 /// # Errors
+///
+/// Returns `SCP-VALID-7000` if `delegator_did` or `delegatee_did` fails
+/// [`validate_did`] (empty, malformed `did:{method}:{id}` format, or
+/// control characters), or if `parent_token` fails
+/// [`validate_ucan_token`] (empty, too long, or control characters).
 ///
 /// Returns `SCP-PERM-3000` since UCAN delegation requires JS-side key custody.
 ///
