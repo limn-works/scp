@@ -501,10 +501,10 @@ impl PerContextState {
     /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
     /// default role system (see `builtin_*` functions in scp-core roles.rs):
     /// - "admin" — all capabilities in the ceiling.
-    /// - "moderator" — messages:read, messages:write, `tool:invoke_all`,
+    /// - "moderator" — messages:read, messages:write, `tool:invoke:*`,
     ///   member:remove, governance:propose (§5.9 elected moderators pattern).
-    /// - "member" — messages:read, messages:write.
-    /// - "author" — messages:write, messages:read, `tool:invoke_all`.
+    /// - "member" — messages:read, messages:write, `tool:invoke:*`.
+    /// - "author" — messages:write, messages:read, `tool:invoke:*`.
     /// - "observer" — messages:read only.
     ///
     /// Capability strings use the format `"{resource}:{action}"` (e.g.
@@ -533,7 +533,7 @@ impl PerContextState {
                     capability,
                     "messages:read"
                         | "messages:write"
-                        | "tool:invoke_all"
+                        | "tool:invoke:*"
                         | "member:remove"
                         | "governance:propose"
                 );
@@ -543,13 +543,22 @@ impl PerContextState {
                 // Authors: messages r/w, tool invoke — intersected with ceiling.
                 let role_grants = matches!(
                     capability,
-                    "messages:write" | "messages:read" | "tool:invoke_all"
+                    "messages:write" | "messages:read" | "tool:invoke:*"
                 );
                 role_grants && in_ceiling(capability)
             }
             "member" => {
-                // Default member capabilities: messages:read, messages:write.
-                matches!(capability, "messages:read" | "messages:write")
+                // Default member capabilities: messages:read, messages:write,
+                // tool:invoke:* — intersected with ceiling.
+                let role_grants = matches!(
+                    capability,
+                    "messages:read" | "messages:write" | "tool:invoke:*"
+                );
+                role_grants && in_ceiling(capability)
+            }
+            "subscriber" => {
+                // Subscribers can only read messages (broadcast contexts).
+                capability == "messages:read" && in_ceiling(capability)
             }
             "observer" => {
                 // Observers can only read messages.
@@ -1896,7 +1905,18 @@ impl WasmContextManager {
                     message: format!("member '{did}' not found"),
                     code: "SCP-CTX-2015".to_owned(),
                 })?;
+                let old_role = member.role.clone();
                 new_role.clone_into(&mut member.role);
+                // Sync broadcast state when role transitions to/from "author".
+                if let Some(ref mut bc) = ctx.broadcast {
+                    if old_role == "author" && new_role != "author" {
+                        bc.authors.remove(did);
+                        bc.key_epochs.remove(did);
+                    } else if new_role == "author" && old_role != "author" {
+                        bc.authors.insert(did.to_owned(), HashSet::new());
+                        bc.key_epochs.insert(did.to_owned(), 0);
+                    }
+                }
                 Ok(serde_json::json!({"action": "ChangeRole", "did": did, "newRole": new_role}))
             }
             WasmGovernanceAction::RegisterTool {
