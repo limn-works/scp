@@ -288,17 +288,19 @@ All signed structures in the protocol use a single canonical hash construction. 
 
 | Order | Field | Encoding |
 |-------|-------|----------|
-| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
-| 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 3 | `epoch` | 8-byte BE u64 |
-| 4 | `generation_number` | 8-byte BE u64 |
-| 5 | `sequence_number` | 8-byte BE u64 |
-| 6 | `timestamp` | 8-byte BE u64 |
-| 7 | `payload_hash` | 4-byte BE length + 32 bytes |
-| 8 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
-| 9 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
+| 1 | `version` | 2-byte BE u16 |
+| 2 | `message_type` | 1-byte U8 discriminator (0x00=Content, 0x01=Signaling, 0x02=KeyDistribution) |
+| 3 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 4 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 5 | `epoch` | 8-byte BE u64 |
+| 6 | `generation_number` | 8-byte BE u64 |
+| 7 | `sequence_number` | 8-byte BE u64 |
+| 8 | `timestamp` | 8-byte BE u64 |
+| 9 | `payload_hash` | 4-byte BE length + 32 bytes |
+| 10 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
+| 11 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
 
-Note: `signing_key_id` is last (position 9) to match the existing implementation. It binds the signature to the specific verification method (`#active` or `#agent`, ADR-039), preventing key confusion attacks.
+Note: `version` (position 1) commits the protocol version to the signature. `message_type` (position 2) is a discriminator byte that prevents type-flipping attacks where an adversary replays a message under different type semantics (#290). `signing_key_id` is last (position 11) to match the existing implementation. It binds the signature to the specific verification method (`#active` or `#agent`, ADR-039), preventing key confusion attacks.
 
 The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by `#active` (Active Signing Key) or `#agent` (Agent Signing Key) from the sender's DID document (ADR-039). The domain separator prevents cross-protocol hash confusion. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs) — verification is the responsibility of context members who can decrypt the payload.
 
