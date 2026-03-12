@@ -600,20 +600,34 @@ def tool_invoke(
     tool_id: str,
     input: dict[str, Any],
     identity_did: str,
+    ucan_token: str,
+    proof_tokens: list[str] | None = None,
 ) -> Any:
     """Invoke a tool within an SCP context.
+
+    Validates the UCAN token for tool invocation authorization before
+    dispatching. The UCAN must contain a ``tool_invoke:{tool_id}`` or
+    ``tool_invoke:*`` capability scoped to the context.
 
     Args:
         context_id: The ID of the context containing the tool.
         tool_id: The ID of the tool to invoke.
         input: A dict of input parameters matching the tool's input schema.
         identity_did: The DID of the invoking identity.
+        ucan_token: JWT-encoded UCAN token authorizing the invocation.
+            Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
+            capability.
+        proof_tokens: Optional list of encoded parent UCAN token strings
+            for delegation chain verification.
 
     Returns:
         A dict containing the tool's JSON-compatible output.
 
     Raises:
-        ContextError: If invocation fails.
+        UcanError: If the UCAN token is invalid, expired, revoked, or
+            lacks the required tool invocation capability.
+        ContextError: If the context is not connected, the tool is not
+            found, or input/output validation fails.
     """
     ...
 
@@ -630,6 +644,129 @@ def tool_verify(context_id: str, tool_id: str) -> ToolVerificationResult:
 
     Raises:
         ContextError: If verification fails.
+    """
+    ...
+
+def tool_invoke_cross_context(
+    source_context_id: str,
+    target_context_id: str,
+    tool_id: str,
+    input: dict[str, Any],
+    invoker_did: str,
+    ucan_token: str,
+    chain_depth: int,
+    proof_tokens: list[str] | None = None,
+) -> Any:
+    """Invoke a tool across context boundaries.
+
+    The source context exposes the tool and the target context accepts the
+    interface. Both contexts must have approved the interface before calls
+    are permitted. Rate limits and chain depth are enforced per spec
+    section 6.2.
+
+    Args:
+        source_context_id: The ID of the calling context.
+        target_context_id: The ID of the context containing the tool.
+        tool_id: The ID of the tool to invoke.
+        input: A dict of input parameters matching the tool's input schema.
+        invoker_did: The DID of the participant invoking the tool.
+        ucan_token: JWT-encoded UCAN token authorizing the invocation.
+            Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
+            capability. Validated against the target context's ceiling.
+        chain_depth: Current cross-context chain depth (0 for first hop).
+        proof_tokens: Optional list of encoded parent UCAN token strings
+            for delegation chain verification.
+
+    Returns:
+        A dict containing the tool's JSON-compatible output.
+
+    Raises:
+        UcanError: If the UCAN token is invalid, expired, revoked, or
+            lacks the required tool invocation capability.
+        ContextError: If either context is not connected, the tool is not
+            found, chain depth is exceeded, or the interface is not
+            approved.
+    """
+    ...
+
+def tool_session_create(
+    context_id: str,
+    tool_id: str,
+    source_context_id: str,
+    ttl_seconds: int,
+) -> str:
+    """Create a stateful tool session.
+
+    Sessions enable multi-turn workflows with state preservation across
+    invocations. Each session has a TTL and is subject to per-caller caps
+    (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+
+    Args:
+        context_id: The context containing the tool.
+        tool_id: The tool to create a session for.
+        source_context_id: The calling context (session cap tracked per
+            caller).
+        ttl_seconds: Time-to-live for the session, in seconds.
+
+    Returns:
+        The session ID (UUID string).
+
+    Raises:
+        ContextError: If the context is not connected, the tool is not
+            found, or the per-caller session cap is exceeded.
+    """
+    ...
+
+def tool_session_invoke(
+    context_id: str,
+    session_id: str,
+    input: dict[str, Any],
+    invoker_did: str,
+    ucan_token: str,
+    proof_tokens: list[str] | None = None,
+) -> Any:
+    """Invoke a tool within an active session.
+
+    Each call is individually governed: the invoker must hold ``ToolInvoke``
+    capability and present a valid UCAN token. Session state is carried
+    forward across invocations.
+
+    Args:
+        context_id: The context containing the tool session.
+        session_id: The session to invoke within.
+        input: A dict of input parameters matching the tool's input schema.
+        invoker_did: The DID of the invoker (capability checked per call).
+        ucan_token: JWT-encoded UCAN token authorizing the invocation.
+            Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
+            capability.
+        proof_tokens: Optional list of encoded parent UCAN token strings
+            for delegation chain verification.
+
+    Returns:
+        A dict containing the tool's JSON-compatible output.
+
+    Raises:
+        UcanError: If the UCAN token is invalid, expired, revoked, or
+            lacks the required tool invocation capability.
+        ContextError: If the session is not found, has expired, or the
+            invoker lacks capability.
+    """
+    ...
+
+def tool_session_close(context_id: str, session_id: str) -> None:
+    """Close a stateful tool session.
+
+    Removes the session from the store, releasing the caller's session
+    slot. After closing, any further invocations with this session ID
+    will fail.
+
+    Args:
+        context_id: The context containing the tool session.
+        session_id: The session to close.
+
+    Raises:
+        ContextError: If the context is not connected or the session is
+            not found.
     """
     ...
 
