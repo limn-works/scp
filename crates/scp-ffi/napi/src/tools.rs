@@ -234,7 +234,10 @@ pub async fn tool_register(
         test_vectors,
         operator_did: definition.operator_did.into(),
         economic_metadata: None,
-        registered_at: 0,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
         signature: Vec::new(),
     };
 

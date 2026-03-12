@@ -240,11 +240,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         test_vectors,
         operator_did: operator_did.into(),
         economic_metadata,
-        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits u64 for millennia
         registered_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
         signature: vec![],
     };
 
