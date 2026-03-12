@@ -764,20 +764,47 @@ pub struct Message {
     pub provenance: Option<DataProvenance>,
 }
 
-/// Provenance metadata for cross-context data transfer.
+/// Provenance metadata for cross-context data transfer (spec §7.7.1).
 ///
 /// Every message or tool output that crosses a context boundary carries
-/// provenance metadata tracing it back to its origin. See spec §12 (Provenance).
+/// provenance metadata tracing it back to its origin. Records the full
+/// lineage: where data came from, who was involved, how it was discovered,
+/// and how many context hops it has traversed.
+///
+/// See ADR-019 and spec §24 (Provenance System).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DataProvenance {
-    /// DID of the original data source.
-    pub source_did: String,
-    /// Context ID where this data originated.
-    pub origin_context_id: String,
-    /// Depth of cross-context hops (0 = direct, 1 = one hop, etc.).
-    pub chain_depth: u32,
-    /// Ed25519 signature bytes over the provenance record.
-    pub signature: Vec<u8>,
+    /// The context from which this data originated.
+    pub source_context: String,
+    /// Current data availability status of the source context.
+    /// One of `"Persistent"`, `"Ephemeral"`, or `"Summary"`.
+    pub source_type: String,
+    /// DIDs of the parties involved in the source context at the time of
+    /// data flow.
+    pub counterparties: Vec<String>,
+    /// Optional human-readable purpose description for this data flow.
+    pub purpose: Option<String>,
+    /// How the data source was discovered. Serialized as:
+    /// - `"None"` -- no protocol-level discovery path
+    /// - `"SharedContext:<context_id>"` -- shared membership
+    /// - `"Registry:<context_id>"` -- discovery registry
+    pub discovery_method: String,
+    /// Age of the data in seconds at the time provenance was attached.
+    pub age_secs: u64,
+    /// Memory scope of the source context: `"Full"`, `"Summary"`, or
+    /// `"Ephemeral"`.
+    pub memory_scope: String,
+    /// Number of cross-context hops this data has traversed. Protocol
+    /// default maximum is 3.
+    pub chain_depth: u8,
+    /// Ordered list of intermediary context IDs when `chain_depth > 0`.
+    pub chain_path: Option<Vec<String>>,
+    /// Cost of producing this data as a u64 amount, if any (spec §19.6).
+    pub payment_amount: Option<u64>,
+    /// Payment adapter used for the payment, if any (spec §19.6).
+    pub payment_adapter: Option<String>,
+    /// Hex-encoded receipt ID for verification of the payment, if any.
+    pub payment_receipt_id: Option<String>,
 }
 
 /// Tool definition for registration in a context.
@@ -5771,6 +5798,16 @@ pub fn provenance_attach(
         None,
     );
 
+    let discovery_method_json = match &prov.discovery_method {
+        scp_core::provenance::DiscoveryMethod::SharedContext(ctx_id) => {
+            serde_json::json!({"SharedContext": ctx_id})
+        }
+        scp_core::provenance::DiscoveryMethod::Registry(ctx_id) => {
+            serde_json::json!({"Registry": ctx_id})
+        }
+        scp_core::provenance::DiscoveryMethod::None => serde_json::json!("None"),
+    };
+
     let result = serde_json::json!({
         "source_context": prov.source_context,
         "source_type": format!("{:?}", prov.source_type),
@@ -5780,6 +5817,10 @@ pub fn provenance_attach(
         "memory_scope": format!("{:?}", prov.memory_scope),
         "chain_path": prov.chain_path,
         "purpose": prov.purpose,
+        "discovery_method": discovery_method_json,
+        "payment_amount": prov.payment_amount.map(|a| a.0),
+        "payment_adapter": prov.payment_adapter,
+        "payment_receipt_id": prov.payment_receipt_id.map(hex::encode),
     });
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {

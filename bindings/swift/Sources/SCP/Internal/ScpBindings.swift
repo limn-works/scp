@@ -2388,48 +2388,123 @@ public func FfiConverterTypeDIDDocument_lower(_ value: DidDocument) -> RustBuffe
 
 
 /**
- * Provenance metadata for cross-context data transfer.
+ * Provenance metadata for cross-context data transfer (spec §7.7.1).
  *
  * Every message or tool output that crosses a context boundary carries
- * provenance metadata tracing it back to its origin. See spec §12 (Provenance).
+ * provenance metadata tracing it back to its origin. Records the full
+ * lineage: where data came from, who was involved, how it was discovered,
+ * and how many context hops it has traversed.
+ *
+ * See ADR-019 and spec §24 (Provenance System).
  */
 public struct DataProvenance {
     /**
-     * DID of the original data source.
+     * The context from which this data originated.
      */
-    public var sourceDid: String
+    public var sourceContext: String
     /**
-     * Context ID where this data originated.
+     * Current data availability status of the source context.
+     * One of `"Persistent"`, `"Ephemeral"`, or `"Summary"`.
      */
-    public var originContextId: String
+    public var sourceType: String
     /**
-     * Depth of cross-context hops (0 = direct, 1 = one hop, etc.).
+     * DIDs of the parties involved in the source context at the time of
+     * data flow.
      */
-    public var chainDepth: UInt32
+    public var counterparties: [String]
     /**
-     * Ed25519 signature bytes over the provenance record.
+     * Optional human-readable purpose description for this data flow.
      */
-    public var signature: Data
+    public var purpose: String?
+    /**
+     * How the data source was discovered. Serialized as:
+     * - `"None"` -- no protocol-level discovery path
+     * - `"SharedContext:<context_id>"` -- shared membership
+     * - `"Registry:<context_id>"` -- discovery registry
+     */
+    public var discoveryMethod: String
+    /**
+     * Age of the data in seconds at the time provenance was attached.
+     */
+    public var ageSecs: UInt64
+    /**
+     * Memory scope of the source context: `"Full"`, `"Summary"`, or
+     * `"Ephemeral"`.
+     */
+    public var memoryScope: String
+    /**
+     * Number of cross-context hops this data has traversed. Protocol
+     * default maximum is 3.
+     */
+    public var chainDepth: UInt8
+    /**
+     * Ordered list of intermediary context IDs when `chainDepth > 0`.
+     */
+    public var chainPath: [String]?
+    /**
+     * Cost of producing this data as a u64 amount, if any (spec §19.6).
+     */
+    public var paymentAmount: UInt64?
+    /**
+     * Payment adapter used for the payment, if any (spec §19.6).
+     */
+    public var paymentAdapter: String?
+    /**
+     * Hex-encoded receipt ID for verification of the payment, if any.
+     */
+    public var paymentReceiptId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * DID of the original data source.
-         */sourceDid: String, 
+         * The context from which this data originated.
+         */sourceContext: String,
         /**
-         * Context ID where this data originated.
-         */originContextId: String, 
+         * Current data availability status of the source context.
+         */sourceType: String,
         /**
-         * Depth of cross-context hops (0 = direct, 1 = one hop, etc.).
-         */chainDepth: UInt32, 
+         * DIDs of the parties involved in the source context.
+         */counterparties: [String],
         /**
-         * Ed25519 signature bytes over the provenance record.
-         */signature: Data) {
-        self.sourceDid = sourceDid
-        self.originContextId = originContextId
+         * Optional human-readable purpose description.
+         */purpose: String?,
+        /**
+         * How the data source was discovered.
+         */discoveryMethod: String,
+        /**
+         * Age of the data in seconds.
+         */ageSecs: UInt64,
+        /**
+         * Memory scope of the source context.
+         */memoryScope: String,
+        /**
+         * Number of cross-context hops.
+         */chainDepth: UInt8,
+        /**
+         * Ordered list of intermediary context IDs.
+         */chainPath: [String]?,
+        /**
+         * Cost of producing this data.
+         */paymentAmount: UInt64?,
+        /**
+         * Payment adapter used.
+         */paymentAdapter: String?,
+        /**
+         * Hex-encoded receipt ID.
+         */paymentReceiptId: String?) {
+        self.sourceContext = sourceContext
+        self.sourceType = sourceType
+        self.counterparties = counterparties
+        self.purpose = purpose
+        self.discoveryMethod = discoveryMethod
+        self.ageSecs = ageSecs
+        self.memoryScope = memoryScope
         self.chainDepth = chainDepth
-        self.signature = signature
+        self.chainPath = chainPath
+        self.paymentAmount = paymentAmount
+        self.paymentAdapter = paymentAdapter
+        self.paymentReceiptId = paymentReceiptId
     }
 }
 
@@ -2440,26 +2515,58 @@ extension DataProvenance: Sendable {}
 
 extension DataProvenance: Equatable, Hashable {
     public static func ==(lhs: DataProvenance, rhs: DataProvenance) -> Bool {
-        if lhs.sourceDid != rhs.sourceDid {
+        if lhs.sourceContext != rhs.sourceContext {
             return false
         }
-        if lhs.originContextId != rhs.originContextId {
+        if lhs.sourceType != rhs.sourceType {
+            return false
+        }
+        if lhs.counterparties != rhs.counterparties {
+            return false
+        }
+        if lhs.purpose != rhs.purpose {
+            return false
+        }
+        if lhs.discoveryMethod != rhs.discoveryMethod {
+            return false
+        }
+        if lhs.ageSecs != rhs.ageSecs {
+            return false
+        }
+        if lhs.memoryScope != rhs.memoryScope {
             return false
         }
         if lhs.chainDepth != rhs.chainDepth {
             return false
         }
-        if lhs.signature != rhs.signature {
+        if lhs.chainPath != rhs.chainPath {
+            return false
+        }
+        if lhs.paymentAmount != rhs.paymentAmount {
+            return false
+        }
+        if lhs.paymentAdapter != rhs.paymentAdapter {
+            return false
+        }
+        if lhs.paymentReceiptId != rhs.paymentReceiptId {
             return false
         }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(sourceDid)
-        hasher.combine(originContextId)
+        hasher.combine(sourceContext)
+        hasher.combine(sourceType)
+        hasher.combine(counterparties)
+        hasher.combine(purpose)
+        hasher.combine(discoveryMethod)
+        hasher.combine(ageSecs)
+        hasher.combine(memoryScope)
         hasher.combine(chainDepth)
-        hasher.combine(signature)
+        hasher.combine(chainPath)
+        hasher.combine(paymentAmount)
+        hasher.combine(paymentAdapter)
+        hasher.combine(paymentReceiptId)
     }
 }
 
@@ -2472,18 +2579,34 @@ public struct FfiConverterTypeDataProvenance: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DataProvenance {
         return
             try DataProvenance(
-                sourceDid: FfiConverterString.read(from: &buf), 
-                originContextId: FfiConverterString.read(from: &buf), 
-                chainDepth: FfiConverterUInt32.read(from: &buf), 
-                signature: FfiConverterData.read(from: &buf)
+                sourceContext: FfiConverterString.read(from: &buf),
+                sourceType: FfiConverterString.read(from: &buf),
+                counterparties: FfiConverterSequenceString.read(from: &buf),
+                purpose: FfiConverterOptionString.read(from: &buf),
+                discoveryMethod: FfiConverterString.read(from: &buf),
+                ageSecs: FfiConverterUInt64.read(from: &buf),
+                memoryScope: FfiConverterString.read(from: &buf),
+                chainDepth: FfiConverterUInt8.read(from: &buf),
+                chainPath: FfiConverterOptionSequenceString.read(from: &buf),
+                paymentAmount: FfiConverterOptionUInt64.read(from: &buf),
+                paymentAdapter: FfiConverterOptionString.read(from: &buf),
+                paymentReceiptId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: DataProvenance, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.sourceDid, into: &buf)
-        FfiConverterString.write(value.originContextId, into: &buf)
-        FfiConverterUInt32.write(value.chainDepth, into: &buf)
-        FfiConverterData.write(value.signature, into: &buf)
+        FfiConverterString.write(value.sourceContext, into: &buf)
+        FfiConverterString.write(value.sourceType, into: &buf)
+        FfiConverterSequenceString.write(value.counterparties, into: &buf)
+        FfiConverterOptionString.write(value.purpose, into: &buf)
+        FfiConverterString.write(value.discoveryMethod, into: &buf)
+        FfiConverterUInt64.write(value.ageSecs, into: &buf)
+        FfiConverterString.write(value.memoryScope, into: &buf)
+        FfiConverterUInt8.write(value.chainDepth, into: &buf)
+        FfiConverterOptionSequenceString.write(value.chainPath, into: &buf)
+        FfiConverterOptionUInt64.write(value.paymentAmount, into: &buf)
+        FfiConverterOptionString.write(value.paymentAdapter, into: &buf)
+        FfiConverterOptionString.write(value.paymentReceiptId, into: &buf)
     }
 }
 

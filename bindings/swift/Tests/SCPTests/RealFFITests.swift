@@ -1552,10 +1552,18 @@ struct RealFFITypeShapeTests {
             sequence: 42,
             contextId: "ctx-test",
             provenance: DataProvenance(
-                sourceDid: "did:dht:z6MkBob",
-                originContextId: "ctx-origin",
+                sourceContext: "ctx-origin",
+                sourceType: "Persistent",
+                counterparties: ["did:dht:z6MkBob"],
+                purpose: nil,
+                discoveryMethod: "None",
+                ageSecs: 60,
+                memoryScope: "Full",
                 chainDepth: 1,
-                signature: Data(repeating: 0xAB, count: 64)
+                chainPath: ["ctx-hop"],
+                paymentAmount: nil,
+                paymentAdapter: nil,
+                paymentReceiptId: nil
             )
         )
         #expect(msg.senderDid == "did:dht:z6MkAlice")
@@ -1563,8 +1571,8 @@ struct RealFFITypeShapeTests {
         #expect(msg.timestamp == 1_700_000_000)
         #expect(msg.sequence == 42)
         #expect(msg.contextId == "ctx-test")
-        #expect(msg.provenance?.sourceDid == "did:dht:z6MkBob")
-        #expect(msg.provenance?.originContextId == "ctx-origin")
+        #expect(msg.provenance?.sourceContext == "ctx-origin")
+        #expect(msg.provenance?.sourceType == "Persistent")
         #expect(msg.provenance?.chainDepth == 1)
     }
 
@@ -1734,17 +1742,33 @@ struct RealFFITypeShapeTests {
         #expect(session.sessionId == "sess-001")
     }
 
-    @Test("FFI: DataProvenance struct construction")
+    @Test("FFI: DataProvenance struct construction — 12 fields per spec §7.7.1")
     func ffiDataProvenanceConstruction() {
         let prov = DataProvenance(
-            sourceDid: "did:dht:z6MkSource",
-            originContextId: "ctx-origin",
+            sourceContext: "ctx-origin",
+            sourceType: "Persistent",
+            counterparties: ["did:dht:z6MkAlice", "did:dht:z6MkBob"],
+            purpose: "recipe sharing",
+            discoveryMethod: "SharedContext:ctx-shared",
+            ageSecs: 300,
+            memoryScope: "Full",
             chainDepth: 2,
-            signature: Data(repeating: 0xCC, count: 64)
+            chainPath: ["ctx-hop-1", "ctx-hop-2"],
+            paymentAmount: 100,
+            paymentAdapter: "lightning",
+            paymentReceiptId: "abcdef0123456789"
         )
-        #expect(prov.sourceDid == "did:dht:z6MkSource")
-        #expect(prov.originContextId == "ctx-origin")
+        #expect(prov.sourceContext == "ctx-origin")
+        #expect(prov.sourceType == "Persistent")
+        #expect(prov.counterparties.count == 2)
+        #expect(prov.purpose == "recipe sharing")
+        #expect(prov.discoveryMethod == "SharedContext:ctx-shared")
+        #expect(prov.ageSecs == 300)
+        #expect(prov.memoryScope == "Full")
         #expect(prov.chainDepth == 2)
-        #expect(prov.signature.count == 64)
+        #expect(prov.chainPath?.count == 2)
+        #expect(prov.paymentAmount == 100)
+        #expect(prov.paymentAdapter == "lightning")
+        #expect(prov.paymentReceiptId == "abcdef0123456789")
     }
 }

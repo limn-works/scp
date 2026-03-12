@@ -23,6 +23,7 @@
 use scp_ffi_uniffi::{
     // Types
     ContextParams,
+    DataProvenance,
     GovernanceModel,
     MemoryScope,
     ToolDefinition,
@@ -667,6 +668,102 @@ async fn evaluate_provenance_quality_rejects_invalid_source_type() {
     let result =
         evaluate_provenance_quality(None, "invalid_type".to_owned(), "active".to_owned(), vec![]);
     assert!(result.is_err(), "Invalid source type should be rejected");
+}
+
+#[tokio::test]
+async fn data_provenance_record_has_all_12_fields() {
+    // Construct a DataProvenance with all 12 fields to verify the struct is
+    // fully aligned with spec §7.7.1.
+    let prov = DataProvenance {
+        source_context: "ctx-origin-001".to_owned(),
+        source_type: "Persistent".to_owned(),
+        counterparties: vec!["did:dht:z6MkAlice".to_owned(), "did:dht:z6MkBob".to_owned()],
+        purpose: Some("data sharing".to_owned()),
+        discovery_method: "SharedContext:ctx-shared".to_owned(),
+        age_secs: 300,
+        memory_scope: "Full".to_owned(),
+        chain_depth: 1,
+        chain_path: Some(vec!["ctx-hop-1".to_owned()]),
+        payment_amount: Some(100),
+        payment_adapter: Some("lightning".to_owned()),
+        payment_receipt_id: Some("ab".repeat(32)),
+    };
+
+    assert_eq!(prov.source_context, "ctx-origin-001");
+    assert_eq!(prov.source_type, "Persistent");
+    assert_eq!(prov.counterparties.len(), 2);
+    assert_eq!(prov.purpose.as_deref(), Some("data sharing"));
+    assert_eq!(prov.discovery_method, "SharedContext:ctx-shared");
+    assert_eq!(prov.age_secs, 300);
+    assert_eq!(prov.memory_scope, "Full");
+    assert_eq!(prov.chain_depth, 1);
+    assert_eq!(prov.chain_path.as_ref().map(Vec::len), Some(1));
+    assert_eq!(prov.payment_amount, Some(100));
+    assert_eq!(prov.payment_adapter.as_deref(), Some("lightning"));
+    assert!(prov.payment_receipt_id.is_some());
+}
+
+#[tokio::test]
+async fn data_provenance_record_optional_fields_can_be_none() {
+    let prov = DataProvenance {
+        source_context: "ctx-minimal".to_owned(),
+        source_type: "Ephemeral".to_owned(),
+        counterparties: vec![],
+        purpose: None,
+        discovery_method: "None".to_owned(),
+        age_secs: 0,
+        memory_scope: "Ephemeral".to_owned(),
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+
+    assert!(prov.purpose.is_none());
+    assert!(prov.chain_path.is_none());
+    assert!(prov.payment_amount.is_none());
+    assert!(prov.payment_adapter.is_none());
+    assert!(prov.payment_receipt_id.is_none());
+}
+
+#[tokio::test]
+async fn provenance_attach_json_contains_all_12_fields() {
+    let result = provenance_attach(
+        "ctx-source".to_owned(),
+        "persistent".to_owned(),
+        "full".to_owned(),
+        vec!["did:dht:z6MkAlice".to_owned()],
+        "ctx-target".to_owned(),
+        None,
+    )
+    .unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let obj = parsed.as_object().unwrap();
+
+    // All 12 fields must be present in the JSON output
+    assert!(obj.contains_key("source_context"), "missing source_context");
+    assert!(obj.contains_key("source_type"), "missing source_type");
+    assert!(obj.contains_key("counterparties"), "missing counterparties");
+    assert!(obj.contains_key("purpose"), "missing purpose");
+    assert!(
+        obj.contains_key("discovery_method"),
+        "missing discovery_method"
+    );
+    assert!(obj.contains_key("age_secs"), "missing age_secs");
+    assert!(obj.contains_key("memory_scope"), "missing memory_scope");
+    assert!(obj.contains_key("chain_depth"), "missing chain_depth");
+    assert!(obj.contains_key("chain_path"), "missing chain_path");
+    assert!(obj.contains_key("payment_amount"), "missing payment_amount");
+    assert!(
+        obj.contains_key("payment_adapter"),
+        "missing payment_adapter"
+    );
+    assert!(
+        obj.contains_key("payment_receipt_id"),
+        "missing payment_receipt_id"
+    );
 }
 
 // ---------------------------------------------------------------------------
