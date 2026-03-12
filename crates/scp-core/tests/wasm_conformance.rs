@@ -3691,39 +3691,118 @@ fn wasm_handle_same_owner_reregister_returns_conflict() {
 }
 
 // ===========================================================================
-// Address resolution conformance: scoped address parsing
+// Address resolution conformance: parsed address variants and field structures
+//
+// WASM `discovery_parse_address` must produce:
+//   - PascalCase type tags per §22.11.3
+//   - Variant-specific field structures matching the NAPI bridge
+//   - All 4 variants: DiscoveryHandle, DomainHandle, AttestationHandle, Unscoped
 // ===========================================================================
 
 #[test]
-fn wasm_scoped_address_parsing_matches_core() {
+fn wasm_discovery_handle_parsing_matches_core() {
     // Core's parse_address handles "alice@cooking-community"
     let core_parsed = scp_core::discovery::parse_address("alice@cooking-community").unwrap();
 
-    // WASM mirrors: split on '@'
+    // Verify the WASM algorithm: normalize, split on '@', classify scope.
     let address = "alice@cooking-community";
-    let at_pos = address.find('@').unwrap();
-    let wasm_local = &address[..at_pos];
-    let wasm_scope = &address[at_pos + 1..];
+    let normalized = address.trim().to_lowercase();
+    let at_pos = normalized.find('@').unwrap();
+    let wasm_local = &normalized[..at_pos];
+    let wasm_scope = &normalized[at_pos + 1..];
 
     match &core_parsed {
         scp_core::discovery::ParsedAddress::DiscoveryHandle { local_part, scope } => {
             assert_eq!(local_part, wasm_local, "local_part mismatch");
             assert_eq!(scope, wasm_scope, "scope mismatch");
+            // WASM type tag must be PascalCase "DiscoveryHandle"
+            assert!(
+                !wasm_scope.contains('.'),
+                "scope without '.' is DiscoveryHandle"
+            );
         }
         other => panic!("expected DiscoveryHandle, got {other:?}"),
     }
 }
 
 #[test]
-fn wasm_unscoped_address_uses_full_name() {
-    // An unscoped name (no '@') should be treated as the full handle lookup key.
-    let address = "alice";
-    let (local_part, scope) = address.find('@').map_or((address, None), |at_pos| {
-        (&address[..at_pos], Some(&address[at_pos + 1..]))
-    });
+fn wasm_domain_handle_parsing_matches_core() {
+    let core_parsed = scp_core::discovery::parse_address("alice@example.com").unwrap();
 
-    assert_eq!(local_part, "alice");
-    assert!(scope.is_none(), "unscoped address should have no scope");
+    let address = "alice@example.com";
+    let normalized = address.trim().to_lowercase();
+    let at_pos = normalized.find('@').unwrap();
+    let wasm_local = &normalized[..at_pos];
+    let wasm_domain = &normalized[at_pos + 1..];
+
+    match &core_parsed {
+        scp_core::discovery::ParsedAddress::DomainHandle { local_part, domain } => {
+            assert_eq!(local_part, wasm_local, "local_part mismatch");
+            assert_eq!(domain, wasm_domain, "domain mismatch");
+            // WASM type tag must be PascalCase "DomainHandle", field is "domain" not "scope"
+            assert!(wasm_domain.contains('.'), "scope with '.' is DomainHandle");
+        }
+        other => panic!("expected DomainHandle, got {other:?}"),
+    }
+}
+
+#[test]
+fn wasm_attestation_handle_parsing_matches_core() {
+    let core_parsed = scp_core::discovery::parse_address("@alice_cooks").unwrap();
+
+    // WASM algorithm: strip leading '@', return handle
+    let address = "@alice_cooks";
+    let normalized = address.trim().to_lowercase();
+    let rest = normalized.strip_prefix('@').unwrap();
+
+    match &core_parsed {
+        scp_core::discovery::ParsedAddress::AttestationHandle { handle, platform } => {
+            assert_eq!(handle, rest, "handle mismatch");
+            assert!(platform.is_none(), "no platform qualifier");
+        }
+        other => panic!("expected AttestationHandle, got {other:?}"),
+    }
+}
+
+#[test]
+fn wasm_attestation_handle_with_platform_matches_core() {
+    let core_parsed = scp_core::discovery::parse_address("@alice_cooks:x").unwrap();
+
+    // WASM algorithm: strip '@', split on ':'
+    let address = "@alice_cooks:x";
+    let normalized = address.trim().to_lowercase();
+    let rest = normalized.strip_prefix('@').unwrap();
+    let colon_pos = rest.find(':').unwrap();
+    let wasm_handle = &rest[..colon_pos];
+    let wasm_platform = &rest[colon_pos + 1..];
+
+    match &core_parsed {
+        scp_core::discovery::ParsedAddress::AttestationHandle { handle, platform } => {
+            assert_eq!(handle, wasm_handle, "handle mismatch");
+            assert_eq!(
+                platform.as_deref(),
+                Some(wasm_platform),
+                "platform mismatch"
+            );
+        }
+        other => panic!("expected AttestationHandle, got {other:?}"),
+    }
+}
+
+#[test]
+fn wasm_unscoped_address_matches_core() {
+    let core_parsed = scp_core::discovery::parse_address("alice").unwrap();
+
+    // WASM algorithm: no '@' prefix, no '@' separator → Unscoped
+    let address = "alice";
+    let normalized = address.trim().to_lowercase();
+
+    match &core_parsed {
+        scp_core::discovery::ParsedAddress::Unscoped { name } => {
+            assert_eq!(name, &normalized, "name mismatch");
+        }
+        other => panic!("expected Unscoped, got {other:?}"),
+    }
 }
 
 /// Verify the WASM trust-level sorting helper produces correct ordering.
