@@ -1309,53 +1309,102 @@ pub fn identity_attest_device(did: String) -> Promise {
     })
 }
 
+/// Parsed attestation token fields extracted from JSON.
+///
+/// Used internally by [`identity_verify_device_attestation`] and exposed
+/// via [`parse_attestation_token`] for testability.
+#[derive(Debug)]
+struct AttestationTokenFields {
+    did: String,
+    timestamp: u64,
+    signature_hex: String,
+}
+
+/// Decodes a base64 attestation token and extracts the required fields.
+///
+/// Returns `Err(ScpWasmError)` if:
+/// - The base64 encoding is invalid (`SCP-IDENT-1013`).
+/// - The JSON structure is invalid (`SCP-IDENT-1013`).
+/// - The `did` field is missing or not a string (`SCP-VALID-7020`).
+/// - The `timestamp` field is missing or not a u64 (`SCP-VALID-7021`).
+/// - The `signature` field is missing or not a string (`SCP-VALID-7022`).
+fn parse_attestation_token(token_base64: &str) -> Result<AttestationTokenFields, ScpWasmError> {
+    use base64::Engine;
+
+    let token_bytes = base64::engine::general_purpose::STANDARD
+        .decode(token_base64.as_bytes())
+        .map_err(|e| ScpWasmError::Identity {
+            message: format!("invalid base64 in attestation token: {e}"),
+            code: "SCP-IDENT-1013".to_owned(),
+        })?;
+
+    let token: serde_json::Value =
+        serde_json::from_slice(&token_bytes).map_err(|e| ScpWasmError::Identity {
+            message: format!("invalid JSON in attestation token: {e}"),
+            code: "SCP-IDENT-1013".to_owned(),
+        })?;
+
+    let did = token["did"]
+        .as_str()
+        .ok_or_else(|| ScpWasmError::Validation {
+            message: "attestation token missing required 'did' field (string)".to_owned(),
+            code: "SCP-VALID-7020".to_owned(),
+        })?
+        .to_owned();
+
+    let timestamp = token["timestamp"]
+        .as_u64()
+        .ok_or_else(|| ScpWasmError::Validation {
+            message: "attestation token missing required 'timestamp' field (u64)".to_owned(),
+            code: "SCP-VALID-7021".to_owned(),
+        })?;
+
+    let signature_hex = token["signature"]
+        .as_str()
+        .ok_or_else(|| ScpWasmError::Validation {
+            message: "attestation token missing required 'signature' field (string)".to_owned(),
+            code: "SCP-VALID-7022".to_owned(),
+        })?
+        .to_owned();
+
+    Ok(AttestationTokenFields {
+        did,
+        timestamp,
+        signature_hex,
+    })
+}
+
 /// Verifies a device attestation token.
 ///
 /// Decodes the base64 token, extracts the DID, timestamp, and Ed25519
 /// signature, then verifies the signature against the identity's public
 /// key in the registry.
+///
+/// # Errors
+///
+/// Rejects with validation errors if required token fields are missing:
+/// - `[SCP-VALID-7020]` — missing `did` field
+/// - `[SCP-VALID-7021]` — missing `timestamp` field
+/// - `[SCP-VALID-7022]` — missing `signature` field
+/// - `[SCP-IDENT-1013]` — invalid base64 or JSON encoding
 #[wasm_bindgen]
 pub fn identity_verify_device_attestation(did: String, token_base64: String) -> Promise {
-    use base64::Engine;
-
     future_to_promise(async move {
-        let token_bytes = base64::engine::general_purpose::STANDARD
-            .decode(token_base64.as_bytes())
-            .map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("invalid base64 in attestation token: {e}"),
-                    code: "SCP-IDENT-1013".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
+        let fields = parse_attestation_token(&token_base64)
+            .map_err(|e| -> JsValue { e.into_js().into() })?;
 
-        let token: serde_json::Value =
-            serde_json::from_slice(&token_bytes).map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("invalid JSON in attestation token: {e}"),
-                    code: "SCP-IDENT-1013".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-
-        let token_did = token["did"].as_str().unwrap_or("");
-        let timestamp = token["timestamp"].as_u64().unwrap_or(0);
-        let sig_hex = token["signature"].as_str().unwrap_or("");
-
-        if token_did != did {
+        if fields.did != did {
             return Ok(JsValue::from_bool(false));
         }
 
         // Freshness check: reject attestations older than 5 minutes (300s).
         // Prevents replay of captured attestation tokens.
         let now_secs = crate::time::now_secs();
-        if now_secs.saturating_sub(timestamp) > 300 {
+        if now_secs.saturating_sub(fields.timestamp) > 300 {
             return Ok(JsValue::from_bool(false));
         }
         // Reject future-dated attestations (clock skew tolerance: 60s).
-        if timestamp > now_secs + 60 {
+        if fields.timestamp > now_secs + 60 {
             return Ok(JsValue::from_bool(false));
         }
 
@@ -1371,7 +1420,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
         };
 
         // Decode the signature from hex.
-        let Ok(sig_bytes) = hex::decode(sig_hex) else {
+        let Ok(sig_bytes) = hex::decode(&fields.signature_hex) else {
             return Ok(JsValue::from_bool(false));
         };
         let sig_array: [u8; 64] = match sig_bytes.try_into() {
@@ -1380,7 +1429,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
         };
 
         // Verify the Ed25519 signature against the public key.
-        let payload = format!("device-attestation:{did}:{timestamp}");
+        let payload = format!("device-attestation:{did}:{}", fields.timestamp);
         let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes) else {
             return Ok(JsValue::from_bool(false));
         };
@@ -1461,7 +1510,7 @@ pub fn identity_load(did: String) -> Promise {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1664,5 +1713,194 @@ mod tests {
         assert_eq!(vms.len(), 2, "should have #0 and #active VMs");
 
         cleanup_registries();
+    }
+
+    // -----------------------------------------------------------------------
+    // Attestation token parsing tests (#511)
+    // -----------------------------------------------------------------------
+
+    /// Helper: base64-encode a JSON value for use as an attestation token.
+    fn encode_token(value: &serde_json::Value) -> String {
+        use base64::Engine;
+        let json = serde_json::to_string(value).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+    }
+
+    #[test]
+    fn test_parse_attestation_token_valid() {
+        let token = serde_json::json!({
+            "did": "did:dht:zTest123",
+            "timestamp": 1_700_000_000_u64,
+            "signature": "abcdef0123456789",
+        });
+        let encoded = encode_token(&token);
+        let result = parse_attestation_token(&encoded).unwrap();
+        assert_eq!(result.did, "did:dht:zTest123");
+        assert_eq!(result.timestamp, 1_700_000_000);
+        assert_eq!(result.signature_hex, "abcdef0123456789");
+    }
+
+    #[test]
+    fn test_parse_attestation_token_missing_did() {
+        let token = serde_json::json!({
+            "timestamp": 1_700_000_000_u64,
+            "signature": "abcdef",
+        });
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7020");
+                assert!(
+                    message.contains("did"),
+                    "message should mention 'did': {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_did_wrong_type() {
+        // did is a number, not a string
+        let token = serde_json::json!({
+            "did": 42,
+            "timestamp": 1_700_000_000_u64,
+            "signature": "abcdef",
+        });
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation { ref code, .. } => {
+                assert_eq!(code, "SCP-VALID-7020");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_missing_timestamp() {
+        let token = serde_json::json!({
+            "did": "did:dht:zTest123",
+            "signature": "abcdef",
+        });
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7021");
+                assert!(
+                    message.contains("timestamp"),
+                    "message should mention 'timestamp': {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_timestamp_wrong_type() {
+        // timestamp is a string, not a u64
+        let token = serde_json::json!({
+            "did": "did:dht:zTest123",
+            "timestamp": "not-a-number",
+            "signature": "abcdef",
+        });
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation { ref code, .. } => {
+                assert_eq!(code, "SCP-VALID-7021");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_missing_signature() {
+        let token = serde_json::json!({
+            "did": "did:dht:zTest123",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7022");
+                assert!(
+                    message.contains("signature"),
+                    "message should mention 'signature': {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_empty_object() {
+        // All three fields missing — should fail on the first one (did).
+        let token = serde_json::json!({});
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation { ref code, .. } => {
+                assert_eq!(
+                    code, "SCP-VALID-7020",
+                    "first missing field should be 'did'"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_invalid_base64() {
+        let err = parse_attestation_token("not-valid-base64!!!").unwrap_err();
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(code, "SCP-IDENT-1013");
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_invalid_json() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"this is not json");
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(code, "SCP-IDENT-1013");
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attestation_token_null_fields() {
+        // Fields present but null — should fail validation.
+        let token = serde_json::json!({
+            "did": null,
+            "timestamp": null,
+            "signature": null,
+        });
+        let encoded = encode_token(&token);
+        let err = parse_attestation_token(&encoded).unwrap_err();
+        match err {
+            ScpWasmError::Validation { ref code, .. } => {
+                assert_eq!(code, "SCP-VALID-7020", "null 'did' should fail validation");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
     }
 }
