@@ -1994,8 +1994,25 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         validate_revocation_scope(scope)?;
         let ctx = self.require_active_context_mut(context_id)?;
+
+        // Pre-validate: check ALL authors' block lists before any mutation.
+        // This prevents partial corruption if a cap check fails mid-loop.
+        if let Some(bc) = ctx.broadcast.as_ref() {
+            for (author_did, block_list) in &bc.authors {
+                if block_list.len() >= WASM_BLOCK_LIST_CAP {
+                    return Err(ScpWasmError::Validation {
+                        message: format!(
+                            "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
+                             for author '{author_did}' during governance ban"
+                        ),
+                        code: "SCP-VALID-7301".to_owned(),
+                    });
+                }
+            }
+        }
+
+        // All caps validated — now commit mutations atomically.
         ctx.read_revoked_members.insert(did.to_owned());
-        // Collect per-author epoch advances to emit after the borrow.
         let mut epoch_advances: Vec<(String, u64)> = Vec::new();
         if let Some(bc) = ctx.broadcast.as_mut() {
             bc.subscribers.remove(did);
@@ -3367,7 +3384,7 @@ pub struct ContextMetadata {
 // ---------------------------------------------------------------------------
 
 /// Current version of the WASM context export format.
-const WASM_EXPORT_VERSION: u32 = 1;
+const WASM_EXPORT_VERSION: u32 = 2;
 
 /// Versioned envelope for context exports.
 ///
@@ -3460,6 +3477,9 @@ struct WasmExportMember {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmExportBroadcast {
     /// Author DIDs mapped to their per-author block lists (§5.14.8).
+    /// Defaults to empty map for backward compat with v1 exports that used
+    /// flat `authors: Vec<String>` (per-author blocking did not exist in v1).
+    #[serde(default)]
     author_block_lists: HashMap<String, Vec<String>>,
     /// Per-author key epochs (§5.14.8). Tracks how many times each author
     /// has rotated their broadcast key due to block events.
@@ -3482,7 +3502,7 @@ struct WasmExportBroadcast {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -4090,6 +4110,23 @@ mod tests {
         assert!(export.key_epochs.is_empty());
     }
 
+    #[test]
+    fn export_broadcast_defaults_missing_author_block_lists() {
+        // v1 exports did not have `author_block_lists` (they had a flat
+        // `authors: Vec<String>` and `blocked_subscribers`). Verify that
+        // deserializing without `author_block_lists` yields an empty map
+        // via #[serde(default)].
+        let json = r#"{"subscribers":["sub1"],"admission":"open"}"#;
+        let export: WasmExportBroadcast = serde_json::from_str(json).unwrap();
+        assert!(export.author_block_lists.is_empty());
+        assert_eq!(export.subscribers, vec!["sub1"]);
+    }
+
+    #[test]
+    fn export_version_is_two() {
+        assert_eq!(WASM_EXPORT_VERSION, 2);
+    }
+
     // -----------------------------------------------------------------------
     // Key epoch tests (§5.14.8)
     //
@@ -4221,6 +4258,113 @@ mod tests {
         assert_eq!(json["type"], "keyEpochAdvance");
         assert_eq!(json["sender_did"], "did:dht:zauthor");
         assert_eq!(json["epoch"], 42);
+    }
+
+    /// Helper: builds a `WasmContextManager` containing a single Broadcast
+    /// context with the given authors and subscribers pre-populated.
+    fn make_manager_with_broadcast(
+        context_id: &str,
+        creator_did: &str,
+        authors: &[&str],
+        subscribers: &[&str],
+    ) -> WasmContextManager {
+        let mut bc = make_broadcast(authors, subscribers);
+        // Ensure the creator is always an author (mirrors create_context).
+        if !bc.authors.contains_key(creator_did) {
+            bc.authors.insert(creator_did.to_owned(), HashSet::new());
+        }
+
+        let mut members = HashMap::new();
+        members.insert(
+            creator_did.to_owned(),
+            MemberEntry {
+                did: creator_did.to_owned(),
+                role: "admin".to_owned(),
+                sequence_number: 0,
+            },
+        );
+
+        let ctx = PerContextState {
+            state: "active".to_owned(),
+            params_json: serde_json::json!({"mode": "Broadcast"}),
+            creator_did: creator_did.to_owned(),
+            mode: "Broadcast".to_owned(),
+            ceiling_strings: HashSet::new(),
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
+            event_log: WasmEventLog::new(context_id.to_owned()),
+            revoked_tokens: HashSet::new(),
+            seen_nonces: HashMap::new(),
+            members,
+            event_buffer: VecDeque::new(),
+            executed_proposals: HashMap::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            broadcast: Some(bc),
+            sessions: HashMap::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            tool_interfaces: Vec::new(),
+            governance_freeze: false,
+            pruning_policy: None,
+            economic_policy_locked: false,
+        };
+
+        let mut mgr = WasmContextManager::new();
+        mgr.contexts.insert(context_id.to_owned(), ctx);
+        mgr
+    }
+
+    #[test]
+    fn governance_ban_enforces_block_list_cap() {
+        let mut mgr =
+            make_manager_with_broadcast("ctx-1", "author-a", &["author-a", "author-b"], &[]);
+
+        // Fill author-a's block list to exactly WASM_BLOCK_LIST_CAP.
+        {
+            let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
+            let bc = ctx.broadcast.as_mut().unwrap();
+            for i in 0..WASM_BLOCK_LIST_CAP {
+                bc.authors
+                    .get_mut("author-a")
+                    .unwrap()
+                    .insert(format!("did:dht:zfiller{i}"));
+            }
+            assert_eq!(bc.authors["author-a"].len(), WASM_BLOCK_LIST_CAP);
+            // author-b is still empty.
+            assert!(bc.authors["author-b"].is_empty());
+        }
+
+        // Call the real dispatch method — it should fail because author-a's
+        // block list is at capacity (pre-validation rejects before any mutation).
+        let err = mgr
+            .dispatch_revoke_read_access("ctx-1", "did:dht:zbanned", "full")
+            .unwrap_err();
+
+        match &err {
+            ScpWasmError::Validation { code, message } => {
+                assert_eq!(code, "SCP-VALID-7301");
+                assert!(
+                    message.contains("during governance ban"),
+                    "expected 'during governance ban' in message, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+
+        // Verify no mutation occurred — author-b's block list must still be
+        // empty (pre-validation prevented partial writes).
+        let bc = mgr.contexts["ctx-1"].broadcast.as_ref().unwrap();
+        assert!(
+            bc.authors["author-b"].is_empty(),
+            "author-b's block list should be empty — pre-validation must prevent partial mutation"
+        );
     }
 
     #[test]
