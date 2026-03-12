@@ -118,7 +118,7 @@ pattern is for the bridge *function*, never for the bridge *arguments*.
 
 ## Legacy API wrappers that manufacture fake handles always fail in production
 
-The legacy `validate(encoded:contextId:presenterDid:)` wrapper creates
+The legacy `validate(encoded:handle:contextId:capability:presenterDid:)` wrapper creates
 `ContextHandle(noPointer: .init())` and passes it to `ucanValidate`. The
 Rust bridge calls `crate::runtime::with_context(&handle.context_id, ...)`.
 A `noPointer:` handle has an empty `contextId`, so `with_context` returns

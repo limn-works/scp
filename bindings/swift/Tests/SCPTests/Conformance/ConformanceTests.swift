@@ -40,7 +40,7 @@ struct ConformanceTests {
     // This dispatcher handles the conformance test categories:
     // - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
     // - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
-    // - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
+    // - `ucan_validate` -> `validate(encoded:handle:contextId:capability:presenterDid:)`
     // - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
     // - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
     // - `transport_connect` -> `connectTransport(config:)`
