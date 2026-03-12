@@ -19,6 +19,22 @@ use crate::manager::with_manager;
 use crate::runtime;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns a human-readable name for a JSON value's type.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WasmToolVerificationResult
 // ---------------------------------------------------------------------------
 
@@ -53,6 +69,68 @@ impl WasmToolVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
+// Schema validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validates the `schema` (input schema) field from the definition JSON.
+///
+/// Rejects missing fields with `SCP-VALID-7035` and non-object values with
+/// `SCP-VALID-7035`. Also performs structural validation (requires `"type"`
+/// field, etc.) via `runtime::validate_schema`.
+///
+/// Returns the validated schema value on success, or an `ScpWasmError` on
+/// failure. Callers convert to `JsError` via `into_js()` at the bridge boundary.
+fn validate_input_schema(def: &serde_json::Value) -> Result<serde_json::Value, ScpWasmError> {
+    let input_schema = def.get("schema").ok_or_else(|| ScpWasmError::Validation {
+        message: "missing required 'schema' field in definition_json — both 'schema' and 'outputSchema' are required".to_owned(),
+        code: "SCP-VALID-7035".to_owned(),
+    })?;
+    if !input_schema.is_object() {
+        return Err(ScpWasmError::Validation {
+            message: format!(
+                "invalid 'schema': expected a JSON object, got {}",
+                json_type_name(input_schema)
+            ),
+            code: "SCP-VALID-7035".to_owned(),
+        });
+    }
+    runtime::validate_schema(input_schema).map_err(|e| ScpWasmError::Validation {
+        message: format!("invalid input schema: {e}"),
+        code: "SCP-VALID-7035".to_owned(),
+    })?;
+    Ok(input_schema.clone())
+}
+
+/// Validates the `outputSchema` field from the definition JSON.
+///
+/// Rejects missing fields with `SCP-VALID-7036` and non-object values with
+/// `SCP-VALID-7036`. Also performs structural validation (requires `"type"`
+/// field, etc.) via `runtime::validate_schema`.
+///
+/// Returns the validated schema value on success, or an `ScpWasmError` on
+/// failure. Callers convert to `JsError` via `into_js()` at the bridge boundary.
+fn validate_output_schema(def: &serde_json::Value) -> Result<serde_json::Value, ScpWasmError> {
+    let output_schema = def.get("outputSchema").ok_or_else(|| ScpWasmError::Validation {
+        message: "missing required 'outputSchema' field in definition_json — both 'schema' and 'outputSchema' are required".to_owned(),
+        code: "SCP-VALID-7036".to_owned(),
+    })?;
+    if !output_schema.is_object() {
+        return Err(ScpWasmError::Validation {
+            message: format!(
+                "invalid 'outputSchema': expected a JSON object, got {}",
+                json_type_name(output_schema)
+            ),
+            code: "SCP-VALID-7036".to_owned(),
+        });
+    }
+    runtime::validate_schema(output_schema).map_err(|e| ScpWasmError::Validation {
+        message: format!("invalid output schema: {e}"),
+        code: "SCP-VALID-7036".to_owned(),
+    })?;
+    Ok(output_schema.clone())
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -63,6 +141,13 @@ impl WasmToolVerificationResult {
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the assigned tool ID.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-VALID-7035` if `schema` is missing, not a JSON object,
+///   or structurally invalid.
+/// - Rejects with `SCP-VALID-7036` if `outputSchema` is missing, not a JSON
+///   object, or structurally invalid.
 #[wasm_bindgen]
 pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Promise {
     let context_id = context.context_id();
@@ -91,34 +176,10 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 
         let description = def["description"].as_str().unwrap_or("").to_owned();
 
-        let input_schema = def
-            .get("schema")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-
-        let output_schema = def
-            .get("outputSchema")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        let input_schema = validate_input_schema(&def).map_err(ScpWasmError::into_js)?;
+        let output_schema = validate_output_schema(&def).map_err(ScpWasmError::into_js)?;
 
         let operator_did = def["operatorDid"].as_str().unwrap_or("").to_owned();
-
-        // Validate schemas.
-        runtime::validate_schema(&input_schema).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("invalid input schema: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            }
-            .into_js()
-        })?;
-
-        runtime::validate_schema(&output_schema).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("invalid output schema: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            }
-            .into_js()
-        })?;
 
         // Parse test vectors.
         let test_vectors: Vec<runtime::TestVector> = def
@@ -465,4 +526,187 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 
         Ok(JsValue::UNDEFINED)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Tests for schema validation helpers. These test the pure-Rust validation
+/// functions (`validate_input_schema`, `validate_output_schema`) which return
+/// `Result<_, ScpWasmError>` — no wasm-bindgen calls, safe on native targets.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // json_type_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_type_name_covers_all_variants() {
+        assert_eq!(json_type_name(&serde_json::json!(null)), "null");
+        assert_eq!(json_type_name(&serde_json::json!(true)), "boolean");
+        assert_eq!(json_type_name(&serde_json::json!(42)), "number");
+        assert_eq!(json_type_name(&serde_json::json!("hello")), "string");
+        assert_eq!(json_type_name(&serde_json::json!([1, 2])), "array");
+        assert_eq!(json_type_name(&serde_json::json!({"a": 1})), "object");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_input_schema — missing field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_input_schema_rejects_missing() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "outputSchema": {"type": "object"}
+        });
+        let err = validate_input_schema(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7035"),
+            "error should contain SCP-VALID-7035, got: {msg}"
+        );
+        assert!(
+            msg.contains("schema"),
+            "error should mention schema, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_input_schema — non-object value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_input_schema_rejects_non_object() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": "not an object",
+            "outputSchema": {"type": "object"}
+        });
+        let err = validate_input_schema(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7035"),
+            "error should contain SCP-VALID-7035, got: {msg}"
+        );
+        assert!(
+            msg.contains("string"),
+            "error should mention the actual type, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_input_schema — structurally invalid (missing "type" field)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_input_schema_rejects_structurally_invalid() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": {"description": "no type field"},
+            "outputSchema": {"type": "object"}
+        });
+        let err = validate_input_schema(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7035"),
+            "error should contain SCP-VALID-7035, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_input_schema — valid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_input_schema_accepts_valid() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": {"type": "object", "properties": {"x": {"type": "number"}}},
+            "outputSchema": {"type": "object"}
+        });
+        assert!(validate_input_schema(&def).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_output_schema — missing field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_output_schema_rejects_missing() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": {"type": "object"}
+        });
+        let err = validate_output_schema(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7036"),
+            "error should contain SCP-VALID-7036, got: {msg}"
+        );
+        assert!(
+            msg.contains("outputSchema"),
+            "error should mention outputSchema, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_output_schema — non-object value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_output_schema_rejects_non_object() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": {"type": "object"},
+            "outputSchema": [1, 2, 3]
+        });
+        let err = validate_output_schema(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7036"),
+            "error should contain SCP-VALID-7036, got: {msg}"
+        );
+        assert!(
+            msg.contains("array"),
+            "error should mention the actual type, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_output_schema — structurally invalid (missing "type" field)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_output_schema_rejects_structurally_invalid() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": {"type": "object"},
+            "outputSchema": {"description": "no type field"}
+        });
+        let err = validate_output_schema(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7036"),
+            "error should contain SCP-VALID-7036, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_output_schema — valid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_output_schema_accepts_valid() {
+        let def = serde_json::json!({
+            "name": "test-tool",
+            "schema": {"type": "object"},
+            "outputSchema": {"type": "object", "properties": {"result": {"type": "string"}}}
+        });
+        assert!(validate_output_schema(&def).is_ok());
+    }
 }
