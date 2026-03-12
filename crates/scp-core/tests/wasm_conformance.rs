@@ -3035,8 +3035,8 @@ fn make_nonce(millis: u64, hex: &str) -> String {
     format!("{millis}-{hex}")
 }
 
-/// Runs a nonce through both the WASM mirror and scp-core's NonceTracker,
-/// returning (wasm_result, core_result) for comparison.
+/// Runs a nonce through both the WASM mirror and scp-core's `NonceTracker`,
+/// returning (`wasm_result`, `core_result`) for comparison.
 fn validate_nonce_both(
     nonce: &str,
     now_secs: u64,
@@ -3048,7 +3048,7 @@ fn validate_nonce_both(
     use scp_identity::cache::TestClock;
     use std::sync::Arc;
 
-    let now_millis = u64::from(now_secs) * 1000;
+    let now_millis = now_secs * 1000;
 
     // WASM mirror: validate format and freshness.
     let wasm_result = wasm_ucan_mirror::validate_nonce_format_and_freshness(nonce, now_millis);
@@ -3359,10 +3359,10 @@ fn nonce_freshness_tolerance_constant_matches() {
         "core should accept nonce at exactly tolerance boundary: {core_ok:?}"
     );
 
-    // 1ms past tolerance: should fail. Since scp-core works in seconds (converts
-    // now_secs to millis internally), we need a difference that survives the
-    // seconds→millis conversion. 1001ms (just over 1 second past) is the minimum
-    // reliable difference.
+    // 1001ms past tolerance: should fail. Both implementations compare in
+    // milliseconds (scp-core converts now_secs × 1000 losslessly), so even
+    // 1ms past would be detected. 1001ms is chosen as a clear, round value
+    // that is unambiguously beyond the boundary.
     let nonce_past_boundary = make_nonce(
         now_millis - tolerance_ms - 1001,
         "bbccddee11223344aabbccdd11223344",
