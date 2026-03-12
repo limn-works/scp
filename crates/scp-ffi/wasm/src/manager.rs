@@ -487,6 +487,9 @@ const WASM_EVENT_BUFFER_CAP: usize = 1000;
 /// Maximum entries per author's block list in broadcast contexts (§5.14.8).
 const WASM_BLOCK_LIST_CAP: usize = 10_000;
 
+/// Maximum members per context. Prevents unbounded growth of the membership map.
+const WASM_MEMBER_CAP: usize = 10_000;
+
 impl PerContextState {
     /// Pushes an event to the receive buffer, evicting the oldest if at capacity.
     fn push_event(&mut self, event: WasmContextEvent) {
@@ -1989,6 +1992,17 @@ impl WasmContextManager {
         role: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.members.len() >= WASM_MEMBER_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "member list has reached capacity ({WASM_MEMBER_CAP}) — \
+                     cannot add additional members"
+                ),
+                code: "SCP-VALID-7302".to_owned(),
+            });
+        }
+
         ctx.members.insert(
             did.to_owned(),
             MemberEntry {
