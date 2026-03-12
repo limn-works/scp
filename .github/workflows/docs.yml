@@ -144,16 +144,11 @@ jobs:
           java-version: "17"
       - name: Generate Dokka
         working-directory: bindings/kotlin
-        run: |
-          if [ -f build.gradle.kts ] || [ -f gradlew ]; then
-            ./gradlew dokkaHtml 2>/dev/null || echo "::notice::Dokka not configured -- skipping"
-          else
-            echo "::notice::Gradle project not found -- skipping Kotlin docs"
-          fi
+        run: ./gradlew :scp-kt:dokkaHtml
       - uses: actions/upload-artifact@v4
         with:
           name: docs-kotlin
-          path: bindings/kotlin/build/dokka/
+          path: bindings/kotlin/scp-kt/build/dokka/html/
           retention-days: 7
           if-no-files-found: ignore
 
