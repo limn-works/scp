@@ -3,6 +3,7 @@ plugins {
     kotlin("plugin.serialization")
     id("org.jlleitschuh.gradle.ktlint") version "12.2.0"
     id("io.gitlab.arturbosch.detekt") version "1.23.8"
+    id("org.jetbrains.dokka")
     id("maven-publish")
     id("signing")
 }
