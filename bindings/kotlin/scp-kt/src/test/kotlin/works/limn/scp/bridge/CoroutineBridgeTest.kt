@@ -460,6 +460,10 @@ class CoroutineBridgeTest {
                     }
 
                 assertEquals("SCP-CTX-2001", exception.code)
+                assertEquals(
+                    "subscriber did:dht:z6MkSub not blocked by author did:dht:z6MkAdmin",
+                    exception.message,
+                )
             }
     }
 
