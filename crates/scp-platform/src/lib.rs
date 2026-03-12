@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 //! Platform abstraction layer for SCP.
 //!
 //! This crate defines the four platform abstraction traits that every SCP

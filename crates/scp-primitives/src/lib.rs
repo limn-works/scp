@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
 //! Shared low-level primitives for the SCP workspace.

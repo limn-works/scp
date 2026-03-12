@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 //! Core protocol implementation for SCP (Shared Context Protocol).
 //!
 //! `scp-core` contains the cryptographic and protocol logic that all SCP
