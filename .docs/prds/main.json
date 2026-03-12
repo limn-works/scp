@@ -1043,9 +1043,11 @@
         "rotate_sender_key_for_block(mls_group, blocked_did) -> SenderKey generates new sender key, increments sender_key_epoch, publishes SenderKeyEpochAdvance, adds blocked_did to block list",
         "Non-blocked members observe epoch advance, send SenderKeyRequest, receive new key. Blocked party sends SenderKeyRequest but receives no response",
         "send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did) -> MlsMessage sends signed block notification as MLS application message",
-        "Block notification signature payload: Ed25519_sign(active_signing_key, SHA-256(context_id || \"block\" || blocker_did || blocked_did || timestamp))",
-        "Block notification content: { \"type\": \"block_notification\", \"blocker\": blocker_did, \"blocked\": blocked_did, \"timestamp\": unix_ms, \"signature\": blocker_signature }",
-        "On receipt, verify Ed25519 signature against blocker's known Active Signing Key from MLS LeafNode. Discard if verification fails. Log discarded notification for anomaly detection",
+        "Block notification signature covers canonical hash SHA-256(\"SCP-BLOCK-NOTIFICATION-V1:\" || len(context_id) || context_id || len(blocker_did) || blocker_did || len(blocked_did) || blocked_did || len(signing_key_id) || signing_key_id || timestamp_BE) per §9.5.2 BlockNotification definition",
+        "Block notification is signed with blocker's Active Signing Key (#active) or Agent Signing Key (#agent) per §9.16.3 and ADR-039",
+        "Block notification JSON includes signing_key_id field identifying which DID document verification method was used (§9.16.3)",
+        "Block notification content: { \"type\": \"block\", \"blocker\": blocker_did, \"blocked\": blocked_did, \"signing_key_id\": \"#active\", \"timestamp\": unix_ms, \"signature\": blocker_signature }",
+        "On receipt, verify Ed25519 signature by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039. Discard if verification fails. Log discarded notification for anomaly detection",
         "On successful verification, blocked party's client automatically calls rotate_sender_key_for_block excluding the blocker",
         "Grace period: sender SHOULD continue accepting old key for decryption of in-flight messages for 30 seconds after epoch advance",
         "Unit tests for SenderKeyEpochAdvance creation and signature verification",
@@ -1079,6 +1081,14 @@
         {
           "file": ".docs/adrs/phase-1.md",
           "section": "## ADR-007: Sender-Side Key Layer"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-039: Shared-DID Human-Agent Identity Model"
         }
       ],
       "details": {
@@ -1086,7 +1096,7 @@
         "newMemberJoin": "When a new member joins the group, they observe each existing member's current sender_key_epoch from the group state. The new member publishes a SenderKeyRequest for each author whose key they need. Each author's SDK responds automatically (checking block list). Same O(N) total work as push-based, but demand-driven and naturally load-balanced.",
         "hpkeAssembly": "HPKE: (1) generate ephemeral X25519 keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. Ephemeral public key included in response.",
         "hpkeOpen": "Uses key_custody.dh_agree(wrapping_key_handle, ephemeral_pk) to compute shared secret inside custody boundary, then KDF + AEAD in software to recover sender key. Wrapping private key never leaves KeyCustody.",
-        "blockNotificationVerification": "Receiver MUST verify Ed25519 signature against blocker's known Active Signing Key (from MLS LeafNode scp_signing_key extension). Discard without action if verification fails. Log discarded notification for anomaly detection."
+        "blockNotificationVerification": "Receiver MUST verify Ed25519 signature by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039. Discard without action if verification fails. Log discarded notification for anomaly detection."
       },
       "result": "Implemented pull-based sender key protocol: SenderKeyEpochAdvance, SenderKeyRequest/Response with HPKE, block notifications, rotate_sender_key_for_block. 15 tests."
     },
