@@ -1083,7 +1083,11 @@ fn resolve_via_handles(
     });
 
     let known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
-        serde_json::from_str(json).map_err(|e| JsError::new(&format!("[SCP-VALID-7090] invalid known_contexts_json: {e}")))?
+        serde_json::from_str(json).map_err(|e| {
+            JsError::new(&format!(
+                "[SCP-VALID-7090] invalid known_contexts_json: {e}"
+            ))
+        })?
     } else {
         wasm_handle_registries()
             .lock()
