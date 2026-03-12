@@ -7,7 +7,7 @@ repository.workspace = true
 license = "AGPL-3.0-only"
 homepage.workspace = true
 readme = "README.md"
-keywords = ["scp", "node", "server", "relay", "identity"]
+keywords = ["node", "server", "relay", "identity"]
 categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]

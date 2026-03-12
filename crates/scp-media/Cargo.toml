@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["scp", "media", "signaling", "real-time", "encryption"]
+keywords = ["media", "signaling", "real-time", "encryption"]
 categories = ["multimedia", "cryptography"]
 
 [dependencies]
