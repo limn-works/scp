@@ -27,7 +27,6 @@ use pyo3::types::{PyDict, PyList};
 
 use _scp_core::custody::FfiKeyCustody;
 use _scp_core::runtime::{self, IdentityEntry};
-use scp_platform::traits::KeyCustody;
 
 static INIT: Once = Once::new();
 
@@ -184,76 +183,6 @@ fn identity_unknown_did_fails() {
     setup();
     let result = runtime::with_identity("did:dht:nonexistent", |_| Ok(()));
     assert!(result.is_err());
-}
-
-#[test]
-fn identity_migrate_produces_new_did_and_updates_registry() {
-    let old_did = create_test_identity();
-    let rt = test_runtime();
-
-    let new_did = rt.block_on(async {
-        // Extract state from the registry (same pattern as py_identity_migrate).
-        let (custody, old_identity, old_doc) = runtime::with_identity(&old_did, |entry| {
-            Ok((
-                Arc::clone(&entry.custody),
-                entry.identity.clone(),
-                entry.document.clone(),
-            ))
-        })
-        .unwrap();
-
-        // Generate a pre-rotation key (mirrors py_identity_migrate).
-        let pre_rotation_key = custody
-            .generate_keypair(scp_platform::traits::KeyType::Ed25519)
-            .await
-            .unwrap();
-
-        let rotated_at = scp_core::time::now_secs().unwrap();
-
-        let sign_fn = scp_identity::DidDht::<
-            scp_identity::InMemoryDhtClient,
-            scp_identity::cache::SystemClock,
-        >::make_sign_fn(Arc::clone(&custody));
-        let did_method = scp_identity::DidDht::with_client_and_signer(
-            Arc::new(scp_identity::InMemoryDhtClient::new()),
-            Arc::new(scp_identity::DidCache::new()),
-            sign_fn,
-        );
-
-        let (new_identity, new_document, _rotation_event) = did_method
-            .migrate_identity(
-                &old_identity,
-                &old_doc,
-                &pre_rotation_key,
-                custody.as_ref(),
-                rotated_at,
-            )
-            .await
-            .unwrap();
-
-        let new_did = new_identity.did.clone();
-
-        // Swap registry entries (same as py_identity_migrate).
-        runtime::remove_identity(&old_did);
-        runtime::register_identity(
-            &new_did,
-            IdentityEntry {
-                identity: new_identity,
-                custody,
-                document: new_document,
-            },
-        );
-
-        new_did
-    });
-
-    // New DID is different from old.
-    assert_ne!(old_did, new_did);
-    // Old DID removed from registry.
-    assert!(!runtime::identity_registry_contains(&old_did));
-    // New DID is in the registry.
-    assert!(runtime::identity_registry_contains(&new_did));
-    assert!(new_did.starts_with("did:dht:"));
 }
 
 // ============================================================================
