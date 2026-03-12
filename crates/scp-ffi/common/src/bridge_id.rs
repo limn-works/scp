@@ -1,15 +1,13 @@
 //! Shared bridge ID generation for all FFI bridges.
 //!
 //! Bridge ID per spec section 12.2.1: `SHA-256(context_id || operator_did || platform || timestamp)`.
-//! Uses length-prefixed fields to prevent domain ambiguity.
 
 use sha2::{Digest, Sha256};
 
 /// Generates a deterministic bridge ID per spec section 12.2.1.
 ///
-/// Computes `SHA-256(len(context_id) || context_id || len(operator_did) ||
-/// operator_did || len(platform) || platform || timestamp)` where lengths
-/// are encoded as little-endian `u64` bytes for unambiguous domain separation.
+/// Computes `SHA-256(context_id || operator_did || platform || timestamp)`
+/// where timestamp is the current Unix epoch seconds as big-endian `u64` bytes.
 ///
 /// Returns `(bridge_id_hex, timestamp_secs)` so callers can use the same
 /// timestamp for `BridgeRegistrationRequest::requested_at`.
@@ -21,21 +19,9 @@ pub fn generate_bridge_id(context_id: &str, operator_did: &str, platform: &str) 
         .unwrap_or(0);
 
     let mut hasher = Sha256::new();
-
-    // Length-prefixed fields for domain separation (prevents
-    // "abcdef" vs "ab""cdef" ambiguity).
-    let ctx_bytes = context_id.as_bytes();
-    hasher.update((ctx_bytes.len() as u64).to_le_bytes());
-    hasher.update(ctx_bytes);
-
-    let op_bytes = operator_did.as_bytes();
-    hasher.update((op_bytes.len() as u64).to_le_bytes());
-    hasher.update(op_bytes);
-
-    let plat_bytes = platform.as_bytes();
-    hasher.update((plat_bytes.len() as u64).to_le_bytes());
-    hasher.update(plat_bytes);
-
+    hasher.update(context_id.as_bytes());
+    hasher.update(operator_did.as_bytes());
+    hasher.update(platform.as_bytes());
     hasher.update(now_secs.to_be_bytes());
 
     (hex::encode(hasher.finalize()), now_secs)
@@ -76,14 +62,23 @@ mod tests {
     }
 
     #[test]
-    fn domain_separation_prevents_ambiguity() {
-        // Without length prefixes, "ab" + "cdef" would hash the same as
-        // "abcd" + "ef" (if platform/timestamp were identical). Length
-        // prefixes prevent this.
-        let (id1, ts1) = generate_bridge_id("ab", "cdef", "p");
-        let (id2, ts2) = generate_bridge_id("abcd", "ef", "p");
-        if ts1 == ts2 {
-            assert_ne!(id1, id2);
-        }
+    fn matches_wasm_raw_concatenation() {
+        // Verify the hash uses raw concatenation per spec §12.2.1:
+        // SHA-256(context_id || operator_did || platform || timestamp).
+        // Manually compute the expected hash for a known timestamp.
+        use sha2::{Digest, Sha256};
+
+        let ctx = "ctx-test";
+        let op = "did:key:operator";
+        let plat = "discord";
+        let (id, ts) = generate_bridge_id(ctx, op, plat);
+
+        let mut hasher = Sha256::new();
+        hasher.update(ctx.as_bytes());
+        hasher.update(op.as_bytes());
+        hasher.update(plat.as_bytes());
+        hasher.update(ts.to_be_bytes());
+
+        assert_eq!(id, hex::encode(hasher.finalize()));
     }
 }

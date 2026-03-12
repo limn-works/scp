@@ -27,7 +27,6 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 z-base-32 = { workspace = true }
 hex = { workspace = true }
-sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-identity = { path = "../../scp-identity" }
