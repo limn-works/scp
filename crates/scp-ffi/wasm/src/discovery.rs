@@ -405,13 +405,34 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
 
     // Timestamp: js_sys is not available in non-wasm test builds, so use a
     // seconds-since-epoch value. In wasm32, js_sys::Date::now() provides
+    // milliseconds; we divide by 1000 for seconds.
+    #[cfg(target_arch = "wasm32")]
+    let now_secs = {
+        let secs = js_sys::Date::now() / 1000.0;
+        if !secs.is_finite() || secs < 0.0 {
+            0u64
+        } else {
+            // f64 -> u64: sign loss is guarded above; truncation is safe
+            // because Unix seconds (~1.7e9) is far below u64::MAX.
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                secs as u64
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     // Build a single ContextDiscoveryResult matching the NAPI bridge's
-    // discovery_result_to_json output format, including trust_level per §22.2.1.
+    // discovery_result_to_json output format, including trust_level and
+    // resolution_path per §22.2.1 / §22.11.3.
     //
     // An scp:// URI is shared out-of-band, so the trust level is
-    // DirectExchange. resolution_path is null because no spec-defined
-    // ResolutionPath.layer value (§22.7: petname/discovery_context/
-    // attestation/domain) applies to direct URI dereference.
+    // DirectExchange and the resolution layer is "Domain" (closest match
+    // for URI-based resolution — no discovery context is involved).
     let result = serde_json::json!([{
         "context_id": context_id,
         "relay_urls": relay_urls,
@@ -422,7 +443,12 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
         "trust_level": {
             "kind": "DirectExchange",
         },
-        "resolution_path": null,
+        "resolution_path": {
+            "layer": "Domain",
+            "source": "context_uri",
+            "source_id": null,
+            "resolved_at": now_secs,
+        },
     }]);
 
     Ok(result.to_string())
@@ -577,9 +603,13 @@ mod tests {
         assert_eq!(arr[0]["relay_urls"][0], "wss://relay.example.com/scp/v1");
         assert_eq!(arr[0]["discovery_source"], "context_uri");
         assert_eq!(arr[0]["mode"], "broadcast");
-        // §22.7: trust_level present, resolution_path null (no spec layer fits URI dereference)
+        // §22.7 / §22.11.3: trust_level and resolution_path present, matching
+        // other bridges (PyO3, NAPI, UniFFI).
         assert_eq!(arr[0]["trust_level"]["kind"], "DirectExchange");
-        assert!(arr[0]["resolution_path"].is_null());
+        assert_eq!(arr[0]["resolution_path"]["layer"], "Domain");
+        assert_eq!(arr[0]["resolution_path"]["source"], "context_uri");
+        assert!(arr[0]["resolution_path"]["source_id"].is_null());
+        assert!(arr[0]["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
     }
 
     #[test]

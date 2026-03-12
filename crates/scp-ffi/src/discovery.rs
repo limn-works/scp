@@ -135,6 +135,91 @@ pub fn py_discovery_normalize_address(address: &str) -> String {
 // context_discover — DHT-based context discovery (SCP-336)
 // ---------------------------------------------------------------------------
 
+/// Maps a [`ContextDiscoverySource`] to trust/resolution metadata.
+///
+/// Returns `(source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id)`.
+/// Shared by both [`discovery_result_to_dict`] (Python) and [`discovery_result_to_json`] (tests).
+fn map_discovery_source(
+    source: &scp_core::discovery::ContextDiscoverySource,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&str>,
+) {
+    match source {
+        scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
+            ("dht_did_document", "DomainVerified", "Domain", "dht", None)
+        }
+        scp_core::discovery::ContextDiscoverySource::WellKnown => {
+            ("well_known", "DomainVerified", "Domain", "well-known", None)
+        }
+        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
+            "discovery_context",
+            "DiscoveryContextVerified",
+            "DiscoveryContext",
+            "discovery_context",
+            Some(context_id.as_str()),
+        ),
+        // §22.7: An scp:// URI is shared out-of-band, so the trust level is
+        // DirectExchange and the resolution layer is "Domain" (closest match
+        // for URI-based resolution — no discovery context is involved).
+        scp_core::discovery::ContextDiscoverySource::ContextUri => (
+            "context_uri",
+            "DirectExchange",
+            "Domain",
+            "context_uri",
+            None,
+        ),
+    }
+}
+
+/// Converts a [`ContextDiscoveryResult`] into a JSON value.
+///
+/// Mirrors the dict structure of [`discovery_result_to_dict`] but returns
+/// `serde_json::Value` for use in unit tests (no Python GIL required).
+/// Includes `trust_level` and `resolution_path` fields per §22.2.1, mapping
+/// from `ContextDiscoverySource` to appropriate trust and path metadata.
+#[cfg(test)]
+fn discovery_result_to_json(
+    result: &scp_core::discovery::ContextDiscoveryResult,
+) -> serde_json::Value {
+    let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
+        map_discovery_source(&result.discovery_source);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut obj = serde_json::json!({
+        "context_id": result.context_id,
+        "relay_urls": result.relay_urls,
+        "publisher_did": &*result.publisher_did,
+        "discovery_source": source_str,
+        "mode": result.mode,
+        "metadata_summary": result.metadata_summary,
+        "trust_level": {
+            "kind": trust_level_kind,
+        },
+        "resolution_path": {
+            "layer": resolution_layer,
+            "source": resolution_source,
+            "source_id": resolution_source_id,
+            "resolved_at": now_secs,
+        },
+    });
+
+    if let scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } =
+        &result.discovery_source
+    {
+        obj["discovery_context_id"] = serde_json::Value::String(context_id.clone());
+    }
+
+    obj
+}
+
 /// Converts a [`ContextDiscoveryResult`] into a Python dict.
 ///
 /// Returns a dict with keys: `context_id`, `relay_urls`, `publisher_did`,
@@ -150,34 +235,14 @@ fn discovery_result_to_dict<'py>(
     dict.set_item("publisher_did", &*result.publisher_did)?;
 
     let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
-        match &result.discovery_source {
-            scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
-                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
-            }
-            scp_core::discovery::ContextDiscoverySource::WellKnown => {
-                ("well_known", "DomainVerified", "Domain", "well-known", None)
-            }
-            scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => {
-                dict.set_item("discovery_context_id", context_id)?;
-                (
-                    "discovery_context",
-                    "DiscoveryContextVerified",
-                    "DiscoveryContext",
-                    "discovery_context",
-                    Some(context_id.as_str()),
-                )
-            }
-            // §22.7: An scp:// URI is shared out-of-band, so the trust level is
-            // DirectExchange and the resolution layer is "Domain" (closest match
-            // for URI-based resolution — no discovery context is involved).
-            scp_core::discovery::ContextDiscoverySource::ContextUri => (
-                "context_uri",
-                "DirectExchange",
-                "Domain",
-                "context_uri",
-                None,
-            ),
-        };
+        map_discovery_source(&result.discovery_source);
+
+    if let scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } =
+        &result.discovery_source
+    {
+        dict.set_item("discovery_context_id", context_id)?;
+    }
+
     dict.set_item("discovery_source", source_str)?;
     dict.set_item("mode", result.mode.as_deref())?;
     dict.set_item("metadata_summary", result.metadata_summary.as_deref())?;
@@ -379,5 +444,88 @@ mod tests {
         // interpreter, but we can test the validation logic.
         assert!(!query.starts_with("did:"));
         assert!(!query.starts_with("scp://"));
+    }
+
+    // -- trust_level / resolution_path tests (mirrors NAPI bridge) -----------
+
+    #[test]
+    fn context_discover_result_serialization() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "abc123".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:dht:zTest".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::DhtDidDocument,
+            mode: Some("broadcast".to_owned()),
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["context_id"], "abc123");
+        assert_eq!(json["discovery_source"], "dht_did_document");
+        assert_eq!(json["mode"], "broadcast");
+        // §22.7: trust_level is a discriminated union object; resolution_path
+        // uses spec PascalCase layer values per §22.11.3.
+        assert_eq!(json["trust_level"]["kind"], "DomainVerified");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "dht");
+        assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn context_discover_result_discovery_context_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "ctx456".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:dht:zTest".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::DiscoveryContext {
+                context_id: "disc-ctx-1".to_owned(),
+            },
+            mode: None,
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
+        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
+        assert_eq!(json["discovery_context_id"], "disc-ctx-1");
+    }
+
+    #[test]
+    fn context_discover_result_context_uri_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "deadbeef".to_owned(),
+            relay_urls: vec!["wss://relay.example.com/scp/v1".to_owned()],
+            publisher_did: "".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::ContextUri,
+            mode: Some("broadcast".to_owned()),
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"]["kind"], "DirectExchange");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "context_uri");
+        assert!(json["resolution_path"]["source_id"].is_null());
+        assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn context_discover_result_well_known_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "wk789".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:web:example.com".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::WellKnown,
+            mode: None,
+            metadata_summary: Some("Example context".to_owned()),
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"]["kind"], "DomainVerified");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "well-known");
+        assert!(json["resolution_path"]["source_id"].is_null());
     }
 }

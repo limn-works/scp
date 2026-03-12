@@ -188,7 +188,7 @@ The SDK ships with a mapping of default discovery context IDs to their canonical
 8. Return AddressResolution::Identity {
      did: "did:dht:z6MkAlice...",
      trust_level: DiscoveryContextVerified,
-     resolution_path: { layer: "discovery_context", context_name: "cooking-community", context_id: "..." }
+     resolution_path: { layer: "DiscoveryContext", context_name: "cooking-community", context_id: "..." }
    }
 ```
 
@@ -434,9 +434,9 @@ Each `AddressResolution` also carries a `ResolutionPath` — structured metadata
 
 ```
 ResolutionPath {
-  layer:         "petname" | "discovery_context" | "attestation" | "domain",
+  layer:         "Petname" | "DiscoveryContext" | "Attestation" | "Domain",
   source:        string,     // discovery context name, domain, platform
-  source_id:     string?,    // discovery context ID (hex, for discovery_context layer)
+  source_id:     string?,    // discovery context ID (hex, for DiscoveryContext layer)
   resolved_at:   timestamp,
 }
 ```
