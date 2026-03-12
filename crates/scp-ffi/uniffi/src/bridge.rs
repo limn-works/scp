@@ -871,7 +871,7 @@ impl DataProvenance {
     }
 
     /// Converts this `UniFFI` bridge type into an scp-core `DataProvenance`.
-    pub fn to_core(&self) -> scp_core::provenance::DataProvenance {
+    pub fn to_core(&self) -> Result<scp_core::provenance::DataProvenance, ScpError> {
         let source_type = match self.source_type {
             SourceType::Persistent => scp_core::provenance::SourceType::Persistent,
             SourceType::Ephemeral => scp_core::provenance::SourceType::Ephemeral,
@@ -894,12 +894,21 @@ impl DataProvenance {
             MemoryScope::Full => scp_core::context::MemoryScope::Full,
         };
 
-        let payment_receipt_id: Option<[u8; 32]> = self.payment_receipt_id.as_ref().and_then(|v| {
-            let arr: Result<[u8; 32], _> = v.as_slice().try_into();
-            arr.ok()
-        });
+        let payment_receipt_id: Option<[u8; 32]> = match &self.payment_receipt_id {
+            Some(v) => {
+                let arr: [u8; 32] = v.as_slice().try_into().map_err(|_| ScpError::Validation {
+                    message: format!(
+                        "payment_receipt_id must be exactly 32 bytes, got {}",
+                        v.len()
+                    ),
+                    code: "SCP-VALID-7050".to_owned(),
+                })?;
+                Some(arr)
+            }
+            None => None,
+        };
 
-        scp_core::provenance::DataProvenance {
+        Ok(scp_core::provenance::DataProvenance {
             source_context: self.source_context.clone(),
             source_type,
             counterparties: self
@@ -918,7 +927,7 @@ impl DataProvenance {
                 .map(scp_core::economy::types::Amount::new),
             payment_adapter: self.payment_adapter.clone(),
             payment_receipt_id,
-        }
+        })
     }
 }
 
@@ -6941,7 +6950,7 @@ mod tests {
         assert_eq!(ffi.payment_receipt_id.as_ref().map(Vec::len), Some(32));
 
         // Round-trip back to core
-        let roundtripped = ffi.to_core();
+        let roundtripped = ffi.to_core().unwrap();
         assert_eq!(roundtripped.source_context, core_prov.source_context);
         assert_eq!(roundtripped.source_type, core_prov.source_type);
         assert_eq!(roundtripped.counterparties.len(), 2);
@@ -7013,7 +7022,7 @@ mod tests {
         ));
         assert!(matches!(ffi.memory_scope, MemoryScope::Summary));
 
-        let roundtripped = ffi.to_core();
+        let roundtripped = ffi.to_core().unwrap();
         assert_eq!(
             roundtripped.source_type,
             scp_core::provenance::SourceType::Summary
