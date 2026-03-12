@@ -422,6 +422,22 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -2150,23 +2166,24 @@ public struct ContextParams {
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
          * Empty list means no ceiling restriction.
-         */ceiling: [String],
+         */ceiling: [String], 
         /**
          * Governance model for this context.
-         */governance: GovernanceModel,
+         */governance: GovernanceModel, 
         /**
          * Memory scope governing key destruction on close.
-         */memoryScope: MemoryScope,
+         */memoryScope: MemoryScope, 
         /**
          * Optional time-to-live in seconds (0 = no TTL).
-         */ttlSeconds: UInt64,
+         */ttlSeconds: UInt64, 
         /**
          * Whether this context can be promoted from ephemeral to persistent.
-         */promotable: Bool,
+         */promotable: Bool, 
         /**
          * Minimum protocol version required to join (spec §13.4).
+         * Encoded as `(major << 8) | minor`, e.g., `0x0100` for SCP/1.0.
          * `0` means no minimum (defaults to SCP/1.0).
-         */minProtocolVersion: UInt16 = 0) {
+         */minProtocolVersion: UInt16) {
         self.ceiling = ceiling
         self.governance = governance
         self.memoryScope = memoryScope
@@ -2223,11 +2240,11 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContextParams {
         return
             try ContextParams(
-                ceiling: FfiConverterSequenceString.read(from: &buf),
-                governance: FfiConverterTypeGovernanceModel.read(from: &buf),
-                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf),
-                ttlSeconds: FfiConverterUInt64.read(from: &buf),
-                promotable: FfiConverterBool.read(from: &buf),
+                ceiling: FfiConverterSequenceString.read(from: &buf), 
+                governance: FfiConverterTypeGovernanceModel.read(from: &buf), 
+                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf), 
+                ttlSeconds: FfiConverterUInt64.read(from: &buf), 
+                promotable: FfiConverterBool.read(from: &buf), 
                 minProtocolVersion: FfiConverterUInt16.read(from: &buf)
         )
     }
@@ -2388,48 +2405,115 @@ public func FfiConverterTypeDIDDocument_lower(_ value: DidDocument) -> RustBuffe
 
 
 /**
- * Provenance metadata for cross-context data transfer.
+ * Provenance metadata for cross-context data transfer (spec §24.2.1).
  *
- * Every message or tool output that crosses a context boundary carries
- * provenance metadata tracing it back to its origin. See spec §12 (Provenance).
+ * Attached automatically by the protocol when data crosses context boundaries.
+ * Records the full lineage of a piece of data: where it came from, who was
+ * involved, how it was discovered, and how many context hops it has traversed.
  */
 public struct DataProvenance {
     /**
-     * DID of the original data source.
+     * The context from which this data originated.
      */
-    public var sourceDid: String
+    public var sourceContext: String
     /**
-     * Context ID where this data originated.
+     * Current data availability status of the source context.
      */
-    public var originContextId: String
+    public var sourceType: SourceType
     /**
-     * Depth of cross-context hops (0 = direct, 1 = one hop, etc.).
+     * DIDs of the parties involved in the source context at the time of
+     * data flow.
      */
-    public var chainDepth: UInt32
+    public var counterparties: [String]
     /**
-     * Ed25519 signature bytes over the provenance record.
+     * Optional human-readable purpose description for this data flow.
      */
-    public var signature: Data
+    public var purpose: String?
+    /**
+     * How the data source was discovered.
+     */
+    public var discoveryMethod: DiscoveryMethod
+    /**
+     * Age of the data in seconds at the time provenance was attached.
+     */
+    public var ageSecs: UInt64
+    /**
+     * Memory scope of the source context.
+     */
+    public var memoryScope: MemoryScope
+    /**
+     * Number of cross-context hops this data has traversed (0 = direct).
+     */
+    public var chainDepth: UInt8
+    /**
+     * Ordered list of intermediary context IDs when `chain_depth > 0`.
+     */
+    public var chainPath: [String]?
+    /**
+     * Cost of producing this data in smallest currency unit, if any (spec §19.6).
+     */
+    public var paymentAmount: UInt64?
+    /**
+     * Payment adapter used, if any (spec §19.6).
+     */
+    public var paymentAdapter: String?
+    /**
+     * Receipt ID for verification of the payment (32 bytes), if any.
+     */
+    public var paymentReceiptId: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * DID of the original data source.
-         */sourceDid: String, 
+         * The context from which this data originated.
+         */sourceContext: String, 
         /**
-         * Context ID where this data originated.
-         */originContextId: String, 
+         * Current data availability status of the source context.
+         */sourceType: SourceType, 
         /**
-         * Depth of cross-context hops (0 = direct, 1 = one hop, etc.).
-         */chainDepth: UInt32, 
+         * DIDs of the parties involved in the source context at the time of
+         * data flow.
+         */counterparties: [String], 
         /**
-         * Ed25519 signature bytes over the provenance record.
-         */signature: Data) {
-        self.sourceDid = sourceDid
-        self.originContextId = originContextId
+         * Optional human-readable purpose description for this data flow.
+         */purpose: String?, 
+        /**
+         * How the data source was discovered.
+         */discoveryMethod: DiscoveryMethod, 
+        /**
+         * Age of the data in seconds at the time provenance was attached.
+         */ageSecs: UInt64, 
+        /**
+         * Memory scope of the source context.
+         */memoryScope: MemoryScope, 
+        /**
+         * Number of cross-context hops this data has traversed (0 = direct).
+         */chainDepth: UInt8, 
+        /**
+         * Ordered list of intermediary context IDs when `chain_depth > 0`.
+         */chainPath: [String]?, 
+        /**
+         * Cost of producing this data in smallest currency unit, if any (spec §19.6).
+         */paymentAmount: UInt64?, 
+        /**
+         * Payment adapter used, if any (spec §19.6).
+         */paymentAdapter: String?, 
+        /**
+         * Receipt ID for verification of the payment (32 bytes), if any.
+         */paymentReceiptId: Data?) {
+        self.sourceContext = sourceContext
+        self.sourceType = sourceType
+        self.counterparties = counterparties
+        self.purpose = purpose
+        self.discoveryMethod = discoveryMethod
+        self.ageSecs = ageSecs
+        self.memoryScope = memoryScope
         self.chainDepth = chainDepth
-        self.signature = signature
+        self.chainPath = chainPath
+        self.paymentAmount = paymentAmount
+        self.paymentAdapter = paymentAdapter
+        self.paymentReceiptId = paymentReceiptId
     }
 }
 
@@ -2440,26 +2524,58 @@ extension DataProvenance: Sendable {}
 
 extension DataProvenance: Equatable, Hashable {
     public static func ==(lhs: DataProvenance, rhs: DataProvenance) -> Bool {
-        if lhs.sourceDid != rhs.sourceDid {
+        if lhs.sourceContext != rhs.sourceContext {
             return false
         }
-        if lhs.originContextId != rhs.originContextId {
+        if lhs.sourceType != rhs.sourceType {
+            return false
+        }
+        if lhs.counterparties != rhs.counterparties {
+            return false
+        }
+        if lhs.purpose != rhs.purpose {
+            return false
+        }
+        if lhs.discoveryMethod != rhs.discoveryMethod {
+            return false
+        }
+        if lhs.ageSecs != rhs.ageSecs {
+            return false
+        }
+        if lhs.memoryScope != rhs.memoryScope {
             return false
         }
         if lhs.chainDepth != rhs.chainDepth {
             return false
         }
-        if lhs.signature != rhs.signature {
+        if lhs.chainPath != rhs.chainPath {
+            return false
+        }
+        if lhs.paymentAmount != rhs.paymentAmount {
+            return false
+        }
+        if lhs.paymentAdapter != rhs.paymentAdapter {
+            return false
+        }
+        if lhs.paymentReceiptId != rhs.paymentReceiptId {
             return false
         }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(sourceDid)
-        hasher.combine(originContextId)
+        hasher.combine(sourceContext)
+        hasher.combine(sourceType)
+        hasher.combine(counterparties)
+        hasher.combine(purpose)
+        hasher.combine(discoveryMethod)
+        hasher.combine(ageSecs)
+        hasher.combine(memoryScope)
         hasher.combine(chainDepth)
-        hasher.combine(signature)
+        hasher.combine(chainPath)
+        hasher.combine(paymentAmount)
+        hasher.combine(paymentAdapter)
+        hasher.combine(paymentReceiptId)
     }
 }
 
@@ -2472,18 +2588,34 @@ public struct FfiConverterTypeDataProvenance: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DataProvenance {
         return
             try DataProvenance(
-                sourceDid: FfiConverterString.read(from: &buf), 
-                originContextId: FfiConverterString.read(from: &buf), 
-                chainDepth: FfiConverterUInt32.read(from: &buf), 
-                signature: FfiConverterData.read(from: &buf)
+                sourceContext: FfiConverterString.read(from: &buf), 
+                sourceType: FfiConverterTypeSourceType.read(from: &buf), 
+                counterparties: FfiConverterSequenceString.read(from: &buf), 
+                purpose: FfiConverterOptionString.read(from: &buf), 
+                discoveryMethod: FfiConverterTypeDiscoveryMethod.read(from: &buf), 
+                ageSecs: FfiConverterUInt64.read(from: &buf), 
+                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf), 
+                chainDepth: FfiConverterUInt8.read(from: &buf), 
+                chainPath: FfiConverterOptionSequenceString.read(from: &buf), 
+                paymentAmount: FfiConverterOptionUInt64.read(from: &buf), 
+                paymentAdapter: FfiConverterOptionString.read(from: &buf), 
+                paymentReceiptId: FfiConverterOptionData.read(from: &buf)
         )
     }
 
     public static func write(_ value: DataProvenance, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.sourceDid, into: &buf)
-        FfiConverterString.write(value.originContextId, into: &buf)
-        FfiConverterUInt32.write(value.chainDepth, into: &buf)
-        FfiConverterData.write(value.signature, into: &buf)
+        FfiConverterString.write(value.sourceContext, into: &buf)
+        FfiConverterTypeSourceType.write(value.sourceType, into: &buf)
+        FfiConverterSequenceString.write(value.counterparties, into: &buf)
+        FfiConverterOptionString.write(value.purpose, into: &buf)
+        FfiConverterTypeDiscoveryMethod.write(value.discoveryMethod, into: &buf)
+        FfiConverterUInt64.write(value.ageSecs, into: &buf)
+        FfiConverterTypeMemoryScope.write(value.memoryScope, into: &buf)
+        FfiConverterUInt8.write(value.chainDepth, into: &buf)
+        FfiConverterOptionSequenceString.write(value.chainPath, into: &buf)
+        FfiConverterOptionUInt64.write(value.paymentAmount, into: &buf)
+        FfiConverterOptionString.write(value.paymentAdapter, into: &buf)
+        FfiConverterOptionData.write(value.paymentReceiptId, into: &buf)
     }
 }
 
@@ -4133,6 +4265,101 @@ extension CustodyMethod: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * How the data source was discovered by the receiving party (spec §24.2.3).
+ */
+
+public enum DiscoveryMethod {
+    
+    /**
+     * Source was discovered through shared membership in the given context.
+     */
+    case sharedContext(contextId: String
+    )
+    /**
+     * Source was discovered through a discovery registry context.
+     */
+    case registry(contextId: String
+    )
+    /**
+     * No protocol-level discovery path.
+     */
+    case none
+}
+
+
+#if compiler(>=6)
+extension DiscoveryMethod: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDiscoveryMethod: FfiConverterRustBuffer {
+    typealias SwiftType = DiscoveryMethod
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DiscoveryMethod {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sharedContext(contextId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .registry(contextId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .none
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DiscoveryMethod, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .sharedContext(contextId):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(contextId, into: &buf)
+            
+        
+        case let .registry(contextId):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(contextId, into: &buf)
+            
+        
+        case .none:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiscoveryMethod_lift(_ buf: RustBuffer) throws -> DiscoveryMethod {
+    return try FfiConverterTypeDiscoveryMethod.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiscoveryMethod_lower(_ value: DiscoveryMethod) -> RustBuffer {
+    return FfiConverterTypeDiscoveryMethod.lower(value)
+}
+
+
+extension DiscoveryMethod: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Governance model for context administration.
  *
  * See spec §5.3 (Capability Ceiling Governance).
@@ -4488,6 +4715,98 @@ extension ScpError: Foundation.LocalizedError {
         String(reflecting: self)
     }
 }
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Current data availability status of the source context (spec §24.2.2).
+ *
+ * Reflects operational state, not creation-time memory scope. A persistent
+ * context that closes becomes `Ephemeral` or `Summary`.
+ */
+
+public enum SourceType {
+    
+    /**
+     * Source context is still open and verifiable.
+     */
+    case persistent
+    /**
+     * Source context has closed and keys have been destroyed.
+     */
+    case ephemeral
+    /**
+     * Source context has closed and a verified summary is available.
+     */
+    case summary
+}
+
+
+#if compiler(>=6)
+extension SourceType: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSourceType: FfiConverterRustBuffer {
+    typealias SwiftType = SourceType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SourceType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .persistent
+        
+        case 2: return .ephemeral
+        
+        case 3: return .summary
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SourceType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .persistent:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .ephemeral:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .summary:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSourceType_lift(_ buf: RustBuffer) throws -> SourceType {
+    return try FfiConverterTypeSourceType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSourceType_lower(_ value: SourceType) -> RustBuffer {
+    return FfiConverterTypeSourceType.lower(value)
+}
+
+
+extension SourceType: Equatable, Hashable {}
+
+
 
 
 
@@ -6561,6 +6880,32 @@ public func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
         )
 }
 /**
+ * Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
+ *
+ * Forward-only: the unblocked subscriber can request the current key on
+ * next pull but cannot decrypt content from the block period.
+ *
+ * # Errors
+ *
+ * - [`ScpError::Context`] with `SCP-CTX-2037` if the tokio task fails.
+ * - [`ScpError::Context`] if the subscriber is not blocked or the
+ * author is not registered.
+ */
+public func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: String, unblockerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_unblock_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterString.lower(unblockerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Unsubscribes a DID from a broadcast context.
  *
  * When `rotate_keys` is `true`, all authors rotate their broadcast keys
@@ -7186,6 +7531,16 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
         )
 }
 /**
+ * Returns the economic policy for a context as a JSON string, or `None`.
+ */
+public func getEconomicPolicy(handle: ContextHandle)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_get_economic_policy(
+        FfiConverterTypeContextHandle_lower(handle),$0
+    )
+})
+}
+/**
  * Executes an approved governance action on a context.
  *
  * The `proposal_json` must be a JSON-serialized `GovernanceProposal` with
@@ -7586,6 +7941,34 @@ public func registerLocalDid(did: String)async   {
 public func scpShutdown(timeoutSecs: UInt64)  {try! rustCall() {
     uniffi_scp_ffi_uniffi_fn_func_scp_shutdown(
         FfiConverterUInt64.lower(timeoutSecs),$0
+    )
+}
+}
+/**
+ * Sets the economic policy for a context (§19.3).
+ *
+ * Accepts the economic policy as a JSON string. Validates the JSON against
+ * the `EconomicPolicy` schema before storing. If the existing policy has
+ * `locked: true`, the mutation is rejected — matching the
+ * `ContextManager::execute_set_economic_policy` behaviour in scp-core.
+ *
+ * # Warning
+ *
+ * This is a low-level FFI function that directly overwrites the economic
+ * policy. It does **not** go through governance — no event logging, no
+ * 24-hour notification period, no proposal flow. Governance enforcement
+ * is the SDK / application layer's responsibility.
+ *
+ * # Errors
+ *
+ * - `ScpError::Validation` if the JSON is invalid or does not parse as
+ * `EconomicPolicy`.
+ * - `ScpError::Permission` if the existing economic policy is locked.
+ */
+public func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_set_economic_policy(
+        FfiConverterTypeContextHandle_lower(handle),
+        FfiConverterString.lower(policyJson),$0
     )
 }
 }
@@ -8223,6 +8606,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 44888) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unblock_subscriber() != 7203) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unsubscribe() != 49698) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8298,6 +8684,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_event_log_verify() != 52809) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_get_economic_policy() != 48515) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_governance_execute() != 62327) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8338,6 +8727,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 6072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_set_economic_policy() != 55428) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sync_classify_offline() != 59370) {

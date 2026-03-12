@@ -1552,10 +1552,18 @@ struct RealFFITypeShapeTests {
             sequence: 42,
             contextId: "ctx-test",
             provenance: DataProvenance(
-                sourceDid: "did:dht:z6MkBob",
-                originContextId: "ctx-origin",
+                sourceContext: "ctx-origin",
+                sourceType: .persistent,
+                counterparties: ["did:dht:z6MkBob"],
+                purpose: nil,
+                discoveryMethod: .none,
+                ageSecs: 300,
+                memoryScope: .full,
                 chainDepth: 1,
-                signature: Data(repeating: 0xAB, count: 64)
+                chainPath: nil,
+                paymentAmount: nil,
+                paymentAdapter: nil,
+                paymentReceiptId: nil
             )
         )
         #expect(msg.senderDid == "did:dht:z6MkAlice")
@@ -1563,8 +1571,8 @@ struct RealFFITypeShapeTests {
         #expect(msg.timestamp == 1_700_000_000)
         #expect(msg.sequence == 42)
         #expect(msg.contextId == "ctx-test")
-        #expect(msg.provenance?.sourceDid == "did:dht:z6MkBob")
-        #expect(msg.provenance?.originContextId == "ctx-origin")
+        #expect(msg.provenance?.sourceContext == "ctx-origin")
+        #expect(msg.provenance?.counterparties == ["did:dht:z6MkBob"])
         #expect(msg.provenance?.chainDepth == 1)
     }
 
@@ -1737,14 +1745,29 @@ struct RealFFITypeShapeTests {
     @Test("FFI: DataProvenance struct construction")
     func ffiDataProvenanceConstruction() {
         let prov = DataProvenance(
-            sourceDid: "did:dht:z6MkSource",
-            originContextId: "ctx-origin",
+            sourceContext: "ctx-origin",
+            sourceType: .persistent,
+            counterparties: ["did:dht:z6MkSource", "did:dht:z6MkOther"],
+            purpose: "recipe sharing",
+            discoveryMethod: .sharedContext(contextId: "ctx-shared"),
+            ageSecs: 42,
+            memoryScope: .full,
             chainDepth: 2,
-            signature: Data(repeating: 0xCC, count: 64)
+            chainPath: ["ctx-hop-1", "ctx-hop-2"],
+            paymentAmount: 1000,
+            paymentAdapter: "stripe",
+            paymentReceiptId: Data(repeating: 0xCC, count: 32)
         )
-        #expect(prov.sourceDid == "did:dht:z6MkSource")
-        #expect(prov.originContextId == "ctx-origin")
+        #expect(prov.sourceContext == "ctx-origin")
+        #expect(prov.sourceType == .persistent)
+        #expect(prov.counterparties.count == 2)
+        #expect(prov.purpose == "recipe sharing")
+        #expect(prov.ageSecs == 42)
+        #expect(prov.memoryScope == .full)
         #expect(prov.chainDepth == 2)
-        #expect(prov.signature.count == 64)
+        #expect(prov.chainPath?.count == 2)
+        #expect(prov.paymentAmount == 1000)
+        #expect(prov.paymentAdapter == "stripe")
+        #expect(prov.paymentReceiptId?.count == 32)
     }
 }

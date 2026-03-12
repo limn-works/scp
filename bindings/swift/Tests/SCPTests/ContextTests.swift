@@ -116,6 +116,25 @@ struct ContextTests {
         )
     }
 
+    /// Builds a ``Message`` for use in stream tests.
+    private func makeTestMessage(
+        sender: String = "did:dht:alice",
+        payload: String = "msg",
+        timestamp: UInt64 = 1_000_000,
+        sequence: UInt64 = 1,
+        contextId: String = "test-context-001",
+        provenance: DataProvenance? = nil
+    ) -> Message {
+        Message(
+            senderDid: sender,
+            payload: Data(payload.utf8),
+            timestamp: timestamp,
+            sequence: sequence,
+            contextId: contextId,
+            provenance: provenance
+        )
+    }
+
     // MARK: - Context creation tests
 
     @Test("Context.create returns a context in active state")
@@ -238,25 +257,25 @@ struct ContextTests {
         }
 
         // Push messages through the listener — using UniFFI Message (payload, not content)
-        let message1 = Message(
-            senderDid: "did:dht:alice",
-            payload: Data("msg1".utf8),
-            timestamp: 1_000_000,
-            sequence: 1,
-            contextId: "test-context-001",
-            provenance: nil
-        )
-        let message2 = Message(
-            senderDid: "did:dht:bob",
-            payload: Data("msg2".utf8),
+        let message1 = makeTestMessage(sender: "did:dht:alice", payload: "msg1")
+        let message2 = makeTestMessage(
+            sender: "did:dht:bob",
+            payload: "msg2",
             timestamp: 1_000_001,
             sequence: 2,
-            contextId: "test-context-001",
             provenance: DataProvenance(
-                sourceDid: "did:dht:bob",
-                originContextId: "other-ctx",
+                sourceContext: "other-ctx",
+                sourceType: .persistent,
+                counterparties: ["did:dht:bob"],
+                purpose: nil,
+                discoveryMethod: .none,
+                ageSecs: 0,
+                memoryScope: .full,
                 chainDepth: 1,
-                signature: Data(repeating: 0x00, count: 64)
+                chainPath: nil,
+                paymentAmount: nil,
+                paymentAdapter: nil,
+                paymentReceiptId: nil
             )
         )
 
@@ -273,7 +292,7 @@ struct ContextTests {
         #expect(received[0].senderDid == "did:dht:alice")
         #expect(received[0].sequence == 1)
         #expect(received[1].senderDid == "did:dht:bob")
-        #expect(received[1].provenance?.originContextId == "other-ctx")
+        #expect(received[1].provenance?.sourceContext == "other-ctx")
     }
 
     @Test("messages stream finishes on error")
@@ -299,13 +318,9 @@ struct ContextTests {
         }
 
         // Push one message then an error
-        resolvedListener.onMessage(message: Message(
-            senderDid: "did:dht:alice",
-            payload: Data("before-error".utf8),
-            timestamp: 1_000_000,
-            sequence: 1,
-            contextId: "test-context-001",
-            provenance: nil
+        resolvedListener.onMessage(message: makeTestMessage(
+            sender: "did:dht:alice",
+            payload: "before-error"
         ))
         resolvedListener.onError(error: ScpError.Transport(
             message: "connection lost",
