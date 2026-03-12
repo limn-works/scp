@@ -533,8 +533,26 @@ class TestBroadcast:
 class TestBridgeConnector:
     """Bridge connector operations through real FFI."""
 
+    async def test_register_succeeds_with_separate_governance_did(self):
+        """bridge_register succeeds when governance_did differs from operator_did."""
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        bob = await Identity.create(CustodyType.IN_MEMORY)
+        handle = _scp_core.py_context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        result = _scp_core.bridge_register(
+            handle.context_id, alice.did, bob.did, "discord", "relay"
+        )
+        assert result["status"] == "active"
+        assert result["platform"] == "discord"
+
     async def test_register_rejects_self_approval(self):
-        """bridge_register uses operator_did as governance approver — hits self-approval guard."""
+        """bridge_register fails when governance_did equals operator_did."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         handle = _scp_core.py_context_create(
             alice.did,
@@ -544,11 +562,8 @@ class TestBridgeConnector:
                 "governance": "single_admin",
             },
         )
-        # The FFI bridge hardcodes governance_did = operator_did, which triggers
-        # the "approver cannot be the same as operator" check. This is a known
-        # bug in the bridge (should use context creator DID as approver).
         with pytest.raises(Exception, match="approver cannot be the same as operator"):
-            _scp_core.bridge_register(handle.context_id, alice.did, "discord", "relay")
+            _scp_core.bridge_register(handle.context_id, alice.did, alice.did, "discord", "relay")
 
     async def test_evaluate_trust_native(self):
         # Non-bridged, native transport → NativeNative (3)

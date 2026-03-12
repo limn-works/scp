@@ -128,12 +128,14 @@ struct BridgeTests {
     func bridgeRegisterRoundtrip() throws {
         var receivedContextId: String?
         var receivedOperatorDid: String?
+        var receivedGovernanceDid: String?
         var receivedPlatform: String?
         var receivedMode: String?
 
-        let mockRegister: BridgeConnectorBridge.RegisterFn = { contextId, operatorDid, platform, mode in
+        let mockRegister: BridgeConnectorBridge.RegisterFn = { contextId, operatorDid, governanceDid, platform, mode in
             receivedContextId = contextId
             receivedOperatorDid = operatorDid
+            receivedGovernanceDid = governanceDid
             receivedPlatform = platform
             receivedMode = mode
             return BridgeRegistrationResult(
@@ -149,6 +151,7 @@ struct BridgeTests {
         let result = try bridgeRegister(
             contextId: "ctx-001",
             operatorDid: "did:dht:z6MkOp",
+            governanceDid: "did:dht:z6MkGov",
             platform: "discord",
             mode: "relay",
             registerFn: mockRegister
@@ -156,6 +159,7 @@ struct BridgeTests {
 
         #expect(receivedContextId == "ctx-001")
         #expect(receivedOperatorDid == "did:dht:z6MkOp")
+        #expect(receivedGovernanceDid == "did:dht:z6MkGov")
         #expect(receivedPlatform == "discord")
         #expect(receivedMode == "relay")
         #expect(result.bridgeId == "bridge-new")

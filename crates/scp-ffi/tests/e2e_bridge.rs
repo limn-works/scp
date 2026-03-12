@@ -722,15 +722,36 @@ fn bridge_evaluate_trust_claimed_bridged() {
 }
 
 #[test]
-fn bridge_register_rejects_self_approval() {
-    // py_bridge_register auto-approves using operator_did as governance_did,
-    // but approve_registration rejects self-approval. This test verifies that
-    // constraint is enforced.
+fn bridge_register_succeeds_with_separate_governance_did() {
+    // py_bridge_register now takes a separate governance_did parameter,
+    // so providing distinct operator and governance DIDs should succeed.
     setup();
     Python::with_gil(|py| {
         let r = _scp_core::bridge_connector::py_bridge_register(
             py,
             "ctx-br",
+            "did:key:op",
+            "did:key:gov",
+            "discord",
+            "relay",
+        );
+        assert!(
+            r.is_ok(),
+            "Registration with distinct governance DID should succeed"
+        );
+    });
+}
+
+#[test]
+fn bridge_register_rejects_self_approval() {
+    // approve_registration rejects self-approval. This test verifies that
+    // constraint is enforced when governance_did == operator_did.
+    setup();
+    Python::with_gil(|py| {
+        let r = _scp_core::bridge_connector::py_bridge_register(
+            py,
+            "ctx-br-self",
+            "did:key:op",
             "did:key:op",
             "discord",
             "relay",

@@ -193,6 +193,7 @@ export interface Bridge {
   bridgeRegister(
     contextId: string,
     operatorDid: string,
+    governanceDid: string,
     platform: string,
     mode: BridgeMode,
   ): {

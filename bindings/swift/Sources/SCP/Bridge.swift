@@ -24,6 +24,7 @@ public enum BridgeConnectorBridge {
     public typealias RegisterFn = @Sendable (
         _ contextId: String,
         _ operatorDid: String,
+        _ governanceDid: String,
         _ platform: String,
         _ mode: String
     ) throws -> BridgeRegistrationResult
@@ -47,11 +48,12 @@ public enum BridgeConnectorBridge {
     }
 
     /// Default register function — delegates to UniFFI
-    /// ``bridgeRegister(contextId:operatorDid:platform:mode:)``.
-    public static let defaultRegister: RegisterFn = { contextId, operatorDid, platform, mode in
+    /// ``bridgeRegister(contextId:operatorDid:governanceDid:platform:mode:)``.
+    public static let defaultRegister: RegisterFn = { contextId, operatorDid, governanceDid, platform, mode in
         try bridgeRegister(
             contextId: contextId,
             operatorDid: operatorDid,
+            governanceDid: governanceDid,
             platform: platform,
             mode: mode
         )
@@ -110,12 +112,15 @@ public func evaluateBridgeTrust(
 /// - Parameters:
 ///   - contextId: The context to register the bridge in.
 ///   - operatorDid: DID of the human operator accountable for the bridge.
+///   - governanceDid: DID of the governance authority approving the
+///     registration.  Must differ from `operatorDid` (self-approval is
+///     forbidden per ADR-023).
 ///   - platform: External platform name (e.g., `"discord"`, `"slack"`).
 ///   - mode: Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
 ///     `"cooperative"`.
 ///   - registerFn: Bridge function override for testing.
 /// - Returns: A ``BridgeRegistrationResult`` with the registration details.
-/// - Throws: ``ScpError`` if registration fails.
+/// - Throws: ``ScpError`` if registration fails (including self-approval).
 ///
 /// ## Provenance
 ///
@@ -124,11 +129,12 @@ public func evaluateBridgeTrust(
 public func bridgeRegister(
     contextId: String,
     operatorDid: String,
+    governanceDid: String,
     platform: String,
     mode: String,
     registerFn: BridgeConnectorBridge.RegisterFn = BridgeConnectorBridge.defaultRegister
 ) throws -> BridgeRegistrationResult {
-    try registerFn(contextId, operatorDid, platform, mode)
+    try registerFn(contextId, operatorDid, governanceDid, platform, mode)
 }
 
 /// Creates a shadow identity for an external platform participant.
@@ -192,19 +198,23 @@ public func evaluateBridgeTrust(
 /// - Parameters:
 ///   - contextId: The context to register the bridge in.
 ///   - operatorDid: DID of the human operator accountable for the bridge.
+///   - governanceDid: DID of the governance authority approving the
+///     registration.  Must differ from `operatorDid` (self-approval is
+///     forbidden per ADR-023).
 ///   - platform: External platform name (e.g., `"discord"`, `"slack"`).
 ///   - mode: Bridge mode.
 ///   - registerFn: Bridge function override for testing.
 /// - Returns: A ``BridgeRegistrationResult`` with the registration details.
-/// - Throws: ``ScpError`` if registration fails.
+/// - Throws: ``ScpError`` if registration fails (including self-approval).
 public func bridgeRegister(
     contextId: String,
     operatorDid: String,
+    governanceDid: String,
     platform: String,
     mode: BridgeMode,
     registerFn: BridgeConnectorBridge.RegisterFn = BridgeConnectorBridge.defaultRegister
 ) throws -> BridgeRegistrationResult {
-    try registerFn(contextId, operatorDid, platform, mode.rawValue)
+    try registerFn(contextId, operatorDid, governanceDid, platform, mode.rawValue)
 }
 
 /// Creates a shadow identity using typed ``BridgeMode``.

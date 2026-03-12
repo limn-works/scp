@@ -49,20 +49,25 @@ export interface ShadowIdentity {
  *
  * @param contextId - Context to register the bridge in.
  * @param operatorDid - DID of the human operator.
+ * @param governanceDid - DID of the governance authority approving the
+ *   registration.  Must differ from `operatorDid` (self-approval is
+ *   forbidden per ADR-023).
  * @param platform - External platform name (e.g., `"discord"`).
  * @param mode - Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
  * @returns The bridge registration result.
  * @throws {ValidationError} If mode is not recognized.
+ * @throws {ContextError} If governance DID matches operator DID (self-approval).
  */
 export async function bridgeRegister(
   contextId: string,
   operatorDid: string,
+  governanceDid: string,
   platform: string,
   mode: BridgeMode,
 ): Promise<BridgeRegistration> {
   try {
     const bridge = await getBridge();
-    const raw = bridge.bridgeRegister(contextId, operatorDid, platform, mode);
+    const raw = bridge.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode);
     return {
       bridgeId: raw.bridge_id,
       operatorDid: raw.operator_did,
