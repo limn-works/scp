@@ -19,6 +19,7 @@ testing = ["resolvers"]
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
+serde_json = { workspace = true }
 hex = { workspace = true, optional = true }
 z-base-32 = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

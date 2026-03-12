@@ -44,8 +44,8 @@ use uuid::Uuid;
 use scp_core::context::membership::KeyPackage;
 
 use scp_ffi_common::validate::{
-    validate_capability_uri, validate_did, validate_relay_url, validate_tool_id,
-    validate_tool_name, validate_ucan_token,
+    json_value_type_name, validate_capability_uri, validate_did, validate_relay_url,
+    validate_tool_id, validate_tool_name, validate_ucan_token,
 };
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
@@ -2830,23 +2830,57 @@ pub async fn tool_register(
             drop(state);
 
             let input_schema: serde_json::Value =
-                serde_json::from_str(&definition.input_schema_json)
-                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+                serde_json::from_str(&definition.input_schema_json).map_err(|e| {
+                    ScpError::Validation {
+                        message: format!("invalid input_schema_json: {e}"),
+                        code: "SCP-VALID-7035".to_owned(),
+                    }
+                })?;
+            if !input_schema.is_object() {
+                return Err(ScpError::Validation {
+                    message: format!(
+                        "invalid input_schema_json: expected a JSON object, got {}",
+                        json_value_type_name(&input_schema)
+                    ),
+                    code: "SCP-VALID-7035".to_owned(),
+                });
+            }
             let output_schema: serde_json::Value =
-                serde_json::from_str(&definition.output_schema_json)
-                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+                serde_json::from_str(&definition.output_schema_json).map_err(|e| {
+                    ScpError::Validation {
+                        message: format!("invalid output_schema_json: {e}"),
+                        code: "SCP-VALID-7036".to_owned(),
+                    }
+                })?;
+            if !output_schema.is_object() {
+                return Err(ScpError::Validation {
+                    message: format!(
+                        "invalid output_schema_json: expected a JSON object, got {}",
+                        json_value_type_name(&output_schema)
+                    ),
+                    code: "SCP-VALID-7036".to_owned(),
+                });
+            }
 
-            let test_vectors: Vec<scp_core::context::tools::TestVector> = definition
-                .test_vectors_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok())
-                .unwrap_or_default();
+            let test_vectors: Vec<scp_core::context::tools::TestVector> =
+                match definition.test_vectors_json.as_deref() {
+                    None => Vec::new(),
+                    Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                        message: format!("invalid test_vectors_json: {e}"),
+                        code: "SCP-VALID-7037".to_owned(),
+                    })?,
+                };
 
-            let implementation_hash: [u8; 32] = definition
-                .implementation_hash
-                .as_deref()
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                .unwrap_or([0u8; 32]);
+            let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+                None => [0u8; 32],
+                Some(bytes) => <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+                    message: format!(
+                        "implementation_hash must be exactly 32 bytes, got {}",
+                        bytes.len()
+                    ),
+                    code: "SCP-VALID-7038".to_owned(),
+                })?,
+            };
 
             let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
@@ -8117,5 +8151,286 @@ mod tests {
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "well-known");
         assert!(json["resolution_path"]["source_id"].is_null());
+    }
+
+    // -- tool_register validation: json_value_type_name via shared helper ------
+
+    #[test]
+    fn json_value_type_name_covers_all_variants() {
+        assert_eq!(json_value_type_name(&serde_json::Value::Null), "null");
+        assert_eq!(
+            json_value_type_name(&serde_json::Value::Bool(false)),
+            "boolean"
+        );
+        assert_eq!(json_value_type_name(&serde_json::json!(42)), "number");
+        assert_eq!(json_value_type_name(&serde_json::json!("hi")), "string");
+        assert_eq!(json_value_type_name(&serde_json::json!([])), "array");
+        assert_eq!(json_value_type_name(&serde_json::json!({})), "object");
+    }
+
+    // -- tool_register validation: schema parse errors -------------------------
+
+    #[tokio::test]
+    async fn tool_register_rejects_invalid_input_schema_json() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: "not valid json{{{".to_owned(),
+            output_schema_json: r#"{"type": "object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("invalid input_schema_json must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7035");
+                assert!(
+                    message.contains("invalid input_schema_json"),
+                    "error should reference field name, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_register_rejects_invalid_output_schema_json() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#"{"type": "object"}"#.to_owned(),
+            output_schema_json: "{broken".to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("invalid output_schema_json must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7036");
+                assert!(
+                    message.contains("invalid output_schema_json"),
+                    "error should reference field name, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    // -- tool_register validation: schema type (non-object) --------------------
+
+    #[tokio::test]
+    async fn tool_register_rejects_non_object_input_schema() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#""a string""#.to_owned(),
+            output_schema_json: r#"{"type": "object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("non-object input_schema must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7035");
+                assert!(
+                    message.contains("expected a JSON object"),
+                    "error should mention expected type, got: {message}"
+                );
+                assert!(
+                    message.contains("string"),
+                    "error should mention actual type, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_register_rejects_non_object_output_schema() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#"{"type": "object"}"#.to_owned(),
+            output_schema_json: "[1, 2, 3]".to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("non-object output_schema must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7036");
+                assert!(
+                    message.contains("expected a JSON object"),
+                    "error should mention expected type, got: {message}"
+                );
+                assert!(
+                    message.contains("array"),
+                    "error should mention actual type, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    // -- tool_register validation: test vectors --------------------------------
+
+    #[tokio::test]
+    async fn tool_register_rejects_invalid_test_vectors_json() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#"{"type": "object"}"#.to_owned(),
+            output_schema_json: r#"{"type": "object"}"#.to_owned(),
+            test_vectors_json: Some(r#"{"not": "an array"}"#.to_owned()),
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("non-array test_vectors_json must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7037");
+                assert!(
+                    message.contains("invalid test_vectors_json"),
+                    "error should reference field name, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_register_rejects_test_vectors_missing_fields() {
+        let handle = test_handle();
+        // Array of objects missing required fields for TestVector deserialization.
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#"{"type": "object"}"#.to_owned(),
+            output_schema_json: r#"{"type": "object"}"#.to_owned(),
+            test_vectors_json: Some(r#"[{"bad": "entry"}]"#.to_owned()),
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("test vectors with missing fields must be rejected");
+        match err {
+            ScpError::Validation { ref code, .. } => {
+                assert_eq!(code, "SCP-VALID-7037");
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    // -- tool_register validation: implementation hash -------------------------
+
+    #[tokio::test]
+    async fn tool_register_rejects_implementation_hash_wrong_length() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#"{"type": "object"}"#.to_owned(),
+            output_schema_json: r#"{"type": "object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: Some(vec![0u8; 16]), // 16 bytes, not 32
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("implementation_hash with wrong length must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7038");
+                assert!(
+                    message.contains("32 bytes"),
+                    "error should mention expected length, got: {message}"
+                );
+                assert!(
+                    message.contains("16"),
+                    "error should report actual length, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_register_rejects_implementation_hash_too_long() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "test-tool".to_owned(),
+            description: "desc".to_owned(),
+            input_schema_json: r#"{"type": "object"}"#.to_owned(),
+            output_schema_json: r#"{"type": "object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: Some(vec![0u8; 64]), // 64 bytes, not 32
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let err = tool_register(handle, def)
+            .await
+            .expect_err("implementation_hash with wrong length must be rejected");
+        match err {
+            ScpError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, "SCP-VALID-7038");
+                assert!(
+                    message.contains("32 bytes"),
+                    "error should mention expected length, got: {message}"
+                );
+                assert!(
+                    message.contains("64"),
+                    "error should report actual length, got: {message}"
+                );
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
     }
 }
