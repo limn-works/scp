@@ -144,7 +144,7 @@ class EventLogConformanceTest {
             runTest(testDispatcher) {
                 @Suppress("MaxLineLength")
                 stubBindings.eventLogCheckpointResult =
-                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1710000000,"signature":"c2lnbmVk"}"""
                 val result = dispatcher.dispatch(
                     "event_log_checkpoint",
                     mapOf(
@@ -155,6 +155,8 @@ class EventLogConformanceTest {
                 )
                 assertTrue(result["checkpoint"]?.contains("merkle_root") == true)
                 assertTrue(result["checkpoint"]?.contains("ctx-1") == true)
+                assertTrue(result["checkpoint"]?.contains("timestamp") == true)
+                assertTrue(result["checkpoint"]?.contains("signature") == true)
             }
 
         @Test
@@ -178,10 +180,12 @@ class EventLogConformanceTest {
             runTest(testDispatcher) {
                 @Suppress("MaxLineLength")
                 stubBindings.eventLogCheckpointResult =
-                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1710000000,"signature":"c2lnbmVk"}"""
                 val result = bridge.infra.eventLogCheckpoint(1L, 2L, 5L)
                 assertTrue(result.contains("merkle_root"))
                 assertTrue(result.contains("event_count"))
+                assertTrue(result.contains("timestamp"))
+                assertTrue(result.contains("signature"))
             }
     }
 

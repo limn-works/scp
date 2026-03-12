@@ -70,7 +70,7 @@ class ConformanceStubBindings : NativeBindings {
     var eventLogVerifyError: BridgeException? = null
     @Suppress("MaxLineLength")
     var eventLogCheckpointResult: String =
-        """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
+        """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1710000000,"signature":"c2lnbmVk"}"""
     var eventLogCheckpointError: BridgeException? = null
 
     var transportConnectResult: Long = 99L
@@ -318,7 +318,7 @@ class ConformanceStubBindings : NativeBindings {
         eventLogVerifyError = null
         @Suppress("MaxLineLength")
         eventLogCheckpointResult =
-            """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
+            """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1710000000,"signature":"c2lnbmVk"}"""
         eventLogCheckpointError = null
         transportConnectResult = 99L
         transportConnectError = null
