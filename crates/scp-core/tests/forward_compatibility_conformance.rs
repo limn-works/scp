@@ -8,7 +8,8 @@
 //! §13.9 item 3: "Ignore unknown fields in all deserialized structures."
 //! §13.9 item 5: "Preserve unknown fields when forwarding (relays only)."
 //!
-//! The `OuterEnvelope` additionally tests preservation via its `extensions` `HashMap`.
+//! The `OuterEnvelope` and `InnerEnvelope` additionally test preservation via their
+//! `extensions` `HashMap`.
 
 #![allow(
     clippy::unwrap_used,
@@ -204,16 +205,16 @@ mod outer_envelope {
 }
 
 // ===========================================================================
-// §13.5.1 — InnerEnvelope: unknown fields MUST be ignored
+// §13.5.1 — InnerEnvelope: unknown fields MUST be preserved
 // ===========================================================================
 
 mod inner_envelope {
     use super::*;
     use scp_core::envelope::inner::InnerEnvelope;
 
-    /// §13.5.1, §13.9 item 3: `InnerEnvelope` MUST ignore unknown fields.
+    /// §13.5.1, §13.9 item 5: `InnerEnvelope` MUST preserve unknown fields.
     #[test]
-    fn unknown_fields_are_ignored_msgpack() {
+    fn unknown_fields_are_preserved_msgpack() {
         // Build a valid InnerEnvelope, serialize to msgpack, inject extra fields.
         let inner = InnerEnvelope {
             version: 256,
@@ -249,9 +250,58 @@ mod inner_envelope {
 
         // Unknown fields must be preserved in extensions (#863).
         assert!(
-            !decoded.extensions.is_empty(),
-            "unknown fields must be preserved in extensions, got empty"
+            decoded.extensions.contains_key("v2_routing_priority"),
+            "extensions must contain v2_routing_priority"
         );
+        assert!(
+            decoded.extensions.contains_key("future_capability_flags"),
+            "extensions must contain future_capability_flags"
+        );
+        assert!(
+            decoded.extensions.contains_key("scp_1_2_metadata"),
+            "extensions must contain scp_1_2_metadata"
+        );
+    }
+
+    /// §13.9 item 5: Unknown fields in `InnerEnvelope` MUST survive roundtrip.
+    /// Verify that serialize -> deserialize -> serialize -> deserialize preserves extensions.
+    #[test]
+    fn unknown_fields_survive_roundtrip() {
+        let inner = InnerEnvelope {
+            version: 256,
+            context_id: "ctx-roundtrip".to_string(),
+            sender_did: "did:dht:roundtrip".to_string(),
+            epoch: 1,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            message_type: scp_core::envelope::inner::MessageType::Content,
+            payload_hash: [0xAA; 32],
+            payload: vec![0x01, 0x02],
+            provenance: None,
+            provenance_hash: [0xBB; 32],
+            signing_key_id: scp_identity::SigningKeyId::Active,
+            signature: [0xCC; 64],
+            extensions: std::collections::HashMap::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&inner).unwrap();
+        let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
+        let decoded: InnerEnvelope = rmp_serde::from_slice(&with_extras).unwrap();
+
+        // Re-serialize and re-deserialize -- extensions must survive
+        let re_bytes = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: InnerEnvelope = rmp_serde::from_slice(&re_bytes).unwrap();
+        assert_eq!(
+            re_decoded.extensions.len(),
+            decoded.extensions.len(),
+            "unknown fields must survive roundtrip"
+        );
+        for key in decoded.extensions.keys() {
+            assert!(
+                re_decoded.extensions.contains_key(key),
+                "extension key '{key}' lost during roundtrip"
+            );
+        }
     }
 }
 
