@@ -880,7 +880,7 @@ impl BroadcastContext {
 
         if !author.block_list.remove(unblocked_did) {
             return Err(ContextError::InvalidState(format!(
-                "subscriber not blocked: {unblocked_did}"
+                "subscriber {unblocked_did} not blocked by author {author_did}"
             )));
         }
 
