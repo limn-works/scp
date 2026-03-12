@@ -60,7 +60,7 @@ pub struct WasmContextHandle {
     ttl_seconds: Option<u64>,
     promotion_policy: Option<String>,
     governance: String,
-    member_count: u64,
+    member_count: u32,
     economic_policy: Option<String>,
     /// Minimum protocol version as `[major, minor]`, or `None` if unset.
     min_protocol_version: Option<Vec<u8>>,
@@ -124,7 +124,7 @@ impl WasmContextHandle {
 
     #[must_use]
     #[wasm_bindgen(getter, js_name = "memberCount")]
-    pub fn member_count(&self) -> u64 {
+    pub fn member_count(&self) -> u32 {
         self.member_count
     }
 
@@ -397,11 +397,15 @@ pub fn context_subscribe(
 ///
 /// Delegates to `WasmContextManager::member_count`.
 #[wasm_bindgen]
-pub fn context_member_count(handle: &WasmContextHandle) -> Option<u64> {
+pub fn context_member_count(handle: &WasmContextHandle) -> Option<u32> {
     let context_id = handle.context_id();
-    with_manager(|mgr| Ok(mgr.member_count(&context_id).map(|c| c as u64)))
-        .ok()
-        .flatten()
+    with_manager(|mgr| {
+        Ok(mgr
+            .member_count(&context_id)
+            .map(|c| u32::try_from(c).unwrap_or(u32::MAX)))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Returns `true` if the DID is a member of the context.
