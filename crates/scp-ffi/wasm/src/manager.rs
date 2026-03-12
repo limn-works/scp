@@ -4871,6 +4871,8 @@ mod tests {
             threshold_value: 0,
             tool_interfaces: Vec::new(),
             governance_freeze: false,
+            pending_proposals: HashMap::new(),
+            resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
         };
