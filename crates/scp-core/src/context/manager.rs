@@ -4713,13 +4713,12 @@ impl ContextManager {
                 // proposal ID and rejecting member DIDs.
                 let rejecting_members: Vec<&str> = missing.clone();
                 let rejected_payload = serde_json::json!({
-                    "event": "TtlExtensionRejected",
+                    "event": "TTLExtensionRejected",
                     "proposal_id": hex::encode(proposal_id),
                     "rejecting_members": rejecting_members,
                 });
-                let _ = self
-                    .event_log
-                    .append_context_event(&context_id_bytes, &rejected_payload.to_string());
+                self.event_log
+                    .append_context_event(&context_id_bytes, &rejected_payload.to_string())?;
                 return Err(ContextError::PermissionDenied(format!(
                     "TTL extension requires unanimous consent — {} of {} members have not approved",
                     missing.len(),
@@ -4780,7 +4779,7 @@ impl ContextManager {
         // containing old deadline, new deadline, proposal ID, and
         // consenting members.
         let extended_payload = serde_json::json!({
-            "event": "TtlExtended",
+            "event": "TTLExtended",
             "old_deadline_unix": old_deadline,
             "new_deadline_unix": new_deadline,
             "proposal_id": hex::encode(proposal_id),
