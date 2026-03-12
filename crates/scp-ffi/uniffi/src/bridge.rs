@@ -764,20 +764,162 @@ pub struct Message {
     pub provenance: Option<DataProvenance>,
 }
 
-/// Provenance metadata for cross-context data transfer.
+/// Current data availability status of the source context (spec §24.2.2).
 ///
-/// Every message or tool output that crosses a context boundary carries
-/// provenance metadata tracing it back to its origin. See spec §12 (Provenance).
+/// Reflects operational state, not creation-time memory scope. A persistent
+/// context that closes becomes `Ephemeral` or `Summary`.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum SourceType {
+    /// Source context is still open and verifiable.
+    Persistent,
+    /// Source context has closed and keys have been destroyed.
+    Ephemeral,
+    /// Source context has closed and a verified summary is available.
+    Summary,
+}
+
+/// How the data source was discovered by the receiving party (spec §24.2.3).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum DiscoveryMethod {
+    /// Source was discovered through shared membership in the given context.
+    SharedContext { context_id: String },
+    /// Source was discovered through a discovery registry context.
+    Registry { context_id: String },
+    /// No protocol-level discovery path.
+    None,
+}
+
+/// Provenance metadata for cross-context data transfer (spec §24.2.1).
+///
+/// Attached automatically by the protocol when data crosses context boundaries.
+/// Records the full lineage of a piece of data: where it came from, who was
+/// involved, how it was discovered, and how many context hops it has traversed.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DataProvenance {
-    /// DID of the original data source.
-    pub source_did: String,
-    /// Context ID where this data originated.
-    pub origin_context_id: String,
-    /// Depth of cross-context hops (0 = direct, 1 = one hop, etc.).
-    pub chain_depth: u32,
-    /// Ed25519 signature bytes over the provenance record.
-    pub signature: Vec<u8>,
+    /// The context from which this data originated.
+    pub source_context: String,
+    /// Current data availability status of the source context.
+    pub source_type: SourceType,
+    /// DIDs of the parties involved in the source context at the time of
+    /// data flow.
+    pub counterparties: Vec<String>,
+    /// Optional human-readable purpose description for this data flow.
+    pub purpose: Option<String>,
+    /// How the data source was discovered.
+    pub discovery_method: DiscoveryMethod,
+    /// Age of the data in seconds at the time provenance was attached.
+    pub age_secs: u64,
+    /// Memory scope of the source context.
+    pub memory_scope: MemoryScope,
+    /// Number of cross-context hops this data has traversed (0 = direct).
+    pub chain_depth: u8,
+    /// Ordered list of intermediary context IDs when `chain_depth > 0`.
+    pub chain_path: Option<Vec<String>>,
+    /// Cost of producing this data in smallest currency unit, if any (spec §19.6).
+    pub payment_amount: Option<u64>,
+    /// Payment adapter used, if any (spec §19.6).
+    pub payment_adapter: Option<String>,
+    /// Receipt ID for verification of the payment (32 bytes), if any.
+    pub payment_receipt_id: Option<Vec<u8>>,
+}
+
+impl DataProvenance {
+    /// Converts an scp-core `DataProvenance` into the `UniFFI` bridge type.
+    pub fn from_core(core: &scp_core::provenance::DataProvenance) -> Self {
+        let source_type = match core.source_type {
+            scp_core::provenance::SourceType::Persistent => SourceType::Persistent,
+            scp_core::provenance::SourceType::Ephemeral => SourceType::Ephemeral,
+            scp_core::provenance::SourceType::Summary => SourceType::Summary,
+        };
+
+        let discovery_method = match &core.discovery_method {
+            scp_core::provenance::DiscoveryMethod::SharedContext(ctx) => {
+                DiscoveryMethod::SharedContext {
+                    context_id: ctx.clone(),
+                }
+            }
+            scp_core::provenance::DiscoveryMethod::Registry(ctx) => DiscoveryMethod::Registry {
+                context_id: ctx.clone(),
+            },
+            scp_core::provenance::DiscoveryMethod::None => DiscoveryMethod::None,
+        };
+
+        let memory_scope = match core.memory_scope {
+            scp_core::context::MemoryScope::Ephemeral => MemoryScope::Ephemeral,
+            scp_core::context::MemoryScope::Summary => MemoryScope::Summary,
+            scp_core::context::MemoryScope::Full => MemoryScope::Full,
+        };
+
+        Self {
+            source_context: core.source_context.clone(),
+            source_type,
+            counterparties: core
+                .counterparties
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            purpose: core.purpose.clone(),
+            discovery_method,
+            age_secs: core.age.as_secs(),
+            memory_scope,
+            chain_depth: core.chain_depth,
+            chain_path: core.chain_path.clone(),
+            payment_amount: core.payment_amount.map(|a| a.0),
+            payment_adapter: core.payment_adapter.clone(),
+            payment_receipt_id: core.payment_receipt_id.map(|r| r.to_vec()),
+        }
+    }
+
+    /// Converts this `UniFFI` bridge type into an scp-core `DataProvenance`.
+    pub fn to_core(&self) -> scp_core::provenance::DataProvenance {
+        let source_type = match self.source_type {
+            SourceType::Persistent => scp_core::provenance::SourceType::Persistent,
+            SourceType::Ephemeral => scp_core::provenance::SourceType::Ephemeral,
+            SourceType::Summary => scp_core::provenance::SourceType::Summary,
+        };
+
+        let discovery_method = match &self.discovery_method {
+            DiscoveryMethod::SharedContext { context_id } => {
+                scp_core::provenance::DiscoveryMethod::SharedContext(context_id.clone())
+            }
+            DiscoveryMethod::Registry { context_id } => {
+                scp_core::provenance::DiscoveryMethod::Registry(context_id.clone())
+            }
+            DiscoveryMethod::None => scp_core::provenance::DiscoveryMethod::None,
+        };
+
+        let memory_scope = match self.memory_scope {
+            MemoryScope::Ephemeral => scp_core::context::MemoryScope::Ephemeral,
+            MemoryScope::Summary => scp_core::context::MemoryScope::Summary,
+            MemoryScope::Full => scp_core::context::MemoryScope::Full,
+        };
+
+        let payment_receipt_id: Option<[u8; 32]> = self.payment_receipt_id.as_ref().and_then(|v| {
+            let arr: Result<[u8; 32], _> = v.as_slice().try_into();
+            arr.ok()
+        });
+
+        scp_core::provenance::DataProvenance {
+            source_context: self.source_context.clone(),
+            source_type,
+            counterparties: self
+                .counterparties
+                .iter()
+                .map(|s| scp_identity::DID::from(s.as_str()))
+                .collect(),
+            purpose: self.purpose.clone(),
+            discovery_method,
+            age: std::time::Duration::from_secs(self.age_secs),
+            memory_scope,
+            chain_depth: self.chain_depth,
+            chain_path: self.chain_path.clone(),
+            payment_amount: self
+                .payment_amount
+                .map(scp_core::economy::types::Amount::new),
+            payment_adapter: self.payment_adapter.clone(),
+            payment_receipt_id,
+        }
+    }
 }
 
 /// Tool definition for registration in a context.
@@ -6757,5 +6899,128 @@ mod tests {
         // Locked policy should be unchanged.
         let result = get_economic_policy(handle).unwrap();
         assert_eq!(result.as_deref(), Some(locked_json));
+    }
+
+    #[test]
+    fn data_provenance_from_core_roundtrip() {
+        let core_prov = scp_core::provenance::DataProvenance {
+            source_context: "ctx-abc".to_string(),
+            source_type: scp_core::provenance::SourceType::Persistent,
+            counterparties: vec![
+                scp_identity::DID::from("did:dht:z6MkAlice"),
+                scp_identity::DID::from("did:dht:z6MkBob"),
+            ],
+            purpose: Some("sharing".to_string()),
+            discovery_method: scp_core::provenance::DiscoveryMethod::SharedContext(
+                "ctx-shared".to_string(),
+            ),
+            age: std::time::Duration::from_secs(42),
+            memory_scope: scp_core::context::MemoryScope::Full,
+            chain_depth: 2,
+            chain_path: Some(vec!["ctx-hop1".to_string(), "ctx-hop2".to_string()]),
+            payment_amount: Some(scp_core::economy::types::Amount::new(1000)),
+            payment_adapter: Some("stripe".to_string()),
+            payment_receipt_id: Some([0xCC; 32]),
+        };
+
+        let ffi = DataProvenance::from_core(&core_prov);
+        assert_eq!(ffi.source_context, "ctx-abc");
+        assert!(matches!(ffi.source_type, SourceType::Persistent));
+        assert_eq!(ffi.counterparties.len(), 2);
+        assert_eq!(ffi.purpose.as_deref(), Some("sharing"));
+        assert!(matches!(
+            ffi.discovery_method,
+            DiscoveryMethod::SharedContext { .. }
+        ));
+        assert_eq!(ffi.age_secs, 42);
+        assert!(matches!(ffi.memory_scope, MemoryScope::Full));
+        assert_eq!(ffi.chain_depth, 2);
+        assert_eq!(ffi.chain_path.as_ref().map(Vec::len), Some(2));
+        assert_eq!(ffi.payment_amount, Some(1000));
+        assert_eq!(ffi.payment_adapter.as_deref(), Some("stripe"));
+        assert_eq!(ffi.payment_receipt_id.as_ref().map(Vec::len), Some(32));
+
+        // Round-trip back to core
+        let roundtripped = ffi.to_core();
+        assert_eq!(roundtripped.source_context, core_prov.source_context);
+        assert_eq!(roundtripped.source_type, core_prov.source_type);
+        assert_eq!(roundtripped.counterparties.len(), 2);
+        assert_eq!(roundtripped.purpose, core_prov.purpose);
+        assert_eq!(roundtripped.age.as_secs(), 42);
+        assert_eq!(roundtripped.memory_scope, core_prov.memory_scope);
+        assert_eq!(roundtripped.chain_depth, core_prov.chain_depth);
+        assert_eq!(roundtripped.chain_path, core_prov.chain_path);
+        assert_eq!(roundtripped.payment_amount, core_prov.payment_amount);
+        assert_eq!(roundtripped.payment_adapter, core_prov.payment_adapter);
+        assert_eq!(
+            roundtripped.payment_receipt_id,
+            core_prov.payment_receipt_id
+        );
+    }
+
+    #[test]
+    fn data_provenance_from_core_ephemeral_no_payment() {
+        let core_prov = scp_core::provenance::DataProvenance {
+            source_context: "ctx-eph".to_string(),
+            source_type: scp_core::provenance::SourceType::Ephemeral,
+            counterparties: vec![],
+            purpose: None,
+            discovery_method: scp_core::provenance::DiscoveryMethod::None,
+            age: std::time::Duration::from_secs(0),
+            memory_scope: scp_core::context::MemoryScope::Ephemeral,
+            chain_depth: 0,
+            chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
+        };
+
+        let ffi = DataProvenance::from_core(&core_prov);
+        assert!(matches!(ffi.source_type, SourceType::Ephemeral));
+        assert!(ffi.counterparties.is_empty());
+        assert!(ffi.purpose.is_none());
+        assert!(matches!(ffi.discovery_method, DiscoveryMethod::None));
+        assert!(matches!(ffi.memory_scope, MemoryScope::Ephemeral));
+        assert_eq!(ffi.chain_depth, 0);
+        assert!(ffi.chain_path.is_none());
+        assert!(ffi.payment_amount.is_none());
+    }
+
+    #[test]
+    fn data_provenance_from_core_summary_registry() {
+        let core_prov = scp_core::provenance::DataProvenance {
+            source_context: "ctx-sum".to_string(),
+            source_type: scp_core::provenance::SourceType::Summary,
+            counterparties: vec![scp_identity::DID::from("did:dht:z6MkCharlie")],
+            purpose: None,
+            discovery_method: scp_core::provenance::DiscoveryMethod::Registry(
+                "ctx-reg".to_string(),
+            ),
+            age: std::time::Duration::from_secs(600),
+            memory_scope: scp_core::context::MemoryScope::Summary,
+            chain_depth: 1,
+            chain_path: Some(vec!["ctx-mid".to_string()]),
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
+        };
+
+        let ffi = DataProvenance::from_core(&core_prov);
+        assert!(matches!(ffi.source_type, SourceType::Summary));
+        assert!(matches!(
+            ffi.discovery_method,
+            DiscoveryMethod::Registry { .. }
+        ));
+        assert!(matches!(ffi.memory_scope, MemoryScope::Summary));
+
+        let roundtripped = ffi.to_core();
+        assert_eq!(
+            roundtripped.source_type,
+            scp_core::provenance::SourceType::Summary
+        );
+        assert!(matches!(
+            roundtripped.discovery_method,
+            scp_core::provenance::DiscoveryMethod::Registry(_)
+        ));
     }
 }

@@ -253,10 +253,18 @@ struct ContextTests {
             sequence: 2,
             contextId: "test-context-001",
             provenance: DataProvenance(
-                sourceDid: "did:dht:bob",
-                originContextId: "other-ctx",
+                sourceContext: "other-ctx",
+                sourceType: .persistent,
+                counterparties: ["did:dht:bob"],
+                purpose: nil,
+                discoveryMethod: .none,
+                ageSecs: 0,
+                memoryScope: .full,
                 chainDepth: 1,
-                signature: Data(repeating: 0x00, count: 64)
+                chainPath: nil,
+                paymentAmount: nil,
+                paymentAdapter: nil,
+                paymentReceiptId: nil
             )
         )
 
@@ -273,7 +281,7 @@ struct ContextTests {
         #expect(received[0].senderDid == "did:dht:alice")
         #expect(received[0].sequence == 1)
         #expect(received[1].senderDid == "did:dht:bob")
-        #expect(received[1].provenance?.originContextId == "other-ctx")
+        #expect(received[1].provenance?.sourceContext == "other-ctx")
     }
 
     @Test("messages stream finishes on error")
