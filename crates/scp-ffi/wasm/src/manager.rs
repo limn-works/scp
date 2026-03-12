@@ -2562,7 +2562,7 @@ impl WasmContextManager {
         description: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
-        let registered_at = crate::time::now_ms_u64();
+        let registered_at = crate::time::now_secs();
         let reg = ToolRegistration {
             tool_id: tool_id.to_owned(),
             name: name.to_owned(),

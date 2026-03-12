@@ -261,9 +261,9 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
     };
 
     // Use the hardened time source (captured Date.now) for the registration
-    // timestamp. std::time::SystemTime is not available on wasm32 — see
-    // crate::time module docs.
-    let registered_at = crate::time::now_ms_u64();
+    // timestamp in seconds per spec §5.4.1. std::time::SystemTime is not
+    // available on wasm32 — see crate::time module docs.
+    let registered_at = crate::time::now_secs();
 
     Ok((
         implementation_hash,
