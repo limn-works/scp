@@ -4779,10 +4779,11 @@ pub async fn governance_execute(
 ) -> Result<String, ScpError> {
     let context_id = handle.context_id.clone();
 
-    let result = runtime()
+    let (result, action_name) = runtime()
         .spawn(async move {
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
+            let action_name = proposal.action.variant_name();
             let manager = crate::runtime::context_manager();
             let result = manager
                 .execute_governance_action(&context_id, &proposal)
@@ -4820,13 +4821,13 @@ pub async fn governance_execute(
                 GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
                 GovernanceActionResult::Executed => "Executed",
             };
-            Ok(result_str.to_owned())
+            Ok::<_, ScpError>((result_str.to_owned(), action_name))
         })
         .await
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance execution: {e}"),
             code: "SCP-CTX-2032".to_owned(),
-        })?;
+        })??;
 
     // Re-sync role state from ContextManager after governance execution (#796).
     // Governance actions may modify roles/membership; without this sync the
@@ -4834,11 +4835,13 @@ pub async fn governance_execute(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance execution: {e}"
+            action = action_name,
+            error = %e,
+            "failed to sync role state after governance execution"
         );
     }
 
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -4931,10 +4934,11 @@ pub async fn governance_propose(
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
 
-    let result = runtime()
+    let (result, action_name) = runtime()
         .spawn(async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
+            let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
             let manager = crate::runtime::context_manager();
             let outcome = manager
@@ -4949,22 +4953,24 @@ pub async fn governance_propose(
                 "status": format!("{:?}", outcome.status),
                 "execution_result": result_str,
             });
-            Ok(response.to_string())
+            Ok::<_, ScpError>((response.to_string(), action_name))
         })
         .await
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance proposal: {e}"),
             code: "SCP-CTX-2041".to_owned(),
-        })?;
+        })??;
 
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance proposal: {e}"
+            action = action_name,
+            error = %e,
+            "failed to sync role state after governance proposal"
         );
     }
 
-    result
+    Ok(result)
 }
 
 /// Casts an approval vote on a pending governance proposal.
@@ -5004,7 +5010,8 @@ pub async fn governance_approve(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance approval: {e}"
+            error = %e,
+            "failed to sync role state after governance approval"
         );
     }
 
@@ -5048,7 +5055,8 @@ pub async fn governance_reject(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance rejection: {e}"
+            error = %e,
+            "failed to sync role state after governance rejection"
         );
     }
 
@@ -5092,7 +5100,8 @@ pub async fn governance_withdraw(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance withdrawal: {e}"
+            error = %e,
+            "failed to sync role state after governance withdrawal"
         );
     }
 
