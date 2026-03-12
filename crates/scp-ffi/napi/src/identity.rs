@@ -9,7 +9,7 @@
 //! - [`identity_load`] — Loads an existing identity by DID string.
 //! - [`identity_resolve`] — Resolves a DID to its document.
 //!
-//! Identity migration (spec §9.6):
+//! Identity migration (spec §9.12):
 //!
 //! - [`NapiIdentity::migrate`] — Performs Layer 2 DID rotation, creating a new
 //!   DID with a pre-rotation key while preserving identity continuity.
@@ -481,7 +481,7 @@ impl NapiIdentity {
         }
     }
 
-    /// Migrates this identity to a new DID (Layer 2 DID rotation, spec §9.6).
+    /// Migrates this identity to a new DID (Layer 2 DID rotation, spec §9.12).
     ///
     /// Creates a new DID with a pre-rotation key, preserving identity
     /// continuity. The old DID's key material is removed from the registry
@@ -504,7 +504,7 @@ impl NapiIdentity {
     /// - `SCP-IDENT-1009`: Key generation or DHT publishing failed during
     ///   migration.
     ///
-    /// See ADR-003 acceptance criterion 4b, spec §9.6, and SCP-214 criterion 10.
+    /// See ADR-003 acceptance criterion 4b, spec §9.12, and SCP-214 criterion 10.
     #[napi]
     pub async fn migrate(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
@@ -522,12 +522,14 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
-            // Generate a fresh pre-rotation key for the migration.
-            // In a full implementation, the pre-rotation key would have been
-            // generated and stored during identity creation. The custody
-            // provider already holds the pre-rotation key from the original
-            // create call. For now, generate a fresh one — migrate_identity
-            // uses it as the new Identity Key.
+            // Spec §9.12 (Compromise Recovery Protocol) requires using the
+            // pre-rotation key from cold storage — the pre-rotation commitment
+            // in the old DID document proves the legitimate owner is rotating,
+            // not an attacker. In-memory custody does not persist keys across
+            // sessions, so no cold storage key exists. Generate a fresh
+            // pre-rotation key instead; `migrate_identity` uses it as the new
+            // Identity Key. Production custody providers (platform/HSM) must
+            // retrieve the original pre-rotation key from durable storage.
             let pre_rotation_key = custody
                 .0
                 .generate_keypair(scp_platform::traits::KeyType::Ed25519)
