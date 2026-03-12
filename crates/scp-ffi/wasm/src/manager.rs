@@ -3339,7 +3339,9 @@ impl WasmContextManager {
 
             if !block_list.remove(subscriber_did) {
                 return Err(ScpWasmError::Context {
-                    message: format!("subscriber not blocked: {subscriber_did}"),
+                    message: format!(
+                        "subscriber {subscriber_did} not blocked by author {unblocker_did}"
+                    ),
                     code: "SCP-CTX-2001".to_owned(),
                 });
             }
