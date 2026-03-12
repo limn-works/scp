@@ -1528,6 +1528,9 @@ mod tests {
 
     #[test]
     fn address_resolve_via_petname() {
+        // Initialize the tokio runtime required by PyO3 bridge functions
+        crate::init_runtime().ok();
+
         let owner = "did:dht:zTestResolver1";
         py_petname_set(owner, "did:dht:zAlice", "alice").unwrap();
 
