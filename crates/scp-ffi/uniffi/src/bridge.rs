@@ -2792,6 +2792,18 @@ pub async fn context_subscribe(
 // See ADR-021 acceptance criterion 4.
 // ---------------------------------------------------------------------------
 
+/// Returns a human-readable type name for a JSON value (for error messages).
+const fn json_value_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Registers a tool in an SCP context.
 ///
 /// # Arguments
@@ -2836,6 +2848,15 @@ pub async fn tool_register(
                         code: "SCP-VALID-7035".to_owned(),
                     }
                 })?;
+            if !input_schema.is_object() {
+                return Err(ScpError::Validation {
+                    message: format!(
+                        "invalid input_schema_json: expected a JSON object, got {}",
+                        json_value_type_name(&input_schema)
+                    ),
+                    code: "SCP-VALID-7035".to_owned(),
+                });
+            }
             let output_schema: serde_json::Value =
                 serde_json::from_str(&definition.output_schema_json).map_err(|e| {
                     ScpError::Validation {
@@ -2843,6 +2864,15 @@ pub async fn tool_register(
                         code: "SCP-VALID-7036".to_owned(),
                     }
                 })?;
+            if !output_schema.is_object() {
+                return Err(ScpError::Validation {
+                    message: format!(
+                        "invalid output_schema_json: expected a JSON object, got {}",
+                        json_value_type_name(&output_schema)
+                    ),
+                    code: "SCP-VALID-7036".to_owned(),
+                });
+            }
 
             let test_vectors: Vec<scp_core::context::tools::TestVector> =
                 match definition.test_vectors_json.as_deref() {

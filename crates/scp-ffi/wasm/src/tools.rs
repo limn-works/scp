@@ -166,25 +166,53 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         let operator_did = def["operatorDid"].as_str().unwrap_or("").to_owned();
 
         // Parse test vectors.
-        let test_vectors: Vec<runtime::TestVector> = def
-            .get("testVectors")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        Some(runtime::TestVector {
-                            input: v.get("input")?.clone(),
-                            expected_output: v.get("expectedOutput")?.clone(),
-                            description: v
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let test_vectors: Vec<runtime::TestVector> = match def.get("testVectors") {
+            None => Vec::new(),
+            Some(tv_value) => {
+                let arr = tv_value.as_array().ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "invalid 'testVectors': expected an array, got {}",
+                            json_value_type_name(tv_value)
+                        ),
+                        code: "SCP-VALID-7037".to_owned(),
+                    }
+                    .into_js()
+                })?;
+
+                let mut vectors = Vec::with_capacity(arr.len());
+                for (i, entry) in arr.iter().enumerate() {
+                    let input = entry.get("input").ok_or_else(|| {
+                        ScpWasmError::Validation {
+                            message: format!(
+                                "test vector at index {i} is missing required 'input' field"
+                            ),
+                            code: "SCP-VALID-7037".to_owned(),
+                        }
+                        .into_js()
+                    })?;
+                    let expected_output = entry.get("expectedOutput").ok_or_else(|| {
+                        ScpWasmError::Validation {
+                            message: format!(
+                                "test vector at index {i} is missing required 'expectedOutput' field"
+                            ),
+                            code: "SCP-VALID-7037".to_owned(),
+                        }
+                        .into_js()
+                    })?;
+                    vectors.push(runtime::TestVector {
+                        input: input.clone(),
+                        expected_output: expected_output.clone(),
+                        description: entry
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                    });
+                }
+                vectors
+            }
+        };
 
         let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
