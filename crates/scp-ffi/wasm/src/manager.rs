@@ -442,17 +442,24 @@ struct WasmToolSession {
     state: serde_json::Value,
     /// Creation timestamp (milliseconds since epoch).
     created_at_ms: f64,
-    /// TTL in milliseconds.
-    ttl_ms: f64,
+    /// Optional TTL in milliseconds. `None` means the session persists for
+    /// the lifetime of the context (spec section 6.2.1).
+    ttl_ms: Option<f64>,
     /// Number of invocations.
     call_count: u64,
 }
 
 impl WasmToolSession {
     /// Returns `true` if this session has expired.
+    ///
+    /// Sessions with `ttl_ms: None` never expire (they persist for the
+    /// lifetime of the context, per spec section 6.2.1).
     fn is_expired(&self) -> bool {
+        let Some(ttl) = self.ttl_ms else {
+            return false;
+        };
         let now = crate::time::now_ms();
-        (now - self.created_at_ms) >= self.ttl_ms
+        (now - self.created_at_ms) >= ttl
     }
 }
 
@@ -1379,7 +1386,7 @@ impl WasmContextManager {
         context_id: &str,
         tool_id: &str,
         source_context_id: &str,
-        ttl_seconds: u64,
+        ttl_seconds: Option<u64>,
     ) -> Result<String, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -1422,7 +1429,7 @@ impl WasmContextManager {
             state: serde_json::Value::Null,
             created_at_ms: now,
             #[allow(clippy::cast_precision_loss)] // JS numbers are f64; TTL values are small
-            ttl_ms: (ttl_seconds as f64) * 1000.0,
+            ttl_ms: ttl_seconds.map(|s| (s as f64) * 1000.0),
             call_count: 0,
         };
 

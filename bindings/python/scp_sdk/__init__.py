@@ -78,7 +78,14 @@ from scp_sdk.provenance import (
     evaluate_provenance_quality,
 )
 from scp_sdk.sync import classify_offline, get_policy, run_sync
-from scp_sdk.tools import TestVector, ToolDefinition
+from scp_sdk.tools import (
+    TestVector,
+    ToolDefinition,
+    invoke_cross_context,
+    session_close,
+    session_create,
+    session_invoke,
+)
 from scp_sdk.transport import TransportConfig, TransportStatus, connect_relay, relay_status
 from scp_sdk.trust import (
     Attestation,
@@ -187,6 +194,7 @@ __all__ = [
     "get_policy",
     "get_stdio_allowlist",
     "handle_ttl_expiry",
+    "invoke_cross_context",
     "list_governance_proposals",
     "mint",
     "normalize_address",
@@ -204,6 +212,9 @@ __all__ = [
     "revoke",
     "run_sync",
     "serve_mcp",
+    "session_close",
+    "session_create",
+    "session_invoke",
     "validate",
     "verify_participation_requirements",
     "withdraw_governance_vote",

@@ -862,7 +862,9 @@ pub fn py_tool_invoke_cross_context(
 /// * `context_id` — The context containing the tool.
 /// * `tool_id` — The tool to create a session for.
 /// * `source_context_id` — The calling context (session cap tracked per caller).
-/// * `ttl_seconds` — Time-to-live for the session, in seconds.
+/// * `ttl_seconds` — Optional time-to-live for the session, in seconds.
+///   `None` means the session persists for the lifetime of the context
+///   (spec section 6.2.1).
 ///
 /// # Returns
 ///
@@ -873,12 +875,12 @@ pub fn py_tool_invoke_cross_context(
 /// Raises `ContextError` if the context is not connected, the tool is
 /// not found, or the per-caller session cap is exceeded.
 #[pyfunction]
-#[pyo3(name = "tool_session_create")]
+#[pyo3(name = "tool_session_create", signature = (context_id, tool_id, source_context_id, ttl_seconds=None))]
 pub fn py_tool_session_create(
     context_id: &str,
     tool_id: &str,
     source_context_id: &str,
-    ttl_seconds: u64,
+    ttl_seconds: Option<u64>,
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
     validate::validate_tool_id(tool_id)?;
@@ -913,7 +915,7 @@ pub fn py_tool_session_create(
             source_context: source_context_id.to_owned(),
             state: serde_json::Value::Null,
             created_at: now_ms,
-            ttl: std::time::Duration::from_secs(ttl_seconds),
+            ttl: ttl_seconds.map(std::time::Duration::from_secs),
             call_count: 0,
         };
 
