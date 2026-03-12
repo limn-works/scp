@@ -1,13 +1,17 @@
 [package]
 name = "scp-mcp"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 description = "MCP (Model Context Protocol) adapter for SCP — JSON-RPC 2.0 types and context namespace mapping"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "json-rpc"]
+categories = ["network-programming", "web-programming"]
 
 [dependencies]
-scp-core = { path = "../scp-core" }
+scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

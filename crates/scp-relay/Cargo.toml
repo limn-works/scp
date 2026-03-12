@@ -1,17 +1,21 @@
 [package]
 name = "scp-relay"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 description = "Standalone SCP native relay server binary"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["relay", "server", "websocket"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "scp-relay"
 path = "src/main.rs"
 
 [dependencies]
-scp-transport = { path = "../scp-transport", features = [
+scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.1", features = [
     "sqlite-blob",
     "redb-blob",
     "postgres-blob",

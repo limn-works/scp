@@ -1,16 +1,20 @@
 [package]
 name = "scp-media"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 description = "Real-time media transport types for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["media", "signaling", "real-time", "encryption"]
+categories = ["multimedia", "cryptography"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-scp-core = { path = "../scp-core" }
-scp-identity = { path = "../scp-identity" }
+scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
+scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1" }
 openmls_traits = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }

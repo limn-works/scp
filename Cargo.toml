@@ -23,6 +23,7 @@ members = [
 edition = "2024"
 repository = "https://github.com/limn/scp"
 license = "Apache-2.0"
+homepage = "https://github.com/limn/scp"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

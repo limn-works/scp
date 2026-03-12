@@ -1,25 +1,29 @@
 [package]
 name = "scp-node"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 description = "Application node composing relay, identity, and HTTP server for SCP"
 edition.workspace = true
 repository.workspace = true
 license = "AGPL-3.0-only"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["node", "server", "relay", "identity"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "scp-node"
 path = "src/main.rs"
 
 [dependencies]
-scp-core = { path = "../scp-core" }
-scp-identity = { path = "../scp-identity", features = ["production-dht"] }
-scp-transport = { path = "../scp-transport", features = [
+scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
+scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1", features = ["production-dht"] }
+scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.1", features = [
     "sqlite-blob",
     "redb-blob",
     "postgres-blob",
     "s3-blob",
 ] }
-scp-platform = { path = "../scp-platform", features = ["testing", "sqlite", "file", "encrypting"] }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", features = ["testing", "sqlite", "file", "encrypting"] }
 axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }
 instant-acme = "0.8"

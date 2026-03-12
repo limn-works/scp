@@ -5,6 +5,7 @@ description = "wasm-bindgen FFI bridge for SCP — exposes scp-core to TypeScrip
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

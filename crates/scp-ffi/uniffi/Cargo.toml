@@ -5,6 +5,7 @@ description = "UniFFI FFI bridge for SCP — generates Swift and Kotlin bindings
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 name = "scp_ffi_uniffi"

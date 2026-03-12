@@ -164,17 +164,16 @@ jobs:
         id: tags
         run: |
           TAGS=(
+            "scp-primitives@${{ env.VERSION }}"
+            "scp-platform@${{ env.VERSION }}"
+            "scp-identity@${{ env.VERSION }}"
+            "scp-event-log@${{ env.VERSION }}"
             "scp-core@${{ env.VERSION }}"
             "scp-transport@${{ env.VERSION }}"
-            "scp-platform@${{ env.VERSION }}"
             "scp-mcp@${{ env.VERSION }}"
-            "scp-python@${{ env.VERSION }}"
-            "scp-ts@${{ env.VERSION }}"
-            "scp-swift@${{ env.VERSION }}"
-            "scp-kt@${{ env.VERSION }}"
-            "scp-go@${{ env.VERSION }}"
-            "scp-csharp@${{ env.VERSION }}"
-            "scp-java@${{ env.VERSION }}"
+            "scp-media@${{ env.VERSION }}"
+            "scp-node@${{ env.VERSION }}"
+            "scp-relay@${{ env.VERSION }}"
           )
 
           for tag in "${TAGS[@]}"; do
@@ -344,6 +343,9 @@ jobs:
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -351,25 +353,82 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # Publish order matters: dependencies first
+      - name: Publish scp-primitives
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-primitives --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
       - name: Publish scp-platform
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-platform --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-identity
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-identity --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-event-log
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-event-log --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
 
       - name: Publish scp-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-core --allow-dirty
 
+      - name: Wait for crates.io index
+        run: sleep 60
+
       - name: Publish scp-transport
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-transport --allow-dirty
 
+      - name: Wait for crates.io index
+        run: sleep 60
+
       - name: Publish scp-mcp
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-mcp --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-media
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-media --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-node
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-node --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-relay
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-relay --allow-dirty
 
   publish-pypi:
     name: "Step 6b: Publish to PyPI"
@@ -669,7 +728,7 @@ jobs:
           done
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
-          echo "- crates.io: scp-platform, scp-core, scp-transport, scp-mcp" >> $GITHUB_STEP_SUMMARY
+          echo "- crates.io: scp-primitives, scp-platform, scp-identity, scp-event-log, scp-core, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
           echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
           echo "- npm: @limn-works/scp-ts" >> $GITHUB_STEP_SUMMARY
           echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY

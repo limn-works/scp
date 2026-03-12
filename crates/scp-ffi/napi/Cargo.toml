@@ -5,6 +5,7 @@ description = "napi-rs FFI bridge for SCP — exposes scp-core to Node.js/Bun vi
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]

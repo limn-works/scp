@@ -5,6 +5,7 @@ description = "Shared bridge adapter types for SCP FFI bridges (PyO3, napi-rs, U
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["resolvers"]

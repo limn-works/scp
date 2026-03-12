@@ -5,6 +5,7 @@ description = "PyO3 FFI bridge for SCP — exposes scp-core to Python as the _sc
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 name = "_scp_core"
