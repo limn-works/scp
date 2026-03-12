@@ -3751,7 +3751,6 @@ fn wasm_trust_level_sorting_order() {
     assert!(trust_level_rank("DiscoveryContextVerified") > trust_level_rank("Unknown"));
 }
 
-
 // ===========================================================================
 // Governance role/broadcast mirror (verbatim from scp-ffi-wasm/src/manager.rs)
 //
