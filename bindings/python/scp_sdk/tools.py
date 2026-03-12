@@ -21,7 +21,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ContextError
+from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError
 
 if TYPE_CHECKING:
     from scp_sdk.identity import Identity
@@ -30,6 +30,17 @@ try:
     import _scp_core  # type: ignore[import-not-found]
 except ImportError:
     _scp_core = None  # type: ignore[assignment]
+
+
+def _translate_bridge_error(exc: Exception) -> Exception:
+    """Translate a ``_scp_core`` bridge exception to an SDK exception.
+
+    Uses :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP` to look up the SDK type
+    by the bridge exception's class name.  Falls back to
+    :class:`~scp_sdk.errors.ContextError` for unmapped types.
+    """
+    sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
+    return sdk_cls(str(exc))
 
 
 @dataclass
@@ -110,10 +121,10 @@ async def invoke_cross_context(
 ) -> dict[str, Any]:
     """Invoke a tool across context boundaries.
 
-    The source context exposes the tool and the target context accepts
-    the interface.  Both contexts must have approved the interface before
-    calls are permitted.  Rate limits and chain depth are enforced per
-    spec section 6.2.
+    The source context initiates the call and the target context
+    contains the tool.  Both contexts must have approved the interface
+    before calls are permitted.  Rate limits and chain depth are
+    enforced per spec section 6.2.
 
     Args:
         source_context: The ID of the calling context.
@@ -126,6 +137,7 @@ async def invoke_cross_context(
             Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
             capability.  Validated against the target context's ceiling.
         chain_depth: Current cross-context chain depth (0 for first hop).
+            Must be in the range 0-255 (u8 on the bridge side).
         proof_tokens: Optional list of encoded parent UCAN token strings
             for delegation chain verification.
 
@@ -136,8 +148,10 @@ async def invoke_cross_context(
         ContextError: If either context is not connected, the tool is
             not found, chain depth is exceeded, or the interface is not
             approved.
-        UcanError: If the UCAN token is invalid, expired, revoked, or
-            lacks the required tool invocation capability.
+        UcanPermissionError: If the UCAN token is invalid, expired,
+            revoked, or lacks the required tool invocation capability.
+        ValidationError: If input validation fails (schema mismatch,
+            invalid parameters).
     """
     if _scp_core is None:
         raise ContextError(
@@ -145,17 +159,26 @@ async def invoke_cross_context(
             code="SCP-CTX-2001",
         )
 
-    result = await asyncio.to_thread(
-        _scp_core.tool_invoke_cross_context,
-        source_context,
-        target_context,
-        tool_id,
-        input,
-        invoker_did,
-        ucan_token,
-        chain_depth,
-        proof_tokens,
-    )
+    if not isinstance(chain_depth, int) or chain_depth < 0 or chain_depth > 255:
+        raise ContextError(
+            f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+            code="SCP-CTX-2002",
+        )
+
+    try:
+        result = await asyncio.to_thread(
+            _scp_core.tool_invoke_cross_context,
+            source_context,
+            target_context,
+            tool_id,
+            input,
+            invoker_did,
+            ucan_token,
+            chain_depth,
+            proof_tokens,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
     return result
 
 
@@ -182,7 +205,8 @@ async def session_create(
         tool_id: The tool to create a session for.
         source_context_id: The calling context (session cap tracked per
             caller).
-        ttl_seconds: Time-to-live for the session, in seconds.
+        ttl_seconds: Time-to-live for the session, in seconds.  Must be
+            a non-negative integer (u64 on the bridge side).
 
     Returns:
         The session ID (UUID string).
@@ -190,6 +214,7 @@ async def session_create(
     Raises:
         ContextError: If the context is not connected, the tool is not
             found, or the per-caller session cap is exceeded.
+        ValidationError: If input validation fails (invalid parameters).
     """
     if _scp_core is None:
         raise ContextError(
@@ -197,13 +222,22 @@ async def session_create(
             code="SCP-CTX-2001",
         )
 
-    return await asyncio.to_thread(
-        _scp_core.tool_session_create,
-        context,
-        tool_id,
-        source_context_id,
-        ttl_seconds,
-    )
+    if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
+        raise ContextError(
+            f"ttl_seconds must be a non-negative integer, got {ttl_seconds!r}",
+            code="SCP-CTX-2002",
+        )
+
+    try:
+        return await asyncio.to_thread(
+            _scp_core.tool_session_create,
+            context,
+            tool_id,
+            source_context_id,
+            ttl_seconds,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
 
 
 async def session_invoke(
@@ -240,8 +274,10 @@ async def session_invoke(
     Raises:
         ContextError: If the session is not found, has expired, or the
             invoker lacks capability.
-        UcanError: If the UCAN token is invalid, expired, revoked, or
-            lacks the required tool invocation capability.
+        UcanPermissionError: If the UCAN token is invalid, expired,
+            revoked, or lacks the required tool invocation capability.
+        ValidationError: If input validation fails (schema mismatch,
+            invalid parameters).
     """
     if _scp_core is None:
         raise ContextError(
@@ -249,15 +285,18 @@ async def session_invoke(
             code="SCP-CTX-2001",
         )
 
-    result = await asyncio.to_thread(
-        _scp_core.tool_session_invoke,
-        context,
-        session_id,
-        input,
-        invoker_did,
-        ucan_token,
-        proof_tokens,
-    )
+    try:
+        result = await asyncio.to_thread(
+            _scp_core.tool_session_invoke,
+            context,
+            session_id,
+            input,
+            invoker_did,
+            ucan_token,
+            proof_tokens,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
     return result
 
 
@@ -275,6 +314,7 @@ async def session_close(context: str, session_id: str) -> None:
     Raises:
         ContextError: If the context is not connected or the session is
             not found.
+        ValidationError: If input validation fails (invalid parameters).
     """
     if _scp_core is None:
         raise ContextError(
@@ -282,11 +322,14 @@ async def session_close(context: str, session_id: str) -> None:
             code="SCP-CTX-2001",
         )
 
-    await asyncio.to_thread(
-        _scp_core.tool_session_close,
-        context,
-        session_id,
-    )
+    try:
+        await asyncio.to_thread(
+            _scp_core.tool_session_close,
+            context,
+            session_id,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
 
 
 __all__ = [
