@@ -230,6 +230,7 @@ mod inner_envelope {
             provenance_hash: [0xBB; 32],
             signing_key_id: scp_identity::SigningKeyId::Active,
             signature: [0xCC; 64],
+            extensions: std::collections::HashMap::new(),
         };
         let bytes = rmp_serde::to_vec_named(&inner).unwrap();
         let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
@@ -237,7 +238,7 @@ mod inner_envelope {
         let result: Result<InnerEnvelope, _> = rmp_serde::from_slice(&with_extras);
         assert!(
             result.is_ok(),
-            "InnerEnvelope must ignore unknown fields per §13.5.1, got: {:?}",
+            "InnerEnvelope must accept unknown fields per §13.5.1, got: {:?}",
             result.unwrap_err()
         );
         let decoded = result.unwrap();
@@ -245,6 +246,12 @@ mod inner_envelope {
         assert_eq!(decoded.sender_did, "did:dht:test");
         assert_eq!(decoded.epoch, 1);
         assert_eq!(decoded.signature, [0xCC; 64]);
+
+        // Unknown fields must be preserved in extensions (#863).
+        assert!(
+            !decoded.extensions.is_empty(),
+            "unknown fields must be preserved in extensions, got empty"
+        );
     }
 }
 
