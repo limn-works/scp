@@ -4,7 +4,7 @@
 
 An agent with no prior context should be able to visit the SCP repository, understand the protocol, build the project, use the SDK in any target language, run tests, and implement features or write a conforming implementation — without human guidance.
 
-## 21.2 Current State as of 9 Mar 2026
+## 21.2 Current State as of 12 Mar 2026
 
 ### Done
 
@@ -15,24 +15,25 @@ An agent with no prior context should be able to visit the SCP repository, under
 | 3 | Module-level Rust docs | 100% of Rust files have `//!` headers | All crates |
 | 4 | Trait contracts | ~100% documented | Invariants and error conditions |
 | 5 | Standards | `.docs/standards/` | 8 languages, error hierarchy, async patterns, CI tiers |
-| 6 | SDK binding READMEs | `bindings/{python,typescript,swift,kotlin}/README.md` | Install, quickstart, platform notes |
-| 7 | Architecture guide | `docs/guides/architecture.md` | Reading guide with entry points |
-| 8 | Transport adapter guide | `docs/guides/transport-adapters.md` | Trait requirements, step-by-step, conformance |
-| 9 | Wire format tables | §9.5.2, §12.12, §19.15, §22.11, §23.16 | Signed structures, bridge, economy, discovery, sync |
-| 10 | Protocol constants registry | §9.18 (16 subsections, ~100 constants) | Domain separators, key derivation labels, sizes, timeouts |
-| 11 | Cryptographic test vectors | §25 (18 subsections) | All crypto operations; hex outputs pending (§25.18) |
-| 12 | Conformance suite spec | §26 | Language-independent test case definitions |
-| 13 | GovernanceAction table | §9.5.2 | All 28 variants with signed structure fields |
-| 14 | ContextParams table | §9.5.2 | All 17 fields tabulated |
-| 15 | Domain separators | §9.18.2 | 30 separators registered, code-verified |
-| 16 | Key derivation labels | §9.18.3 | HPKE info, HKDF salt/info, HMAC domains, MLS exporter |
-| 17 | Provenance system | §24 | Full specification with chain depth limits |
-| 18 | README.md | Root | Protocol overview, capabilities, architecture |
-| 19 | LICENSING.md | Root | License structure and FAQ |
-| 20 | CI workflows | `.github/workflows/` | Build matrix, docs, release, security scanning |
-| 21 | Getting started guide | `GETTING-STARTED.md` | Prerequisites, setup, build, test, project structure |
-| 22 | Testing guide | `TESTING.md` | Per-language commands, feature flags, lint, conformance, CI matrix |
-| 23 | Contributing guide | `CONTRIBUTING.md` | Workflow, commits, code style, artifact flow, PRD process |
+| 6 | Inline doc coverage | ~82–100% across all crates (lowest: scp-ffi-wasm ~82%) | See §21.8.1 coverage table |
+| 7 | SDK binding READMEs | `bindings/{python,typescript,swift,kotlin}/README.md` | Install, quickstart, platform notes |
+| 8 | Architecture guide | `docs/guides/architecture.md` | Reading guide with entry points |
+| 9 | Transport adapter guide | `docs/guides/transport-adapters.md` | Trait requirements, step-by-step, conformance |
+| 10 | Wire format tables | §9.5.2, §12.12, §19.15, §22.11, §23.16 | Signed structures, bridge, economy, discovery, sync |
+| 11 | Protocol constants registry | §9.18 (16 subsections, ~100 constants) | Domain separators, key derivation labels, sizes, timeouts |
+| 12 | Cryptographic test vectors | §25 (18 subsections) | All crypto operations; hex outputs pending (§25.18) |
+| 13 | Conformance suite spec | §26 | Language-independent test case definitions |
+| 14 | GovernanceAction table | §9.5.2 | All 28 variants with signed structure fields |
+| 15 | ContextParams table | §9.5.2 | All 17 fields tabulated |
+| 16 | Domain separators | §9.18.2 | 30 separators registered, code-verified |
+| 17 | Key derivation labels | §9.18.3 | HPKE info, HKDF salt/info, HMAC domains, MLS exporter |
+| 18 | Provenance system | §24 | Full specification with chain depth limits |
+| 19 | README.md | Root | Protocol overview, capabilities, architecture |
+| 20 | LICENSING.md | Root | License structure and FAQ |
+| 21 | CI workflows | `.github/workflows/` | Build matrix, docs, release, security scanning |
+| 22 | Getting started guide | `GETTING-STARTED.md` | Prerequisites, setup, build, test, project structure |
+| 23 | Testing guide | `TESTING.md` | Per-language commands, feature flags, lint, conformance, CI matrix |
+| 24 | Contributing guide | `CONTRIBUTING.md` | Workflow, commits, code style, artifact flow, PRD process |
 
 ### Gaps
 
@@ -42,8 +43,8 @@ An agent with no prior context should be able to visit the SCP repository, under
 | ~~Testing guide~~ | ~~Commands in standards only~~ | ~~`TESTING.md`~~ | Done |
 | ~~Contributing guide~~ | ~~None~~ | ~~`CONTRIBUTING.md`~~ | Done |
 | Example applications | Pseudocode only | Runnable examples per language | P0 |
-| FFI crate READMEs | None | `crates/scp-ffi/{src,napi,wasm,uniffi}/README.md` | P1 |
-| Inline doc coverage | 57% (scp-core) | 90%+ | P1 |
+| FFI crate READMEs | In progress | `crates/scp-ffi/{src,napi,wasm,uniffi}/README.md` | P1 |
+| Inline doc coverage | 82% (scp-ffi-wasm lowest) | 100% | P1 |
 | Generated API reference | None | Hosted rustdoc, typedoc, Dokka, DocC | P1 |
 | Remaining guides | 2 of 5 | Storage backends, relay ops, conformance testing | P2 |
 | Test vector hex outputs | Spec complete, outputs pending | Run reference impl to generate §25.18 | P2 |
@@ -205,18 +206,18 @@ Crates and their enforcement status:
 
 | Crate | `missing_docs` | Current Coverage | Target |
 |---|---|---|---|
-| `scp-core` | `warn` (to add) | ~57% | 100% |
-| `scp-identity` | `warn` (to add) | ~60% | 100% |
-| `scp-transport` | `warn` (to add) | ~45% | 100% |
-| `scp-event-log` | `warn` (to add) | ~55% | 100% |
-| `scp-platform` | `warn` (to add) | ~70% | 100% |
-| `scp-media` | `warn` (to add) | ~40% | 100% |
-| `scp-ffi` | `warn` (to add) | ~30% | 90% |
-| `scp-ffi-napi` | `warn` (to add) | ~25% | 90% |
-| `scp-ffi-uniffi` | `warn` (to add) | ~25% | 90% |
-| `scp-ffi-wasm` | `warn` (to add) | ~30% | 90% |
-| `scp-primitives` | `warn` (to add) | ~80% | 100% |
-| `scp-testing` | `warn` (to add) | ~40% | 90% |
+| `scp-core` | `warn` (to add) | ~98% | 100% |
+| `scp-identity` | `warn` (to add) | ~97% | 100% |
+| `scp-transport` | `warn` (to add) | ~98% | 100% |
+| `scp-event-log` | `warn` (to add) | ~100% | 100% |
+| `scp-platform` | `warn` (to add) | ~100% | 100% |
+| `scp-media` | `warn` (to add) | ~100% | 100% |
+| `scp-ffi` | `warn` (to add) | ~99% | 100% |
+| `scp-ffi-napi` | `warn` (to add) | ~100% | 100% |
+| `scp-ffi-uniffi` | `warn` (to add) | ~100% | 100% |
+| `scp-ffi-wasm` | `warn` (to add) | ~82% | 100% |
+| `scp-primitives` | `warn` (to add) | ~100% | 100% |
+| `scp-testing` | `warn` (to add) | ~90% | 100% |
 
 ### 21.8.2 Quality Standard
 
