@@ -2175,7 +2175,7 @@ impl WasmContextManager {
         // This prevents partial corruption if a cap check fails mid-loop.
         if let Some(bc) = ctx.broadcast.as_ref() {
             for (author_did, block_list) in &bc.authors {
-                if block_list.len() >= WASM_BLOCK_LIST_CAP {
+                if block_list.len() >= WASM_BLOCK_LIST_CAP && !block_list.contains(did) {
                     return Err(ScpWasmError::Validation {
                         message: format!(
                             "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
@@ -3265,7 +3265,7 @@ impl WasmContextManager {
                         code: "SCP-CTX-2001".to_owned(),
                     })?;
 
-            if block_list.len() >= WASM_BLOCK_LIST_CAP {
+            if block_list.len() >= WASM_BLOCK_LIST_CAP && !block_list.contains(subscriber_did) {
                 return Err(ScpWasmError::Validation {
                     message: format!(
                         "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
@@ -5033,6 +5033,57 @@ mod tests {
             bc.authors["author-b"].is_empty(),
             "author-b's block list should be empty — pre-validation must prevent partial mutation"
         );
+    }
+
+    #[test]
+    fn governance_ban_allows_reban_at_capacity() {
+        let mut mgr =
+            make_manager_with_broadcast("ctx-1", "author-a", &["author-a", "author-b"], &[]);
+
+        let target = "did:dht:ztarget";
+
+        // Fill both authors' block lists to exactly WASM_BLOCK_LIST_CAP,
+        // ensuring `target` is already present in each.
+        {
+            let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
+            let bc = ctx.broadcast.as_mut().unwrap();
+            for author in ["author-a", "author-b"] {
+                let bl = bc.authors.get_mut(author).unwrap();
+                bl.insert(target.to_owned());
+                for i in 1..WASM_BLOCK_LIST_CAP {
+                    bl.insert(format!("did:dht:zfiller{i}"));
+                }
+                assert_eq!(bl.len(), WASM_BLOCK_LIST_CAP);
+            }
+        }
+
+        // Re-banning an already-blocked DID at capacity must succeed (HashSet
+        // insert is a no-op, so the cap is not exceeded).
+        mgr.dispatch_revoke_read_access("ctx-1", target, "full")
+            .expect("re-ban of already-blocked DID at capacity should succeed");
+    }
+
+    #[test]
+    fn per_author_block_allows_reblock_at_capacity() {
+        let mut mgr = make_manager_with_broadcast("ctx-1", "author-a", &["author-a"], &["sub1"]);
+
+        let target = "did:dht:ztarget";
+
+        // Fill author-a's block list to capacity with target already present.
+        {
+            let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
+            let bc = ctx.broadcast.as_mut().unwrap();
+            let bl = bc.authors.get_mut("author-a").unwrap();
+            bl.insert(target.to_owned());
+            for i in 1..WASM_BLOCK_LIST_CAP {
+                bl.insert(format!("did:dht:zfiller{i}"));
+            }
+            assert_eq!(bl.len(), WASM_BLOCK_LIST_CAP);
+        }
+
+        // Re-blocking an already-blocked subscriber at capacity must succeed.
+        mgr.block_broadcast_subscriber("ctx-1", target, "author-a")
+            .expect("re-block of already-blocked DID at capacity should succeed");
     }
 
     #[test]
