@@ -449,7 +449,7 @@ TTL extension is a governance action with additional consent requirements beyond
 1. **Proposal.** An admin submits a `ProposeTTLExtension` governance proposal:
    ```
    ProposeTTLExtension {
-     new_ttl: u64,              // New TTL in seconds from context creation time (MUST be > current TTL)
+     extension_secs: u64,       // Duration in seconds to add to the current TTL
      reason: String,            // Human-readable justification
    }
    ```
