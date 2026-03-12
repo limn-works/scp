@@ -110,7 +110,7 @@ public enum ToolBridge {
         _ handle: ContextHandle,
         _ toolId: String,
         _ sourceContextId: String,
-        _ ttlSeconds: UInt64
+        _ ttlSeconds: UInt64?
     ) async throws -> String
 
     /// Invoke a tool within an active session.
@@ -395,7 +395,8 @@ public extension Context {
     /// - Parameters:
     ///   - toolId: The tool ID to create a session for.
     ///   - sourceContextId: The context ID of the calling context.
-    ///   - ttlSeconds: Time-to-live for the session in seconds.
+    ///   - ttlSeconds: Time-to-live for the session in seconds, or `nil` for
+    ///     server-default TTL (spec section 6.2.1).
     ///   - sessionCreateFn: Bridge function override for testing.
     /// - Returns: A ``ToolSessionResult`` containing the session ID.
     /// - Throws: ``ScpError/Tool(message:code:)`` if session creation fails.
@@ -408,7 +409,7 @@ public extension Context {
     func createToolSession(
         toolId: String,
         sourceContextId: String,
-        ttlSeconds: UInt64,
+        ttlSeconds: UInt64? = nil,
         sessionCreateFn: ToolBridge.SessionCreateFn = ToolBridge.defaultSessionCreate
     ) async throws -> ToolSessionResult {
         guard state == .active else {
