@@ -449,7 +449,7 @@ TTL extension is a governance action with additional consent requirements beyond
 1. **Proposal.** An admin submits a `ProposeTTLExtension` governance proposal:
    ```
    ProposeTTLExtension {
-     new_ttl: u64,              // New TTL in seconds from context creation time (MUST be > current TTL)
+     additional_secs: u64,      // Duration in seconds to add to the current TTL
      reason: String,            // Human-readable justification
    }
    ```
@@ -463,7 +463,7 @@ TTL extension is a governance action with additional consent requirements beyond
    }
    ```
 4. **Consent deadline.** Members have 24 hours to respond. Members who do not respond within 24 hours are treated as having rejected the extension. This prevents indefinite extension of a context that a member expected to be temporary.
-5. **Activation.** If all members consent, the TTL is updated. A `TTLExtended` event is recorded in the event log with the old TTL, new TTL, proposal ID, and list of consenting members.
+5. **Activation.** If all members consent, the TTL is updated. A `TTLExtended` event is recorded in the event log with the old TTL deadline (unix timestamp), new TTL deadline (unix timestamp), proposal ID, and list of consenting members.
 6. **Rejection.** If any member rejects (explicitly or by timeout), the extension fails. A `TTLExtensionRejected` event is recorded. The original TTL remains in effect.
 
 **Bilateral context shortcut.** For two-party contexts, TTL extension requires only the other party's consent (the proposer's consent is implicit in the proposal). No governance proposal is needed — a direct `TTLExtensionConsent` exchange suffices.
