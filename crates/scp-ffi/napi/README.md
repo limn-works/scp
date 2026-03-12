@@ -28,19 +28,20 @@ released or the deadline elapses.
 
 | Module | Domain |
 |--------|--------|
-| `identity.rs` | DID create (with optional agent key), load, resolve, migrate |
+| `bridge_connector.rs` | Bridge connector operations (register, trust evaluation, shadow identities) |
 | `context.rs` | Context lifecycle, membership, governance, broadcast, TTL, export/import |
-| `tools.rs` | Tool register, invoke, verify |
-| `ucan.rs` | UCAN validate, mint, revoke |
-| `event_log.rs` | Merkle event log query and verify |
-| `transport.rs` | Relay connect, disconnect, status |
 | `discovery.rs` | Context discovery |
-| `provenance.rs` | Provenance operations |
-| `trust.rs` | Trust evaluation |
-| `sync.rs` | Offline sync classification |
-| `mcp.rs` | MCP server/client bridge |
-| `runtime.rs` | ContextManager init, UCAN state registry |
 | `error.rs` | `ScpNapiError` to napi Error mapping |
+| `event_log.rs` | Merkle event log query and verify |
+| `identity.rs` | DID create (with optional agent key), load, resolve, migrate |
+| `mcp.rs` | MCP server/client bridge |
+| `provenance.rs` | Provenance operations |
+| `runtime.rs` | ContextManager init, UCAN state registry |
+| `sync.rs` | Offline sync classification |
+| `tools.rs` | Tool register, invoke, verify |
+| `transport.rs` | Relay connect, disconnect, status |
+| `trust.rs` | Trust evaluation |
+| `ucan.rs` | UCAN validate, mint, revoke |
 
 ## Key differences from PyO3
 

@@ -42,17 +42,23 @@ checking. `ucan_mint` generates real Ed25519 keypairs via `rand_core::OsRng`.
 
 | Module | Domain |
 |--------|--------|
-| `runtime.rs` | WASM-local registry, `ToolRegistry`, `WasmEventLog`, Merkle proofs, schema validation |
-| `identity.rs` | Ed25519 key generation, `did:dht:z{zbase32}` derivation |
+| `bridge.rs` | Bridge connector operations (register, trust evaluation, shadow identities) |
 | `context.rs` | Context lifecycle (create, join, leave, close, send, subscribe, export, import) |
-| `tools.rs` | Tool register (deterministic IDs), invoke (echo mode), verify |
-| `ucan.rs` | Full UCAN validate, mint, revoke |
-| `event_log.rs` | Event metadata storage, query with filtering, Merkle proofs |
 | `custody.rs` | `JsKeyCustody` extern type (WebCrypto injection) |
-| `storage.rs` | `JsStorage` extern type (OPFS/IndexedDB injection) |
-| `transport.rs` | Transport connect, disconnect, status |
 | `discovery.rs` | Context discovery |
 | `error.rs` | `ScpWasmError` with stable error codes (`SCP-*-NNNN`) |
+| `event_log.rs` | Event metadata storage, query with filtering, Merkle proofs |
+| `identity.rs` | Ed25519 key generation, `did:dht:z{zbase32}` derivation |
+| `manager.rs` | Centralized `WasmContextManager` mirroring scp-core `ContextManager` |
+| `provenance.rs` | Provenance chain depth, quality evaluation, metadata attachment |
+| `runtime.rs` | WASM-local registry, `ToolRegistry`, `WasmEventLog`, Merkle proofs, schema validation |
+| `storage.rs` | `JsStorage` extern type (OPFS/IndexedDB injection) |
+| `sync.rs` | Offline classification and sync policy |
+| `time.rs` | Hardened time source (captured `Date.now` reference) |
+| `tools.rs` | Tool register (deterministic IDs), invoke (echo mode), verify |
+| `transport.rs` | Transport connect, disconnect, status |
+| `trust.rs` | Trust engine (attestation, challenge, score query) |
+| `ucan.rs` | Full UCAN validate, mint, revoke |
 
 ## Build
 

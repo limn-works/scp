@@ -206,18 +206,18 @@ Crates and their enforcement status:
 
 | Crate | `missing_docs` | Current Coverage | Target |
 |---|---|---|---|
-| `scp-core` | `warn` (to add) | ~98% | 100% |
-| `scp-identity` | `warn` (to add) | ~97% | 100% |
-| `scp-transport` | `warn` (to add) | ~98% | 100% |
-| `scp-event-log` | `warn` (to add) | ~100% | 100% |
-| `scp-platform` | `warn` (to add) | ~100% | 100% |
-| `scp-media` | `warn` (to add) | ~100% | 100% |
-| `scp-ffi` | `warn` (to add) | ~99% | 100% |
-| `scp-ffi-napi` | `warn` (to add) | ~100% | 100% |
-| `scp-ffi-uniffi` | `warn` (to add) | ~100% | 100% |
-| `scp-ffi-wasm` | `warn` (to add) | ~82% | 100% |
-| `scp-primitives` | `warn` (to add) | ~100% | 100% |
-| `scp-testing` | `warn` (to add) | ~90% | 100% |
+| `scp-core` | `warn` | ~98% | 100% |
+| `scp-identity` | `warn` | ~97% | 100% |
+| `scp-transport` | `warn` | ~98% | 100% |
+| `scp-event-log` | `warn` | ~100% | 100% |
+| `scp-platform` | `warn` | ~100% | 100% |
+| `scp-media` | `warn` | ~100% | 100% |
+| `scp-ffi` | not yet | ~99% | 100% |
+| `scp-ffi-napi` | not yet | ~100% | 100% |
+| `scp-ffi-uniffi` | not yet | ~100% | 100% |
+| `scp-ffi-wasm` | not yet | ~82% | 100% |
+| `scp-primitives` | `warn` | ~100% | 100% |
+| `scp-testing` | not yet | ~90% | 100% |
 
 ### 21.8.2 Quality Standard
 

@@ -28,21 +28,24 @@ module import. Sync bridge functions release the GIL via
 
 | Module | Domain |
 |--------|--------|
-| `identity.rs` | DID create, load, resolve, rotate, migrate |
+| `bridge_adapters.rs` | Shared bridge adapter types for the UCAN validation pipeline |
+| `bridge_connector.rs` | Bridge connector operations (register, trust evaluation, shadow identities) |
 | `context.rs` | Context create, join, leave, close, send, receive |
-| `tools.rs` | Tool register, invoke, verify |
-| `ucan.rs` | UCAN validate (11-step ADR-016), mint, delegate, revoke |
-| `event_log.rs` | Merkle event log query and verify |
-| `mcp.rs` | MCP server/client (stdio + SSE), tool handlers |
-| `transport.rs` | Relay connect, disconnect, status |
+| `custody.rs` | `FfiKeyCustody` enum dispatch for `KeyCustody` trait (in-memory + file) |
 | `discovery.rs` | Context discovery (local + relay probe) |
-| `provenance.rs` | Provenance attach and chain verification |
-| `trust.rs` | Trust evaluation |
-| `sync.rs` | Offline sync classification |
-| `validate.rs` | Input validation at FFI boundary |
-| `runtime.rs` | Global registries (context, identity, relay, storage) |
 | `error.rs` | `ScpPyError` to Python exception mapping |
+| `event_log.rs` | Merkle event log query and verify |
+| `identity.rs` | DID create, load, resolve, rotate, migrate |
+| `mcp.rs` | MCP server/client (stdio + SSE), tool handlers |
+| `provenance.rs` | Provenance attach and chain verification |
+| `runtime.rs` | Global registries (context, identity, relay, storage) |
+| `sync.rs` | Offline sync classification |
+| `tools.rs` | Tool register, invoke, verify |
+| `transport.rs` | Relay connect, disconnect, status |
+| `trust.rs` | Trust evaluation |
 | `types.rs` | JSON <-> Python dict conversion |
+| `ucan.rs` | UCAN validate (11-step ADR-016), mint, delegate, revoke |
+| `validate.rs` | Input validation at FFI boundary |
 
 ## Build
 
