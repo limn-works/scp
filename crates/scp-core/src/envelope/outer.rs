@@ -358,21 +358,14 @@ pub fn open_envelope(
     )
     .map_err(|e| EnvelopeError::SenderKeyDecryptionFailed(e.to_string()))?;
 
-    // 3. Size-check then deserialize inner envelope (#347).
-    //    Defense in depth: reject oversized decrypted payloads before
-    //    deserializing. The BOUNDED_BYTES_MAX limit on `encrypted_blob`
-    //    bounds the decrypted size transitively, but we check explicitly.
-    {
-        use crate::serde_util::BOUNDED_BYTES_MAX;
-        if plaintext.len() > BOUNDED_BYTES_MAX {
-            return Err(EnvelopeError::EnvelopeTooLarge {
-                size: plaintext.len(),
-                max: BOUNDED_BYTES_MAX,
-            });
-        }
-    }
-    let inner: InnerEnvelope = rmp_serde::from_slice(&plaintext)
-        .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
+    // 3. Deserialize inner envelope via `from_bytes` (#347, #863).
+    //    `from_bytes` applies a pre-deserialization size check against
+    //    `MAX_ENVELOPE_SIZE` before invoking the deserializer, preventing
+    //    `serde`'s `#[serde(flatten)]` buffering from allocating memory for
+    //    oversized inputs. The outer envelope's `BOUNDED_BYTES_MAX` limit on
+    //    `encrypted_blob` bounds the decrypted size transitively;
+    //    `from_bytes` acts as defense in depth.
+    let inner = InnerEnvelope::from_bytes(&plaintext)?;
 
     // 3a. Reject unsupported protocol versions early (§13.2.1).
     if inner.version != super::inner::SCP_INNER_ENVELOPE_VERSION {

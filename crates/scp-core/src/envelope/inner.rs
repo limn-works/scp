@@ -14,6 +14,8 @@
 //!
 //! See ADR-002 acceptance criteria 2 and 6 in `.docs/adrs/phase-1.md`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -145,6 +147,14 @@ pub struct InnerEnvelope {
 
     /// The message payload (after bucket padding).
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    ///
+    /// **Interaction with `#[serde(flatten)]` on `extensions`:** When
+    /// `flatten` is present, serde buffers all map entries before dispatching
+    /// to field deserializers. This means `serde_bounded_bytes` fires *after*
+    /// the full input has been buffered into memory. Callers that deserialize
+    /// untrusted bytes should apply an upfront size check before calling
+    /// `rmp_serde::from_slice`; `serde_bounded_bytes` acts as
+    /// defense-in-depth for the individual field.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub payload: Vec<u8>,
 
@@ -165,6 +175,53 @@ pub struct InnerEnvelope {
     /// Ed25519 signature over the canonical hash of all critical fields.
     #[serde(with = "crate::serde_util::serde_signature_64")]
     pub signature: [u8; 64],
+
+    /// Forward-compatibility extensions — unknown fields from future protocol
+    /// versions are preserved here for forward-compatible roundtripping
+    /// (§13.5.1). Intermediaries and SDK storage layers that deserialize and
+    /// re-serialize inner envelopes MUST NOT strip unrecognized fields.
+    /// Excluded from canonical hash computation and signing.
+    ///
+    /// Uses `rmpv::Value` (not `serde_json::Value`) to preserve `MessagePack`
+    /// type fidelity. A `MsgPack` Binary field roundtrips as Binary; with
+    /// `serde_json::Value` it would degrade to an Array of numbers — silent
+    /// data corruption.
+    ///
+    /// **Security note:** Extensions carry no authenticity guarantee. Fields
+    /// in this map are not covered by the envelope signature. Do not use
+    /// extension values for security-sensitive decisions.
+    #[serde(flatten)]
+    pub extensions: HashMap<String, rmpv::Value>,
+}
+
+impl InnerEnvelope {
+    /// Deserializes an `InnerEnvelope` from `MessagePack` bytes with a
+    /// pre-deserialization size check.
+    ///
+    /// The size check rejects inputs exceeding [`MAX_ENVELOPE_SIZE`] *before*
+    /// invoking the deserializer, preventing `serde`'s `#[serde(flatten)]`
+    /// buffering from allocating memory for oversized inputs. This mirrors
+    /// [`OuterEnvelope::from_bytes`](super::outer::OuterEnvelope::from_bytes).
+    ///
+    /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::EnvelopeTooLarge`] if `data.len()` exceeds
+    /// `MAX_ENVELOPE_SIZE`.
+    /// Returns [`EnvelopeError::DeserializationFailed`] if the bytes are not
+    /// a valid `MessagePack`-encoded `InnerEnvelope`.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, EnvelopeError> {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        if data.len() > MAX_ENVELOPE_SIZE {
+            return Err(EnvelopeError::EnvelopeTooLarge {
+                size: data.len(),
+                max: MAX_ENVELOPE_SIZE,
+            });
+        }
+        rmp_serde::from_slice(data).map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +328,7 @@ pub async fn create_inner_envelope(
         provenance_hash,
         signing_key_id: params.signing_key_id,
         signature: sig_bytes,
+        extensions: HashMap::new(),
     })
 }
 
@@ -1589,11 +1647,106 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // from_bytes tests (#863)
+    // -----------------------------------------------------------------------
+
+    /// #863: Valid envelope serialized to msgpack and deserialized via
+    /// `from_bytes` preserves all fields.
+    #[tokio::test]
+    async fn from_bytes_roundtrip_preserves_fields() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let provenance = Provenance {
+            source: "from-bytes-test".into(),
+            upstream_hash: Some("upstream-abc".into()),
+        };
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
+                context_id: "ctx-from-bytes",
+                sender_did: "did:dht:from-bytes",
+                epoch: 7,
+                generation: 3,
+                sequence: 42,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Signaling,
+                payload: b"from_bytes roundtrip",
+                provenance: Some(provenance.clone()),
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        let decoded = InnerEnvelope::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.version, SCP_INNER_ENVELOPE_VERSION);
+        assert_eq!(decoded.context_id, "ctx-from-bytes");
+        assert_eq!(decoded.sender_did, "did:dht:from-bytes");
+        assert_eq!(decoded.epoch, 7);
+        assert_eq!(decoded.generation, 3);
+        assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.timestamp, 1_700_000_000);
+        assert_eq!(decoded.message_type, MessageType::Signaling);
+        assert_eq!(decoded.payload_hash, envelope.payload_hash);
+        assert_eq!(decoded.payload, envelope.payload);
+        assert_eq!(decoded.provenance, Some(provenance));
+        assert_eq!(decoded.provenance_hash, envelope.provenance_hash);
+        assert_eq!(decoded.signing_key_id, SigningKeyId::Agent);
+        assert_eq!(decoded.signature, envelope.signature);
+
+        // Signature must still verify after from_bytes roundtrip.
+        let valid = verify_inner_signature(&decoded, pubkey.as_bytes()).unwrap();
+        assert!(valid, "signature must verify after from_bytes roundtrip");
+    }
+
+    /// #863: `from_bytes` rejects input exceeding `MAX_ENVELOPE_SIZE` before
+    /// invoking the deserializer (parity with `OuterEnvelope::from_bytes`).
+    #[test]
+    fn from_bytes_rejects_oversized_input() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let oversized = vec![0u8; MAX_ENVELOPE_SIZE + 1];
+        let result = InnerEnvelope::from_bytes(&oversized);
+        assert!(result.is_err());
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("EnvelopeTooLarge"),
+            "error should be EnvelopeTooLarge, got: {err_msg}"
+        );
+    }
+
+    /// #863: `from_bytes` accepts input at exactly `MAX_ENVELOPE_SIZE` (the
+    /// size check is not off-by-one). The deserialization itself will fail
+    /// because the bytes are not valid `MessagePack`, but the size check passes.
+    #[test]
+    fn from_bytes_accepts_at_limit() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let at_limit = vec![0u8; MAX_ENVELOPE_SIZE];
+        let result = InnerEnvelope::from_bytes(&at_limit);
+        // Should fail with DeserializationFailed (invalid msgpack), not
+        // EnvelopeTooLarge.
+        assert!(result.is_err());
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("DeserializationFailed"),
+            "should be DeserializationFailed at the limit, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward compatibility: unknown fields preserved (#863, §13.5.1, #593)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn inner_envelope_ignores_unknown_fields() {
+    async fn inner_envelope_preserves_unknown_fields_json_roundtrip() {
         let (custody, signing_key) = setup().await;
 
         let envelope = create_inner_envelope(
@@ -1616,19 +1769,169 @@ mod tests {
         .await
         .unwrap();
 
-        // Serialize to JSON, inject an unknown field, deserialize back.
-        let mut map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
-        map.insert("future_protocol_extension".into(), "v2-data".into());
-
-        let result = serde_json::from_value::<InnerEnvelope>(serde_json::Value::Object(map));
-        assert!(
-            result.is_ok(),
-            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
-            result.unwrap_err()
+        // Inject an unknown extension field directly and verify msgpack roundtrip.
+        let mut envelope_with_ext = envelope;
+        envelope_with_ext.extensions.insert(
+            "future_protocol_extension".into(),
+            rmpv::Value::from("present"),
         );
-        let decoded = result.unwrap();
+
+        let bytes = rmp_serde::to_vec_named(&envelope_with_ext).unwrap();
+        let decoded: InnerEnvelope = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.context_id, "ctx-fwd");
         assert_eq!(decoded.sender_did, "did:dht:fwd-compat");
+
+        // Unknown field must be preserved in extensions.
+        assert!(
+            decoded.extensions.contains_key("future_protocol_extension"),
+            "unknown field must be preserved in extensions, got: {:?}",
+            decoded.extensions
+        );
+
+        // Re-serialize and re-deserialize — extensions must persist.
+        let re_bytes = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: InnerEnvelope = rmp_serde::from_slice(&re_bytes).unwrap();
+        assert!(
+            re_decoded
+                .extensions
+                .contains_key("future_protocol_extension"),
+            "extensions must survive msgpack roundtrip"
+        );
+    }
+
+    /// #863: Extensions must survive a `MessagePack` roundtrip — the actual wire
+    /// format. Simulates a newer protocol version adding a field.
+    #[test]
+    fn inner_envelope_extensions_survive_msgpack_roundtrip() {
+        #[derive(serde::Serialize)]
+        struct ExtendedInnerEnvelope {
+            version: u16,
+            #[serde(with = "crate::serde_util::serde_bounded_string")]
+            context_id: String,
+            #[serde(with = "crate::serde_util::serde_bounded_string")]
+            sender_did: String,
+            epoch: u64,
+            generation: u64,
+            sequence: u64,
+            timestamp: u64,
+            message_type: MessageType,
+            #[serde(with = "crate::serde_util::serde_hash_32")]
+            payload_hash: [u8; 32],
+            #[serde(with = "crate::serde_util::serde_bounded_bytes")]
+            payload: Vec<u8>,
+            provenance: Option<Provenance>,
+            #[serde(with = "crate::serde_util::serde_hash_32")]
+            provenance_hash: [u8; 32],
+            signing_key_id: SigningKeyId,
+            #[serde(with = "crate::serde_util::serde_signature_64")]
+            signature: [u8; 64],
+            /// Field unknown to the current `InnerEnvelope` definition.
+            v2_sender_trust_score: rmpv::Value,
+        }
+
+        let trust_map = rmpv::Value::Map(vec![
+            (rmpv::Value::from("score"), rmpv::Value::F64(0.95)),
+            (rmpv::Value::from("basis"), rmpv::Value::from("direct")),
+        ]);
+
+        let extended = ExtendedInnerEnvelope {
+            version: SCP_INNER_ENVELOPE_VERSION,
+            context_id: "ctx-ext".into(),
+            sender_did: "did:dht:ext-test".into(),
+            epoch: 1,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
+            payload_hash: Sha256::digest(b"test").into(),
+            payload: vec![0xAA; 256],
+            provenance: None,
+            provenance_hash: Sha256::digest([0x00]).into(),
+            signing_key_id: SigningKeyId::Active,
+            signature: [0x42; 64],
+            v2_sender_trust_score: trust_map,
+        };
+
+        // Serialize the extended struct to MessagePack.
+        let msgpack_bytes = rmp_serde::to_vec_named(&extended).unwrap();
+
+        // Deserialize as the standard InnerEnvelope.
+        let decoded: InnerEnvelope = rmp_serde::from_slice(&msgpack_bytes).unwrap();
+
+        // Known fields must be correct.
+        assert_eq!(decoded.context_id, "ctx-ext");
+        assert_eq!(decoded.sender_did, "did:dht:ext-test");
+        assert_eq!(decoded.epoch, 1);
+
+        // The unknown field must survive in extensions.
+        assert!(
+            decoded.extensions.contains_key("v2_sender_trust_score"),
+            "unknown field must be preserved in extensions after msgpack roundtrip, got: {:?}",
+            decoded.extensions
+        );
+        let ext = &decoded.extensions["v2_sender_trust_score"];
+        assert_eq!(ext["score"], rmpv::Value::F64(0.95));
+        assert_eq!(ext["basis"], rmpv::Value::from("direct"));
+
+        // Re-serialize and re-deserialize — the extension must persist.
+        let re_encoded = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: InnerEnvelope = rmp_serde::from_slice(&re_encoded).unwrap();
+        assert!(
+            re_decoded.extensions.contains_key("v2_sender_trust_score"),
+            "unknown field must survive msgpack roundtrip"
+        );
+    }
+
+    /// #863: Extensions must NOT affect canonical hash or signature verification.
+    #[tokio::test]
+    async fn extensions_excluded_from_signature() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let mut envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
+                context_id: "ctx-ext-sig",
+                sender_did: "did:dht:ext-sig-test",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"extensions dont affect sig",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Verify original signature.
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(valid, "original signature must verify");
+
+        // Add extensions — signature must still verify.
+        envelope
+            .extensions
+            .insert("future_field".into(), rmpv::Value::from("future_value"));
+        envelope.extensions.insert(
+            "another_future_field".into(),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::from("nested"),
+                rmpv::Value::Array(vec![
+                    rmpv::Value::from(1),
+                    rmpv::Value::from(2),
+                    rmpv::Value::from(3),
+                ]),
+            )]),
+        );
+
+        let still_valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(
+            still_valid,
+            "extensions must not affect signature verification"
+        );
     }
 }
