@@ -252,6 +252,33 @@ pub fn remove_context(context_id: &str) {
     ucan_registry().remove(context_id);
 }
 
+/// Re-syncs the `UcanContextState.role_state` for a context from the shared
+/// `ContextManager`.
+///
+/// Must be called after any governance action that modifies role state
+/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
+/// the NAPI-side copy used by UCAN/tool capability checks stays current.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError` if the context is not registered in either the
+/// manager or the UCAN state registry.
+pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpNapiError> {
+    let mgr = context_manager();
+    let new_role_state =
+        mgr.get_role_state(context_id)
+            .await
+            .ok_or_else(|| ScpNapiError::Context {
+                message: format!("context '{context_id}' not found in ContextManager"),
+                code: "SCP-CTX-2023".to_owned(),
+            })?;
+
+    with_context(context_id, |st| {
+        st.role_state = new_role_state;
+        Ok(())
+    })
+}
+
 /// Registers a tool handler for a tool in a context.
 ///
 /// The handler will be called when the tool is invoked. The tool must already

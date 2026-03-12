@@ -1160,10 +1160,22 @@ pub async fn context_execute_governance_action(
     };
 
     let manager = context_manager();
+    let context_id = handle.context_id.clone();
     let result = manager
-        .execute_governance_action(&handle.context_id, &proposal)
+        .execute_governance_action(&context_id, &proposal)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    // Re-sync local UCAN role state cache from ContextManager after any
+    // governance action that may have modified roles/membership (#560).
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to sync role state after governance action — \
+             local capability checks may be stale"
+        );
+    }
 
     Ok(format!("{result:?}"))
 }
@@ -1361,9 +1373,37 @@ pub fn context_get_economic_policy(handle: &NapiContextHandle) -> Option<String>
 mod tests {
     use crate::runtime::context_manager;
     use scp_core::context::ContextParams;
+    use scp_core::context::governance::{
+        GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+    };
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
     use scp_identity::DID;
+
+    fn approved_proposal(
+        pid: [u8; 32],
+        context_id: &str,
+        action: GovernanceAction,
+        approver_did: &str,
+    ) -> GovernanceProposal {
+        GovernanceProposal {
+            proposal_id: pid,
+            context_id: context_id.into(),
+            proposer_did: DID(approver_did.to_owned()),
+            action,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: DID(approver_did.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        }
+    }
 
     /// Verifies that `ContextManager::member_count` returns the live member
     /// count — not a hardcoded value.  After creation the count is 1 (the
@@ -1470,5 +1510,181 @@ mod tests {
             context_get_economic_policy(&handle).as_deref(),
             Some(locked_json)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Role state sync after governance (#560)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn role_state_syncs_after_change_role() {
+        let manager = context_manager();
+        let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCreator1";
+        let params = ContextParams {
+            ceiling: vec![Capability::new("role:assign")],
+            ..ContextParams::default()
+        };
+        manager
+            .create_context(ctx_id.clone(), params, DID(creator.to_owned()))
+            .await
+            .unwrap();
+        crate::runtime::register_test_context(&ctx_id, creator);
+        let new_did = "did:key:z6MkNapiMember1";
+        let add = approved_proposal(
+            [10u8; 32],
+            &ctx_id,
+            GovernanceAction::AddMember {
+                did: DID(new_did.to_owned()),
+                role: "member".to_owned(),
+            },
+            creator,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &add)
+            .await
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id)
+            .await
+            .unwrap();
+        let change = approved_proposal(
+            [11u8; 32],
+            &ctx_id,
+            GovernanceAction::ChangeRole {
+                did: DID(new_did.to_owned()),
+                new_role: "observer".to_owned(),
+            },
+            creator,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &change)
+            .await
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id)
+            .await
+            .unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            let assignment = st
+                .role_state
+                .assignments
+                .get(new_did)
+                .expect("member should have an assignment");
+            assert_eq!(assignment.role_name, "observer");
+            Ok(())
+        })
+        .unwrap();
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[tokio::test]
+    async fn role_state_syncs_after_add_member() {
+        let manager = context_manager();
+        let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCreator2";
+        let params = ContextParams {
+            ceiling: vec![Capability::new("role:assign")],
+            ..ContextParams::default()
+        };
+        manager
+            .create_context(ctx_id.clone(), params, DID(creator.to_owned()))
+            .await
+            .unwrap();
+        crate::runtime::register_test_context(&ctx_id, creator);
+        let new_did = "did:key:z6MkNapiAdded1";
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(!st.role_state.members.contains(new_did));
+            Ok(())
+        })
+        .unwrap();
+        let add = approved_proposal(
+            [12u8; 32],
+            &ctx_id,
+            GovernanceAction::AddMember {
+                did: DID(new_did.to_owned()),
+                role: "member".to_owned(),
+            },
+            creator,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &add)
+            .await
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id)
+            .await
+            .unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(st.role_state.members.contains(new_did));
+            assert_eq!(
+                st.role_state
+                    .assignments
+                    .get(new_did)
+                    .map(|a| a.role_name.as_str()),
+                Some("member")
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::runtime::remove_context(&ctx_id);
+    }
+
+    #[tokio::test]
+    async fn role_state_syncs_after_remove_member() {
+        let manager = context_manager();
+        let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCreator3";
+        let target = "did:key:z6MkNapiRemTarget";
+        let params = ContextParams {
+            ceiling: vec![Capability::new("role:assign")],
+            ..ContextParams::default()
+        };
+        manager
+            .create_context(ctx_id.clone(), params, DID(creator.to_owned()))
+            .await
+            .unwrap();
+        crate::runtime::register_test_context(&ctx_id, creator);
+        let add = approved_proposal(
+            [13u8; 32],
+            &ctx_id,
+            GovernanceAction::AddMember {
+                did: DID(target.to_owned()),
+                role: "member".to_owned(),
+            },
+            creator,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &add)
+            .await
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id)
+            .await
+            .unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(st.role_state.members.contains(target));
+            Ok(())
+        })
+        .unwrap();
+        let rm = approved_proposal(
+            [14u8; 32],
+            &ctx_id,
+            GovernanceAction::RemoveMember {
+                did: DID(target.to_owned()),
+                reason: Some("test removal".to_owned()),
+            },
+            creator,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &rm)
+            .await
+            .unwrap();
+        crate::runtime::sync_role_state_from_manager(&ctx_id)
+            .await
+            .unwrap();
+        crate::runtime::with_context(&ctx_id, |st| {
+            assert!(!st.role_state.members.contains(target));
+            assert!(!st.role_state.assignments.contains_key(target));
+            Ok(())
+        })
+        .unwrap();
+        crate::runtime::remove_context(&ctx_id);
     }
 }
