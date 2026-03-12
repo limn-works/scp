@@ -7079,4 +7079,87 @@ mod tests {
             other => panic!("expected Validation error, got: {other:?}"),
         }
     }
+
+    // -- discovery_result_to_json: trust_level / resolution_path tests --------
+
+    #[test]
+    fn discovery_result_to_json_dht_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "abc123".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:dht:zTest".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::DhtDidDocument,
+            mode: Some("broadcast".to_owned()),
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["context_id"], "abc123");
+        assert_eq!(json["discovery_source"], "dht_did_document");
+        assert_eq!(json["mode"], "broadcast");
+        // §22.7: trust_level is a discriminated union object; resolution_path
+        // uses spec PascalCase layer values per §22.11.3.
+        assert_eq!(json["trust_level"]["kind"], "DomainVerified");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "dht");
+        assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn discovery_result_to_json_discovery_context_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "ctx456".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:dht:zTest".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::DiscoveryContext {
+                context_id: "disc-ctx-1".to_owned(),
+            },
+            mode: None,
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
+        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
+        assert_eq!(json["discovery_context_id"], "disc-ctx-1");
+    }
+
+    #[test]
+    fn discovery_result_to_json_context_uri_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "deadbeef".to_owned(),
+            relay_urls: vec!["wss://relay.example.com/scp/v1".to_owned()],
+            publisher_did: "".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::ContextUri,
+            mode: Some("broadcast".to_owned()),
+            metadata_summary: None,
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"]["kind"], "DirectExchange");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "context_uri");
+        assert!(json["resolution_path"]["source_id"].is_null());
+        assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn discovery_result_to_json_well_known_source() {
+        let result = scp_core::discovery::ContextDiscoveryResult {
+            context_id: "wk789".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+            publisher_did: "did:web:example.com".into(),
+            discovery_source: scp_core::discovery::ContextDiscoverySource::WellKnown,
+            mode: None,
+            metadata_summary: Some("Example context".to_owned()),
+        };
+
+        let json = discovery_result_to_json(&result);
+        assert_eq!(json["trust_level"]["kind"], "DomainVerified");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
+        assert_eq!(json["resolution_path"]["source"], "well-known");
+        assert!(json["resolution_path"]["source_id"].is_null());
+    }
 }
