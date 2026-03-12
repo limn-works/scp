@@ -208,13 +208,14 @@ async def delegate(
     delegatee: str,
     capabilities: Sequence[str],
     context: str,
+    *,
+    encoded_parent: str,
 ) -> UcanToken:
     """Create a delegated UCAN from a parent token.
 
-    Verifies that the delegator matches the parent token's audience and
-    that the requested capabilities are a subset of the parent's
-    capabilities (attenuation -- never widening).  Mints a new token
-    with the parent as proof.
+    Delegates to ``_scp_core.ucan_delegate`` which performs real Ed25519
+    signing via the delegator's retained ``KeyCustody`` and enforces
+    attenuation (capabilities can only narrow, never widen).
 
     Args:
         parent_token: The parent :class:`UcanToken` to delegate from.
@@ -224,6 +225,9 @@ async def delegate(
         capabilities: Capability URIs to grant (must be a subset of the
             parent token's capabilities).
         context: The context ID to scope the delegated token to.
+        encoded_parent: The full encoded JWT string of the parent token.
+            Required for the Rust bridge to parse and verify the parent's
+            signature and delegation chain.
 
     Returns:
         A new :class:`UcanToken` representing the delegated token.
@@ -231,37 +235,20 @@ async def delegate(
     Raises:
         UcanPermissionError: If delegation fails -- delegator does not
             match the parent's audience, capabilities exceed the parent's
-            capabilities, etc.
+            capabilities, signing fails, etc.
     """
-    # Verify delegator matches the parent token's audience.
-    if delegator != parent_token.audience:
-        raise UcanPermissionError(
-            f"Delegator DID {delegator!r} does not match parent token "
-            f"audience {parent_token.audience!r}",
-            code="SCP-PERM-3001",
+    try:
+        bridge_token = await asyncio.to_thread(
+            _scp_core.ucan_delegate,
+            context,
+            delegator,
+            delegatee,
+            encoded_parent,
+            list(capabilities),
         )
-
-    # Verify attenuation: requested capabilities must be a subset of the
-    # parent's capabilities (never widening).
-    parent_caps = set(parent_token.capabilities)
-    requested_caps = set(capabilities)
-    excess = requested_caps - parent_caps
-    if excess:
-        raise UcanPermissionError(
-            f"Cannot delegate capabilities not present in parent token: {sorted(excess)}",
-            code="SCP-PERM-3002",
-        )
-
-    # Delegate by minting a new token from the delegator to the delegatee
-    # with the attenuated capabilities.  The parent token's ID is included
-    # in the proof chain so that validators can verify the delegation chain
-    # back to the root token.
-    return await mint(
-        audience=delegatee,
-        capabilities=list(capabilities),
-        context=context,
-        proofs=[parent_token.token_id],
-    )
+    except Exception as exc:
+        raise UcanPermissionError(str(exc)) from exc
+    return UcanToken._from_bridge(bridge_token)
 
 
 __all__ = [

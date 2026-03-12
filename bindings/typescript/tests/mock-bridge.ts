@@ -502,6 +502,67 @@ export function createMockBridge(): Bridge & {
       ctx.revokedTokens.add(token);
     },
 
+    async ucanDelegate(
+      handle: BridgeContextHandle,
+      delegatorDid: string,
+      delegateeDid: string,
+      parentToken: string,
+      capabilities: readonly string[],
+    ): Promise<UcanToken> {
+      const ctx = getContext(handle);
+
+      // Find the parent token by encoded string
+      let parentUcan: UcanToken | undefined;
+      for (const [_id, ucan] of ctx.ucans) {
+        if (ucan.encoded === parentToken) {
+          parentUcan = ucan;
+          break;
+        }
+      }
+      if (parentUcan === undefined) {
+        throw new Error("[SCP-PERM-3000] Parent token not recognized in context");
+      }
+
+      // Verify delegator matches parent audience (iss/aud chain linkage)
+      if (parentUcan.audience !== delegatorDid) {
+        throw new Error(
+          `[SCP-PERM-3000] Delegator DID '${delegatorDid}' does not match parent token audience '${parentUcan.audience}'`,
+        );
+      }
+
+      // Verify attenuation: requested capabilities must be subset of parent
+      const parentCaps = new Set(parentUcan.capabilities);
+      for (const cap of capabilities) {
+        if (!parentCaps.has(cap)) {
+          throw new Error(`[SCP-PERM-3000] Cannot delegate capability not in parent: ${cap}`);
+        }
+      }
+
+      // Mint the delegated token
+      const tokenId = generateId("ucan");
+      const encoded = `eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.${Buffer.from(
+        JSON.stringify({
+          iss: delegatorDid,
+          aud: delegateeDid,
+          cap: capabilities,
+          prf: [parentUcan.id],
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+      ).toString("base64url")}.mock-signature-${tokenId}`;
+
+      const token: UcanToken = {
+        id: tokenId,
+        encoded,
+        issuer: delegatorDid,
+        audience: delegateeDid,
+        capabilities: [...capabilities],
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      };
+
+      ctx.ucans.set(tokenId, token);
+      return token;
+    },
+
     // Event Log
     async eventLogQuery(
       handle: BridgeContextHandle,

@@ -87,11 +87,17 @@ export async function revokeUcan(ctx: Context, token: string): Promise<void> {
  * Delegates a UCAN token to another member.
  *
  * Creates a new UCAN token that delegates a subset of the original token's
- * capabilities to another member. Attenuation rules ensure the delegated
- * token cannot exceed the original's scope.
+ * capabilities to another member. The delegator must be the audience of the
+ * original token (iss/aud chain linkage). Attenuation rules ensure the
+ * delegated token cannot exceed the original's scope.
+ *
+ * Delegates to the real `bridge.ucanDelegate()` which performs Ed25519
+ * signing via the delegator's retained `KeyCustody` and enforces
+ * attenuation, iss/aud chain validation, and ceiling compliance.
  *
  * @param ctx - The context to delegate within.
- * @param originalToken - The original token to delegate from.
+ * @param originalToken - The original token to delegate from (must include `encoded` JWT).
+ * @param delegatorDid - The DID of the entity delegating (must match originalToken.audience).
  * @param targetDid - The DID of the delegation target.
  * @param capabilities - Capability URIs to delegate (must be a subset of the original).
  * @returns The delegated UCAN token.
@@ -100,15 +106,19 @@ export async function revokeUcan(ctx: Context, token: string): Promise<void> {
 export async function delegateUcan(
   ctx: Context,
   originalToken: UcanToken,
+  delegatorDid: string,
   targetDid: string,
   capabilities: readonly string[],
 ): Promise<UcanToken> {
-  // Delegation is implemented as minting with the original token as proof.
-  // The bridge layer validates attenuation rules.
   try {
     const bridge = await getBridge();
-    const _ = originalToken; // Used for delegation chain in full runtime.
-    return await bridge.ucanMint(ctx._handle, targetDid, capabilities);
+    return await bridge.ucanDelegate(
+      ctx._handle,
+      delegatorDid,
+      targetDid,
+      originalToken.encoded,
+      capabilities,
+    );
   } catch (error) {
     throw mapBridgeError(error);
   }

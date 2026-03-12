@@ -220,6 +220,7 @@ export declare function revokeUcan(ctx: Context, token: string): Promise<void>;
 export declare function delegateUcan(
   ctx: Context,
   originalToken: UcanToken,
+  delegatorDid: string,
   targetDid: string,
   capabilities: readonly string[],
 ): Promise<UcanToken>;
