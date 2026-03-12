@@ -258,7 +258,7 @@ pub fn evaluate_provenance_quality(
 /// - `target_context_id` — ID of the target context.
 /// - `existing_chain_depth` — Chain depth from existing provenance, or -1 for first hop.
 /// - `existing_chain_path_json` — JSON array of context IDs from existing provenance, or empty.
-/// - `discovery_method` — Optional: `"none"`, `"shared_context:<id>"`, or `"registry:<id>"`.
+/// - `discovery_method` — Optional: `"OutOfBand"`, `"out_of_band"`, `"shared_context:<id>"`, or `"registry:<id>"`. `"none"`/`"None"` accepted for backward compat.
 /// - `purpose` — Optional human-readable purpose description.
 ///
 /// # WASM limitation: no `counterparty_policy`
@@ -282,7 +282,7 @@ pub fn evaluate_provenance_quality(
 /// const prov = provenance_attach(
 ///   "ctx-source", "Persistent", "Full",
 ///   '["did:key:alice"]', "ctx-target", -1, "[]",
-///   "none", null
+///   "OutOfBand", null
 /// );
 /// ```
 #[wasm_bindgen]
@@ -370,12 +370,20 @@ pub fn provenance_attach(
 }
 
 /// Parses a discovery method string into a JSON value (§24.2.3).
+///
+/// Accepted formats:
+/// - `OutOfBand`, `out_of_band`, `None`, `none`, or absent → `"OutOfBand"`
+/// - `shared_context:<context_id>` → `{"SharedContext": "<context_id>"}`
+/// - `registry:<context_id>` → `{"Registry": "<context_id>"}`
+///
+/// `"None"` / `"none"` are accepted for backward compatibility (renamed to
+/// `OutOfBand` in issue #772).
 fn parse_wasm_discovery_method(s: Option<&str>) -> Result<serde_json::Value, JsError> {
     let Some(s) = s else {
-        return Ok(serde_json::json!("None"));
+        return Ok(serde_json::json!("OutOfBand"));
     };
     match s {
-        "none" | "None" => Ok(serde_json::json!("None")),
+        "none" | "None" | "OutOfBand" | "out_of_band" => Ok(serde_json::json!("OutOfBand")),
         _ if s.starts_with("shared_context:") => {
             let ctx_id = &s["shared_context:".len()..];
             if ctx_id.is_empty() {
@@ -395,8 +403,8 @@ fn parse_wasm_discovery_method(s: Option<&str>) -> Result<serde_json::Value, JsE
             Ok(serde_json::json!({"Registry": ctx_id}))
         }
         other => Err(JsError::new(&format!(
-            "[SCP-VALID-7216] invalid discovery_method '{other}': expected 'none', \
-             'shared_context:<context_id>', or 'registry:<context_id>'"
+            "[SCP-VALID-7216] invalid discovery_method '{other}': expected 'OutOfBand', \
+             'out_of_band', 'shared_context:<context_id>', or 'registry:<context_id>'"
         ))),
     }
 }
@@ -544,7 +552,7 @@ mod tests {
         assert_eq!(json["chain_depth"], 0);
         assert!(json["chain_path"].is_null());
         assert_eq!(json["source_context"], "ctx-source");
-        assert_eq!(json["discovery_method"], "None");
+        assert_eq!(json["discovery_method"], "OutOfBand");
         assert!(json["purpose"].is_null());
         assert!(json["payment_amount"].is_null());
         assert!(json["payment_adapter"].is_null());
@@ -687,6 +695,6 @@ mod tests {
         assert_eq!(registry, serde_json::json!({"Registry": "reg-456"}));
 
         let none = parse_wasm_discovery_method(None).unwrap();
-        assert_eq!(none, serde_json::json!("None"));
+        assert_eq!(none, serde_json::json!("OutOfBand"));
     }
 }

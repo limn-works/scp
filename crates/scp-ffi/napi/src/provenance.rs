@@ -280,8 +280,8 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
         }
         other => Err(ScpNapiError::Validation {
             message: format!(
-                "invalid discovery_method '{other}': expected 'OutOfBand', 'none', \
-                 'shared_context:<context_id>', or 'registry:<context_id>'"
+                "invalid discovery_method '{other}': expected 'OutOfBand', 'out_of_band', \
+                 'none', 'shared_context:<context_id>', or 'registry:<context_id>'"
             ),
             code: "SCP-VALID-7216".to_owned(),
         }

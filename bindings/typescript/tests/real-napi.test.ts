@@ -576,7 +576,7 @@ if (bridge === null) {
       expect(record.chain_depth).toBe(1);
       expect(Array.isArray(record.counterparties)).toBe(true);
       // New fields present with default values.
-      expect(record.discovery_method).toBe("None");
+      expect(record.discovery_method).toBe("OutOfBand");
       expect(record.purpose).toBeNull();
       expect(record.payment_amount).toBeNull();
       expect(record.payment_adapter).toBeNull();

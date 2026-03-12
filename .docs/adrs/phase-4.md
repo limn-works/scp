@@ -412,7 +412,11 @@ pub enum SourceType {
 pub enum DiscoveryMethod {
     SharedContext(ContextId),
     Registry(ContextId),
-    None,
+    /// Renamed from `None` to `OutOfBand` to avoid shadowing `Optional.none`
+    /// in Swift bindings (issue #772). Wire format changed from `"None"` to
+    /// `"OutOfBand"`; `#[serde(alias = "None")]` preserves backward
+    /// compatibility for deserialization of existing data.
+    OutOfBand,
 }
 
 /// Provenance quality evaluation tiers (§7.7.2).
