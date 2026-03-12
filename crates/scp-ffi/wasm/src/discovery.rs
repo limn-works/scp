@@ -1315,8 +1315,53 @@ mod tests {
         let result = discovery_parse_address("alice@photography".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["type"], "DiscoveryHandle");
+        assert_eq!(json["local_part"], "alice");
         assert_eq!(json["scope"], "photography");
+        // No extra fields leak
+        assert!(json.get("domain").is_none());
+        assert!(json.get("raw").is_none());
     }
+
+    #[test]
+    fn parse_domain_handle_unit() {
+        let result = discovery_parse_address("alice@example.com".to_owned()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["type"], "DomainHandle");
+        assert_eq!(json["local_part"], "alice");
+        assert_eq!(json["domain"], "example.com");
+        // No extra fields leak
+        assert!(json.get("scope").is_none());
+    }
+
+    #[test]
+    fn parse_attestation_handle_no_platform_unit() {
+        let result = discovery_parse_address("@alice_cooks".to_owned()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["type"], "AttestationHandle");
+        assert_eq!(json["handle"], "alice_cooks");
+        assert!(json["platform"].is_null());
+    }
+
+    #[test]
+    fn parse_attestation_handle_with_platform_unit() {
+        let result = discovery_parse_address("@alice_cooks:x".to_owned()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["type"], "AttestationHandle");
+        assert_eq!(json["handle"], "alice_cooks");
+        assert_eq!(json["platform"], "x");
+    }
+
+    #[test]
+    fn parse_unscoped_unit() {
+        let result = discovery_parse_address("alice".to_owned()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["type"], "Unscoped");
+        assert_eq!(json["name"], "alice");
+    }
+
+    // Error-path tests for discovery_parse_address are in the wasm_tests
+    // module below (target_arch = "wasm32"), because JsError::new() panics
+    // on non-wasm targets.
 
     // -- scp:// URI parsing tests -------------------------------------------
 
@@ -1506,7 +1551,7 @@ mod wasm_tests {
     }
 
     #[test]
-    fn parse_attestation_handle() {
+    fn parse_attestation_handle_no_platform() {
         let result = discovery_parse_address("@alice_cooks".to_owned()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["type"], "AttestationHandle");
@@ -1544,11 +1589,6 @@ mod wasm_tests {
     #[test]
     fn parse_empty_scope_fails() {
         assert!(discovery_parse_address("alice@".to_owned()).is_err());
-    }
-
-    #[test]
-    fn parse_invalid_local_part_fails() {
-        assert!(discovery_parse_address("ALICE@scope".to_owned()).is_err());
     }
 
     #[test]
