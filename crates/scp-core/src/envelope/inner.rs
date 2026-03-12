@@ -1647,6 +1647,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // from_bytes tests (#863)
+    // -----------------------------------------------------------------------
+
+    /// #863: Valid envelope serialized to msgpack and deserialized via
+    /// `from_bytes` preserves all fields.
+    #[tokio::test]
+    async fn from_bytes_roundtrip_preserves_fields() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let provenance = Provenance {
+            source: "from-bytes-test".into(),
+            upstream_hash: Some("upstream-abc".into()),
+        };
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
+                context_id: "ctx-from-bytes",
+                sender_did: "did:dht:from-bytes",
+                epoch: 7,
+                generation: 3,
+                sequence: 42,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Signaling,
+                payload: b"from_bytes roundtrip",
+                provenance: Some(provenance.clone()),
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        let decoded = InnerEnvelope::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.version, SCP_INNER_ENVELOPE_VERSION);
+        assert_eq!(decoded.context_id, "ctx-from-bytes");
+        assert_eq!(decoded.sender_did, "did:dht:from-bytes");
+        assert_eq!(decoded.epoch, 7);
+        assert_eq!(decoded.generation, 3);
+        assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.timestamp, 1_700_000_000);
+        assert_eq!(decoded.message_type, MessageType::Signaling);
+        assert_eq!(decoded.payload_hash, envelope.payload_hash);
+        assert_eq!(decoded.payload, envelope.payload);
+        assert_eq!(decoded.provenance, Some(provenance));
+        assert_eq!(decoded.provenance_hash, envelope.provenance_hash);
+        assert_eq!(decoded.signing_key_id, SigningKeyId::Agent);
+        assert_eq!(decoded.signature, envelope.signature);
+
+        // Signature must still verify after from_bytes roundtrip.
+        let valid = verify_inner_signature(&decoded, pubkey.as_bytes()).unwrap();
+        assert!(valid, "signature must verify after from_bytes roundtrip");
+    }
+
+    /// #863: `from_bytes` rejects input exceeding `MAX_ENVELOPE_SIZE` before
+    /// invoking the deserializer (parity with `OuterEnvelope::from_bytes`).
+    #[test]
+    fn from_bytes_rejects_oversized_input() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let oversized = vec![0u8; MAX_ENVELOPE_SIZE + 1];
+        let result = InnerEnvelope::from_bytes(&oversized);
+        assert!(result.is_err());
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("EnvelopeTooLarge"),
+            "error should be EnvelopeTooLarge, got: {err_msg}"
+        );
+    }
+
+    /// #863: `from_bytes` accepts input at exactly `MAX_ENVELOPE_SIZE` (the
+    /// size check is not off-by-one). The deserialization itself will fail
+    /// because the bytes are not valid `MessagePack`, but the size check passes.
+    #[test]
+    fn from_bytes_accepts_at_limit() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let at_limit = vec![0u8; MAX_ENVELOPE_SIZE];
+        let result = InnerEnvelope::from_bytes(&at_limit);
+        // Should fail with DeserializationFailed (invalid msgpack), not
+        // EnvelopeTooLarge.
+        assert!(result.is_err());
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("DeserializationFailed"),
+            "should be DeserializationFailed at the limit, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Forward compatibility: unknown fields preserved (#863, §13.5.1, #593)
     // -----------------------------------------------------------------------
 
