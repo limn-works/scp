@@ -1673,13 +1673,32 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
 
         // Re-sync local role state cache from ContextManager after any
         // governance action that may have modified roles/membership (#560).
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to sync role state after governance action — \
-                 local capability checks may be stale"
-            );
+        //
+        // NOTE: Cannot call `sync_role_state_from_manager()` here because that
+        // function uses `rt.block_on()` and we are already inside `rt.block_on()`.
+        // Nested `block_on` panics with "Cannot start a runtime from within a
+        // runtime." Instead, inline the async logic with `.await`.
+        match mgr.get_role_state(&context_id).await {
+            Some(new_role_state) => {
+                if let Err(e) = crate::runtime::with_ffi_state(&context_id, |st| {
+                    st.role_state = new_role_state;
+                    Ok(())
+                }) {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "failed to sync role state after governance action — \
+                         local capability checks may be stale"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    "failed to sync role state after governance action — \
+                     context not found in ContextManager"
+                );
+            }
         }
 
         use scp_core::context::manager::GovernanceActionResult;
