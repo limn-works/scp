@@ -191,7 +191,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         return Err(ScpPyError::ValidationError {
             message: format!(
                 "invalid 'input_schema': expected a JSON object, got {}",
-                value_type_name(&input_schema)
+                scp_ffi_common::validate::json_value_type_name(&input_schema)
             ),
             code: "SCP-VALID-7035".to_owned(),
         }
@@ -207,7 +207,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         return Err(ScpPyError::ValidationError {
             message: format!(
                 "invalid 'output_schema': expected a JSON object, got {}",
-                value_type_name(&output_schema)
+                scp_ffi_common::validate::json_value_type_name(&output_schema)
             ),
             code: "SCP-VALID-7036".to_owned(),
         }
@@ -680,18 +680,6 @@ fn extract_test_vectors(
     Ok(result)
 }
 
-/// Returns a human-readable type name for a `serde_json::Value`.
-const fn value_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Cross-context tool invocation
 // ---------------------------------------------------------------------------
@@ -1127,13 +1115,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_type_name_covers_all_variants() {
-        assert_eq!(value_type_name(&serde_json::Value::Null), "null");
-        assert_eq!(value_type_name(&serde_json::Value::Bool(true)), "boolean");
-        assert_eq!(value_type_name(&serde_json::json!(42)), "number");
-        assert_eq!(value_type_name(&serde_json::json!("hello")), "string");
-        assert_eq!(value_type_name(&serde_json::json!([1, 2])), "array");
-        assert_eq!(value_type_name(&serde_json::json!({"a": 1})), "object");
+    fn json_value_type_name_covers_all_variants() {
+        use scp_ffi_common::validate::json_value_type_name;
+        assert_eq!(json_value_type_name(&serde_json::Value::Null), "null");
+        assert_eq!(
+            json_value_type_name(&serde_json::Value::Bool(true)),
+            "boolean"
+        );
+        assert_eq!(json_value_type_name(&serde_json::json!(42)), "number");
+        assert_eq!(json_value_type_name(&serde_json::json!("hello")), "string");
+        assert_eq!(json_value_type_name(&serde_json::json!([1, 2])), "array");
+        assert_eq!(json_value_type_name(&serde_json::json!({"a": 1})), "object");
     }
 
     /// Schema validation rejects missing `input_schema` with `SCP-VALID-7035`.

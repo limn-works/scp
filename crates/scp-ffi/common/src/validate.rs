@@ -395,6 +395,26 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
+// JSON value type name
+// ---------------------------------------------------------------------------
+
+/// Returns a human-readable type name for a [`serde_json::Value`] variant.
+///
+/// Used in error messages when schema or test-vector validation encounters an
+/// unexpected JSON type (e.g. "expected a JSON object, got array").
+#[must_use]
+pub const fn json_value_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -654,5 +674,20 @@ mod tests {
     fn empty_transport_mode_rejected() {
         let err = validate_transport_mode("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
+    }
+
+    // -- json_value_type_name --
+
+    #[test]
+    fn json_value_type_name_covers_all_variants() {
+        assert_eq!(json_value_type_name(&serde_json::Value::Null), "null");
+        assert_eq!(
+            json_value_type_name(&serde_json::Value::Bool(true)),
+            "boolean"
+        );
+        assert_eq!(json_value_type_name(&serde_json::json!(42)), "number");
+        assert_eq!(json_value_type_name(&serde_json::json!("hello")), "string");
+        assert_eq!(json_value_type_name(&serde_json::json!([1, 2])), "array");
+        assert_eq!(json_value_type_name(&serde_json::json!({"a": 1})), "object");
     }
 }

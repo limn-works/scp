@@ -4902,6 +4902,7 @@ dependencies = [
  "scp-core",
  "scp-identity",
  "scp-platform",
+ "serde_json",
  "tokio",
  "tracing",
  "z-base-32",

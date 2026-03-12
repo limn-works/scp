@@ -10,25 +10,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use scp_ffi_common::validate::{
-    validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
+    json_value_type_name, validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
 };
 
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 use crate::manager::with_manager;
 use crate::runtime;
-
-/// Returns a human-readable type name for a JSON value (for error messages).
-const fn json_value_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // WasmToolVerificationResult
