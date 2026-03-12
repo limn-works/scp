@@ -417,6 +417,7 @@ pub async fn ucan_mint(
 /// See ADR-016 criterion 4.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn ucan_delegate(
     handle: &NapiContextHandle,
     delegator_did: String,
@@ -454,23 +455,6 @@ pub async fn ucan_delegate(
         use scp_core::crypto::ucan::Attenuation;
         use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
         use scp_core::crypto::ucan::validate::parse_ucan;
-
-        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: "UCAN delegation requires key custody — create the context with an \
-                      in_memory identity (identity_create(\"in_memory\"))"
-                    .to_owned(),
-                code: "SCP-PERM-3023".to_owned(),
-            })
-        })?;
-        let signing_key = handle.signing_key.ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: "UCAN delegation requires a signing key — the context creator identity \
-                      must have an active signing key"
-                    .to_owned(),
-                code: "SCP-PERM-3023".to_owned(),
-            })
-        })?;
 
         let context_id = handle.context_id();
 
@@ -527,25 +511,36 @@ pub async fn ucan_delegate(
             Some(ceiling_strings)
         };
 
-        let params = DelegateParams {
-            parent_token: &parsed_parent,
-            delegator_did: &delegator_did,
-            delegator_key: &signing_key,
-            delegatee_did: &delegatee_did,
-            attenuated_capabilities: &attenuations,
-            lifetime_secs: 3600,
-            facts: None,
-            key_scope: None,
-            signing_key_id: None,
-            ceiling,
-        };
+        // Look up the DELEGATOR's identity from the global identity registry.
+        // This is critical: the delegation must be signed with the delegator's
+        // Ed25519 key, NOT the context creator's key. The previous code used
+        // `handle.signing_key` (the context creator's key), which would produce
+        // tokens with invalid signatures when the delegator is not the creator.
+        let token = crate::runtime::with_identity(&delegator_did, |entry| {
+            let params = DelegateParams {
+                parent_token: &parsed_parent,
+                delegator_did: &delegator_did,
+                delegator_key: &entry.identity.active_signing_key,
+                delegatee_did: &delegatee_did,
+                attenuated_capabilities: &attenuations,
+                lifetime_secs: 3600,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling: ceiling.clone(),
+            };
 
-        let token = delegate_ucan(&params, &custody.0).await.map_err(|e| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: format!("UCAN delegation failed: {e}"),
-                code: "SCP-PERM-3023".to_owned(),
-            })
-        })?;
+            // napi-rs async functions run on the tokio runtime, but
+            // `with_identity` holds a DashMap ref guard (sync). Use
+            // `tokio::task::block_in_place` to avoid nesting block_on calls.
+            let rt_handle = tokio::runtime::Handle::current();
+            let result = tokio::task::block_in_place(|| {
+                rt_handle.block_on(async { delegate_ucan(&params, &entry.custody.0).await })
+            });
+
+            result.map_err(ScpNapiError::from)
+        })
+        .map_err(napi::Error::from)?;
 
         let data = NapiUcanTokenData {
             token_id: token.payload.nnc.clone(),

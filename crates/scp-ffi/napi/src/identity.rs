@@ -273,6 +273,15 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Update the identity registry with the rotated key handles.
+            crate::runtime::register_identity(
+                &new_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: new_identity.clone(),
+                    custody: Arc::clone(&custody),
+                },
+            );
+
             let handle = Self {
                 inner: Arc::new(NapiIdentityInner {
                     did: new_identity.did.clone(),
@@ -640,6 +649,17 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Register identity in the global registry so that bridge functions
+            // like `ucan_delegate` can look up this identity's key material by
+            // DID (matching the PyO3 bridge's identity registry pattern).
+            crate::runtime::register_identity(
+                &scp_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: scp_identity.clone(),
+                    custody: Arc::clone(&key_custody),
+                },
+            );
+
             let handle = NapiIdentity {
                 inner: Arc::new(NapiIdentityInner {
                     did: scp_identity.did.clone(),
@@ -716,6 +736,15 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                 .create_with_agent_key(&key_custody.0)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            // Register identity in the global registry (same as identity_create).
+            crate::runtime::register_identity(
+                &scp_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: scp_identity.clone(),
+                    custody: Arc::clone(&key_custody),
+                },
+            );
 
             let handle = NapiIdentity {
                 inner: Arc::new(NapiIdentityInner {
