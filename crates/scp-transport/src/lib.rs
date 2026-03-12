@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 //! Transport abstraction layer for SCP (Shared Context Protocol).
 //!
 //! `scp-transport` defines the [`TransportAdapter`] trait that all SCP transport

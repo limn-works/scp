@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 //! Application node for SCP deployments.
 //!
 //! `scp-node` provides [`ApplicationNode`], a concrete SDK type that composes

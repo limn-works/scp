@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 //! Real-time media transport types for SCP (Shared Context Protocol).
 //!
 //! `scp-media` implements the delegated media model defined in ADR-024.
