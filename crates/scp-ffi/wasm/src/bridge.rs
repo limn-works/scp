@@ -85,6 +85,7 @@ pub struct WasmShadowIdentity {
     shadow_id: String,
     platform_handle: String,
     bridge_id: String,
+    context_id: String,
     attributed_role: String,
     provenance_status: String,
 }
@@ -107,6 +108,12 @@ impl WasmShadowIdentity {
     #[wasm_bindgen(getter, js_name = "bridge_id")]
     pub fn bridge_id(&self) -> String {
         self.bridge_id.clone()
+    }
+
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "context_id")]
+    pub fn context_id(&self) -> String {
+        self.context_id.clone()
     }
 
     #[must_use]
@@ -329,10 +336,31 @@ pub fn bridge_register(
 
     let bridge_mode = BridgeMode::from_str(&mode).map_err(ScpWasmError::into_js)?;
 
-    // Deterministic bridge ID: "bridge-{platform}-{context_id_prefix}"
-    // Mirrors the NAPI bridge's ID generation logic.
-    let ctx_prefix: String = context_id.chars().take(8).collect();
-    let bridge_id = format!("bridge-{platform}-{ctx_prefix}");
+    // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
+    // Uses current timestamp for uniqueness. Hex-encoded for readability.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let now_secs = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            (js_sys::Date::now() / 1000.0) as u64
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+    };
+    let bridge_id = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(context_id.as_bytes());
+        hasher.update(operator_did.as_bytes());
+        hasher.update(platform.as_bytes());
+        hasher.update(now_secs.to_be_bytes());
+        hex::encode(hasher.finalize())
+    };
 
     Ok(WasmBridgeRegistration {
         bridge_id,
@@ -402,7 +430,7 @@ pub fn bridge_create_shadow(
 
     // Default to "ctx-shadow" when context_id is None, matching the NAPI
     // bridge's `context_id.unwrap_or_else(|| "ctx-shadow".to_string())`.
-    let _ctx_id = context_id.unwrap_or_else(|| "ctx-shadow".to_owned());
+    let ctx_id = context_id.unwrap_or_else(|| "ctx-shadow".to_owned());
 
     // Deterministic shadow ID: "shadow-{bridge_id}-{handle_sans_at}"
     // Mirrors the NAPI bridge's ID generation logic.
@@ -413,6 +441,7 @@ pub fn bridge_create_shadow(
         shadow_id,
         platform_handle,
         bridge_id,
+        context_id: ctx_id,
         attributed_role: "observer".to_owned(),
         provenance_status: ShadowProvenanceStatus::Shadow.as_str().to_owned(),
     })

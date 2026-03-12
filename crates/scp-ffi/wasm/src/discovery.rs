@@ -99,19 +99,18 @@ fn validate_scope(scope: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Determines the address type from the scope part.
+/// Determines the address type from the scope part per spec §22.2.
 ///
-/// - Scope contains `.` => `"DomainHandle"` (e.g., `alice@example.com`)
-/// - Scope starts with `did:` => `"AttestationHandle"` (e.g., `alice@did:key:z6Mk...`)
-/// - Scope is `_` => `"Unscoped"` (e.g., `alice@_`)
-/// - Otherwise => `"DiscoveryHandle"` (e.g., `alice@photography`)
+/// - Scope contains `.` => `"domain_handle"` (e.g., `alice@example.com`)
+/// - Otherwise => `"discovery_handle"` (e.g., `alice@photography`)
+///
+/// Note: `Unscoped` (bare name, no `@`) and `AttestationHandle` (platform-
+/// prefixed) are distinguished at the address parsing level in scp-core,
+/// not by scope string inspection. The WASM bridge only handles the two
+/// scope-based types that the spec's §22.2 disambiguation table defines.
 fn classify_scope(scope: &str) -> &'static str {
-    if scope == "_" {
-        "unscoped"
-    } else if scope.contains('.') {
+    if scope.contains('.') {
         "domain_handle"
-    } else if scope.starts_with("did:") {
-        "attestation_handle"
     } else {
         "discovery_handle"
     }
@@ -406,25 +405,13 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
 
     // Timestamp: js_sys is not available in non-wasm test builds, so use a
     // seconds-since-epoch value. In wasm32, js_sys::Date::now() provides
-    // milliseconds; for native test builds, fall back to std::time.
-    #[cfg(target_arch = "wasm32")]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     // Build a single ContextDiscoveryResult matching the NAPI bridge's
-    // discovery_result_to_json output format, including trust_level and
-    // resolution_path per §22.2.1.
+    // discovery_result_to_json output format, including trust_level per §22.2.1.
     //
     // An scp:// URI is shared out-of-band, so the trust level is
-    // DirectExchange and the resolution layer is "domain" (closest match
-    // for URI-based resolution — no discovery context is involved).
-    // See NAPI bridge: ContextDiscoverySource::ContextUri mapping.
+    // DirectExchange. resolution_path is null because no spec-defined
+    // ResolutionPath.layer value (§22.7: petname/discovery_context/
+    // attestation/domain) applies to direct URI dereference.
     let result = serde_json::json!([{
         "context_id": context_id,
         "relay_urls": relay_urls,
@@ -435,12 +422,7 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
         "trust_level": {
             "kind": "DirectExchange",
         },
-        "resolution_path": {
-            "layer": "domain",
-            "source": "context_uri",
-            "source_id": null,
-            "resolved_at": now_secs,
-        },
+        "resolution_path": null,
     }]);
 
     Ok(result.to_string())
@@ -573,10 +555,12 @@ mod tests {
 
     #[test]
     fn classify_scope_types() {
-        assert_eq!(classify_scope("_"), "unscoped");
+        // Only two scope-based types per spec §22.2: domain (has `.`) or discovery
         assert_eq!(classify_scope("example.com"), "domain_handle");
-        assert_eq!(classify_scope("did:key:z6MkTest"), "attestation_handle");
         assert_eq!(classify_scope("photography"), "discovery_handle");
+        // "_" and "did:" scopes are regular scopes — not special-cased
+        assert_eq!(classify_scope("_"), "discovery_handle");
+        assert_eq!(classify_scope("did:key:z6MkTest"), "discovery_handle");
     }
 
     // -- scp:// URI parsing tests -------------------------------------------
@@ -593,12 +577,9 @@ mod tests {
         assert_eq!(arr[0]["relay_urls"][0], "wss://relay.example.com/scp/v1");
         assert_eq!(arr[0]["discovery_source"], "context_uri");
         assert_eq!(arr[0]["mode"], "broadcast");
-        // §22.7: trust_level and resolution_path must be present
+        // §22.7: trust_level present, resolution_path null (no spec layer fits URI dereference)
         assert_eq!(arr[0]["trust_level"]["kind"], "DirectExchange");
-        assert_eq!(arr[0]["resolution_path"]["layer"], "domain");
-        assert_eq!(arr[0]["resolution_path"]["source"], "context_uri");
-        assert!(arr[0]["resolution_path"]["source_id"].is_null());
-        assert!(arr[0]["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
+        assert!(arr[0]["resolution_path"].is_null());
     }
 
     #[test]
