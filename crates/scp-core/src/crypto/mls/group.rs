@@ -902,5 +902,4 @@ mod tests {
             "key package must use SCP ciphersuite"
         );
     }
-
 }
