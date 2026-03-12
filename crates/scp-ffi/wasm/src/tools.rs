@@ -19,7 +19,7 @@ use crate::manager::with_manager;
 use crate::runtime;
 
 /// Returns a human-readable type name for a JSON value (for error messages).
-fn json_value_type_name(v: &serde_json::Value) -> &'static str {
+const fn json_value_type_name(v: &serde_json::Value) -> &'static str {
     match v {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "boolean",
@@ -92,15 +92,14 @@ fn extract_schema_field(
     })?;
 
     if !schema.is_object() {
-        return Err(ScpWasmError::Validation {
+        Err(ScpWasmError::Validation {
             message: format!(
                 "invalid '{field_name}': expected a JSON object, got {}",
                 json_value_type_name(&schema)
             ),
             code: code.to_owned(),
         }
-        .into_js()
-        .into());
+        .into_js())?;
     }
 
     // Validate against JSON Schema meta-schema.
