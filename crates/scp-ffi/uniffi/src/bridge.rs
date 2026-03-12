@@ -4836,7 +4836,8 @@ pub async fn governance_execute(
         tracing::warn!(
             context_id = %handle.context_id,
             action = action_name,
-            "failed to sync role state after governance execution: {e}"
+            error = %e,
+            "failed to sync role state after governance execution"
         );
     }
 
@@ -4964,7 +4965,8 @@ pub async fn governance_propose(
         tracing::warn!(
             context_id = %handle.context_id,
             action = action_name,
-            "failed to sync role state after governance proposal: {e}"
+            error = %e,
+            "failed to sync role state after governance proposal"
         );
     }
 
@@ -5008,7 +5010,8 @@ pub async fn governance_approve(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance approval: {e}"
+            error = %e,
+            "failed to sync role state after governance approval"
         );
     }
 
@@ -5052,7 +5055,8 @@ pub async fn governance_reject(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance rejection: {e}"
+            error = %e,
+            "failed to sync role state after governance rejection"
         );
     }
 
@@ -5096,7 +5100,8 @@ pub async fn governance_withdraw(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
         tracing::warn!(
             context_id = %handle.context_id,
-            "failed to sync role state after governance withdrawal: {e}"
+            error = %e,
+            "failed to sync role state after governance withdrawal"
         );
     }
 
