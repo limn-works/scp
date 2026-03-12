@@ -1390,15 +1390,13 @@ fn verify_ed25519_signature(
     match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
-            // Distinguish malformed inputs (public key / signature byte length
-            // errors) from valid-but-non-matching signatures.
-            if reason.contains("must be 32 bytes")
-                || reason.contains("must be 64 bytes")
-                || reason.contains("invalid public key")
-            {
-                Err(SenderKeyError::VerificationFailed(reason))
-            } else {
+            // Signature mismatch → Ok(false). Malformed inputs → Err.
+            // Match the known verification-failure prefix so unknown errors
+            // default to Err (safe) rather than Ok(false) (silent suppression).
+            if reason.starts_with("signature verification failed") {
                 Ok(false)
+            } else {
+                Err(SenderKeyError::VerificationFailed(reason))
             }
         }
     }
