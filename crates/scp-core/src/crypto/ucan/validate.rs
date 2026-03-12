@@ -791,7 +791,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
         .map(|pos| &token.encoded[..pos])
         .ok_or_else(|| UcanError::MalformedToken("missing signature segment".to_owned()))?;
 
-    crate::crypto::ed25519::verify_ed25519_signature_strict(
+    crate::crypto::ed25519::verify_ed25519_signature(
         &pk_bytes,
         signing_input.as_bytes(),
         &token.signature,

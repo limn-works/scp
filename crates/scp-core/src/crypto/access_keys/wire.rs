@@ -586,7 +586,8 @@ fn compute_request_hash(
     .to_vec()
 }
 
-/// Verifies an Ed25519 signature.
+/// Verifies an Ed25519 signature, delegating to the canonical
+/// [`scp_primitives::crypto::verify_ed25519_signature`].
 ///
 /// Returns `Ok(true)` if the signature is valid, `Ok(false)` if it is
 /// well-formed but invalid, or `Err` if the inputs are malformed.
@@ -595,24 +596,19 @@ fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, AccessKeyError> {
-    use ed25519_dalek::{Signature, VerifyingKey};
-
-    let vk = VerifyingKey::from_bytes(&public_key.try_into().map_err(|_| {
-        AccessKeyError::VerificationFailed(format!(
-            "public key must be 32 bytes, got {}",
-            public_key.len()
-        ))
-    })?)
-    .map_err(|e| AccessKeyError::VerificationFailed(e.to_string()))?;
-
-    let sig = Signature::from_bytes(&signature.try_into().map_err(|_| {
-        AccessKeyError::VerificationFailed(format!(
-            "signature must be 64 bytes, got {}",
-            signature.len()
-        ))
-    })?);
-
-    Ok(vk.verify_strict(message, &sig).is_ok())
+    match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
+        Ok(()) => Ok(true),
+        Err(reason) => {
+            if reason.contains("must be 32 bytes")
+                || reason.contains("must be 64 bytes")
+                || reason.contains("invalid public key")
+            {
+                Err(AccessKeyError::VerificationFailed(reason))
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

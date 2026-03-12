@@ -1387,7 +1387,7 @@ fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, SenderKeyError> {
-    match crate::crypto::ed25519::verify_ed25519_signature_strict(public_key, message, signature) {
+    match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
             // Distinguish malformed inputs (public key / signature byte length

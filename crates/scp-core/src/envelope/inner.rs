@@ -332,7 +332,7 @@ pub fn verify_inner_signature(
     let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
 
     // Verify using strict mode (rejects small-order points).
-    match crate::crypto::ed25519::verify_ed25519_signature_strict(
+    match crate::crypto::ed25519::verify_ed25519_signature(
         sender_public_key,
         &canonical_hash,
         &inner.signature,
