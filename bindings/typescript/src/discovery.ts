@@ -247,3 +247,306 @@ export async function resolveAddress(query: string): Promise<AddressResolution[]
     }),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Petname operations (§22.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Assigns a petname to a DID within the owner's local namespace.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param targetDid - DID to assign the petname to.
+ * @param name - The petname string.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameSet(ownerDid: string, targetDid: string, name: string): Promise<void> {
+  try {
+    const bridge = await getBridge();
+    bridge.petnameSet(ownerDid, targetDid, name);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Removes a petname from a DID.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param targetDid - DID to remove the petname from.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameRemove(ownerDid: string, targetDid: string): Promise<void> {
+  try {
+    const bridge = await getBridge();
+    bridge.petnameRemove(ownerDid, targetDid);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Assigns a petname to a context within the owner's local namespace.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param contextId - Context ID to assign the petname to.
+ * @param name - The petname string.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameSetContext(
+  ownerDid: string,
+  contextId: string,
+  name: string,
+): Promise<void> {
+  try {
+    const bridge = await getBridge();
+    bridge.petnameSetContext(ownerDid, contextId, name);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Removes a petname from a context.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param contextId - Context ID to remove the petname from.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameRemoveContext(ownerDid: string, contextId: string): Promise<void> {
+  try {
+    const bridge = await getBridge();
+    bridge.petnameRemoveContext(ownerDid, contextId);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Resolves a petname to a list of DIDs.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param name - The petname to resolve.
+ * @returns Array of DID strings matching the petname.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameResolveDid(ownerDid: string, name: string): Promise<string[]> {
+  try {
+    const bridge = await getBridge();
+    const json = bridge.petnameResolveDid(ownerDid, name);
+    return safeJsonParse(json, "petnameResolveDid") as string[];
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Resolves a petname to a list of context IDs.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param name - The petname to resolve.
+ * @returns Array of context ID strings matching the petname.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameResolveContext(ownerDid: string, name: string): Promise<string[]> {
+  try {
+    const bridge = await getBridge();
+    const json = bridge.petnameResolveContext(ownerDid, name);
+    return safeJsonParse(json, "petnameResolveContext") as string[];
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Gets the petname assigned to a DID, if any.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param targetDid - DID to look up.
+ * @returns The petname string, or `null` if no petname is assigned.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameGetForDid(
+  ownerDid: string,
+  targetDid: string,
+): Promise<string | null> {
+  try {
+    const bridge = await getBridge();
+    return bridge.petnameGetForDid(ownerDid, targetDid);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Gets the petname assigned to a context, if any.
+ *
+ * @param ownerDid - DID of the identity that owns this petname map.
+ * @param contextId - Context ID to look up.
+ * @returns The petname string, or `null` if no petname is assigned.
+ * @throws {ValidationError} If `ownerDid` is empty.
+ */
+export async function petnameGetForContext(
+  ownerDid: string,
+  contextId: string,
+): Promise<string | null> {
+  try {
+    const bridge = await getBridge();
+    return bridge.petnameGetForContext(ownerDid, contextId);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Handle Registry operations (§22.3.1)
+// ---------------------------------------------------------------------------
+
+/** Result of a handle registration. */
+export interface HandleRegisterResult {
+  readonly status: string;
+  readonly handle: string;
+}
+
+/** Result of a handle lookup. */
+export interface HandleLookupResult {
+  readonly results: readonly Record<string, unknown>[];
+}
+
+/** Result of a handle deregistration. */
+export interface HandleDeregisterResult {
+  readonly removed: boolean;
+}
+
+/**
+ * Registers a handle in a discovery context.
+ *
+ * @param discoveryContextId - ID of the discovery context.
+ * @param handle - The handle string to register.
+ * @param targetJson - JSON describing the target (`{ "type": "identity", "did": "..." }` or `{ "type": "context", "context_id": "...", "relay_urls": [...] }`).
+ * @param registrantDid - DID of the registrant.
+ * @param options - Optional description and tags.
+ * @returns Registration result.
+ * @throws {ValidationError} If `targetJson` is malformed.
+ */
+export async function handleRegister(
+  discoveryContextId: string,
+  handle: string,
+  targetJson: string,
+  registrantDid: string,
+  options?: { description?: string; tags?: string[] },
+): Promise<HandleRegisterResult> {
+  try {
+    const bridge = await getBridge();
+    const result = bridge.handleRegister(
+      discoveryContextId,
+      handle,
+      targetJson,
+      registrantDid,
+      options?.description,
+      options?.tags,
+    );
+    return safeJsonParse(result, "handleRegister") as HandleRegisterResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Looks up a handle in a discovery context.
+ *
+ * @param discoveryContextId - ID of the discovery context.
+ * @param handle - The handle string to look up.
+ * @param typeFilter - Optional filter: `"identity"` or `"context"`.
+ * @returns Lookup result with a `results` array of matching entries.
+ */
+export async function handleLookup(
+  discoveryContextId: string,
+  handle: string,
+  typeFilter?: string,
+): Promise<HandleLookupResult> {
+  try {
+    const bridge = await getBridge();
+    const result = bridge.handleLookup(discoveryContextId, handle, typeFilter);
+    return safeJsonParse(result, "handleLookup") as HandleLookupResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Deregisters a handle from a discovery context.
+ *
+ * @param discoveryContextId - ID of the discovery context.
+ * @param handle - The handle string to deregister.
+ * @param did - DID of the registrant requesting deregistration.
+ * @returns Deregistration result with a `removed` boolean.
+ */
+export async function handleDeregister(
+  discoveryContextId: string,
+  handle: string,
+  did: string,
+): Promise<HandleDeregisterResult> {
+  try {
+    const bridge = await getBridge();
+    const result = bridge.handleDeregister(discoveryContextId, handle, did);
+    return safeJsonParse(result, "handleDeregister") as HandleDeregisterResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-path address resolution (§22.8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves a human-readable address via multi-path resolution pipeline.
+ *
+ * Uses the petname layer first, then handle registries, then attestation
+ * and domain layers per §22.8.
+ *
+ * @param ownerDid - DID of the identity whose petname map to consult.
+ * @param address - The address string to resolve (e.g., `"alice@cooking-community"`).
+ * @param knownContextsJson - Optional JSON object mapping context IDs to names.
+ *   If omitted, uses all registered discovery contexts.
+ * @returns Typed address resolution results.
+ * @throws {ValidationError} If `ownerDid` is empty or address parsing fails.
+ */
+export async function addressResolve(
+  ownerDid: string,
+  address: string,
+  knownContextsJson?: string,
+): Promise<AddressResolution[]> {
+  try {
+    const bridge = await getBridge();
+    const raw = await bridge.addressResolve(ownerDid, address, knownContextsJson);
+    const parsed = safeJsonParse(raw, "addressResolve") as Array<Record<string, unknown>>;
+    return parsed.map((item): AddressResolution => {
+      const trustLevel = parseTrustLevel(item.trust_level ?? item.trustLevel);
+      const rawPath = (item.resolution_path ?? item.resolutionPath ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const resolutionPath = parseResolutionPath(rawPath);
+      if (item.type === "Identity") {
+        return {
+          type: "Identity",
+          did: item.did as string,
+          trustLevel,
+          resolutionPath,
+        };
+      }
+      return {
+        type: "Context",
+        contextId: (item.context_id ?? item.contextId) as string,
+        relayUrls: (item.relay_urls ?? item.relayUrls ?? []) as readonly string[],
+        mode: (item.mode ?? null) as string | null,
+        trustLevel,
+        resolutionPath,
+      };
+    });
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}

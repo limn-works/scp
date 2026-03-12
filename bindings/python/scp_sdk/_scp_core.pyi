@@ -1361,3 +1361,271 @@ def bridge_create_shadow(
         ContextError: If shadow creation fails.
     """
     ...
+
+# ---------------------------------------------------------------------------
+# Discovery bridge functions (crates/scp-ffi/src/discovery.rs)
+# ---------------------------------------------------------------------------
+
+def discovery_parse_address(address: str) -> str:
+    """Parse an SCP address string into its components.
+
+    Returns a JSON string with the parsed address type and fields.
+
+    Args:
+        address: The address string to parse.
+
+    Returns:
+        JSON string with parsed address components.
+
+    Raises:
+        ValidationError: If the address is malformed.
+    """
+    ...
+
+def discovery_create_query(
+    capabilities: list[str] | None = None,
+    keywords: list[str] | None = None,
+    min_history_secs: int | None = None,
+) -> str:
+    """Create a discovery query as a JSON string.
+
+    Args:
+        capabilities: Optional list of required capabilities.
+        keywords: Optional list of search keywords.
+        min_history_secs: Optional minimum history age in seconds.
+
+    Returns:
+        JSON-encoded discovery query.
+    """
+    ...
+
+def discovery_normalize_address(address: str) -> str:
+    """Normalize an address string per SCP addressing rules.
+
+    Lowercases and trims whitespace.
+
+    Args:
+        address: The address string to normalize.
+
+    Returns:
+        Normalized address string.
+    """
+    ...
+
+def context_discover(query: str) -> str:
+    """Discover contexts from a DID string or ``scp://`` URI.
+
+    Args:
+        query: A DID string or ``scp://`` URI.
+
+    Returns:
+        JSON string with an array of discovery results.
+
+    Raises:
+        ValidationError: If DID resolution or URI parsing fails.
+    """
+    ...
+
+# -- Petname operations (section 22.4) --
+
+def petname_set(owner_did: str, target_did: str, name: str) -> None:
+    """Set a petname for a DID.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        target_did: DID to assign the petname to.
+        name: The petname string.
+
+    Raises:
+        ValidationError: If owner_did or target_did is empty.
+    """
+    ...
+
+def petname_remove(owner_did: str, target_did: str) -> None:
+    """Remove a petname from a DID.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        target_did: DID to remove the petname from.
+
+    Raises:
+        ValidationError: If owner_did or target_did is empty.
+    """
+    ...
+
+def petname_set_context(owner_did: str, context_id: str, name: str) -> None:
+    """Set a petname for a context.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        context_id: Context ID to assign the petname to.
+        name: The petname string.
+
+    Raises:
+        ValidationError: If owner_did or context_id is empty.
+    """
+    ...
+
+def petname_remove_context(owner_did: str, context_id: str) -> None:
+    """Remove a petname from a context.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        context_id: Context ID to remove the petname from.
+
+    Raises:
+        ValidationError: If owner_did or context_id is empty.
+    """
+    ...
+
+def petname_resolve_did(owner_did: str, name: str) -> list[str]:
+    """Resolve a petname to DIDs.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        name: The petname to resolve.
+
+    Returns:
+        List of DID strings associated with the petname.
+
+    Raises:
+        ValidationError: If owner_did is empty.
+    """
+    ...
+
+def petname_resolve_context(owner_did: str, name: str) -> list[str]:
+    """Resolve a petname to context IDs.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        name: The petname to resolve.
+
+    Returns:
+        List of context ID strings associated with the petname.
+
+    Raises:
+        ValidationError: If owner_did is empty.
+    """
+    ...
+
+def petname_get_for_did(owner_did: str, target_did: str) -> str | None:
+    """Get the petname assigned to a DID, if any.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        target_did: DID to look up.
+
+    Returns:
+        The petname string, or ``None`` if no petname is assigned.
+
+    Raises:
+        ValidationError: If owner_did or target_did is empty.
+    """
+    ...
+
+def petname_get_for_context(owner_did: str, context_id: str) -> str | None:
+    """Get the petname assigned to a context, if any.
+
+    Args:
+        owner_did: DID of the identity owning this petname map.
+        context_id: Context ID to look up.
+
+    Returns:
+        The petname string, or ``None`` if no petname is assigned.
+
+    Raises:
+        ValidationError: If owner_did or context_id is empty.
+    """
+    ...
+
+# -- Handle registry operations (section 22.3.1) --
+
+def handle_register(
+    discovery_context_id: str,
+    handle: str,
+    target_json: str,
+    registrant_did: str,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Register a handle in a discovery context.
+
+    Args:
+        discovery_context_id: ID of the discovery context.
+        handle: The handle string to register.
+        target_json: JSON describing the target (identity or context).
+        registrant_did: DID of the registrant.
+        description: Optional human-readable description.
+        tags: Optional list of tag strings.
+
+    Returns:
+        JSON string with the registration result.
+
+    Raises:
+        ValidationError: If required fields are empty or target_json is invalid.
+    """
+    ...
+
+def handle_lookup(
+    discovery_context_id: str,
+    handle: str,
+    type_filter: str | None = None,
+) -> str:
+    """Look up a handle in a discovery context.
+
+    Args:
+        discovery_context_id: ID of the discovery context.
+        handle: The handle string to look up.
+        type_filter: Optional filter: ``"identity"`` or ``"context"``.
+
+    Returns:
+        JSON string with a results array of matching entries.
+
+    Raises:
+        ValidationError: If type_filter is not a recognized value.
+    """
+    ...
+
+def handle_deregister(
+    discovery_context_id: str,
+    handle: str,
+    did: str,
+) -> str:
+    """Deregister a handle from a discovery context.
+
+    Args:
+        discovery_context_id: ID of the discovery context.
+        handle: The handle string to deregister.
+        did: DID of the registrant requesting deregistration.
+
+    Returns:
+        JSON string with a ``removed`` boolean.
+
+    Raises:
+        ValidationError: If required fields are empty.
+    """
+    ...
+
+# -- Address resolution (section 22.8) --
+
+def address_resolve(
+    owner_did: str,
+    address: str,
+    known_contexts_json: str | None = None,
+) -> str:
+    """Resolve a human-readable address via multi-path resolution.
+
+    Args:
+        owner_did: DID of the identity whose petname map to consult.
+        address: The address string to resolve.
+        known_contexts_json: Optional JSON object mapping context IDs
+            to scope names.
+
+    Returns:
+        JSON string with an array of ``AddressResolution`` objects.
+
+    Raises:
+        ValidationError: If owner_did is empty or known_contexts_json
+            is malformed.
+    """
+    ...

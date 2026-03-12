@@ -109,9 +109,275 @@ def discover(query: str) -> list[dict[str, Any]]:
     return [dict(r) for r in bridge.context_discover(query)]
 
 
+# ---------------------------------------------------------------------------
+# Petname operations (spec section 22.4)
+# ---------------------------------------------------------------------------
+
+
+def petname_set(owner_did: str, target_did: str, name: str) -> None:
+    """Assign a petname to a DID within the owner's local namespace.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        target_did: DID to assign the petname to.
+        name: The petname string.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    bridge.petname_set(owner_did, target_did, name)
+
+
+def petname_remove(owner_did: str, target_did: str) -> None:
+    """Remove a petname from a DID.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        target_did: DID to remove the petname from.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    bridge.petname_remove(owner_did, target_did)
+
+
+def petname_set_context(owner_did: str, context_id: str, name: str) -> None:
+    """Assign a petname to a context within the owner's local namespace.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        context_id: Context ID to assign the petname to.
+        name: The petname string.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    bridge.petname_set_context(owner_did, context_id, name)
+
+
+def petname_remove_context(owner_did: str, context_id: str) -> None:
+    """Remove a petname from a context.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        context_id: Context ID to remove the petname from.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    bridge.petname_remove_context(owner_did, context_id)
+
+
+def petname_resolve_did(owner_did: str, name: str) -> list[str]:
+    """Resolve a petname to a list of DIDs.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        name: The petname to resolve.
+
+    Returns:
+        A list of DID strings matching the petname.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    return list(bridge.petname_resolve_did(owner_did, name))
+
+
+def petname_resolve_context(owner_did: str, name: str) -> list[str]:
+    """Resolve a petname to a list of context IDs.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        name: The petname to resolve.
+
+    Returns:
+        A list of context ID strings matching the petname.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    return list(bridge.petname_resolve_context(owner_did, name))
+
+
+def petname_get_for_did(owner_did: str, target_did: str) -> str | None:
+    """Get the petname assigned to a DID, if any.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        target_did: DID to look up.
+
+    Returns:
+        The petname string, or ``None`` if no petname is assigned.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    return bridge.petname_get_for_did(owner_did, target_did)
+
+
+def petname_get_for_context(owner_did: str, context_id: str) -> str | None:
+    """Get the petname assigned to a context, if any.
+
+    Args:
+        owner_did: DID of the identity that owns this petname map.
+        context_id: Context ID to look up.
+
+    Returns:
+        The petname string, or ``None`` if no petname is assigned.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty.
+    """
+    bridge = _bridge()
+    return bridge.petname_get_for_context(owner_did, context_id)
+
+
+# ---------------------------------------------------------------------------
+# Handle registry operations (spec section 22.3.1)
+# ---------------------------------------------------------------------------
+
+
+def handle_register(
+    discovery_context_id: str,
+    handle: str,
+    target_json: str,
+    registrant_did: str,
+    *,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Register a handle in a discovery context.
+
+    Args:
+        discovery_context_id: ID of the discovery context.
+        handle: The handle string to register.
+        target_json: JSON string describing the target. Must have a
+            ``"type"`` field (``"identity"`` or ``"context"``).
+        registrant_did: DID of the registrant.
+        description: Optional human-readable description.
+        tags: Optional list of tag strings.
+
+    Returns:
+        A dict with the registration result.
+
+    Raises:
+        ValidationError: If ``target_json`` is malformed.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.handle_register(
+        discovery_context_id, handle, target_json, registrant_did, description, tags
+    )
+    return json.loads(result)
+
+
+def handle_lookup(
+    discovery_context_id: str,
+    handle: str,
+    *,
+    type_filter: str | None = None,
+) -> dict[str, Any]:
+    """Look up a handle in a discovery context.
+
+    Args:
+        discovery_context_id: ID of the discovery context.
+        handle: The handle string to look up.
+        type_filter: Optional filter: ``"identity"`` or ``"context"``.
+
+    Returns:
+        A dict with a ``results`` list of matching handle entries.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.handle_lookup(discovery_context_id, handle, type_filter)
+    return json.loads(result)
+
+
+def handle_deregister(
+    discovery_context_id: str,
+    handle: str,
+    did: str,
+) -> dict[str, Any]:
+    """Deregister a handle from a discovery context.
+
+    Args:
+        discovery_context_id: ID of the discovery context.
+        handle: The handle string to deregister.
+        did: DID of the registrant requesting deregistration.
+
+    Returns:
+        A dict with a ``removed`` boolean.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.handle_deregister(discovery_context_id, handle, did)
+    return json.loads(result)
+
+
+# ---------------------------------------------------------------------------
+# Address resolution (spec section 22.8)
+# ---------------------------------------------------------------------------
+
+
+def address_resolve(
+    owner_did: str,
+    address: str,
+    *,
+    known_contexts_json: str | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve a human-readable address via multi-path resolution.
+
+    Uses the petname layer first, then handle registries, then attestation
+    and domain layers per the resolution pipeline (spec section 22.8).
+
+    Args:
+        owner_did: DID of the identity whose petname map to consult.
+        address: The address string to resolve
+            (e.g., ``"alice@cooking-community"``).
+        known_contexts_json: Optional JSON object mapping context IDs to
+            names. If ``None``, uses all registered discovery contexts.
+
+    Returns:
+        A list of ``AddressResolution`` dicts, each with ``type``
+        (``"Identity"`` or ``"Context"``), trust level, and resolution
+        path metadata.
+
+    Raises:
+        ValidationError: If ``owner_did`` is empty or address parsing fails.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.address_resolve(owner_did, address, known_contexts_json)
+    return json.loads(result)
+
+
 __all__ = [
+    "address_resolve",
     "create_query",
     "discover",
+    "handle_deregister",
+    "handle_lookup",
+    "handle_register",
     "normalize_address",
     "parse_address",
+    "petname_get_for_context",
+    "petname_get_for_did",
+    "petname_remove",
+    "petname_remove_context",
+    "petname_resolve_context",
+    "petname_resolve_did",
+    "petname_set",
+    "petname_set_context",
 ]

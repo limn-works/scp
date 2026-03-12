@@ -79,7 +79,7 @@ pub enum PetnameEvent {
 /// persistence (§3.7).
 ///
 /// See §22.4 Petnames.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PetnameMap {
     /// Maps petname -> list of DIDs (multiple DIDs possible for same name).
     did_petnames: HashMap<String, Vec<DID>>,

@@ -6496,6 +6496,590 @@ pub fn discovery_normalize_address(address: String) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Petname bridge functions (§22.4)
+// ---------------------------------------------------------------------------
+
+/// Global petname map keyed by owner DID string.
+fn uniffi_petname_maps()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::PetnameMap>> {
+    use std::sync::{Mutex, OnceLock};
+    static MAPS: OnceLock<
+        Mutex<std::collections::HashMap<String, scp_core::discovery::PetnameMap>>,
+    > = OnceLock::new();
+    MAPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Global handle registries keyed by discovery context ID.
+fn uniffi_handle_registries()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::HandleRegistry>>
+{
+    use std::sync::{Mutex, OnceLock};
+    static REGISTRIES: OnceLock<
+        Mutex<std::collections::HashMap<String, scp_core::discovery::HandleRegistry>>,
+    > = OnceLock::new();
+    REGISTRIES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Sets a petname for a DID.
+#[uniffi::export]
+pub fn petname_set(owner_did: String, target_did: String, name: String) -> Result<(), ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let mut guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    let map = guard.entry(owner_did).or_default();
+    map.set_petname(scp_identity::DID::from(target_did.as_str()), name);
+    Ok(())
+}
+
+/// Removes a petname from a DID.
+#[uniffi::export]
+pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let mut guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    if let Some(map) = guard.get_mut(&owner_did) {
+        map.remove_petname(&scp_identity::DID::from(target_did.as_str()));
+    }
+    Ok(())
+}
+
+/// Sets a petname for a context.
+#[uniffi::export]
+pub fn petname_set_context(
+    owner_did: String,
+    context_id: String,
+    name: String,
+) -> Result<(), ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let mut guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    let map = guard.entry(owner_did).or_default();
+    map.set_context_petname(context_id, name);
+    Ok(())
+}
+
+/// Removes a petname from a context.
+#[uniffi::export]
+pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(), ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let mut guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    if let Some(map) = guard.get_mut(&owner_did) {
+        map.remove_context_petname(&context_id);
+    }
+    Ok(())
+}
+
+/// Resolves a petname to DIDs. Returns a JSON array of DID strings.
+#[uniffi::export]
+pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    let dids: Vec<String> = guard
+        .get(&owner_did)
+        .map(|map| {
+            map.resolve_did(&name)
+                .into_iter()
+                .map(|d| d.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&dids).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize petname resolve result: {e}"),
+        code: "SCP-VALID-7074".to_owned(),
+    })
+}
+
+/// Resolves a petname to context IDs. Returns a JSON array of strings.
+#[uniffi::export]
+pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String, ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    let ids: Vec<String> = guard
+        .get(&owner_did)
+        .map(|map| map.resolve_context(&name))
+        .unwrap_or_default();
+    serde_json::to_string(&ids).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize petname resolve result: {e}"),
+        code: "SCP-VALID-7074".to_owned(),
+    })
+}
+
+/// Gets the petname for a DID.
+#[uniffi::export]
+pub fn petname_get_for_did(
+    owner_did: String,
+    target_did: String,
+) -> Result<Option<String>, ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    Ok(guard.get(&owner_did).and_then(|map| {
+        map.petname_for_did(&scp_identity::DID::from(target_did.as_str()))
+            .map(str::to_owned)
+    }))
+}
+
+/// Gets the petname for a context.
+#[uniffi::export]
+pub fn petname_get_for_context(
+    owner_did: String,
+    context_id: String,
+) -> Result<Option<String>, ScpError> {
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+    let guard = uniffi_petname_maps()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("petname lock poisoned: {e}"),
+            code: "SCP-VALID-7072".to_owned(),
+        })?;
+    Ok(guard
+        .get(&owner_did)
+        .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
+}
+
+// ---------------------------------------------------------------------------
+// Handle registry bridge functions (§22.3.1)
+// ---------------------------------------------------------------------------
+
+/// Registers a handle in a discovery context. Returns JSON result.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn handle_register(
+    discovery_context_id: String,
+    handle: String,
+    target_json: String,
+    registrant_did: String,
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<String, ScpError> {
+    let target = uniffi_parse_handle_target(&target_json)?;
+    let params = scp_core::discovery::HandleRegisterParams {
+        handle,
+        target,
+        metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
+    };
+    let mut guard = uniffi_handle_registries()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("handle registry lock poisoned: {e}"),
+            code: "SCP-VALID-7080".to_owned(),
+        })?;
+    let registry = guard
+        .entry(discovery_context_id.clone())
+        .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
+    let result = registry
+        .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
+        .map_err(|e| ScpError::Validation {
+            message: format!("clock error during handle registration: {e}"),
+            code: "SCP-VALID-7081".to_owned(),
+        })?;
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize handle register result: {e}"),
+        code: "SCP-VALID-7082".to_owned(),
+    })
+}
+
+/// Looks up a handle in a discovery context. Returns JSON result.
+#[uniffi::export]
+pub fn handle_lookup(
+    discovery_context_id: String,
+    handle: String,
+    type_filter: Option<String>,
+) -> Result<String, ScpError> {
+    let filter = match type_filter.as_deref() {
+        Some("identity") => Some(scp_core::discovery::HandleTypeFilter::Identity),
+        Some("context") => Some(scp_core::discovery::HandleTypeFilter::Context),
+        Some(other) => {
+            return Err(ScpError::Validation {
+                message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
+                code: "SCP-VALID-7083".to_owned(),
+            });
+        }
+        None => None,
+    };
+    let guard = uniffi_handle_registries()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("handle registry lock poisoned: {e}"),
+            code: "SCP-VALID-7080".to_owned(),
+        })?;
+    let result = guard.get(&discovery_context_id).map_or_else(
+        || scp_core::discovery::HandleLookupResult {
+            results: Vec::new(),
+        },
+        |registry| {
+            registry.lookup(&scp_core::discovery::HandleLookupParams {
+                handle,
+                type_filter: filter,
+            })
+        },
+    );
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize handle lookup result: {e}"),
+        code: "SCP-VALID-7084".to_owned(),
+    })
+}
+
+/// Deregisters a handle from a discovery context. Returns JSON result.
+#[uniffi::export]
+pub fn handle_deregister(
+    discovery_context_id: String,
+    handle: String,
+    did: String,
+) -> Result<String, ScpError> {
+    let mut guard = uniffi_handle_registries()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            message: format!("handle registry lock poisoned: {e}"),
+            code: "SCP-VALID-7080".to_owned(),
+        })?;
+    let result = guard.get_mut(&discovery_context_id).map_or_else(
+        || scp_core::discovery::HandleDeregisterResult { removed: false },
+        |registry| {
+            registry.deregister(&scp_core::discovery::HandleDeregisterParams {
+                handle,
+                did: scp_identity::DID::from(did.as_str()),
+            })
+        },
+    );
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize handle deregister result: {e}"),
+        code: "SCP-VALID-7085".to_owned(),
+    })
+}
+
+/// Resolves a human-readable address via multi-path resolution.
+/// Returns a JSON array of `AddressResolution` objects.
+#[uniffi::export]
+pub fn address_resolve(
+    owner_did: String,
+    address: String,
+    known_contexts_json: Option<String>,
+) -> Result<String, ScpError> {
+    use scp_core::discovery::addressing::{
+        AddressResolution, AddressType, HandleQuerier, HandleTarget, ResolutionLayer,
+        ResolutionPath, TrustLevel,
+    };
+
+    if owner_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "owner_did must not be empty".to_owned(),
+            code: "SCP-VALID-7070".to_owned(),
+        });
+    }
+
+    struct UniFFIHandleQuerier;
+
+    impl HandleQuerier for UniFFIHandleQuerier {
+        async fn lookup_handle(
+            &self,
+            context_id: &String,
+            handle: &str,
+            type_filter: Option<AddressType>,
+        ) -> Vec<AddressResolution> {
+            let Ok(guard) = uniffi_handle_registries().lock() else {
+                return Vec::new();
+            };
+            let Some(registry) = guard.get(context_id.as_str()) else {
+                return Vec::new();
+            };
+            let filter = type_filter.map(|tf| match tf {
+                AddressType::Identity => scp_core::discovery::HandleTypeFilter::Identity,
+                AddressType::Context => scp_core::discovery::HandleTypeFilter::Context,
+            });
+            let result = registry.lookup(&scp_core::discovery::HandleLookupParams {
+                handle: handle.to_owned(),
+                type_filter: filter,
+            });
+            let now = scp_core::time::now_secs().unwrap_or(0);
+            result
+                .results
+                .into_iter()
+                .map(|entry| {
+                    let resolution_path = ResolutionPath {
+                        layer: ResolutionLayer::DiscoveryContext,
+                        source: "local_registry".to_owned(),
+                        source_id: Some(context_id.clone()),
+                        resolved_at: now,
+                    };
+                    let trust_level = TrustLevel::DiscoveryContextVerified;
+                    match &entry.target {
+                        HandleTarget::Identity { did } => AddressResolution::Identity {
+                            did: did.clone(),
+                            trust_level,
+                            resolution_path,
+                        },
+                        HandleTarget::Context {
+                            context_id: ctx_id,
+                            relay_urls,
+                        } => AddressResolution::Context {
+                            context_id: ctx_id.clone(),
+                            relay_urls: relay_urls.clone(),
+                            mode: None,
+                            trust_level,
+                            resolution_path,
+                        },
+                    }
+                })
+                .collect()
+        }
+
+        async fn lookup_domain_handle(
+            &self,
+            _domain: &str,
+            _handle: &str,
+        ) -> Vec<AddressResolution> {
+            Vec::new()
+        }
+
+        async fn lookup_attestation_handle(
+            &self,
+            _handle: &str,
+            _platform: Option<&str>,
+        ) -> Vec<AddressResolution> {
+            Vec::new()
+        }
+    }
+
+    let known_contexts: std::collections::HashMap<String, String> =
+        if let Some(ref json) = known_contexts_json {
+            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                message: format!("invalid known_contexts_json: {e}"),
+                code: "SCP-VALID-7090".to_owned(),
+            })?
+        } else {
+            let guard = uniffi_handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    message: format!("handle registry lock poisoned: {e}"),
+                    code: "SCP-VALID-7080".to_owned(),
+                })?;
+            guard.keys().map(|k| (k.clone(), k.clone())).collect()
+        };
+    let known_domains: Vec<&str> = Vec::new();
+    let petname_map = {
+        let guard = uniffi_petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: "SCP-VALID-7072".to_owned(),
+            })?;
+        guard.get(&owner_did).cloned().unwrap_or_default()
+    };
+
+    let handle = tokio::runtime::Handle::current();
+    let results = tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            let mut resolver = scp_core::discovery::AddressResolver::new();
+            let querier = UniFFIHandleQuerier;
+            resolver
+                .resolve(
+                    &address,
+                    &petname_map,
+                    &querier,
+                    &known_contexts,
+                    &known_domains,
+                )
+                .await
+                .map_err(|e| ScpError::Validation {
+                    message: format!("address resolution failed: {e}"),
+                    code: "SCP-VALID-7091".to_owned(),
+                })
+        })
+    })?;
+
+    fn addr_resolution_to_json(resolution: &AddressResolution) -> serde_json::Value {
+        match resolution {
+            AddressResolution::Identity {
+                did,
+                trust_level,
+                resolution_path,
+            } => serde_json::json!({
+                "type": "Identity",
+                "did": did.to_string(),
+                "trust_level": trust_to_json(trust_level),
+                "resolution_path": path_to_json(resolution_path),
+            }),
+            AddressResolution::Context {
+                context_id,
+                relay_urls,
+                mode,
+                trust_level,
+                resolution_path,
+            } => serde_json::json!({
+                "type": "Context",
+                "context_id": context_id,
+                "relay_urls": relay_urls,
+                "mode": mode,
+                "trust_level": trust_to_json(trust_level),
+                "resolution_path": path_to_json(resolution_path),
+            }),
+        }
+    }
+
+    fn trust_to_json(trust_level: &TrustLevel) -> serde_json::Value {
+        match trust_level {
+            TrustLevel::DirectExchange => serde_json::json!({"kind": "DirectExchange"}),
+            TrustLevel::LocalPetname => serde_json::json!({"kind": "LocalPetname"}),
+            TrustLevel::MultiLayerCorroborated { sources } => serde_json::json!({
+                "kind": "MultiLayerCorroborated",
+                "sources": sources.iter().map(path_to_json).collect::<Vec<_>>(),
+            }),
+            TrustLevel::DomainVerified => serde_json::json!({"kind": "DomainVerified"}),
+            TrustLevel::AttestationVerified => {
+                serde_json::json!({"kind": "AttestationVerified"})
+            }
+            TrustLevel::DiscoveryContextVerified => {
+                serde_json::json!({"kind": "DiscoveryContextVerified"})
+            }
+        }
+    }
+
+    fn path_to_json(path: &ResolutionPath) -> serde_json::Value {
+        let layer = match path.layer {
+            ResolutionLayer::Petname => "Petname",
+            ResolutionLayer::DiscoveryContext => "DiscoveryContext",
+            ResolutionLayer::Attestation => "Attestation",
+            ResolutionLayer::Domain => "Domain",
+            ResolutionLayer::MultiLayerCorroborated => "MultiLayerCorroborated",
+        };
+        serde_json::json!({
+            "layer": layer,
+            "source": path.source,
+            "source_id": path.source_id,
+            "resolved_at": path.resolved_at,
+        })
+    }
+
+    let json_results: Vec<serde_json::Value> =
+        results.iter().map(addr_resolution_to_json).collect();
+    serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize address resolution results: {e}"),
+        code: "SCP-VALID-7092".to_owned(),
+    })
+}
+
+/// Parses a `HandleTarget` from a JSON string (`UniFFI` helper).
+fn uniffi_parse_handle_target(
+    json: &str,
+) -> Result<scp_core::discovery::addressing::HandleTarget, ScpError> {
+    let val: serde_json::Value = serde_json::from_str(json).map_err(|e| ScpError::Validation {
+        message: format!("invalid target_json: {e}"),
+        code: "SCP-VALID-7086".to_owned(),
+    })?;
+    let target_type = val["type"].as_str().ok_or_else(|| ScpError::Validation {
+        message: "target_json must have a 'type' field ('identity' or 'context')".to_owned(),
+        code: "SCP-VALID-7086".to_owned(),
+    })?;
+    match target_type {
+        "identity" => {
+            let did = val["did"].as_str().ok_or_else(|| ScpError::Validation {
+                message: "identity target must have a 'did' field".to_owned(),
+                code: "SCP-VALID-7086".to_owned(),
+            })?;
+            Ok(scp_core::discovery::addressing::HandleTarget::Identity {
+                did: scp_identity::DID::from(did),
+            })
+        }
+        "context" => {
+            let ctx_id = val["context_id"]
+                .as_str()
+                .ok_or_else(|| ScpError::Validation {
+                    message: "context target must have a 'context_id' field".to_owned(),
+                    code: "SCP-VALID-7086".to_owned(),
+                })?;
+            let relay_urls = val["relay_urls"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(scp_core::discovery::addressing::HandleTarget::Context {
+                context_id: ctx_id.to_owned(),
+                relay_urls,
+            })
+        }
+        other => Err(ScpError::Validation {
+            message: format!("invalid target type '{other}': expected 'identity' or 'context'"),
+            code: "SCP-VALID-7086".to_owned(),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Identity — create with agent key (#421)
 // ---------------------------------------------------------------------------
 

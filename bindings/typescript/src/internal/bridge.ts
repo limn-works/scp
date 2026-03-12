@@ -256,6 +256,35 @@ export interface Bridge {
   discoveryNormalizeAddress(address: string): string;
   contextDiscover(query: string): Promise<string>;
 
+  // Petnames (section 22.4)
+  petnameSet(ownerDid: string, targetDid: string, name: string): void;
+  petnameRemove(ownerDid: string, targetDid: string): void;
+  petnameSetContext(ownerDid: string, contextId: string, name: string): void;
+  petnameRemoveContext(ownerDid: string, contextId: string): void;
+  petnameResolveDid(ownerDid: string, name: string): string;
+  petnameResolveContext(ownerDid: string, name: string): string;
+  petnameGetForDid(ownerDid: string, targetDid: string): string | null;
+  petnameGetForContext(ownerDid: string, contextId: string): string | null;
+
+  // Handle Registry (section 22.3.1)
+  handleRegister(
+    discoveryContextId: string,
+    handle: string,
+    targetJson: string,
+    registrantDid: string,
+    description: string | undefined,
+    tags: string[] | undefined,
+  ): string;
+  handleLookup(discoveryContextId: string, handle: string, typeFilter: string | undefined): string;
+  handleDeregister(discoveryContextId: string, handle: string, did: string): string;
+
+  // Address Resolution (section 22.8)
+  addressResolve(
+    ownerDid: string,
+    address: string,
+    knownContextsJson: string | undefined,
+  ): Promise<string>;
+
   // Provenance
   evaluateProvenanceQuality(
     sourceContext: string | undefined,
