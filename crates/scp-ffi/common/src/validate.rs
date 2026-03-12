@@ -69,8 +69,8 @@ pub const MAX_DID_LEN: usize = 512;
 /// Maximum length for a tool name.
 pub const MAX_TOOL_NAME_LEN: usize = 256;
 
-/// Maximum length for a tool ID.
-pub const MAX_TOOL_ID_LEN: usize = 512;
+/// Maximum length for a tool ID (spec §5.4.1).
+pub const MAX_TOOL_ID_LEN: usize = 128;
 
 /// Maximum length for a capability URI string.
 pub const MAX_CAPABILITY_URI_LEN: usize = 1024;
@@ -244,19 +244,32 @@ pub fn validate_tool_name(name: &str) -> Result<(), ValidationError> {
 
 /// Validates a tool ID string.
 ///
-/// Tool IDs are derived from tool names (e.g., `tool-my-tool`). Validation
-/// enforces:
+/// Tool IDs are derived from tool names (e.g., `tool-my-tool`). Per spec
+/// §5.4.1, tool IDs must contain only lowercase alphanumeric characters,
+/// hyphens, and underscores (`[a-z0-9_-]`). Validation enforces:
 /// - Non-empty
-/// - Length <= [`MAX_TOOL_ID_LEN`]
+/// - Length <= [`MAX_TOOL_ID_LEN`] (128 chars per §5.4.1)
+/// - Characters restricted to `[a-z0-9_-]`
 /// - No control characters
 ///
 /// # Errors
 ///
 /// Returns [`ValidationError`] if the tool ID is empty,
-/// too long, or contains control characters.
+/// too long, contains control characters, or contains characters outside
+/// the `[a-z0-9_-]` class.
 pub fn validate_tool_id(tool_id: &str) -> Result<(), ValidationError> {
     validate_non_empty(tool_id, "tool_id", MAX_TOOL_ID_LEN)?;
     reject_control_chars(tool_id, "tool_id")?;
+
+    if !tool_id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(ValidationError::new(format!(
+            "tool_id contains invalid characters: expected [a-z0-9_-], got {tool_id:?}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -550,9 +563,46 @@ mod tests {
     }
 
     #[test]
+    fn valid_tool_id_with_underscores_and_digits() {
+        assert!(validate_tool_id("my_tool_42").is_ok());
+    }
+
+    #[test]
     fn empty_tool_id_rejected() {
         let err = validate_tool_id("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn tool_id_with_uppercase_rejected() {
+        let err = validate_tool_id("Tool-My-Tool").unwrap_err();
+        assert!(err.message.contains("invalid characters"));
+        assert!(err.message.contains("[a-z0-9_-]"));
+    }
+
+    #[test]
+    fn tool_id_with_spaces_rejected() {
+        let err = validate_tool_id("tool my tool").unwrap_err();
+        assert!(err.message.contains("invalid characters"));
+    }
+
+    #[test]
+    fn tool_id_with_special_chars_rejected() {
+        let err = validate_tool_id("tool/my.tool").unwrap_err();
+        assert!(err.message.contains("invalid characters"));
+    }
+
+    #[test]
+    fn tool_id_too_long_rejected() {
+        let long_id = "a".repeat(MAX_TOOL_ID_LEN + 1);
+        let err = validate_tool_id(&long_id).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn tool_id_at_max_length_accepted() {
+        let id = "a".repeat(MAX_TOOL_ID_LEN);
+        assert!(validate_tool_id(&id).is_ok());
     }
 
     // -- Capability URI --
