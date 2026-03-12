@@ -3339,7 +3339,9 @@ impl WasmContextManager {
 
             if !block_list.remove(subscriber_did) {
                 return Err(ScpWasmError::Context {
-                    message: format!("subscriber not blocked: {subscriber_did}"),
+                    message: format!(
+                        "subscriber {subscriber_did} not blocked by author {unblocker_did}"
+                    ),
                     code: "SCP-CTX-2001".to_owned(),
                 });
             }
@@ -5033,6 +5035,37 @@ mod tests {
             bc.authors["author-b"].is_empty(),
             "author-b's block list should be empty — pre-validation must prevent partial mutation"
         );
+    }
+
+    #[test]
+    fn unblock_not_blocked_subscriber_error_contains_both_dids() {
+        let author = "did:dht:zauthor1";
+        let subscriber = "did:dht:zsub_not_blocked";
+        let mut mgr = make_manager_with_broadcast("ctx-1", author, &[author], &[subscriber]);
+
+        // Subscriber is NOT blocked — unblock should fail.
+        let err = mgr
+            .unblock_broadcast_subscriber("ctx-1", subscriber, author)
+            .unwrap_err();
+
+        match &err {
+            ScpWasmError::Context { message, code } => {
+                assert_eq!(code, "SCP-CTX-2001");
+                assert!(
+                    message.contains(subscriber),
+                    "error should contain subscriber DID, got: {message}"
+                );
+                assert!(
+                    message.contains(author),
+                    "error should contain author/unblocker DID, got: {message}"
+                );
+                assert_eq!(
+                    message,
+                    &format!("subscriber {subscriber} not blocked by author {author}")
+                );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
     }
 
     #[test]
