@@ -522,6 +522,10 @@ pub async fn delete_context_handler(
 // Router constructor
 // ---------------------------------------------------------------------------
 
+/// Maximum request body size for the dev API (64 KiB).
+/// Prevents unbounded memory allocation from oversized POST bodies.
+const DEV_API_MAX_BODY_SIZE: usize = 64 * 1024;
+
 /// Returns an axum [`Router`] serving the dev API endpoints under
 /// `/scp/dev/v1`.
 ///
@@ -531,10 +535,6 @@ pub async fn delete_context_handler(
 /// `Authorization: Bearer <token>` header receive HTTP 401.
 ///
 /// See spec section 18.10.2.
-/// Maximum request body size for the dev API (64 KiB).
-/// Prevents unbounded memory allocation from oversized POST bodies.
-const DEV_API_MAX_BODY_SIZE: usize = 64 * 1024;
-
 pub fn dev_router(state: Arc<NodeState>, token: String) -> axum::Router {
     use axum::middleware;
     use axum::routing::get;

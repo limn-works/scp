@@ -533,25 +533,61 @@ pub struct DeadlockJustification {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceAction {
     /// Add a member to the context with a specified role.
-    AddMember { did: DID, role: String },
+    AddMember {
+        /// The DID of the member to add.
+        did: DID,
+        /// The role to assign to the new member.
+        role: String,
+    },
     /// Remove a member from the context.
-    RemoveMember { did: DID, reason: Option<String> },
+    RemoveMember {
+        /// The DID of the member to remove.
+        did: DID,
+        /// Optional reason for removal.
+        reason: Option<String>,
+    },
     /// Change a member's role.
-    ChangeRole { did: DID, new_role: String },
+    ChangeRole {
+        /// The DID of the member whose role is changing.
+        did: DID,
+        /// The new role to assign.
+        new_role: String,
+    },
     /// Register a new tool in the context.
-    RegisterTool { registration: Box<ToolRegistration> },
+    RegisterTool {
+        /// The full tool registration descriptor.
+        registration: Box<ToolRegistration>,
+    },
     /// Remove a tool from the context.
-    RemoveTool { tool_id: ToolId },
+    RemoveTool {
+        /// The identifier of the tool to remove.
+        tool_id: ToolId,
+    },
     /// Modify the capability ceiling (only if `ceiling_policy` is `Governed`).
-    ModifyCeiling { new_ceiling: Vec<Capability> },
+    ModifyCeiling {
+        /// The new capability ceiling to apply.
+        new_ceiling: Vec<Capability>,
+    },
     /// Close the context.
-    CloseContext { reason: Option<String> },
+    CloseContext {
+        /// Optional reason for closure.
+        reason: Option<String>,
+    },
     /// Extend context TTL (requires unanimous consent per spec section 5.10).
-    ExtendTtl { additional_secs: u64 },
+    ExtendTtl {
+        /// Additional seconds to add to the context TTL.
+        additional_secs: u64,
+    },
     /// Transfer single-admin authority (`SingleAdmin` model only).
-    TransferAdmin { new_admin: DID },
+    TransferAdmin {
+        /// The DID of the new admin.
+        new_admin: DID,
+    },
     /// Create a child context (spec section 5.13).
-    CreateChildContext { params: Box<ContextParams> },
+    CreateChildContext {
+        /// The parameters for the child context.
+        params: Box<ContextParams>,
+    },
     /// Block an author in a broadcast context (spec section 5.14.8).
     ///
     /// Removes the author from the broadcast context, destroying their sender
@@ -790,7 +826,10 @@ pub enum RejectionReason {
     /// Majority of voters rejected (Majority model).
     MajorityRejected,
     /// Any single voter rejected (Unanimity model).
-    UnanimityBroken { rejector: DID },
+    UnanimityBroken {
+        /// The DID of the voter who broke unanimity.
+        rejector: DID,
+    },
     /// Threshold of rejections reached, making approval impossible
     /// (Threshold model: rejections > signers - threshold).
     ApprovalImpossible,
@@ -813,13 +852,19 @@ pub enum ProposalStatus {
     /// Proposal reached quorum and was approved. The action will be executed.
     Approved,
     /// Proposal was rejected (explicit rejection or failed to reach quorum).
-    Rejected { reason: RejectionReason },
+    Rejected {
+        /// The specific reason the proposal was rejected.
+        reason: RejectionReason,
+    },
     /// Proposal expired before reaching quorum.
     Expired,
     /// Proposal was cancelled by the proposer before resolution.
     Cancelled,
     /// Proposal was invalidated (e.g., epoch reset, proposer removed).
-    Invalidated { reason: String },
+    Invalidated {
+        /// Human-readable reason for invalidation.
+        reason: String,
+    },
 }
 
 impl ProposalStatus {
@@ -894,7 +939,10 @@ pub enum GovernanceModelConfig {
     /// Single admin holds all governance authority. Phase 2 baseline.
     /// The creator is the initial (and only) admin. Admin transfer is
     /// a governance action that replaces the admin DID.
-    SingleAdmin { admin_did: DID },
+    SingleAdmin {
+        /// The DID of the sole administrator.
+        admin_did: DID,
+    },
 
     /// M-of-N threshold approval. A fixed set of designated signers;
     /// a proposal passes when at least `threshold` of them approve.
@@ -1048,25 +1096,36 @@ pub enum GovernanceError {
 pub enum GovernanceEvent {
     /// A new proposal was created.
     ProposalCreated {
+        /// Unique identifier for the proposal.
         proposal_id: ProposalId,
+        /// The DID of the member who proposed the action.
         proposer_did: DID,
+        /// The governance action being proposed.
         action: Box<GovernanceAction>,
+        /// Unix timestamp (seconds) when voting closes.
         voting_deadline: u64,
     },
     /// A vote was cast on a proposal.
     VoteCast {
+        /// The proposal being voted on.
         proposal_id: ProposalId,
+        /// The DID of the voter.
         voter_did: DID,
+        /// Whether the vote is an approval or rejection.
         vote: VoteType,
     },
     /// A vote was withdrawn from a proposal.
     VoteWithdrawn {
+        /// The proposal from which the vote was withdrawn.
         proposal_id: ProposalId,
+        /// The DID of the voter who withdrew.
         voter_did: DID,
     },
     /// A proposal was resolved (approved, rejected, expired, etc.).
     ProposalResolved {
+        /// The proposal that was resolved.
         proposal_id: ProposalId,
+        /// The terminal status the proposal reached.
         status: ProposalStatus,
     },
     /// Deadlock recovery was triggered (ADR-031 §10).
@@ -1075,7 +1134,9 @@ pub enum GovernanceEvent {
     /// fallback quorum (majority-of-active). Records the justification
     /// and the governance parameter changes applied.
     DeadlockRecovery {
+        /// The justification for triggering deadlock recovery.
         justification: DeadlockJustification,
+        /// The governance parameter changes applied.
         changes: Vec<GovernanceReconfigAction>,
     },
     /// A simultaneous governance conflict was detected (ADR-031 §7).
@@ -1083,7 +1144,9 @@ pub enum GovernanceEvent {
     /// Logged when two conflicting proposals land at the same event log
     /// sequence, triggering a governance freeze state.
     ConflictDetected {
+        /// The first conflicting proposal.
         proposal_a: ProposalId,
+        /// The second conflicting proposal.
         proposal_b: ProposalId,
     },
     /// A governance conflict was resolved (ADR-031 §7).
@@ -1091,7 +1154,9 @@ pub enum GovernanceEvent {
     /// Logged when a sequential conflict is resolved (lower sequence wins)
     /// or when a `ResolveConflict` action is executed.
     ConflictResolved {
+        /// The proposal that won the conflict.
         winner_id: ProposalId,
+        /// The proposal that lost the conflict.
         loser_id: ProposalId,
     },
     /// A governance action was successfully executed (ADR-031 §8).
