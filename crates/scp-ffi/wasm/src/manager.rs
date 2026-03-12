@@ -3660,7 +3660,7 @@ impl WasmContextManager {
                 ttl_seconds: ctx.ttl_seconds,
                 promotion_policy: ctx.promotion_policy.clone(),
                 governance: ctx.governance.clone(),
-                member_count: ctx.members.len() as u64,
+                member_count: u32::try_from(ctx.members.len()).unwrap_or(u32::MAX),
                 economic_policy: ctx.economic_policy.clone(),
                 min_protocol_version,
             }
@@ -4039,7 +4039,7 @@ pub struct ContextMetadata {
     pub ttl_seconds: Option<u64>,
     pub promotion_policy: Option<String>,
     pub governance: String,
-    pub member_count: u64,
+    pub member_count: u32,
     pub economic_policy: Option<String>,
     /// Minimum protocol version as `[major, minor]`, or `None` if unset.
     pub min_protocol_version: Option<(u8, u8)>,
