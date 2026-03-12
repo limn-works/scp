@@ -449,7 +449,10 @@ class CoroutineBridgeTest {
         fun `broadcastUnblockSubscriber propagates BridgeException`() =
             runTest(ioDispatcher) {
                 stubBindings.broadcastUnblockThrows =
-                    BridgeException("subscriber not blocked", "SCP-CTX-2001")
+                    BridgeException(
+                        "subscriber did:dht:z6MkSub not blocked by author did:dht:z6MkAdmin",
+                        "SCP-CTX-2001",
+                    )
 
                 val exception =
                     assertFailsWith<BridgeException> {
