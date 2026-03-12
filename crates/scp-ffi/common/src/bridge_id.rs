@@ -4,10 +4,18 @@
 
 use sha2::{Digest, Sha256};
 
-/// Generates a deterministic bridge ID per spec section 12.2.1.
+/// Generates a bridge ID per spec section 12.2.1.
 ///
 /// Computes `SHA-256(context_id || operator_did || platform || timestamp)`
 /// where timestamp is the current Unix epoch seconds as big-endian `u64` bytes.
+///
+/// # Non-determinism by design
+///
+/// The timestamp component means the same `(context_id, operator_did, platform)`
+/// inputs produce a **different** bridge ID on each call. This is intentional
+/// per spec section 12.2.1: the timestamp makes each registration unique, so the same
+/// operator can register multiple bridges for the same context and platform
+/// at different times without ID collisions.
 ///
 /// Returns `(bridge_id_hex, timestamp_secs)` so callers can use the same
 /// timestamp for `BridgeRegistrationRequest::requested_at`.
