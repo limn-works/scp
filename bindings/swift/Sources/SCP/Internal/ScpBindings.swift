@@ -5103,7 +5103,7 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * The bridge unpacks this into a `PseudonymKeypair`.
      */
     func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
-
+    
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
      *
@@ -5111,17 +5111,31 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * directly. Platform implementations using software-backed Ed25519 storage
      * (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
      *
-     * Returns `ScpError` if the key is not found, not exportable (hardware-backed
-     * TEE keys are non-extractable), or not an Ed25519 key.
+     * # Default
+     *
+     * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
+     * implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
+     * `AndroidKeyCustody`) override this with real implementations. Third-party
+     * `KeyCustodyProvider` implementations that do not need governance vote
+     * signing may rely on the default until they add support.
+     *
+     * **Note:** `UniFFI` callback interfaces require foreign implementations to
+     * define all methods. The generated Swift protocol / Kotlin interface will
+     * include this method. The default here applies only to Rust-side callers.
+     *
+     * # Errors
+     *
+     * Returns `ScpError` if the key is not found, not exportable, or not
+     * an Ed25519 key.
      */
     func exportSigningKeyBytes(keyId: String) async throws  -> Data
-
+    
     /**
      * Return the custody type for `key_id`: `"hardware"`, `"software"`, or
      * `"in_memory"`. Stays sync — no I/O required.
      */
     func custodyType(keyId: String)  -> String
-
+    
 }
 
 
@@ -5455,7 +5469,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-
+            
             let writeReturn = { uniffiOutReturn.pointee = FfiConverterString.lower($0) }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -6685,6 +6699,19 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
+ * Resolves a human-readable address via multi-path resolution.
+ * Returns a JSON array of `AddressResolution` objects.
+ */
+public func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_address_resolve(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(address),
+        FfiConverterOptionString.lower(knownContextsJson),$0
+    )
+})
+}
+/**
  * Creates a shadow identity for an external platform participant.
  *
  * Shadow identities represent non-SCP participants in a bridged context.
@@ -6738,12 +6765,15 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  * Registers a new bridge connector with a context.
  *
  * Creates a bridge registration, submits a registration request, and
- * immediately approves it (for FFI / testing purposes).
+ * immediately approves it using the provided governance DID.
  *
  * # Arguments
  *
  * * `context_id` — Context to register the bridge in.
  * * `operator_did` — DID of the human operator accountable for the bridge.
+ * * `governance_did` — DID of the governance authority approving the
+ * registration.  Must differ from `operator_did` (self-approval is
+ * forbidden per ADR-023).
  * * `platform` — External platform name (e.g., `"discord"`, `"slack"`).
  * * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
  *
@@ -6754,7 +6784,8 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  * # Errors
  *
  * Returns `ScpError::Validation` if `mode` is not recognized, or
- * `ScpError::Context` if registration fails.
+ * `ScpError::Context` if registration or approval fails (including
+ * self-approval).
  *
  * See spec section 12 (Bridge System) and ADR-023.
  */
@@ -7597,6 +7628,29 @@ public func getEconomicPolicy(handle: ContextHandle)throws  -> String?  {
 })
 }
 /**
+ * Casts an approval vote on a pending governance proposal.
+ *
+ * Delegates to [`ContextManager::approve_governance_proposal`].
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` (SCP-CTX-2042) if the vote fails.
+ */
+public func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_approve(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Executes an approved governance action on a context.
  *
  * The `proposal_json` must be a JSON-serialized `GovernanceProposal` with
@@ -7627,6 +7681,172 @@ public func governanceExecute(handle: ContextHandle, proposalJson: String)async 
             liftFunc: FfiConverterString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+/**
+ * Retrieves a single governance proposal by hex-encoded ID.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` (SCP-CTX-2045) if the proposal is not found.
+ */
+public func governanceGetProposal(handle: ContextHandle, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_get_proposal(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Lists all governance proposals for a context.
+ *
+ * Returns a JSON array of proposals.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
+ */
+public func governanceListProposals(handle: ContextHandle)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_list_proposals(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Proposes a governance action for voting.
+ *
+ * Delegates to [`ContextManager::propose_governance_action_checked`].
+ * For `SingleAdmin` contexts, the proposal is auto-approved and executed.
+ * For multi-admin models (Threshold, Majority, Unanimity), the proposal
+ * enters `Pending` status.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context handle.
+ * * `proposer_did` — DID of the proposer.
+ * * `action_json` — JSON-serialized `GovernanceAction`.
+ *
+ * # Returns
+ *
+ * JSON string: `{ "proposal_id": hex, "status": string, "execution_result": string | null }`.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` (SCP-CTX-2041) if the proposal fails.
+ */
+public func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_propose(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposerDid),FfiConverterString.lower(actionJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Casts a rejection vote on a pending governance proposal.
+ *
+ * Delegates to [`ContextManager::reject_governance_proposal`].
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` (SCP-CTX-2043) if the vote fails.
+ */
+public func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_reject(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Withdraws a previously cast vote on a pending governance proposal.
+ *
+ * Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+ * key is required.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` (SCP-CTX-2044) if the withdrawal fails.
+ */
+public func governanceWithdraw(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_withdraw(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Deregisters a handle from a discovery context. Returns JSON result.
+ */
+public func handleDeregister(discoveryContextId: String, handle: String, did: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_handle_deregister(
+        FfiConverterString.lower(discoveryContextId),
+        FfiConverterString.lower(handle),
+        FfiConverterString.lower(did),$0
+    )
+})
+}
+/**
+ * Looks up a handle in a discovery context. Returns JSON result.
+ */
+public func handleLookup(discoveryContextId: String, handle: String, typeFilter: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_handle_lookup(
+        FfiConverterString.lower(discoveryContextId),
+        FfiConverterString.lower(handle),
+        FfiConverterOptionString.lower(typeFilter),$0
+    )
+})
+}
+/**
+ * Registers a handle in a discovery context. Returns JSON result.
+ */
+public func handleRegister(discoveryContextId: String, handle: String, targetJson: String, registrantDid: String, description: String?, tags: [String]?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_handle_register(
+        FfiConverterString.lower(discoveryContextId),
+        FfiConverterString.lower(handle),
+        FfiConverterString.lower(targetJson),
+        FfiConverterString.lower(registrantDid),
+        FfiConverterOptionString.lower(description),
+        FfiConverterOptionSequenceString.lower(tags),$0
+    )
+})
 }
 /**
  * Generates a device attestation token for an identity.
@@ -7915,6 +8135,92 @@ public func isLocalDid(did: String)async  -> Bool  {
             errorHandler: nil
             
         )
+}
+/**
+ * Gets the petname for a context.
+ */
+public func petnameGetForContext(ownerDid: String, contextId: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_get_for_context(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+/**
+ * Gets the petname for a DID.
+ */
+public func petnameGetForDid(ownerDid: String, targetDid: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_get_for_did(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(targetDid),$0
+    )
+})
+}
+/**
+ * Removes a petname from a DID.
+ */
+public func petnameRemove(ownerDid: String, targetDid: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_remove(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(targetDid),$0
+    )
+}
+}
+/**
+ * Removes a petname from a context.
+ */
+public func petnameRemoveContext(ownerDid: String, contextId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_remove_context(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(contextId),$0
+    )
+}
+}
+/**
+ * Resolves a petname to context IDs. Returns a JSON array of strings.
+ */
+public func petnameResolveContext(ownerDid: String, name: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_resolve_context(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+/**
+ * Resolves a petname to DIDs. Returns a JSON array of DID strings.
+ */
+public func petnameResolveDid(ownerDid: String, name: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_resolve_did(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+/**
+ * Sets a petname for a DID.
+ */
+public func petnameSet(ownerDid: String, targetDid: String, name: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_set(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(targetDid),
+        FfiConverterString.lower(name),$0
+    )
+}
+}
+/**
+ * Sets a petname for a context.
+ */
+public func petnameSetContext(ownerDid: String, contextId: String, name: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_petname_set_context(
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(name),$0
+    )
+}
 }
 /**
  * Attaches provenance metadata when data crosses a context boundary.
@@ -8632,13 +8938,16 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_address_resolve() != 37580) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_create_shadow() != 47104) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_evaluate_trust() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 22617) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 43003) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 35635) {
@@ -8743,7 +9052,34 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_get_economic_policy() != 48515) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_approve() != 48284) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_governance_execute() != 62327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_get_proposal() != 12966) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_list_proposals() != 8689) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_propose() != 52624) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_reject() != 14412) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_withdraw() != 3502) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_handle_deregister() != 3324) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_handle_lookup() != 35920) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_handle_register() != 9330) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_attest_device() != 13846) {
@@ -8771,6 +9107,30 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_is_local_did() != 887) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_get_for_context() != 17935) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_get_for_did() != 33171) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_remove() != 40370) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_remove_context() != 44518) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_resolve_context() != 15380) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_resolve_did() != 58642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_set() != 6017) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_petname_set_context() != 17277) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_attach() != 1075) {
@@ -8935,7 +9295,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 45052) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 57759) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 26569) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 59116) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_message() != 11557) {
