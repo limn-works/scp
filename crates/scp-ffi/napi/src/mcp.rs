@@ -771,7 +771,7 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
         | AllowlistError::PathInCommand(_)
         | AllowlistError::InvalidCommand(_) => ScpNapiError::Validation {
             message: msg,
-            code: "SCP-VALID-7030".to_owned(),
+            code: "SCP-VALID-7033".to_owned(),
         },
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
             ScpNapiError::Transport {
