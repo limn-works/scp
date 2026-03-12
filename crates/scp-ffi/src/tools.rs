@@ -558,6 +558,8 @@ pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerific
 /// Accepts a hex-encoded SHA-256 hash string (64 chars). Returns zeroed hash
 /// if not provided. Per spec §5.4: content-addressable reference to the tool's
 /// implementation.
+///
+/// Returns `SCP-VALID-7038` on validation failure (aligned with NAPI bridge).
 fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8; 32]> {
     let hash_obj = match registration.get_item("implementation_hash")? {
         Some(val) if !val.is_none() => val,
@@ -565,27 +567,39 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     };
 
     let hex_str: String = hash_obj.extract().map_err(|_| {
-        ScpPyError::validation("'implementation_hash' must be a hex string".to_owned())
+        ScpPyError::ValidationError {
+            message: "'implementation_hash' must be a hex string".to_owned(),
+            code: "SCP-VALID-7038".to_owned(),
+        }
     })?;
 
     if hex_str.len() != 64 {
-        return Err(ScpPyError::validation(format!(
-            "'implementation_hash' must be 64 hex chars (SHA-256), got {}",
-            hex_str.len()
-        ))
+        return Err(ScpPyError::ValidationError {
+            message: format!(
+                "'implementation_hash' must be 64 hex chars (SHA-256), got {}",
+                hex_str.len()
+            ),
+            code: "SCP-VALID-7038".to_owned(),
+        }
         .into());
     }
 
     let mut hash = [0u8; 32];
     for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
         let byte_str = std::str::from_utf8(chunk).map_err(|_| {
-            ScpPyError::validation("invalid UTF-8 in implementation_hash".to_owned())
+            ScpPyError::ValidationError {
+                message: "invalid UTF-8 in implementation_hash".to_owned(),
+                code: "SCP-VALID-7038".to_owned(),
+            }
         })?;
         hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            ScpPyError::validation(format!(
-                "invalid hex in implementation_hash at position {}",
-                i * 2
-            ))
+            ScpPyError::ValidationError {
+                message: format!(
+                    "invalid hex in implementation_hash at position {}",
+                    i * 2
+                ),
+                code: "SCP-VALID-7038".to_owned(),
+            }
         })?;
     }
 
@@ -637,6 +651,8 @@ fn extract_economic_metadata(
 ///
 /// Each test vector is a Python dict with `input`, `expected_output`, and
 /// `description` keys. Returns an empty Vec if the field is missing.
+///
+/// Returns `SCP-VALID-7037` on validation failure (aligned with NAPI bridge).
 fn extract_test_vectors(
     registration: &Bound<'_, PyDict>,
 ) -> PyResult<Vec<scp_core::context::tools::TestVector>> {
@@ -647,13 +663,19 @@ fn extract_test_vectors(
 
     let vectors_list = vectors_obj
         .downcast::<pyo3::types::PyList>()
-        .map_err(|_| ScpPyError::validation("'test_vectors' must be a list".to_owned()))?;
+        .map_err(|_| ScpPyError::ValidationError {
+            message: "'test_vectors' must be a list".to_owned(),
+            code: "SCP-VALID-7037".to_owned(),
+        })?;
 
     let mut result = Vec::with_capacity(vectors_list.len());
     for item in vectors_list.iter() {
         let dict = item
             .downcast::<PyDict>()
-            .map_err(|_| ScpPyError::validation("each test vector must be a dict".to_owned()))?;
+            .map_err(|_| ScpPyError::ValidationError {
+                message: "each test vector must be a dict".to_owned(),
+                code: "SCP-VALID-7037".to_owned(),
+            })?;
         let tv_json = py_dict_to_json(dict)?;
 
         let input = tv_json
