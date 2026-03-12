@@ -1666,6 +1666,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             serde_json::from_str(&proposal_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
             })?;
+        let action_name = proposal.action.variant_name();
         let result = mgr
             .execute_governance_action(&context_id, &proposal)
             .await
@@ -1686,6 +1687,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
                 }) {
                     tracing::warn!(
                         context_id = %context_id,
+                        action = action_name,
                         error = %e,
                         "failed to sync role state after governance action — \
                          local capability checks may be stale"
@@ -1695,6 +1697,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             None => {
                 tracing::warn!(
                     context_id = %context_id,
+                    action = action_name,
                     "failed to sync role state after governance action — \
                      context not found in ContextManager"
                 );
@@ -1808,6 +1811,8 @@ fn py_governance_propose(
                 PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
             })?;
 
+        let action_name = action.variant_name();
+
         let outcome = mgr
             .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
             .await
@@ -1820,6 +1825,7 @@ fn py_governance_propose(
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
             tracing::warn!(
                 context_id = %context_id,
+                action = action_name,
                 error = %e,
                 "failed to sync role state after governance proposal — \
                  local capability checks may be stale"

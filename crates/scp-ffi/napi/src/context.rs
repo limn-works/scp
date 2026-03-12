@@ -1128,6 +1128,8 @@ pub async fn context_execute_governance_action(
         })
     })?;
 
+    let action_name = action.variant_name();
+
     // Generate a random proposal ID (32 bytes).
     let mut proposal_id = [0u8; 32];
     {
@@ -1171,6 +1173,7 @@ pub async fn context_execute_governance_action(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
         tracing::warn!(
             context_id = %context_id,
+            action = action_name,
             error = %e,
             "failed to sync role state after governance action — \
              local capability checks may be stale"
@@ -1271,6 +1274,8 @@ pub async fn context_governance_propose(
         })
     })?;
 
+    let action_name = action.variant_name();
+
     #[cfg(feature = "allow_in_memory_custody")]
     {
         let signing_key = resolve_napi_signing_key(handle).await?;
@@ -1292,6 +1297,7 @@ pub async fn context_governance_propose(
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
             tracing::warn!(
                 context_id = %context_id,
+                action = action_name,
                 error = %e,
                 "failed to sync role state after governance proposal"
             );
@@ -1309,7 +1315,7 @@ pub async fn context_governance_propose(
 
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (handle, action, proposer_did);
+        let _ = (handle, action, action_name, proposer_did);
         return Err(NapiError::from(ScpNapiError::Permission {
             message: "governance proposal requires key custody — in_memory custody feature \
                       is not enabled"
