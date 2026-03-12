@@ -1878,7 +1878,10 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
         | AllowlistError::NulInEntry(_)
         | AllowlistError::ControlCharInEntry(_)
         | AllowlistError::PathInCommand(_)
-        | AllowlistError::InvalidCommand(_) => ScpPyError::validation(msg),
+        | AllowlistError::InvalidCommand(_) => ScpPyError::ValidationError {
+            message: msg,
+            code: "SCP-VALID-7033".to_owned(),
+        },
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
             ScpPyError::transport(msg)
         }
