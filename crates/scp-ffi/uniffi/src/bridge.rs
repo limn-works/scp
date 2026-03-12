@@ -2896,7 +2896,10 @@ pub async fn tool_register(
                 test_vectors,
                 operator_did: definition.operator_did.into(),
                 economic_metadata: None,
-                registered_at: 0,
+                registered_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
                 signature: Vec::new(),
             };
 
@@ -8492,5 +8495,40 @@ mod tests {
             }
             other => panic!("expected ScpError::Context, got {other:?}"),
         }
+    }
+
+    /// `registered_at` on a tool registered via the `UniFFI` bridge must be a
+    /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
+    /// Calls the actual `tool_register` bridge function and inspects the
+    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    #[tokio::test]
+    async fn registered_at_is_seconds_epoch() {
+        let handle = test_handle();
+        let def = ToolDefinition {
+            name: "timestamp-probe".to_owned(),
+            description: "probes registered_at value".to_owned(),
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+        };
+
+        let tool_id = tool_register(handle.clone(), def)
+            .await
+            .expect("tool_register should succeed");
+
+        let registry = handle.tool_registry.lock().await;
+        let reg = registry
+            .get(&tool_id)
+            .expect("tool should exist in registry after registration");
+        assert!(
+            reg.registered_at > 1_700_000_000 && reg.registered_at < 2_000_000_000,
+            "registered_at should be seconds-epoch (got {}); \
+             milliseconds would be ~1.7 trillion, hardcoded 0 would fail lower bound",
+            reg.registered_at
+        );
     }
 }
