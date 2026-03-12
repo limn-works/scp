@@ -88,7 +88,7 @@ const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
 
 /// Maximum age in seconds for a sender key request to be considered fresh.
 ///
-/// Matches [`NONCE_EXPIRY_SECS`] so timestamp freshness and nonce dedup windows
+/// Matches `NONCE_EXPIRY_SECS` so timestamp freshness and nonce dedup windows
 /// are aligned: a request that survived nonce replay should also survive the
 /// freshness check, and vice versa.
 const REQUEST_FRESHNESS_SECS: u64 = NONCE_EXPIRY_SECS;
@@ -146,7 +146,7 @@ pub struct SenderKeyRequest {
     pub wrapping_pubkey: [u8; 32],
     /// Cryptographic nonce for replay protection (16 bytes, generated with
     /// `OsRng`). The responder echoes this in [`SenderKeyResponse::request_nonce`]
-    /// and rejects duplicate nonces within [`NONCE_EXPIRY_SECS`].
+    /// and rejects duplicate nonces within `NONCE_EXPIRY_SECS`.
     #[serde(with = "serde_bytes")]
     pub nonce: [u8; REQUEST_NONCE_SIZE],
     /// Unix timestamp in seconds when the request was created.
@@ -526,12 +526,12 @@ pub fn verify_sender_key_request(
 /// Validates that a [`SenderKeyRequest`] timestamp is within the freshness
 /// window.
 ///
-/// Sender key requests older than [`REQUEST_FRESHNESS_SECS`] seconds are
+/// Sender key requests older than `REQUEST_FRESHNESS_SECS` seconds are
 /// rejected to prevent replay of old requests. Requests with timestamps far
 /// in the future (beyond the freshness window) are also rejected to guard
 /// against clock-skew manipulation.
 ///
-/// The freshness window is aligned with [`NONCE_EXPIRY_SECS`] so that
+/// The freshness window is aligned with `NONCE_EXPIRY_SECS` so that
 /// timestamp validation and nonce dedup cover the same time horizon.
 ///
 /// # Parameters
@@ -600,10 +600,10 @@ pub struct HandleRequestParams<'a, S: BuildHasher = std::collections::hash_map::
 /// Two layers of replay defense:
 ///
 /// 1. **Timestamp freshness** — rejects requests with timestamps outside
-///    [`REQUEST_FRESHNESS_SECS`] (past or future), preventing replay of old
+///    `REQUEST_FRESHNESS_SECS` (past or future), preventing replay of old
 ///    requests and guarding against clock-skew manipulation.
 /// 2. **Nonce dedup** — rejects requests whose nonce has been seen within
-///    [`NONCE_EXPIRY_SECS`], preventing replay of recently-valid requests.
+///    `NONCE_EXPIRY_SECS`, preventing replay of recently-valid requests.
 ///    After processing, the nonce is recorded in the dedup cache.
 ///
 /// # Sybil Resistance (BLACK-006, §9.16.6)
@@ -944,7 +944,7 @@ pub async fn send_block_notification(
 /// Validates that a [`BlockNotification`] timestamp is within the freshness
 /// window.
 ///
-/// Block notifications older than [`BLOCK_NOTIFICATION_FRESHNESS_MS`]
+/// Block notifications older than `BLOCK_NOTIFICATION_FRESHNESS_MS`
 /// milliseconds are rejected to prevent replay of old block events.
 ///
 /// # Parameters
@@ -1074,8 +1074,8 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 
 /// Bounded nonce deduplication cache for sender key request replay protection.
 ///
-/// Tracks seen request nonces for up to [`NONCE_EXPIRY_SECS`] seconds and
-/// caps the stored count at [`NONCE_DEDUP_CAPACITY`] entries to prevent
+/// Tracks seen request nonces for up to `NONCE_EXPIRY_SECS` seconds and
+/// caps the stored count at `NONCE_DEDUP_CAPACITY` entries to prevent
 /// memory exhaustion from `DoS` attacks.
 ///
 /// Callers should call [`NonceDedup::is_replayed`] before processing a
@@ -1095,10 +1095,10 @@ impl NonceDedup {
         }
     }
 
-    /// Returns `true` if `nonce` has been seen within [`NONCE_EXPIRY_SECS`]
+    /// Returns `true` if `nonce` has been seen within `NONCE_EXPIRY_SECS`
     /// of `now_secs`, indicating a replay attempt.
     ///
-    /// Also evicts entries older than [`NONCE_EXPIRY_SECS`].
+    /// Also evicts entries older than `NONCE_EXPIRY_SECS`.
     pub fn is_replayed(&mut self, nonce: &[u8; REQUEST_NONCE_SIZE], now_secs: u64) -> bool {
         self.seen
             .retain(|_, seen_at| now_secs.saturating_sub(*seen_at) < NONCE_EXPIRY_SECS);
@@ -1107,7 +1107,7 @@ impl NonceDedup {
 
     /// Records `nonce` as seen at `now_secs`.
     ///
-    /// If at capacity ([`NONCE_DEDUP_CAPACITY`]), the oldest entry is evicted
+    /// If at capacity (`NONCE_DEDUP_CAPACITY`), the oldest entry is evicted
     /// to make room.
     pub fn record(&mut self, nonce: [u8; REQUEST_NONCE_SIZE], now_secs: u64) {
         if self.seen.len() >= NONCE_DEDUP_CAPACITY

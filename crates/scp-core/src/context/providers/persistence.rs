@@ -1,7 +1,7 @@
 //! Production [`ContextPersistence`] implementation.
 //!
 //! The canonical production implementation is
-//! [`ProtocolStorePersistence`](crate::store::context::ProtocolStorePersistence),
+//! [`ProtocolStorePersistence`],
 //! which wraps `Arc<ProtocolStore<S>>` and implements the synchronous
 //! [`ContextPersistence`] trait by bridging to the async `ProtocolStore` methods.
 //!

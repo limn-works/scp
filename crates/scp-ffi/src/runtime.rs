@@ -130,7 +130,7 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// remain in [`FfiBridgeState`] for subsystem operations (tools.rs, ucan.rs,
 /// `event_log.rs`).
 ///
-/// When the global storage provider ([`STORAGE_PROVIDER`]) has been
+/// When the global storage provider (`STORAGE_PROVIDER`) has been
 /// initialized via [`init_storage`], a [`ProtocolStorePersistence`] is
 /// constructed from it and injected into the `ContextManager`. This enables
 /// context state persistence across process restarts without requiring
@@ -240,7 +240,7 @@ pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidRe
 /// Initializes the global production DID resolver.
 ///
 /// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
-/// `DualLayerResolver`) in an [`IdentityBackedDidResolver`] and stores it
+/// `DualLayerResolver`) in an `IdentityBackedDidResolver` and stores it
 /// as the process-global resolver for UCAN validation and attestation
 /// verification.
 ///
@@ -769,7 +769,7 @@ fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
 
 /// Metadata about a known context's relay presence.
 ///
-/// Stored in the [`KNOWN_CONTEXTS`] registry so that `py_mcp_load_contexts`
+/// Stored in the `KNOWN_CONTEXTS` registry so that `py_mcp_load_contexts`
 /// can probe relays for context activity. The relay is a dumb blob store
 /// with no identity-to-context mapping, so the client must track which
 /// routing IDs correspond to which contexts.
@@ -842,14 +842,14 @@ fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
 
 /// Retained identity state for a single DID.
 ///
-/// Stores the [`ScpIdentity`] (opaque key handles), the [`FfiKeyCustody`]
+/// Stores the [`ScpIdentity`] (opaque key handles), the [`FfiKeyCustody`](crate::custody::FfiKeyCustody)
 /// that owns the key material, and the [`DidDocument`]. The custody provider
 /// is behind an `Arc` so it can be shared with context-scoped operations
 /// (pseudonym derivation, signing, UCAN minting) without moving or cloning
 /// the key material.
 ///
-/// The `custody` field uses [`FfiKeyCustody`] — an enum dispatch wrapper —
-/// because [`KeyCustody`] uses RPITIT and is not object-safe. This allows
+/// The `custody` field uses [`FfiKeyCustody`](crate::custody::FfiKeyCustody) — an enum dispatch wrapper —
+/// because `KeyCustody` uses RPITIT and is not object-safe. This allows
 /// the FFI bridge to support both in-memory (testing) and file-backed
 /// (production) custody without dynamic dispatch via `dyn`.
 ///

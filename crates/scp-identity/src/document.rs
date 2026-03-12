@@ -639,7 +639,7 @@ impl DidDocument {
     /// If an existing device attestation entry exists, it is replaced. Other
     /// service entries are preserved.
     ///
-    /// The token is produced by [`DeviceAttestation::attest()`] from the
+    /// The token is produced by `DeviceAttestation::attest()` from the
     /// `scp-platform` crate. The protocol does not prescribe interpretation --
     /// contexts MAY require device attestation for admission (§9.3).
     ///
@@ -939,7 +939,7 @@ impl DidDocument {
 /// migration (Layer 2 rotation).
 ///
 /// Contains the old and new DID strings, cryptographic proofs of the migration,
-/// and a timestamp. Context participants use [`verify_migration`] to verify the
+/// and a timestamp. Context participants use `verify_migration` to verify the
 /// proofs before accepting the new DID.
 ///
 /// See ADR-003 acceptance criterion 4b.

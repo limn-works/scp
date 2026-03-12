@@ -666,30 +666,35 @@ pub struct WasmUcanToken {
 
 #[wasm_bindgen]
 impl WasmUcanToken {
+    /// Returns the token ID (SHA-256 CID of the encoded JWT).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "tokenId")]
     pub fn token_id(&self) -> String {
         self.token_id.clone()
     }
 
+    /// Returns the issuer DID of the token.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn issuer(&self) -> String {
         self.issuer.clone()
     }
 
+    /// Returns the audience DID of the token.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn audience(&self) -> String {
         self.audience.clone()
     }
 
+    /// Returns the token's capabilities as a JSON string.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "capabilitiesJson")]
     pub fn capabilities_json(&self) -> String {
         self.capabilities_json.clone()
     }
 
+    /// Returns the token expiration as seconds since the Unix epoch, or `undefined`.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "expiresAt")]
     pub fn expires_at(&self) -> Option<f64> {

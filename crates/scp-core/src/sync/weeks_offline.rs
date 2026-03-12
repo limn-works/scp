@@ -68,7 +68,7 @@ pub const MAX_EPOCH_DRIFT: u64 = 1_000;
 /// exceeding this triggers Tier 3 recovery. Defined separately for clarity
 /// and to allow governance-configurable overrides.
 ///
-/// For policy-aware code, use [`SyncPolicy::tier_2_threshold_secs`] instead.
+/// For policy-aware code, use `SyncPolicy::tier_2_threshold_secs` instead.
 ///
 /// See ADR-029 section 4 trigger condition 1.
 pub const MAX_OFFLINE_DURATION_SECS: u64 = super::TIER_2_THRESHOLD_SECS;

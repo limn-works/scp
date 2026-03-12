@@ -12,11 +12,10 @@
 //! - [`ProtocolStoreEventLogPersistence`] — Wraps `ProtocolStore` for event
 //!   log entry persistence across process restarts (#636).
 //!
-//! The transport provider ([`RelayTransportProvider`]) lives in `scp-transport`
-//! because it wraps [`NativeRelayAdapter`].
+//! The transport provider (`RelayTransportProvider`) lives in `scp-transport`
+//! because it wraps `NativeRelayAdapter`.
 //!
 //! [`ContextManager`]: super::manager::ContextManager
-//! [`NativeRelayAdapter`]: scp_transport::native::adapter::NativeRelayAdapter
 
 pub mod crypto;
 pub mod event_log;

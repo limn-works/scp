@@ -32,13 +32,21 @@ use crate::error::ApiError;
 /// A stored platform identity attestation.
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredAttestation {
+    /// Unique attestation identifier.
     pub attestation_id: String,
+    /// Current attestation status (e.g., `"active"`, `"revoked"`).
     pub status: String,
+    /// The bridge that produced this attestation.
     pub bridge_id: String,
+    /// The user's handle on the bridged platform.
     pub platform_handle: String,
+    /// The user's unique identifier on the bridged platform.
     pub platform_user_id: String,
+    /// Cryptographic evidence supporting the attestation.
     pub evidence: AttestationEvidence,
+    /// Unix timestamp (seconds) when the attestation was issued.
     pub issued_at: u64,
+    /// Unix timestamp (seconds) when the attestation expires.
     pub expires_at: u64,
 }
 
@@ -884,7 +892,7 @@ async fn webhook_handler(
 /// Returns an axum [`Router`] serving bridge endpoints.
 ///
 /// The router expects [`BridgeState`] as shared state and
-/// [`BridgeAuthContext`] as a request extension (injected by the bridge
+/// `BridgeAuthContext` as a request extension (injected by the bridge
 /// auth middleware layer applied by the caller).
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
     Router::new()

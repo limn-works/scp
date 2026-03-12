@@ -487,9 +487,9 @@ impl DidResolver for DispatchDidResolver<'_> {
 // BridgeRevocationChecker
 // ---------------------------------------------------------------------------
 
-/// Bridge [`RevocationChecker`] that wraps the context's [`RevocationList`].
+/// Bridge [`RevocationChecker`] that wraps the context's `RevocationList`.
 ///
-/// Holds a reference to the revocation list from the [`ContextRuntime`] and
+/// Holds a reference to the revocation list from the `ContextRuntime` and
 /// delegates the `is_revoked` check. This uses the content-hash CID format
 /// from `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
 pub struct BridgeRevocationChecker<'a> {

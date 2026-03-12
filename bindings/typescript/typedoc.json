@@ -7,6 +7,5 @@
   "excludePrivate": true,
   "excludeInternal": true,
   "includeVersion": true,
-  "plugin": ["typedoc-plugin-markdown"],
-  "theme": "default"
+  "plugin": ["typedoc-plugin-markdown"]
 }

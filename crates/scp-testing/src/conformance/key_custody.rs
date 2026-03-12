@@ -1,7 +1,7 @@
 //! Key custody conformance test macro.
 //!
-//! The [`key_custody_conformance`] macro generates 4 test cases that validate
-//! any [`KeyCustody`](scp_platform::KeyCustody) implementation against the
+//! The `key_custody_conformance` macro generates 4 test cases that validate
+//! any `KeyCustody` implementation against the
 //! protocol specification (ADR-006):
 //!
 //! 1. `generate_sign_verify_roundtrip` — generate Ed25519 keypair, sign data, verify signature
@@ -11,12 +11,12 @@
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
-/// Generates 4 conformance tests for a [`KeyCustody`] implementation.
+/// Generates 4 conformance tests for a `KeyCustody` implementation.
 ///
 /// # Arguments
 ///
 /// The macro takes a single expression that evaluates to an instance of a type
-/// implementing [`KeyCustody`]. This expression is called once per test to
+/// implementing `KeyCustody`. This expression is called once per test to
 /// create a fresh custody provider with no pre-existing keys.
 ///
 /// # Example

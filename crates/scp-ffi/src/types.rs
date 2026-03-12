@@ -5,8 +5,8 @@
 //! - [`py_dict_to_json`]: `Python dict` -> [`serde_json::Value`]
 //! - [`json_to_py_dict`]: [`serde_json::Value`] -> `Python object`
 //! - [`encode_hex`]: `&[u8]` -> lowercase hex `String` (delegates to `hex::encode`)
-//! - [`generate_context_id`]: CSPRNG context ID (pure hex, spec-compliant)
-//! - [`generate_random_id`]: CSPRNG prefixed handle ID (internal use)
+//! - `generate_context_id`: CSPRNG context ID (pure hex, spec-compliant)
+//! - `generate_random_id`: CSPRNG prefixed handle ID (internal use)
 //!
 //! These are the foundational conversion functions used by all bridge modules
 //! that pass structured data between Python and Rust (context params, tool
@@ -88,7 +88,7 @@ const MAX_NESTING_DEPTH: usize = 64;
 ///
 /// Returns `ScpPyError::ValidationError` if:
 /// - a dict value has an unsupported Python type (e.g., custom objects, bytes, sets)
-/// - nesting depth exceeds [`MAX_NESTING_DEPTH`] (64 levels)
+/// - nesting depth exceeds `MAX_NESTING_DEPTH` (64 levels)
 pub fn py_dict_to_json(dict: &Bound<'_, PyDict>) -> Result<Value, ScpPyError> {
     py_dict_to_json_depth(dict, 0)
 }

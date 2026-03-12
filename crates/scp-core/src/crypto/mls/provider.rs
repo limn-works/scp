@@ -5,9 +5,9 @@
 //!
 //! - Group lifecycle → [`group::create_group`], [`group::add_member`],
 //!   [`group::remove_member`], [`group::destroy_group`]
-//! - Encrypt/decrypt → [`encrypt::encrypt`], [`encrypt::decrypt`]
-//! - Key packages → [`key_package::KeyPackageBuffer`]
-//! - Sender keys → [`sender_keys::generate_sender_key`]
+//! - Encrypt/decrypt → `encrypt::encrypt`, `encrypt::decrypt`
+//! - Key packages → `key_package::KeyPackageBuffer`
+//! - Sender keys → `sender_keys::generate_sender_key`
 //!
 //! Each context's MLS group and sender key are stored in per-context maps
 //! protected by `std::sync::Mutex`. The provider is `Send + Sync` as required

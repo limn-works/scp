@@ -1,9 +1,9 @@
 //! Per-member budget tracking for economic governance.
 //!
 //! Tracks cumulative spending per member against their governance-approved
-//! spending limits. Unlike the rolling-window [`BudgetTracker`] in
+//! spending limits. Unlike the rolling-window `BudgetTracker` in
 //! `crypto::ucan::spending`, this tracker enforces lifetime budget caps
-//! set by governance via [`GovernanceAction::ApproveSpend`].
+//! set by governance via [`crate::context::governance::GovernanceAction::ApproveSpend`].
 //!
 //! See spec section 19.5 and ADR-033.
 
@@ -20,8 +20,8 @@ use super::types::Amount;
 /// Per-member cumulative budget tracker for governance-approved spending.
 ///
 /// Each member starts with a limit of zero (no spending allowed). Governance
-/// grants are additive via [`grant`]. Spending is recorded via [`record_spend`]
-/// and checked via [`remaining`].
+/// grants are additive via [`MemberBudgetTracker::grant`]. Spending is recorded via [`MemberBudgetTracker::record_spend`]
+/// and checked via [`MemberBudgetTracker::remaining`].
 ///
 /// # Thread safety
 ///
@@ -70,7 +70,7 @@ impl MemberBudgetTracker {
 
     /// Grants additional spending budget to a member.
     ///
-    /// Governance calls this when [`GovernanceAction::ApproveSpend`] is
+    /// Governance calls this when [`crate::context::governance::GovernanceAction::ApproveSpend`] is
     /// executed. Amounts are additive: granting 100 twice gives a total
     /// limit of 200.
     pub fn grant(&mut self, did: &DID, amount: Amount) {

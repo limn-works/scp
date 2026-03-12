@@ -1,7 +1,7 @@
 //! Device attestation conformance test macro.
 //!
-//! The [`attestation_conformance`] macro generates 2 test cases that validate
-//! any [`DeviceAttestation`](scp_platform::DeviceAttestation) implementation
+//! The `attestation_conformance` macro generates 2 test cases that validate
+//! any `DeviceAttestation` implementation
 //! against the protocol specification (ADR-006):
 //!
 //! 1. `attest_verify_roundtrip` — `attest()`, then `verify(token)` -> success
@@ -9,12 +9,12 @@
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
-/// Generates 2 conformance tests for a [`DeviceAttestation`] implementation.
+/// Generates 2 conformance tests for a `DeviceAttestation` implementation.
 ///
 /// # Arguments
 ///
 /// The macro takes a single expression that evaluates to an instance of a type
-/// implementing [`DeviceAttestation`]. This expression is called once per test
+/// implementing `DeviceAttestation`. This expression is called once per test
 /// to create a fresh attestation provider.
 ///
 /// # Example

@@ -76,7 +76,7 @@ pub struct PruningConfig {
     /// Events older than `now - retention_secs` are eligible for pruning
     /// (provided they are behind a valid checkpoint).
     ///
-    /// Clamped to [`MIN_RETENTION_SECS`] (30 days) minimum.
+    /// Clamped to `MIN_RETENTION_SECS` (30 days) minimum.
     /// `None` disables time-based retention (only checkpoint-count applies).
     pub retention_secs: Option<u64>,
 
@@ -170,7 +170,10 @@ pub enum PruningError {
     /// The requested leaf index is in the pruned region but no leaf hash
     /// was retained.
     #[error("leaf hash not available for pruned event at index {index}")]
-    LeafHashNotAvailable { index: u64 },
+    LeafHashNotAvailable {
+        /// The event index that was requested but has no retained leaf hash.
+        index: u64,
+    },
 
     /// The checkpoint's Merkle root does not match the log state.
     #[error("checkpoint Merkle root mismatch")]

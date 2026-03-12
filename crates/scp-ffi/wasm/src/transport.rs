@@ -2,13 +2,13 @@
 //!
 //! Exposes SCP transport operations to JavaScript:
 //!
-//! - [`transport_connect`] — Connect to an SCP relay.
-//! - [`transport_disconnect`] — Disconnect from the current relay.
-//! - [`transport_status`] — Query the current transport status.
+//! - `transport_connect` — Connect to an SCP relay.
+//! - `transport_disconnect` — Disconnect from the current relay.
+//! - `transport_status` — Query the current transport status.
 //!
 //! # Types
 //!
-//! - [`WasmTransportStatus`] — Connection status (connected, relay URL,
+//! - `WasmTransportStatus` — Connection status (connected, relay URL,
 //!   latency).
 //!
 //! # Browser `WebSocket` transport

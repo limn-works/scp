@@ -10,7 +10,7 @@
 //! 1. A bridge calls [`create_shadow`] to create a [`ShadowIdentity`] for an
 //!    external platform participant. The shadow starts with the `"observer"`
 //!    role.
-//! 2. Context governance may call [`upgrade_shadow_role`] to promote a shadow
+//! 2. Context governance may call `upgrade_shadow_role` to promote a shadow
 //!    to a more privileged role.
 //! 3. [`list_shadows`] returns all shadows for a given bridge.
 //! 4. [`can_exercise_capability`] checks whether a shadow is allowed to

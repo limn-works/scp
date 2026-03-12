@@ -4,7 +4,7 @@
 //!
 //! - [`ucan_validate`] — Validate a UCAN token for a required capability.
 //! - [`ucan_mint`] — Mint a new UCAN token for a context member with real
-//!   Ed25519 signing via [`InMemoryKeyCustody`] (RED-102).
+//!   Ed25519 signing via `InMemoryKeyCustody` (RED-102).
 //! - [`ucan_revoke`] — Revoke a UCAN token.
 //!
 //! # Validation pipeline
@@ -285,7 +285,7 @@ pub async fn ucan_validate(
 
 /// Mints a new UCAN token for a context member with real Ed25519 signing.
 ///
-/// Uses the context creator's [`InMemoryKeyCustody`] and active signing key
+/// Uses the context creator's `InMemoryKeyCustody` and active signing key
 /// (retained on the context handle during `context_create`) to produce a
 /// properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
 ///
@@ -413,7 +413,7 @@ pub async fn ucan_mint(
 /// Delegates a UCAN token to another member.
 ///
 /// Creates a delegated UCAN from an existing parent token, signed with the
-/// delegator's Ed25519 key via the retained [`InMemoryKeyCustody`].
+/// delegator's Ed25519 key via the retained `InMemoryKeyCustody`.
 /// Delegation enforces attenuation (capabilities can only narrow, never widen).
 ///
 /// # Arguments

@@ -4,7 +4,7 @@
 //! SCP has not shipped, so no backward compatibility is needed.
 //!
 //! The `KeyCustodySigner` adapter bridges `scp-platform`'s `KeyCustody`/`KeyHandle`
-//! to the [`EventLogSigner`](scp_event_log::EventLogSigner) trait defined in `scp-event-log`.
+//! to the [`EventLogSigner`] trait defined in `scp-event-log`.
 //!
 //! See ADR-011 in `.docs/adrs/phase-2.md` for the full design.
 

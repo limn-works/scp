@@ -116,16 +116,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+      - uses: oven-sh/setup-bun@v2
       - name: Install typedoc
         working-directory: bindings/typescript
         run: |
-          npm install --no-save typedoc typedoc-plugin-markdown typescript
+          bun add --dev typedoc typedoc-plugin-markdown
       - name: Generate docs
         working-directory: bindings/typescript
-        run: npx typedoc
+        run: bunx typedoc
       - uses: actions/upload-artifact@v4
         with:
           name: docs-typescript
@@ -188,7 +186,6 @@ jobs:
             <li><a href="docs-rust/scp_core/">Rust (scp-core)</a></li>
             <li><a href="docs-python/">Python (scp-python)</a></li>
             <li><a href="docs-typescript/">TypeScript (@limn-works/scp-ts)</a></li>
-            <li><a href="docs-swift/">Swift (SCP)</a></li>
             <li><a href="docs-kotlin/">Kotlin (scp-kt)</a></li>
           </ul>
           </body>

@@ -210,7 +210,7 @@ impl BlockListState {
 
     /// Blocks a DID in a specific context (Tier 1).
     ///
-    /// Records a [`BlockDIDInContext`] event and updates the materialized
+    /// Records a [`BlockListEvent::BlockDIDInContext`] event and updates the materialized
     /// state. Idempotent — blocking an already-blocked DID is a no-op
     /// on state (the event is still recorded for log completeness).
     pub fn block_did_in_context(&mut self, target_did: DID, context_id: String, timestamp: u64) {
@@ -224,7 +224,7 @@ impl BlockListState {
 
     /// Blocks a DID globally across all contexts (Tier 2).
     ///
-    /// Records a [`BlockDID`] event. **Does NOT automatically propagate
+    /// Records a [`BlockListEvent::BlockDID`] event. **Does NOT automatically propagate
     /// to per-context lists** — the caller (SDK orchestration layer) is
     /// responsible for enumerating shared contexts and executing the
     /// per-context block protocol.
@@ -243,7 +243,7 @@ impl BlockListState {
     /// Unblocks a DID in a specific context (Tier 1).
     ///
     /// Removes the target from the per-context block list and records an
-    /// [`UnblockDIDInContext`] event.
+    /// [`BlockListEvent::UnblockDIDInContext`] event.
     ///
     /// **Forward-only restoration (§9.16.8):**
     /// - The blocker does NOT rotate their sender key — the current key
@@ -288,7 +288,7 @@ impl BlockListState {
     ///
     /// Removes the target from the global block list AND from all
     /// per-context block lists where the target appears. Records an
-    /// [`UnblockDID`] event.
+    /// [`BlockListEvent::UnblockDID`] event.
     ///
     /// **Forward-only restoration (§9.16.8):** Same guarantees as
     /// [`unblock_did_in_context`](Self::unblock_did_in_context) — no

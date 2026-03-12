@@ -2,7 +2,7 @@
 //!
 //! [`EncryptingAdapter`] wraps any `Storage` implementation with per-value
 //! AES-256-GCM encryption, making it satisfy the sealed
-//! [`EncryptedStorage`](crate::encrypted::EncryptedStorage) bound without
+//! [`EncryptedStorage`] bound without
 //! requiring the inner backend to encrypt natively.
 //!
 //! # Wire format

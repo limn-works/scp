@@ -203,7 +203,7 @@ impl HeartbeatMonitor {
 
     /// Checks whether suppression is suspected based on the heartbeat gap.
     ///
-    /// Returns [`Some(SuppressionSuspected)`] if the time since the last
+    /// Returns `Some(SuppressionSuspected)` if the time since the last
     /// received heartbeat exceeds `interval * suppression_threshold_multiplier`.
     /// Returns [`None`] if monitoring is disabled, no heartbeats have been
     /// sent yet, or the gap is within the acceptable threshold.

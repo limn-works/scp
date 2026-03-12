@@ -2,9 +2,9 @@
 //!
 //! Exposes offline classification and sync policy to JavaScript (browser target):
 //!
-//! - [`sync_classify_offline`] — Classify offline duration using default thresholds.
-//! - [`sync_get_policy`] — Get the default sync policy as JSON.
-//! - [`sync_classify_offline_custom`] — Classify offline duration with custom thresholds.
+//! - `sync_classify_offline` — Classify offline duration using default thresholds.
+//! - `sync_get_policy` — Get the default sync policy as JSON.
+//! - `sync_classify_offline_custom` — Classify offline duration with custom thresholds.
 //!
 //! # WASM constraints
 //!

@@ -186,7 +186,7 @@ type SignFn = dyn Fn(u64, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>
 /// - [`DidDht::new()`] — Creates a default instance with `InMemoryDhtClient`
 ///   and no signing capability (for backward compatibility with SCP-006 tests).
 /// - [`DidDht::with_client()`] — Creates an instance with a specific DHT client.
-/// - [`DidDht::with_client_and_custody()`] — Creates a fully-configured instance
+/// - `DidDht::with_client_and_custody()` — Creates a fully-configured instance
 ///   with DHT client and signing capability.
 pub struct DidDht<D: DhtClient = InMemoryDhtClient, C: Clock = SystemClock> {
     /// The DHT client used for publish/resolve operations.
@@ -242,7 +242,7 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
     ///
     /// This constructor is backward-compatible with SCP-006 tests. The
     /// `publish` method will return an error unless a signing function is
-    /// configured via [`DidDht::with_client_and_custody`].
+    /// configured via `DidDht::with_client_and_custody`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -472,7 +472,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Publishes a DID document to the DHT with the given signing function.
     ///
     /// This is the internal publish implementation used by both
-    /// `DidMethod::publish` and the [`RepublishManager`].
+    /// `DidMethod::publish` and the `RepublishManager`.
     ///
     /// # Errors
     ///
@@ -996,7 +996,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 
     /// Attaches a device attestation token to a DID document.
     ///
-    /// Calls [`DeviceAttestation::attest()`] to generate a platform-specific
+    /// Calls `DeviceAttestation::attest()` to generate a platform-specific
     /// attestation token, then stores it as an `ScpDeviceAttestation` service
     /// entry in the DID document (§9.3). The token is base64-encoded in the
     /// `serviceEndpoint` field. The service entry uses the ID format

@@ -864,7 +864,7 @@ impl TtlExpiryResult {
 
 /// Runs TTL expiry cleanup with exponential backoff retries.
 ///
-/// Attempts cleanup up to [`TTL_EXPIRY_MAX_RETRIES`] times. The
+/// Attempts cleanup up to `TTL_EXPIRY_MAX_RETRIES` times. The
 /// `completed_steps` bitmask from each attempt is carried forward to the
 /// next, so operations that already succeeded (state transition, key
 /// destruction, event log append) are never re-executed. This prevents
@@ -949,7 +949,7 @@ pub async fn run_ttl_expiry_with_retries(
 /// Manages a TTL timer for a single context.
 ///
 /// On expiry, the timer runs cleanup with exponential backoff retries (up to
-/// [`TTL_EXPIRY_MAX_RETRIES`] attempts). If cleanup fails after all retries,
+/// `TTL_EXPIRY_MAX_RETRIES` attempts). If cleanup fails after all retries,
 /// the optional `on_error` callback is invoked with the context ID and a
 /// [`TtlExpiryResult`] describing which operations succeeded and which failed.
 ///

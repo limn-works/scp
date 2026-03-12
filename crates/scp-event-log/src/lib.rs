@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
 //! Verifiable event log (Merkle tree) for SCP contexts.

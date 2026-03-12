@@ -160,7 +160,7 @@ pub struct OfflineConflict {
 /// A lightweight snapshot of a governance proposal for conflict detection.
 ///
 /// Contains only the fields needed for conflict resolution -- not the full
-/// [`GovernanceProposal`] with its vote tracking.
+/// [`crate::context::governance::GovernanceProposal`] with its vote tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceProposalSnapshot {
     /// Unique proposal identifier.
@@ -481,7 +481,7 @@ pub fn resolve_governance_conflict(
 /// remove the other's proposer, creating a circular dependency that cannot
 /// be resolved by simple ordering.
 ///
-/// Uses [`classify_conflict_pairs`] — the same classification logic as
+/// Uses `classify_conflict_pairs` — the same classification logic as
 /// [`resolve_governance_conflict`] — to avoid divergence risk.
 ///
 /// See ADR-031 sections 7 and 10.

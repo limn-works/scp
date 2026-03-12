@@ -166,7 +166,7 @@ pub fn deserialize_signaling(bytes: &[u8]) -> Result<SignalingMessage, serde_jso
 /// with the [`MessageType::Signaling`] discriminator.
 ///
 /// Callers pass the returned tuple directly to
-/// [`scp_core::envelope::create_inner_envelope_typed`] to construct an
+/// `scp_core::envelope::create_inner_envelope_typed` to construct an
 /// authenticated, encrypted SCP envelope that relays will route as a normal
 /// message. This function does **not** perform encryption or signing — it
 /// only prepares the payload and identifies the message type.

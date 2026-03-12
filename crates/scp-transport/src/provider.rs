@@ -1,8 +1,8 @@
-//! Production [`ContextTransportProvider`] wrapping [`NativeRelayAdapter`].
+//! Production [`ContextTransportProvider`] wrapping `NativeRelayAdapter`.
 //!
 //! [`RelayTransportProvider`] implements the synchronous
 //! [`ContextTransportProvider`] trait from `scp-core` by wrapping a
-//! [`NativeRelayAdapter`] (or any [`TransportAdapter`]) and bridging
+//! `NativeRelayAdapter` (or any [`TransportAdapter`]) and bridging
 //! async transport operations to synchronous calls using
 //! `tokio::task::block_in_place`.
 //!

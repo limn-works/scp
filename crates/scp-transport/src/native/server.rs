@@ -94,7 +94,7 @@ pub struct RelayConfig {
     /// When set, the relay rejects any WebSocket upgrade whose
     /// `Authorization: Bearer <hex>` header does not match this value
     /// (hex-encoded, constant-time comparison). Used by
-    /// [`ApplicationNode`] to prevent unauthorized connections to the
+    /// `ApplicationNode` to prevent unauthorized connections to the
     /// internal relay port.
     ///
     /// See GitHub issue #85 for the threat model and #225 for the
@@ -202,7 +202,7 @@ impl RelayServer {
     /// projection handlers). See spec section 18.11.5.
     ///
     /// Use this constructor when only running the WebSocket transport. For
-    /// multi-transport setups, use [`new_shared`] to pass shared rate limiters
+    /// multi-transport setups, use `new_shared` to pass shared rate limiters
     /// and connection trackers.
     #[must_use]
     pub fn new(config: RelayConfig, storage: impl Into<Arc<BlobStorageBackend>>) -> Self {
@@ -638,7 +638,7 @@ const fn hex_nibble(c: u8) -> Option<u8> {
 
 /// Encodes a `[u8; 32]` as a 64-character lowercase hex string.
 ///
-/// Used by [`ApplicationNode`] to format the bridge token for the
+/// Used by `ApplicationNode` to format the bridge token for the
 /// WebSocket connection URL.
 #[must_use]
 pub fn hex_encode_32(bytes: &[u8; 32]) -> String {

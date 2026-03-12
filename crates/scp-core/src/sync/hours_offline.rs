@@ -875,7 +875,7 @@ impl ReconnectionCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if any storage operation fails.
+    /// Returns [`crate::store::StoreError`] if any storage operation fails.
     pub async fn drain_context_queue<S: scp_platform::traits::Storage>(
         store: &crate::store::ProtocolStore<S>,
         context_id: &str,

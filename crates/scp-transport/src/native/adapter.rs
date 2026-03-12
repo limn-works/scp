@@ -3,7 +3,7 @@
 //!
 //! This adapter translates between the SCP transport API ([`TransportAdapter`])
 //! and the native relay protocol ([`ClientMessage`] / [`RelayMessage`]). It
-//! wraps a [`NativeRelayClient`] to handle connection lifecycle, keepalive,
+//! wraps a `NativeRelayClient` to handle connection lifecycle, keepalive,
 //! reconnection, and deduplication.
 //!
 //! # Mapping
@@ -18,7 +18,7 @@
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 //!
-//! [`NativeRelayClient`]: super::client::NativeRelayClient
+//! `NativeRelayClient`: see `super::client::NativeRelayClient`
 
 use std::pin::Pin;
 
@@ -39,7 +39,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///
 /// Implements [`TransportAdapter`] by translating each transport operation
 /// into the corresponding native relay protocol operation via a
-/// [`NativeRelayClient`].
+/// `NativeRelayClient`.
 ///
 /// # Construction
 ///
@@ -49,7 +49,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// path.
 ///
 /// For tests using local `ws://` relays, use
-/// [`RelayUrlSource::DhtResolved`] as the source — DHT-resolved URLs are
+/// `RelayUrlSource::DhtResolved` as the source — DHT-resolved URLs are
 /// the only source permitted to use plaintext WebSocket.
 ///
 /// # Examples
