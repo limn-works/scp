@@ -1784,7 +1784,7 @@ fn resolve_signing_key(identity_did: &str) -> PyResult<ed25519_dalek::SigningKey
 ///
 /// # Errors
 ///
-/// Returns `RuntimeError` (SCP-GOV-5000) if the context manager is not
+/// Returns `RuntimeError` (SCP-CTX-2040) if the context manager is not
 /// initialized, the action JSON is invalid, or the proposal fails.
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did, action_json))]
@@ -1805,14 +1805,14 @@ fn py_governance_propose(
     rt.block_on(async move {
         let action: scp_core::context::governance::GovernanceAction =
             serde_json::from_str(&action_json_owned).map_err(|e| {
-                PyValueError::new_err(format!("SCP-GOV-5000: invalid governance action JSON: {e}"))
+                PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
             })?;
 
         let outcome = mgr
             .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
             .await
             .map_err(|e| {
-                PyRuntimeError::new_err(format!("SCP-GOV-5001: governance proposal failed: {e}"))
+                PyRuntimeError::new_err(format!("SCP-CTX-2041: governance proposal failed: {e}"))
             })?;
 
         // Re-sync local role state cache from ContextManager after any
@@ -1857,7 +1857,7 @@ fn py_governance_propose(
 ///
 /// # Errors
 ///
-/// Returns `RuntimeError` (SCP-GOV-5002) if the vote fails.
+/// Returns `RuntimeError` (SCP-CTX-2042) if the vote fails.
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
 fn py_governance_approve(
@@ -1879,7 +1879,7 @@ fn py_governance_approve(
             .approve_governance_proposal(&context_id, &proposal_id, &voter_did, &signing_key)
             .await
             .map_err(|e| {
-                PyRuntimeError::new_err(format!("SCP-GOV-5002: governance approval failed: {e}"))
+                PyRuntimeError::new_err(format!("SCP-CTX-2042: governance approval failed: {e}"))
             })?;
 
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
@@ -1912,7 +1912,7 @@ fn py_governance_approve(
 ///
 /// # Errors
 ///
-/// Returns `RuntimeError` (SCP-GOV-5003) if the vote fails.
+/// Returns `RuntimeError` (SCP-CTX-2043) if the vote fails.
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
 fn py_governance_reject(
@@ -1934,7 +1934,7 @@ fn py_governance_reject(
             .reject_governance_proposal(&context_id, &proposal_id, &voter_did, &signing_key)
             .await
             .map_err(|e| {
-                PyRuntimeError::new_err(format!("SCP-GOV-5003: governance rejection failed: {e}"))
+                PyRuntimeError::new_err(format!("SCP-CTX-2043: governance rejection failed: {e}"))
             })?;
 
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
@@ -1967,7 +1967,7 @@ fn py_governance_reject(
 ///
 /// # Errors
 ///
-/// Returns `RuntimeError` (SCP-GOV-5004) if the withdrawal fails.
+/// Returns `RuntimeError` (SCP-CTX-2044) if the withdrawal fails.
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
 fn py_governance_withdraw(
@@ -1989,7 +1989,7 @@ fn py_governance_withdraw(
             .await
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
-                    "SCP-GOV-5004: governance vote withdrawal failed: {e}"
+                    "SCP-CTX-2044: governance vote withdrawal failed: {e}"
                 ))
             })?;
 
@@ -2008,15 +2008,72 @@ fn py_governance_withdraw(
 /// Parses a hex-encoded proposal ID into a 32-byte array.
 fn parse_proposal_id(hex_str: &str) -> PyResult<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| {
-        PyValueError::new_err(format!("SCP-GOV-5000: invalid proposal ID hex: {e}"))
+        PyValueError::new_err(format!("SCP-CTX-2040: invalid proposal ID hex: {e}"))
     })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
         PyValueError::new_err(format!(
-            "SCP-GOV-5000: proposal ID must be 32 bytes, got {}",
+            "SCP-CTX-2040: proposal ID must be 32 bytes, got {}",
             v.len()
         ))
     })?;
     Ok(arr)
+}
+
+/// Retrieves a single governance proposal by hex-encoded ID.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2045) if the proposal is not found.
+#[pyfunction]
+#[pyo3(signature = (handle, proposal_id_hex))]
+fn py_governance_get_proposal(
+    handle: &PyContextHandle,
+    proposal_id_hex: String,
+) -> PyResult<String> {
+    let context_id = handle.context_id.clone();
+    let proposal_id = parse_proposal_id(&proposal_id_hex)?;
+
+    let mgr = crate::runtime::context_manager()
+        .map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
+    let rt = crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
+
+    rt.block_on(async move {
+        let proposal = mgr
+            .get_proposal(&context_id, &proposal_id)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-CTX-2045: get proposal failed: {e}"))
+            })?;
+
+        serde_json::to_string(&proposal).map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2045: serialization failed: {e}"))
+        })
+    })
+}
+
+/// Lists all governance proposals for a context.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2046) if listing fails.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_governance_list_proposals(handle: &PyContextHandle) -> PyResult<String> {
+    let context_id = handle.context_id.clone();
+
+    let mgr = crate::runtime::context_manager()
+        .map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
+    let rt = crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
+
+    rt.block_on(async move {
+        let proposals = mgr.list_proposals(&context_id).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2046: list proposals failed: {e}"))
+        })?;
+
+        serde_json::to_string(&proposals).map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2046: serialization failed: {e}"))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2490,6 +2547,8 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_governance_approve, m)?)?;
     m.add_function(wrap_pyfunction!(py_governance_reject, m)?)?;
     m.add_function(wrap_pyfunction!(py_governance_withdraw, m)?)?;
+    m.add_function(wrap_pyfunction!(py_governance_get_proposal, m)?)?;
+    m.add_function(wrap_pyfunction!(py_governance_list_proposals, m)?)?;
     // Broadcast (#369)
     m.add_function(wrap_pyfunction!(py_broadcast_subscribe, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;

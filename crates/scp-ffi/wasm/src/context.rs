@@ -554,7 +554,7 @@ pub fn context_governance_propose(
             .map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("action_json is not valid: {e}"),
-                    code: "SCP-GOV-5000".to_owned(),
+                    code: "SCP-CTX-2040".to_owned(),
                 }
                 .into_js()
             })?;
@@ -567,7 +567,7 @@ pub fn context_governance_propose(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize proposal result: {e}"),
-                code: "SCP-GOV-5001".to_owned(),
+                code: "SCP-CTX-2041".to_owned(),
             }
             .into_js()
         })?;
@@ -609,7 +609,7 @@ pub fn context_governance_approve(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize approval result: {e}"),
-                code: "SCP-GOV-5002".to_owned(),
+                code: "SCP-CTX-2042".to_owned(),
             }
             .into_js()
         })?;
@@ -651,7 +651,7 @@ pub fn context_governance_reject(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize rejection result: {e}"),
-                code: "SCP-GOV-5003".to_owned(),
+                code: "SCP-CTX-2043".to_owned(),
             }
             .into_js()
         })?;
@@ -692,7 +692,65 @@ pub fn context_governance_withdraw(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize withdrawal result: {e}"),
-                code: "SCP-GOV-5004".to_owned(),
+                code: "SCP-CTX-2044".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Governance query bridge functions (#621)
+// ---------------------------------------------------------------------------
+
+/// Retrieves a single governance proposal by ID.
+///
+/// Delegates to `WasmContextManager::get_proposal`.
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with proposal details.
+#[wasm_bindgen]
+pub fn context_governance_get_proposal(handle: &WasmContextHandle, proposal_id: String) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result = with_manager(|mgr| mgr.get_proposal(&context_id, &proposal_id))
+            .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("failed to serialize proposal: {e}"),
+                code: "SCP-CTX-2045".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Lists all pending governance proposals for a context.
+///
+/// Delegates to `WasmContextManager::list_proposals`.
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON array of proposals.
+#[wasm_bindgen]
+pub fn context_governance_list_proposals(handle: &WasmContextHandle) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result =
+            with_manager(|mgr| mgr.list_proposals(&context_id)).map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("failed to serialize proposals: {e}"),
+                code: "SCP-CTX-2046".to_owned(),
             }
             .into_js()
         })?;

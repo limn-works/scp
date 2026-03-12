@@ -240,6 +240,29 @@ public enum GovernanceBridge {
             handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
         )
     }
+
+    /// Retrieve a single governance proposal by hex-encoded ID (#621).
+    public typealias GetProposalFn = @Sendable (
+        _ handle: ContextHandle,
+        _ proposalIdHex: String
+    ) async throws -> String
+
+    /// List all governance proposals for a context (#621).
+    public typealias ListProposalsFn = @Sendable (
+        _ handle: ContextHandle
+    ) async throws -> String
+
+    /// Default get proposal function that delegates to the UniFFI-generated binding.
+    public static let defaultGetProposal: GetProposalFn = { handle, proposalIdHex in
+        try await governanceGetProposal(
+            handle: handle, proposalIdHex: proposalIdHex
+        )
+    }
+
+    /// Default list proposals function that delegates to the UniFFI-generated binding.
+    public static let defaultListProposals: ListProposalsFn = { handle in
+        try await governanceListProposals(handle: handle)
+    }
 }
 
 // MARK: - MembershipBridge
@@ -440,7 +463,7 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-GOV-5001"
+                code: "SCP-CTX-2041"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
@@ -470,7 +493,7 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-GOV-5002"
+                code: "SCP-CTX-2042"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
@@ -498,7 +521,7 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-GOV-5003"
+                code: "SCP-CTX-2043"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
@@ -526,7 +549,7 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(
                 message: "Context is not active",
-                code: "SCP-GOV-5004"
+                code: "SCP-CTX-2044"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
@@ -536,6 +559,55 @@ public extension Context {
             )
         }
         return try await withdrawFn(contextHandle, voterDid, proposalIdHex)
+    }
+
+    /// Retrieves a governance proposal by hex-encoded ID.
+    ///
+    /// - Parameters:
+    ///   - proposalIdHex: Hex-encoded 32-byte proposal ID.
+    ///   - getProposalFn: Bridge function override for testing.
+    /// - Returns: JSON string with proposal details.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the proposal is not found.
+    func getGovernanceProposal(
+        proposalIdHex: String,
+        getProposalFn: GovernanceBridge.GetProposalFn = GovernanceBridge.defaultGetProposal
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2045"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await getProposalFn(contextHandle, proposalIdHex)
+    }
+
+    /// Lists all governance proposals for this context.
+    ///
+    /// - Parameter listProposalsFn: Bridge function override for testing.
+    /// - Returns: JSON array of proposals.
+    /// - Throws: ``ScpError/Context(message:code:)`` if listing fails.
+    func listGovernanceProposals(
+        listProposalsFn: GovernanceBridge.ListProposalsFn = GovernanceBridge.defaultListProposals
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2046"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await listProposalsFn(contextHandle)
     }
 }
 

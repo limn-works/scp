@@ -279,6 +279,24 @@ interface KeyCustodyProvider {
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
     fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle
+
+    /**
+     * Export the raw Ed25519 private key bytes (32 bytes) for a key handle.
+     *
+     * Required for governance vote signing, which needs the raw signing key
+     * bytes. Software-backed keys can export their private material.
+     * Hardware-backed TEE keys are non-extractable and MUST throw an error
+     * with a clear message indicating that governance signing is not supported
+     * on hardware-backed keys until a Signer trait is adopted.
+     *
+     * @param keyHandle Handle to an Ed25519 key.
+     * @return 32-byte raw Ed25519 private key bytes.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     * @throws ScpException with code `SCP-CRYPTO-4005` if key is hardware-backed
+     *   and cannot be exported (TEE keys are non-extractable).
+     */
+    fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray
 }
 
 /**

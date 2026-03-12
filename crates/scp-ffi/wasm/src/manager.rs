@@ -2509,7 +2509,18 @@ impl WasmContextManager {
                     message: format!(
                         "member {proposer_did} does not have 'governance:propose' capability"
                     ),
-                    code: "SCP-GOV-5001".to_owned(),
+                    code: "SCP-CTX-2041".to_owned(),
+                });
+            }
+        }
+
+        // Check for duplicate proposal ID.
+        {
+            let ctx = self.require_active_context_mut(context_id)?;
+            if ctx.pending_proposals.contains_key(proposal_id) {
+                return Err(ScpWasmError::Context {
+                    message: format!("proposal {proposal_id} already exists"),
+                    code: "SCP-CTX-2041".to_owned(),
                 });
             }
         }
@@ -2611,7 +2622,7 @@ impl WasmContextManager {
                     message: format!(
                         "member {voter_did} does not have 'governance:vote' capability"
                     ),
-                    code: "SCP-GOV-5002".to_owned(),
+                    code: "SCP-CTX-2042".to_owned(),
                 });
             }
         }
@@ -2629,13 +2640,13 @@ impl WasmContextManager {
                 .get_mut(proposal_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-GOV-5002".to_owned(),
+                    code: "SCP-CTX-2042".to_owned(),
                 })?;
 
         if proposal.voting_deadline_ms <= now {
             return Err(ScpWasmError::Context {
                 message: "proposal voting deadline has expired".to_owned(),
-                code: "SCP-GOV-5002".to_owned(),
+                code: "SCP-CTX-2042".to_owned(),
             });
         }
 
@@ -2645,7 +2656,7 @@ impl WasmContextManager {
         {
             return Err(ScpWasmError::Permission {
                 message: format!("member {voter_did} has already voted on this proposal"),
-                code: "SCP-GOV-5002".to_owned(),
+                code: "SCP-CTX-2042".to_owned(),
             });
         }
 
@@ -2699,7 +2710,7 @@ impl WasmContextManager {
                     message: format!(
                         "member {voter_did} does not have 'governance:vote' capability"
                     ),
-                    code: "SCP-GOV-5003".to_owned(),
+                    code: "SCP-CTX-2043".to_owned(),
                 });
             }
         }
@@ -2716,13 +2727,13 @@ impl WasmContextManager {
                 .get_mut(proposal_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-GOV-5003".to_owned(),
+                    code: "SCP-CTX-2043".to_owned(),
                 })?;
 
         if proposal.voting_deadline_ms <= now {
             return Err(ScpWasmError::Context {
                 message: "proposal voting deadline has expired".to_owned(),
-                code: "SCP-GOV-5003".to_owned(),
+                code: "SCP-CTX-2043".to_owned(),
             });
         }
 
@@ -2731,7 +2742,7 @@ impl WasmContextManager {
         {
             return Err(ScpWasmError::Permission {
                 message: format!("member {voter_did} has already voted on this proposal"),
-                code: "SCP-GOV-5003".to_owned(),
+                code: "SCP-CTX-2043".to_owned(),
             });
         }
 
@@ -2781,7 +2792,7 @@ impl WasmContextManager {
                 .get_mut(proposal_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-GOV-5004".to_owned(),
+                    code: "SCP-CTX-2044".to_owned(),
                 })?;
 
         let voter = voter_did.to_owned();
@@ -2795,7 +2806,7 @@ impl WasmContextManager {
         } else {
             return Err(ScpWasmError::Permission {
                 message: format!("member {voter_did} has not voted on proposal {proposal_id}"),
-                code: "SCP-GOV-5004".to_owned(),
+                code: "SCP-CTX-2044".to_owned(),
             });
         }
 
@@ -2806,6 +2817,72 @@ impl WasmContextManager {
         );
 
         Ok(serde_json::json!({ "status": "Pending" }))
+    }
+
+    /// Retrieves a single pending governance proposal by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proposal is not found.
+    pub fn get_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context {context_id} not found"),
+                code: "SCP-CTX-2045".to_owned(),
+            })?;
+
+        let proposal =
+            ctx.pending_proposals
+                .get(proposal_id)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!("proposal {proposal_id} not found"),
+                    code: "SCP-CTX-2045".to_owned(),
+                })?;
+
+        Ok(serde_json::json!({
+            "proposal_id": proposal_id,
+            "proposer_did": proposal.proposer_did,
+            "approvals": proposal.approvals,
+            "rejections": proposal.rejections,
+            "voting_deadline_ms": proposal.voting_deadline_ms,
+        }))
+    }
+
+    /// Lists all pending governance proposals for a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found.
+    pub fn list_proposals(&self, context_id: &str) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context {context_id} not found"),
+                code: "SCP-CTX-2046".to_owned(),
+            })?;
+
+        let proposals: Vec<serde_json::Value> = ctx
+            .pending_proposals
+            .iter()
+            .map(|(id, p)| {
+                serde_json::json!({
+                    "proposal_id": id,
+                    "proposer_did": p.proposer_did,
+                    "approvals": p.approvals,
+                    "rejections": p.rejections,
+                    "voting_deadline_ms": p.voting_deadline_ms,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!(proposals))
     }
 
     // -----------------------------------------------------------------------

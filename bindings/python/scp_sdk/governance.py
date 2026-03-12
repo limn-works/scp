@@ -210,7 +210,7 @@ async def propose_governance_action(
     Raises:
         ContextError: If the bridge is unavailable.
         ValueError: If the action JSON is invalid.
-        RuntimeError: If the proposal fails (SCP-GOV-5001).
+        RuntimeError: If the proposal fails (SCP-CTX-2041).
     """
     try:
         import _scp_core
@@ -246,7 +246,7 @@ async def approve_governance_proposal(
 
     Raises:
         ContextError: If the bridge is unavailable.
-        RuntimeError: If the vote fails (SCP-GOV-5002).
+        RuntimeError: If the vote fails (SCP-CTX-2042).
     """
     try:
         import _scp_core
@@ -280,7 +280,7 @@ async def reject_governance_proposal(
 
     Raises:
         ContextError: If the bridge is unavailable.
-        RuntimeError: If the vote fails (SCP-GOV-5003).
+        RuntimeError: If the vote fails (SCP-CTX-2043).
     """
     try:
         import _scp_core
@@ -317,7 +317,7 @@ async def withdraw_governance_vote(
 
     Raises:
         ContextError: If the bridge is unavailable.
-        RuntimeError: If the withdrawal fails (SCP-GOV-5004).
+        RuntimeError: If the withdrawal fails (SCP-CTX-2044).
     """
     try:
         import _scp_core
@@ -331,11 +331,69 @@ async def withdraw_governance_vote(
     return _scp_core.py_governance_withdraw(context._handle, did, proposal_id_hex)
 
 
+async def get_governance_proposal(
+    context: Context,
+    proposal_id_hex: str,
+) -> str:
+    """Retrieve a single governance proposal by hex-encoded ID.
+
+    Delegates to ``_scp_core.py_governance_get_proposal``.
+
+    Args:
+        context: The context containing the proposal.
+        proposal_id_hex: Hex-encoded 32-byte proposal ID.
+
+    Returns:
+        JSON string with the full proposal details.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If the proposal is not found (SCP-CTX-2045).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    return _scp_core.py_governance_get_proposal(context._handle, proposal_id_hex)
+
+
+async def list_governance_proposals(context: Context) -> str:
+    """List all governance proposals for a context.
+
+    Delegates to ``_scp_core.py_governance_list_proposals``.
+
+    Args:
+        context: The context to list proposals for.
+
+    Returns:
+        JSON array of proposals.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If listing fails (SCP-CTX-2046).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    return _scp_core.py_governance_list_proposals(context._handle)
+
+
 __all__ = [
     "GovernanceActionResult",
     "approve_governance_proposal",
     "execute_governance_action",
+    "get_governance_proposal",
     "handle_ttl_expiry",
+    "list_governance_proposals",
     "propose_governance_action",
     "propose_ttl_extension",
     "reject_governance_proposal",

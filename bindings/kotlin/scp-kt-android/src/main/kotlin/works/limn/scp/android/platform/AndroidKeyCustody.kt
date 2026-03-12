@@ -367,6 +367,55 @@ class AndroidKeyCustody internal constructor(
         )
     }
 
+    /**
+     * Exports the raw 32-byte Ed25519 private key bytes for governance vote signing.
+     *
+     * For software-backed keys ([CustodyType.SOFTWARE]): extracts the 32-byte seed from
+     * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy.
+     *
+     * For hardware-backed keys ([CustodyType.HARDWARE]): throws an error because TEE keys
+     * are non-extractable. Governance signing on hardware-backed keys requires a future
+     * architectural change to use a Signer trait instead of raw key export.
+     *
+     * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
+     * @return 32-byte raw Ed25519 private key bytes.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
+     * @throws ScpException with code `SCP-CRYPTO-4005` if the key is hardware-backed
+     *   (TEE keys are non-extractable).
+     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     */
+    override fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray {
+        if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            throw ScpException(
+                "Cannot export signing key bytes from hardware-backed TEE custody " +
+                    "(handle '${keyHandle.id}'). Hardware keys are non-extractable. " +
+                    "Governance signing on hardware-backed keys requires a Signer trait " +
+                    "(see GitHub issue for architectural fix).",
+                "SCP-CRYPTO-4005",
+            )
+        }
+
+        val storedType = softwareKeyTypes[keyHandle.id]
+        if (storedType != null && storedType != KeyType.ED25519) {
+            throw ScpException(
+                "exportSigningKeyBytes requires an Ed25519 key; handle '${keyHandle.id}' is X25519",
+                "SCP-CRYPTO-4003",
+            )
+        }
+
+        val keyPair = softwareKeys[keyHandle.id]
+            ?: throw ScpException(
+                "Key not found: ${keyHandle.id}",
+                "SCP-CRYPTO-4001",
+            )
+
+        val privateParams = keyPair.private as Ed25519PrivateKeyParameters
+        val seed = privateParams.encoded
+        val result = seed.copyOf()
+        seed.fill(0)
+        return result
+    }
+
     // -----------------------------------------------------------------------
     // Private: Keystore Ed25519 operations (API 33+)
     // -----------------------------------------------------------------------

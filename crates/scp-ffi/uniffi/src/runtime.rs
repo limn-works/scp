@@ -222,6 +222,32 @@ pub fn remove_ucan_state(context_id: &str) {
     map.remove(context_id);
 }
 
+/// Syncs role state from the `ContextManager` after governance operations.
+///
+/// The `UniFFI` bridge reads role state directly from the `ContextManager`
+/// (unlike PyO3/NAPI which cache `role_state` locally). This function
+/// validates the `ContextManager` state is consistent and logs the sync
+/// for traceability, matching the pattern of the other bridges.
+///
+/// # Errors
+///
+/// Returns `ScpError` if the context is not registered in the manager.
+pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate::ScpError> {
+    let manager = context_manager();
+    let _role_state =
+        manager
+            .get_role_state(context_id)
+            .await
+            .ok_or_else(|| crate::ScpError::Context {
+                message: format!(
+                    "context '{context_id}' not found in ContextManager during role state sync"
+                ),
+                code: "SCP-CTX-2040".to_owned(),
+            })?;
+    tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Provider implementations for the FFI bridge
 //

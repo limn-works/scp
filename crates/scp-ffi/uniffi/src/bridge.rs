@@ -4809,7 +4809,7 @@ async fn resolve_uniffi_signing_key(
         message: "no signing key on context handle — governance lifecycle \
                   requires an identity with an active signing key"
             .to_owned(),
-        code: "SCP-GOV-5000".to_owned(),
+        code: "SCP-CTX-2040".to_owned(),
     })?;
 
     if let Some(ref cb) = handle.callback_custody {
@@ -4818,7 +4818,7 @@ async fn resolve_uniffi_signing_key(
             .await
             .map_err(|e| ScpError::Context {
                 message: format!("failed to export signing key from platform custody: {e}"),
-                code: "SCP-GOV-5000".to_owned(),
+                code: "SCP-CTX-2040".to_owned(),
             });
     }
 
@@ -4830,7 +4830,7 @@ async fn resolve_uniffi_signing_key(
             .await
             .map_err(|e| ScpError::Context {
                 message: format!("failed to export signing key from in-memory custody: {e}"),
-                code: "SCP-GOV-5000".to_owned(),
+                code: "SCP-CTX-2040".to_owned(),
             });
     }
 
@@ -4838,7 +4838,7 @@ async fn resolve_uniffi_signing_key(
         message: "no custody provider on context handle — governance lifecycle \
                   requires an identity created with custody"
             .to_owned(),
-        code: "SCP-GOV-5000".to_owned(),
+        code: "SCP-CTX-2040".to_owned(),
     })
 }
 
@@ -4846,11 +4846,11 @@ async fn resolve_uniffi_signing_key(
 fn parse_uniffi_proposal_id(hex_str: &str) -> Result<[u8; 32], ScpError> {
     let bytes = hex::decode(hex_str).map_err(|e| ScpError::Validation {
         message: format!("invalid proposal ID hex: {e}"),
-        code: "SCP-GOV-5000".to_owned(),
+        code: "SCP-CTX-2040".to_owned(),
     })?;
     bytes.try_into().map_err(|v: Vec<u8>| ScpError::Validation {
         message: format!("proposal ID must be 32 bytes, got {}", v.len()),
-        code: "SCP-GOV-5000".to_owned(),
+        code: "SCP-CTX-2040".to_owned(),
     })
 }
 
@@ -4873,7 +4873,7 @@ fn parse_uniffi_proposal_id(hex_str: &str) -> Result<[u8; 32], ScpError> {
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Context` (SCP-GOV-5001) if the proposal fails.
+/// Returns `ScpError::Context` (SCP-CTX-2041) if the proposal fails.
 #[uniffi::export]
 pub async fn governance_propose(
     handle: Arc<ContextHandle>,
@@ -4883,7 +4883,7 @@ pub async fn governance_propose(
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
 
-    runtime()
+    let result = runtime()
         .spawn(async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
@@ -4906,8 +4906,17 @@ pub async fn governance_propose(
         .await
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance proposal: {e}"),
-            code: "SCP-GOV-5001".to_owned(),
-        })?
+            code: "SCP-CTX-2041".to_owned(),
+        })?;
+
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        tracing::warn!(
+            context_id = %handle.context_id,
+            "failed to sync role state after governance proposal: {e}"
+        );
+    }
+
+    result
 }
 
 /// Casts an approval vote on a pending governance proposal.
@@ -4916,7 +4925,7 @@ pub async fn governance_propose(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Context` (SCP-GOV-5002) if the vote fails.
+/// Returns `ScpError::Context` (SCP-CTX-2042) if the vote fails.
 #[uniffi::export]
 pub async fn governance_approve(
     handle: Arc<ContextHandle>,
@@ -4927,7 +4936,7 @@ pub async fn governance_approve(
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
-    runtime()
+    let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
             let manager = crate::runtime::context_manager();
@@ -4941,8 +4950,17 @@ pub async fn governance_approve(
         .await
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance approval: {e}"),
-            code: "SCP-GOV-5002".to_owned(),
-        })?
+            code: "SCP-CTX-2042".to_owned(),
+        })?;
+
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        tracing::warn!(
+            context_id = %handle.context_id,
+            "failed to sync role state after governance approval: {e}"
+        );
+    }
+
+    result
 }
 
 /// Casts a rejection vote on a pending governance proposal.
@@ -4951,7 +4969,7 @@ pub async fn governance_approve(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Context` (SCP-GOV-5003) if the vote fails.
+/// Returns `ScpError::Context` (SCP-CTX-2043) if the vote fails.
 #[uniffi::export]
 pub async fn governance_reject(
     handle: Arc<ContextHandle>,
@@ -4962,7 +4980,7 @@ pub async fn governance_reject(
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
-    runtime()
+    let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
             let manager = crate::runtime::context_manager();
@@ -4976,8 +4994,17 @@ pub async fn governance_reject(
         .await
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance rejection: {e}"),
-            code: "SCP-GOV-5003".to_owned(),
-        })?
+            code: "SCP-CTX-2043".to_owned(),
+        })?;
+
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        tracing::warn!(
+            context_id = %handle.context_id,
+            "failed to sync role state after governance rejection: {e}"
+        );
+    }
+
+    result
 }
 
 /// Withdraws a previously cast vote on a pending governance proposal.
@@ -4987,7 +5014,7 @@ pub async fn governance_reject(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Context` (SCP-GOV-5004) if the withdrawal fails.
+/// Returns `ScpError::Context` (SCP-CTX-2044) if the withdrawal fails.
 #[uniffi::export]
 pub async fn governance_withdraw(
     handle: Arc<ContextHandle>,
@@ -4997,7 +5024,7 @@ pub async fn governance_withdraw(
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
-    runtime()
+    let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
             let manager = crate::runtime::context_manager();
@@ -5011,7 +5038,80 @@ pub async fn governance_withdraw(
         .await
         .map_err(|e| ScpError::Context {
             message: format!("tokio task join error during governance withdrawal: {e}"),
-            code: "SCP-GOV-5004".to_owned(),
+            code: "SCP-CTX-2044".to_owned(),
+        })?;
+
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        tracing::warn!(
+            context_id = %handle.context_id,
+            "failed to sync role state after governance withdrawal: {e}"
+        );
+    }
+
+    result
+}
+
+/// Retrieves a single governance proposal by hex-encoded ID.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2045) if the proposal is not found.
+#[uniffi::export]
+pub async fn governance_get_proposal(
+    handle: Arc<ContextHandle>,
+    proposal_id_hex: String,
+) -> Result<String, ScpError> {
+    let context_id = handle.context_id.clone();
+    let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let proposal = manager
+                .get_proposal(&context_id, &proposal_id)
+                .await
+                .map_err(ScpError::from)?;
+
+            serde_json::to_string(&proposal).map_err(|e| ScpError::Context {
+                message: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2045".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during get proposal: {e}"),
+            code: "SCP-CTX-2045".to_owned(),
+        })?
+}
+
+/// Lists all governance proposals for a context.
+///
+/// Returns a JSON array of proposals.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
+#[uniffi::export]
+pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<String, ScpError> {
+    let context_id = handle.context_id.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let proposals = manager
+                .list_proposals(&context_id)
+                .await
+                .map_err(ScpError::from)?;
+
+            serde_json::to_string(&proposals).map_err(|e| ScpError::Context {
+                message: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2046".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during list proposals: {e}"),
+            code: "SCP-CTX-2046".to_owned(),
         })?
 }
 

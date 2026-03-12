@@ -1197,7 +1197,7 @@ async fn resolve_napi_signing_key(
             message: "no custody provider on context handle — governance lifecycle \
                       requires an identity created with custody"
                 .to_owned(),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         })
     })?;
     let key_handle = handle.signing_key.ok_or_else(|| {
@@ -1205,7 +1205,7 @@ async fn resolve_napi_signing_key(
             message: "no signing key on context handle — governance lifecycle \
                       requires an identity with an active signing key"
                 .to_owned(),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         })
     })?;
     custody
@@ -1215,7 +1215,7 @@ async fn resolve_napi_signing_key(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("failed to export signing key for governance: {e}"),
-                code: "SCP-GOV-5000".to_owned(),
+                code: "SCP-CTX-2040".to_owned(),
             })
         })
 }
@@ -1225,13 +1225,13 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid proposal ID hex: {e}"),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         })
     })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("proposal ID must be 32 bytes, got {}", v.len()),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         })
     })?;
     Ok(arr)
@@ -1256,7 +1256,7 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-GOV-5001` if the proposal fails.
+/// - Rejects with `SCP-CTX-2041` if the proposal fails.
 #[napi(js_name = "contextGovernancePropose")]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn context_governance_propose(
@@ -1267,7 +1267,7 @@ pub async fn context_governance_propose(
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         })
     })?;
 
@@ -1285,7 +1285,7 @@ pub async fn context_governance_propose(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance proposal failed: {e}"),
-                    code: "SCP-GOV-5001".to_owned(),
+                    code: "SCP-CTX-2041".to_owned(),
                 })
             })?;
 
@@ -1314,7 +1314,7 @@ pub async fn context_governance_propose(
             message: "governance proposal requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         }));
     }
 
@@ -1329,7 +1329,7 @@ pub async fn context_governance_propose(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-GOV-5002` if the vote fails.
+/// - Rejects with `SCP-CTX-2042` if the vote fails.
 #[napi(js_name = "contextGovernanceApprove")]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn context_governance_approve(
@@ -1353,7 +1353,7 @@ pub async fn context_governance_approve(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance approval failed: {e}"),
-                    code: "SCP-GOV-5002".to_owned(),
+                    code: "SCP-CTX-2042".to_owned(),
                 })
             })?;
 
@@ -1375,7 +1375,7 @@ pub async fn context_governance_approve(
             message: "governance approval requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         }));
     }
 
@@ -1389,7 +1389,7 @@ pub async fn context_governance_approve(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-GOV-5003` if the vote fails.
+/// - Rejects with `SCP-CTX-2043` if the vote fails.
 #[napi(js_name = "contextGovernanceReject")]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn context_governance_reject(
@@ -1413,7 +1413,7 @@ pub async fn context_governance_reject(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance rejection failed: {e}"),
-                    code: "SCP-GOV-5003".to_owned(),
+                    code: "SCP-CTX-2043".to_owned(),
                 })
             })?;
 
@@ -1435,7 +1435,7 @@ pub async fn context_governance_reject(
             message: "governance rejection requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-GOV-5000".to_owned(),
+            code: "SCP-CTX-2040".to_owned(),
         }));
     }
 
@@ -1450,7 +1450,7 @@ pub async fn context_governance_reject(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-GOV-5004` if the withdrawal fails.
+/// - Rejects with `SCP-CTX-2044` if the withdrawal fails.
 #[napi(js_name = "contextGovernanceWithdraw")]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn context_governance_withdraw(
@@ -1469,7 +1469,7 @@ pub async fn context_governance_withdraw(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("governance vote withdrawal failed: {e}"),
-                code: "SCP-GOV-5004".to_owned(),
+                code: "SCP-CTX-2044".to_owned(),
             })
         })?;
 
@@ -1482,6 +1482,73 @@ pub async fn context_governance_withdraw(
     }
 
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — governance queries (#621)
+// ---------------------------------------------------------------------------
+
+/// Retrieves a single governance proposal by hex-encoded ID.
+///
+/// Returns the full proposal as a JSON string, or rejects if not found.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2045` if the proposal is not found.
+#[napi(js_name = "contextGovernanceGetProposal")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_governance_get_proposal(
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+) -> napi::Result<String> {
+    let context_id = handle.context_id.clone();
+    let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
+    let manager = context_manager();
+
+    let proposal = manager
+        .get_proposal(&context_id, &proposal_id)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("get proposal failed: {e}"),
+                code: "SCP-CTX-2045".to_owned(),
+            })
+        })?;
+
+    serde_json::to_string(&proposal).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2045".to_owned(),
+        })
+    })
+}
+
+/// Lists all governance proposals for a context.
+///
+/// Returns a JSON array of proposals, or an empty array if the context
+/// has no pending proposals.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2046` if listing fails.
+#[napi(js_name = "contextGovernanceListProposals")]
+pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager();
+
+    let proposals = manager.list_proposals(&context_id).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("list proposals failed: {e}"),
+            code: "SCP-CTX-2046".to_owned(),
+        })
+    })?;
+
+    serde_json::to_string(&proposals).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2046".to_owned(),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
