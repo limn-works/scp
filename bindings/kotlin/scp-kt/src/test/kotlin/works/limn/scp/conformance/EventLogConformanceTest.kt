@@ -52,7 +52,7 @@ class EventLogConformanceTest {
                 """[{"type":"joined","did":"did:dht:z6MkA"}]"""
             val result = dispatcher.dispatch(
                 "event_log_query",
-                mapOf("context_id" to "ctx-1", "filter" to "{}"),
+                mapOf("context_handle" to "1", "filter" to "{}"),
             )
             assertTrue(result["result"]?.contains("joined") == true)
         }
@@ -63,7 +63,7 @@ class EventLogConformanceTest {
                 stubBindings.eventLogQueryResult = "[]"
                 val result = dispatcher.dispatch(
                     "event_log_query",
-                    mapOf("context_id" to "ctx-1", "filter" to "{}"),
+                    mapOf("context_handle" to "1", "filter" to "{}"),
                 )
                 assertEquals("[]", result["result"])
             }
@@ -74,7 +74,7 @@ class EventLogConformanceTest {
                 BridgeException("Context not found", "SCP-CTX-2030")
             val result = dispatcher.dispatch(
                 "event_log_query",
-                mapOf("context_id" to "ctx-missing", "filter" to "{}"),
+                mapOf("context_handle" to "1", "filter" to "{}"),
             )
             assertEquals("SCP-CTX-2030", result["error"])
         }
@@ -86,7 +86,7 @@ class EventLogConformanceTest {
             val result = dispatcher.dispatch(
                 "event_log_query",
                 mapOf(
-                    "context_id" to "ctx-1",
+                    "context_handle" to "1",
                     "filter" to """{"type":"message"}""",
                 ),
             )
@@ -103,8 +103,8 @@ class EventLogConformanceTest {
                 val result = dispatcher.dispatch(
                     "event_log_verify",
                     mapOf(
-                        "context_id" to "ctx-1",
-                        "proof" to """{"type":"inclusion","verified":true}""",
+                        "context_handle" to "1",
+                        "claim" to """{"type":"inclusion","leaf_index":0}""",
                     ),
                 )
                 assertEquals("true", result["is_valid"])
@@ -117,8 +117,8 @@ class EventLogConformanceTest {
                 val result = dispatcher.dispatch(
                     "event_log_verify",
                     mapOf(
-                        "context_id" to "ctx-1",
-                        "proof" to """{"type":"inclusion","verified":false}""",
+                        "context_handle" to "1",
+                        "claim" to """{"type":"inclusion","leaf_index":0}""",
                     ),
                 )
                 assertEquals("false", result["is_valid"])
@@ -131,7 +131,7 @@ class EventLogConformanceTest {
                     BridgeException("Proof verification failed", "SCP-CTX-2032")
                 val result = dispatcher.dispatch(
                     "event_log_verify",
-                    mapOf("context_id" to "ctx-1", "proof" to "{}"),
+                    mapOf("context_handle" to "1", "claim" to "{}"),
                 )
                 assertEquals("SCP-CTX-2032", result["error"])
             }
@@ -144,7 +144,7 @@ class EventLogConformanceTest {
             runTest(testDispatcher) {
                 @Suppress("MaxLineLength")
                 stubBindings.eventLogCheckpointResult =
-                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
                 val result = dispatcher.dispatch(
                     "event_log_checkpoint",
                     mapOf(
@@ -178,7 +178,7 @@ class EventLogConformanceTest {
             runTest(testDispatcher) {
                 @Suppress("MaxLineLength")
                 stubBindings.eventLogCheckpointResult =
-                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
                 val result = bridge.infra.eventLogCheckpoint(1L, 2L, 5L)
                 assertTrue(result.contains("merkle_root"))
                 assertTrue(result.contains("event_count"))
@@ -197,7 +197,7 @@ class EventLogConformanceTest {
                     category = "event_log",
                     description = "Query event log (stub returns error)",
                     operation = "event_log_query",
-                    input = mapOf("context_id" to "ctx-test"),
+                    input = mapOf("context_handle" to "1"),
                     expected = mapOf("error" to "SCP-CTX-2030"),
                 )
                 val result = dispatcher.dispatch(
@@ -221,7 +221,7 @@ class EventLogConformanceTest {
                     category = "event_log",
                     description = "Verify event log proof (stub returns error)",
                     operation = "event_log_verify",
-                    input = mapOf("context_id" to "ctx-test"),
+                    input = mapOf("context_handle" to "1"),
                     expected = mapOf("error" to "SCP-CTX-2032"),
                 )
                 val result = dispatcher.dispatch(

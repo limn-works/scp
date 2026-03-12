@@ -214,9 +214,11 @@ private class TestNativeBindings : NativeBindings {
         parentToken: String,
         capabilitiesJson: String,
     ): String = ""
-    override fun eventLogQuery(contextId: String, filterJson: String): String = ""
-    override fun eventLogVerify(contextId: String, proofJson: String): Boolean = false
-    override fun eventLogCheckpoint(contextHandle: Long, identityHandle: Long, epoch: Long): String = ""
+    override fun eventLogQuery(contextHandle: Long, filterJson: String): String = ""
+    override fun eventLogVerify(contextHandle: Long, claimJson: String): Boolean = false
+    @Suppress("MaxLineLength")
+    override fun eventLogCheckpoint(contextHandle: Long, identityHandle: Long, epoch: Long): String =
+        """{"context_id":"","sender_did":"","event_count":0,"merkle_root":"","epoch":0,"timestamp":0,"signature":""}"""
     override fun transportConnect(configJson: String, cancellationHandle: CancellationHandle?): Long = 0L
     override fun transportStatus(transportHandle: Long): String = ""
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }

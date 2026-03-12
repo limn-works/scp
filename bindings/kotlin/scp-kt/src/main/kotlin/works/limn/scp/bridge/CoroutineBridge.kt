@@ -323,13 +323,13 @@ interface UcanBindings {
  */
 interface InfraBindings {
     fun eventLogQuery(
-        contextId: String,
+        contextHandle: Long,
         filterJson: String,
     ): String
 
     fun eventLogVerify(
-        contextId: String,
-        proofJson: String,
+        contextHandle: Long,
+        claimJson: String,
     ): Boolean
 
     fun eventLogCheckpoint(
@@ -1150,26 +1150,26 @@ class InfraBridge internal constructor(
     /**
      * Query the event log for a context.
      *
-     * @param contextId The context ID to query.
+     * @param contextHandle Handle from context create or join.
      * @param filterJson JSON-encoded query filter.
      * @return JSON-encoded event log entries.
      */
     suspend fun eventLogQuery(
-        contextId: String,
+        contextHandle: Long,
         filterJson: String,
-    ): String = bridge.ffiCall { bindings.eventLogQuery(contextId, filterJson) }
+    ): String = bridge.ffiCall { bindings.eventLogQuery(contextHandle, filterJson) }
 
     /**
-     * Verify an event log proof.
+     * Verify a claim against the context event log (Merkle proof).
      *
-     * @param contextId The context ID.
-     * @param proofJson JSON-encoded proof to verify.
+     * @param contextHandle Handle from context create or join.
+     * @param claimJson JSON-encoded claim to verify.
      * @return true if the proof is valid.
      */
     suspend fun eventLogVerify(
-        contextId: String,
-        proofJson: String,
-    ): Boolean = bridge.ffiCall { bindings.eventLogVerify(contextId, proofJson) }
+        contextHandle: Long,
+        claimJson: String,
+    ): Boolean = bridge.ffiCall { bindings.eventLogVerify(contextHandle, claimJson) }
 
     /**
      * Generate a signed consistency checkpoint for equivocation detection.

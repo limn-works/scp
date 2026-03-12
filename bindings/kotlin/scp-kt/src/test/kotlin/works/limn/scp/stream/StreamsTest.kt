@@ -50,7 +50,7 @@ class StreamsTest {
             )
 
             val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val pages = factory.eventLogPages("ctx-1", "{}").toList()
+            val pages = factory.eventLogPages(1L, "{}").toList()
 
             assertEquals(2, pages.size)
             assertEquals("""[{"event":"joined"},{"event":"left"}]""", pages[0])
@@ -62,7 +62,7 @@ class StreamsTest {
             stubInfra.eventLogQueryResults = mutableListOf("[]")
 
             val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val pages = factory.eventLogPages("ctx-1", "{}").toList()
+            val pages = factory.eventLogPages(1L, "{}").toList()
 
             assertTrue(pages.isEmpty())
         }
@@ -75,7 +75,7 @@ class StreamsTest {
             )
 
             val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            factory.eventLogPages("ctx-1", """{"type":"joined"}""", pageSize = 25).toList()
+            factory.eventLogPages(1L, """{"type":"joined"}""", pageSize = 25).toList()
 
             assertEquals(2, stubInfra.capturedFilters.size)
             assertTrue(stubInfra.capturedFilters[0].contains("\"_offset\":0"))
@@ -91,7 +91,7 @@ class StreamsTest {
             )
 
             val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val pages = factory.messageHistoryPages("ctx-1", "{}").toList()
+            val pages = factory.messageHistoryPages(1L, "{}").toList()
 
             assertEquals(1, pages.size)
             assertEquals("""[{"msg":"hello"},{"msg":"world"}]""", pages[0])
@@ -102,7 +102,7 @@ class StreamsTest {
             stubInfra.eventLogQueryResults = mutableListOf("[]")
 
             val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val flow = factory.eventLogPages("ctx-1", "{}")
+            val flow = factory.eventLogPages(1L, "{}")
 
             assertEquals(0, stubInfra.queryCount)
 
@@ -121,7 +121,7 @@ class StreamsTest {
             )
 
             val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val firstPage = factory.eventLogPages("ctx-1", "{}").first()
+            val firstPage = factory.eventLogPages(1L, "{}").first()
 
             assertEquals("""[{"event":"1"}]""", firstPage)
             assertEquals(1, stubInfra.queryCount)
@@ -511,19 +511,20 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
     var queryCount = 0
     var capturedFilters = mutableListOf<String>()
 
-    override fun eventLogQuery(contextId: String, filterJson: String): String {
+    override fun eventLogQuery(contextHandle: Long, filterJson: String): String {
         queryCount++
         capturedFilters.add(filterJson)
         return if (eventLogQueryResults.isNotEmpty()) eventLogQueryResults.removeAt(0) else "[]"
     }
 
-    override fun eventLogVerify(contextId: String, proofJson: String): Boolean = eventLogVerifyResult
+    override fun eventLogVerify(contextHandle: Long, claimJson: String): Boolean = eventLogVerifyResult
 
+    @Suppress("MaxLineLength")
     override fun eventLogCheckpoint(
         contextHandle: Long,
         identityHandle: Long,
         epoch: Long,
-    ): String = """{"context_id":"ctx-stub","sender_did":"did:dht:stub","event_count":0,"merkle_root":"00","epoch":0}"""
+    ): String = """{"context_id":"ctx-stub","sender_did":"did:dht:stub","event_count":0,"merkle_root":"00","epoch":0,"timestamp":0,"signature":"00"}"""
 
     override fun transportConnect(
         configJson: String,
