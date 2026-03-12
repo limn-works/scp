@@ -7,7 +7,7 @@
 //!
 //! - [`EventLogMetrics`] -- Per-context metrics collector tracking event
 //!   counts, byte totals, growth rates, and proof timing.
-//! - [`GrowthSnapshot`] -- A timestamped sample of event count and byte total,
+//! - `GrowthSnapshot` -- A timestamped sample of event count and byte total,
 //!   used for rate calculation.
 //! - [`ProofProfile`] -- Timing and memory data from a single proof operation.
 //! - [`MetricsExport`] -- Serializable snapshot of all collected metrics.

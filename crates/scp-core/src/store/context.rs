@@ -163,7 +163,7 @@ fn context_prefix(context_id: &str) -> Result<String, super::StoreError> {
 ///
 /// # Errors
 ///
-/// Returns [`super::StoreError::InvalidKey`] if `context_id`
+/// Returns `StoreError::InvalidKey` if `context_id`
 /// contains invalid key characters.
 pub fn governance_config_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -177,7 +177,7 @@ pub fn governance_config_key(context_id: &str) -> Result<String, super::StoreErr
 ///
 /// # Errors
 ///
-/// Returns [`super::StoreError::InvalidKey`] if `context_id`
+/// Returns `StoreError::InvalidKey` if `context_id`
 /// contains invalid key characters.
 pub fn governance_proposal_key(
     context_id: &str,
@@ -195,7 +195,7 @@ pub fn governance_proposal_key(
 ///
 /// # Errors
 ///
-/// Returns [`super::StoreError::InvalidKey`] if `context_id`
+/// Returns `StoreError::InvalidKey` if `context_id`
 /// contains invalid key characters.
 pub fn governance_pending_index_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -209,7 +209,7 @@ pub fn governance_pending_index_key(context_id: &str) -> Result<String, super::S
 ///
 /// # Errors
 ///
-/// Returns [`super::StoreError::InvalidKey`] if `context_id`
+/// Returns `StoreError::InvalidKey` if `context_id`
 /// contains invalid key characters.
 pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -223,7 +223,7 @@ pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::
 ///
 /// # Errors
 ///
-/// Returns [`super::StoreError::InvalidKey`] if `context_id`
+/// Returns `StoreError::InvalidKey` if `context_id`
 /// contains invalid key characters.
 pub fn governance_deadlock_state_key(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
@@ -802,7 +802,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// `context/{context_id}/grace/{epoch:020d}`.
     ///
     /// **Note:** The primary production persistence path for grace entries is
-    /// the [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot) blob,
+    /// the `ContextSnapshot` blob,
     /// which persists grace entries atomically alongside all other context
     /// state (membership, roles, governance, TTL, etc.) to ensure
     /// transactional consistency (§23.11 step 2). This individual CRUD method
@@ -829,7 +829,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns entries sorted by epoch number.
     ///
     /// **Note:** The primary production persistence path loads grace entries
-    /// from the [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot)
+    /// from the `ContextSnapshot`
     /// blob (see `restore_context` in `context/manager.rs`). This method
     /// loads from individual storage keys and is available for direct-access
     /// patterns (e.g., recovery, diagnostics, testing) but is not called in
@@ -864,7 +864,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// **Note:** The primary production persistence path manages grace
     /// entries atomically within the
-    /// [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// `ContextSnapshot` blob.
     /// This individual CRUD method is available for direct-access patterns
     /// (e.g., targeted cleanup during recovery or testing) but expired
     /// entries are normally excluded at snapshot creation time rather than
@@ -884,7 +884,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// **Note:** The primary production persistence path manages grace
     /// entries atomically within the
-    /// [`crate::context::manager::ContextSnapshot`](crate::context::manager::ContextSnapshot) blob.
+    /// `ContextSnapshot` blob.
     /// This method is available for bulk cleanup of individually-stored
     /// grace entries (e.g., during the inconsistent state fallback §23.11
     /// or migration from individual keys to the snapshot path).

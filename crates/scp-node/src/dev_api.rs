@@ -251,7 +251,7 @@ pub struct CreateContextRequest {
 /// Handler for `GET /scp/dev/v1/health`.
 ///
 /// Returns a [`HealthResponse`] with the node's uptime (computed from
-/// [`NodeState::start_time`]), relay connection count, and storage status.
+/// `NodeState::start_time`), relay connection count, and storage status.
 ///
 /// See spec section 18.10.3.
 pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {

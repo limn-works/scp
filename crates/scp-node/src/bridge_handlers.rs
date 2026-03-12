@@ -884,7 +884,7 @@ async fn webhook_handler(
 /// Returns an axum [`Router`] serving bridge endpoints.
 ///
 /// The router expects [`BridgeState`] as shared state and
-/// [`BridgeAuthContext`] as a request extension (injected by the bridge
+/// `BridgeAuthContext` as a request extension (injected by the bridge
 /// auth middleware layer applied by the caller).
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
     Router::new()

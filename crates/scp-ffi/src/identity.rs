@@ -21,7 +21,7 @@
 //!
 //! [`PyIdentity`] stores the DID string and custody type — NOT the raw
 //! [`ScpIdentity`], which contains
-//! [`KeyHandle`]s that are not safe to hold across
+//! `KeyHandle`s that are not safe to hold across
 //! Python GIL boundaries. Crypto operations reconstruct state from stored
 //! metadata when the full runtime is wired.
 //!

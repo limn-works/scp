@@ -4,7 +4,7 @@
 //! connections to mask activity patterns. This module provides:
 //!
 //! - [`CoverTrafficConfig`] -- per-connection configuration driven by
-//!   [`CoverTrafficTier`](crate::profile::CoverTrafficTier).
+//!   [`CoverTrafficTier`].
 //! - [`CoverTrafficGenerator`] -- produces dummy messages on a strict timer,
 //!   always emitting exactly one dummy per interval regardless of real traffic.
 //! - [`CoverAction`] -- the decision output: send a dummy or skip (off tier).

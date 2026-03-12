@@ -488,7 +488,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 
     /// Returns the dev API router if the dev API is enabled.
     ///
-    /// Returns `Some(Router)` when [`ApplicationNodeBuilder::local_api`] was
+    /// Returns `Some(Router)` when `ApplicationNodeBuilder::local_api` was
     /// called (i.e., a dev token was generated), `None` otherwise. The
     /// returned router includes all `/scp/dev/v1/*` routes with bearer token
     /// middleware applied.
@@ -516,7 +516,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// ## TLS termination
     ///
     /// When a TLS configuration was provisioned during
-    /// [`ApplicationNodeBuilder::build`] (domain mode with successful ACME or
+    /// `ApplicationNodeBuilder::build` (domain mode with successful ACME or
     /// injected TLS provider), `serve()` terminates TLS using
     /// [`tokio_rustls::TlsAcceptor`] and serves HTTPS/WSS. When no TLS
     /// configuration is present (no-domain mode, or TLS provisioning opted
@@ -524,7 +524,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     ///
     /// ## Dev API
     ///
-    /// When the dev API is configured (via [`ApplicationNodeBuilder::local_api`]),
+    /// When the dev API is configured (via `ApplicationNodeBuilder::local_api`),
     /// a separate tokio task is spawned to serve the dev API on the configured
     /// address. The dev API listener runs concurrently with the public
     /// listener. When the dev API is not configured, `serve()` behaves exactly
@@ -533,8 +533,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     ///
     /// ## HTTP/3
     ///
-    /// When the `http3` feature is enabled and an [`Http3Config`] is provided
-    /// via [`ApplicationNodeBuilder::http3`], an HTTP/3 listener is started
+    /// When the `http3` feature is enabled and an `Http3Config` is provided
+    /// via `ApplicationNodeBuilder::http3`, an HTTP/3 listener is started
     /// on a separate QUIC endpoint. All HTTP/1.1 and HTTP/2 responses include
     /// an `Alt-Svc` header advertising the HTTP/3 endpoint (spec section
     /// 10.15.1).
