@@ -156,6 +156,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn ffi_custody_in_memory_generates_and_signs() {
         let custody = FfiKeyCustody::InMemory(InMemoryKeyCustody::new());
         let handle = custody
@@ -194,6 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn ffi_custody_in_memory_custody_type_is_in_memory() {
         let custody = FfiKeyCustody::InMemory(InMemoryKeyCustody::new());
         let handle = custody

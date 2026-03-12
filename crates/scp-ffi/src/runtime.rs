@@ -1270,6 +1270,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
@@ -1338,6 +1339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
