@@ -107,7 +107,12 @@ fn parse_test_vectors(def: &serde_json::Value) -> Result<Vec<runtime::TestVector
 }
 
 /// Parsed provenance fields: `(implementation_hash, signature, economic_metadata, registered_at)`.
-type ProvenanceFields = ([u8; 32], Vec<u8>, Option<runtime::ToolEconomicMetadata>, u64);
+type ProvenanceFields = (
+    [u8; 32],
+    Vec<u8>,
+    Option<runtime::ToolEconomicMetadata>,
+    u64,
+);
 
 /// Parses optional provenance and economic fields from the definition JSON.
 ///
@@ -141,29 +146,56 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
         None => Vec::new(),
         Some(b64) => {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("invalid 'signature': invalid base64: {e}"),
-                    code: "SCP-VALID-7038".to_owned(),
-                }
-                .into_js()
-            })?
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| {
+                    ScpWasmError::Validation {
+                        message: format!("invalid 'signature': invalid base64: {e}"),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?
         }
     };
 
-    let economic_metadata = def.get("economicMetadata").and_then(|em| {
-        let cost_per_invoke = em.get("costPerInvoke")?.as_u64()?;
-        let cost_formula = em
-            .get("costFormula")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned);
-        let payee = em.get("payee").and_then(|v| v.as_str())?.to_owned();
-        Some(runtime::ToolEconomicMetadata {
-            cost_per_invoke,
-            cost_formula,
-            payee,
-        })
-    });
+    let economic_metadata = match def.get("economicMetadata") {
+        None => None,
+        Some(em) => {
+            let cost_per_invoke = em
+                .get("costPerInvoke")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: "invalid 'economicMetadata': missing or non-numeric \
+                                  'costPerInvoke'"
+                            .to_owned(),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?;
+            let payee = em
+                .get("payee")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: "invalid 'economicMetadata': missing or non-string 'payee'"
+                            .to_owned(),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?
+                .to_owned();
+            let cost_formula = em
+                .get("costFormula")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            Some(runtime::ToolEconomicMetadata {
+                cost_per_invoke,
+                cost_formula,
+                payee,
+            })
+        }
+    };
 
     // Use the hardened time source (captured Date.now) for the registration
     // timestamp. std::time::SystemTime is not available on wasm32 — see
