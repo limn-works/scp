@@ -272,10 +272,10 @@ struct WasmProposal {
     proposer_did: String,
     /// The governance action to execute if approved.
     action: WasmGovernanceAction,
-    /// DIDs that voted approve.
-    approvals: Vec<String>,
-    /// DIDs that voted reject.
-    rejections: Vec<String>,
+    /// Votes to approve: `(voter_did, timestamp_secs)`.
+    approvals: Vec<(String, u64)>,
+    /// Votes to reject: `(voter_did, timestamp_secs)`.
+    rejections: Vec<(String, u64)>,
     /// Voting deadline (ms since epoch). Default 1 hour from creation.
     voting_deadline_ms: f64,
     /// Context ID this proposal belongs to.
@@ -417,6 +417,7 @@ struct PerContextState {
     /// Proposals move here from `pending_proposals` when quorum is reached or
     /// the proposal is definitively rejected. This allows retrieval of resolved
     /// proposals via `get_proposal` and `list_proposals` (#621 F4).
+    /// Capped at [`WASM_RESOLVED_PROPOSAL_CAP`]; oldest by `created_at` evicted.
     resolved_proposals: HashMap<String, WasmProposal>,
     /// Pruning policy JSON string (ADR-030 §6).
     pruning_policy: Option<String>,
@@ -476,6 +477,10 @@ const WASM_PROPOSAL_CAP: usize = 10_000;
 /// Executed proposal TTL in milliseconds (24 hours).
 const WASM_PROPOSAL_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
 
+/// Maximum number of resolved (approved/rejected) proposals per context.
+/// When at capacity, the oldest entry (by `created_at`) is evicted.
+const WASM_RESOLVED_PROPOSAL_CAP: usize = 10_000;
+
 /// Maximum events in the receive buffer. Matches `PyO3` channel capacity.
 const WASM_EVENT_BUFFER_CAP: usize = 1000;
 
@@ -531,6 +536,23 @@ impl PerContextState {
     /// malformed (non-numeric values are rejected, not silently defaulted).
     fn check_version_compatibility(&self) -> Result<(), ScpWasmError> {
         parse_and_check_min_protocol_version(&self.params_json)
+    }
+
+    /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
+    /// at [`WASM_RESOLVED_PROPOSAL_CAP`].
+    fn insert_resolved_proposal(&mut self, id: String, proposal: WasmProposal) {
+        if self.resolved_proposals.len() >= WASM_RESOLVED_PROPOSAL_CAP {
+            // Evict the entry with the smallest `created_at`.
+            if let Some(oldest_key) = self
+                .resolved_proposals
+                .iter()
+                .min_by_key(|(_, p)| p.created_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.resolved_proposals.remove(&oldest_key);
+            }
+        }
+        self.resolved_proposals.insert(id, proposal);
     }
 }
 
@@ -2563,7 +2585,7 @@ impl WasmContextManager {
         let proposal = WasmProposal {
             proposer_did: proposer_did.to_owned(),
             action: action.clone(),
-            approvals: vec![proposer_did.to_owned()],
+            approvals: vec![(proposer_did.to_owned(), now_secs)],
             rejections: Vec::new(),
             voting_deadline_ms: now + WASM_PROPOSAL_DEADLINE_MS,
             context_id: context_id.to_owned(),
@@ -2606,7 +2628,7 @@ impl WasmContextManager {
                 // Move to resolved_proposals for later retrieval.
                 "Approved".clone_into(&mut p.status);
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
-                    ctx.resolved_proposals.insert(pid.clone(), p);
+                    ctx.insert_resolved_proposal(pid.clone(), p);
                 }
                 return Ok(serde_json::json!({
                     "proposal_id": pid,
@@ -2675,8 +2697,8 @@ impl WasmContextManager {
         }
 
         // Check for duplicate vote.
-        if proposal.approvals.contains(&voter_did.to_owned())
-            || proposal.rejections.contains(&voter_did.to_owned())
+        if proposal.approvals.iter().any(|(d, _)| d == voter_did)
+            || proposal.rejections.iter().any(|(d, _)| d == voter_did)
         {
             return Err(ScpWasmError::Permission {
                 message: format!("member {voter_did} has already voted on this proposal"),
@@ -2684,7 +2706,9 @@ impl WasmContextManager {
             });
         }
 
-        proposal.approvals.push(voter_did.to_owned());
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
+        proposal.approvals.push((voter_did.to_owned(), vote_ts));
 
         ctx.event_log.append_event(
             crate::runtime::wasm_event_type_tag("GovernanceVoteApproval"),
@@ -2707,7 +2731,7 @@ impl WasmContextManager {
                 // Move to resolved_proposals for later retrieval.
                 "Approved".clone_into(&mut p.status);
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
-                    ctx.resolved_proposals.insert(pid.clone(), p);
+                    ctx.insert_resolved_proposal(pid.clone(), p);
                 }
                 return Ok(serde_json::json!({
                     "status": "Approved",
@@ -2766,8 +2790,8 @@ impl WasmContextManager {
             });
         }
 
-        if proposal.approvals.contains(&voter_did.to_owned())
-            || proposal.rejections.contains(&voter_did.to_owned())
+        if proposal.approvals.iter().any(|(d, _)| d == voter_did)
+            || proposal.rejections.iter().any(|(d, _)| d == voter_did)
         {
             return Err(ScpWasmError::Permission {
                 message: format!("member {voter_did} has already voted on this proposal"),
@@ -2775,7 +2799,9 @@ impl WasmContextManager {
             });
         }
 
-        proposal.rejections.push(voter_did.to_owned());
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
+        proposal.rejections.push((voter_did.to_owned(), vote_ts));
 
         ctx.event_log.append_event(
             crate::runtime::wasm_event_type_tag("GovernanceVoteRejection"),
@@ -2799,7 +2825,7 @@ impl WasmContextManager {
                 && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
             {
                 "Rejected".clone_into(&mut p.status);
-                ctx3.resolved_proposals.insert(proposal_id.to_owned(), p);
+                ctx3.insert_resolved_proposal(proposal_id.to_owned(), p);
             }
             return Ok(serde_json::json!({ "status": "Rejected" }));
         }
@@ -2828,8 +2854,8 @@ impl WasmContextManager {
                 })?;
 
         let voter = voter_did.to_owned();
-        let was_approval = proposal.approvals.iter().position(|v| v == &voter);
-        let was_rejection = proposal.rejections.iter().position(|v| v == &voter);
+        let was_approval = proposal.approvals.iter().position(|(d, _)| d == &voter);
+        let was_rejection = proposal.rejections.iter().position(|(d, _)| d == &voter);
 
         if let Some(idx) = was_approval {
             proposal.approvals.remove(idx);
@@ -2909,7 +2935,8 @@ impl WasmContextManager {
     /// native bridges' `GovernanceProposal` serialization.
     ///
     /// Fields: `proposal_id`, `context_id`, `proposer_did`, `action`,
-    /// `status`, `created_at` (ISO 8601), `created_at_epoch` (seconds),
+    /// `status`, `created_at` (Unix epoch seconds, u64), `created_at_epoch`
+    /// (null — placeholder for compatibility with native bridge serialization),
     /// `voting_deadline` (seconds), `approvals` (with `voter_did` and
     /// `vote` fields), `rejections` (same shape).
     fn proposal_to_json(proposal_id: &str, proposal: &WasmProposal) -> serde_json::Value {
@@ -2919,11 +2946,11 @@ impl WasmContextManager {
         let approvals: Vec<serde_json::Value> = proposal
             .approvals
             .iter()
-            .map(|did| {
+            .map(|(did, ts)| {
                 serde_json::json!({
                     "voter_did": did,
                     "vote": "Approve",
-                    "timestamp": proposal.created_at,
+                    "timestamp": ts,
                     "signature": [],
                 })
             })
@@ -2932,11 +2959,11 @@ impl WasmContextManager {
         let rejections: Vec<serde_json::Value> = proposal
             .rejections
             .iter()
-            .map(|did| {
+            .map(|(did, ts)| {
                 serde_json::json!({
                     "voter_did": did,
                     "vote": "Reject",
-                    "timestamp": proposal.created_at,
+                    "timestamp": ts,
                     "signature": [],
                 })
             })
