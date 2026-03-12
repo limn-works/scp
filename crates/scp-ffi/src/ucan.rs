@@ -230,6 +230,11 @@ pub fn py_ucan_validate(
 ///
 /// # Errors
 ///
+/// Raises `ValidationError` if `member_did` fails [`validate_did`]
+/// (empty, malformed `did:{method}:{id}` format, or control characters),
+/// if any capability URI fails [`validate_capability_uri`], or if any
+/// proof token fails [`validate_ucan_token`].
+///
 /// Raises `UcanError` if minting fails: capabilities outside the context
 /// ceiling, issuer not authorized, signing fails, etc.
 ///
@@ -324,6 +329,11 @@ pub fn py_ucan_mint(
 /// A [`PyUcanToken`] with the delegated token's metadata.
 ///
 /// # Errors
+///
+/// Raises `ValidationError` if `delegator_did` or `delegatee_did` fails
+/// [`validate_did`] (empty, malformed `did:{method}:{id}` format, or
+/// control characters), if `parent_token` fails [`validate_ucan_token`],
+/// or if any capability URI fails [`validate_capability_uri`].
 ///
 /// Raises `UcanError` if delegation fails: delegator not matching parent
 /// audience, capabilities wider than parent, signing failure, etc.
