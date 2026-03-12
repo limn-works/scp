@@ -4749,8 +4749,12 @@ fn nonce_conformance_format_table_driven() {
             make_nonce_str(now_ms, "AaBbCcDd11223344aAbBcCdD11223344"),
             true,
         ),
-        // Multiple dashes (first split captures timestamp, rest is suffix).
-        (format!("{now_ms}-aabb-ccdd11223344aabbccdd11223"), false),
+        // Multiple dashes — hex_part is exactly 32 chars but contains a dash (non-hex).
+        // split_once('-') yields hex_part "aabbccdd1122334-aabbccdd1122334" (32 chars, dash at pos 15).
+        (
+            make_nonce_str(now_ms, "aabbccdd1122334-aabbccdd1122334"),
+            false,
+        ),
     ];
 
     for (i, (nonce, expected_ok)) in test_vectors.iter().enumerate() {
