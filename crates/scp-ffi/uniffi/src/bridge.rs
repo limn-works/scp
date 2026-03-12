@@ -6745,7 +6745,7 @@ pub fn handle_register(
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7080".to_owned(),
+            code: "SCP-VALID-7120".to_owned(),
         })?;
     let registry = guard
         .entry(discovery_context_id.clone())
@@ -6754,11 +6754,11 @@ pub fn handle_register(
         .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
         .map_err(|e| ScpError::Validation {
             message: format!("clock error during handle registration: {e}"),
-            code: "SCP-VALID-7081".to_owned(),
+            code: "SCP-VALID-7121".to_owned(),
         })?;
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize handle register result: {e}"),
-        code: "SCP-VALID-7082".to_owned(),
+        code: "SCP-VALID-7122".to_owned(),
     })
 }
 
@@ -6775,7 +6775,7 @@ pub fn handle_lookup(
         Some(other) => {
             return Err(ScpError::Validation {
                 message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: "SCP-VALID-7083".to_owned(),
+                code: "SCP-VALID-7123".to_owned(),
             });
         }
         None => None,
@@ -6784,7 +6784,7 @@ pub fn handle_lookup(
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7080".to_owned(),
+            code: "SCP-VALID-7120".to_owned(),
         })?;
     let result = guard.get(&discovery_context_id).map_or_else(
         || scp_core::discovery::HandleLookupResult {
@@ -6799,7 +6799,7 @@ pub fn handle_lookup(
     );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize handle lookup result: {e}"),
-        code: "SCP-VALID-7084".to_owned(),
+        code: "SCP-VALID-7124".to_owned(),
     })
 }
 
@@ -6814,7 +6814,7 @@ pub fn handle_deregister(
         .lock()
         .map_err(|e| ScpError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7080".to_owned(),
+            code: "SCP-VALID-7120".to_owned(),
         })?;
     let result = guard.get_mut(&discovery_context_id).map_or_else(
         || scp_core::discovery::HandleDeregisterResult { removed: false },
@@ -6827,7 +6827,7 @@ pub fn handle_deregister(
     );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize handle deregister result: {e}"),
-        code: "SCP-VALID-7085".to_owned(),
+        code: "SCP-VALID-7125".to_owned(),
     })
 }
 
@@ -6935,7 +6935,7 @@ pub fn address_resolve(
                 .lock()
                 .map_err(|e| ScpError::Validation {
                     message: format!("handle registry lock poisoned: {e}"),
-                    code: "SCP-VALID-7080".to_owned(),
+                    code: "SCP-VALID-7120".to_owned(),
                 })?;
             guard.keys().map(|k| (k.clone(), k.clone())).collect()
         };
@@ -7048,17 +7048,17 @@ fn uniffi_parse_handle_target(
 ) -> Result<scp_core::discovery::addressing::HandleTarget, ScpError> {
     let val: serde_json::Value = serde_json::from_str(json).map_err(|e| ScpError::Validation {
         message: format!("invalid target_json: {e}"),
-        code: "SCP-VALID-7086".to_owned(),
+        code: "SCP-VALID-7126".to_owned(),
     })?;
     let target_type = val["type"].as_str().ok_or_else(|| ScpError::Validation {
         message: "target_json must have a 'type' field ('identity' or 'context')".to_owned(),
-        code: "SCP-VALID-7086".to_owned(),
+        code: "SCP-VALID-7126".to_owned(),
     })?;
     match target_type {
         "identity" => {
             let did = val["did"].as_str().ok_or_else(|| ScpError::Validation {
                 message: "identity target must have a 'did' field".to_owned(),
-                code: "SCP-VALID-7086".to_owned(),
+                code: "SCP-VALID-7126".to_owned(),
             })?;
             Ok(scp_core::discovery::addressing::HandleTarget::Identity {
                 did: scp_identity::DID::from(did),
@@ -7069,7 +7069,7 @@ fn uniffi_parse_handle_target(
                 .as_str()
                 .ok_or_else(|| ScpError::Validation {
                     message: "context target must have a 'context_id' field".to_owned(),
-                    code: "SCP-VALID-7086".to_owned(),
+                    code: "SCP-VALID-7126".to_owned(),
                 })?;
             let relay_urls = val["relay_urls"]
                 .as_array()
@@ -7086,7 +7086,7 @@ fn uniffi_parse_handle_target(
         }
         other => Err(ScpError::Validation {
             message: format!("invalid target type '{other}': expected 'identity' or 'context'"),
-            code: "SCP-VALID-7086".to_owned(),
+            code: "SCP-VALID-7126".to_owned(),
         }),
     }
 }

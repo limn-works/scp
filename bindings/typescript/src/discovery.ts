@@ -405,7 +405,7 @@ export async function petnameGetForContext(
 /** Result of a handle registration. */
 export interface HandleRegisterResult {
   readonly status: string;
-  readonly handle: string;
+  readonly entry_id: string | null;
 }
 
 /** Result of a handle lookup. */

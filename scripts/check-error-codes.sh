@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # check-error-codes.sh — CI gate enforcing SCP error code conformance.
 #
-# Scans source files for SCP error codes and verifies each one uses a
-# canonical prefix with a number in the allocated range (sdk-common.md).
+# Phase 1: Validates every SCP error code uses a canonical prefix with a
+#           number in the allocated range (sdk-common.md).
+# Phase 2: Detects cross-bridge error code collisions — same code number
+#           used for semantically different errors.
 #
 # Canonical prefixes and ranges:
 #   SCP-IDENT-   1000-1999    SCP-CTX-     2000-2999
@@ -100,6 +102,142 @@ done < <(
 
 echo ""
 echo "Checked $CHECKED error code occurrences."
+
+# ---------------------------------------------------------------------------
+# Phase 2: Cross-bridge error code uniqueness.
+#
+# Scans the 4 FFI bridge source directories for error code definitions and
+# detects when the same code is used with different error messages, indicating
+# a semantic collision.
+#
+# Only scans non-test production code. Lines containing "message:" or
+# "JsError::new" with a quoted string are considered error definitions.
+# Test files, assertions, and comment-only lines are excluded.
+#
+# Same code for same purpose across bridges is fine (e.g. SCP-VALID-7120 =
+# "lock poisoned" in all 4 bridges). Different messages for the same code
+# signals a collision.
+# ---------------------------------------------------------------------------
+
+COLLISION_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$COLLISION_TMPDIR"' EXIT
+
+COLLISION_COUNT=0
+
+# Scan only production FFI bridge source files (not tests).
+while IFS=: read -r file line_num content; do
+    # Skip test files entirely.
+    case "$file" in
+        */tests/*|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js) continue ;;
+    esac
+
+    # Skip lines inside #[cfg(test)] modules (Rust inline tests).
+    # Heuristic: if the line contains assert/test macros, skip it.
+    case "$content" in
+        *assert_eq*|*assert!*|*assert_ne*|*matches!*|*"#[test]"*|*"#[cfg(test)]"*) continue ;;
+    esac
+
+    # Skip comment-only lines.
+    trimmed="${content#"${content%%[![:space:]]*}"}"
+    case "$trimmed" in
+        "//"*|"///"*|"#"*|"*"*) continue ;;
+    esac
+
+    # Only process lines that define an error (contain message/Error patterns).
+    case "$content" in
+        *message:*|*message*format*|*JsError::new*|*Error*message*) ;;
+        *) continue ;;
+    esac
+
+    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP)-([0-9]+) ]]; do
+        prefix="${BASH_REMATCH[1]}"
+        number="${BASH_REMATCH[2]}"
+        full_code="SCP-${prefix}-${number}"
+
+        # Extract and normalize the error message from the line.
+        msg=$(echo "$content" \
+            | sed -E 's/'"$full_code"'//g' \
+            | sed -E 's/\{[^}]*\}//g' \
+            | sed -E 's/format!\(//g' \
+            | sed -E 's/ScpError::[A-Za-z]+//g' \
+            | sed -E 's/ScpPyError::[A-Za-z]+//g' \
+            | sed -E 's/ScpNapiError::[A-Za-z]+//g' \
+            | sed -E 's/JsError::new//g' \
+            | sed -E 's/\.to_owned\(\)//g' \
+            | sed -E 's/[^a-zA-Z ]/ /g' \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/  +/ /g' \
+            | sed -E 's/^ +| +$//g')
+
+        # Keep first 5 words as fingerprint.
+        msg=$(echo "$msg" | awk '{for(i=1;i<=5&&i<=NF;i++) printf "%s ", $i}' | sed 's/ *$//')
+
+        # Skip if too short to be meaningful.
+        word_count=$(echo "$msg" | wc -w | tr -d ' ')
+        if [[ "$word_count" -lt 3 ]]; then
+            content="${content#*"$full_code"}"
+            continue
+        fi
+
+        safe_code=$(echo "$full_code" | tr '-' '_')
+        code_file="$COLLISION_TMPDIR/$safe_code"
+
+        if [[ -f "$code_file" ]]; then
+            existing=$(head -1 "$code_file")
+            existing_loc=$(sed -n '2p' "$code_file")
+            if [[ "$msg" != "$existing" ]]; then
+                # Verify low word overlap — same semantic purpose may
+                # have minor wording differences across bridges.
+                overlap=0
+                total=0
+                for word in $msg; do
+                    total=$((total + 1))
+                    case " $existing " in
+                        *" $word "*) overlap=$((overlap + 1)) ;;
+                    esac
+                done
+                # Flag only when <50% word overlap.
+                if [[ $total -gt 0 && $((overlap * 2)) -lt $total ]]; then
+                    echo "COLLISION: $full_code used for different purposes:"
+                    echo "  First seen: $existing_loc"
+                    echo "    meaning: $existing"
+                    echo "  Also seen: $file:$line_num"
+                    echo "    meaning: $msg"
+                    COLLISION_COUNT=$((COLLISION_COUNT + 1))
+                fi
+            fi
+        else
+            printf '%s\n%s\n' "$msg" "$file:$line_num" > "$code_file"
+        fi
+
+        content="${content#*"$full_code"}"
+    done
+done < <(
+    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP)-[0-9]+' \
+        --include='*.rs' \
+        --include='*.kt' \
+        --include='*.swift' \
+        --include='*.py' \
+        --include='*.ts' \
+        --include='*.js' \
+        --exclude-dir='.git' \
+        --exclude-dir='.claude' \
+        --exclude-dir='.docs' \
+        --exclude-dir='target' \
+        --exclude-dir='build' \
+        --exclude-dir='node_modules' \
+        --exclude='check-error-codes.sh' \
+        --exclude='sdk-common.md' \
+        --exclude='CLAUDE.md' \
+        . 2>/dev/null || true
+)
+
+if [[ $COLLISION_COUNT -gt 0 ]]; then
+    VIOLATIONS=$((VIOLATIONS + COLLISION_COUNT))
+    echo ""
+    echo "Found $COLLISION_COUNT error code collision(s)."
+    echo "Each error code number must have a single semantic meaning across all bridges."
+fi
 
 if [[ $VIOLATIONS -gt 0 ]]; then
     echo "FAILED: $VIOLATIONS violation(s) found."

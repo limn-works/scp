@@ -180,7 +180,7 @@ interface WasmModule {
     ownerDid: string,
     address: string,
     knownContextsJson: string | undefined,
-  ) => Promise<string>;
+  ) => string;
   // Provenance
   evaluate_provenance_quality: (
     sourceContext: string | undefined,

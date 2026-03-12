@@ -863,7 +863,7 @@ pub fn handle_register(
     tags_json: Option<String>,
 ) -> Result<String, JsError> {
     let target: serde_json::Value = serde_json::from_str(&target_json)
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7086] invalid target_json: {e}")))?;
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid target_json: {e}")))?;
 
     // Ownership check for identity targets.
     if target["type"].as_str() == Some("identity")
@@ -885,7 +885,7 @@ pub fn handle_register(
     let entry_id = {
         let mut guard = wasm_handle_registries()
             .lock()
-            .map_err(|e| JsError::new(&format!("[SCP-VALID-7080] lock poisoned: {e}")))?;
+            .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?;
         let registry = guard
             .entry(discovery_context_id)
             .or_insert_with(WasmHandleRegistry::new);
@@ -929,7 +929,7 @@ pub fn handle_lookup(
     let normalized = handle.to_lowercase();
     let results: Vec<serde_json::Value> = wasm_handle_registries()
         .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7080] lock poisoned: {e}")))?
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
         .get(&discovery_context_id)
         .and_then(|registry| registry.entries.get(&normalized))
         .filter(|entry| match type_filter.as_deref() {
@@ -959,7 +959,7 @@ pub fn handle_deregister(
     let normalized = handle.to_lowercase();
     let removed = wasm_handle_registries()
         .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7080] lock poisoned: {e}")))?
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
         .get_mut(&discovery_context_id)
         .is_some_and(|registry| {
             if registry
@@ -1087,7 +1087,7 @@ fn resolve_via_handles(
     } else {
         wasm_handle_registries()
             .lock()
-            .map_err(|e| JsError::new(&format!("[SCP-VALID-7080] lock poisoned: {e}")))?
+            .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
             .keys()
             .map(|k| (k.clone(), k.clone()))
             .collect()
@@ -1096,7 +1096,7 @@ fn resolve_via_handles(
     let mut results = Vec::new();
     let guard = wasm_handle_registries()
         .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7080] lock poisoned: {e}")))?;
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?;
     for (scope_name, ctx_id) in &known_contexts {
         // If a scope is specified, only search in contexts whose scope name matches.
         if scope.is_some_and(|s| scope_name != s) {

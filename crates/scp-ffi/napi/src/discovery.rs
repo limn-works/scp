@@ -194,13 +194,13 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
     let val: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid target_json: {e}"),
-            code: "SCP-VALID-7086".to_owned(),
+            code: "SCP-VALID-7126".to_owned(),
         })
     })?;
     let target_type = val["type"].as_str().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Validation {
             message: "target_json must have a 'type' field ('identity' or 'context')".to_owned(),
-            code: "SCP-VALID-7086".to_owned(),
+            code: "SCP-VALID-7126".to_owned(),
         })
     })?;
     match target_type {
@@ -208,7 +208,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
             let did = val["did"].as_str().ok_or_else(|| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: "identity target must have a 'did' field".to_owned(),
-                    code: "SCP-VALID-7086".to_owned(),
+                    code: "SCP-VALID-7126".to_owned(),
                 })
             })?;
             Ok(HandleTarget::Identity {
@@ -219,7 +219,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
             let ctx_id = val["context_id"].as_str().ok_or_else(|| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: "context target must have a 'context_id' field".to_owned(),
-                    code: "SCP-VALID-7086".to_owned(),
+                    code: "SCP-VALID-7126".to_owned(),
                 })
             })?;
             let relay_urls = val["relay_urls"]
@@ -237,7 +237,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
         }
         other => Err(napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid target type '{other}': expected 'identity' or 'context'"),
-            code: "SCP-VALID-7086".to_owned(),
+            code: "SCP-VALID-7126".to_owned(),
         })),
     }
 }
@@ -707,7 +707,7 @@ pub fn handle_register(
     let mut guard = handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7080".to_owned(),
+            code: "SCP-VALID-7120".to_owned(),
         })
     })?;
     let registry = guard
@@ -718,13 +718,13 @@ pub fn handle_register(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("clock error during handle registration: {e}"),
-                code: "SCP-VALID-7081".to_owned(),
+                code: "SCP-VALID-7121".to_owned(),
             })
         })?;
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize handle register result: {e}"),
-            code: "SCP-VALID-7082".to_owned(),
+            code: "SCP-VALID-7122".to_owned(),
         })
     })
 }
@@ -743,7 +743,7 @@ pub fn handle_lookup(
         Some(other) => {
             return Err(napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: "SCP-VALID-7083".to_owned(),
+                code: "SCP-VALID-7123".to_owned(),
             }));
         }
         None => None,
@@ -751,7 +751,7 @@ pub fn handle_lookup(
     let guard = handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7080".to_owned(),
+            code: "SCP-VALID-7120".to_owned(),
         })
     })?;
     let result = guard.get(&discovery_context_id).map_or_else(
@@ -768,7 +768,7 @@ pub fn handle_lookup(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize handle lookup result: {e}"),
-            code: "SCP-VALID-7084".to_owned(),
+            code: "SCP-VALID-7124".to_owned(),
         })
     })
 }
@@ -784,7 +784,7 @@ pub fn handle_deregister(
     let mut guard = handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7080".to_owned(),
+            code: "SCP-VALID-7120".to_owned(),
         })
     })?;
     let result = guard.get_mut(&discovery_context_id).map_or_else(
@@ -799,7 +799,7 @@ pub fn handle_deregister(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize handle deregister result: {e}"),
-            code: "SCP-VALID-7085".to_owned(),
+            code: "SCP-VALID-7125".to_owned(),
         })
     })
 }
@@ -834,7 +834,7 @@ pub async fn address_resolve(
         let guard = handle_registries().lock().map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("handle registry lock poisoned: {e}"),
-                code: "SCP-VALID-7080".to_owned(),
+                code: "SCP-VALID-7120".to_owned(),
             })
         })?;
         guard.keys().map(|k| (k.clone(), k.clone())).collect()
