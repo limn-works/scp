@@ -1337,6 +1337,26 @@ mod tests {
         });
     }
 
+    /// `extract_test_vectors` rejects a dict (wrong type — should be a list) with SCP-VALID-7037.
+    #[test]
+    fn extract_test_vectors_rejects_wrong_type() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            let wrong_type = pyo3::types::PyDict::new(py);
+            wrong_type.set_item("not", "a list").unwrap();
+            dict.set_item("test_vectors", wrong_type).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject dict as test_vectors");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7037"),
+                "error should contain SCP-VALID-7037, got: {err_str}"
+            );
+        });
+    }
+
     /// `extract_test_vectors` accepts None/missing `test_vectors` (returns empty vec).
     #[test]
     fn extract_test_vectors_accepts_missing() {
