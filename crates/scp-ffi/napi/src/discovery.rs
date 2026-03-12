@@ -128,25 +128,25 @@ fn discovery_result_to_json(
     let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
         match &result.discovery_source {
             scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
-                ("dht_did_document", "DomainVerified", "domain", "dht", None)
+                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
             }
             scp_core::discovery::ContextDiscoverySource::WellKnown => {
-                ("well_known", "DomainVerified", "domain", "well-known", None)
+                ("well_known", "DomainVerified", "Domain", "well-known", None)
             }
             scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
                 "discovery_context",
                 "DiscoveryContextVerified",
-                "discovery_context",
+                "DiscoveryContext",
                 "discovery_context",
                 Some(context_id.as_str()),
             ),
             // §22.7: An scp:// URI is shared out-of-band, so the trust level is
-            // DirectExchange and the resolution layer is "domain" (closest match
+            // `DirectExchange` and the resolution layer is `"Domain"` (closest match
             // for URI-based resolution — no discovery context is involved).
             scp_core::discovery::ContextDiscoverySource::ContextUri => (
                 "context_uri",
                 "DirectExchange",
-                "domain",
+                "Domain",
                 "context_uri",
                 None,
             ),
