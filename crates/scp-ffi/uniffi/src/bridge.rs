@@ -6530,6 +6530,9 @@ pub fn bridge_register(
     platform: String,
     mode: String,
 ) -> Result<BridgeRegistrationResult, ScpError> {
+    validate_did(&operator_did)?;
+    validate_did(&governance_did)?;
+
     let bridge_mode = match mode.as_str() {
         "relay" => scp_core::bridge::BridgeMode::Relay,
         "puppet" => scp_core::bridge::BridgeMode::Puppet,
