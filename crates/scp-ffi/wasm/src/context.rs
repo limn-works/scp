@@ -57,10 +57,15 @@ pub struct WasmContextHandle {
     mode: String,
     ceiling: Vec<String>,
     ceiling_policy: String,
-    ttl_seconds: Option<u64>,
+    /// Stored as `u32` (not `u64`) to avoid wasm-bindgen mapping to
+    /// JavaScript `BigInt`. `u32::MAX` ≈ 136 years — well beyond any
+    /// practical TTL.
+    ttl_seconds: Option<u32>,
     promotion_policy: Option<String>,
     governance: String,
-    member_count: u64,
+    /// Stored as `u32` (not `u64`) to avoid wasm-bindgen mapping to
+    /// JavaScript `BigInt`. Saturates at `u32::MAX`.
+    member_count: u32,
     economic_policy: Option<String>,
     /// Minimum protocol version as `[major, minor]`, or `None` if unset.
     min_protocol_version: Option<Vec<u8>>,
@@ -106,7 +111,7 @@ impl WasmContextHandle {
 
     #[must_use]
     #[wasm_bindgen(getter, js_name = "ttlSeconds")]
-    pub fn ttl_seconds(&self) -> Option<u64> {
+    pub fn ttl_seconds(&self) -> Option<u32> {
         self.ttl_seconds
     }
 
@@ -124,7 +129,7 @@ impl WasmContextHandle {
 
     #[must_use]
     #[wasm_bindgen(getter, js_name = "memberCount")]
-    pub fn member_count(&self) -> u64 {
+    pub fn member_count(&self) -> u32 {
         self.member_count
     }
 
@@ -161,10 +166,12 @@ impl WasmContextHandle {
             mode: meta.mode,
             ceiling: meta.ceiling,
             ceiling_policy: meta.ceiling_policy,
-            ttl_seconds: meta.ttl_seconds,
+            ttl_seconds: meta
+                .ttl_seconds
+                .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
             promotion_policy: meta.promotion_policy,
             governance: meta.governance,
-            member_count: meta.member_count,
+            member_count: u32::try_from(meta.member_count).unwrap_or(u32::MAX),
             economic_policy: meta.economic_policy,
             min_protocol_version: meta.min_protocol_version.map(|(maj, min)| vec![maj, min]),
         }
@@ -395,13 +402,19 @@ pub fn context_subscribe(
 
 /// Returns the member count for a context.
 ///
-/// Delegates to `WasmContextManager::member_count`.
+/// Delegates to `WasmContextManager::member_count`. Returns `u32` (not `u64`)
+/// to avoid wasm-bindgen mapping to JavaScript `BigInt`. Saturates at
+/// `u32::MAX`. Returns `None`/`null` if the context is not registered.
 #[wasm_bindgen]
-pub fn context_member_count(handle: &WasmContextHandle) -> Option<u64> {
+pub fn context_member_count(handle: &WasmContextHandle) -> Option<u32> {
     let context_id = handle.context_id();
-    with_manager(|mgr| Ok(mgr.member_count(&context_id).map(|c| c as u64)))
-        .ok()
-        .flatten()
+    with_manager(|mgr| {
+        Ok(mgr
+            .member_count(&context_id)
+            .map(|c| u32::try_from(c).unwrap_or(u32::MAX)))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Returns `true` if the DID is a member of the context.

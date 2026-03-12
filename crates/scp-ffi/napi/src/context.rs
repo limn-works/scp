@@ -63,7 +63,9 @@ pub struct NapiContextHandle {
     /// Ceiling policy — `"immutable"` or `"governed"`.
     ceiling_policy: String,
     /// Optional TTL in seconds. `None` means the context is persistent.
-    ttl_seconds: Option<u64>,
+    /// Stored as `u32` (not `u64`) to avoid napi-rs mapping to JavaScript
+    /// `BigInt`. `u32::MAX` ≈ 136 years — well beyond any practical TTL.
+    ttl_seconds: Option<u32>,
     /// Promotion policy — `"no_promotion"` or `"promotable"`. Only meaningful
     /// when `ttl_seconds` is `Some`.
     promotion_policy: Option<String>,
@@ -144,11 +146,12 @@ impl NapiContextHandle {
         self.ceiling_policy.clone()
     }
 
-    /// Returns the optional TTL in seconds.
+    /// Returns the optional TTL in seconds as `u32` (not `u64`, to avoid
+    /// napi-rs `BigInt` mapping). `u32::MAX` ≈ 136 years.
     #[napi(getter, js_name = "ttlSeconds")]
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
-    pub fn ttl_seconds(&self) -> Option<u64> {
+    pub fn ttl_seconds(&self) -> Option<u32> {
         self.ttl_seconds
     }
 
@@ -171,16 +174,20 @@ impl NapiContextHandle {
     /// This is a live query — the count always reflects the actual
     /// membership state, not a cached snapshot.
     ///
+    /// Returns `u32` instead of `u64` to avoid napi-rs mapping `u64` to
+    /// JavaScript `BigInt`, which breaks the expected `number` API contract.
+    /// Saturates at `u32::MAX` for counts exceeding 2^32 (theoretical only).
+    ///
     /// # Errors
     ///
     /// The `Result` return type is required by napi-rs. This getter is infallible.
     #[napi(getter, js_name = "memberCount")]
-    pub fn member_count(&self) -> napi::Result<u64> {
+    pub fn member_count(&self) -> napi::Result<u32> {
         let manager = context_manager();
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))
             .unwrap_or(0);
-        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Returns the optional economic policy string.
@@ -315,7 +322,9 @@ pub async fn context_create(
         .as_str()
         .unwrap_or("immutable")
         .to_owned();
-    let ttl_seconds = params["ttlSeconds"].as_u64();
+    let ttl_seconds = params["ttlSeconds"]
+        .as_u64()
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
     let promotion_policy = params["promotionPolicy"].as_str().map(str::to_owned);
     let governance = params["governance"]
         .as_str()
@@ -380,7 +389,7 @@ pub async fn context_create(
         ceiling: core_ceiling,
         ceiling_policy: core_ceiling_policy,
         promotion_policy: core_promotion_policy,
-        ttl: ttl_seconds.map(std::time::Duration::from_secs),
+        ttl: ttl_seconds.map(|s| std::time::Duration::from_secs(u64::from(s))),
         memory_scope: core_memory_scope,
         governance: core_governance,
         min_protocol_version,
@@ -662,16 +671,17 @@ pub fn context_subscribe(
 ///
 /// # Returns
 ///
-/// The member count, or `0` if the context is not registered.
+/// The member count as `u32` (not `u64`, to avoid napi-rs `BigInt` mapping),
+/// or `null` if the context is not registered. Saturates at `u32::MAX`.
 ///
 /// # Errors
 ///
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberCount")]
-pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u64> {
+pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<Option<u32>> {
     let manager = context_manager();
-    let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
-    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    let count = manager.member_count(&handle.context_id).await;
+    Ok(count.map(|c| u32::try_from(c).unwrap_or(u32::MAX)))
 }
 
 /// Returns whether a DID is a member of the context.
@@ -2057,5 +2067,37 @@ mod tests {
         })
         .unwrap();
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // u32 saturation fallback (#835)
+    // -----------------------------------------------------------------------
+
+    /// Verifies that the `u32::try_from(count).unwrap_or(u32::MAX)` pattern
+    /// saturates at `u32::MAX` for values exceeding 2^32, rather than
+    /// truncating or panicking.
+    #[test]
+    fn u32_saturation_fallback_clamps_large_values() {
+        let large: usize = u32::MAX as usize + 1;
+        let result = u32::try_from(large).unwrap_or(u32::MAX);
+        assert_eq!(result, u32::MAX, "values above u32::MAX should saturate");
+
+        let large_u64: u64 = u64::from(u32::MAX) + 1;
+        let result = u32::try_from(large_u64).unwrap_or(u32::MAX);
+        assert_eq!(result, u32::MAX, "u64 above u32::MAX should saturate");
+
+        // Exact boundary: u32::MAX itself should pass through.
+        let boundary: usize = u32::MAX as usize;
+        let result = u32::try_from(boundary).unwrap_or(u32::MAX);
+        assert_eq!(result, u32::MAX, "u32::MAX should pass through unchanged");
+
+        // Below boundary: should convert exactly.
+        let below: usize = u32::MAX as usize - 1;
+        let result = u32::try_from(below).unwrap_or(u32::MAX);
+        assert_eq!(
+            result,
+            u32::MAX - 1,
+            "values below u32::MAX should convert exactly"
+        );
     }
 }
