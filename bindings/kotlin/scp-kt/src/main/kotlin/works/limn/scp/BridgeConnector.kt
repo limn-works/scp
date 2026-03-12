@@ -37,6 +37,9 @@ interface BridgeConnectorBindings {
      *
      * @param contextId The context to register in.
      * @param operatorDid DID of the bridge operator.
+     * @param governanceDid DID of the governance authority approving the
+     *   registration.  Must differ from [operatorDid] (self-approval is
+     *   forbidden per ADR-023).
      * @param platform Platform identifier (e.g., "slack", "discord").
      * @param mode Bridge mode: "relay", "puppet", "api", or "cooperative".
      * @return JSON string with the registration result.
@@ -44,6 +47,7 @@ interface BridgeConnectorBindings {
     fun bridgeRegister(
         contextId: String,
         operatorDid: String,
+        governanceDid: String,
         platform: String,
         mode: String,
     ): String
@@ -122,6 +126,9 @@ class BridgeConnectorBridge internal constructor(
      *
      * @param contextId The context to register in.
      * @param operatorDid DID of the bridge operator.
+     * @param governanceDid DID of the governance authority approving the
+     *   registration.  Must differ from [operatorDid] (self-approval is
+     *   forbidden per ADR-023).
      * @param platform Platform identifier (e.g., "slack", "discord").
      * @param mode Bridge mode.
      * @return JSON string with the registration result.
@@ -129,11 +136,12 @@ class BridgeConnectorBridge internal constructor(
     suspend fun register(
         contextId: String,
         operatorDid: String,
+        governanceDid: String,
         platform: String,
         mode: BridgeMode,
     ): String =
         bridge.ffiCall {
-            bindings.bridgeRegister(contextId, operatorDid, platform, mode.rawValue)
+            bindings.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode.rawValue)
         }
 
     /**
@@ -143,6 +151,9 @@ class BridgeConnectorBridge internal constructor(
      *
      * @param contextId The context to register in.
      * @param operatorDid DID of the bridge operator.
+     * @param governanceDid DID of the governance authority approving the
+     *   registration.  Must differ from [operatorDid] (self-approval is
+     *   forbidden per ADR-023).
      * @param platform Platform identifier (e.g., "slack", "discord").
      * @param mode Bridge mode: "relay", "puppet", "api", or "cooperative".
      * @return JSON string with the registration result.
@@ -150,11 +161,12 @@ class BridgeConnectorBridge internal constructor(
     suspend fun register(
         contextId: String,
         operatorDid: String,
+        governanceDid: String,
         platform: String,
         mode: String,
     ): String =
         bridge.ffiCall {
-            bindings.bridgeRegister(contextId, operatorDid, platform, mode)
+            bindings.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode)
         }
 
     /**

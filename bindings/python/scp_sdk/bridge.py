@@ -34,16 +34,21 @@ def _bridge() -> Any:
 def register(
     context_id: str,
     operator_did: str,
+    governance_did: str,
     platform: str,
     mode: BridgeMode | str,
 ) -> dict[str, Any]:
     """Register a bridge connector with a context.
 
-    Creates a registration request and immediately approves it.
+    Creates a registration request and immediately approves it using the
+    provided governance DID.
 
     Args:
         context_id: Context to register the bridge in.
         operator_did: DID of the human operator accountable for the bridge.
+        governance_did: DID of the governance authority approving the
+            registration.  Must differ from *operator_did* (self-approval
+            is forbidden per ADR-023).
         platform: External platform name (e.g., ``"discord"``, ``"slack"``).
         mode: Bridge mode.  Accepts a :class:`~scp_sdk.types.BridgeMode`
             enum member or a raw string (``"relay"``, ``"puppet"``,
@@ -55,11 +60,14 @@ def register(
 
     Raises:
         ValidationError: If *mode* is not recognized.
-        ContextError: If registration fails.
+        ContextError: If registration or approval fails (including
+            self-approval).
     """
     bridge = _bridge()
     mode_str = mode.value if isinstance(mode, BridgeMode) else mode
-    return dict(bridge.bridge_register(context_id, operator_did, platform, mode_str))
+    return dict(
+        bridge.bridge_register(context_id, operator_did, governance_did, platform, mode_str)
+    )
 
 
 def evaluate_trust(

@@ -42,6 +42,7 @@ pub struct NapiShadowIdentity {
 }
 
 /// Bridge registration result.
+#[derive(Debug)]
 #[napi(object)]
 pub struct NapiBridgeRegistration {
     /// Unique identifier for the registered bridge.
@@ -121,15 +122,24 @@ pub fn bridge_evaluate_trust(
 /// Registers a new bridge connector with a context.
 ///
 /// Creates a temporary `BridgeRegistry`, submits a registration request,
-/// and immediately approves it.
+/// and immediately approves it using the provided governance DID.
+///
+/// The `governance_did` must differ from `operator_did` — self-approval is
+/// forbidden per ADR-023.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bridge_register(
     context_id: String,
     operator_did: String,
+    governance_did: String,
     platform: String,
     mode: String,
 ) -> napi::Result<NapiBridgeRegistration> {
+    scp_ffi_common::validate::validate_did(&operator_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_did(&governance_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let bridge_mode = parse_bridge_mode(&mode)?;
 
     let mut registry = BridgeRegistry::new(context_id.clone());
@@ -149,19 +159,18 @@ pub fn bridge_register(
     };
 
     let _event = register_bridge(&mut registry, request).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
+        napi::Error::from(ScpNapiError::Context {
             message: format!("bridge registration failed: {e}"),
-            code: "SCP-VALID-7012".to_owned(),
+            code: "SCP-CTX-2100".to_owned(),
         })
     })?;
 
-    // The approver must differ from the operator (governance rule).
-    let approver_did: scp_identity::DID = format!("{operator_did}:approver").into();
+    let approver_did: scp_identity::DID = governance_did.into();
     let (connector, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
+            napi::Error::from(ScpNapiError::Context {
                 message: format!("bridge approval failed: {e}"),
-                code: "SCP-VALID-7013".to_owned(),
+                code: "SCP-CTX-2101".to_owned(),
             })
         })?;
 
@@ -281,12 +290,30 @@ mod tests {
         let result = bridge_register(
             "ctx-test".to_owned(),
             "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
         )
         .unwrap();
         assert_eq!(result.status, "active");
         assert_eq!(result.platform, "discord");
+    }
+
+    #[test]
+    fn register_bridge_rejects_self_approval() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:operator".to_owned(),
+            "discord".to_owned(),
+            "relay".to_owned(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("approver cannot be the same"),
+            "expected self-approval error, got: {err}"
+        );
     }
 
     #[test]

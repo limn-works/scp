@@ -1279,3 +1279,85 @@ def mcp_register_tool_handler(
         ContextError: If the context or tool is not found.
     """
     ...
+
+# Bridge connector bridge functions (crates/scp-ffi/src/bridge_connector.rs)
+
+def bridge_register(
+    context_id: str,
+    operator_did: str,
+    governance_did: str,
+    platform: str,
+    mode: str,
+) -> dict[str, str]:
+    """Register a bridge connector with a context.
+
+    Creates a registration request and immediately approves it using the
+    provided governance DID.
+
+    Args:
+        context_id: Context to register the bridge in.
+        operator_did: DID of the human operator accountable for the bridge.
+        governance_did: DID of the governance authority approving the
+            registration.  Must differ from ``operator_did`` (self-approval
+            is forbidden per ADR-023).
+        platform: External platform name (e.g., ``"discord"``).
+        mode: Bridge mode: ``"relay"``, ``"puppet"``, ``"api"``, or
+            ``"cooperative"``.
+
+    Returns:
+        A dict with ``bridge_id``, ``operator_did``, ``platform``,
+        ``mode``, ``status``, ``context_id``.
+
+    Raises:
+        ValidationError: If *mode* is not recognized.
+        ContextError: If registration or approval fails (including
+            self-approval).
+    """
+    ...
+
+def bridge_evaluate_trust(
+    is_bridged: bool = False,
+    is_native_transport: bool = True,
+    shadow_status: str = "shadow",
+) -> int:
+    """Evaluate the trust level for an action based on bridge provenance.
+
+    Returns an integer (0--3) representing the trust tier.
+
+    Args:
+        is_bridged: Whether the action has bridge provenance.
+        is_native_transport: Whether the transport is native SCP.
+        shadow_status: ``"shadow"`` or ``"claimed"``.
+
+    Returns:
+        Trust tier as an integer (0--3).
+
+    Raises:
+        ValidationError: If *shadow_status* is invalid.
+    """
+    ...
+
+def bridge_create_shadow(
+    bridge_id: str,
+    platform_handle: str,
+    bridge_mode: str,
+    context_id: str = "ctx-shadow",
+) -> dict[str, str]:
+    """Create a shadow identity for an external platform participant.
+
+    Args:
+        bridge_id: The bridge connector ID that owns this shadow.
+        platform_handle: External platform handle (e.g., ``"@user#1234"``).
+        bridge_mode: Bridge mode: ``"relay"``, ``"puppet"``, ``"api"``, or
+            ``"cooperative"``.
+        context_id: Context the shadow is being created in.
+
+    Returns:
+        A dict with ``shadow_id``, ``platform_handle``, ``bridge_id``,
+        ``attributed_role``, ``provenance_status``.
+
+    Raises:
+        ValidationError: If *bridge_mode* is invalid.
+        ContextError: If shadow creation fails.
+    """
+    ...

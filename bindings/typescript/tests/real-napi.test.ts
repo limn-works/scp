@@ -689,13 +689,25 @@ if (bridge === null) {
     });
 
     test("registers a bridge connector", () => {
-      const reg = napi.bridgeRegister("ctx-bridge-test", "did:key:operator", "discord", "relay");
+      const reg = napi.bridgeRegister(
+        "ctx-bridge-test",
+        "did:key:operator",
+        "did:key:governance",
+        "discord",
+        "relay",
+      );
       expect(reg.bridge_id).toBeTruthy();
       expect(reg.operator_did).toBe("did:key:operator");
       expect(reg.platform).toBe("discord");
       expect(reg.mode).toBe("relay");
       expect(reg.status).toBe("active");
       expect(reg.context_id).toBe("ctx-bridge-test");
+    });
+
+    test("rejects self-approval (operator === governance)", () => {
+      expect(() =>
+        napi.bridgeRegister("ctx-self", "did:key:operator", "did:key:operator", "discord", "relay"),
+      ).toThrow(/approver cannot be the same/);
     });
 
     test("creates a shadow identity", () => {
@@ -710,7 +722,7 @@ if (bridge === null) {
 
     test("registers bridges with all four modes", () => {
       for (const mode of ["relay", "puppet", "api", "cooperative"]) {
-        const reg = napi.bridgeRegister(`ctx-${mode}`, "did:key:op", "slack", mode);
+        const reg = napi.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
         expect(reg.status).toBe("active");
       }
     });

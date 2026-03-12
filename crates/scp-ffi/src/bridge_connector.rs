@@ -30,7 +30,7 @@ use crate::error::ScpPyError;
 /// Registers a new bridge connector with a context.
 ///
 /// Creates a `BridgeRegistry`, submits a registration request, and
-/// immediately approves it (for FFI demonstration / testing purposes).
+/// immediately approves it using the provided governance DID.
 ///
 /// Returns a dict with the bridge registration details.
 ///
@@ -38,6 +38,9 @@ use crate::error::ScpPyError;
 ///
 /// * `context_id` -- Context to register the bridge in.
 /// * `operator_did` -- DID of the human operator accountable for the bridge.
+/// * `governance_did` -- DID of the governance authority approving the
+///   registration.  Must differ from `operator_did` (self-approval is
+///   forbidden per ADR-023).
 /// * `platform` -- External platform name (e.g., `"discord"`, `"slack"`).
 /// * `mode` -- Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
 ///
@@ -48,15 +51,21 @@ use crate::error::ScpPyError;
 /// # Errors
 ///
 /// Raises `ValidationError` if `mode` is not recognized or registration fails.
+/// Raises `ContextError` if the governance DID matches the operator DID
+/// (self-approval).
 #[pyfunction]
 #[pyo3(name = "bridge_register")]
 pub fn py_bridge_register(
     py: Python<'_>,
     context_id: &str,
     operator_did: &str,
+    governance_did: &str,
     platform: &str,
     mode: &str,
 ) -> PyResult<Py<PyDict>> {
+    crate::validate::validate_did(operator_did)?;
+    crate::validate::validate_did(governance_did)?;
+
     let bridge_mode = parse_bridge_mode(mode)?;
 
     let mut registry = BridgeRegistry::new(context_id.to_string());
@@ -80,9 +89,9 @@ pub fn py_bridge_register(
         code: "SCP-CTX-2100".to_string(),
     })?;
 
-    let governance_did: scp_identity::DID = operator_did.into();
+    let approver_did: scp_identity::DID = governance_did.into();
     let (connector, _approval_event) =
-        approve_registration(&mut registry, &bridge_id, &governance_did, 0).map_err(|e| {
+        approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             ScpPyError::ContextError {
                 message: format!("bridge approval failed: {e}"),
                 code: "SCP-CTX-2101".to_string(),

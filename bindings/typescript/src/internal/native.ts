@@ -669,15 +669,22 @@ export function createNativeBridge(): Bridge {
     },
 
     // Bridge Connector
-    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: BridgeMode) {
+    bridgeRegister(
+      contextId: string,
+      operatorDid: string,
+      governanceDid: string,
+      platform: string,
+      mode: BridgeMode,
+    ) {
       return (
         addon.bridgeRegister as (
           c: string,
           o: string,
+          g: string,
           p: string,
           m: BridgeMode,
         ) => ReturnType<Bridge["bridgeRegister"]>
-      )(contextId, operatorDid, platform, mode);
+      )(contextId, operatorDid, governanceDid, platform, mode);
     },
 
     bridgeEvaluateTrust(

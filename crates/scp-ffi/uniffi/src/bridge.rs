@@ -6499,12 +6499,15 @@ pub struct ShadowIdentityResult {
 /// Registers a new bridge connector with a context.
 ///
 /// Creates a bridge registration, submits a registration request, and
-/// immediately approves it (for FFI / testing purposes).
+/// immediately approves it using the provided governance DID.
 ///
 /// # Arguments
 ///
 /// * `context_id` — Context to register the bridge in.
 /// * `operator_did` — DID of the human operator accountable for the bridge.
+/// * `governance_did` — DID of the governance authority approving the
+///   registration.  Must differ from `operator_did` (self-approval is
+///   forbidden per ADR-023).
 /// * `platform` — External platform name (e.g., `"discord"`, `"slack"`).
 /// * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
 ///
@@ -6515,13 +6518,15 @@ pub struct ShadowIdentityResult {
 /// # Errors
 ///
 /// Returns `ScpError::Validation` if `mode` is not recognized, or
-/// `ScpError::Context` if registration fails.
+/// `ScpError::Context` if registration or approval fails (including
+/// self-approval).
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
 #[uniffi::export]
 pub fn bridge_register(
     context_id: String,
     operator_did: String,
+    governance_did: String,
     platform: String,
     mode: String,
 ) -> Result<BridgeRegistrationResult, ScpError> {
@@ -6563,11 +6568,11 @@ pub fn bridge_register(
         }
     })?;
 
-    let governance_did: scp_identity::DID = operator_did.clone().into();
+    let approver_did: scp_identity::DID = governance_did.into();
     let (connector, _approval_event) = scp_core::bridge::registration::approve_registration(
         &mut registry,
         &bridge_id,
-        &governance_did,
+        &approver_did,
         0,
     )
     .map_err(|e| ScpError::Context {

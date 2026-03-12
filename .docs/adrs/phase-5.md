@@ -124,7 +124,7 @@ pub enum ClaimError {
 
 2. **Bridge registration:**
    - Operator DID presents registration request to context governance.
-   - Context governance approves or rejects.
+   - Context governance approves or rejects. The approver must be a different DID from the operator (self-approval is forbidden).
    - Registered bridge visible in context metadata (visible before opt-in, per legibility tenet).
    - Registration is a context event in the Merkle log.
 

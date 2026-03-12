@@ -127,6 +127,7 @@ interface WasmModule {
   bridge_register: (
     contextId: string,
     operatorDid: string,
+    governanceDid: string,
     platform: string,
     mode: BridgeMode,
   ) => ReturnType<Bridge["bridgeRegister"]>;
@@ -873,9 +874,15 @@ export function createWasmBridge(): Bridge {
     },
 
     // Bridge Connector
-    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: BridgeMode) {
+    bridgeRegister(
+      contextId: string,
+      operatorDid: string,
+      governanceDid: string,
+      platform: string,
+      mode: BridgeMode,
+    ) {
       const wasm = getWasm();
-      return wasm.bridge_register(contextId, operatorDid, platform, mode);
+      return wasm.bridge_register(contextId, operatorDid, governanceDid, platform, mode);
     },
 
     bridgeEvaluateTrust(

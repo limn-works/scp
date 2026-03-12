@@ -6703,11 +6703,12 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  *
  * See spec section 12 (Bridge System) and ADR-023.
  */
-public func bridgeRegister(contextId: String, operatorDid: String, platform: String, mode: String)throws  -> BridgeRegistrationResult  {
+public func bridgeRegister(contextId: String, operatorDid: String, governanceDid: String, platform: String, mode: String)throws  -> BridgeRegistrationResult  {
     return try  FfiConverterTypeBridgeRegistrationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_bridge_register(
         FfiConverterString.lower(contextId),
         FfiConverterString.lower(operatorDid),
+        FfiConverterString.lower(governanceDid),
         FfiConverterString.lower(platform),
         FfiConverterString.lower(mode),$0
     )
