@@ -7549,17 +7549,16 @@ pub fn bridge_register(
 
     let mut registry = scp_core::bridge::registration::BridgeRegistry::new(context_id.clone());
 
-    let bridge_id = format!(
-        "bridge-{platform}-{}",
-        context_id.chars().take(8).collect::<String>()
-    );
+    // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
+    let (bridge_id, now_secs) =
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
     let request = scp_core::bridge::registration::BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
         platform: platform.clone(),
         mode: bridge_mode,
         context_id: context_id.clone(),
-        requested_at: 0,
+        requested_at: now_secs,
         self_hosted: false,
     };
 
@@ -8440,6 +8439,47 @@ mod tests {
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    // -- bridge_register: format and self-approval tests -----------------------
+
+    #[test]
+    fn bridge_register_returns_active_with_valid_bridge_id() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
+            "discord".to_owned(),
+            "relay".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(result.status, "active");
+        assert_eq!(result.platform, "discord");
+        // bridge_id must be a 64-char hex string (SHA-256 output per §12.2.1)
+        assert_eq!(result.bridge_id.len(), 64);
+        assert!(result.bridge_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn bridge_register_rejects_self_approval() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:operator".to_owned(),
+            "discord".to_owned(),
+            "relay".to_owned(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ScpError::Context { ref message, .. } => {
+                assert!(
+                    message.contains("approver cannot be the same"),
+                    "expected self-approval error, got: {err:?}"
+                );
+            }
+            other => panic!("expected ScpError::Context, got {other:?}"),
         }
     }
 }

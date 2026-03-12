@@ -144,17 +144,16 @@ pub fn bridge_register(
 
     let mut registry = BridgeRegistry::new(context_id.clone());
 
-    let bridge_id = format!(
-        "bridge-{platform}-{}",
-        context_id.chars().take(8).collect::<String>()
-    );
+    // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
+    let (bridge_id, now_secs) =
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
     let request = BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
         platform: platform.clone(),
         mode: bridge_mode,
         context_id: context_id.clone(),
-        requested_at: 0,
+        requested_at: now_secs,
         self_hosted: false,
     };
 
@@ -297,6 +296,9 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, "active");
         assert_eq!(result.platform, "discord");
+        // bridge_id must be a 64-char hex string (SHA-256 output per §12.2.1)
+        assert_eq!(result.bridge_id.len(), 64);
+        assert!(result.bridge_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

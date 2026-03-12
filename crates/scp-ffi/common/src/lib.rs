@@ -13,6 +13,9 @@
 
 pub mod validate;
 
+mod bridge_id;
+pub use bridge_id::generate_bridge_id;
+
 // All resolver types below require the `resolvers` feature (scp-core, scp-identity, tokio).
 // WASM uses `default-features = false` to get only the `validate` module.
 #[cfg(feature = "resolvers")]
