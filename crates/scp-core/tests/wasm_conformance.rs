@@ -23,10 +23,14 @@
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
+use std::sync::Arc;
+
 use scp_core::context::tools::schema;
+use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_event_log::proof as core_proof;
 use scp_event_log::tree as core_tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
+use scp_identity::cache::{Clock, TestClock};
 
 // ===========================================================================
 // WASM algorithm mirror (verbatim from scp-ffi-wasm/src/runtime.rs)
@@ -4234,4 +4238,538 @@ fn member_capability_ceiling_intersection() {
         !ctx.member_has_capability(did, "tool:invoke:*"),
         "member should NOT have tool:invoke:* when tool:invoke:* is removed from ceiling"
     );
+}
+
+// ===========================================================================
+// WASM nonce format validation mirror (verbatim from scp-ffi-wasm/src/ucan.rs)
+//
+// Mirrors `validate_nonce_format_and_freshness` from the WASM bridge.
+// The only change is accepting `now_ms` as a parameter instead of calling
+// `crate::time::now_ms_u64()`, enabling deterministic testing.
+//
+// See ADR-016 step 9, spec section 9.14, and issue #785.
+// ===========================================================================
+
+mod wasm_nonce_mirror {
+    /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+    /// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS` and
+    /// WASM `NONCE_FRESHNESS_TOLERANCE_MS`.
+    const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+
+    /// Validates UCAN nonce format and freshness, mirroring the WASM bridge's
+    /// `validate_nonce_format_and_freshness` from `scp-ffi-wasm/src/ucan.rs`.
+    ///
+    /// Format: `{unix_millis_timestamp}-{32_hex_chars}` (ADR-016 section 7.2).
+    /// Freshness: timestamp within now +/- 5 minutes (spec section 9.14).
+    ///
+    /// Accepts `now_ms` as a parameter for deterministic testing (the WASM
+    /// bridge calls `crate::time::now_ms_u64()` which delegates to JS
+    /// `Date.now()`).
+    pub fn validate_nonce_format_and_freshness(nonce: &str, now_ms: u64) -> Result<(), String> {
+        if nonce.is_empty() {
+            return Err("nonce is empty".to_owned());
+        }
+
+        // 1. Format: split into timestamp and hex suffix.
+        let (ts_part, hex_part) = nonce
+            .split_once('-')
+            .ok_or_else(|| format!("nonce format invalid: missing '-' separator in '{nonce}'"))?;
+
+        let nonce_millis: u64 = ts_part
+            .parse()
+            .map_err(|_| format!("nonce format invalid: non-numeric timestamp in '{ts_part}'"))?;
+
+        if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "nonce format invalid: expected 32 hex chars suffix, got '{hex_part}'"
+            ));
+        }
+
+        // 2. Freshness: timestamp within now +/- 5 minutes.
+        if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now_ms {
+            return Err(format!("nonce too old: {nonce}"));
+        }
+
+        if nonce_millis > now_ms.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
+            return Err(format!("nonce too far in the future: {nonce}"));
+        }
+
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// UCAN nonce format validation conformance tests (issue #785)
+//
+// Cross-validates the WASM bridge's `validate_nonce_format_and_freshness`
+// (mirrored in `wasm_nonce_mirror`) against scp-core's
+// `NonceTracker::check_and_record`. Both must agree on accept/reject for
+// identical inputs across format validation and freshness boundary conditions.
+//
+// See ADR-016 step 9, spec section 9.14.
+// ===========================================================================
+
+/// Base timestamp for nonce conformance tests: 2024-01-01 00:00:00 UTC.
+const NONCE_BASE_SECS: u64 = 1_704_067_200;
+
+/// Creates a WASM-mirror-compatible `now_ms` and a core `NonceTracker` at
+/// the same point in time.
+fn nonce_test_setup() -> (u64, NonceTracker<Arc<TestClock>>, Arc<TestClock>) {
+    let clock = Arc::new(TestClock::new(NONCE_BASE_SECS));
+    let tracker = NonceTracker::new("ctx-nonce-conformance".to_owned(), Arc::clone(&clock));
+    let now_ms = NONCE_BASE_SECS * 1000;
+    (now_ms, tracker, clock)
+}
+
+/// Helper: constructs a nonce string from millisecond timestamp and hex suffix.
+fn make_nonce_str(millis: u64, hex: &str) -> String {
+    format!("{millis}-{hex}")
+}
+
+// ---------------------------------------------------------------------------
+// Format validation conformance: both implementations must agree on
+// accept/reject for format-only checks.
+// ---------------------------------------------------------------------------
+
+/// Test: valid nonce format is accepted by both implementations.
+#[test]
+fn nonce_conformance_valid_format_accepted() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let nonce = make_nonce_str(now_ms, "aabbccdd11223344aabbccdd11223344");
+    let expiry = clock.now() + 3600;
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept valid nonce: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept valid nonce: {core_result:?}"
+    );
+}
+
+/// Test: empty nonce is rejected by both implementations.
+#[test]
+fn nonce_conformance_empty_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness("", now_ms);
+    let core_result = tracker.check_and_record("", expiry);
+
+    assert!(wasm_result.is_err(), "WASM should reject empty nonce");
+    assert!(core_result.is_err(), "core should reject empty nonce");
+}
+
+/// Test: nonce missing '-' separator is rejected by both implementations.
+#[test]
+fn nonce_conformance_missing_separator_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let nonce = "noseparatorhere";
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(nonce, now_ms);
+    let core_result = tracker.check_and_record(nonce, expiry);
+
+    assert!(
+        wasm_result.is_err(),
+        "WASM should reject nonce missing separator"
+    );
+    assert!(
+        core_result.is_err(),
+        "core should reject nonce missing separator"
+    );
+}
+
+/// Test: nonce with non-numeric timestamp is rejected by both implementations.
+#[test]
+fn nonce_conformance_non_numeric_timestamp_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let nonce = "notanumber-aabbccdd11223344aabbccdd11223344";
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(nonce, now_ms);
+    let core_result = tracker.check_and_record(nonce, expiry);
+
+    assert!(
+        wasm_result.is_err(),
+        "WASM should reject non-numeric timestamp"
+    );
+    assert!(
+        core_result.is_err(),
+        "core should reject non-numeric timestamp"
+    );
+}
+
+/// Test: nonce with hex suffix shorter than 32 chars is rejected by both.
+#[test]
+fn nonce_conformance_hex_too_short_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let nonce = make_nonce_str(now_ms, "aabbccdd112233");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(wasm_result.is_err(), "WASM should reject hex too short");
+    assert!(core_result.is_err(), "core should reject hex too short");
+}
+
+/// Test: nonce with hex suffix longer than 32 chars is rejected by both.
+#[test]
+fn nonce_conformance_hex_too_long_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let nonce = make_nonce_str(now_ms, "aabbccdd11223344aabbccdd11223344ff");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(wasm_result.is_err(), "WASM should reject hex too long");
+    assert!(core_result.is_err(), "core should reject hex too long");
+}
+
+/// Test: nonce with non-hex characters in suffix is rejected by both.
+#[test]
+fn nonce_conformance_non_hex_chars_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let nonce = make_nonce_str(now_ms, "gghhiidd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(wasm_result.is_err(), "WASM should reject non-hex chars");
+    assert!(core_result.is_err(), "core should reject non-hex chars");
+}
+
+/// Test: nonce with uppercase hex chars is accepted by both implementations.
+/// `is_ascii_hexdigit()` accepts both upper and lower case.
+#[test]
+fn nonce_conformance_uppercase_hex_accepted() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    let nonce = make_nonce_str(now_ms, "AABBCCDD11223344AABBCCDD11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept uppercase hex: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept uppercase hex: {core_result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Freshness boundary condition conformance: both implementations must agree
+// on the +/- 5 minute tolerance window.
+// ---------------------------------------------------------------------------
+
+/// Test: nonce 6 minutes in the past (> 5 minute tolerance) is rejected by both.
+#[test]
+fn nonce_conformance_too_old_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // 6 minutes in the past.
+    let old_millis = now_ms - 6 * 60 * 1000;
+    let nonce = make_nonce_str(old_millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_err(),
+        "WASM should reject nonce 6 minutes old"
+    );
+    assert!(
+        core_result.is_err(),
+        "core should reject nonce 6 minutes old"
+    );
+}
+
+/// Test: nonce 6 minutes in the future (> 5 minute tolerance) is rejected by both.
+#[test]
+fn nonce_conformance_too_future_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // 6 minutes in the future.
+    let future_millis = now_ms + 6 * 60 * 1000;
+    let nonce = make_nonce_str(future_millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_err(),
+        "WASM should reject nonce 6 minutes in future"
+    );
+    assert!(
+        core_result.is_err(),
+        "core should reject nonce 6 minutes in future"
+    );
+}
+
+/// Test: nonce 4 minutes in the past (within 5 minute tolerance) is accepted by both.
+#[test]
+fn nonce_conformance_within_past_tolerance_accepted() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // 4 minutes in the past.
+    let millis = now_ms - 4 * 60 * 1000;
+    let nonce = make_nonce_str(millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept nonce 4 minutes old: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept nonce 4 minutes old: {core_result:?}"
+    );
+}
+
+/// Test: nonce 4 minutes in the future (within 5 minute tolerance) is accepted by both.
+#[test]
+fn nonce_conformance_within_future_tolerance_accepted() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // 4 minutes in the future.
+    let millis = now_ms + 4 * 60 * 1000;
+    let nonce = make_nonce_str(millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept nonce 4 minutes in future: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept nonce 4 minutes in future: {core_result:?}"
+    );
+}
+
+/// Test: nonce exactly at the past 5-minute boundary is accepted by both.
+///
+/// The condition is `nonce_millis + tolerance < now` (strict less-than),
+/// so exactly at the boundary means `nonce_millis + tolerance == now`,
+/// which should be accepted.
+#[test]
+fn nonce_conformance_exact_past_boundary_accepted() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // Exactly 5 minutes in the past.
+    let millis = now_ms - 5 * 60 * 1000;
+    let nonce = make_nonce_str(millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept nonce exactly at past boundary: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept nonce exactly at past boundary: {core_result:?}"
+    );
+}
+
+/// Test: nonce exactly at the future 5-minute boundary is accepted by both.
+///
+/// The condition is `nonce_millis > now + tolerance` (strict greater-than),
+/// so exactly at the boundary means `nonce_millis == now + tolerance`,
+/// which should be accepted.
+#[test]
+fn nonce_conformance_exact_future_boundary_accepted() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // Exactly 5 minutes in the future.
+    let millis = now_ms + 5 * 60 * 1000;
+    let nonce = make_nonce_str(millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept nonce exactly at future boundary: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept nonce exactly at future boundary: {core_result:?}"
+    );
+}
+
+/// Test: nonce 1 ms past the past 5-minute boundary is rejected by both.
+///
+/// This is the off-by-one guard: `nonce_millis + tolerance < now` triggers
+/// when `nonce_millis = now - tolerance - 1`.
+#[test]
+fn nonce_conformance_one_ms_past_boundary_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // 5 minutes + 1 ms in the past.
+    let millis = now_ms - 5 * 60 * 1000 - 1;
+    let nonce = make_nonce_str(millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_err(),
+        "WASM should reject nonce 1 ms past boundary"
+    );
+    assert!(
+        core_result.is_err(),
+        "core should reject nonce 1 ms past boundary"
+    );
+}
+
+/// Test: nonce 1 ms past the future 5-minute boundary is rejected by both.
+///
+/// This is the off-by-one guard: `nonce_millis > now + tolerance` triggers
+/// when `nonce_millis = now + tolerance + 1`.
+#[test]
+fn nonce_conformance_one_ms_past_future_boundary_rejected() {
+    let (now_ms, mut tracker, clock) = nonce_test_setup();
+    let expiry = clock.now() + 3600;
+
+    // 5 minutes + 1 ms in the future.
+    let millis = now_ms + 5 * 60 * 1000 + 1;
+    let nonce = make_nonce_str(millis, "aabbccdd11223344aabbccdd11223344");
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_err(),
+        "WASM should reject nonce 1 ms past future boundary"
+    );
+    assert!(
+        core_result.is_err(),
+        "core should reject nonce 1 ms past future boundary"
+    );
+}
+
+/// Test: nonce with timestamp 0 (epoch) and now at epoch is accepted by both.
+#[test]
+fn nonce_conformance_epoch_timestamp_accepted() {
+    let clock = Arc::new(TestClock::new(0));
+    let mut tracker = NonceTracker::new("ctx-nonce-epoch".to_owned(), Arc::clone(&clock));
+    let now_ms: u64 = 0;
+
+    let nonce = make_nonce_str(0, "aabbccdd11223344aabbccdd11223344");
+    let expiry = 3600;
+
+    let wasm_result = wasm_nonce_mirror::validate_nonce_format_and_freshness(&nonce, now_ms);
+    let core_result = tracker.check_and_record(&nonce, expiry);
+
+    assert!(
+        wasm_result.is_ok(),
+        "WASM should accept epoch nonce at epoch: {wasm_result:?}"
+    );
+    assert!(
+        core_result.is_ok(),
+        "core should accept epoch nonce at epoch: {core_result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Table-driven format conformance: exhaustive test vectors
+// ---------------------------------------------------------------------------
+
+/// Comprehensive table-driven test: runs identical format test vectors through
+/// both WASM mirror and scp-core `NonceTracker`, asserting identical
+/// accept/reject for every case. Time is frozen at `NONCE_BASE_SECS` for both.
+#[test]
+fn nonce_conformance_format_table_driven() {
+    let now_ms = NONCE_BASE_SECS * 1000;
+    let valid_hex = "aabbccdd11223344aabbccdd11223344";
+
+    // (nonce string, expected format-valid: true/false)
+    // Freshness-valid nonces (timestamp == now_ms) only; this tests FORMAT.
+    let test_vectors: Vec<(String, bool)> = vec![
+        // Valid format.
+        (make_nonce_str(now_ms, valid_hex), true),
+        // Missing separator.
+        ("noseparator".to_owned(), false),
+        ("1234567890123".to_owned(), false),
+        // Non-numeric timestamp.
+        (format!("abc-{valid_hex}"), false),
+        (format!("12.34-{valid_hex}"), false),
+        (format!("-{valid_hex}"), false),
+        // Hex suffix wrong length.
+        (make_nonce_str(now_ms, "aabbccdd"), false),
+        (
+            make_nonce_str(now_ms, "aabbccdd11223344aabbccdd11223344ff"),
+            false,
+        ),
+        (make_nonce_str(now_ms, ""), false),
+        // Non-hex chars in suffix.
+        (
+            make_nonce_str(now_ms, "gghhiidd11223344aabbccdd11223344"),
+            false,
+        ),
+        (
+            make_nonce_str(now_ms, "aabbccdd1122334_aabbccdd11223344"),
+            false,
+        ),
+        // Uppercase hex (valid — is_ascii_hexdigit accepts both cases).
+        (
+            make_nonce_str(now_ms, "AABBCCDD11223344AABBCCDD11223344"),
+            true,
+        ),
+        // Mixed case (valid).
+        (
+            make_nonce_str(now_ms, "AaBbCcDd11223344aAbBcCdD11223344"),
+            true,
+        ),
+        // Multiple dashes (first split captures timestamp, rest is suffix).
+        (format!("{now_ms}-aabb-ccdd11223344aabbccdd11223"), false),
+    ];
+
+    for (i, (nonce, expected_ok)) in test_vectors.iter().enumerate() {
+        let clock = Arc::new(TestClock::new(NONCE_BASE_SECS));
+        let mut tracker = NonceTracker::new("ctx-nonce-table".to_owned(), Arc::clone(&clock));
+        let expiry = clock.now() + 3600;
+
+        let wasm_ok = wasm_nonce_mirror::validate_nonce_format_and_freshness(nonce, now_ms).is_ok();
+        let core_ok = tracker.check_and_record(nonce, expiry).is_ok();
+
+        assert_eq!(
+            wasm_ok, core_ok,
+            "NONCE FORMAT DIVERGENCE at test vector {i}: \
+             nonce='{nonce}', wasm_ok={wasm_ok}, core_ok={core_ok}"
+        );
+        assert_eq!(
+            wasm_ok, *expected_ok,
+            "unexpected result at test vector {i}: \
+             nonce='{nonce}', expected_ok={expected_ok}, got={wasm_ok}"
+        );
+    }
 }
