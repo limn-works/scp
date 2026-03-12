@@ -93,16 +93,16 @@ class ColdStreamFactory(
      * Collection triggers the first query. Cancelling the collector stops
      * fetching subsequent pages.
      *
-     * @param contextId The context to query.
+     * @param contextHandle Handle from context create or join.
      * @param filterJson JSON-encoded query filter (e.g., event type, time range).
      * @param pageSize Number of entries per page.
      * @return Cold [Flow] of JSON-encoded event log pages.
      */
     fun eventLogPages(
-        contextId: String,
+        contextHandle: Long,
         filterJson: String,
         pageSize: Int = 50,
-    ): Flow<String> = paginatedEventQuery(contextId, filterJson, pageSize)
+    ): Flow<String> = paginatedEventQuery(contextHandle, filterJson, pageSize)
 
     /**
      * Cold flow of message history for a context, fetched page by page.
@@ -114,16 +114,16 @@ class ColdStreamFactory(
      * (`infraBindings.eventLogQuery`). These will diverge when separate
      * message-history FFI bindings are added.
      *
-     * @param contextId The context to query.
+     * @param contextHandle Handle from context create or join.
      * @param filterJson JSON-encoded query filter (e.g., time range, sender).
      * @param pageSize Number of messages per page.
      * @return Cold [Flow] of JSON-encoded message history pages.
      */
     fun messageHistoryPages(
-        contextId: String,
+        contextHandle: Long,
         filterJson: String,
         pageSize: Int = 50,
-    ): Flow<String> = paginatedEventQuery(contextId, filterJson, pageSize)
+    ): Flow<String> = paginatedEventQuery(contextHandle, filterJson, pageSize)
 
     /**
      * Shared implementation for paginated event/message queries.
@@ -134,7 +134,7 @@ class ColdStreamFactory(
      * message history, the two public functions will diverge.
      */
     private fun paginatedEventQuery(
-        contextId: String,
+        contextHandle: Long,
         filterJson: String,
         pageSize: Int,
     ): Flow<String> =
@@ -144,7 +144,7 @@ class ColdStreamFactory(
                 val paginatedFilter = buildPaginatedFilter(filterJson, offset, pageSize)
                 val page =
                     withContext(ioDispatcher) {
-                        infraBindings.eventLogQuery(contextId, paginatedFilter)
+                        infraBindings.eventLogQuery(contextHandle, paginatedFilter)
                     }
                 if (page == "[]" || page.isBlank()) break
                 emit(page)

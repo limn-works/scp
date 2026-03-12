@@ -230,18 +230,18 @@ class ConformanceDispatcher(
     private suspend fun dispatchEventLogQuery(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
-        val contextId = input["context_id"] ?: ""
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val filter = input["filter"] ?: "{}"
-        val result = bridge.infra.eventLogQuery(contextId, filter)
+        val result = bridge.infra.eventLogQuery(contextHandle, filter)
         mapOf("result" to result)
     }
 
     private suspend fun dispatchEventLogVerify(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
-        val contextId = input["context_id"] ?: ""
-        val proof = input["proof"] ?: "{}"
-        val valid = bridge.infra.eventLogVerify(contextId, proof)
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
+        val claim = input["claim"] ?: input["proof"] ?: "{}"
+        val valid = bridge.infra.eventLogVerify(contextHandle, claim)
         mapOf("is_valid" to valid.toString())
     }
 

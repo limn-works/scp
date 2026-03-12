@@ -201,7 +201,7 @@ class CoroutineBridgeTest {
         fun `eventLogQuery dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.eventLogQueryResult = """[{"event":"joined"}]"""
-                val result = bridge.infra.eventLogQuery("ctx-1", """{"type":"joined"}""")
+                val result = bridge.infra.eventLogQuery(1L, """{"type":"joined"}""")
                 assertEquals("""[{"event":"joined"}]""", result)
             }
 
@@ -209,7 +209,7 @@ class CoroutineBridgeTest {
         fun `eventLogVerify dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.eventLogVerifyResult = true
-                val result = bridge.infra.eventLogVerify("ctx-1", """{"proof":"abc"}""")
+                val result = bridge.infra.eventLogVerify(1L, """{"type":"inclusion","leaf_index":0}""")
                 assertTrue(result)
             }
 
@@ -218,7 +218,7 @@ class CoroutineBridgeTest {
             runTest(ioDispatcher) {
                 @Suppress("MaxLineLength")
                 val checkpointJson =
-                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
                 stubBindings.eventLogCheckpointResult = checkpointJson
                 val result = bridge.infra.eventLogCheckpoint(1L, 2L, 5L)
                 assertEquals(checkpointJson, result)
@@ -723,13 +723,13 @@ class StubNativeBindings : NativeBindings {
     }
 
     override fun eventLogQuery(
-        contextId: String,
+        contextHandle: Long,
         filterJson: String,
     ): String = eventLogQueryResult
 
     override fun eventLogVerify(
-        contextId: String,
-        proofJson: String,
+        contextHandle: Long,
+        claimJson: String,
     ): Boolean = eventLogVerifyResult
 
     override fun eventLogCheckpoint(
