@@ -215,6 +215,8 @@ export interface TestVector {
   readonly input: Readonly<Record<string, unknown>>;
   /** Expected output as a JSON object. */
   readonly expectedOutput: Readonly<Record<string, unknown>>;
+  /** Human-readable description of what this test vector verifies. */
+  readonly description: string;
 }
 
 // ---------------------------------------------------------------------------
