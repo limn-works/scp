@@ -284,8 +284,12 @@ impl BroadcastState {
     }
 
     /// Returns `true` if the given subscriber DID is blocked by ANY author.
-    /// Used for subscription gating — a governance-banned subscriber (added to
-    /// all authors' block lists) should not be able to re-subscribe.
+    /// Useful for governance-ban checks (when a subscriber has been added to
+    /// all authors' block lists). NOT used for subscription gating — per
+    /// scp-core `BroadcastContext::subscribe`, subscription always succeeds
+    /// regardless of block lists. Blocking only affects key distribution
+    /// (`handle_broadcast_key_request`).
+    #[cfg(test)]
     fn is_blocked_by_any_author(&self, subscriber_did: &str) -> bool {
         self.authors
             .values()
@@ -421,6 +425,9 @@ const WASM_PROPOSAL_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
 
 /// Maximum events in the receive buffer. Matches `PyO3` channel capacity.
 const WASM_EVENT_BUFFER_CAP: usize = 1000;
+
+/// Maximum entries per author's block list in broadcast contexts (§5.14.8).
+const WASM_BLOCK_LIST_CAP: usize = 10_000;
 
 impl PerContextState {
     /// Pushes an event to the receive buffer, evicting the oldest if at capacity.
@@ -2390,13 +2397,6 @@ impl WasmContextManager {
                 code: "SCP-CTX-2001".to_owned(),
             })?;
 
-        if bc.is_blocked_by_any_author(subscriber_did) {
-            return Err(ScpWasmError::Permission {
-                message: format!("subscriber '{subscriber_did}' is blocked"),
-                code: "SCP-PERM-3000".to_owned(),
-            });
-        }
-
         bc.subscribers.insert(subscriber_did.to_owned());
 
         // Also add as a member if not already present.
@@ -2535,6 +2535,16 @@ impl WasmContextManager {
                         message: format!("author not found: {blocker_did}"),
                         code: "SCP-CTX-2001".to_owned(),
                     })?;
+
+            if block_list.len() >= WASM_BLOCK_LIST_CAP {
+                return Err(ScpWasmError::Validation {
+                    message: format!(
+                        "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
+                         for author '{blocker_did}'"
+                    ),
+                    code: "SCP-VALID-7301".to_owned(),
+                });
+            }
 
             block_list.insert(subscriber_did.to_owned());
         }
@@ -3920,7 +3930,7 @@ mod tests {
         assert!(bc.authors["author-a"].contains("sub1"));
         // sub1 is NOT blocked by author-b
         assert!(!bc.authors["author-b"].contains("sub1"));
-        // is_blocked_by_any_author returns true (for subscription gating)
+        // is_blocked_by_any_author returns true (for governance-ban detection)
         assert!(bc.is_blocked_by_any_author("sub1"));
         // sub2 is blocked by nobody
         assert!(!bc.is_blocked_by_any_author("sub2"));
