@@ -20,9 +20,9 @@
 //!
 //! `context_discover` handles `scp://` URIs locally (pure parsing, no network
 //! I/O). For `did:` queries, DHT resolution requires network I/O that cannot
-//! be performed from Rust in WASM — the function returns an empty results
-//! array. The TypeScript wrapper layer should implement DID-based discovery
-//! via the Fetch API if needed.
+//! be performed from Rust in WASM — the function returns an error
+//! (`SCP-CTX-2022`). The TypeScript wrapper layer should implement DID-based
+//! discovery via the Fetch API if needed.
 //!
 //! See spec section 22 and ADR-022.
 
@@ -513,7 +513,7 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
 /// - **`scp://` URIs**: Parsed locally (pure string operation, no network I/O).
 ///   Returns a JSON array with a single discovery result.
 /// - **`did:` queries**: DHT resolution requires network I/O that cannot be
-///   performed from Rust in WASM. Returns an empty JSON array `"[]"`. The
+///   performed from Rust in WASM. Returns an error (`SCP-CTX-2022`). The
 ///   TypeScript wrapper layer should implement DID-based discovery via the
 ///   Fetch API if needed.
 ///
@@ -523,20 +523,21 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
 ///
 /// # DID query limitation
 ///
-/// DID-based queries (`did:dht:...`, `did:web:...`, etc.) always return an
-/// empty results array `"[]"` in the WASM bridge. DHT resolution requires
-/// network I/O (BEP44 DHT lookups via HTTP relays), which is not available
-/// from Rust compiled to `wasm32-unknown-unknown`. The TypeScript wrapper
-/// layer can implement DID-based discovery via the browser Fetch API if
-/// needed — this is a known architectural limitation per ADR-034, not a
-/// missing feature.
+/// DID-based queries (`did:dht:...`, `did:web:...`, etc.) return an error
+/// (`SCP-CTX-2022`) in the WASM bridge. DHT resolution requires network
+/// I/O (BEP44 DHT lookups via HTTP relays), which is not available from
+/// Rust compiled to `wasm32-unknown-unknown`. The TypeScript wrapper layer
+/// can implement DID-based discovery via the browser Fetch API if needed —
+/// this is a known architectural limitation per ADR-034, not a missing
+/// feature.
 ///
 /// See §5.14.11, §18.2.2, §18.4.
 ///
 /// # Errors
 ///
-/// Returns `JsError` if the query is not a valid DID or `scp://` URI, or
-/// if the `scp://` URI is malformed.
+/// Returns `JsError` if the query is not a valid DID or `scp://` URI, if
+/// the `scp://` URI is malformed, or if the query is a DID (unsupported
+/// in WASM).
 ///
 /// # JS usage
 ///
@@ -548,9 +549,12 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
 /// const arr = JSON.parse(results);
 /// console.log(arr[0].context_id); // "deadbeef"
 ///
-/// // DID query — returns empty array (DHT unavailable in WASM)
-/// const empty = await context_discover("did:dht:z6MkTest");
-/// console.log(JSON.parse(empty)); // []
+/// // DID query — rejects with SCP-CTX-2022 (DHT unavailable in WASM)
+/// try {
+///     await context_discover("did:dht:z6MkTest");
+/// } catch (e) {
+///     console.log(e.message); // "[SCP-CTX-2022] DID-based discovery is not available..."
+/// }
 /// ```
 #[wasm_bindgen]
 pub fn context_discover(query: String) -> Promise {
@@ -563,9 +567,13 @@ pub fn context_discover(query: String) -> Promise {
             Ok(JsValue::from_str(&results_json))
         } else if query.starts_with("did:") {
             // DHT resolution requires network I/O — not available in WASM.
-            // Return empty results array. The TypeScript wrapper layer can
-            // implement DID-based discovery via the Fetch API if needed.
-            Ok(JsValue::from_str("[]"))
+            // Return an explicit error so callers don't silently get empty results.
+            // The TypeScript wrapper layer can implement DID-based discovery
+            // via the Fetch API if needed.
+            Err(JsValue::from_str(&format!(
+                "[SCP-CTX-2022] DID-based discovery is not available in the WASM bridge \
+                 (requires network I/O for DHT resolution): {query}"
+            )))
         } else {
             Err(JsValue::from_str(&format!(
                 "[SCP-VALID-7027] query must be a DID (starts with 'did:') or an scp:// URI \
