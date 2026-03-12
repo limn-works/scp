@@ -163,6 +163,114 @@ fn validate_test_vectors(
 }
 
 // ---------------------------------------------------------------------------
+// Provenance field parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed provenance fields: `(implementation_hash, signature, economic_metadata, registered_at)`.
+type ProvenanceFields = (
+    [u8; 32],
+    Vec<u8>,
+    Option<runtime::ToolEconomicMetadata>,
+    u64,
+);
+
+/// Parses optional provenance and economic fields from the definition JSON.
+///
+/// When a field is absent, a safe default is used. When a field is present but
+/// malformed, returns `SCP-VALID-7038`.
+fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, JsValue> {
+    let implementation_hash = match def.get("implementationHash").and_then(|v| v.as_str()) {
+        None => [0u8; 32],
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid 'implementationHash': invalid hex: {e}"),
+                    code: "SCP-VALID-7038".to_owned(),
+                }
+                .into_js()
+            })?;
+            <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                ScpWasmError::Validation {
+                    message: format!(
+                        "invalid 'implementationHash': must be exactly 32 bytes, got {}",
+                        bytes.len()
+                    ),
+                    code: "SCP-VALID-7038".to_owned(),
+                }
+                .into_js()
+            })?
+        }
+    };
+
+    let signature = match def.get("signature").and_then(|v| v.as_str()) {
+        None => Vec::new(),
+        Some(b64) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| {
+                    ScpWasmError::Validation {
+                        message: format!("invalid 'signature': invalid base64: {e}"),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?
+        }
+    };
+
+    let economic_metadata = match def.get("economicMetadata") {
+        None => None,
+        Some(em) => {
+            let cost_per_invoke = em
+                .get("costPerInvoke")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: "invalid 'economicMetadata': missing or non-numeric \
+                                  'costPerInvoke'"
+                            .to_owned(),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?;
+            let payee = em
+                .get("payee")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: "invalid 'economicMetadata': missing or non-string 'payee'"
+                            .to_owned(),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?
+                .to_owned();
+            let cost_formula = em
+                .get("costFormula")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            Some(runtime::ToolEconomicMetadata {
+                cost_per_invoke,
+                cost_formula,
+                payee,
+            })
+        }
+    };
+
+    // Use the hardened time source (captured Date.now) for the registration
+    // timestamp. std::time::SystemTime is not available on wasm32 — see
+    // crate::time module docs.
+    let registered_at = crate::time::now_ms_u64();
+
+    Ok((
+        implementation_hash,
+        signature,
+        economic_metadata,
+        registered_at,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -235,14 +343,21 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 
         let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
+        let (implementation_hash, signature, economic_metadata, registered_at) =
+            parse_provenance_fields(&def)?;
+
         let registration = runtime::ToolRegistration {
             tool_id: tool_id.clone(),
             name,
             description,
             input_schema,
             output_schema,
+            implementation_hash,
             test_vectors,
             operator_did,
+            economic_metadata,
+            registered_at,
+            signature,
         };
 
         with_manager(|mgr| mgr.register_tool(&context_id, registration))
