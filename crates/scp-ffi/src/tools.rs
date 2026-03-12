@@ -1264,4 +1264,242 @@ mod tests {
             );
         });
     }
+
+    // -----------------------------------------------------------------------
+    // extract_test_vectors — SCP-VALID-7037
+    // -----------------------------------------------------------------------
+
+    /// Helper: builds a valid registration dict with both schemas set.
+    /// Callers can then set `test_vectors` / `implementation_hash` to
+    /// exercise 7037/7038 paths without tripping earlier validation.
+    fn valid_registration_dict(py: Python<'_>) -> Bound<'_, PyDict> {
+        let dict = PyDict::new(py);
+        dict.set_item("name", "test-tool").unwrap();
+        dict.set_item("description", "a test").unwrap();
+        dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
+            .unwrap();
+        let schema = PyDict::new(py);
+        let input = PyDict::new(py);
+        input.set_item("type", "object").unwrap();
+        schema.set_item("input_schema", input).unwrap();
+        let output = PyDict::new(py);
+        output.set_item("type", "object").unwrap();
+        schema.set_item("output_schema", output).unwrap();
+        dict.set_item("schema", schema).unwrap();
+        dict
+    }
+
+    /// `extract_test_vectors` rejects a non-list `test_vectors` with SCP-VALID-7037.
+    #[test]
+    fn extract_test_vectors_rejects_non_list() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            dict.set_item("test_vectors", "not-a-list").unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject non-list test_vectors");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7037"),
+                "error should contain SCP-VALID-7037, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("test_vectors"),
+                "error should mention test_vectors, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_test_vectors` rejects a list containing non-dict items with SCP-VALID-7037.
+    #[test]
+    fn extract_test_vectors_rejects_non_dict_item() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            let vectors = pyo3::types::PyList::new(py, [42i32]).unwrap();
+            dict.set_item("test_vectors", vectors).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(
+                result.is_err(),
+                "should reject non-dict items in test_vectors"
+            );
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7037"),
+                "error should contain SCP-VALID-7037, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("test vector must be a dict"),
+                "error should describe the issue, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_test_vectors` rejects a dict (wrong type — should be a list) with SCP-VALID-7037.
+    #[test]
+    fn extract_test_vectors_rejects_wrong_type() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            let wrong_type = pyo3::types::PyDict::new(py);
+            wrong_type.set_item("not", "a list").unwrap();
+            dict.set_item("test_vectors", wrong_type).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject dict as test_vectors");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7037"),
+                "error should contain SCP-VALID-7037, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_test_vectors` accepts None/missing `test_vectors` (returns empty vec).
+    #[test]
+    fn extract_test_vectors_accepts_missing() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            // No test_vectors key set — should not error on extraction.
+            // Will fail later on context lookup, but the extraction succeeds.
+            let result = extract_test_vectors(&dict.as_borrowed());
+            assert!(result.is_ok(), "missing test_vectors should be accepted");
+            assert!(result.unwrap().is_empty());
+        });
+    }
+
+    /// `extract_test_vectors` accepts an empty list.
+    #[test]
+    fn extract_test_vectors_accepts_empty_list() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            let empty_list = pyo3::types::PyList::empty(py);
+            dict.set_item("test_vectors", empty_list).unwrap();
+
+            let result = extract_test_vectors(&dict.as_borrowed());
+            assert!(result.is_ok(), "empty list should be accepted");
+            assert!(result.unwrap().is_empty());
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_implementation_hash — SCP-VALID-7038
+    // -----------------------------------------------------------------------
+
+    /// `extract_implementation_hash` rejects a non-string value with SCP-VALID-7038.
+    #[test]
+    fn extract_implementation_hash_rejects_non_string() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            dict.set_item("implementation_hash", 12345).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(
+                result.is_err(),
+                "should reject non-string implementation_hash"
+            );
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7038"),
+                "error should contain SCP-VALID-7038, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("implementation_hash"),
+                "error should mention implementation_hash, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_implementation_hash` rejects wrong-length hex string with SCP-VALID-7038.
+    #[test]
+    fn extract_implementation_hash_rejects_wrong_length() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            // 32 hex chars instead of the required 64 (for 32 bytes).
+            dict.set_item("implementation_hash", "abcdef0123456789abcdef0123456789")
+                .unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(
+                result.is_err(),
+                "should reject wrong-length implementation_hash"
+            );
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7038"),
+                "error should contain SCP-VALID-7038, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("64 hex chars"),
+                "error should mention required length, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_implementation_hash` rejects invalid hex chars with SCP-VALID-7038.
+    #[test]
+    fn extract_implementation_hash_rejects_invalid_hex() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            // 64 chars but contains non-hex 'g'.
+            dict.set_item(
+                "implementation_hash",
+                "gg00000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(
+                result.is_err(),
+                "should reject invalid hex in implementation_hash"
+            );
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7038"),
+                "error should contain SCP-VALID-7038, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("invalid hex"),
+                "error should mention invalid hex, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_implementation_hash` accepts None/missing (returns zeroed hash).
+    #[test]
+    fn extract_implementation_hash_accepts_missing() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            // No implementation_hash key.
+            let result = extract_implementation_hash(&dict.as_borrowed());
+            assert!(
+                result.is_ok(),
+                "missing implementation_hash should be accepted"
+            );
+            assert_eq!(result.unwrap(), [0u8; 32]);
+        });
+    }
+
+    /// `extract_implementation_hash` accepts a valid 64-char hex string.
+    #[test]
+    fn extract_implementation_hash_accepts_valid_hex() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            dict.set_item("implementation_hash", "ab".repeat(32))
+                .unwrap();
+
+            let result = extract_implementation_hash(&dict.as_borrowed());
+            assert!(result.is_ok(), "valid 64-char hex should be accepted");
+            assert_eq!(result.unwrap(), [0xab; 32]);
+        });
+    }
 }
