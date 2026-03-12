@@ -106,12 +106,12 @@ pub struct NapiToolVerificationResult {
 
 /// Validates and parses a JSON schema string.
 ///
-/// Returns an `SCP-VALID-7031` error for `input_schema_json` or
-/// `SCP-VALID-7032` for `output_schema_json` when the JSON is malformed.
+/// Returns an `SCP-VALID-7035` error for `input_schema_json` or
+/// `SCP-VALID-7036` for `output_schema_json` when the JSON is malformed.
 fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json::Value> {
     let code = match field_name {
-        "input_schema_json" => "SCP-VALID-7031",
-        _ => "SCP-VALID-7032",
+        "input_schema_json" => "SCP-VALID-7035",
+        _ => "SCP-VALID-7036",
     };
     serde_json::from_str(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -124,7 +124,7 @@ fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json
 /// Validates and parses optional test vectors JSON.
 ///
 /// `None` is acceptable (no test vectors). A `Some` value that is not valid
-/// JSON returns `SCP-VALID-7033`.
+/// JSON returns `SCP-VALID-7037`.
 fn validate_test_vectors_json(
     json: Option<&str>,
 ) -> napi::Result<Vec<scp_core::context::tools::TestVector>> {
@@ -134,7 +134,7 @@ fn validate_test_vectors_json(
             serde_json::from_str(s).map_err(|e| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("invalid test_vectors_json: {e}"),
-                    code: "SCP-VALID-7033".to_owned(),
+                    code: "SCP-VALID-7037".to_owned(),
                 })
             })
         },
@@ -144,7 +144,7 @@ fn validate_test_vectors_json(
 /// Validates an optional implementation hash.
 ///
 /// `None` is acceptable (defaults to zeroed hash). A `Some` value that is not
-/// exactly 32 bytes returns `SCP-VALID-7034`.
+/// exactly 32 bytes returns `SCP-VALID-7038`.
 fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> {
     bytes.map_or_else(
         || Ok([0u8; 32]),
@@ -155,7 +155,7 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
                         "implementation_hash must be exactly 32 bytes, got {}",
                         b.len()
                     ),
-                    code: "SCP-VALID-7034".to_owned(),
+                    code: "SCP-VALID-7038".to_owned(),
                 })
             })
         },
@@ -181,10 +181,10 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 /// # Errors
 ///
 /// - Rejects with `SCP-TOOL-6003` if the context is not `"active"`.
-/// - Rejects with `SCP-VALID-7031` if `input_schema_json` is not valid JSON.
-/// - Rejects with `SCP-VALID-7032` if `output_schema_json` is not valid JSON.
-/// - Rejects with `SCP-VALID-7033` if `test_vectors_json` is provided but not valid JSON.
-/// - Rejects with `SCP-VALID-7034` if `implementation_hash` is provided but not exactly 32 bytes.
+/// - Rejects with `SCP-VALID-7035` if `input_schema_json` is not valid JSON.
+/// - Rejects with `SCP-VALID-7036` if `output_schema_json` is not valid JSON.
+/// - Rejects with `SCP-VALID-7037` if `test_vectors_json` is provided but not valid JSON.
+/// - Rejects with `SCP-VALID-7038` if `implementation_hash` is provided but not exactly 32 bytes.
 /// - Rejects with `SCP-TOOL-6001` if registration fails (permission denied,
 ///   schema invalid, duplicate name, etc.) in the full runtime.
 #[napi]
@@ -910,8 +910,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7031"),
-            "error should contain SCP-VALID-7031, got: {msg}"
+            msg.contains("SCP-VALID-7035"),
+            "error should contain SCP-VALID-7035, got: {msg}"
         );
         assert!(
             msg.contains("invalid input_schema_json"),
@@ -925,8 +925,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7032"),
-            "error should contain SCP-VALID-7032, got: {msg}"
+            msg.contains("SCP-VALID-7036"),
+            "error should contain SCP-VALID-7036, got: {msg}"
         );
         assert!(
             msg.contains("invalid output_schema_json"),
@@ -939,7 +939,7 @@ mod tests {
         let result = validate_schema_json("", "input_schema_json");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7031"));
+        assert!(msg.contains("SCP-VALID-7035"));
     }
 
     // -----------------------------------------------------------------------
@@ -966,8 +966,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7033"),
-            "error should contain SCP-VALID-7033, got: {msg}"
+            msg.contains("SCP-VALID-7037"),
+            "error should contain SCP-VALID-7037, got: {msg}"
         );
         assert!(
             msg.contains("invalid test_vectors_json"),
@@ -981,7 +981,7 @@ mod tests {
         let result = validate_test_vectors_json(Some(r#"{"not": "an array"}"#));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7033"));
+        assert!(msg.contains("SCP-VALID-7037"));
     }
 
     // -----------------------------------------------------------------------
@@ -1010,8 +1010,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7034"),
-            "error should contain SCP-VALID-7034, got: {msg}"
+            msg.contains("SCP-VALID-7038"),
+            "error should contain SCP-VALID-7038, got: {msg}"
         );
         assert!(
             msg.contains("got 16"),
@@ -1025,7 +1025,7 @@ mod tests {
         let result = validate_implementation_hash(Some(&hash));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7034"));
+        assert!(msg.contains("SCP-VALID-7038"));
         assert!(
             msg.contains("got 64"),
             "error should report actual length, got: {msg}"
@@ -1037,7 +1037,7 @@ mod tests {
         let result = validate_implementation_hash(Some(&[]));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7034"));
+        assert!(msg.contains("SCP-VALID-7038"));
         assert!(msg.contains("got 0"));
     }
 }

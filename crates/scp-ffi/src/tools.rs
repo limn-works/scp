@@ -181,14 +181,38 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         .downcast::<PyDict>()
         .map_err(|_| ScpPyError::validation("'schema' must be a dict".to_owned()))?;
     let schema_json = py_dict_to_json(schema_dict)?;
-    let input_schema = schema_json
-        .get("input_schema")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-    let output_schema = schema_json
-        .get("output_schema")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+    let input_schema = schema_json.get("input_schema").cloned().ok_or_else(|| {
+        ScpPyError::ValidationError {
+            message: "missing 'input_schema' in schema dict — both 'input_schema' and 'output_schema' are required".to_owned(),
+            code: "SCP-VALID-7035".to_owned(),
+        }
+    })?;
+    if !input_schema.is_object() {
+        return Err(ScpPyError::ValidationError {
+            message: format!(
+                "invalid 'input_schema': expected a JSON object, got {}",
+                value_type_name(&input_schema)
+            ),
+            code: "SCP-VALID-7035".to_owned(),
+        }
+        .into());
+    }
+    let output_schema = schema_json.get("output_schema").cloned().ok_or_else(|| {
+        ScpPyError::ValidationError {
+            message: "missing 'output_schema' in schema dict — both 'input_schema' and 'output_schema' are required".to_owned(),
+            code: "SCP-VALID-7036".to_owned(),
+        }
+    })?;
+    if !output_schema.is_object() {
+        return Err(ScpPyError::ValidationError {
+            message: format!(
+                "invalid 'output_schema': expected a JSON object, got {}",
+                value_type_name(&output_schema)
+            ),
+            code: "SCP-VALID-7036".to_owned(),
+        }
+        .into());
+    }
 
     // Extract test vectors (optional).
     let test_vectors = extract_test_vectors(registration)?;
@@ -656,6 +680,18 @@ fn extract_test_vectors(
     Ok(result)
 }
 
+/// Returns a human-readable type name for a `serde_json::Value`.
+const fn value_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cross-context tool invocation
 // ---------------------------------------------------------------------------
@@ -1079,4 +1115,145 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_tool_session_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_session_close, m)?)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_type_name_covers_all_variants() {
+        assert_eq!(value_type_name(&serde_json::Value::Null), "null");
+        assert_eq!(value_type_name(&serde_json::Value::Bool(true)), "boolean");
+        assert_eq!(value_type_name(&serde_json::json!(42)), "number");
+        assert_eq!(value_type_name(&serde_json::json!("hello")), "string");
+        assert_eq!(value_type_name(&serde_json::json!([1, 2])), "array");
+        assert_eq!(value_type_name(&serde_json::json!({"a": 1})), "object");
+    }
+
+    /// Schema validation rejects missing `input_schema` with `SCP-VALID-7035`.
+    #[test]
+    fn schema_validation_rejects_missing_input_schema() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("description", "a test").unwrap();
+            dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
+                .unwrap();
+
+            // Schema dict with only output_schema, missing input_schema.
+            let schema = PyDict::new(py);
+            schema.set_item("output_schema", PyDict::new(py)).unwrap();
+            dict.set_item("schema", schema).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject missing input_schema");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7035"),
+                "error should contain SCP-VALID-7035, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("input_schema"),
+                "error should mention input_schema, got: {err_str}"
+            );
+        });
+    }
+
+    /// Schema validation rejects missing `output_schema` with `SCP-VALID-7036`.
+    #[test]
+    fn schema_validation_rejects_missing_output_schema() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("description", "a test").unwrap();
+            dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
+                .unwrap();
+
+            // Schema dict with only input_schema, missing output_schema.
+            let schema = PyDict::new(py);
+            let inner = PyDict::new(py);
+            inner.set_item("type", "object").unwrap();
+            schema.set_item("input_schema", inner).unwrap();
+            dict.set_item("schema", schema).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject missing output_schema");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7036"),
+                "error should contain SCP-VALID-7036, got: {err_str}"
+            );
+            assert!(
+                err_str.contains("output_schema"),
+                "error should mention output_schema, got: {err_str}"
+            );
+        });
+    }
+
+    /// Schema validation rejects non-object `input_schema` with `SCP-VALID-7035`.
+    #[test]
+    fn schema_validation_rejects_non_object_input_schema() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("description", "a test").unwrap();
+            dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
+                .unwrap();
+
+            // Schema dict with input_schema as a string, not an object.
+            let schema = PyDict::new(py);
+            schema.set_item("input_schema", "not-an-object").unwrap();
+            let output = PyDict::new(py);
+            output.set_item("type", "object").unwrap();
+            schema.set_item("output_schema", output).unwrap();
+            dict.set_item("schema", schema).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject non-object input_schema");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7035"),
+                "error should contain SCP-VALID-7035, got: {err_str}"
+            );
+        });
+    }
+
+    /// Schema validation rejects non-object `output_schema` with `SCP-VALID-7036`.
+    #[test]
+    fn schema_validation_rejects_non_object_output_schema() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("description", "a test").unwrap();
+            dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
+                .unwrap();
+
+            // Schema dict with output_schema as an array, not an object.
+            let schema = PyDict::new(py);
+            let input = PyDict::new(py);
+            input.set_item("type", "object").unwrap();
+            schema.set_item("input_schema", input).unwrap();
+            let output_list = pyo3::types::PyList::new(py, [1, 2, 3]).unwrap();
+            schema.set_item("output_schema", output_list).unwrap();
+            dict.set_item("schema", schema).unwrap();
+
+            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            assert!(result.is_err(), "should reject non-object output_schema");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("SCP-VALID-7036"),
+                "error should contain SCP-VALID-7036, got: {err_str}"
+            );
+        });
+    }
 }
