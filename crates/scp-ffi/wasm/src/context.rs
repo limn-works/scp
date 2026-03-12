@@ -68,66 +68,77 @@ pub struct WasmContextHandle {
 
 #[wasm_bindgen]
 impl WasmContextHandle {
+    /// Returns the unique context identifier.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "contextId")]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
     }
 
+    /// Returns the current context lifecycle state (e.g., `"active"`, `"closed"`).
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn state(&self) -> String {
         self.state.borrow().clone()
     }
 
+    /// Returns the DID of the context creator.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "creatorDid")]
     pub fn creator_did(&self) -> String {
         self.creator_did.clone()
     }
 
+    /// Returns the context mode (e.g., `"standard"`, `"broadcast"`).
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn mode(&self) -> String {
         self.mode.clone()
     }
 
+    /// Returns the capability ceiling as an array of capability URI strings.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn ceiling(&self) -> js_sys::Array {
         self.ceiling.iter().map(|s| JsValue::from_str(s)).collect()
     }
 
+    /// Returns the ceiling enforcement policy (e.g., `"strict"`, `"permissive"`).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "ceilingPolicy")]
     pub fn ceiling_policy(&self) -> String {
         self.ceiling_policy.clone()
     }
 
+    /// Returns the context TTL in seconds, or `undefined` if no TTL is set.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "ttlSeconds")]
     pub fn ttl_seconds(&self) -> Option<u64> {
         self.ttl_seconds
     }
 
+    /// Returns the promotion policy, or `undefined` if unset.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "promotionPolicy")]
     pub fn promotion_policy(&self) -> Option<String> {
         self.promotion_policy.clone()
     }
 
+    /// Returns the governance model (e.g., `"single_admin"`, `"threshold"`).
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn governance(&self) -> String {
         self.governance.clone()
     }
 
+    /// Returns the current number of context members.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> u64 {
         self.member_count
     }
 
+    /// Returns the economic policy as a JSON string, or `undefined` if unset.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "economicPolicy")]
     pub fn economic_policy(&self) -> Option<String> {
@@ -187,24 +198,28 @@ pub struct WasmMessage {
 
 #[wasm_bindgen]
 impl WasmMessage {
+    /// Returns the DID of the message sender.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "senderDid")]
     pub fn sender_did(&self) -> String {
         self.sender_did.clone()
     }
 
+    /// Returns the message payload as a base64-encoded string.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "payloadBase64")]
     pub fn payload_base64(&self) -> String {
         self.payload_base64.clone()
     }
 
+    /// Returns the message timestamp as seconds since the Unix epoch.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn timestamp(&self) -> f64 {
         self.timestamp
     }
 
+    /// Returns the context ID the message belongs to.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "contextId")]
     pub fn context_id(&self) -> String {

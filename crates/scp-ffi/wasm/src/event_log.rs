@@ -54,30 +54,35 @@ pub struct WasmEvent {
 
 #[wasm_bindgen]
 impl WasmEvent {
+    /// Returns the event type string (e.g., `"MessageSent"`, `"MemberJoined"`).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "eventType")]
     pub fn event_type(&self) -> String {
         self.event_type.clone()
     }
 
+    /// Returns the DID of the actor who produced this event.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "actorDid")]
     pub fn actor_did(&self) -> String {
         self.actor_did.clone()
     }
 
+    /// Returns the event timestamp as seconds since the Unix epoch.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn timestamp(&self) -> f64 {
         self.timestamp
     }
 
+    /// Returns the event payload as a JSON string.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "payloadJson")]
     pub fn payload_json(&self) -> String {
         self.payload_json.clone()
     }
 
+    /// Returns the event's sequence number within the log.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn sequence(&self) -> u32 {
@@ -100,18 +105,21 @@ pub struct WasmProof {
 
 #[wasm_bindgen]
 impl WasmProof {
+    /// Returns whether the proof verification succeeded.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn verified(&self) -> bool {
         self.verified
     }
 
+    /// Returns the proof type (`"inclusion"` or `"absence"`).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "proofType")]
     pub fn proof_type(&self) -> String {
         self.proof_type.clone()
     }
 
+    /// Returns the proof details as a JSON string.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "detailsJson")]
     pub fn details_json(&self) -> String {
@@ -144,42 +152,52 @@ pub struct WasmCheckpoint {
 
 #[wasm_bindgen]
 impl WasmCheckpoint {
+    /// Returns the context ID this checkpoint belongs to.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "contextId")]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
     }
 
+    /// Returns the DID of the identity that generated the checkpoint.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "senderDid")]
     pub fn sender_did(&self) -> String {
         self.sender_did.clone()
     }
 
+    /// Returns the number of events in the log at checkpoint time.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "eventCount")]
     pub fn event_count(&self) -> u32 {
         u32::try_from(self.event_count).unwrap_or(u32::MAX)
     }
 
+    /// Returns the Merkle root hash as a hex string.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "merkleRoot")]
     pub fn merkle_root(&self) -> String {
         self.merkle_root.clone()
     }
 
+    /// Returns the MLS epoch at checkpoint time, or `undefined` if unset.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn epoch(&self) -> Option<u32> {
         self.epoch.map(|e| u32::try_from(e).unwrap_or(u32::MAX))
     }
 
+    /// Returns the checkpoint timestamp as seconds since the Unix epoch.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn timestamp(&self) -> f64 {
         self.timestamp
     }
 
+    /// Returns the SHA-256 hash of the canonical signing payload (hex).
+    ///
+    /// The TypeScript SDK must sign this hash via `SubtleCrypto` to produce
+    /// the final signed checkpoint.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "signingPayloadHash")]
     pub fn signing_payload_hash(&self) -> String {
