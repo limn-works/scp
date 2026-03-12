@@ -236,6 +236,15 @@ public func delegateUcanToken(
 /// ``validateUcanToken(handle:token:capability:validateFn:)``. Prefer the
 /// handle-based API for production use.
 ///
+/// - Parameters:
+///   - encoded: The encoded UCAN token string.
+///   - handle: The ``ContextHandle`` for the context.
+///   - contextId: The context identifier (unused, kept for backward compat).
+///   - capability: The required capability string to validate against.
+///   - presenterDid: Optional DID of the agent presenting the token.
+///   - validateFn: Bridge function override for testing.
+/// - Returns: A ``UcanValidationResult`` indicating success or failure.
+///
 /// ## Provenance
 ///
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
@@ -245,11 +254,12 @@ public func validate(
     encoded: String,
     handle: ContextHandle,
     contextId _: String,
-    presenterDid: String,
+    capability: String,
+    presenterDid: String? = nil,
     validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
 ) async throws -> UcanValidationResult {
     do {
-        try await validateFn(handle, encoded, presenterDid, nil, nil)
+        try await validateFn(handle, encoded, capability, presenterDid, nil)
         return UcanValidationResult(isValid: true, token: nil, failureReason: nil)
     } catch {
         return UcanValidationResult(isValid: false, token: nil, failureReason: "\(error)")

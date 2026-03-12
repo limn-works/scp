@@ -40,7 +40,7 @@ struct ConformanceTests {
     // This dispatcher handles the conformance test categories:
     // - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
     // - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
-    // - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
+    // - `ucan_validate` -> `validate(encoded:handle:contextId:capability:presenterDid:)`
     // - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
     // - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
     // - `transport_connect` -> `connectTransport(config:)`
@@ -60,7 +60,8 @@ struct ConformanceTests {
         case "ucan_validate":
             let encoded = input["encoded"] ?? ""
             let contextId = input["context_id"] ?? ""
-            let presenterDid = input["presenter_did"] ?? ""
+            let capability = input["capability"] ?? "messages:read"
+            let presenterDid = input["presenter_did"]
             let handle = ContextHandle(noPointer: .init())
             // Inject a mock validateFn to avoid calling the real UniFFI bridge
             // (which would crash on the nil-pointer handle).
@@ -75,6 +76,7 @@ struct ConformanceTests {
                     encoded: encoded,
                     handle: handle,
                     contextId: contextId,
+                    capability: capability,
                     presenterDid: presenterDid,
                     validateFn: mockValidate
                 )

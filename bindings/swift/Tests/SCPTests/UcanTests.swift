@@ -179,19 +179,16 @@ struct UcanTests {
         let handle = ContextHandle(noPointer: .init())
         var receivedToken: String?
         var receivedCapability: String?
-
         let mockValidate: UcanBridge.ValidateFn = { _, token, capability, _, _ in
             receivedToken = token
             receivedCapability = capability
         }
-
         try await validateUcanToken(
             handle: handle,
             token: "eyJhbGciOiJFZERTQSJ9.test.sig",
             capability: "messages:write",
             validateFn: mockValidate
         )
-
         #expect(receivedToken == "eyJhbGciOiJFZERTQSJ9.test.sig")
         #expect(receivedCapability == "messages:write")
     }
@@ -232,36 +229,31 @@ struct UcanTests {
     func revokeRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
         var revokedToken: String?
-
-        let mockRevoke: UcanBridge.RevokeFn = { _, token in
-            revokedToken = token
-        }
-
+        let mockRevoke: UcanBridge.RevokeFn = { _, token in revokedToken = token }
         try await revokeUcanToken(
-            handle: handle,
-            token: "header.payload.signature",
-            revokeFn: mockRevoke
+            handle: handle, token: "header.payload.signature", revokeFn: mockRevoke
         )
-
         #expect(revokedToken == "header.payload.signature")
     }
 
     // MARK: - Legacy API
 
-    @Test("legacy validate returns UcanValidationResult via bridge")
-    func legacyValidateRoundtrip() async throws {
+    @Test("legacy validate passes capability and presenterDid in correct arg positions")
+    func legacyValidateArgOrder() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in }
-
-        let result = try await validate(
-            encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
-            handle: handle,
-            contextId: "ctx-001",
-            presenterDid: "did:dht:z6MkPresenter",
-            validateFn: mockValidate
+        var capArg = ""
+        var didArg: String?
+        let mock: UcanBridge.ValidateFn = { _, _, cap, did, _ in capArg = cap; didArg = did }
+        let res = try await validate(
+            encoded: "tok", handle: handle, contextId: "ctx",
+            capability: "messages:write", presenterDid: "did:dht:z6MkP", validateFn: mock
         )
-
-        #expect(result.isValid)
+        #expect(res.isValid && capArg == "messages:write" && didArg == "did:dht:z6MkP")
+        let res2 = try await validate(
+            encoded: "tok", handle: handle, contextId: "ctx",
+            capability: "messages:read", validateFn: mock
+        )
+        #expect(res2.isValid && capArg == "messages:read" && didArg == nil)
     }
 
     @Test("legacy mint delegates to bridge")
