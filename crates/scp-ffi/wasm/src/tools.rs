@@ -56,6 +56,112 @@ impl WasmToolVerificationResult {
 // Validation helpers for tool registration inputs
 // ---------------------------------------------------------------------------
 
+/// Parses test vectors from the definition JSON.
+///
+/// Returns an empty `Vec` when the `testVectors` field is absent. Returns
+/// `SCP-VALID-7037` when the field is present but not a valid array of
+/// `{input, expectedOutput}` objects.
+fn parse_test_vectors(def: &serde_json::Value) -> Result<Vec<runtime::TestVector>, JsValue> {
+    let Some(tv_value) = def.get("testVectors") else {
+        return Ok(Vec::new());
+    };
+    let arr = tv_value.as_array().ok_or_else(|| {
+        ScpWasmError::Validation {
+            message: format!(
+                "invalid 'testVectors': expected an array, got {}",
+                json_value_type_name(tv_value)
+            ),
+            code: "SCP-VALID-7037".to_owned(),
+        }
+        .into_js()
+    })?;
+    let mut vectors = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let input = entry.get("input").ok_or_else(|| {
+            ScpWasmError::Validation {
+                message: format!("test vector at index {i} is missing required 'input' field"),
+                code: "SCP-VALID-7037".to_owned(),
+            }
+            .into_js()
+        })?;
+        let expected_output = entry.get("expectedOutput").ok_or_else(|| {
+            ScpWasmError::Validation {
+                message: format!(
+                    "test vector at index {i} is missing required 'expectedOutput' field"
+                ),
+                code: "SCP-VALID-7037".to_owned(),
+            }
+            .into_js()
+        })?;
+        vectors.push(runtime::TestVector {
+            input: input.clone(),
+            expected_output: expected_output.clone(),
+            description: entry
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_owned(),
+        });
+    }
+    Ok(vectors)
+}
+
+/// Parses optional provenance and economic fields from the definition JSON.
+///
+/// Returns `(implementation_hash, signature, economic_metadata, registered_at)`.
+fn parse_provenance_fields(
+    def: &serde_json::Value,
+) -> (
+    [u8; 32],
+    Vec<u8>,
+    Option<runtime::ToolEconomicMetadata>,
+    u64,
+) {
+    let implementation_hash = def
+        .get("implementationHash")
+        .and_then(|v| v.as_str())
+        .and_then(|hex_str| {
+            let bytes = hex::decode(hex_str).ok()?;
+            <[u8; 32]>::try_from(bytes.as_slice()).ok()
+        })
+        .unwrap_or([0u8; 32]);
+
+    let signature = def
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .and_then(|b64| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.decode(b64).ok()
+        })
+        .unwrap_or_default();
+
+    let economic_metadata = def.get("economicMetadata").and_then(|em| {
+        let cost_per_invoke = em.get("costPerInvoke")?.as_u64()?;
+        let cost_formula = em
+            .get("costFormula")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        let payee = em.get("payee").and_then(|v| v.as_str())?.to_owned();
+        Some(runtime::ToolEconomicMetadata {
+            cost_per_invoke,
+            cost_formula,
+            payee,
+        })
+    });
+
+    // Use the hardened time source (captured Date.now) for the registration
+    // timestamp. std::time::SystemTime is not available on wasm32 — see
+    // crate::time module docs.
+    let registered_at = crate::time::now_ms_u64();
+
+    (
+        implementation_hash,
+        signature,
+        economic_metadata,
+        registered_at,
+    )
+}
+
 /// Validates a required JSON Schema field from a definition object, returning
 /// the extracted value or a typed `ScpWasmError`.
 ///
@@ -156,57 +262,10 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         let output_schema = extract_schema_field(&def, "outputSchema")?;
 
         let operator_did = def["operatorDid"].as_str().unwrap_or("").to_owned();
-
-        // Parse test vectors.
-        let test_vectors: Vec<runtime::TestVector> = match def.get("testVectors") {
-            None => Vec::new(),
-            Some(tv_value) => {
-                let arr = tv_value.as_array().ok_or_else(|| {
-                    ScpWasmError::Validation {
-                        message: format!(
-                            "invalid 'testVectors': expected an array, got {}",
-                            json_value_type_name(tv_value)
-                        ),
-                        code: "SCP-VALID-7037".to_owned(),
-                    }
-                    .into_js()
-                })?;
-
-                let mut vectors = Vec::with_capacity(arr.len());
-                for (i, entry) in arr.iter().enumerate() {
-                    let input = entry.get("input").ok_or_else(|| {
-                        ScpWasmError::Validation {
-                            message: format!(
-                                "test vector at index {i} is missing required 'input' field"
-                            ),
-                            code: "SCP-VALID-7037".to_owned(),
-                        }
-                        .into_js()
-                    })?;
-                    let expected_output = entry.get("expectedOutput").ok_or_else(|| {
-                        ScpWasmError::Validation {
-                            message: format!(
-                                "test vector at index {i} is missing required 'expectedOutput' field"
-                            ),
-                            code: "SCP-VALID-7037".to_owned(),
-                        }
-                        .into_js()
-                    })?;
-                    vectors.push(runtime::TestVector {
-                        input: input.clone(),
-                        expected_output: expected_output.clone(),
-                        description: entry
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
-                vectors
-            }
-        };
-
+        let test_vectors = parse_test_vectors(&def)?;
         let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+        let (implementation_hash, signature, economic_metadata, registered_at) =
+            parse_provenance_fields(&def);
 
         let registration = runtime::ToolRegistration {
             tool_id: tool_id.clone(),
@@ -214,8 +273,12 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             description,
             input_schema,
             output_schema,
+            implementation_hash,
             test_vectors,
             operator_did,
+            economic_metadata,
+            registered_at,
+            signature,
         };
 
         with_manager(|mgr| mgr.register_tool(&context_id, registration))

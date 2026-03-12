@@ -2551,14 +2551,19 @@ impl WasmContextManager {
         description: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+        let registered_at = crate::time::now_ms_u64();
         let reg = ToolRegistration {
             tool_id: tool_id.to_owned(),
             name: name.to_owned(),
             description: description.to_owned(),
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
+            implementation_hash: [0u8; 32],
             test_vectors: Vec::new(),
             operator_did: ctx.creator_did.clone(),
+            economic_metadata: None,
+            registered_at,
+            signature: Vec::new(),
         };
         ctx.tool_registry
             .insert(reg)

@@ -82,6 +82,20 @@ impl ToolRegistry {
     }
 }
 
+/// Optional economic metadata for a tool (spec section 19.3).
+///
+/// Mirrors `scp_core::context::tools::ToolEconomicMetadata`. Tool-level costs
+/// are additive with context costs.
+pub struct ToolEconomicMetadata {
+    /// Cost per invocation in the smallest currency unit.
+    pub cost_per_invoke: u64,
+    /// Optional pricing formula identifier for dynamic pricing.
+    pub cost_formula: Option<String>,
+    /// The DID that receives tool invocation payments. May differ from the
+    /// context payee.
+    pub payee: String,
+}
+
 /// A tool registration entry.
 ///
 /// Mirrors `scp_core::context::tools::ToolRegistration`.
@@ -96,10 +110,18 @@ pub struct ToolRegistration {
     pub input_schema: serde_json::Value,
     /// JSON Schema for output.
     pub output_schema: serde_json::Value,
+    /// SHA-256 hash of the tool implementation. Used for integrity verification.
+    pub implementation_hash: [u8; 32],
     /// Test vectors for verification.
     pub test_vectors: Vec<TestVector>,
     /// DID of the tool operator.
     pub operator_did: String,
+    /// Optional economic metadata for per-invocation costs (spec section 19.3).
+    pub economic_metadata: Option<ToolEconomicMetadata>,
+    /// Unix timestamp (milliseconds) when the tool was registered.
+    pub registered_at: u64,
+    /// Ed25519 signature over the canonical registration bytes.
+    pub signature: Vec<u8>,
 }
 
 /// A known input-output pair for tool verification.
