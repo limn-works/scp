@@ -218,6 +218,10 @@ Crates and their enforcement status:
 | `scp-ffi-wasm` | not yet | ~82% | 100% |
 | `scp-primitives` | `warn` | ~100% | 100% |
 | `scp-testing` | not yet | ~90% | 100% |
+| `scp-node` | not yet | ~91% | 100% |
+| `scp-mcp` | not yet | ~100% | 100% |
+| `scp-relay` | not yet | ~100% | 100% |
+| `scp-ffi-common` | not yet | ~90% | 100% |
 
 ### 21.8.2 Quality Standard
 
