@@ -519,6 +519,12 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
 
     override fun eventLogVerify(contextId: String, proofJson: String): Boolean = eventLogVerifyResult
 
+    override fun eventLogCheckpoint(
+        contextHandle: Long,
+        identityHandle: Long,
+        epoch: Long,
+    ): String = """{"context_id":"ctx-stub","sender_did":"did:dht:stub","event_count":0,"merkle_root":"00","epoch":0}"""
+
     override fun transportConnect(
         configJson: String,
         cancellationHandle: CancellationHandle?,

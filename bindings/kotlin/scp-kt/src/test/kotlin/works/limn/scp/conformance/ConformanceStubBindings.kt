@@ -68,6 +68,10 @@ class ConformanceStubBindings : NativeBindings {
     var eventLogQueryError: BridgeException? = null
     var eventLogVerifyResult: Boolean = true
     var eventLogVerifyError: BridgeException? = null
+    @Suppress("MaxLineLength")
+    var eventLogCheckpointResult: String =
+        """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+    var eventLogCheckpointError: BridgeException? = null
 
     var transportConnectResult: Long = 99L
     var transportConnectError: BridgeException? = null
@@ -247,6 +251,15 @@ class ConformanceStubBindings : NativeBindings {
         return eventLogVerifyResult
     }
 
+    override fun eventLogCheckpoint(
+        contextHandle: Long,
+        identityHandle: Long,
+        epoch: Long,
+    ): String {
+        eventLogCheckpointError?.let { throw it }
+        return eventLogCheckpointResult
+    }
+
     override fun transportConnect(
         configJson: String,
         cancellationHandle: CancellationHandle?,
@@ -303,6 +316,10 @@ class ConformanceStubBindings : NativeBindings {
         eventLogQueryError = null
         eventLogVerifyResult = true
         eventLogVerifyError = null
+        @Suppress("MaxLineLength")
+        eventLogCheckpointResult =
+            """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5}"""
+        eventLogCheckpointError = null
         transportConnectResult = 99L
         transportConnectError = null
         transportStatusResult = """{"connected":true}"""

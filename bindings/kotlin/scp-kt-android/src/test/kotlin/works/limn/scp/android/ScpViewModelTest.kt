@@ -216,6 +216,7 @@ private class TestNativeBindings : NativeBindings {
     ): String = ""
     override fun eventLogQuery(contextId: String, filterJson: String): String = ""
     override fun eventLogVerify(contextId: String, proofJson: String): Boolean = false
+    override fun eventLogCheckpoint(contextHandle: Long, identityHandle: Long, epoch: Long): String = ""
     override fun transportConnect(configJson: String, cancellationHandle: CancellationHandle?): Long = 0L
     override fun transportStatus(transportHandle: Long): String = ""
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
