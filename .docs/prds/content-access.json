@@ -117,7 +117,9 @@
         "Propagation enumerates all contexts where both blocker and target are members",
         "Propagation is idempotent — re-executing against an already-blocked context is a no-op",
         "Propagation is best-effort — offline contexts are queued for execution on reconnection",
-        "Block notification is signed with blocker's Active Signing Key per §9.16.3",
+        "Block notification is signed with blocker's Active Signing Key (#active) or Agent Signing Key (#agent) per §9.16.3 and ADR-039",
+        "Block notification JSON includes signing_key_id field identifying which DID document verification method was used (§9.16.3)",
+        "Block notification canonical hash includes signing_key_id as field 4 per §9.5.2 BlockNotification definition",
         "Bidirectional: both blocker and target rotate sender keys excluding each other",
         "Tests verify Tier 1 block protocol execution in a single context",
         "Tests verify Tier 2 propagation across multiple shared contexts",
@@ -149,6 +151,14 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.16.7 SDK-Mandated State Destruction (Layer 2)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-039: Shared-DID Human-Agent Identity Model"
         }
       ],
       "details": {}
@@ -335,7 +345,8 @@
         "On verified block notification, blocked party's SDK deletes the blocker's access key from local store",
         "Destruction occurs synchronously before processing subsequent messages (not in a background task)",
         "On block initiation, blocker's SDK deletes the target's access key from local store",
-        "Block notification signature is verified against blocker's Active Signing Key before destruction",
+        "Block notification signature is verified by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039",
+        "Verification succeeds for both #active (Active Signing Key) and #agent (Agent Signing Key) paths",
         "Invalid block notification signature causes discard + anomaly log (no destruction)",
         "Tests verify sender key deletion on verified block notification (all epochs for blocker DID purged from ProtocolStore)",
         "Tests verify access key deletion on both sides (blocker and blocked) via ProtocolStore get returning None",
@@ -371,6 +382,14 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.16.3 Block Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-039: Shared-DID Human-Agent Identity Model"
         }
       ],
       "details": {}
