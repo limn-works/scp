@@ -1054,20 +1054,16 @@ mod tests {
         );
 
         // Look up identity A — must get A's DID, not B's.
-        let looked_up_did_a = runtime::with_identity(&did_a, |entry| {
-            Ok(entry.identity.did.clone())
-        })
-        .unwrap();
+        let looked_up_did_a =
+            runtime::with_identity(&did_a, |entry| Ok(entry.identity.did.clone())).unwrap();
         assert_eq!(
             looked_up_did_a, did_a,
             "registry must return identity A's DID for A's DID"
         );
 
         // Look up identity B — must get B's DID, not A's.
-        let looked_up_did_b = runtime::with_identity(&did_b, |entry| {
-            Ok(entry.identity.did.clone())
-        })
-        .unwrap();
+        let looked_up_did_b =
+            runtime::with_identity(&did_b, |entry| Ok(entry.identity.did.clone())).unwrap();
         assert_eq!(
             looked_up_did_b, did_b,
             "registry must return identity B's DID for B's DID"
@@ -1075,14 +1071,12 @@ mod tests {
 
         // Cross-check: the custody Arc pointers must be different,
         // confirming different key material is returned for each DID.
-        let custody_ptr_a = runtime::with_identity(&did_a, |entry| {
-            Ok(Arc::as_ptr(&entry.custody) as usize)
-        })
-        .unwrap();
-        let custody_ptr_b = runtime::with_identity(&did_b, |entry| {
-            Ok(Arc::as_ptr(&entry.custody) as usize)
-        })
-        .unwrap();
+        let custody_ptr_a =
+            runtime::with_identity(&did_a, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
+                .unwrap();
+        let custody_ptr_b =
+            runtime::with_identity(&did_b, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
+                .unwrap();
         assert_ne!(
             custody_ptr_a, custody_ptr_b,
             "different identities in the registry must have different custody providers — \
