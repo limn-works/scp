@@ -1024,6 +1024,25 @@ mod tests {
     }
 
     #[test]
+    fn event_log_entries_via_dyn_dispatch() {
+        use crate::context::builder::ContextEventLogProvider;
+
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [19u8; 32];
+
+        provider.init_event_log(&ctx_id).unwrap();
+        provider.append_event(&ctx_id, "ContextCreated").unwrap();
+        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+
+        // Call event_log_entries through dyn dispatch.
+        let boxed: Box<dyn ContextEventLogProvider> = Box::new(provider);
+        let entries = boxed.event_log_entries(&ctx_id).unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event, "ContextCreated");
+        assert_eq!(entries[1].event, "MemberJoined");
+    }
+
+    #[test]
     fn import_persists_entries() {
         let persistence = std::sync::Arc::new(MockEventLogPersistence::new());
         let provider = MerkleEventLogProvider::with_persistence(persistence.clone());

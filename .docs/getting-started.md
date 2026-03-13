@@ -1,6 +1,6 @@
 # Getting Started with SCP (Rust)
 
-End-to-end walkthrough: create an identity, create a context, send a message, persist state, and restore after restart.
+End-to-end walkthrough: create a context, send a message, persist state, and restore after restart.
 
 ## Quick Start
 
@@ -27,9 +27,11 @@ Pass a `Storage` implementation to `.storage()` and the builder auto-wires
 
 ```rust
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryStorage;
+use zeroize::Zeroizing;
 
-let storage = EncryptingAdapter::new(InMemoryStorage::new());
+let key = Zeroizing::new([0x42u8; 32]); // your encryption key
+let storage = EncryptingAdapter::new(InMemoryStorage::new(), key);
 
 let manager = ContextManager::builder()
     .crypto(Box::new(my_crypto_provider))
@@ -57,7 +59,7 @@ assert_eq!(handle.state().await, ContextState::Active);
 
 ```rust
 manager
-    .send_message("my-context-1", "did:dht:z6Mk...sender", b"hello world", 0, 0)
+    .send_message(&handle, &"did:dht:z6Mk...sender".into(), b"hello world", None)
     .await?;
 ```
 

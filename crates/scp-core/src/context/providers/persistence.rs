@@ -40,6 +40,7 @@ pub use crate::store::context::ProtocolStoreContextBridge;
 ///     Box::new(transport),
 ///     Box::new(event_log),
 ///     Box::new(persistence),
+///     key_resolver,
 /// );
 /// ```
 pub struct InMemoryPersistence {

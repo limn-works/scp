@@ -623,7 +623,7 @@
     },
     {
       "id": "SCP-PERSIST-021",
-      "title": "Implement ProtocolStorePersistence canonical bridge",
+      "title": "Implement ProtocolStoreContextBridge canonical bridge",
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
@@ -631,9 +631,9 @@
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Implement `ProtocolStorePersistence<S: Storage>` that wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`. `persist_context` stores the full `ContextSnapshot` under `context/{id}/full_snapshot` as a single atomic blob. `persist_broadcast` delegates to `ProtocolStore::store_broadcast_state`. Buffer zeroization for key material (defense-in-depth). This is the canonical bridge between the dyn-compatible trait and the generic ProtocolStore.",
+      "description": "Implement `ProtocolStoreContextBridge<S: Storage>` that wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`. `persist_context` stores the full `ContextSnapshot` under `context/{id}/full_snapshot` as a single atomic blob. `persist_broadcast` delegates to `ProtocolStore::store_broadcast_state`. Buffer zeroization for key material (defense-in-depth). This is the canonical bridge between the dyn-compatible trait and the generic ProtocolStore.",
       "acceptanceCriteria": [
-        "`ProtocolStorePersistence<S>` struct wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`",
+        "`ProtocolStoreContextBridge<S>` struct wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`",
         "`persist_context` serializes full ContextSnapshot to single key, `load_context` deserializes from same key",
         "`persist_broadcast` and `load_broadcast` delegate to existing ProtocolStore broadcast methods",
         "`delete_context` calls `ProtocolStore::delete_context`, `list_persisted_contexts` calls `list_active_contexts`",
@@ -641,7 +641,7 @@
         "Unit tests: persist/load roundtrip for both ContextSnapshot and BroadcastContextSnapshot"
       ],
       "actionItems": [
-        "Define `ProtocolStorePersistence<S: Storage>` struct wrapping `Arc<ProtocolStore<S>>`",
+        "Define `ProtocolStoreContextBridge<S: Storage>` struct wrapping `Arc<ProtocolStore<S>>`",
         "Implement all 6 `ContextPersistence` trait methods with delegation to ProtocolStore",
         "Add zeroize-on-drop for serialized byte buffers containing key material",
         "Write roundtrip unit tests for ContextSnapshot and BroadcastContextSnapshot"

@@ -359,7 +359,7 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 **Step 1:** #385 — Production provider implementations (ContextCrypto, Transport, EventLog, Persistence) — **COMPLETE** → cd90541 + 0e2dd00
   - Absorbs #300 (no production providers)
   - Pure scp-core/scp-transport, no FFI
-  - MlsCryptoProvider, RelayTransportProvider, MerkleEventLogProvider, InMemoryPersistence + ProtocolStorePersistence
+  - MlsCryptoProvider, RelayTransportProvider, MerkleEventLogProvider, InMemoryPersistence + ProtocolStoreContextBridge
   - 31 new tests
 **Step 2 (parallel):** Bridge rewrites — **COMPLETE**
   - #386 — PyO3 bridge rewrite → 83c6630 (ContextRuntime → ContextManager + FfiBridgeState)

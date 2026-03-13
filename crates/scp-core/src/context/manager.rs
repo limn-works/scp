@@ -16127,4 +16127,49 @@ mod tests {
             "create_context should accept min_protocol_version None"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // ContextManagerBuilder tests (#937 review finding 6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builder_without_crypto_returns_missing_crypto_error() {
+        let result = ContextManager::builder().build();
+        assert!(
+            matches!(result, Err(ContextManagerBuildError::MissingCrypto)),
+            "expected MissingCrypto error"
+        );
+    }
+
+    #[test]
+    fn builder_with_only_crypto_succeeds() {
+        let result = ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .build();
+        assert!(
+            result.is_ok(),
+            "builder with only crypto should succeed with defaults"
+        );
+    }
+
+    #[test]
+    fn builder_persistence_wires_through() {
+        use crate::context::providers::persistence::InMemoryPersistence;
+
+        let result = ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .persistence(Box::new(InMemoryPersistence::new()))
+            .build();
+        assert!(
+            result.is_ok(),
+            "builder with crypto + persistence should succeed"
+        );
+
+        // The manager should have persistence wired.
+        let manager = result.unwrap();
+        assert!(
+            manager.persistence.is_some(),
+            "persistence() should wire through to the manager"
+        );
+    }
 }
