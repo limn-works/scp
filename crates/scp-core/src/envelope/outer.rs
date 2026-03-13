@@ -87,11 +87,22 @@ pub struct OuterEnvelope {
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_blob: Vec<u8>,
 
-    /// Unknown fields from newer protocol versions, preserved for
-    /// forward compatibility per spec §13.5.1. Intermediaries (relays,
-    /// bridges) MUST NOT strip fields they do not recognize.
+    /// Forward-compatibility extensions — unknown fields from future protocol
+    /// versions are preserved here for forward-compatible roundtripping
+    /// (§13.5.1). Intermediaries (relays, bridges) that deserialize and
+    /// re-serialize outer envelopes MUST NOT strip unrecognized fields.
+    ///
+    /// Uses `rmpv::Value` (not `serde_json::Value`) to preserve `MessagePack`
+    /// type fidelity. A `MsgPack` Binary field roundtrips as Binary; with
+    /// `serde_json::Value` it would degrade to an Array of numbers — silent
+    /// data corruption.
+    ///
+    /// **Security note:** Extensions carry no authenticity guarantee. The outer
+    /// envelope is unsigned, and these fields have no integrity protection
+    /// beyond the MLS encryption of the inner envelope. Do not use extension
+    /// values for security-sensitive decisions.
     #[serde(flatten)]
-    pub extensions: HashMap<String, serde_json::Value>,
+    pub extensions: HashMap<String, rmpv::Value>,
 }
 
 /// Constructs an outer envelope from its components.
@@ -541,19 +552,135 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // Forward compatibility: unknown fields preserved (§13.5.1, #593, #919)
     // -------------------------------------------------------------------
+
+    /// Injects extra string-keyed string-valued fields into a `MessagePack`
+    /// named map, simulating a newer protocol version's extra fields.
+    fn inject_msgpack_str_fields(original: &[u8], extras: &[(&str, &str)]) -> Vec<u8> {
+        let first = original[0];
+        let (old_count, body_offset) = if first & 0xF0 == 0x80 {
+            (u32::from(first & 0x0F), 1)
+        } else if first == 0xDE {
+            let count = u32::from(u16::from_be_bytes([original[1], original[2]]));
+            (count, 3)
+        } else if first == 0xDF {
+            let count = u32::from_be_bytes([original[1], original[2], original[3], original[4]]);
+            (count, 5)
+        } else {
+            panic!("expected msgpack map header, got 0x{first:02X}");
+        };
+
+        let new_count = old_count + u32::try_from(extras.len()).unwrap();
+        let mut result = Vec::with_capacity(original.len() + extras.len() * 64);
+
+        // Write new map header.
+        if new_count <= 15 {
+            result.push(0x80 | u8::try_from(new_count).unwrap());
+        } else if new_count <= 0xFFFF {
+            result.push(0xDE);
+            result.extend_from_slice(&u16::try_from(new_count).unwrap().to_be_bytes());
+        } else {
+            result.push(0xDF);
+            result.extend_from_slice(&new_count.to_be_bytes());
+        }
+
+        // Copy existing map body.
+        result.extend_from_slice(&original[body_offset..]);
+
+        // Append extra key-value pairs as fixstr.
+        for (k, v) in extras {
+            // Encode key.
+            let kb = k.as_bytes();
+            if kb.len() <= 31 {
+                result.push(0xA0 | u8::try_from(kb.len()).unwrap());
+            } else {
+                result.push(0xD9);
+                result.push(u8::try_from(kb.len()).unwrap());
+            }
+            result.extend_from_slice(kb);
+            // Encode value.
+            let vb = v.as_bytes();
+            if vb.len() <= 31 {
+                result.push(0xA0 | u8::try_from(vb.len()).unwrap());
+            } else {
+                result.push(0xD9);
+                result.push(u8::try_from(vb.len()).unwrap());
+            }
+            result.extend_from_slice(vb);
+        }
+        result
+    }
+
+    /// Injects a single Binary-typed extension field into a `MessagePack`
+    /// named map. This simulates a future protocol version adding a field
+    /// whose wire type is `MsgPack` Binary (0xC4/0xC5/0xC6).
+    fn inject_msgpack_binary_field(original: &[u8], key: &str, data: &[u8]) -> Vec<u8> {
+        let first = original[0];
+        let (old_count, body_offset) = if first & 0xF0 == 0x80 {
+            (u32::from(first & 0x0F), 1)
+        } else if first == 0xDE {
+            let count = u32::from(u16::from_be_bytes([original[1], original[2]]));
+            (count, 3)
+        } else if first == 0xDF {
+            let count = u32::from_be_bytes([original[1], original[2], original[3], original[4]]);
+            (count, 5)
+        } else {
+            panic!("expected msgpack map header, got 0x{first:02X}");
+        };
+
+        let new_count = old_count + 1;
+        let mut result = Vec::with_capacity(original.len() + key.len() + data.len() + 16);
+
+        if new_count <= 15 {
+            result.push(0x80 | u8::try_from(new_count).unwrap());
+        } else if new_count <= 0xFFFF {
+            result.push(0xDE);
+            result.extend_from_slice(&u16::try_from(new_count).unwrap().to_be_bytes());
+        } else {
+            result.push(0xDF);
+            result.extend_from_slice(&new_count.to_be_bytes());
+        }
+
+        result.extend_from_slice(&original[body_offset..]);
+
+        // Key as fixstr / str8.
+        let kb = key.as_bytes();
+        if kb.len() <= 31 {
+            result.push(0xA0 | u8::try_from(kb.len()).unwrap());
+        } else {
+            result.push(0xD9);
+            result.push(u8::try_from(kb.len()).unwrap());
+        }
+        result.extend_from_slice(kb);
+
+        // Value as bin8/bin16/bin32.
+        let len = data.len();
+        if len <= 0xFF {
+            result.push(0xC4);
+            result.push(u8::try_from(len).unwrap());
+        } else if len <= 0xFFFF {
+            result.push(0xC5);
+            result.extend_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        } else {
+            result.push(0xC6);
+            result.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
+        }
+        result.extend_from_slice(data);
+
+        result
+    }
 
     #[test]
     fn outer_envelope_ignores_unknown_fields() {
         let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
-        let mut map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
-        map.insert("future_protocol_field".into(), "v2-data".into());
-        let result = serde_json::from_value::<OuterEnvelope>(serde_json::Value::Object(map));
+        let bytes = envelope.to_bytes().unwrap();
+        let with_extra = inject_msgpack_str_fields(&bytes, &[("future_protocol_field", "v2-data")]);
+
+        let result = OuterEnvelope::from_bytes(&with_extra);
         assert!(
             result.is_ok(),
-            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            "wire-format types must accept unknown fields per §13.5.1: {:?}",
             result.unwrap_err()
         );
         let decoded = result.unwrap();
@@ -567,18 +694,11 @@ mod tests {
     fn outer_envelope_preserves_unknown_fields_roundtrip() {
         let envelope =
             create_outer_envelope(&[0xBB; 32], Some(&[0xCC; 32]), 7200, vec![0xDE, 0xAD]).unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+        let with_extra = inject_msgpack_str_fields(&bytes, &[("v2_routing_priority", "high")]);
 
-        // Serialize to JSON, inject an unknown field.
-        let mut map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
-        map.insert(
-            "v2_routing_priority".into(),
-            serde_json::json!({"level": "high", "ttl_override": 9000}),
-        );
-
-        // Deserialize back — the unknown field should land in `extensions`.
-        let decoded: OuterEnvelope =
-            serde_json::from_value(serde_json::Value::Object(map)).unwrap();
+        // Deserialize — the unknown field should land in `extensions`.
+        let decoded = OuterEnvelope::from_bytes(&with_extra).unwrap();
         assert_eq!(decoded.routing_id, envelope.routing_id);
         assert_eq!(decoded.blob_ttl, 7200);
         assert_eq!(decoded.encrypted_blob, vec![0xDE, 0xAD]);
@@ -588,34 +708,29 @@ mod tests {
             decoded.extensions.contains_key("v2_routing_priority"),
             "unknown field must be preserved in extensions"
         );
-        let ext = &decoded.extensions["v2_routing_priority"];
-        assert_eq!(ext["level"], "high");
-        assert_eq!(ext["ttl_override"], 9000);
+        assert_eq!(
+            decoded.extensions["v2_routing_priority"],
+            rmpv::Value::String("high".into()),
+        );
 
-        // Re-serialize and verify the field is still present.
-        let reserialized: serde_json::Value = serde_json::to_value(&decoded).unwrap();
-        let reserialized_map = reserialized.as_object().unwrap();
+        // Re-serialize and re-deserialize — extensions must survive.
+        let re_bytes = decoded.to_bytes().unwrap();
+        let re_decoded = OuterEnvelope::from_bytes(&re_bytes).unwrap();
         assert!(
-            reserialized_map.contains_key("v2_routing_priority"),
+            re_decoded.extensions.contains_key("v2_routing_priority"),
             "unknown field must survive serialize → deserialize → serialize roundtrip"
         );
     }
 
-    /// Finding 2: Full roundtrip — serialize → inject unknown → deserialize →
-    /// compare key fields.
+    /// Full roundtrip — serialize → inject unknown → deserialize → compare.
     #[test]
     fn outer_envelope_roundtrip_with_unknown_field() {
         let original =
             create_outer_envelope(&[0xAA; 32], Some(&[0xDD; 32]), 3600, vec![0x42; 16]).unwrap();
+        let bytes = original.to_bytes().unwrap();
+        let with_extra = inject_msgpack_str_fields(&bytes, &[("future_version_hint", "scp/2.0")]);
 
-        // Serialize to JSON Value.
-        let mut json = serde_json::to_value(&original).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .insert("future_version_hint".into(), serde_json::json!("scp/2.0"));
-
-        // Deserialize back.
-        let decoded: OuterEnvelope = serde_json::from_value(json).unwrap();
+        let decoded = OuterEnvelope::from_bytes(&with_extra).unwrap();
 
         // Key fields match the original.
         assert_eq!(decoded.version, original.version);
@@ -627,13 +742,13 @@ mod tests {
         // Unknown field preserved.
         assert_eq!(
             decoded.extensions.get("future_version_hint"),
-            Some(&serde_json::json!("scp/2.0")),
+            Some(&rmpv::Value::String("scp/2.0".into())),
         );
     }
 
-    /// #593-F1: Extensions must survive a `MessagePack` roundtrip — the actual wire
-    /// format. Previous tests only exercised JSON. This test proves that
-    /// `#[serde(flatten)]` extensions survive `rmp_serde` encode → decode.
+    /// #593-F1: Extensions must survive a `MessagePack` roundtrip — the actual
+    /// wire format. This test proves that `#[serde(flatten)]` extensions with
+    /// `rmpv::Value` survive `rmp_serde` encode → decode.
     #[test]
     fn outer_envelope_extensions_survive_msgpack_roundtrip() {
         // A wrapper struct that has all OuterEnvelope fields plus one extra.
@@ -650,7 +765,7 @@ mod tests {
             #[serde(with = "serde_bytes")]
             encrypted_blob: Vec<u8>,
             /// Field unknown to the current `OuterEnvelope` definition.
-            v2_routing_priority: serde_json::Value,
+            v2_routing_priority: rmpv::Value,
         }
 
         let extended = ExtendedOuterEnvelope {
@@ -659,7 +774,7 @@ mod tests {
             recipient_hint: Some(vec![0xCC; 32]),
             blob_ttl: 7200,
             encrypted_blob: vec![0xDE, 0xAD],
-            v2_routing_priority: serde_json::json!({"level": "high", "ttl_override": 9000}),
+            v2_routing_priority: rmpv::Value::String("high".into()),
         };
 
         // Step 1: Serialize the extended struct to MessagePack (named fields).
@@ -684,9 +799,10 @@ mod tests {
             "unknown field must be preserved in extensions after msgpack roundtrip, got: {:?}",
             decoded.extensions
         );
-        let ext = &decoded.extensions["v2_routing_priority"];
-        assert_eq!(ext["level"], "high");
-        assert_eq!(ext["ttl_override"], 9000);
+        assert_eq!(
+            decoded.extensions["v2_routing_priority"],
+            rmpv::Value::String("high".into()),
+        );
 
         // Step 5: Re-serialize and re-deserialize — the extension must persist.
         let re_encoded = rmp_serde::to_vec_named(&decoded).unwrap();
@@ -702,15 +818,15 @@ mod tests {
     #[test]
     fn from_bytes_preserves_many_extension_keys() {
         let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
-        let mut json: serde_json::Value = serde_json::to_value(&envelope).unwrap();
-        let map = json.as_object_mut().unwrap();
+        // Inject extensions directly into the struct then roundtrip via msgpack.
+        let mut extended = envelope;
         for i in 0..64 {
-            map.insert(format!("ext_key_{i}"), serde_json::json!(i));
+            extended
+                .extensions
+                .insert(format!("ext_key_{i}"), rmpv::Value::Integer(i.into()));
         }
-
-        let tweaked: OuterEnvelope = serde_json::from_value(json).unwrap();
-        assert_eq!(tweaked.extensions.len(), 64);
-        let bytes = tweaked.to_bytes().unwrap();
+        assert_eq!(extended.extensions.len(), 64);
+        let bytes = extended.to_bytes().unwrap();
 
         let result = OuterEnvelope::from_bytes(&bytes);
         assert!(
@@ -723,6 +839,58 @@ mod tests {
             recovered.extensions.len(),
             64,
             "all 64 extension keys must survive roundtrip"
+        );
+    }
+
+    /// §13.5.1 / #919: A `MessagePack` Binary extension field MUST roundtrip
+    /// as Binary, not degrade to Array. This is the key motivation for using
+    /// `rmpv::Value` instead of `serde_json::Value` in `OuterEnvelope`
+    /// extensions (matching the `InnerEnvelope` fix from #863).
+    #[test]
+    fn binary_extension_survives_roundtrip_as_binary() {
+        let envelope = create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01]).unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+
+        // Inject a Binary-typed extension field at the raw msgpack level.
+        // This simulates a future protocol version that adds a binary field.
+        let binary_data: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        let with_binary = inject_msgpack_binary_field(&bytes, "future_binary_field", binary_data);
+
+        // First deserialization: binary must land in extensions as Binary.
+        let decoded = OuterEnvelope::from_bytes(&with_binary)
+            .expect("OuterEnvelope must accept binary extension fields");
+
+        let ext = decoded
+            .extensions
+            .get("future_binary_field")
+            .expect("extensions must contain future_binary_field");
+
+        // CRITICAL: The value must be Binary, not Array.
+        assert!(
+            matches!(ext, rmpv::Value::Binary(_)),
+            "binary extension field must be rmpv::Value::Binary, got: {ext:?}"
+        );
+        assert_eq!(
+            ext,
+            &rmpv::Value::Binary(binary_data.to_vec()),
+            "binary content must be preserved exactly"
+        );
+
+        // Roundtrip: re-serialize and re-deserialize — must stay Binary.
+        let re_bytes = decoded.to_bytes().unwrap();
+        let re_decoded = OuterEnvelope::from_bytes(&re_bytes).unwrap();
+        let re_ext = re_decoded
+            .extensions
+            .get("future_binary_field")
+            .expect("binary extension must survive roundtrip");
+        assert!(
+            matches!(re_ext, rmpv::Value::Binary(_)),
+            "binary extension must remain Binary after roundtrip, got: {re_ext:?}"
+        );
+        assert_eq!(
+            re_ext,
+            &rmpv::Value::Binary(binary_data.to_vec()),
+            "binary content must survive roundtrip exactly"
         );
     }
 
