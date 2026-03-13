@@ -596,6 +596,12 @@ class ParticipationThreshold:
                 f"(Rust type is u64), got {self.value}"
             )
             raise ValueError(msg)
+        if self.value > 0xFFFF_FFFF_FFFF_FFFF:
+            msg = (
+                f"ParticipationThreshold.value must be <= 18446744073709551615 "
+                f"(Rust type is u64), got {self.value}"
+            )
+            raise ValueError(msg)
 
 
 @dataclass
@@ -666,6 +672,12 @@ class ParticipationProfile:
             if val < 0:
                 msg = (
                     f"ParticipationProfile.{name} must be non-negative "
+                    f"(Rust type is u64), got {val}"
+                )
+                raise ValueError(msg)
+            if val > 0xFFFF_FFFF_FFFF_FFFF:
+                msg = (
+                    f"ParticipationProfile.{name} must be <= 18446744073709551615 "
                     f"(Rust type is u64), got {val}"
                 )
                 raise ValueError(msg)
@@ -743,6 +755,12 @@ class RequireParticipation:
                 f"(Rust type is u64), got {self.max_age_secs}"
             )
             raise ValueError(msg)
+        if self.max_age_secs > 0xFFFF_FFFF_FFFF_FFFF:
+            msg = (
+                f"RequireParticipation.max_age_secs must be <= 18446744073709551615 "
+                f"(Rust type is u64), got {self.max_age_secs}"
+            )
+            raise ValueError(msg)
         if self.min_contexts < 0:
             msg = (
                 f"RequireParticipation.min_contexts must be non-negative "
@@ -770,7 +788,7 @@ class RequireParticipation:
 def verify_participation_requirements(
     requirements: list[RequireParticipation],
     profiles: list[ParticipationProfile],
-) -> bool:
+) -> None:
     """Verify participation profiles against admission requirements.
 
     Delegates to the Rust ``scp-core`` implementation via the PyO3
@@ -783,23 +801,13 @@ def verify_participation_requirements(
     5. Diagnostic error reporting (``ParticipationAdmissionError``).
     6. Typed field extraction (``ParticipationFact.extract_value``).
 
-    .. note::
-
-        **Breaking change from earlier API:** This function now accepts
-        ``list[RequireParticipation]`` and ``list[ParticipationProfile]``
-        (plural) instead of singular values. The failure mode changed
-        from returning ``False`` to raising ``RuntimeError`` with
-        diagnostic details from the Rust bridge. The ``-> bool`` return
-        type is kept for compatibility, but in practice the function
-        can only return ``True`` -- verification failures raise.
+    Success is indicated by returning without exception. Verification
+    failures raise ``RuntimeError`` with diagnostic details from the
+    Rust bridge.
 
     Args:
         requirements: The participation requirements to verify against.
         profiles: The participation profiles to evaluate.
-
-    Returns:
-        ``True`` if all requirements are satisfied. This function never
-        returns ``False`` -- verification failures raise ``RuntimeError``.
 
     Raises:
         ScpError: If the bridge module is not available.
@@ -812,7 +820,7 @@ def verify_participation_requirements(
     profile_json = json.dumps([p._to_bridge_dict() for p in profiles])
     requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
 
-    return bridge.verify_participation_requirements(profile_json, requirements_json)
+    bridge.verify_participation_requirements(profile_json, requirements_json)
 
 
 __all__ = [
