@@ -3594,11 +3594,23 @@ mod wasm_proposal_mirror {
 mod wasm_petname_mirror {
     use std::collections::HashMap;
 
+    /// WASM-mirror petname event enum that mirrors `WasmPetnameEvent` in the
+    /// WASM bridge (`scp-ffi-wasm/src/discovery.rs`). Must stay in sync with
+    /// scp-core's `PetnameEvent` serde format.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum WasmPetnameEvent {
+        SetPetname { did: String, name: String },
+        RemovePetname { did: String },
+        SetContextPetname { context_id: String, name: String },
+        RemoveContextPetname { context_id: String },
+    }
+
     pub struct WasmPetnameMap {
         did_petnames: HashMap<String, Vec<String>>,
         did_to_petname: HashMap<String, String>,
         context_petnames: HashMap<String, Vec<String>>,
         context_to_petname: HashMap<String, String>,
+        pub event_log: Vec<WasmPetnameEvent>,
     }
 
     impl WasmPetnameMap {
@@ -3608,66 +3620,95 @@ mod wasm_petname_mirror {
                 did_to_petname: HashMap::new(),
                 context_petnames: HashMap::new(),
                 context_to_petname: HashMap::new(),
+                event_log: Vec::new(),
             }
+        }
+
+        pub fn apply_event(&mut self, event: &WasmPetnameEvent) {
+            match event {
+                WasmPetnameEvent::SetPetname { did, name } => {
+                    if let Some(old_name) = self.did_to_petname.remove(did.as_str()) {
+                        if let Some(dids) = self.did_petnames.get_mut(&old_name) {
+                            dids.retain(|d| d != did);
+                        }
+                        if self.did_petnames.get(&old_name).is_some_and(Vec::is_empty) {
+                            self.did_petnames.remove(&old_name);
+                        }
+                    }
+                    self.did_petnames
+                        .entry(name.clone())
+                        .or_default()
+                        .push(did.clone());
+                    self.did_to_petname.insert(did.clone(), name.clone());
+                }
+                WasmPetnameEvent::RemovePetname { did } => {
+                    if let Some(name) = self.did_to_petname.remove(did.as_str()) {
+                        if let Some(dids) = self.did_petnames.get_mut(&name) {
+                            dids.retain(|d| d != did);
+                        }
+                        if self.did_petnames.get(&name).is_some_and(Vec::is_empty) {
+                            self.did_petnames.remove(&name);
+                        }
+                    }
+                }
+                WasmPetnameEvent::SetContextPetname { context_id, name } => {
+                    if let Some(old_name) = self.context_to_petname.remove(context_id.as_str()) {
+                        if let Some(ids) = self.context_petnames.get_mut(&old_name) {
+                            ids.retain(|id| id != context_id);
+                        }
+                        if self
+                            .context_petnames
+                            .get(&old_name)
+                            .is_some_and(Vec::is_empty)
+                        {
+                            self.context_petnames.remove(&old_name);
+                        }
+                    }
+                    self.context_petnames
+                        .entry(name.clone())
+                        .or_default()
+                        .push(context_id.clone());
+                    self.context_to_petname
+                        .insert(context_id.clone(), name.clone());
+                }
+                WasmPetnameEvent::RemoveContextPetname { context_id } => {
+                    if let Some(name) = self.context_to_petname.remove(context_id.as_str()) {
+                        if let Some(ids) = self.context_petnames.get_mut(&name) {
+                            ids.retain(|id| id != context_id);
+                        }
+                        if self.context_petnames.get(&name).is_some_and(Vec::is_empty) {
+                            self.context_petnames.remove(&name);
+                        }
+                    }
+                }
+            }
+            self.event_log.push(event.clone());
         }
 
         pub fn set_petname(&mut self, did: &str, name: &str) {
-            if let Some(old_name) = self.did_to_petname.remove(did) {
-                if let Some(dids) = self.did_petnames.get_mut(&old_name) {
-                    dids.retain(|d| d != did);
-                }
-                if self.did_petnames.get(&old_name).is_some_and(Vec::is_empty) {
-                    self.did_petnames.remove(&old_name);
-                }
-            }
-            self.did_petnames
-                .entry(name.to_owned())
-                .or_default()
-                .push(did.to_owned());
-            self.did_to_petname.insert(did.to_owned(), name.to_owned());
+            self.apply_event(&WasmPetnameEvent::SetPetname {
+                did: did.to_owned(),
+                name: name.to_owned(),
+            });
         }
 
         pub fn remove_petname(&mut self, did: &str) {
-            if let Some(name) = self.did_to_petname.remove(did) {
-                if let Some(dids) = self.did_petnames.get_mut(&name) {
-                    dids.retain(|d| d != did);
-                }
-                if self.did_petnames.get(&name).is_some_and(Vec::is_empty) {
-                    self.did_petnames.remove(&name);
-                }
-            }
+            self.apply_event(&WasmPetnameEvent::RemovePetname {
+                did: did.to_owned(),
+            });
         }
 
         pub fn set_context_petname(&mut self, context_id: &str, name: &str) {
-            if let Some(old_name) = self.context_to_petname.remove(context_id) {
-                if let Some(ids) = self.context_petnames.get_mut(&old_name) {
-                    ids.retain(|id| id != context_id);
-                }
-                if self
-                    .context_petnames
-                    .get(&old_name)
-                    .is_some_and(Vec::is_empty)
-                {
-                    self.context_petnames.remove(&old_name);
-                }
-            }
-            self.context_petnames
-                .entry(name.to_owned())
-                .or_default()
-                .push(context_id.to_owned());
-            self.context_to_petname
-                .insert(context_id.to_owned(), name.to_owned());
+            self.apply_event(&WasmPetnameEvent::SetContextPetname {
+                context_id: context_id.to_owned(),
+                name: name.to_owned(),
+            });
         }
 
         pub fn remove_context_petname(&mut self, context_id: &str) {
-            if let Some(name) = self.context_to_petname.remove(context_id) {
-                if let Some(ids) = self.context_petnames.get_mut(&name) {
-                    ids.retain(|id| id != context_id);
-                }
-                if self.context_petnames.get(&name).is_some_and(Vec::is_empty) {
-                    self.context_petnames.remove(&name);
-                }
-            }
+            self.apply_event(&WasmPetnameEvent::RemoveContextPetname {
+                context_id: context_id.to_owned(),
+            });
         }
 
         pub fn resolve_did(&self, name: &str) -> Vec<String> {
@@ -3684,6 +3725,14 @@ mod wasm_petname_mirror {
 
         pub fn petname_for_context(&self, context_id: &str) -> Option<String> {
             self.context_to_petname.get(context_id).cloned()
+        }
+
+        pub fn did_petname_count(&self) -> usize {
+            self.did_to_petname.len()
+        }
+
+        pub fn context_petname_count(&self) -> usize {
+            self.context_to_petname.len()
         }
     }
 }
@@ -4031,6 +4080,240 @@ fn wasm_petname_context_matches_core() {
 
     assert!(core.resolve_context("work").is_empty());
     assert!(wasm.resolve_context("work").is_empty());
+}
+
+// ===========================================================================
+// Test: apply_event produces same state as core PetnameMap::apply_event
+// ===========================================================================
+
+#[test]
+fn wasm_petname_event_emission_matches_core() {
+    use scp_core::discovery::{PetnameEvent, PetnameMap};
+    use scp_identity::DID;
+    use wasm_petname_mirror::{WasmPetnameEvent, WasmPetnameMap};
+
+    // Core: apply events via apply_event
+    let mut core = PetnameMap::default();
+    core.apply_event(&PetnameEvent::SetPetname {
+        did: DID::from("did:dht:zAlice"),
+        name: "alice".to_owned(),
+    });
+    core.apply_event(&PetnameEvent::SetContextPetname {
+        context_id: "ctx-work".to_owned(),
+        name: "work".to_owned(),
+    });
+    core.apply_event(&PetnameEvent::RemovePetname {
+        did: DID::from("did:dht:zAlice"),
+    });
+
+    // WASM mirror: apply matching events
+    let mut wasm = WasmPetnameMap::new();
+    wasm.apply_event(&WasmPetnameEvent::SetPetname {
+        did: "did:dht:zAlice".to_owned(),
+        name: "alice".to_owned(),
+    });
+    wasm.apply_event(&WasmPetnameEvent::SetContextPetname {
+        context_id: "ctx-work".to_owned(),
+        name: "work".to_owned(),
+    });
+    wasm.apply_event(&WasmPetnameEvent::RemovePetname {
+        did: "did:dht:zAlice".to_owned(),
+    });
+
+    // State must match
+    assert!(
+        core.resolve_did("alice").is_empty(),
+        "core should have no 'alice' after remove"
+    );
+    assert!(
+        wasm.resolve_did("alice").is_empty(),
+        "wasm should have no 'alice' after remove"
+    );
+
+    assert_eq!(
+        core.resolve_context("work"),
+        wasm.resolve_context("work"),
+        "context petname should match after apply_event"
+    );
+
+    // WASM event log should have recorded all 3 events
+    assert_eq!(
+        wasm.event_log.len(),
+        3,
+        "wasm event_log should contain 3 events"
+    );
+}
+
+// ===========================================================================
+// Test: WasmPetnameEvent serde format matches scp-core PetnameEvent
+// ===========================================================================
+
+#[test]
+fn wasm_petname_event_serde_matches_core() {
+    use scp_core::discovery::PetnameEvent;
+    use scp_identity::DID;
+    use wasm_petname_mirror::WasmPetnameEvent;
+
+    // SetPetname
+    let core_set = serde_json::to_value(PetnameEvent::SetPetname {
+        did: DID::from("did:dht:zAlice"),
+        name: "alice".to_owned(),
+    })
+    .unwrap();
+    let wasm_set = serde_json::to_value(WasmPetnameEvent::SetPetname {
+        did: "did:dht:zAlice".to_owned(),
+        name: "alice".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(core_set, wasm_set, "SetPetname serde format mismatch");
+
+    // RemovePetname
+    let core_remove = serde_json::to_value(PetnameEvent::RemovePetname {
+        did: DID::from("did:dht:zAlice"),
+    })
+    .unwrap();
+    let wasm_remove = serde_json::to_value(WasmPetnameEvent::RemovePetname {
+        did: "did:dht:zAlice".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(
+        core_remove, wasm_remove,
+        "RemovePetname serde format mismatch"
+    );
+
+    // SetContextPetname
+    let core_ctx = serde_json::to_value(PetnameEvent::SetContextPetname {
+        context_id: "ctx-1".to_owned(),
+        name: "one".to_owned(),
+    })
+    .unwrap();
+    let wasm_ctx = serde_json::to_value(WasmPetnameEvent::SetContextPetname {
+        context_id: "ctx-1".to_owned(),
+        name: "one".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(
+        core_ctx, wasm_ctx,
+        "SetContextPetname serde format mismatch"
+    );
+
+    // RemoveContextPetname
+    let core_ctx_rm = serde_json::to_value(PetnameEvent::RemoveContextPetname {
+        context_id: "ctx-1".to_owned(),
+    })
+    .unwrap();
+    let wasm_ctx_rm = serde_json::to_value(WasmPetnameEvent::RemoveContextPetname {
+        context_id: "ctx-1".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(
+        core_ctx_rm, wasm_ctx_rm,
+        "RemoveContextPetname serde format mismatch"
+    );
+}
+
+// ===========================================================================
+// Test: did_petname_count and context_petname_count match core
+// ===========================================================================
+
+#[test]
+fn wasm_petname_count_matches_core() {
+    use scp_identity::DID;
+    use wasm_petname_mirror::WasmPetnameMap;
+
+    let mut core = scp_core::discovery::PetnameMap::default();
+    let mut wasm = WasmPetnameMap::new();
+
+    // Empty
+    assert_eq!(core.did_petname_count(), wasm.did_petname_count());
+    assert_eq!(core.context_petname_count(), wasm.context_petname_count());
+
+    // Add DID petnames
+    core.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
+    core.set_petname(DID::from("did:dht:zBob"), "bob".to_owned());
+    wasm.set_petname("did:dht:zAlice", "alice");
+    wasm.set_petname("did:dht:zBob", "bob");
+
+    assert_eq!(
+        core.did_petname_count(),
+        wasm.did_petname_count(),
+        "did_petname_count mismatch after adds"
+    );
+
+    // Add context petnames
+    core.set_context_petname("ctx-1".to_owned(), "one".to_owned());
+    wasm.set_context_petname("ctx-1", "one");
+
+    assert_eq!(
+        core.context_petname_count(),
+        wasm.context_petname_count(),
+        "context_petname_count mismatch after add"
+    );
+
+    // Remove and verify counts
+    core.remove_petname(&DID::from("did:dht:zAlice"));
+    wasm.remove_petname("did:dht:zAlice");
+
+    assert_eq!(
+        core.did_petname_count(),
+        wasm.did_petname_count(),
+        "did_petname_count mismatch after remove"
+    );
+}
+
+// ===========================================================================
+// Test: convenience methods emit events matching apply_event path
+// ===========================================================================
+
+#[test]
+fn wasm_petname_convenience_methods_emit_events() {
+    use wasm_petname_mirror::{WasmPetnameEvent, WasmPetnameMap};
+
+    let mut wasm = WasmPetnameMap::new();
+
+    // Convenience methods should record events in the log
+    wasm.set_petname("did:dht:zAlice", "alice");
+    wasm.set_context_petname("ctx-1", "one");
+    wasm.remove_petname("did:dht:zAlice");
+    wasm.remove_context_petname("ctx-1");
+
+    assert_eq!(wasm.event_log.len(), 4, "should have 4 events");
+
+    assert!(
+        matches!(
+            &wasm.event_log[0],
+            WasmPetnameEvent::SetPetname { did, name }
+            if did == "did:dht:zAlice" && name == "alice"
+        ),
+        "event 0 should be SetPetname"
+    );
+
+    assert!(
+        matches!(
+            &wasm.event_log[1],
+            WasmPetnameEvent::SetContextPetname { context_id, name }
+            if context_id == "ctx-1" && name == "one"
+        ),
+        "event 1 should be SetContextPetname"
+    );
+
+    assert!(
+        matches!(
+            &wasm.event_log[2],
+            WasmPetnameEvent::RemovePetname { did }
+            if did == "did:dht:zAlice"
+        ),
+        "event 2 should be RemovePetname"
+    );
+
+    assert!(
+        matches!(
+            &wasm.event_log[3],
+            WasmPetnameEvent::RemoveContextPetname { context_id }
+            if context_id == "ctx-1"
+        ),
+        "event 3 should be RemoveContextPetname"
+    );
 }
 
 // ===========================================================================
