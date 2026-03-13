@@ -89,6 +89,16 @@ _SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
     "malformed token: invalid DID document",
     "malformed token: network unavailable",
     "malformed token: DID revoked/downgraded",
+    # Runtime MalformedToken(format!(...)) constructions from validate.rs
+    # that represent signature/DID resolution failures (step 2).
+    "malformed token: verification method",
+    "malformed token: unrecognized signing key ID",
+    # Runtime MalformedToken(format!(...)) constructions from resolvers.rs
+    # BridgeDidResolver — DID decode/resolution failures (step 2).
+    "malformed token: z-base-32 decode failed",
+    "malformed token: DID public key must be 32 bytes",
+    "malformed token: hex decode failed",
+    "malformed token: unsupported DID method",
 )
 
 # Error message prefixes that indicate a capability ceiling/scope failure.

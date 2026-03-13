@@ -43,6 +43,7 @@ from scp_sdk.trust import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _RUST_UCAN_MOD = _REPO_ROOT / "crates" / "scp-core" / "src" / "crypto" / "ucan" / "mod.rs"
+_RUST_VALIDATE = _REPO_ROOT / "crates" / "scp-core" / "src" / "crypto" / "ucan" / "validate.rs"
 _RUST_RESOLVERS = _REPO_ROOT / "crates" / "scp-ffi" / "common" / "src" / "resolvers.rs"
 
 
@@ -50,12 +51,19 @@ _RUST_RESOLVERS = _REPO_ROOT / "crates" / "scp-ffi" / "common" / "src" / "resolv
 # Helpers — parse Rust source for #[error("...")] annotations
 # ---------------------------------------------------------------------------
 
-# Matches thiserror #[error("...")] attribute strings.
-# Captures everything inside the outermost quotes.
-_ERROR_ATTR_RE = re.compile(r'#\[error\("([^"]+)"\)\]')
+# Matches thiserror #[error("...")] attribute strings, including multi-line
+# annotations where whitespace may appear between the parentheses.
+# Uses re.DOTALL so \s matches newlines between the opening paren and the
+# closing paren.  Captures everything inside the outermost quotes.
+_ERROR_ATTR_RE = re.compile(r'#\[error\(\s*"([^"]+)"\s*\)\]', re.DOTALL)
 
 # Matches Display impl format strings: write!(f, "...", ...) patterns.
 _WRITE_FMT_RE = re.compile(r'write!\(f,\s*"([^"]+)"')
+
+# Matches runtime MalformedToken(format!("...", ...)) constructions.
+# Captures the format string literal inside the format!() macro.
+# Uses re.DOTALL so \s matches newlines in multi-line format! calls.
+_MALFORMED_TOKEN_FMT_RE = re.compile(r'MalformedToken\(format!\(\s*"([^"]+)"', re.DOTALL)
 
 
 def _extract_error_prefixes_from_thiserror(source: str) -> list[str]:
@@ -75,6 +83,30 @@ def _extract_error_prefixes_from_thiserror(source: str) -> list[str]:
             prefixes.append(fmt)
         else:
             prefixes.append(fmt[:brace_idx])
+    return prefixes
+
+
+def _extract_runtime_malformed_token_prefixes(source: str) -> list[str]:
+    """Extract static prefixes from ``MalformedToken(format!("..."))`` calls.
+
+    These are runtime error constructions in ``validate.rs`` and
+    ``resolvers.rs`` that produce ``MalformedToken`` variants with
+    dynamic format strings.  The Display output is
+    ``"malformed token: <format string expanded>"`` because
+    ``MalformedToken(String)`` has ``#[error("malformed token: {0}")]``.
+
+    Returns the ``"malformed token: <static prefix>"`` for each call.
+    """
+    prefixes: list[str] = []
+    for match in _MALFORMED_TOKEN_FMT_RE.finditer(source):
+        fmt = match.group(1)
+        brace_idx = fmt.find("{")
+        if brace_idx == -1:
+            static_part = fmt
+        else:
+            static_part = fmt[:brace_idx]
+        # The Display impl wraps with "malformed token: " prefix.
+        prefixes.append(f"malformed token: {static_part}")
     return prefixes
 
 
@@ -148,6 +180,12 @@ class TestRustSourceExists:
         assert _RUST_UCAN_MOD.exists(), (
             f"Rust UcanError source not found at {_RUST_UCAN_MOD}. "
             f"If the file moved, update _RUST_UCAN_MOD in this test."
+        )
+
+    def test_validate_rs_exists(self) -> None:
+        assert _RUST_VALIDATE.exists(), (
+            f"Rust validate source not found at {_RUST_VALIDATE}. "
+            f"If the file moved, update _RUST_VALIDATE in this test."
         )
 
     def test_resolvers_rs_exists(self) -> None:
@@ -344,6 +382,87 @@ class TestResolutionErrorClassification:
         assert _classify_ucan_error(message) == expected_stage
 
 
+class TestRuntimeMalformedTokenCoverage:
+    """Runtime ``MalformedToken(format!(...))`` constructions in validate.rs and
+    resolvers.rs must be covered by specific Python sub-prefixes.
+
+    These runtime messages are wrapped by the ``#[error("malformed token: {0}")]``
+    Display impl, so the Python-visible prefix is ``"malformed token: <static part>"``.
+    Without specific sub-prefixes, they all fall through to the generic
+    ``"malformed token:"`` catch-all in ``_TOKEN_PARSE_PREFIXES`` and classify
+    as ``token_parse`` instead of the correct pipeline stage.
+    """
+
+    @pytest.fixture(scope="class")
+    def validate_runtime_prefixes(self) -> list[str]:
+        """Extract runtime MalformedToken prefixes from validate.rs."""
+        source = _RUST_VALIDATE.read_text()
+        return _extract_runtime_malformed_token_prefixes(source)
+
+    @pytest.fixture(scope="class")
+    def resolver_runtime_prefixes(self) -> list[str]:
+        """Extract runtime MalformedToken prefixes from resolvers.rs."""
+        source = _RUST_RESOLVERS.read_text()
+        return _extract_runtime_malformed_token_prefixes(source)
+
+    def test_each_validate_runtime_prefix_covered(
+        self, validate_runtime_prefixes: list[str]
+    ) -> None:
+        """Each validate.rs runtime MalformedToken prefix must be covered
+        by at least one Python prefix."""
+        uncovered: list[str] = []
+        for rust_pfx in validate_runtime_prefixes:
+            covered = any(
+                rust_pfx.startswith(py_prefix) or py_prefix.startswith(rust_pfx)
+                for py_prefix in _FLAT_PYTHON_PREFIXES
+            )
+            if not covered:
+                uncovered.append(rust_pfx)
+        assert not uncovered, (
+            "validate.rs runtime MalformedToken prefixes not covered:\n"
+            + "\n".join(f"  - {p!r}" for p in uncovered)
+            + "\n\nAdd a matching sub-prefix to the appropriate "
+            "_*_PREFIXES tuple in scp_sdk/trust.py."
+        )
+
+    def test_each_resolver_runtime_prefix_covered(
+        self, resolver_runtime_prefixes: list[str]
+    ) -> None:
+        """Each resolvers.rs runtime MalformedToken prefix must be covered
+        by at least one Python prefix."""
+        uncovered: list[str] = []
+        for rust_pfx in resolver_runtime_prefixes:
+            covered = any(
+                rust_pfx.startswith(py_prefix) or py_prefix.startswith(rust_pfx)
+                for py_prefix in _FLAT_PYTHON_PREFIXES
+            )
+            if not covered:
+                uncovered.append(rust_pfx)
+        assert not uncovered, (
+            "resolvers.rs runtime MalformedToken prefixes not covered:\n"
+            + "\n".join(f"  - {p!r}" for p in uncovered)
+            + "\n\nAdd a matching sub-prefix to _SIGNATURE_CHAIN_PREFIXES "
+            "in scp_sdk/trust.py."
+        )
+
+    def test_runtime_prefixes_classify_correctly(
+        self, validate_runtime_prefixes: list[str], resolver_runtime_prefixes: list[str]
+    ) -> None:
+        """Runtime MalformedToken messages should NOT classify as 'unknown'."""
+        all_prefixes = validate_runtime_prefixes + resolver_runtime_prefixes
+        unknown_msgs: list[str] = []
+        for prefix in all_prefixes:
+            # Create a synthetic message by appending a test value.
+            msg = f"{prefix}test_value"
+            stage = _classify_ucan_error(msg)
+            if stage == "unknown":
+                unknown_msgs.append(msg)
+        assert not unknown_msgs, (
+            "Runtime MalformedToken messages classified as 'unknown':\n"
+            + "\n".join(f"  - {m!r}" for m in unknown_msgs)
+        )
+
+
 class TestPrefixCountsMatchExpected:
     """Sanity check: the number of Rust UcanError variants must match what
     we expect.  If a variant is added or removed, this test catches it
@@ -367,10 +486,12 @@ class TestPrefixCountsMatchExpected:
         """ResolutionError should have exactly 4 Display arms."""
         resolver_source = _RUST_RESOLVERS.read_text()
         # Count write!(f, "...") patterns in the Display impl.
+        # The regex is file-global, so this is an exact count of all
+        # write!(f, "...") calls in the file (currently only in the
+        # ResolutionError Display impl).
         resolution_count = len(_WRITE_FMT_RE.findall(resolver_source))
-        # The file may contain other write! calls, so we verify at least 4.
-        assert resolution_count >= 4, (
-            f"Expected at least 4 ResolutionError Display arms, found "
-            f"{resolution_count}. If variants were added, update the "
-            f"Python _SIGNATURE_CHAIN_PREFIXES in trust.py."
+        assert resolution_count == 4, (
+            f"Expected exactly 4 ResolutionError Display arms, found "
+            f"{resolution_count}. If variants were added or removed, "
+            f"update _SIGNATURE_CHAIN_PREFIXES in trust.py and this count."
         )
