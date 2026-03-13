@@ -41,9 +41,9 @@ enum SourceType {
 impl SourceType {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "Persistent" => Some(Self::Persistent),
-            "Ephemeral" => Some(Self::Ephemeral),
-            "Summary" => Some(Self::Summary),
+            "Persistent" | "persistent" => Some(Self::Persistent),
+            "Ephemeral" | "ephemeral" => Some(Self::Ephemeral),
+            "Summary" | "summary" => Some(Self::Summary),
             _ => None,
         }
     }
@@ -72,11 +72,15 @@ enum ContextState {
 impl ContextState {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "Active" => Some(Self::Active),
-            "ClosedWithSummaryVerified" => Some(Self::ClosedWithSummaryVerified),
-            "ClosedWithSummaryUnverified" => Some(Self::ClosedWithSummaryUnverified),
-            "ClosedEphemeral" => Some(Self::ClosedEphemeral),
-            "Unknown" => Some(Self::Unknown),
+            "Active" | "active" => Some(Self::Active),
+            "ClosedWithSummaryVerified" | "closed_with_summary_verified" => {
+                Some(Self::ClosedWithSummaryVerified)
+            }
+            "ClosedWithSummaryUnverified" | "closed_with_summary_unverified" => {
+                Some(Self::ClosedWithSummaryUnverified)
+            }
+            "ClosedEphemeral" | "closed_ephemeral" => Some(Self::ClosedEphemeral),
+            "Unknown" | "unknown" => Some(Self::Unknown),
             _ => None,
         }
     }
@@ -104,9 +108,9 @@ enum MemoryScope {
 impl MemoryScope {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "Full" => Some(Self::Full),
-            "Summary" => Some(Self::Summary),
-            "Ephemeral" => Some(Self::Ephemeral),
+            "Full" | "full" => Some(Self::Full),
+            "Summary" | "summary" => Some(Self::Summary),
+            "Ephemeral" | "ephemeral" => Some(Self::Ephemeral),
             _ => None,
         }
     }
@@ -196,28 +200,33 @@ pub fn provenance_check_chain_depth(depth: u32, max_depth_override: Option<u32>)
 ///
 /// # Arguments
 ///
-/// - `source_type` — One of `"Persistent"`, `"Ephemeral"`, `"Summary"`, or `None`
-///   (no provenance).
-/// - `context_state` — One of `"Active"`, `"ClosedWithSummaryVerified"`,
-///   `"ClosedWithSummaryUnverified"`, `"ClosedEphemeral"`, `"Unknown"`.
-/// - `has_counterparties` — `"true"` or `"false"` string indicating whether
-///   counterparties are known.
+/// - `source_context` — Source context ID, or `None` (no provenance).
+/// - `source_type` — One of `"Persistent"` / `"persistent"`, `"Ephemeral"` / `"ephemeral"`,
+///   `"Summary"` / `"summary"`.
+/// - `context_state` — One of `"Active"` / `"active"`,
+///   `"ClosedWithSummaryVerified"` / `"closed_with_summary_verified"`,
+///   `"ClosedWithSummaryUnverified"` / `"closed_with_summary_unverified"`,
+///   `"ClosedEphemeral"` / `"closed_ephemeral"`, `"Unknown"` / `"unknown"`.
+/// - `counterparties_json` — Optional JSON array of counterparty DID strings.
+///   Non-empty array → counterparties known. `None` or `"[]"` → unknown.
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `context_state` or `source_type` are invalid values.
+/// Returns `JsError` if `context_state` or `source_type` are invalid values,
+/// or if `counterparties_json` is not valid JSON.
 ///
 /// # JS usage
 ///
 /// ```js
-/// const tier = evaluate_provenance_quality("Persistent", "Active", true);
+/// const tier = evaluate_provenance_quality("ctx-1", "persistent", "active", '["did:key:z6Mk..."]');
 /// console.log(tier); // 3
 /// ```
 #[wasm_bindgen]
 pub fn evaluate_provenance_quality(
-    source_type: Option<String>,
+    source_context: Option<String>,
+    source_type: String,
     context_state: String,
-    has_counterparties: bool,
+    counterparties_json: Option<String>,
 ) -> Result<u32, JsError> {
     let cs = ContextState::from_str(&context_state).ok_or_else(|| {
         JsError::new(&format!(
@@ -225,20 +234,26 @@ pub fn evaluate_provenance_quality(
         ))
     })?;
 
-    let Some(st_str) = source_type else {
-        return Ok(compute_quality(
-            false,
-            &SourceType::Persistent,
-            cs,
-            has_counterparties,
-        ));
+    let has_counterparties = if let Some(ref json) = counterparties_json {
+        let arr: Vec<String> = serde_json::from_str(json).map_err(|e| {
+            JsError::new(&format!(
+                "[SCP-VALID-7202] invalid counterparties_json: {e}"
+            ))
+        })?;
+        !arr.is_empty()
+    } else {
+        false
     };
 
-    let st = SourceType::from_str(&st_str).ok_or_else(|| {
-        JsError::new(&format!("[SCP-VALID-7201] invalid source_type: '{st_str}'"))
+    let has_provenance = source_context.is_some();
+
+    let st = SourceType::from_str(&source_type).ok_or_else(|| {
+        JsError::new(&format!(
+            "[SCP-VALID-7201] invalid source_type: '{source_type}'"
+        ))
     })?;
 
-    Ok(compute_quality(true, &st, cs, has_counterparties))
+    Ok(compute_quality(has_provenance, &st, cs, has_counterparties))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,8 +267,10 @@ pub fn evaluate_provenance_quality(
 /// # Arguments
 ///
 /// - `source_context_id` — ID of the source context.
-/// - `source_type` — One of `"Persistent"`, `"Ephemeral"`, `"Summary"`.
-/// - `memory_scope` — One of `"Full"`, `"Summary"`, `"Ephemeral"`.
+/// - `source_type` — One of `"Persistent"` / `"persistent"`, `"Ephemeral"` / `"ephemeral"`,
+///   `"Summary"` / `"summary"`.
+/// - `memory_scope` — One of `"Full"` / `"full"`, `"Summary"` / `"summary"`,
+///   `"Ephemeral"` / `"ephemeral"`.
 /// - `counterparties_json` — JSON array of DID strings.
 /// - `target_context_id` — ID of the target context.
 /// - `existing_chain_depth` — Chain depth from existing provenance, or -1 for first hop.
@@ -444,24 +461,31 @@ mod tests {
 
     #[test]
     fn evaluate_quality_persistent_active() {
-        let tier =
-            evaluate_provenance_quality(Some("Persistent".to_owned()), "Active".to_owned(), true)
-                .unwrap();
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "Persistent".to_owned(),
+            "Active".to_owned(),
+            Some("[\"did:key:alice\"]".to_owned()),
+        )
+        .unwrap();
         assert_eq!(tier, 3);
     }
 
     #[test]
     fn evaluate_quality_no_provenance() {
-        let tier = evaluate_provenance_quality(None, "Active".to_owned(), false).unwrap();
+        let tier =
+            evaluate_provenance_quality(None, "Persistent".to_owned(), "Active".to_owned(), None)
+                .unwrap();
         assert_eq!(tier, 0);
     }
 
     #[test]
     fn evaluate_quality_summary_verified() {
         let tier = evaluate_provenance_quality(
-            Some("Summary".to_owned()),
+            Some("ctx-1".to_owned()),
+            "Summary".to_owned(),
             "ClosedWithSummaryVerified".to_owned(),
-            true,
+            Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
         assert_eq!(tier, 2);
@@ -471,32 +495,45 @@ mod tests {
     fn evaluate_quality_active_ephemeral_always_returns_1() {
         // Active + non-Persistent always degrades to EphemeralKnownParties (1),
         // regardless of counterparties — matches scp-core evaluate_quality.
-        let with_parties =
-            evaluate_provenance_quality(Some("Ephemeral".to_owned()), "Active".to_owned(), true)
-                .unwrap();
+        let with_parties = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "Ephemeral".to_owned(),
+            "Active".to_owned(),
+            Some("[\"did:key:alice\"]".to_owned()),
+        )
+        .unwrap();
         assert_eq!(with_parties, 1);
 
-        let without_parties =
-            evaluate_provenance_quality(Some("Ephemeral".to_owned()), "Active".to_owned(), false)
-                .unwrap();
+        let without_parties = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "Ephemeral".to_owned(),
+            "Active".to_owned(),
+            None,
+        )
+        .unwrap();
         assert_eq!(without_parties, 1);
     }
 
     #[test]
     fn evaluate_quality_active_summary_always_returns_1() {
         // Active + Summary also degrades to EphemeralKnownParties (1).
-        let tier =
-            evaluate_provenance_quality(Some("Summary".to_owned()), "Active".to_owned(), false)
-                .unwrap();
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "Summary".to_owned(),
+            "Active".to_owned(),
+            None,
+        )
+        .unwrap();
         assert_eq!(tier, 1);
     }
 
     #[test]
     fn evaluate_quality_ephemeral_with_parties() {
         let tier = evaluate_provenance_quality(
-            Some("Ephemeral".to_owned()),
+            Some("ctx-1".to_owned()),
+            "Ephemeral".to_owned(),
             "ClosedEphemeral".to_owned(),
-            true,
+            Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
         assert_eq!(tier, 1);
@@ -505,9 +542,23 @@ mod tests {
     #[test]
     fn evaluate_quality_ephemeral_no_parties() {
         let tier = evaluate_provenance_quality(
-            Some("Ephemeral".to_owned()),
+            Some("ctx-1".to_owned()),
+            "Ephemeral".to_owned(),
             "ClosedEphemeral".to_owned(),
-            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tier, 0);
+    }
+
+    #[test]
+    fn evaluate_quality_ephemeral_empty_parties() {
+        // Empty counterparties array should be treated as no counterparties
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "Ephemeral".to_owned(),
+            "ClosedEphemeral".to_owned(),
+            Some("[]".to_owned()),
         )
         .unwrap();
         assert_eq!(tier, 0);
@@ -515,9 +566,13 @@ mod tests {
 
     #[test]
     fn evaluate_quality_unknown_state() {
-        let tier =
-            evaluate_provenance_quality(Some("Persistent".to_owned()), "Unknown".to_owned(), true)
-                .unwrap();
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "Persistent".to_owned(),
+            "Unknown".to_owned(),
+            Some("[\"did:key:alice\"]".to_owned()),
+        )
+        .unwrap();
         assert_eq!(tier, 0);
     }
 
@@ -525,9 +580,23 @@ mod tests {
     fn evaluate_quality_invalid_state_fails() {
         assert!(
             evaluate_provenance_quality(
-                Some("Persistent".to_owned()),
+                Some("ctx-1".to_owned()),
+                "Persistent".to_owned(),
                 "InvalidState".to_owned(),
-                true,
+                Some("[\"did:key:alice\"]".to_owned()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn evaluate_quality_invalid_counterparties_json_fails() {
+        assert!(
+            evaluate_provenance_quality(
+                Some("ctx-1".to_owned()),
+                "Persistent".to_owned(),
+                "Active".to_owned(),
+                Some("not valid json".to_owned()),
             )
             .is_err()
         );
@@ -696,5 +765,299 @@ mod tests {
 
         let none = parse_wasm_discovery_method(None).unwrap();
         assert_eq!(none, serde_json::json!("OutOfBand"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Lowercase / snake_case enum value tests (NAPI parity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_quality_lowercase_source_type_and_context_state() {
+        // lowercase "persistent" + "active" must work (matches NAPI bridge)
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "persistent".to_owned(),
+            "active".to_owned(),
+            Some("[\"did:key:alice\"]".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(tier, 3);
+    }
+
+    #[test]
+    fn evaluate_quality_lowercase_ephemeral() {
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "ephemeral".to_owned(),
+            "closed_ephemeral".to_owned(),
+            Some("[\"did:key:alice\"]".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(tier, 1);
+    }
+
+    #[test]
+    fn evaluate_quality_lowercase_summary_verified() {
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "summary".to_owned(),
+            "closed_with_summary_verified".to_owned(),
+            Some("[\"did:key:alice\"]".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(tier, 2);
+    }
+
+    #[test]
+    fn evaluate_quality_lowercase_summary_unverified() {
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "summary".to_owned(),
+            "closed_with_summary_unverified".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tier, 0);
+    }
+
+    #[test]
+    fn evaluate_quality_lowercase_unknown() {
+        let tier = evaluate_provenance_quality(
+            Some("ctx-1".to_owned()),
+            "persistent".to_owned(),
+            "unknown".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tier, 0);
+    }
+
+    #[test]
+    fn attach_lowercase_source_type_and_memory_scope() {
+        let result = provenance_attach(
+            "ctx-source".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
+            "[\"did:key:alice\"]".to_owned(),
+            "ctx-target".to_owned(),
+            -1.0,
+            "[]".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["source_context"], "ctx-source");
+        assert_eq!(json["source_type"], "Persistent");
+        assert_eq!(json["memory_scope"], "Full");
+    }
+
+    #[test]
+    fn attach_lowercase_ephemeral_summary() {
+        let result = provenance_attach(
+            "ctx-source".to_owned(),
+            "ephemeral".to_owned(),
+            "summary".to_owned(),
+            "[]".to_owned(),
+            "ctx-target".to_owned(),
+            -1.0,
+            "[]".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["source_type"], "Ephemeral");
+        assert_eq!(json["memory_scope"], "Summary");
+    }
+
+    #[test]
+    fn attach_lowercase_summary_ephemeral_scope() {
+        let result = provenance_attach(
+            "ctx-source".to_owned(),
+            "summary".to_owned(),
+            "ephemeral".to_owned(),
+            "[]".to_owned(),
+            "ctx-target".to_owned(),
+            -1.0,
+            "[]".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["source_type"], "Summary");
+        assert_eq!(json["memory_scope"], "Ephemeral");
+    }
+}
+
+/// Tests that run on all targets (including native) to verify `lowercase/snake_case`
+/// enum parsing without requiring wasm-bindgen types.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests_native {
+    use super::*;
+
+    // -- SourceType --
+
+    #[test]
+    fn source_type_from_str_pascal_case() {
+        assert!(matches!(
+            SourceType::from_str("Persistent"),
+            Some(SourceType::Persistent)
+        ));
+        assert!(matches!(
+            SourceType::from_str("Ephemeral"),
+            Some(SourceType::Ephemeral)
+        ));
+        assert!(matches!(
+            SourceType::from_str("Summary"),
+            Some(SourceType::Summary)
+        ));
+    }
+
+    #[test]
+    fn source_type_from_str_lowercase() {
+        assert!(matches!(
+            SourceType::from_str("persistent"),
+            Some(SourceType::Persistent)
+        ));
+        assert!(matches!(
+            SourceType::from_str("ephemeral"),
+            Some(SourceType::Ephemeral)
+        ));
+        assert!(matches!(
+            SourceType::from_str("summary"),
+            Some(SourceType::Summary)
+        ));
+    }
+
+    #[test]
+    fn source_type_from_str_invalid() {
+        assert!(SourceType::from_str("PERSISTENT").is_none());
+        assert!(SourceType::from_str("invalid").is_none());
+        assert!(SourceType::from_str("").is_none());
+    }
+
+    // -- ContextState --
+
+    #[test]
+    fn context_state_from_str_pascal_case() {
+        assert!(matches!(
+            ContextState::from_str("Active"),
+            Some(ContextState::Active)
+        ));
+        assert!(matches!(
+            ContextState::from_str("ClosedWithSummaryVerified"),
+            Some(ContextState::ClosedWithSummaryVerified)
+        ));
+        assert!(matches!(
+            ContextState::from_str("ClosedWithSummaryUnverified"),
+            Some(ContextState::ClosedWithSummaryUnverified)
+        ));
+        assert!(matches!(
+            ContextState::from_str("ClosedEphemeral"),
+            Some(ContextState::ClosedEphemeral)
+        ));
+        assert!(matches!(
+            ContextState::from_str("Unknown"),
+            Some(ContextState::Unknown)
+        ));
+    }
+
+    #[test]
+    fn context_state_from_str_snake_case() {
+        assert!(matches!(
+            ContextState::from_str("active"),
+            Some(ContextState::Active)
+        ));
+        assert!(matches!(
+            ContextState::from_str("closed_with_summary_verified"),
+            Some(ContextState::ClosedWithSummaryVerified)
+        ));
+        assert!(matches!(
+            ContextState::from_str("closed_with_summary_unverified"),
+            Some(ContextState::ClosedWithSummaryUnverified)
+        ));
+        assert!(matches!(
+            ContextState::from_str("closed_ephemeral"),
+            Some(ContextState::ClosedEphemeral)
+        ));
+        assert!(matches!(
+            ContextState::from_str("unknown"),
+            Some(ContextState::Unknown)
+        ));
+    }
+
+    #[test]
+    fn context_state_from_str_invalid() {
+        assert!(ContextState::from_str("ACTIVE").is_none());
+        assert!(ContextState::from_str("closedEphemeral").is_none());
+        assert!(ContextState::from_str("").is_none());
+    }
+
+    // -- MemoryScope --
+
+    #[test]
+    fn memory_scope_from_str_pascal_case() {
+        assert!(matches!(
+            MemoryScope::from_str("Full"),
+            Some(MemoryScope::Full)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("Summary"),
+            Some(MemoryScope::Summary)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("Ephemeral"),
+            Some(MemoryScope::Ephemeral)
+        ));
+    }
+
+    #[test]
+    fn memory_scope_from_str_lowercase() {
+        assert!(matches!(
+            MemoryScope::from_str("full"),
+            Some(MemoryScope::Full)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("summary"),
+            Some(MemoryScope::Summary)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("ephemeral"),
+            Some(MemoryScope::Ephemeral)
+        ));
+    }
+
+    #[test]
+    fn memory_scope_from_str_invalid() {
+        assert!(MemoryScope::from_str("FULL").is_none());
+        assert!(MemoryScope::from_str("invalid").is_none());
+        assert!(MemoryScope::from_str("").is_none());
+    }
+
+    // -- compute_quality with lowercase-parsed enums --
+
+    #[test]
+    fn compute_quality_with_lowercase_parsed_enums() {
+        let st = SourceType::from_str("persistent").unwrap();
+        let cs = ContextState::from_str("active").unwrap();
+        assert_eq!(compute_quality(true, &st, cs, true), 3);
+
+        let st2 = SourceType::from_str("summary").unwrap();
+        let cs2 = ContextState::from_str("closed_with_summary_verified").unwrap();
+        assert_eq!(compute_quality(true, &st2, cs2, true), 2);
+
+        let st3 = SourceType::from_str("ephemeral").unwrap();
+        let cs3 = ContextState::from_str("closed_ephemeral").unwrap();
+        assert_eq!(compute_quality(true, &st3, cs3, true), 1);
+        assert_eq!(compute_quality(true, &st3, cs3, false), 0);
+
+        let cs4 = ContextState::from_str("unknown").unwrap();
+        assert_eq!(compute_quality(true, &st, cs4, true), 0);
     }
 }
