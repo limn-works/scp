@@ -175,7 +175,9 @@ class TestClassifyUcanError:
         assert _classify_ucan_error(msg) == "nonce"
 
     def test_clock_error(self) -> None:
-        assert _classify_ucan_error("system clock error: time went backwards") == "nonce"
+        # UcanError::ClockError is produced by verify_expiry() (step 11),
+        # not nonce checking (step 9).  Correctly classified as "expiry".
+        assert _classify_ucan_error("system clock error: time went backwards") == "expiry"
 
     # -- Revocation errors (step 10) --
 

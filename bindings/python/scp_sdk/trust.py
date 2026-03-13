@@ -120,7 +120,6 @@ _NONCE_PREFIXES: tuple[str, ...] = (
     "nonce from the future:",
     "invalid nonce format:",
     "nonce tracker full:",
-    "system clock error:",
 )
 
 # Error message prefixes that indicate a revocation failure.
@@ -135,6 +134,7 @@ _EXPIRY_PREFIXES: tuple[str, ...] = (
     "token not yet valid",
     "invalid time range:",
     "expiry too far in the future:",
+    "system clock error:",
 )
 
 
