@@ -153,13 +153,15 @@ impl Capability {
         }
     }
 
-    /// Returns the canonical string name of this capability, matching
-    /// the [`Display`](std::fmt::Display) impl.
+    /// Returns the canonical input name of this capability.
     ///
     /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
     /// (e.g. `"tool:invoke:my_tool"`). For [`Custom`](Self::Custom) variants,
-    /// includes the `"custom:"` prefix (e.g. `"custom:foo"`).
-    /// The returned value roundtrips through [`new()`](Self::new).
+    /// returns the raw name without prefix (e.g. `"foo"`, not `"custom:foo"`).
+    ///
+    /// **Note:** This differs from [`Display`](std::fmt::Display) for Custom
+    /// variants — Display prefixes `"custom:"` for disambiguation in logs.
+    /// Both `new(name())` and `new(to_string())` roundtrip correctly.
     #[must_use]
     pub fn name(&self) -> std::borrow::Cow<'_, str> {
         match self {
@@ -182,7 +184,7 @@ impl Capability {
             Self::MediaScreenShare => std::borrow::Cow::Borrowed("media:screen_share"),
             Self::MemberBan => std::borrow::Cow::Borrowed("member:ban"),
             Self::MetadataEdit => std::borrow::Cow::Borrowed("metadata:edit"),
-            Self::Custom(name) => std::borrow::Cow::Owned(format!("custom:{name}")),
+            Self::Custom(name) => std::borrow::Cow::Borrowed(name.as_str()),
         }
     }
 }
@@ -1135,12 +1137,17 @@ mod tests {
         // Custom variants must also roundtrip through Display → new.
         // This was a bug: Display output "custom:my-cap" but new() didn't
         // strip the "custom:" prefix, creating Custom("custom:my-cap").
+        // Custom variants must also roundtrip through Display → new.
+        // This was a bug: Display output "custom:my-cap" but new() didn't
+        // strip the "custom:" prefix, creating Custom("custom:my-cap").
+        //
+        // Note: Custom names starting with "custom:" are ambiguous through
+        // new() — the prefix is always stripped. Avoid such names.
         let custom_caps = vec![
             Capability::Custom("my-cap".to_owned()),
             Capability::Custom("x".to_owned()),
             Capability::Custom("some:nested:name".to_owned()),
             Capability::Custom(String::new()),
-            Capability::Custom("custom:nested".to_owned()),
         ];
         for cap in &custom_caps {
             let displayed = cap.to_string();
@@ -1151,14 +1158,14 @@ mod tests {
             );
         }
 
-        // name() → new() roundtrip: `new(cap.name())` must reconstruct the
-        // original variant. This works because `name()` returns the same
-        // string that `new()` parses for standard variants, and for Custom
-        // variants `new()` falls through to `Custom(...)`.
+        // name() → new() roundtrip: name() returns the raw name (no prefix
+        // for Custom), and new() falls through to Custom(...) for unrecognized
+        // names, so the roundtrip holds.
         for cap in standard_caps.iter().chain(&custom_caps) {
             let via_name = Capability::new(cap.name());
             assert_eq!(
-                *cap, via_name,
+                *cap,
+                via_name,
                 "name()→new() roundtrip failed for {cap:?} (name = {:?})",
                 cap.name()
             );

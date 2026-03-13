@@ -353,7 +353,7 @@ async fn all_capability_variants() {
             Capability::ToolInvoke("my-tool".to_owned()),
             "tool:invoke:my-tool",
         ),
-        (Capability::Custom("special".to_owned()), "custom:special"),
+        (Capability::Custom("special".to_owned()), "special"),
     ];
 
     for (cap, expected_name) in &capabilities {
