@@ -53,7 +53,7 @@ class GovernanceConformanceTest {
                     BridgeException("Write capability required", "SCP-PERM-3020")
                 val result = dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "hello"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
                 )
                 assertEquals("SCP-PERM-3020", result["error"])
             }
@@ -65,7 +65,7 @@ class GovernanceConformanceTest {
                     BridgeException("Admin capability required", "SCP-PERM-3021")
                 val result = dispatcher.dispatch(
                     "context_close",
-                    mapOf("context_handle" to "10"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
                 assertEquals("SCP-PERM-3021", result["error"])
             }
@@ -93,7 +93,7 @@ class GovernanceConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_mint",
                     mapOf(
-                        "identity_handle" to "1",
+                        "context_handle" to "10",
                         "audience_did" to "did:dht:z6MkMember",
                         "capabilities" to """["admin"]""",
                     ),
@@ -109,9 +109,9 @@ class GovernanceConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_validate",
                     mapOf(
+                        "context_handle" to "10",
                         "encoded" to "overcapped.token",
                         "capability" to "admin",
-                        "context_id" to "ctx-limited",
                     ),
                 )
                 assertEquals("SCP-PERM-3013", result["error"])
@@ -151,7 +151,7 @@ class GovernanceConformanceTest {
                     BridgeException("test", "SCP-PERM-3001")
                 val result = dispatcher.dispatch(
                     "ucan_validate",
-                    mapOf("encoded" to "t"),
+                    mapOf("context_handle" to "10", "encoded" to "t"),
                 )
                 assertEquals("SCP-PERM-3001", result["error"])
             }

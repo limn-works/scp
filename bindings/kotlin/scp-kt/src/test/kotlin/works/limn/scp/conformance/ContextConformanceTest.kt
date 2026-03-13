@@ -92,14 +92,13 @@ class ContextConformanceTest {
     @Nested
     inner class ContextJoin {
         @Test
-        fun `context_join returns handle for valid context ID`() =
+        fun `context_join succeeds for valid context`() =
             runTest(testDispatcher) {
-                stubBindings.contextJoinResult = 200L
                 val result = dispatcher.dispatch(
                     "context_join",
-                    mapOf("identity_handle" to "1", "context_id" to "ctx-abc"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
-                assertEquals("200", result["handle"])
+                assertEquals("joined", result["status"])
             }
 
         @Test
@@ -109,7 +108,7 @@ class ContextConformanceTest {
                     BridgeException("Context not found", "SCP-CTX-2002")
                 val result = dispatcher.dispatch(
                     "context_join",
-                    mapOf("identity_handle" to "1", "context_id" to "ctx-none"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
                 assertEquals("SCP-CTX-2002", result["error"])
             }
@@ -122,7 +121,7 @@ class ContextConformanceTest {
             runTest(testDispatcher) {
                 val result = dispatcher.dispatch(
                     "context_leave",
-                    mapOf("context_handle" to "10"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
                 assertEquals("left", result["status"])
                 assertTrue(stubBindings.contextLeaveCalled)
@@ -135,7 +134,7 @@ class ContextConformanceTest {
                     BridgeException("Not a member", "SCP-CTX-2003")
                 val result = dispatcher.dispatch(
                     "context_leave",
-                    mapOf("context_handle" to "10"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
                 assertEquals("SCP-CTX-2003", result["error"])
             }
@@ -147,7 +146,7 @@ class ContextConformanceTest {
         fun `context_close succeeds for admin`() = runTest(testDispatcher) {
             val result = dispatcher.dispatch(
                 "context_close",
-                mapOf("context_handle" to "10"),
+                mapOf("context_handle" to "10", "identity_handle" to "1"),
             )
             assertEquals("closed", result["status"])
             assertTrue(stubBindings.contextCloseCalled)
@@ -160,7 +159,7 @@ class ContextConformanceTest {
                     BridgeException("Not authorized", "SCP-PERM-3001")
                 val result = dispatcher.dispatch(
                     "context_close",
-                    mapOf("context_handle" to "10"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
                 assertEquals("SCP-PERM-3001", result["error"])
             }
@@ -180,7 +179,7 @@ class ContextConformanceTest {
 
                 val leaveResult = dispatcher.dispatch(
                     "context_leave",
-                    mapOf("context_handle" to "10"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
                 )
                 assertEquals("left", leaveResult["status"])
             }
@@ -188,16 +187,15 @@ class ContextConformanceTest {
         @Test
         fun `context lifecycle - join then close`() =
             runTest(testDispatcher) {
-                stubBindings.contextJoinResult = 20L
                 val joinResult = dispatcher.dispatch(
                     "context_join",
-                    mapOf("identity_handle" to "1", "context_id" to "ctx-1"),
+                    mapOf("context_handle" to "20", "identity_handle" to "1"),
                 )
-                assertEquals("20", joinResult["handle"])
+                assertEquals("joined", joinResult["status"])
 
                 val closeResult = dispatcher.dispatch(
                     "context_close",
-                    mapOf("context_handle" to "20"),
+                    mapOf("context_handle" to "20", "identity_handle" to "1"),
                 )
                 assertEquals("closed", closeResult["status"])
             }

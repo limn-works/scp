@@ -95,17 +95,18 @@ class ConformanceDispatcher(
     private suspend fun dispatchContextJoin(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
-        val contextId = input["context_id"] ?: ""
-        val handle = bridge.context.join(identityHandle, contextId)
-        mapOf("handle" to handle.toString())
+        bridge.context.join(contextHandle, identityHandle)
+        mapOf("status" to "joined")
     }
 
     private suspend fun dispatchContextLeave(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
         val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
-        bridge.context.leave(contextHandle)
+        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
+        bridge.context.leave(contextHandle, identityHandle)
         mapOf("status" to "left")
     }
 
@@ -113,7 +114,8 @@ class ConformanceDispatcher(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
         val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
-        bridge.context.close(contextHandle)
+        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
+        bridge.context.close(contextHandle, identityHandle)
         mapOf("status" to "closed")
     }
 
@@ -121,8 +123,9 @@ class ConformanceDispatcher(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
         val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
+        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
         val payload = (input["payload"] ?: "").toByteArray()
-        bridge.context.send(contextHandle, payload)
+        bridge.context.send(contextHandle, identityHandle, payload)
         mapOf("status" to "sent")
     }
 
@@ -141,37 +144,48 @@ class ConformanceDispatcher(
         val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val toolId = input["tool_id"] ?: ""
         val toolInput = input["input"] ?: "{}"
-        val output = bridge.tools.invoke(contextHandle, toolId, toolInput)
+        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
+        val ucanToken = input["ucan_token"]
+        val proofTokens = input["proof_tokens"]?.let { listOf(it) }
+        val output = bridge.tools.invoke(
+            contextHandle,
+            toolId,
+            toolInput,
+            identityHandle,
+            ucanToken,
+            proofTokens,
+        )
         mapOf("output" to output)
     }
 
     private suspend fun dispatchToolVerify(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val toolId = input["tool_id"] ?: ""
-        val toolInput = input["input"] ?: "{}"
-        val toolOutput = input["output"] ?: "{}"
-        val valid = bridge.tools.verify(toolId, toolInput, toolOutput)
-        mapOf("is_valid" to valid.toString())
+        val resultJson = bridge.tools.verify(contextHandle, toolId)
+        mapOf("result" to resultJson)
     }
 
     private suspend fun dispatchUcanValidate(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val token = input["encoded"] ?: input["token"] ?: ""
         val capability = input["capability"] ?: ""
-        val contextId = input["context_id"] ?: ""
-        bridge.ucan.validate(token, capability, contextId)
+        val presentingAgentDid = input["presenting_agent_did"]
+        val proofTokens = input["proof_tokens"]?.let { listOf(it) }
+        bridge.ucan.validate(contextHandle, token, capability, presentingAgentDid, proofTokens)
         mapOf("status" to "valid")
     }
 
     private suspend fun dispatchUcanMint(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
-        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val memberDid = input["audience_did"] ?: input["member_did"] ?: ""
         val capabilities = input["capabilities"] ?: "[]"
-        val token = bridge.ucan.mint(identityHandle, memberDid, capabilities)
+        val token = bridge.ucan.mint(contextHandle, memberDid, capabilities)
         mapOf("token" to token)
     }
 
@@ -196,9 +210,9 @@ class ConformanceDispatcher(
     private suspend fun dispatchUcanRevoke(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
-        val identityHandle = input["identity_handle"]?.toLongOrNull() ?: 0L
+        val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
         val token = input["token"] ?: input["encoded"] ?: ""
-        bridge.ucan.revoke(identityHandle, token)
+        bridge.ucan.revoke(contextHandle, token)
         mapOf("status" to "revoked")
     }
 

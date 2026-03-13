@@ -106,33 +106,31 @@ class ToolsConformanceTest {
     @Nested
     inner class ToolVerify {
         @Test
-        fun `tool_verify returns true for valid test vector`() =
+        fun `tool_verify returns result for registered tool`() =
             runTest(testDispatcher) {
                 stubBindings.toolVerifyResult = true
                 val result = dispatcher.dispatch(
                     "tool_verify",
                     mapOf(
+                        "context_handle" to "10",
                         "tool_id" to "tool-calc-001",
-                        "input" to """{"a":1,"b":2}""",
-                        "output" to """{"result":3}""",
                     ),
                 )
-                assertEquals("true", result["is_valid"])
+                assertTrue(result["result"]?.contains("\"passed\":true") == true)
             }
 
         @Test
-        fun `tool_verify returns false for invalid test vector`() =
+        fun `tool_verify returns failed result`() =
             runTest(testDispatcher) {
                 stubBindings.toolVerifyResult = false
                 val result = dispatcher.dispatch(
                     "tool_verify",
                     mapOf(
+                        "context_handle" to "10",
                         "tool_id" to "tool-calc-001",
-                        "input" to """{"a":1,"b":2}""",
-                        "output" to """{"result":999}""",
                     ),
                 )
-                assertEquals("false", result["is_valid"])
+                assertTrue(result["result"]?.contains("\"passed\":false") == true)
             }
 
         @Test
@@ -143,9 +141,8 @@ class ToolsConformanceTest {
                 val result = dispatcher.dispatch(
                     "tool_verify",
                     mapOf(
+                        "context_handle" to "10",
                         "tool_id" to "tool-calc-001",
-                        "input" to "{}",
-                        "output" to "{}",
                     ),
                 )
                 assertEquals("SCP-TOOL-6003", result["error"])

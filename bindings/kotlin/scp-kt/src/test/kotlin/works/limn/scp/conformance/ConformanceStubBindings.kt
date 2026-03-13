@@ -54,7 +54,7 @@ class ConformanceStubBindings : NativeBindings {
     var toolRegisterError: BridgeException? = null
     var toolInvokeResult: String = """{"output":"ok"}"""
     var toolInvokeError: BridgeException? = null
-    var toolVerifyResult: Boolean = true
+    var toolVerifyResult: Boolean = true // kept as Boolean, serialized to JSON in toolVerify()
     var toolVerifyError: BridgeException? = null
 
     var ucanValidateError: BridgeException? = null
@@ -106,24 +106,33 @@ class ConformanceStubBindings : NativeBindings {
     }
 
     override fun contextJoin(
+        contextHandle: Long,
         identityHandle: Long,
-        contextId: String,
-    ): Long {
+    ) {
         contextJoinError?.let { throw it }
-        return contextJoinResult
     }
 
-    override fun contextLeave(contextHandle: Long) {
+    override fun contextLeave(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         contextLeaveCalled = true
         contextLeaveError?.let { throw it }
     }
 
-    override fun contextClose(contextHandle: Long) {
+    override fun contextClose(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         contextCloseCalled = true
         contextCloseError?.let { throw it }
     }
 
-    override fun contextSend(contextHandle: Long, payload: ByteArray) {
+    override fun contextSend(
+        contextHandle: Long,
+        identityHandle: Long,
+        payload: ByteArray,
+    ) {
         contextSendCalled = true
         contextSendPayload = payload
         contextSendError?.let { throw it }
@@ -165,7 +174,7 @@ class ConformanceStubBindings : NativeBindings {
     // BroadcastBindings
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
-    override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
+    override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
     override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) = Unit
     override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String =
@@ -186,30 +195,35 @@ class ConformanceStubBindings : NativeBindings {
         contextHandle: Long,
         toolId: String,
         inputJson: String,
+        identityHandle: Long,
+        ucanToken: String?,
+        proofTokens: List<String>?,
     ): String {
         toolInvokeError?.let { throw it }
         return toolInvokeResult
     }
 
     override fun toolVerify(
+        contextHandle: Long,
         toolId: String,
-        inputJson: String,
-        outputJson: String,
-    ): Boolean {
+    ): String {
         toolVerifyError?.let { throw it }
-        return toolVerifyResult
+        @Suppress("MaxLineLength")
+        return """{"tool_id":"$toolId","passed":$toolVerifyResult,"failures":[]}"""
     }
 
     override fun ucanValidate(
+        contextHandle: Long,
         token: String,
         capability: String,
-        contextId: String,
+        presentingAgentDid: String?,
+        proofTokens: List<String>?,
     ) {
         ucanValidateError?.let { throw it }
     }
 
     override fun ucanMint(
-        identityHandle: Long,
+        contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
     ): String {
@@ -218,7 +232,7 @@ class ConformanceStubBindings : NativeBindings {
     }
 
     override fun ucanRevoke(
-        identityHandle: Long,
+        contextHandle: Long,
         token: String,
     ) {
         ucanRevokeError?.let { throw it }

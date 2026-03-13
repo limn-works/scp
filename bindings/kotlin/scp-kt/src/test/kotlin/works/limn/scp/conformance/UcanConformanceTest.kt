@@ -51,9 +51,9 @@ class UcanConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_validate",
                     mapOf(
+                        "context_handle" to "10",
                         "encoded" to "test.token.sig",
                         "capability" to "read",
-                        "context_id" to "ctx-1",
                     ),
                 )
                 assertEquals("valid", result["status"])
@@ -67,9 +67,9 @@ class UcanConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_validate",
                     mapOf(
+                        "context_handle" to "10",
                         "encoded" to "bad.token",
                         "capability" to "write",
-                        "context_id" to "ctx-1",
                     ),
                 )
                 assertEquals("SCP-PERM-3001", result["error"])
@@ -83,9 +83,9 @@ class UcanConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_validate",
                     mapOf(
+                        "context_handle" to "10",
                         "encoded" to "expired.token.sig",
                         "capability" to "read",
-                        "context_id" to "ctx-1",
                     ),
                 )
                 assertEquals("SCP-PERM-3010", result["error"])
@@ -99,9 +99,9 @@ class UcanConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_validate",
                     mapOf(
+                        "context_handle" to "10",
                         "encoded" to "replayed.token.sig",
                         "capability" to "read",
-                        "context_id" to "ctx-1",
                     ),
                 )
                 assertEquals("SCP-PERM-3011", result["error"])
@@ -116,7 +116,7 @@ class UcanConformanceTest {
             val result = dispatcher.dispatch(
                 "ucan_mint",
                 mapOf(
-                    "identity_handle" to "1",
+                    "context_handle" to "10",
                     "audience_did" to "did:dht:z6MkAudience",
                     "capabilities" to """["read","write"]""",
                 ),
@@ -131,7 +131,7 @@ class UcanConformanceTest {
             val result = dispatcher.dispatch(
                 "ucan_mint",
                 mapOf(
-                    "identity_handle" to "1",
+                    "context_handle" to "10",
                     "audience_did" to "did:dht:z6MkAudience",
                 ),
             )
@@ -146,7 +146,7 @@ class UcanConformanceTest {
                 val result = dispatcher.dispatch(
                     "ucan_mint",
                     mapOf(
-                        "identity_handle" to "1",
+                        "context_handle" to "10",
                         "audience_did" to "did:dht:z6MkAudience",
                         "capabilities" to """["admin"]""",
                     ),
@@ -197,7 +197,7 @@ class UcanConformanceTest {
             val mintResult = dispatcher.dispatch(
                 "ucan_mint",
                 mapOf(
-                    "identity_handle" to "1",
+                    "context_handle" to "10",
                     "audience_did" to "did:dht:z6MkDelegator",
                     "capabilities" to """["read","write"]""",
                 ),
@@ -226,7 +226,7 @@ class UcanConformanceTest {
         fun `ucan_revoke succeeds`() = runTest(testDispatcher) {
             val result = dispatcher.dispatch(
                 "ucan_revoke",
-                mapOf("identity_handle" to "1", "token" to "header.payload.signature"),
+                mapOf("context_handle" to "10", "token" to "header.payload.signature"),
             )
             assertEquals("revoked", result["status"])
         }
@@ -237,7 +237,7 @@ class UcanConformanceTest {
                 BridgeException("Not authorized to revoke", "SCP-PERM-3003")
             val result = dispatcher.dispatch(
                 "ucan_revoke",
-                mapOf("identity_handle" to "1", "token" to "header.payload.signature"),
+                mapOf("context_handle" to "10", "token" to "header.payload.signature"),
             )
             assertEquals("SCP-PERM-3003", result["error"])
         }
@@ -256,8 +256,8 @@ class UcanConformanceTest {
                     description = "Validate a UCAN token (stub returns error)",
                     operation = "ucan_validate",
                     input = mapOf(
+                        "context_handle" to "10",
                         "encoded" to "test.token.sig",
-                        "context_id" to "ctx-1",
                     ),
                     expected = mapOf("error" to "SCP-PERM-3001"),
                 )
