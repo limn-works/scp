@@ -98,5 +98,16 @@ required-features = ["testing"]
 name = "content_access_integration"
 required-features = ["testing"]
 
+[[example]]
+name = "identity"
+
+[[example]]
+name = "context"
+required-features = ["testing"]
+
+[[example]]
+name = "tools"
+required-features = ["testing"]
+
 [lints]
 workspace = true
