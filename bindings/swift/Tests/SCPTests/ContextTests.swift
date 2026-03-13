@@ -140,7 +140,9 @@ struct ContextTests {
     @Test("Context.create returns a context in active state")
     func createReturnsActiveContext() async throws {
         let capturedParams = Locked<ContextParams?>(nil)
-        let createFn: ContextBridge.CreateFn = { _, params in
+        let capturedIdentity = Locked<Identity?>(nil)
+        let createFn: ContextBridge.CreateFn = { identity, params in
+            capturedIdentity.withLock { $0 = identity }
             capturedParams.withLock { $0 = params }
             return MockContextHandle(
                 id: "ctx-create-test",
@@ -174,6 +176,10 @@ struct ContextTests {
 
         #expect(await context.contextId == "ctx-create-test")
         #expect(await context.state == .active)
+
+        // Verify the factory forwarded identity to the bridge function
+        let forwardedIdentity = capturedIdentity.current
+        #expect(forwardedIdentity != nil)
 
         // Verify the factory forwarded params to the bridge function
         let forwarded = capturedParams.current
