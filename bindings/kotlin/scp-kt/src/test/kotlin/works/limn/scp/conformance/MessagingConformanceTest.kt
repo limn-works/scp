@@ -57,7 +57,7 @@ class MessagingConformanceTest {
             runTest(testDispatcher) {
                 val result = dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "hello"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
                 )
                 assertEquals("sent", result["status"])
                 assertTrue(stubBindings.contextSendCalled)
@@ -68,7 +68,7 @@ class MessagingConformanceTest {
             runTest(testDispatcher) {
                 dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "test message"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "test message"),
                 )
                 assertEquals(
                     "test message",
@@ -83,7 +83,7 @@ class MessagingConformanceTest {
                     BridgeException("Context closed", "SCP-CTX-2010")
                 val result = dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "hello"),
+                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
                 )
                 assertEquals("SCP-CTX-2010", result["error"])
             }
@@ -203,6 +203,7 @@ class MessagingConformanceTest {
                     operation = "context_send",
                     input = mapOf(
                         "context_handle" to "10",
+                        "identity_handle" to "1",
                         "payload" to "hello world",
                     ),
                     expected = mapOf("status" to "sent"),

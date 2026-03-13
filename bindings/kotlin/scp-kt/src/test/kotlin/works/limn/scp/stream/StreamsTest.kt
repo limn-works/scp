@@ -461,17 +461,19 @@ class StubEventContextBindings : EventContextBindings {
 
     override fun contextCreate(identityHandle: Long, paramsJson: String): Long = contextCreateResult
 
-    override fun contextJoin(identityHandle: Long, contextId: String): Long = contextJoinResult
+    override fun contextJoin(contextHandle: Long, identityHandle: Long) {
+        // no-op
+    }
 
-    override fun contextLeave(contextHandle: Long) {
+    override fun contextLeave(contextHandle: Long, identityHandle: Long) {
         contextLeaveCalled = true
     }
 
-    override fun contextClose(contextHandle: Long) {
+    override fun contextClose(contextHandle: Long, identityHandle: Long) {
         contextCloseCalled = true
     }
 
-    override fun contextSend(contextHandle: Long, payload: ByteArray) {
+    override fun contextSend(contextHandle: Long, identityHandle: Long, payload: ByteArray) {
         contextSendCalled = true
     }
 

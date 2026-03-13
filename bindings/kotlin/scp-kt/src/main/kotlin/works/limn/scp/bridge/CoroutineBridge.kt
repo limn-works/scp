@@ -165,23 +165,22 @@ interface ContextBindings {
     ): Long
 
     /**
-     * Joins an existing SCP context by context ID.
+     * Joins an existing SCP context.
      *
      * The context must be in `Active` state. Delegates to `ContextManager`
      * which validates version compatibility and adds the member with a
      * key package.
      *
+     * @param contextHandle Opaque handle from [contextCreate].
      * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
      *   or [IdentityBindings.identityLoad].
-     * @param contextId The unique identifier of the context to join.
-     * @return Opaque context handle.
      * @throws BridgeException with `SCP-CTX-2013` if the context is not
      *   in active state, or with `SCP-VALID-7000` if the DID is malformed.
      */
     fun contextJoin(
+        contextHandle: Long,
         identityHandle: Long,
-        contextId: String,
-    ): Long
+    )
 
     /**
      * Leaves an SCP context gracefully (member-initiated).
@@ -190,9 +189,14 @@ interface ContextBindings {
      * The context remains active for other members.
      *
      * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
+     *   or [IdentityBindings.identityLoad].
      * @throws BridgeException with `SCP-CTX-2001` if the leave operation fails.
      */
-    fun contextLeave(contextHandle: Long)
+    fun contextLeave(
+        contextHandle: Long,
+        identityHandle: Long,
+    )
 
     /**
      * Closes an SCP context (admin action).
@@ -201,10 +205,15 @@ interface ContextBindings {
      * by the `ContextManager` via the `ContextClose` capability check.
      *
      * @param contextHandle Opaque handle from [contextCreate].
+     * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
+     *   or [IdentityBindings.identityLoad].
      * @throws BridgeException with `SCP-CTX-2001` if the close operation
      *   fails or the caller lacks the `ContextClose` capability.
      */
-    fun contextClose(contextHandle: Long)
+    fun contextClose(
+        contextHandle: Long,
+        identityHandle: Long,
+    )
 
     /**
      * Sends a message to an SCP context.
@@ -214,12 +223,15 @@ interface ContextBindings {
      * provider. The context must be in `Active` state.
      *
      * @param contextHandle Opaque handle from [contextCreate] or [contextJoin].
+     * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
+     *   or [IdentityBindings.identityLoad].
      * @param payload Raw message bytes (application content).
      * @throws BridgeException with `SCP-CTX-2019` if the context is not
      *   active, or with `SCP-CRYPTO-4001` if inner envelope signing fails.
      */
     fun contextSend(
         contextHandle: Long,
+        identityHandle: Long,
         payload: ByteArray,
     )
 
@@ -492,14 +504,15 @@ interface BroadcastBindings {
      * active subscribers can decrypt it.
      *
      * @param contextHandle Opaque handle from context create or join.
-     * @param authorDid DID of the author publishing the message.
+     * @param identityHandle Opaque handle from [IdentityBindings.identityCreate]
+     *   or [IdentityBindings.identityLoad] for the publishing author.
      * @param payload Raw message bytes to broadcast.
      * @throws BridgeException if publishing fails (e.g., author is not
      *   the broadcast owner, context not active).
      */
     fun broadcastPublish(
         contextHandle: Long,
-        authorDid: String,
+        identityHandle: Long,
         payload: ByteArray,
     )
 
@@ -622,42 +635,53 @@ interface ToolBindings {
      * Invokes a registered tool in an SCP context.
      *
      * Validates the input against the tool's JSON schema, checks UCAN
-     * authorization, and dispatches to the tool handler if one is
-     * registered. The context must be in `Active` state.
+     * authorization via the full 11-step ADR-016 pipeline, and dispatches
+     * to the tool handler if one is registered. The context must be in
+     * `Active` state.
      *
      * @param contextHandle Opaque handle from context create or join.
      * @param toolId The tool's assigned ID from [toolRegister].
      * @param inputJson JSON-encoded tool input matching the tool's
      *   input schema.
+     * @param identityHandle Opaque handle for the invoker's identity
+     *   (used for capability checking).
+     * @param ucanToken Optional JWT-encoded UCAN token authorizing the
+     *   invocation. Must contain `tool_invoke:{tool_id}` or
+     *   `tool_invoke:*` capability.
+     * @param proofTokens Optional list of encoded parent UCAN tokens
+     *   for delegation chain traversal (ADR-016 step 3).
      * @return JSON-encoded tool output.
      * @throws BridgeException with `SCP-TOOL-6005` if the context is not
      *   active, with `SCP-TOOL-6002` if invocation fails, or with
      *   `SCP-PERM-3001` if UCAN authorization fails.
      */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun toolInvoke(
         contextHandle: Long,
         toolId: String,
         inputJson: String,
+        identityHandle: Long,
+        ucanToken: String?,
+        proofTokens: List<String>?,
     ): String
 
     /**
-     * Verifies a tool invocation's input/output pair against test vectors.
+     * Verifies a tool's registration status in an SCP context.
      *
-     * Checks that the given input produces the expected output according
-     * to the tool's registered test vectors.
+     * Checks that the tool is registered and returns its verification
+     * result including whether it passed and any failure details.
      *
+     * @param contextHandle Opaque handle from context create or join.
      * @param toolId The tool's assigned ID.
-     * @param inputJson JSON-encoded tool input.
-     * @param outputJson JSON-encoded tool output to verify.
-     * @return `true` if verification passes (all test vectors satisfied).
+     * @return JSON-encoded verification result with `tool_id`, `passed`,
+     *   and `failures` fields.
      * @throws BridgeException with `SCP-TOOL-6007` if the context is not
      *   active or verification encounters an error.
      */
     fun toolVerify(
+        contextHandle: Long,
         toolId: String,
-        inputJson: String,
-        outputJson: String,
-    ): Boolean
+    ): String
 }
 
 /**
@@ -674,18 +698,24 @@ interface UcanBindings {
      * prevention, revocation checking, delegation chain traversal, and
      * capability ceiling enforcement.
      *
+     * @param contextHandle Opaque handle from context create or join.
      * @param token The UCAN token string (JWT-encoded).
      * @param capability The capability URI to validate against (e.g.,
      *   `"scp:ctx:abc123/messages:write"`).
-     * @param contextId The context ID for scoping the validation.
+     * @param presentingAgentDid Optional DID of the presenting agent
+     *   for delegation chain verification.
+     * @param proofTokens Optional list of encoded parent UCAN tokens
+     *   for delegation chain traversal (ADR-016 step 3).
      * @throws BridgeException with `SCP-PERM-3002` if validation fails
      *   (malformed token, expired, revoked, nonce replay, insufficient
      *   capability, or invalid signature).
      */
     fun ucanValidate(
+        contextHandle: Long,
         token: String,
         capability: String,
-        contextId: String,
+        presentingAgentDid: String?,
+        proofTokens: List<String>?,
     )
 
     /**
@@ -696,7 +726,7 @@ interface UcanBindings {
      * `scp_core::crypto::ucan::mint::mint_ucan`. Capabilities are
      * automatically scoped to the context. Enforces ceiling constraints.
      *
-     * @param identityHandle Opaque handle from identity create or load.
+     * @param contextHandle Opaque handle from context create or join.
      * @param memberDid The DID of the member receiving the token.
      * @param capabilitiesJson JSON-encoded list of capability URI strings
      *   to grant (e.g., `["messages:write", "tool_invoke:*"]`).
@@ -706,7 +736,7 @@ interface UcanBindings {
      *   custody for signing.
      */
     fun ucanMint(
-        identityHandle: Long,
+        contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
     ): String
@@ -719,12 +749,12 @@ interface UcanBindings {
      * idempotent: revoking a non-existent or already-revoked token
      * succeeds silently.
      *
-     * @param identityHandle Opaque handle from identity create or load.
+     * @param contextHandle Opaque handle from context create or join.
      * @param token The full encoded JWT string of the token to revoke.
      * @throws BridgeException if the revocation operation fails.
      */
     fun ucanRevoke(
-        identityHandle: Long,
+        contextHandle: Long,
         token: String,
     )
 
@@ -1137,41 +1167,50 @@ class ContextBridge internal constructor(
     ): Long = bridge.ffiCall { bindings.contextCreate(identityHandle, paramsJson) }
 
     /**
-     * Join an existing context by ID.
+     * Join an existing context.
      *
+     * @param contextHandle Handle from context create.
      * @param identityHandle Handle from identity create or load.
-     * @param contextId The context ID to join.
-     * @return Opaque context handle.
      */
     suspend fun join(
+        contextHandle: Long,
         identityHandle: Long,
-        contextId: String,
-    ): Long = bridge.ffiCall { bindings.contextJoin(identityHandle, contextId) }
+    ): Unit = bridge.ffiCall { bindings.contextJoin(contextHandle, identityHandle) }
 
     /**
      * Leave a context gracefully (member action).
      *
      * @param contextHandle Handle from context create or join.
+     * @param identityHandle Handle from identity create or load.
      */
-    suspend fun leave(contextHandle: Long): Unit = bridge.ffiCall { bindings.contextLeave(contextHandle) }
+    suspend fun leave(
+        contextHandle: Long,
+        identityHandle: Long,
+    ): Unit = bridge.ffiCall { bindings.contextLeave(contextHandle, identityHandle) }
 
     /**
      * Close a context (admin action). Terminates the context for all members.
      *
      * @param contextHandle Handle from context create.
+     * @param identityHandle Handle from identity create or load.
      */
-    suspend fun close(contextHandle: Long): Unit = bridge.ffiCall { bindings.contextClose(contextHandle) }
+    suspend fun close(
+        contextHandle: Long,
+        identityHandle: Long,
+    ): Unit = bridge.ffiCall { bindings.contextClose(contextHandle, identityHandle) }
 
     /**
      * Send a message to a context.
      *
      * @param contextHandle Handle from context create or join.
+     * @param identityHandle Handle from identity create or load.
      * @param payload Raw message bytes.
      */
     suspend fun send(
         contextHandle: Long,
+        identityHandle: Long,
         payload: ByteArray,
-    ): Unit = bridge.ffiCall { bindings.contextSend(contextHandle, payload) }
+    ): Unit = bridge.ffiCall { bindings.contextSend(contextHandle, identityHandle, payload) }
 
     /**
      * Set the economic policy for a context (§19.3).
@@ -1275,27 +1314,41 @@ class ToolBridge internal constructor(
      * @param contextHandle Handle from context create or join.
      * @param toolId The tool's assigned ID.
      * @param inputJson JSON-encoded tool input.
+     * @param identityHandle Handle for the invoker's identity.
+     * @param ucanToken Optional UCAN token authorizing the invocation.
+     * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @return JSON-encoded tool output.
      */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     suspend fun invoke(
         contextHandle: Long,
         toolId: String,
         inputJson: String,
-    ): String = bridge.ffiCall { bindings.toolInvoke(contextHandle, toolId, inputJson) }
+        identityHandle: Long,
+        ucanToken: String?,
+        proofTokens: List<String>? = null,
+    ): String = bridge.ffiCall {
+        bindings.toolInvoke(
+            contextHandle,
+            toolId,
+            inputJson,
+            identityHandle,
+            ucanToken,
+            proofTokens,
+        )
+    }
 
     /**
-     * Verify a tool invocation's input/output pair.
+     * Verify a tool's registration status in a context.
      *
+     * @param contextHandle Handle from context create or join.
      * @param toolId The tool's ID.
-     * @param inputJson JSON-encoded tool input.
-     * @param outputJson JSON-encoded tool output.
-     * @return true if the verification passes.
+     * @return JSON-encoded verification result.
      */
     suspend fun verify(
+        contextHandle: Long,
         toolId: String,
-        inputJson: String,
-        outputJson: String,
-    ): Boolean = bridge.ffiCall { bindings.toolVerify(toolId, inputJson, outputJson) }
+    ): String = bridge.ffiCall { bindings.toolVerify(contextHandle, toolId) }
 }
 
 /**
@@ -1308,41 +1361,47 @@ class UcanBridge internal constructor(
     /**
      * Validate a UCAN token for a capability in a context.
      *
+     * @param contextHandle Handle from context create or join.
      * @param token The UCAN token string.
      * @param capability The capability to validate.
-     * @param contextId The context ID.
+     * @param presentingAgentDid Optional DID of the presenting agent.
+     * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @throws BridgeException if validation fails.
      */
     suspend fun validate(
+        contextHandle: Long,
         token: String,
         capability: String,
-        contextId: String,
-    ): Unit = bridge.ffiCall { bindings.ucanValidate(token, capability, contextId) }
+        presentingAgentDid: String? = null,
+        proofTokens: List<String>? = null,
+    ): Unit = bridge.ffiCall {
+        bindings.ucanValidate(contextHandle, token, capability, presentingAgentDid, proofTokens)
+    }
 
     /**
      * Mint a UCAN token delegating capabilities to a member DID.
      *
-     * @param identityHandle Handle from identity create or load.
+     * @param contextHandle Handle from context create or join.
      * @param memberDid The DID to delegate capabilities to.
      * @param capabilitiesJson JSON-encoded list of capabilities.
      * @return The minted UCAN token string.
      */
     suspend fun mint(
-        identityHandle: Long,
+        contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
-    ): String = bridge.ffiCall { bindings.ucanMint(identityHandle, memberDid, capabilitiesJson) }
+    ): String = bridge.ffiCall { bindings.ucanMint(contextHandle, memberDid, capabilitiesJson) }
 
     /**
      * Revoke a previously minted UCAN token.
      *
-     * @param identityHandle Handle from identity create or load.
+     * @param contextHandle Handle from context create or join.
      * @param token The full encoded JWT string of the token to revoke.
      */
     suspend fun revoke(
-        identityHandle: Long,
+        contextHandle: Long,
         token: String,
-    ): Unit = bridge.ffiCall { bindings.ucanRevoke(identityHandle, token) }
+    ): Unit = bridge.ffiCall { bindings.ucanRevoke(contextHandle, token) }
 
     /**
      * Delegate a UCAN token to another entity with attenuated capabilities.
@@ -1577,14 +1636,15 @@ class BroadcastBridgeOps internal constructor(
      * Publish a message to a broadcast context.
      *
      * @param contextHandle Handle from context create or join.
-     * @param authorDid The DID of the author publishing the message.
+     * @param identityHandle Handle from identity create or load for the
+     *   publishing author.
      * @param payload Raw message bytes.
      */
     suspend fun publish(
         contextHandle: Long,
-        authorDid: String,
+        identityHandle: Long,
         payload: ByteArray,
-    ): Unit = bridge.ffiCall { bindings.broadcastPublish(contextHandle, authorDid, payload) }
+    ): Unit = bridge.ffiCall { bindings.broadcastPublish(contextHandle, identityHandle, payload) }
 
     /**
      * Block a subscriber's read access in a broadcast context.

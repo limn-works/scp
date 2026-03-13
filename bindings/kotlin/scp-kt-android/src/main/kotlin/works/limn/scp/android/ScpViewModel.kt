@@ -22,14 +22,16 @@ import kotlinx.coroutines.sync.withLock
  * Resource handle for an active SCP context tracked by [ScpViewModel].
  *
  * Encapsulates the opaque context handle returned by [CoroutineBridge.ContextBridge.create]
- * or [CoroutineBridge.ContextBridge.join], along with the bridge needed to call [leave] on
- * cleanup.
+ * or [CoroutineBridge.ContextBridge.join], the identity handle of the member, and the bridge
+ * needed to call [leave] on cleanup.
  *
  * @property handle Opaque context handle from the FFI layer.
+ * @property identityHandle Opaque identity handle for the member in this context.
  * @property bridge The [CoroutineBridge] used to dispatch cleanup operations.
  */
 data class TrackedContext(
     val handle: Long,
+    val identityHandle: Long,
     val bridge: CoroutineBridge,
 )
 
@@ -53,7 +55,7 @@ data class TrackedContext(
  *     private val contextHandle = ...
  *
  *     init {
- *         trackContext(TrackedContext(contextHandle, bridge))
+ *         trackContext(TrackedContext(contextHandle, identityHandle, bridge))
  *     }
  *
  *     val messages: StateFlow<List<String>> = bridge.context
@@ -116,7 +118,7 @@ abstract class ScpViewModel : ViewModel() {
                 snapshot
             }
             for (ctx in contexts) {
-                runCatching { ctx.bridge.context.leave(ctx.handle) }
+                runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
             }
         }
         cleanupScope.cancel()

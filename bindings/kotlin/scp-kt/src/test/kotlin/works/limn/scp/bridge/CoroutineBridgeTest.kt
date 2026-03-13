@@ -102,30 +102,28 @@ class CoroutineBridgeTest {
         @Test
         fun `contextJoin dispatches on IO`() =
             runTest(ioDispatcher) {
-                stubBindings.contextJoinResult = 11L
-                val result = bridge.context.join(1L, "ctx-123")
-                assertEquals(11L, result)
+                bridge.context.join(10L, 1L)
             }
 
         @Test
         fun `contextSend dispatches on IO`() =
             runTest(ioDispatcher) {
                 val payload = "hello".toByteArray()
-                bridge.context.send(10L, payload)
+                bridge.context.send(10L, 1L, payload)
                 assertTrue(stubBindings.contextSendCalled)
             }
 
         @Test
         fun `contextLeave dispatches on IO`() =
             runTest(ioDispatcher) {
-                bridge.context.leave(10L)
+                bridge.context.leave(10L, 1L)
                 assertTrue(stubBindings.contextLeaveCalled)
             }
 
         @Test
         fun `contextClose dispatches on IO`() =
             runTest(ioDispatcher) {
-                bridge.context.close(10L)
+                bridge.context.close(10L, 1L)
                 assertTrue(stubBindings.contextCloseCalled)
             }
     }
@@ -148,7 +146,7 @@ class CoroutineBridgeTest {
         fun `toolInvoke dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.toolInvokeResult = """{"output":"ok"}"""
-                val result = bridge.tools.invoke(10L, "tool-001", """{"input":"data"}""")
+                val result = bridge.tools.invoke(10L, "tool-001", """{"input":"data"}""", 1L, "ucan.token.sig")
                 assertEquals("""{"output":"ok"}""", result)
             }
 
@@ -156,14 +154,14 @@ class CoroutineBridgeTest {
         fun `toolVerify dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.toolVerifyResult = true
-                val result = bridge.tools.verify("tool-001", """{"in":"x"}""", """{"out":"y"}""")
-                assertTrue(result)
+                val result = bridge.tools.verify(10L, "tool-001")
+                assertTrue(result.contains("\"passed\":true"))
             }
 
         @Test
         fun `ucanValidate dispatches on IO`() =
             runTest(ioDispatcher) {
-                bridge.ucan.validate("token", "read", "ctx-1")
+                bridge.ucan.validate(10L, "token", "read")
                 assertTrue(stubBindings.ucanValidateCalled)
             }
 
@@ -171,14 +169,14 @@ class CoroutineBridgeTest {
         fun `ucanMint dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.ucanMintResult = "minted-token"
-                val result = bridge.ucan.mint(1L, "did:dht:member", """["read","write"]""")
+                val result = bridge.ucan.mint(10L, "did:dht:member", """["read","write"]""")
                 assertEquals("minted-token", result)
             }
 
         @Test
         fun `ucanRevoke dispatches on IO`() =
             runTest(ioDispatcher) {
-                bridge.ucan.revoke(1L, "header.payload.signature")
+                bridge.ucan.revoke(10L, "header.payload.signature")
                 assertTrue(stubBindings.ucanRevokeCalled)
             }
 
@@ -593,20 +591,29 @@ class StubNativeBindings : NativeBindings {
     ): Long = contextCreateResult
 
     override fun contextJoin(
+        contextHandle: Long,
         identityHandle: Long,
-        contextId: String,
-    ): Long = contextJoinResult
+    ) {
+        // no-op
+    }
 
-    override fun contextLeave(contextHandle: Long) {
+    override fun contextLeave(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         contextLeaveCalled = true
     }
 
-    override fun contextClose(contextHandle: Long) {
+    override fun contextClose(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         contextCloseCalled = true
     }
 
     override fun contextSend(
         contextHandle: Long,
+        identityHandle: Long,
         payload: ByteArray,
     ) {
         contextSendCalled = true
@@ -662,7 +669,7 @@ class StubNativeBindings : NativeBindings {
     var broadcastUnblockThrows: Exception? = null
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
-    override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
+    override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) {
         broadcastBlockCalled = true
         lastBlockSubscriberDid = subscriberDid
@@ -689,30 +696,34 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         toolId: String,
         inputJson: String,
+        identityHandle: Long,
+        ucanToken: String?,
+        proofTokens: List<String>?,
     ): String = toolInvokeResult
 
     override fun toolVerify(
+        contextHandle: Long,
         toolId: String,
-        inputJson: String,
-        outputJson: String,
-    ): Boolean = toolVerifyResult
+    ): String = """{"tool_id":"$toolId","passed":$toolVerifyResult,"failures":[]}"""
 
     override fun ucanValidate(
+        contextHandle: Long,
         token: String,
         capability: String,
-        contextId: String,
+        presentingAgentDid: String?,
+        proofTokens: List<String>?,
     ) {
         ucanValidateCalled = true
     }
 
     override fun ucanMint(
-        identityHandle: Long,
+        contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
     ): String = ucanMintResult
 
     override fun ucanRevoke(
-        identityHandle: Long,
+        contextHandle: Long,
         token: String,
     ) {
         ucanRevokeCalled = true

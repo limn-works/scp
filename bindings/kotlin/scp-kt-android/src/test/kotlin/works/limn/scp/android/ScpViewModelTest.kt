@@ -52,8 +52,8 @@ class ScpViewModelTest {
     @Test
     fun `onCleared calls leave on all tracked contexts`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel()
-        val ctx1 = TrackedContext(handle = 1L, bridge = bridge)
-        val ctx2 = TrackedContext(handle = 2L, bridge = bridge)
+        val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
+        val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
 
         viewModel.trackContext(ctx1)
         viewModel.trackContext(ctx2)
@@ -72,8 +72,8 @@ class ScpViewModelTest {
         stubBindings.leaveThrowsForHandle = 1L
 
         val viewModel = TestScpViewModel()
-        viewModel.trackContext(TrackedContext(handle = 1L, bridge = bridge))
-        viewModel.trackContext(TrackedContext(handle = 2L, bridge = bridge))
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
         advanceUntilIdle()
 
         viewModel.callOnCleared()
@@ -86,7 +86,7 @@ class ScpViewModelTest {
     @Test
     fun `untrackContext prevents leave on cleared`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel()
-        val ctx = TrackedContext(handle = 1L, bridge = bridge)
+        val ctx = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
 
         viewModel.trackContext(ctx)
         advanceUntilIdle()
@@ -111,7 +111,7 @@ class ScpViewModelTest {
     @Test
     fun `trackContext returns the same context for chaining`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel()
-        val ctx = TrackedContext(handle = 42L, bridge = bridge)
+        val ctx = TrackedContext(handle = 42L, identityHandle = 1L, bridge = bridge)
         val returned = viewModel.trackContext(ctx)
         assertEquals(ctx, returned)
     }
@@ -119,7 +119,7 @@ class ScpViewModelTest {
     @Test
     fun `onCleared clears the active contexts list`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel()
-        viewModel.trackContext(TrackedContext(handle = 1L, bridge = bridge))
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
         advanceUntilIdle()
 
         viewModel.callOnCleared()
@@ -151,7 +151,7 @@ private class TestNativeBindings : NativeBindings {
     val leaveCalledHandles = mutableListOf<Long>()
     var leaveThrowsForHandle: Long? = null
 
-    override fun contextLeave(contextHandle: Long) {
+    override fun contextLeave(contextHandle: Long, identityHandle: Long) {
         leaveCalledHandles.add(contextHandle)
         if (contextHandle == leaveThrowsForHandle) {
             throw ScpLeaveException("leave failed for handle $contextHandle")
@@ -162,9 +162,9 @@ private class TestNativeBindings : NativeBindings {
     override fun identityLoad(did: String): Long = 0L
     override fun identityResolve(did: String): String = ""
     override fun contextCreate(identityHandle: Long, paramsJson: String): Long = 0L
-    override fun contextJoin(identityHandle: Long, contextId: String): Long = 0L
-    override fun contextClose(contextHandle: Long) { /* no-op */ }
-    override fun contextSend(contextHandle: Long, payload: ByteArray) { /* no-op */ }
+    override fun contextJoin(contextHandle: Long, identityHandle: Long) { /* no-op */ }
+    override fun contextClose(contextHandle: Long, identityHandle: Long) { /* no-op */ }
+    override fun contextSend(contextHandle: Long, identityHandle: Long, payload: ByteArray) { /* no-op */ }
     override fun contextSubscribe(contextHandle: Long, callback: MessageCallback): Long = 0L
     override fun contextUnsubscribe(subscriptionHandle: Long) { /* no-op */ }
     override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) { /* no-op */ }
@@ -193,7 +193,7 @@ private class TestNativeBindings : NativeBindings {
     // BroadcastBindings
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
-    override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
+    override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
     override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) = Unit
     override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String = "{}"
@@ -202,11 +202,25 @@ private class TestNativeBindings : NativeBindings {
     override fun broadcastAdmission(contextHandle: Long): String? = null
 
     override fun toolRegister(contextHandle: Long, definitionJson: String): String = ""
-    override fun toolInvoke(contextHandle: Long, toolId: String, inputJson: String): String = ""
-    override fun toolVerify(toolId: String, inputJson: String, outputJson: String): Boolean = false
-    override fun ucanValidate(token: String, capability: String, contextId: String) { /* no-op */ }
-    override fun ucanMint(identityHandle: Long, memberDid: String, capabilitiesJson: String): String = ""
-    override fun ucanRevoke(identityHandle: Long, token: String) { /* no-op */ }
+    override fun toolInvoke(
+        contextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String?,
+        proofTokens: List<String>?,
+    ): String = ""
+    override fun toolVerify(contextHandle: Long, toolId: String): String =
+        """{"tool_id":"$toolId","passed":false,"failures":[]}"""
+    override fun ucanValidate(
+        contextHandle: Long,
+        token: String,
+        capability: String,
+        presentingAgentDid: String?,
+        proofTokens: List<String>?,
+    ) { /* no-op */ }
+    override fun ucanMint(contextHandle: Long, memberDid: String, capabilitiesJson: String): String = ""
+    override fun ucanRevoke(contextHandle: Long, token: String) { /* no-op */ }
     override fun ucanDelegate(
         contextHandle: Long,
         delegatorDid: String,
