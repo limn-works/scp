@@ -1080,6 +1080,54 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
     await expect(ctx.resetTtlTimer(-5)).rejects.toThrow(ContextError);
   });
 
+  it("extendTtl rejects zero or negative seconds", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.extendTtl(0)).rejects.toThrow(ContextError);
+    await expect(ctx.extendTtl(-10)).rejects.toThrow(ContextError);
+  });
+
+  it("extendTtl rejects Infinity and -Infinity", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.extendTtl(Infinity)).rejects.toThrow(ContextError);
+    await expect(ctx.extendTtl(-Infinity)).rejects.toThrow(ContextError);
+  });
+
+  it("proposeTtlExtension rejects Infinity and -Infinity", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.proposeTtlExtension(Infinity)).rejects.toThrow(ContextError);
+    await expect(ctx.proposeTtlExtension(-Infinity)).rejects.toThrow(ContextError);
+  });
+
+  it("resetTtlTimer rejects Infinity and -Infinity", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.resetTtlTimer(Infinity)).rejects.toThrow(ContextError);
+    await expect(ctx.resetTtlTimer(-Infinity)).rejects.toThrow(ContextError);
+  });
+
   it("export returns Uint8Array", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const handle = await mockBridge.contextCreate(
