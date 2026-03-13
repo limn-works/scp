@@ -1055,8 +1055,7 @@ mod tests {
         let ctx_id = format!("ctx-napi-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiTsTest";
 
-        let handle =
-            NapiContextHandle::test_active(ctx_id.clone(), creator_did.to_owned());
+        let handle = NapiContextHandle::test_active(ctx_id.clone(), creator_did.to_owned());
 
         let definition = NapiToolDefinition {
             name: "napi-timestamp-probe".to_owned(),
