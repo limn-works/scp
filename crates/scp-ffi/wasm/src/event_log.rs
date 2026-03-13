@@ -594,7 +594,7 @@ mod tests {
     // JSON output structure — validates the serialized event format
     // -----------------------------------------------------------------------
 
-    /// Helper: builds a LogSummary event JSON value matching the bridge output.
+    /// Helper: builds a `LogSummary` event JSON value matching the bridge output.
     fn build_log_summary(count: u64, root: &str, timestamp: f64) -> serde_json::Value {
         let payload = serde_json::json!({
             "event_count": count,
