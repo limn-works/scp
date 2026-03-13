@@ -18,6 +18,19 @@ See ``.docs/adrs/phase-3.md`` ADR-014 for the full SDK design.
 
 from __future__ import annotations
 
+import sys
+
+# Register the native extension under its bare name so that function-scoped
+# ``import _scp_core`` (used throughout the SDK) resolves correctly.  Maturin
+# installs the extension as ``scp_sdk._scp_core`` (see pyproject.toml
+# module-name), but every call-site does a bare ``import _scp_core``.
+try:
+    from scp_sdk import _scp_core
+
+    sys.modules["_scp_core"] = _scp_core
+except ImportError:
+    pass  # Native extension not available (pure-Python / mocked tests)
+
 from scp_sdk.bridge import (
     create_shadow,
 )
