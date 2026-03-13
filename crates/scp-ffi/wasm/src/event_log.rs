@@ -209,17 +209,100 @@ impl WasmCheckpoint {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Extracts filter fields from a parsed JSON filter object.
+///
+/// The filter JSON uses camelCase keys matching the TypeScript `EventFilter`
+/// interface: `eventType`, `actorDid`, `afterSequence`, `beforeSequence`,
+/// `limit`. This mirrors the NAPI bridge's filter handling (where the
+/// TypeScript wrapper converts camelCase to `snake_case` before sending,
+/// but WASM receives camelCase directly from `JSON.stringify`).
+fn extract_filter(filter: Option<&serde_json::Value>) -> ParsedFilter {
+    let Some(f) = filter else {
+        return ParsedFilter::default();
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    ParsedFilter {
+        event_type: f
+            .get("eventType")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        actor_did: f
+            .get("actorDid")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        after_sequence: f.get("afterSequence").and_then(serde_json::Value::as_u64),
+        before_sequence: f.get("beforeSequence").and_then(serde_json::Value::as_u64),
+        limit: f
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .map(|l| l as usize),
+    }
+}
+
+/// Parsed filter criteria for event log queries.
+#[derive(Default)]
+struct ParsedFilter {
+    event_type: Option<String>,
+    actor_did: Option<String>,
+    after_sequence: Option<u64>,
+    before_sequence: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// Applies filter criteria to an event JSON value.
+///
+/// Returns `true` if the event passes all filter conditions. The event is
+/// expected to have `eventType`, `actorDid`, and `sequence` fields matching
+/// the TypeScript `Event` interface.
+fn event_matches_filter(event: &serde_json::Value, filter: &ParsedFilter) -> bool {
+    if let Some(ref et) = filter.event_type
+        && event.get("eventType").and_then(|v| v.as_str()) != Some(et.as_str())
+    {
+        return false;
+    }
+    if let Some(ref ad) = filter.actor_did
+        && event.get("actorDid").and_then(|v| v.as_str()) != Some(ad.as_str())
+    {
+        return false;
+    }
+    if let Some(after_seq) = filter.after_sequence {
+        let seq = event
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if seq <= after_seq {
+            return false;
+        }
+    }
+    if let Some(before_seq) = filter.before_sequence {
+        let seq = event
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if seq >= before_seq {
+            return false;
+        }
+    }
+    true
+}
+
 /// Queries the context event log.
 ///
 /// Delegates to `WasmContextManager::event_log_query`. Returns a JSON array of
 /// event objects matching the TypeScript `Event` interface. When events exist,
 /// returns a `LogSummary` event carrying event count and Merkle root in
 /// `payloadJson`, consistent with the NAPI bridge.
+///
+/// Filter fields (`eventType`, `actorDid`, `afterSequence`, `beforeSequence`,
+/// `limit`) are applied to the returned events. Fields use camelCase to match
+/// the TypeScript `EventFilter` interface directly — the WASM bridge receives
+/// JSON from `JSON.stringify(filter)` without `snake_case` conversion (unlike
+/// the NAPI bridge where the TypeScript wrapper converts keys).
 #[wasm_bindgen]
 pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        // Validate filter JSON if provided, and extract limit.
+        // Validate filter JSON if provided.
         let filter: Option<serde_json::Value> = match filter_json {
             Some(ref json_str) => {
                 let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
@@ -234,6 +317,8 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
             None => None,
         };
 
+        let parsed = extract_filter(filter.as_ref());
+
         let (count, root) =
             with_manager(|mgr| mgr.event_log_query(&context_id)).map_err(ScpWasmError::into_js)?;
 
@@ -241,13 +326,6 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
         if count == 0 {
             return Ok(JsValue::from_str("[]"));
         }
-
-        #[allow(clippy::cast_possible_truncation)]
-        let limit = filter
-            .as_ref()
-            .and_then(|f| f.get("limit"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|l| l as usize);
 
         let payload = serde_json::json!({
             "event_count": count,
@@ -265,11 +343,15 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
             "sequence": count.saturating_sub(1),
         });
 
+        // Apply filter criteria (eventType, actorDid, afterSequence,
+        // beforeSequence) then limit. This matches the NAPI bridge pattern
+        // where filters are applied to the returned events.
         let events = [summary];
-        let result: Vec<&serde_json::Value> = limit.map_or_else(
-            || events.iter().collect(),
-            |lim| events.iter().take(lim).collect(),
-        );
+        let result: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| event_matches_filter(e, &parsed))
+            .take(parsed.limit.unwrap_or(usize::MAX))
+            .collect();
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
@@ -525,5 +607,211 @@ mod tests {
             msg.contains("SCP-VALID-7040"),
             "error should contain SCP-VALID-7040, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON output structure — validates the serialized event format
+    // -----------------------------------------------------------------------
+
+    /// Helper: builds a LogSummary event JSON value matching the bridge output.
+    fn build_log_summary(count: u64, root: &str, timestamp: f64) -> serde_json::Value {
+        let payload = serde_json::json!({
+            "event_count": count,
+            "merkle_root": root,
+        });
+        serde_json::json!({
+            "eventType": "LogSummary",
+            "actorDid": "",
+            "timestamp": timestamp,
+            "payloadJson": serde_json::to_string(&payload).unwrap(),
+            "sequence": count.saturating_sub(1),
+        })
+    }
+
+    #[test]
+    fn json_output_has_required_event_fields() {
+        let event = build_log_summary(5, "abcd1234", 1_700_000_000.0);
+        assert_eq!(event["eventType"], "LogSummary");
+        assert_eq!(event["actorDid"], "");
+        assert_eq!(event["timestamp"], 1_700_000_000.0);
+        assert_eq!(event["sequence"], 4);
+        // payloadJson is a nested JSON string.
+        let payload_str = event["payloadJson"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(payload_str).unwrap();
+        assert_eq!(payload["event_count"], 5);
+        assert_eq!(payload["merkle_root"], "abcd1234");
+    }
+
+    #[test]
+    fn json_output_wraps_in_array() {
+        let event = build_log_summary(1, "ffff", 100.0);
+        let events = vec![&event];
+        let serialized = serde_json::to_string(&events).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["eventType"], "LogSummary");
+    }
+
+    #[test]
+    fn json_output_empty_array_when_no_events() {
+        let events: Vec<&serde_json::Value> = vec![];
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert_eq!(serialized, "[]");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_filter — camelCase filter field extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_filter_none_returns_defaults() {
+        let parsed = extract_filter(None);
+        assert!(parsed.event_type.is_none());
+        assert!(parsed.actor_did.is_none());
+        assert!(parsed.after_sequence.is_none());
+        assert!(parsed.before_sequence.is_none());
+        assert!(parsed.limit.is_none());
+    }
+
+    #[test]
+    fn extract_filter_extracts_all_camel_case_fields() {
+        let filter = Some(serde_json::json!({
+            "eventType": "MessageSent",
+            "actorDid": "did:dht:z1234",
+            "afterSequence": 5,
+            "beforeSequence": 10,
+            "limit": 3,
+        }));
+        let parsed = extract_filter(filter.as_ref());
+        assert_eq!(parsed.event_type.as_deref(), Some("MessageSent"));
+        assert_eq!(parsed.actor_did.as_deref(), Some("did:dht:z1234"));
+        assert_eq!(parsed.after_sequence, Some(5));
+        assert_eq!(parsed.before_sequence, Some(10));
+        assert_eq!(parsed.limit, Some(3));
+    }
+
+    #[test]
+    fn extract_filter_partial_fields() {
+        let filter = Some(serde_json::json!({ "limit": 1 }));
+        let parsed = extract_filter(filter.as_ref());
+        assert!(parsed.event_type.is_none());
+        assert_eq!(parsed.limit, Some(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // event_matches_filter — filter predicate tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn filter_matches_all_when_no_criteria() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter::default();
+        assert!(event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_by_event_type_match() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            event_type: Some("LogSummary".to_owned()),
+            ..Default::default()
+        };
+        assert!(event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_by_event_type_mismatch() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            event_type: Some("MessageSent".to_owned()),
+            ..Default::default()
+        };
+        assert!(!event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_by_actor_did_mismatch() {
+        let event = build_log_summary(5, "root", 100.0);
+        // LogSummary has actorDid="" so filtering for a specific DID should exclude it.
+        let filter = ParsedFilter {
+            actor_did: Some("did:dht:z1234".to_owned()),
+            ..Default::default()
+        };
+        assert!(!event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_by_actor_did_match_empty() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            actor_did: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_after_sequence_excludes() {
+        // LogSummary has sequence = count - 1 = 4.
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            after_sequence: Some(4),
+            ..Default::default()
+        };
+        // sequence 4 is NOT > 4, so should be excluded.
+        assert!(!event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_after_sequence_includes() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            after_sequence: Some(3),
+            ..Default::default()
+        };
+        // sequence 4 > 3, so should be included.
+        assert!(event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_before_sequence_excludes() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            before_sequence: Some(4),
+            ..Default::default()
+        };
+        // sequence 4 is NOT < 4, so should be excluded.
+        assert!(!event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_before_sequence_includes() {
+        let event = build_log_summary(5, "root", 100.0);
+        let filter = ParsedFilter {
+            before_sequence: Some(5),
+            ..Default::default()
+        };
+        // sequence 4 < 5, so should be included.
+        assert!(event_matches_filter(&event, &filter));
+    }
+
+    #[test]
+    fn filter_combined_after_and_before_sequence() {
+        let event = build_log_summary(5, "root", 100.0);
+        // sequence = 4, range (3, 6) → 4 > 3 && 4 < 6 → included
+        let filter = ParsedFilter {
+            after_sequence: Some(3),
+            before_sequence: Some(6),
+            ..Default::default()
+        };
+        assert!(event_matches_filter(&event, &filter));
+
+        // sequence = 4, range (4, 6) → 4 > 4 is false → excluded
+        let filter2 = ParsedFilter {
+            after_sequence: Some(4),
+            before_sequence: Some(6),
+            ..Default::default()
+        };
+        assert!(!event_matches_filter(&event, &filter2));
     }
 }
