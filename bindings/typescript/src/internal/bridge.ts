@@ -447,3 +447,16 @@ export async function getBridge(): Promise<Bridge> {
 export function _resetBridge(): void {
   _bridge = null;
 }
+
+/**
+ * Injects a bridge instance for testing.
+ *
+ * This is intended for testing only — it allows tests to inject a mock bridge
+ * so that SDK classes (`Context`, `Identity`, etc.) use the mock instead of
+ * loading a native or WASM bridge.
+ *
+ * @internal
+ */
+export function _setBridge(bridge: Bridge): void {
+  _bridge = bridge;
+}
