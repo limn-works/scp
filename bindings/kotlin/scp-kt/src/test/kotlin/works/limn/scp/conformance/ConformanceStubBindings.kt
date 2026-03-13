@@ -36,7 +36,6 @@ class ConformanceStubBindings : NativeBindings {
 
     var contextCreateResult: Long = 10L
     var contextCreateError: BridgeException? = null
-    var contextJoinResult: Long = 11L
     var contextJoinError: BridgeException? = null
 
     var contextLeaveCalled = false
@@ -303,7 +302,6 @@ class ConformanceStubBindings : NativeBindings {
         identityResolveError = null
         contextCreateResult = 10L
         contextCreateError = null
-        contextJoinResult = 11L
         contextJoinError = null
         contextLeaveCalled = false
         contextLeaveError = null

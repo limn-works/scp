@@ -106,7 +106,7 @@ override fun onCleared() {
             snapshot
         }
         for (ctx in contexts) {
-            runCatching { ctx.bridge.context.leave(ctx.handle) }
+            runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
         }
         cleanupScope.cancel()
     }

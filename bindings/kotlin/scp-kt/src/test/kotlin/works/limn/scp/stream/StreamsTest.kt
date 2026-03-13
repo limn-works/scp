@@ -444,7 +444,6 @@ class StubEventContextBindings : EventContextBindings {
     var contextSubscribeResult = 0L
     var contextSubscribeEventsResult = 0L
     var contextCreateResult = 0L
-    var contextJoinResult = 0L
     var contextUnsubscribeCalled = false
     var eventUnsubscribeCalled = false
     var contextLeaveCalled = false
