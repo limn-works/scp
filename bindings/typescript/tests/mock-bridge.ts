@@ -49,6 +49,8 @@ interface MockContext {
   ucans: Map<string, UcanToken>;
   revokedTokens: Set<string>;
   economicPolicy: string | null;
+  ttlSecs: number | null;
+  drainedEvents: string[];
 }
 
 interface MockTransport {
@@ -210,7 +212,7 @@ export function createMockBridge(): Bridge & {
       identity: BridgeIdentityHandle,
       paramsJson: string,
     ): Promise<BridgeContextHandle> {
-      const _params = JSON.parse(paramsJson);
+      const params = JSON.parse(paramsJson) as { ttlSeconds?: number };
       const contextId = generateId("ctx");
       const ctx: MockContext = {
         contextId,
@@ -223,6 +225,8 @@ export function createMockBridge(): Bridge & {
         ucans: new Map(),
         revokedTokens: new Set(),
         economicPolicy: null,
+        ttlSecs: params.ttlSeconds ?? null,
+        drainedEvents: [],
       };
 
       // Record ContextCreated event
@@ -632,11 +636,108 @@ export function createMockBridge(): Bridge & {
       return null;
     },
 
-    async contextExtendTtl(
-      _handle: BridgeContextHandle,
-      _additionalSecs: number,
-    ): Promise<boolean> {
+    async contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<boolean> {
+      const ctx = getContext(handle);
+      if (ctx.ttlSecs !== null) {
+        ctx.ttlSecs += additionalSecs;
+      }
       return true;
+    },
+
+    async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
+      const ctx = getContext(handle);
+      ctx.state = "expired";
+      ctx.events.push({
+        eventType: "TtlExpired",
+        actorDid: ctx.creatorDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: {},
+        sequence: ctx.events.length,
+      });
+      for (const sub of ctx.subscriptions) {
+        sub.onComplete();
+      }
+    },
+
+    async contextProposeTtlExtension(
+      handle: BridgeContextHandle,
+      _proposerDid: string,
+      extensionSecs: number,
+    ): Promise<boolean> {
+      const ctx = getContext(handle);
+      // In the mock, single-member contexts auto-approve
+      if (ctx.ttlSecs !== null) {
+        ctx.ttlSecs += extensionSecs;
+      }
+      return ctx.members.size <= 1;
+    },
+
+    async contextResetTtlTimer(
+      handle: BridgeContextHandle,
+      newDurationSecs: number,
+    ): Promise<void> {
+      const ctx = getContext(handle);
+      ctx.ttlSecs = newDurationSecs;
+    },
+
+    async contextExport(handle: BridgeContextHandle): Promise<Uint8Array> {
+      const ctx = getContext(handle);
+      const exportData = {
+        snapshot: {
+          context_id: ctx.contextId,
+          creator_did: ctx.creatorDid,
+          state: ctx.state,
+          members: [...ctx.members],
+          event_count: ctx.events.length,
+        },
+      };
+      return new TextEncoder().encode(JSON.stringify(exportData));
+    },
+
+    async contextImport(data: Uint8Array): Promise<string> {
+      const json = new TextDecoder().decode(data);
+      let parsed: { snapshot?: { context_id?: string; creator_did?: string; members?: string[] } };
+      try {
+        parsed = JSON.parse(json) as typeof parsed;
+      } catch {
+        throw new Error("[SCP-CTX-2032] Invalid export data: malformed JSON");
+      }
+      const snapshot = parsed.snapshot;
+      if (snapshot === undefined || snapshot.context_id === undefined) {
+        throw new Error("[SCP-CTX-2032] Invalid export data: missing snapshot");
+      }
+      const contextId = snapshot.context_id;
+      const creatorDid = snapshot.creator_did ?? "did:dht:unknown";
+      const members = snapshot.members ?? [creatorDid];
+      const ctx: MockContext = {
+        contextId,
+        state: "active",
+        creatorDid,
+        events: [],
+        tools: new Map(),
+        members: new Set(members),
+        subscriptions: [],
+        ucans: new Map(),
+        revokedTokens: new Set(),
+        economicPolicy: null,
+        ttlSecs: null,
+        drainedEvents: [],
+      };
+      ctx.events.push({
+        eventType: "ContextImported",
+        actorDid: creatorDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { contextId },
+        sequence: 0,
+      });
+      contexts.set(contextId, ctx);
+      return contextId;
+    },
+
+    async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
+      const ctx = getContext(handle);
+      const events = ctx.events.map((e) => JSON.stringify(e));
+      return events;
     },
 
     // Economic policy (§19.3)

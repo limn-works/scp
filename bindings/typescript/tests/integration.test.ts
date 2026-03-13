@@ -10,11 +10,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { _validateEconomicPolicyJson } from "../src/context";
-import { ValidationError } from "../src/errors";
-import { _resetBridge } from "../src/internal/bridge";
+import { _validateEconomicPolicyJson, Context } from "../src/context";
+import { ContextError, ValidationError } from "../src/errors";
+import { _resetBridge, _setBridge } from "../src/internal/bridge";
 import { defineToolDefinition } from "../src/tools";
 import { Transport } from "../src/transport";
+import { delegateUcan, mintUcan } from "../src/ucan";
 import { createMockBridge } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -891,5 +892,284 @@ describe("EconomicPolicy schema validation", () => {
   it("rejects missing payee", () => {
     const json = JSON.stringify({ locked: false, cost_schedule: {}, payment_adapters: [] });
     expect(() => _validateEconomicPolicyJson(json)).toThrow(/'payee' must be a string/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. TTL expiry, proposal, and reset (bridge level)
+// ---------------------------------------------------------------------------
+
+describe("TTL operations (mock bridge)", () => {
+  it("handleTtlExpiry transitions context to expired", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+
+    await mockBridge.contextHandleTtlExpiry(ctx);
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    expect(ctxState?.state).toBe("expired");
+  });
+
+  it("proposeTtlExtension returns true for single-member context", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+
+    const approved = await mockBridge.contextProposeTtlExtension(ctx, identity.did, 120);
+    expect(approved).toBe(true);
+    expect(mockBridge._contexts.get(ctx.contextId)?.ttlSecs).toBe(420);
+  });
+
+  it("proposeTtlExtension returns false for multi-member context", async () => {
+    const alice = await mockBridge.identityCreate("in_memory");
+    const bob = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      alice,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    await mockBridge.contextJoin(ctx, bob.did);
+
+    const approved = await mockBridge.contextProposeTtlExtension(ctx, alice.did, 120);
+    expect(approved).toBe(false);
+  });
+
+  it("resetTtlTimer replaces TTL with new duration", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+
+    await mockBridge.contextResetTtlTimer(ctx, 600);
+    expect(mockBridge._contexts.get(ctx.contextId)?.ttlSecs).toBe(600);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. Context export/import (bridge level)
+// ---------------------------------------------------------------------------
+
+describe("Context export/import (mock bridge)", () => {
+  it("exports and re-imports a context", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+    );
+
+    const exported = await mockBridge.contextExport(ctx);
+    expect(exported).toBeInstanceOf(Uint8Array);
+    expect(exported.length).toBeGreaterThan(0);
+
+    const importedId = await mockBridge.contextImport(exported);
+    expect(importedId).toBe(ctx.contextId);
+
+    // The imported context should be active
+    const importedCtx = mockBridge._contexts.get(importedId);
+    expect(importedCtx?.state).toBe("active");
+  });
+
+  it("import rejects malformed data", async () => {
+    await expect(mockBridge.contextImport(new TextEncoder().encode("not json{"))).rejects.toThrow(
+      /SCP-CTX-2032/,
+    );
+  });
+
+  it("import rejects missing snapshot", async () => {
+    await expect(
+      mockBridge.contextImport(new TextEncoder().encode(JSON.stringify({}))),
+    ).rejects.toThrow(/SCP-CTX-2032/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. Drain events (bridge level)
+// ---------------------------------------------------------------------------
+
+describe("Drain events (mock bridge)", () => {
+  it("drains events from context", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+    );
+
+    await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg1"));
+    await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg2"));
+
+    const events = await mockBridge.contextDrainEvents(ctx);
+    expect(events.length).toBe(3); // ContextCreated + 2 MessageSent
+    for (const e of events) {
+      expect(typeof e).toBe("string");
+      const parsed = JSON.parse(e);
+      expect(parsed.eventType).toBeTruthy();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. SDK Context class: TTL, export/import, drain (SDK wrapper level)
+// ---------------------------------------------------------------------------
+
+describe("Context SDK wrapper — TTL, export/import, drain", () => {
+  beforeEach(() => {
+    _setBridge(mockBridge);
+  });
+
+  it("handleTtlExpiry delegates to bridge", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await ctx.handleTtlExpiry();
+    expect(mockBridge._contexts.get(handle.contextId)?.state).toBe("expired");
+  });
+
+  it("proposeTtlExtension delegates to bridge", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    const approved = await ctx.proposeTtlExtension(120);
+    expect(approved).toBe(true);
+  });
+
+  it("proposeTtlExtension rejects zero or negative seconds", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.proposeTtlExtension(0)).rejects.toThrow(ContextError);
+    await expect(ctx.proposeTtlExtension(-10)).rejects.toThrow(ContextError);
+  });
+
+  it("resetTtlTimer delegates to bridge", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await ctx.resetTtlTimer(600);
+    expect(mockBridge._contexts.get(handle.contextId)?.ttlSecs).toBe(600);
+  });
+
+  it("resetTtlTimer rejects zero or negative seconds", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.resetTtlTimer(0)).rejects.toThrow(ContextError);
+    await expect(ctx.resetTtlTimer(-5)).rejects.toThrow(ContextError);
+  });
+
+  it("export returns Uint8Array", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"] }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    const exported = await ctx.export();
+    expect(exported).toBeInstanceOf(Uint8Array);
+    expect(exported.length).toBeGreaterThan(0);
+  });
+
+  it("static import returns context ID", async () => {
+    _setBridge(mockBridge);
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"] }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    const exported = await ctx.export();
+    const importedId = await Context.import(exported);
+    expect(importedId).toBe(handle.contextId);
+  });
+
+  it("drainEvents returns event strings", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await mockBridge.contextSend(handle, identity.did, new TextEncoder().encode("hello"));
+
+    const events = await ctx.drainEvents();
+    expect(events.length).toBe(2); // ContextCreated + MessageSent
+    for (const e of events) {
+      expect(typeof e).toBe("string");
+    }
+  });
+
+  it("methods throw on disposed context", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await ctx.leave();
+
+    await expect(ctx.handleTtlExpiry()).rejects.toThrow(ContextError);
+    await expect(ctx.proposeTtlExtension(120)).rejects.toThrow(ContextError);
+    await expect(ctx.resetTtlTimer(600)).rejects.toThrow(ContextError);
+    await expect(ctx.export()).rejects.toThrow(ContextError);
+    await expect(ctx.drainEvents()).rejects.toThrow(ContextError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. UCAN delegation via SDK wrapper
+// ---------------------------------------------------------------------------
+
+describe("UCAN delegation (SDK wrapper)", () => {
+  beforeEach(() => {
+    _setBridge(mockBridge);
+  });
+
+  it("delegateUcan delegates to bridge and returns delegated token", async () => {
+    const admin = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      admin,
+      JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+    );
+    const ctx = Context._fromHandle(handle, admin.did);
+
+    const memberDid = (await mockBridge.identityCreate("in_memory")).did;
+    const parentToken = await mintUcan(ctx, memberDid, ["messages:read", "messages:write"]);
+
+    const delegateeDid = (await mockBridge.identityCreate("in_memory")).did;
+    const delegated = await delegateUcan(ctx, parentToken, memberDid, delegateeDid, [
+      "messages:read",
+    ]);
+
+    expect(delegated.issuer).toBe(memberDid);
+    expect(delegated.audience).toBe(delegateeDid);
+    expect(delegated.capabilities).toEqual(["messages:read"]);
+    expect(delegated.encoded).toBeTruthy();
   });
 });
