@@ -376,6 +376,12 @@ class ParticipationThreshold:
                 f"Valid: {sorted(PARTICIPATION_THRESHOLD_OPERATORS)}"
             )
             raise ValueError(msg)
+        if self.value < 0:
+            msg = (
+                f"ParticipationThreshold.value must be non-negative "
+                f"(Rust type is u64), got {self.value}"
+            )
+            raise ValueError(msg)
 
 
 @dataclass
@@ -429,6 +435,46 @@ class ParticipationProfile:
     #: 64-byte array as a list of integers.
     signature: list[int] = field(default_factory=lambda: [0] * 64)
 
+    def __post_init__(self) -> None:
+        # Non-negative validation for u64 numeric fields.
+        _u64_fields = (
+            "participation_duration_secs",
+            "governance_actions_against",
+            "governance_actions_by",
+            "tool_invocation_count",
+            "context_creation_count",
+            "role_progression_count",
+            "attestation_count",
+            "updated_at",
+        )
+        for name in _u64_fields:
+            val = getattr(self, name)
+            if val < 0:
+                msg = (
+                    f"ParticipationProfile.{name} must be non-negative "
+                    f"(Rust type is u64), got {val}"
+                )
+                raise ValueError(msg)
+
+        # Byte array length validation.
+        _byte_fields: list[tuple[str, int]] = [
+            ("event_log_root", 32),
+            ("signer_public_key", 32),
+            ("signature", 64),
+        ]
+        for name, expected_len in _byte_fields:
+            arr = getattr(self, name)
+            if len(arr) != expected_len:
+                msg = (
+                    f"ParticipationProfile.{name} must be exactly {expected_len} "
+                    f"elements, got {len(arr)}"
+                )
+                raise ValueError(msg)
+            for i, elem in enumerate(arr):
+                if not (0 <= elem <= 255):
+                    msg = f"ParticipationProfile.{name}[{i}] must be 0-255, got {elem}"
+                    raise ValueError(msg)
+
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict matching the Rust ``ParticipationProfile``
         serde JSON representation."""
@@ -468,11 +514,33 @@ class RequireParticipation:
 
     #: Maximum age in seconds for the profile's ``updated_at``
     #: timestamp. Profiles older than this are rejected.
+    #: SDK convenience default: 3600 (1 hour).
     max_age_secs: int = 3600
 
     #: Minimum number of independent source contexts (distinct
     #: ``signer_public_key`` values) required.
+    #: SDK convenience default: 1. Rust type is u32 (max 4294967295).
     min_contexts: int = 1
+
+    def __post_init__(self) -> None:
+        if self.max_age_secs < 0:
+            msg = (
+                f"RequireParticipation.max_age_secs must be non-negative "
+                f"(Rust type is u64), got {self.max_age_secs}"
+            )
+            raise ValueError(msg)
+        if self.min_contexts < 0:
+            msg = (
+                f"RequireParticipation.min_contexts must be non-negative "
+                f"(Rust type is u32), got {self.min_contexts}"
+            )
+            raise ValueError(msg)
+        if self.min_contexts > 0xFFFF_FFFF:
+            msg = (
+                f"RequireParticipation.min_contexts must be <= 4294967295 "
+                f"(Rust type is u32), got {self.min_contexts}"
+            )
+            raise ValueError(msg)
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict matching the Rust ``RequireParticipation``
@@ -501,12 +569,23 @@ def verify_participation_requirements(
     5. Diagnostic error reporting (``ParticipationAdmissionError``).
     6. Typed field extraction (``ParticipationFact.extract_value``).
 
+    .. note::
+
+        **Breaking change from earlier API:** This function now accepts
+        ``list[RequireParticipation]`` and ``list[ParticipationProfile]``
+        (plural) instead of singular values. The failure mode changed
+        from returning ``False`` to raising ``RuntimeError`` with
+        diagnostic details from the Rust bridge. The ``-> bool`` return
+        type is kept for compatibility, but in practice the function
+        can only return ``True`` -- verification failures raise.
+
     Args:
         requirements: The participation requirements to verify against.
         profiles: The participation profiles to evaluate.
 
     Returns:
-        ``True`` if all requirements are satisfied.
+        ``True`` if all requirements are satisfied. This function never
+        returns ``False`` -- verification failures raise ``RuntimeError``.
 
     Raises:
         ScpError: If the bridge module is not available.
