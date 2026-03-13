@@ -211,30 +211,65 @@ impl WasmCheckpoint {
 
 /// Queries the context event log.
 ///
-/// Delegates to `WasmContextManager::event_log_query`. Returns a JSON string
-/// with `eventCount` and `merkleRoot` fields.
+/// Delegates to `WasmContextManager::event_log_query`. Returns a JSON array of
+/// event objects matching the TypeScript `Event` interface. When events exist,
+/// returns a `LogSummary` event carrying event count and Merkle root in
+/// `payloadJson`, consistent with the NAPI bridge.
 #[wasm_bindgen]
 pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        // Validate filter JSON if provided.
-        if let Some(ref filter) = filter_json {
-            let _f: serde_json::Value = serde_json::from_str(filter).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("filter_json is not valid JSON: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
-                }
-                .into_js()
-            })?;
-        }
+        // Validate filter JSON if provided, and extract limit.
+        let filter: Option<serde_json::Value> = match filter_json {
+            Some(ref json_str) => {
+                let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+                    ScpWasmError::Validation {
+                        message: format!("filter_json is not valid JSON: {e}"),
+                        code: "SCP-VALID-7000".to_owned(),
+                    }
+                    .into_js()
+                })?;
+                Some(parsed)
+            }
+            None => None,
+        };
 
         let (count, root) =
             with_manager(|mgr| mgr.event_log_query(&context_id)).map_err(ScpWasmError::into_js)?;
 
-        let result = serde_json::json!({
-            "eventCount": count,
-            "merkleRoot": root,
+        // Empty log → empty array.
+        if count == 0 {
+            return Ok(JsValue::from_str("[]"));
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let limit = filter
+            .as_ref()
+            .and_then(|f| f.get("limit"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|l| l as usize);
+
+        let payload = serde_json::json!({
+            "event_count": count,
+            "merkle_root": root,
         });
+
+        #[allow(clippy::cast_precision_loss)]
+        let timestamp_f64 = crate::time::now_secs() as f64;
+
+        let summary = serde_json::json!({
+            "eventType": "LogSummary",
+            "actorDid": "",
+            "timestamp": timestamp_f64,
+            "payloadJson": serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned()),
+            "sequence": count.saturating_sub(1),
+        });
+
+        let events = [summary];
+        let result: Vec<&serde_json::Value> = limit.map_or_else(
+            || events.iter().collect(),
+            |lim| events.iter().take(lim).collect(),
+        );
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
