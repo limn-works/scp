@@ -554,7 +554,6 @@ class StubNativeBindings : NativeBindings {
     var identityLoadResult = 0L
     var identityResolveResult = ""
     var contextCreateResult = 0L
-    var contextJoinResult = 0L
     var contextSubscribeResult = 0L
     var toolRegisterResult = ""
     var toolInvokeResult = ""
