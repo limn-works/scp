@@ -935,6 +935,7 @@ describe("TTL operations (mock bridge)", () => {
 
     const approved = await mockBridge.contextProposeTtlExtension(ctx, alice.did, 120);
     expect(approved).toBe(false);
+    expect(mockBridge._contexts.get(ctx.contextId)?.ttlSecs).toBe(300);
   });
 
   it("resetTtlTimer replaces TTL with new duration", async () => {
