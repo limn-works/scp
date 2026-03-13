@@ -32,6 +32,7 @@ public enum ContextBridge {
     /// The closure type for sending a message. Injected for testability.
     public typealias SendFn = @Sendable (
         _ handle: any ContextHandleProtocol,
+        _ identity: Identity,
         _ payload: Data
     ) async throws -> Void
 
@@ -43,12 +44,14 @@ public enum ContextBridge {
 
     /// The closure type for leaving a context. Injected for testability.
     public typealias LeaveFn = @Sendable (
-        _ handle: any ContextHandleProtocol
+        _ handle: any ContextHandleProtocol,
+        _ identity: Identity
     ) async throws -> Void
 
     /// The closure type for closing a context. Injected for testability.
     public typealias CloseFn = @Sendable (
-        _ handle: any ContextHandleProtocol
+        _ handle: any ContextHandleProtocol,
+        _ identity: Identity
     ) async throws -> Void
 
     /// The closure type for joining an existing context. Injected for testability.
@@ -60,6 +63,39 @@ public enum ContextBridge {
     /// Default join function — delegates to UniFFI ``contextJoin``.
     public static let defaultJoin: JoinFn = { handle, identity in
         try await contextJoin(handle: handle, identity: identity)
+    }
+
+    /// Default send function — delegates to UniFFI ``contextSend``.
+    public static let defaultSend: SendFn = { handle, identity, payload in
+        guard let ctxHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "invalid handle type for contextSend",
+                code: "SCP-CTX-2001"
+            )
+        }
+        try await contextSend(handle: ctxHandle, identity: identity, payload: payload)
+    }
+
+    /// Default leave function — delegates to UniFFI ``contextLeave``.
+    public static let defaultLeave: LeaveFn = { handle, identity in
+        guard let ctxHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "invalid handle type for contextLeave",
+                code: "SCP-CTX-2001"
+            )
+        }
+        try await contextLeave(handle: ctxHandle, identity: identity)
+    }
+
+    /// Default close function — delegates to UniFFI ``contextClose``.
+    public static let defaultClose: CloseFn = { handle, identity in
+        guard let ctxHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "invalid handle type for contextClose",
+                code: "SCP-CTX-2001"
+            )
+        }
+        try await contextClose(handle: ctxHandle, identity: identity)
     }
 
     /// The closure type for setting economic policy. Injected for testability.
@@ -183,6 +219,12 @@ public actor Context {
 
     // MARK: - Internal state
 
+    /// The identity of the local participant in this context.
+    ///
+    /// Internal visibility so that extensions in other files (Tools.swift,
+    /// etc.) can access the identity for UniFFI bridge calls that require it.
+    let identity: Identity
+
     /// The opaque UniFFI handle to the Rust context.
     ///
     /// Internal visibility so that extensions in other files (Tools.swift,
@@ -218,6 +260,7 @@ public actor Context {
     ///
     /// - Parameters:
     ///   - handle: The opaque UniFFI context handle.
+    ///   - identity: The ``Identity`` of the local participant.
     ///   - contextId: Optional override for the context ID. When `nil`,
     ///     the ID is read from the handle. Pass explicitly in tests where
     ///     the handle has no backing FFI pointer.
@@ -230,18 +273,20 @@ public actor Context {
     ///   - closeFn: Bridge function for closing the context.
     init(
         handle: any ContextHandleProtocol,
+        identity: Identity,
         contextId: String? = nil,
         creatorDid: String? = nil,
         initialState: ContextState? = nil,
-        sendFn: @escaping ContextBridge.SendFn,
+        sendFn: @escaping ContextBridge.SendFn = ContextBridge.defaultSend,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
-        leaveFn: @escaping ContextBridge.LeaveFn,
-        closeFn: @escaping ContextBridge.CloseFn,
+        leaveFn: @escaping ContextBridge.LeaveFn = ContextBridge.defaultLeave,
+        closeFn: @escaping ContextBridge.CloseFn = ContextBridge.defaultClose,
         setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
             = ContextBridge.defaultSetEconomicPolicy,
         getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
             = ContextBridge.defaultGetEconomicPolicy
     ) {
+        self.identity = identity
         self.handle = handle
         if let contextId {
             self.contextId = contextId
@@ -280,14 +325,15 @@ public actor Context {
     deinit {
         // Safety net: schedule close if the caller forgot to call it explicitly.
         // `try?` intentionally suppresses errors in the deinit path. The detached
-        // task captures only the handle and closeFn (both Sendable) — it does not
-        // capture `self`, which would be invalid in deinit.
+        // task captures only the handle, identity, and closeFn (all Sendable) — it
+        // does not capture `self`, which would be invalid in deinit.
         streamContinuation?.finish()
         guard !didClose else { return }
         let capturedHandle = handle
+        let capturedIdentity = identity
         let capturedCloseFn = closeFn
         Task.detached {
-            try? await capturedCloseFn(capturedHandle)
+            try? await capturedCloseFn(capturedHandle, capturedIdentity)
         }
     }
 
@@ -311,14 +357,14 @@ public actor Context {
     ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
     /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
-    static func create( // swiftlint:disable:this function_parameter_count
+    static func create(
         identity: Identity,
         params: ContextParams,
         createFn: ContextBridge.CreateFn = ContextBridge.defaultCreate,
-        sendFn: @escaping ContextBridge.SendFn,
+        sendFn: @escaping ContextBridge.SendFn = ContextBridge.defaultSend,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
-        leaveFn: @escaping ContextBridge.LeaveFn,
-        closeFn: @escaping ContextBridge.CloseFn,
+        leaveFn: @escaping ContextBridge.LeaveFn = ContextBridge.defaultLeave,
+        closeFn: @escaping ContextBridge.CloseFn = ContextBridge.defaultClose,
         setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
             = ContextBridge.defaultSetEconomicPolicy,
         getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
@@ -327,6 +373,7 @@ public actor Context {
         let handle = try await createFn(identity, params)
         return Context(
             handle: handle,
+            identity: identity,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -354,7 +401,7 @@ public actor Context {
                 code: "SCP-CTX-2001"
             )
         }
-        try await sendFn(handle, payload)
+        try await sendFn(handle, identity, payload)
     }
 
     /// Sets the economic policy for this context (spec section 19).
@@ -463,7 +510,7 @@ public actor Context {
                 code: "SCP-CTX-2001"
             )
         }
-        try await leaveFn(handle)
+        try await leaveFn(handle, identity)
         state = .closed
         didClose = true
         streamContinuation?.finish()
@@ -487,7 +534,7 @@ public actor Context {
             // Closing an already-closed context is idempotent — no error.
             return
         }
-        try await closeFn(handle)
+        try await closeFn(handle, identity)
         state = .closed
         didClose = true
         streamContinuation?.finish()
