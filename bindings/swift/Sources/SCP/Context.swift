@@ -257,7 +257,6 @@ public actor Context {
     ///
     /// This initializer is `internal` — production callers use
     /// ``create(identity:params:)`` or `SCP.createContext(params:)`.
-
     ///
     /// - Parameters:
     ///   - handle: The opaque UniFFI context handle.
@@ -358,7 +357,7 @@ public actor Context {
     ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
     /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
-    static func create( // swiftlint:disable:this function_parameter_count
+    static func create(
         identity: Identity,
         params: ContextParams,
         createFn: ContextBridge.CreateFn = ContextBridge.defaultCreate,
