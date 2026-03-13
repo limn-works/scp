@@ -9,6 +9,14 @@
 //! - `discovery_normalize_address` — Normalize an address to canonical form.
 //! - `discovery_create_query` — Create a discovery query descriptor.
 //! - `context_discover` — Discover contexts from a DID or `scp://` URI.
+//! - `petname_set` / `petname_remove` — Set/remove DID petnames (§22.4).
+//! - `petname_set_context` / `petname_remove_context` — Context petnames.
+//! - `petname_resolve_did` / `petname_resolve_context` — Resolve petnames.
+//! - `petname_get_for_did` / `petname_get_for_context` — Reverse lookup.
+//! - `petname_apply_event` — Apply a `WasmPetnameEvent` matching scp-core's
+//!   event-driven mutation model (§22.9.2).
+//! - `petname_list_events` — List emitted events for an owner DID.
+//! - `petname_did_count` / `petname_context_count` — Count stored petnames.
 //!
 //! CI trigger: Re-run after transient GitHub API failure.
 //!
@@ -594,7 +602,44 @@ pub fn context_discover(query: String) -> Promise {
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Petname event types mirroring `scp_core::discovery::petnames::PetnameEvent`.
+///
+/// Events for the identity private state event log related to petnames (§22.9.2).
+/// All mutations flow through `apply_event` to match scp-core's append-only
+/// event log model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WasmPetnameEvent {
+    /// Assigns a petname to a DID.
+    SetPetname {
+        /// The DID to assign the petname to.
+        did: String,
+        /// The petname string.
+        name: String,
+    },
+    /// Removes a petname from a DID.
+    RemovePetname {
+        /// The DID whose petname is being removed.
+        did: String,
+    },
+    /// Assigns a petname to a context.
+    SetContextPetname {
+        /// The context ID to assign the petname to.
+        context_id: String,
+        /// The petname string.
+        name: String,
+    },
+    /// Removes a petname from a context.
+    RemoveContextPetname {
+        /// The context ID whose petname is being removed.
+        context_id: String,
+    },
+}
+
 /// In-memory petname map (mirrors scp-core `PetnameMap`).
+///
+/// All mutations go through `apply_event` to match scp-core's event-driven
+/// model (§22.9.2). Convenience methods (`set_petname`, etc.) create and apply
+/// events internally, recording them in `event_log` for retrieval.
 struct WasmPetnameMap {
     /// petname -> list of DIDs
     did_petnames: HashMap<String, Vec<String>>,
@@ -604,6 +649,8 @@ struct WasmPetnameMap {
     context_petnames: HashMap<String, Vec<String>>,
     /// context ID -> petname (reverse)
     context_to_petname: HashMap<String, String>,
+    /// Append-only log of applied events (mirrors identity private state log).
+    event_log: Vec<WasmPetnameEvent>,
 }
 
 impl WasmPetnameMap {
@@ -613,67 +660,107 @@ impl WasmPetnameMap {
             did_to_petname: HashMap::new(),
             context_petnames: HashMap::new(),
             context_to_petname: HashMap::new(),
+            event_log: Vec::new(),
         }
     }
 
+    /// Applies a petname event, updating internal state and recording the event.
+    ///
+    /// This is the primary mutation method -- all changes go through events
+    /// to match scp-core's append-only event log model (§3.7).
+    fn apply_event(&mut self, event: &WasmPetnameEvent) {
+        match event {
+            WasmPetnameEvent::SetPetname { did, name } => {
+                // Remove any existing petname for this DID.
+                if let Some(old_name) = self.did_to_petname.remove(did.as_str()) {
+                    if let Some(dids) = self.did_petnames.get_mut(&old_name) {
+                        dids.retain(|d| d != did);
+                    }
+                    if self.did_petnames.get(&old_name).is_some_and(Vec::is_empty) {
+                        self.did_petnames.remove(&old_name);
+                    }
+                }
+                // Set the new petname.
+                self.did_petnames
+                    .entry(name.clone())
+                    .or_default()
+                    .push(did.clone());
+                self.did_to_petname.insert(did.clone(), name.clone());
+            }
+            WasmPetnameEvent::RemovePetname { did } => {
+                if let Some(name) = self.did_to_petname.remove(did.as_str()) {
+                    if let Some(dids) = self.did_petnames.get_mut(&name) {
+                        dids.retain(|d| d != did);
+                    }
+                    if self.did_petnames.get(&name).is_some_and(Vec::is_empty) {
+                        self.did_petnames.remove(&name);
+                    }
+                }
+            }
+            WasmPetnameEvent::SetContextPetname { context_id, name } => {
+                // Remove any existing petname for this context.
+                if let Some(old_name) = self.context_to_petname.remove(context_id.as_str()) {
+                    if let Some(ids) = self.context_petnames.get_mut(&old_name) {
+                        ids.retain(|id| id != context_id);
+                    }
+                    if self
+                        .context_petnames
+                        .get(&old_name)
+                        .is_some_and(Vec::is_empty)
+                    {
+                        self.context_petnames.remove(&old_name);
+                    }
+                }
+                // Set the new petname.
+                self.context_petnames
+                    .entry(name.clone())
+                    .or_default()
+                    .push(context_id.clone());
+                self.context_to_petname
+                    .insert(context_id.clone(), name.clone());
+            }
+            WasmPetnameEvent::RemoveContextPetname { context_id } => {
+                if let Some(name) = self.context_to_petname.remove(context_id.as_str()) {
+                    if let Some(ids) = self.context_petnames.get_mut(&name) {
+                        ids.retain(|id| id != context_id);
+                    }
+                    if self.context_petnames.get(&name).is_some_and(Vec::is_empty) {
+                        self.context_petnames.remove(&name);
+                    }
+                }
+            }
+        }
+        self.event_log.push(event.clone());
+    }
+
+    /// Convenience: sets a petname for a DID via event.
     fn set_petname(&mut self, did: &str, name: &str) {
-        // Remove old petname for this DID if any.
-        if let Some(old_name) = self.did_to_petname.remove(did) {
-            if let Some(dids) = self.did_petnames.get_mut(&old_name) {
-                dids.retain(|d| d != did);
-            }
-            if self.did_petnames.get(&old_name).is_some_and(Vec::is_empty) {
-                self.did_petnames.remove(&old_name);
-            }
-        }
-        self.did_petnames
-            .entry(name.to_owned())
-            .or_default()
-            .push(did.to_owned());
-        self.did_to_petname.insert(did.to_owned(), name.to_owned());
+        self.apply_event(&WasmPetnameEvent::SetPetname {
+            did: did.to_owned(),
+            name: name.to_owned(),
+        });
     }
 
+    /// Convenience: removes a petname from a DID via event.
     fn remove_petname(&mut self, did: &str) {
-        if let Some(name) = self.did_to_petname.remove(did) {
-            if let Some(dids) = self.did_petnames.get_mut(&name) {
-                dids.retain(|d| d != did);
-            }
-            if self.did_petnames.get(&name).is_some_and(Vec::is_empty) {
-                self.did_petnames.remove(&name);
-            }
-        }
+        self.apply_event(&WasmPetnameEvent::RemovePetname {
+            did: did.to_owned(),
+        });
     }
 
+    /// Convenience: sets a petname for a context via event.
     fn set_context_petname(&mut self, context_id: &str, name: &str) {
-        if let Some(old_name) = self.context_to_petname.remove(context_id) {
-            if let Some(ids) = self.context_petnames.get_mut(&old_name) {
-                ids.retain(|id| id != context_id);
-            }
-            if self
-                .context_petnames
-                .get(&old_name)
-                .is_some_and(Vec::is_empty)
-            {
-                self.context_petnames.remove(&old_name);
-            }
-        }
-        self.context_petnames
-            .entry(name.to_owned())
-            .or_default()
-            .push(context_id.to_owned());
-        self.context_to_petname
-            .insert(context_id.to_owned(), name.to_owned());
+        self.apply_event(&WasmPetnameEvent::SetContextPetname {
+            context_id: context_id.to_owned(),
+            name: name.to_owned(),
+        });
     }
 
+    /// Convenience: removes a petname from a context via event.
     fn remove_context_petname(&mut self, context_id: &str) {
-        if let Some(name) = self.context_to_petname.remove(context_id) {
-            if let Some(ids) = self.context_petnames.get_mut(&name) {
-                ids.retain(|id| id != context_id);
-            }
-            if self.context_petnames.get(&name).is_some_and(Vec::is_empty) {
-                self.context_petnames.remove(&name);
-            }
-        }
+        self.apply_event(&WasmPetnameEvent::RemoveContextPetname {
+            context_id: context_id.to_owned(),
+        });
     }
 
     fn resolve_did(&self, name: &str) -> Vec<String> {
@@ -691,6 +778,16 @@ impl WasmPetnameMap {
     fn petname_for_context(&self, context_id: &str) -> Option<String> {
         self.context_to_petname.get(context_id).cloned()
     }
+
+    /// Returns the number of DID petnames (mirrors `PetnameMap::did_petname_count`).
+    fn did_petname_count(&self) -> usize {
+        self.did_to_petname.len()
+    }
+
+    /// Returns the number of context petnames (mirrors `PetnameMap::context_petname_count`).
+    fn context_petname_count(&self) -> usize {
+        self.context_to_petname.len()
+    }
 }
 
 /// Global petname maps keyed by owner DID.
@@ -700,24 +797,38 @@ fn wasm_petname_maps() -> &'static Mutex<HashMap<String, WasmPetnameMap>> {
     MAPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Sets a petname for a DID.
-///
-/// # Errors
-///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
-#[wasm_bindgen]
-pub fn petname_set(owner_did: String, target_did: String, name: String) -> Result<(), JsError> {
+/// Acquires the petname lock, returning a `JsError` on poison.
+fn lock_petname_maps()
+-> Result<std::sync::MutexGuard<'static, HashMap<String, WasmPetnameMap>>, JsError> {
+    wasm_petname_maps()
+        .lock()
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))
+}
+
+/// Validates that `owner_did` is non-empty.
+fn validate_owner_did(owner_did: &str) -> Result<(), JsError> {
     if owner_did.is_empty() {
         return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
     }
+    Ok(())
+}
+
+/// Sets a petname for a DID.
+///
+/// Emits a `SetPetname` event matching scp-core's `PetnameEvent::SetPetname`.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` or `target_did` is empty, or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_set(owner_did: String, target_did: String, name: String) -> Result<(), JsError> {
+    validate_owner_did(&owner_did)?;
     if target_did.is_empty() {
         return Err(JsError::new(
             "[SCP-VALID-7111] target_did must not be empty",
         ));
     }
-    wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+    lock_petname_maps()?
         .entry(owner_did)
         .or_insert_with(WasmPetnameMap::new)
         .set_petname(&target_did, &name);
@@ -726,19 +837,15 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
 
 /// Removes a petname from a DID.
 ///
+/// Emits a `RemovePetname` event matching scp-core's `PetnameEvent::RemovePetname`.
+///
 /// # Errors
 ///
 /// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
-    if let Some(map) = wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
-        .get_mut(&owner_did)
-    {
+    validate_owner_did(&owner_did)?;
+    if let Some(map) = lock_petname_maps()?.get_mut(&owner_did) {
         map.remove_petname(&target_did);
     }
     Ok(())
@@ -746,26 +853,25 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), JsErr
 
 /// Sets a petname for a context.
 ///
+/// Emits a `SetContextPetname` event matching scp-core's
+/// `PetnameEvent::SetContextPetname`.
+///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` or `context_id` is empty, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_set_context(
     owner_did: String,
     context_id: String,
     name: String,
 ) -> Result<(), JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
+    validate_owner_did(&owner_did)?;
     if context_id.is_empty() {
         return Err(JsError::new(
             "[SCP-VALID-7113] context_id must not be empty",
         ));
     }
-    wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+    lock_petname_maps()?
         .entry(owner_did)
         .or_insert_with(WasmPetnameMap::new)
         .set_context_petname(&context_id, &name);
@@ -774,19 +880,16 @@ pub fn petname_set_context(
 
 /// Removes a petname from a context.
 ///
+/// Emits a `RemoveContextPetname` event matching scp-core's
+/// `PetnameEvent::RemoveContextPetname`.
+///
 /// # Errors
 ///
 /// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(), JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
-    if let Some(map) = wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
-        .get_mut(&owner_did)
-    {
+    validate_owner_did(&owner_did)?;
+    if let Some(map) = lock_petname_maps()?.get_mut(&owner_did) {
         map.remove_context_petname(&context_id);
     }
     Ok(())
@@ -799,12 +902,8 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
 /// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
-    let dids = wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+    validate_owner_did(&owner_did)?;
+    let dids = lock_petname_maps()?
         .get(&owner_did)
         .map(|map| map.resolve_did(&name))
         .unwrap_or_default();
@@ -818,12 +917,8 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Js
 /// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String, JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
-    let ids = wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+    validate_owner_did(&owner_did)?;
+    let ids = lock_petname_maps()?
         .get(&owner_did)
         .map(|map| map.resolve_context(&name))
         .unwrap_or_default();
@@ -837,12 +932,8 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
 /// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_get_for_did(owner_did: String, target_did: String) -> Result<JsValue, JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
-    let name = wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+    validate_owner_did(&owner_did)?;
+    let name = lock_petname_maps()?
         .get(&owner_did)
         .and_then(|map| map.petname_for_did(&target_did));
     name.map_or_else(|| Ok(JsValue::NULL), |n| Ok(JsValue::from_str(&n)))
@@ -855,15 +946,93 @@ pub fn petname_get_for_did(owner_did: String, target_did: String) -> Result<JsVa
 /// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_get_for_context(owner_did: String, context_id: String) -> Result<JsValue, JsError> {
-    if owner_did.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
-    }
-    let name = wasm_petname_maps()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))?
+    validate_owner_did(&owner_did)?;
+    let name = lock_petname_maps()?
         .get(&owner_did)
         .and_then(|map| map.petname_for_context(&context_id));
     name.map_or_else(|| Ok(JsValue::NULL), |n| Ok(JsValue::from_str(&n)))
+}
+
+/// Applies a petname event from JSON.
+///
+/// The event JSON must match the `WasmPetnameEvent` serde format, which mirrors
+/// scp-core's `PetnameEvent` (§22.9.2). This is the event-driven mutation path
+/// matching `PetnameMap::apply_event` in scp-core.
+///
+/// Example JSON:
+/// ```json
+/// {"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}
+/// {"RemovePetname": {"did": "did:dht:zAlice"}}
+/// {"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}
+/// {"RemoveContextPetname": {"context_id": "ctx-1"}}
+/// ```
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty, the JSON is malformed,
+/// or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_apply_event(owner_did: String, event_json: String) -> Result<(), JsError> {
+    validate_owner_did(&owner_did)?;
+    let event: WasmPetnameEvent = serde_json::from_str(&event_json)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7114] invalid petname event JSON: {e}")))?;
+    lock_petname_maps()?
+        .entry(owner_did)
+        .or_insert_with(WasmPetnameMap::new)
+        .apply_event(&event);
+    Ok(())
+}
+
+/// Returns all emitted petname events for an owner DID as a JSON array.
+///
+/// Events are returned in emission order. Each element matches the
+/// `WasmPetnameEvent` serde format (same as scp-core `PetnameEvent`).
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_list_events(owner_did: String) -> Result<String, JsError> {
+    validate_owner_did(&owner_did)?;
+    let events: Vec<WasmPetnameEvent> = lock_petname_maps()?
+        .get(&owner_did)
+        .map(|map| map.event_log.clone())
+        .unwrap_or_default();
+    Ok(serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+/// Returns the number of DID petnames for an owner.
+///
+/// Mirrors `PetnameMap::did_petname_count` in scp-core.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_did_count(owner_did: String) -> Result<u32, JsError> {
+    validate_owner_did(&owner_did)?;
+    let count = lock_petname_maps()?
+        .get(&owner_did)
+        .map_or(0, WasmPetnameMap::did_petname_count);
+    u32::try_from(count)
+        .map_err(|_| JsError::new("[SCP-VALID-7115] petname count exceeds u32::MAX"))
+}
+
+/// Returns the number of context petnames for an owner.
+///
+/// Mirrors `PetnameMap::context_petname_count` in scp-core.
+///
+/// # Errors
+///
+/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+#[wasm_bindgen]
+pub fn petname_context_count(owner_did: String) -> Result<u32, JsError> {
+    validate_owner_did(&owner_did)?;
+    let count = lock_petname_maps()?
+        .get(&owner_did)
+        .map_or(0, WasmPetnameMap::context_petname_count);
+    u32::try_from(count)
+        .map_err(|_| JsError::new("[SCP-VALID-7116] petname count exceeds u32::MAX"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,6 +1634,198 @@ mod tests {
         map.set_petname("did:dht:zBob", "bob");
         assert_eq!(map.petname_for_did("did:dht:zBob"), Some("bob".to_owned()));
         assert_eq!(map.petname_for_did("did:dht:zNonExistent"), None);
+    }
+
+    // -- WasmPetnameEvent + apply_event tests --------------------------------
+
+    #[test]
+    fn wasm_petname_event_serialization_roundtrip() {
+        let events = vec![
+            WasmPetnameEvent::SetPetname {
+                did: "did:dht:zAlice".to_owned(),
+                name: "alice".to_owned(),
+            },
+            WasmPetnameEvent::RemovePetname {
+                did: "did:dht:zAlice".to_owned(),
+            },
+            WasmPetnameEvent::SetContextPetname {
+                context_id: "ctx-1".to_owned(),
+                name: "work".to_owned(),
+            },
+            WasmPetnameEvent::RemoveContextPetname {
+                context_id: "ctx-1".to_owned(),
+            },
+        ];
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            let deserialized: WasmPetnameEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event, &deserialized);
+        }
+    }
+
+    #[test]
+    fn wasm_petname_apply_event_set_petname() {
+        let mut map = WasmPetnameMap::new();
+        map.apply_event(&WasmPetnameEvent::SetPetname {
+            did: "did:dht:zAlice".to_owned(),
+            name: "alice".to_owned(),
+        });
+        assert_eq!(map.resolve_did("alice").len(), 1);
+        assert_eq!(map.event_log.len(), 1);
+    }
+
+    #[test]
+    fn wasm_petname_apply_event_remove_petname() {
+        let mut map = WasmPetnameMap::new();
+        map.apply_event(&WasmPetnameEvent::SetPetname {
+            did: "did:dht:zAlice".to_owned(),
+            name: "alice".to_owned(),
+        });
+        map.apply_event(&WasmPetnameEvent::RemovePetname {
+            did: "did:dht:zAlice".to_owned(),
+        });
+        assert!(map.resolve_did("alice").is_empty());
+        assert_eq!(map.event_log.len(), 2);
+    }
+
+    #[test]
+    fn wasm_petname_apply_event_set_context_petname() {
+        let mut map = WasmPetnameMap::new();
+        map.apply_event(&WasmPetnameEvent::SetContextPetname {
+            context_id: "ctx-recipes".to_owned(),
+            name: "recipes".to_owned(),
+        });
+        assert_eq!(map.resolve_context("recipes").len(), 1);
+        assert_eq!(map.event_log.len(), 1);
+    }
+
+    #[test]
+    fn wasm_petname_apply_event_remove_context_petname() {
+        let mut map = WasmPetnameMap::new();
+        map.apply_event(&WasmPetnameEvent::SetContextPetname {
+            context_id: "ctx-1".to_owned(),
+            name: "work".to_owned(),
+        });
+        map.apply_event(&WasmPetnameEvent::RemoveContextPetname {
+            context_id: "ctx-1".to_owned(),
+        });
+        assert!(map.resolve_context("work").is_empty());
+        assert_eq!(map.event_log.len(), 2);
+    }
+
+    #[test]
+    fn wasm_petname_convenience_methods_emit_events() {
+        let mut map = WasmPetnameMap::new();
+        map.set_petname("did:dht:zAlice", "alice");
+        map.set_context_petname("ctx-1", "work");
+        map.remove_petname("did:dht:zAlice");
+        map.remove_context_petname("ctx-1");
+        assert_eq!(map.event_log.len(), 4);
+        assert!(matches!(
+            &map.event_log[0],
+            WasmPetnameEvent::SetPetname { did, name }
+            if did == "did:dht:zAlice" && name == "alice"
+        ));
+        assert!(matches!(
+            &map.event_log[1],
+            WasmPetnameEvent::SetContextPetname { context_id, name }
+            if context_id == "ctx-1" && name == "work"
+        ));
+        assert!(matches!(
+            &map.event_log[2],
+            WasmPetnameEvent::RemovePetname { did }
+            if did == "did:dht:zAlice"
+        ));
+        assert!(matches!(
+            &map.event_log[3],
+            WasmPetnameEvent::RemoveContextPetname { context_id }
+            if context_id == "ctx-1"
+        ));
+    }
+
+    #[test]
+    fn wasm_petname_set_replaces_previous_emits_single_event() {
+        let mut map = WasmPetnameMap::new();
+        map.set_petname("did:dht:zAlice", "old-name");
+        map.set_petname("did:dht:zAlice", "new-name");
+        assert!(map.resolve_did("old-name").is_empty());
+        assert_eq!(map.resolve_did("new-name").len(), 1);
+        assert_eq!(map.event_log.len(), 2);
+    }
+
+    #[test]
+    fn wasm_petname_multiple_dids_same_name() {
+        let mut map = WasmPetnameMap::new();
+        map.set_petname("did:dht:zAlice1", "bob");
+        map.set_petname("did:dht:zAlice2", "bob");
+        assert_eq!(map.resolve_did("bob").len(), 2);
+    }
+
+    // -- WasmPetnameMap: count tests -----------------------------------------
+
+    #[test]
+    fn wasm_petname_did_count() {
+        let mut map = WasmPetnameMap::new();
+        assert_eq!(map.did_petname_count(), 0);
+        map.set_petname("did:dht:zAlice", "alice");
+        assert_eq!(map.did_petname_count(), 1);
+        map.set_petname("did:dht:zBob", "bob");
+        assert_eq!(map.did_petname_count(), 2);
+        map.remove_petname("did:dht:zAlice");
+        assert_eq!(map.did_petname_count(), 1);
+    }
+
+    #[test]
+    fn wasm_petname_context_count() {
+        let mut map = WasmPetnameMap::new();
+        assert_eq!(map.context_petname_count(), 0);
+        map.set_context_petname("ctx-1", "one");
+        assert_eq!(map.context_petname_count(), 1);
+        map.set_context_petname("ctx-2", "two");
+        assert_eq!(map.context_petname_count(), 2);
+        map.remove_context_petname("ctx-1");
+        assert_eq!(map.context_petname_count(), 1);
+    }
+
+    // -- WasmPetnameEvent serde format matches scp-core PetnameEvent ---------
+
+    #[test]
+    fn wasm_petname_event_serde_matches_core_format() {
+        let event = WasmPetnameEvent::SetPetname {
+            did: "did:dht:zAlice".to_owned(),
+            name: "alice".to_owned(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["SetPetname"].is_object());
+        assert_eq!(parsed["SetPetname"]["did"], "did:dht:zAlice");
+        assert_eq!(parsed["SetPetname"]["name"], "alice");
+
+        let remove = WasmPetnameEvent::RemovePetname {
+            did: "did:dht:zAlice".to_owned(),
+        };
+        let json = serde_json::to_string(&remove).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["RemovePetname"].is_object());
+        assert_eq!(parsed["RemovePetname"]["did"], "did:dht:zAlice");
+
+        let ctx_set = WasmPetnameEvent::SetContextPetname {
+            context_id: "ctx-1".to_owned(),
+            name: "work".to_owned(),
+        };
+        let json = serde_json::to_string(&ctx_set).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["SetContextPetname"].is_object());
+        assert_eq!(parsed["SetContextPetname"]["context_id"], "ctx-1");
+        assert_eq!(parsed["SetContextPetname"]["name"], "work");
+
+        let ctx_remove = WasmPetnameEvent::RemoveContextPetname {
+            context_id: "ctx-1".to_owned(),
+        };
+        let json = serde_json::to_string(&ctx_remove).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["RemoveContextPetname"].is_object());
+        assert_eq!(parsed["RemoveContextPetname"]["context_id"], "ctx-1");
     }
 
     // -- WasmHandleRegistry unit tests ---------------------------------------
