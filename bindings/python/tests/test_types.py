@@ -478,9 +478,10 @@ class TestCapability:
         assert Capability.MEDIA_VIDEO.value == "media:video"
         assert Capability.MEDIA_SCREEN_SHARE.value == "media:screen_share"
         assert Capability.MEMBER_BAN.value == "member:ban"
+        assert Capability.METADATA_EDIT.value == "metadata:edit"
 
     def test_variant_count(self) -> None:
-        assert len(Capability) == 17
+        assert len(Capability) == 18
 
     def test_tool_invoke_parameterised(self) -> None:
         cap = Capability.tool_invoke("my-tool-id")

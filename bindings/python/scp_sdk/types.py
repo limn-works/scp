@@ -230,6 +230,7 @@ class Capability(enum.Enum):
     MEDIA_VIDEO = "media:video"
     MEDIA_SCREEN_SHARE = "media:screen_share"
     MEMBER_BAN = "member:ban"
+    METADATA_EDIT = "metadata:edit"
 
     @staticmethod
     def tool_invoke(tool_id: str) -> str:

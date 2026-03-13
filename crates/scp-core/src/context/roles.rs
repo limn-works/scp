@@ -102,6 +102,8 @@ pub enum Capability {
     /// Ban a member from the context, revoking all access permanently (spec section 5.3).
     /// Gates the `RevokeReadAccess` governance action.
     MemberBan,
+    /// Edit context operational metadata (spec section 5.7, §5.3.1).
+    MetadataEdit,
     /// Context-specific custom capability.
     Custom(String),
 }
@@ -114,7 +116,7 @@ impl Capability {
     /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
     /// `"governance:vote"`, `"context:close"`, `"context:child:create"`,
     /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
-    /// `"media:screen_share"`, `"member:ban"`.
+    /// `"media:screen_share"`, `"member:ban"`, `"metadata:edit"`.
     /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
@@ -137,6 +139,7 @@ impl Capability {
             "media:video" => Self::MediaVideo,
             "media:screen_share" => Self::MediaScreenShare,
             "member:ban" => Self::MemberBan,
+            "metadata:edit" => Self::MetadataEdit,
             other => other.strip_prefix("tool:invoke:").map_or_else(
                 || Self::Custom(other.to_owned()),
                 |tool_id| Self::ToolInvoke(tool_id.to_owned()),
@@ -169,6 +172,7 @@ impl Capability {
             Self::MediaVideo => std::borrow::Cow::Borrowed("media:video"),
             Self::MediaScreenShare => std::borrow::Cow::Borrowed("media:screen_share"),
             Self::MemberBan => std::borrow::Cow::Borrowed("member:ban"),
+            Self::MetadataEdit => std::borrow::Cow::Borrowed("metadata:edit"),
             Self::Custom(name) => std::borrow::Cow::Borrowed(name.as_str()),
         }
     }
@@ -195,6 +199,7 @@ impl std::fmt::Display for Capability {
             Self::MediaVideo => write!(f, "media:video"),
             Self::MediaScreenShare => write!(f, "media:screen_share"),
             Self::MemberBan => write!(f, "member:ban"),
+            Self::MetadataEdit => write!(f, "metadata:edit"),
             Self::Custom(name) => write!(f, "custom:{name}"),
         }
     }
