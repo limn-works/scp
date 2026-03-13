@@ -734,6 +734,12 @@ fn bridge_register_succeeds_with_separate_governance_did() {
             "did:key:gov",
             "discord",
             "relay",
+            None,
+            None,
+            10_000,
+            "",
+            "",
+            "",
         );
         assert!(
             r.is_ok(),
@@ -755,6 +761,12 @@ fn bridge_register_rejects_self_approval() {
             "did:key:op",
             "discord",
             "relay",
+            None,
+            None,
+            10_000,
+            "",
+            "",
+            "",
         );
         assert!(r.is_err(), "Self-approval should be rejected");
     });

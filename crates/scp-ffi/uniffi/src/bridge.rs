@@ -7521,6 +7521,12 @@ pub struct ShadowIdentityResult {
 ///   forbidden per ADR-023).
 /// * `platform` — External platform name (e.g., `"discord"`, `"slack"`).
 /// * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
+/// * `webhook_url` — For cooperative mode: the platform's webhook receiver URL.
+/// * `platform_key` — For cooperative mode: the platform's Ed25519 public key (32 bytes).
+/// * `max_shadows` — Governance-configured shadow limit (default 10,000).
+/// * `metadata_display_name` — Human-readable display name for the bridge.
+/// * `metadata_description` — Free-text description of the bridge.
+/// * `metadata_operator_contact` — Contact information for the bridge operator.
 ///
 /// # Returns
 ///
@@ -7536,12 +7542,19 @@ pub struct ShadowIdentityResult {
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
 #[uniffi::export]
+#[allow(clippy::too_many_arguments)]
 pub fn bridge_register(
     context_id: String,
     operator_did: String,
     governance_did: String,
     platform: String,
     mode: String,
+    webhook_url: Option<String>,
+    platform_key: Option<Vec<u8>>,
+    max_shadows: Option<u32>,
+    metadata_display_name: Option<String>,
+    metadata_description: Option<String>,
+    metadata_operator_contact: Option<String>,
 ) -> Result<BridgeRegistrationResult, ScpError> {
     validate_did(&operator_did)?;
     validate_did(&governance_did)?;
@@ -7561,6 +7574,15 @@ pub fn bridge_register(
         }
     };
 
+    let parsed_platform_key = platform_key
+        .map(|k| {
+            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpError::Validation {
+                message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
+                code: "SCP-VALID-7052".to_owned(),
+            })
+        })
+        .transpose()?;
+
     let mut registry = scp_core::bridge::registration::BridgeRegistry::new(context_id.clone());
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
@@ -7574,6 +7596,14 @@ pub fn bridge_register(
         context_id: context_id.clone(),
         requested_at: now_secs,
         self_hosted: false,
+        webhook_url,
+        platform_key: parsed_platform_key,
+        max_shadows: max_shadows.unwrap_or(10_000),
+        metadata: scp_core::bridge::registration::BridgeRegistrationMetadata {
+            display_name: metadata_display_name.unwrap_or_default(),
+            description: metadata_description.unwrap_or_default(),
+            operator_contact: metadata_operator_contact.unwrap_or_default(),
+        },
     };
 
     scp_core::bridge::registration::register_bridge(&mut registry, request).map_err(|e| {
@@ -8466,6 +8496,12 @@ mod tests {
             "did:key:governance".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(result.status, "active");
@@ -8483,6 +8519,12 @@ mod tests {
             "did:key:operator".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -8494,6 +8536,50 @@ mod tests {
                 );
             }
             other => panic!("expected ScpError::Context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_register_with_optional_fields() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
+            "discord".to_owned(),
+            "cooperative".to_owned(),
+            Some("https://example.com/webhook".to_owned()),
+            Some(vec![42u8; 32]),
+            Some(500),
+            Some("My Discord Bridge".to_owned()),
+            Some("Bridges #general channel".to_owned()),
+            Some("admin@example.com".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(result.status, "active");
+    }
+
+    #[test]
+    fn bridge_register_rejects_invalid_platform_key_length() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
+            "discord".to_owned(),
+            "cooperative".to_owned(),
+            None,
+            Some(vec![42u8; 16]), // wrong length
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ScpError::Validation { ref code, .. } => {
+                assert_eq!(code, "SCP-VALID-7052");
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
         }
     }
 

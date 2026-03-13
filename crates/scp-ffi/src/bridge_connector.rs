@@ -13,7 +13,8 @@ use pyo3::types::PyDict;
 
 use scp_core::bridge::provenance::{evaluate_trust_level, mark_bridge_provenance};
 use scp_core::bridge::registration::{
-    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
+    BridgeRegistrationMetadata, BridgeRegistrationRequest, BridgeRegistry, approve_registration,
+    register_bridge,
 };
 use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_core::bridge::{
@@ -43,6 +44,15 @@ use crate::error::ScpPyError;
 ///   forbidden per ADR-023).
 /// * `platform` -- External platform name (e.g., `"discord"`, `"slack"`).
 /// * `mode` -- Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
+/// * `webhook_url` -- For cooperative mode: the platform's webhook receiver
+///   URL (spec §12.2.1). `None` for non-cooperative modes.
+/// * `platform_key` -- For cooperative mode: the platform's Ed25519 public
+///   key as 32 bytes (spec §12.2.1, §12.10.2). `None` for non-cooperative modes.
+/// * `max_shadows` -- Governance-configured shadow limit for this bridge
+///   (spec §12.2.1). Defaults to 10,000.
+/// * `metadata_display_name` -- Human-readable display name for the bridge.
+/// * `metadata_description` -- Free-text description of the bridge.
+/// * `metadata_operator_contact` -- Contact information for the bridge operator.
 ///
 /// # Returns
 ///
@@ -57,6 +67,20 @@ use crate::error::ScpPyError;
 /// (self-approval) or if registration fails.
 #[pyfunction]
 #[pyo3(name = "bridge_register")]
+#[pyo3(signature = (
+    context_id,
+    operator_did,
+    governance_did,
+    platform,
+    mode,
+    webhook_url=None,
+    platform_key=None,
+    max_shadows=10_000,
+    metadata_display_name="",
+    metadata_description="",
+    metadata_operator_contact=""
+))]
+#[allow(clippy::too_many_arguments)]
 pub fn py_bridge_register(
     py: Python<'_>,
     context_id: &str,
@@ -64,11 +88,26 @@ pub fn py_bridge_register(
     governance_did: &str,
     platform: &str,
     mode: &str,
+    webhook_url: Option<&str>,
+    platform_key: Option<Vec<u8>>,
+    max_shadows: u32,
+    metadata_display_name: &str,
+    metadata_description: &str,
+    metadata_operator_contact: &str,
 ) -> PyResult<Py<PyDict>> {
     crate::validate::validate_did(operator_did)?;
     crate::validate::validate_did(governance_did)?;
 
     let bridge_mode = parse_bridge_mode(mode)?;
+
+    let parsed_platform_key = platform_key
+        .map(|k| {
+            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpPyError::ValidationError {
+                message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
+                code: "SCP-VALID-7052".to_string(),
+            })
+        })
+        .transpose()?;
 
     let mut registry = BridgeRegistry::new(context_id.to_string());
 
@@ -83,6 +122,14 @@ pub fn py_bridge_register(
         context_id: context_id.to_string(),
         requested_at: now_secs,
         self_hosted: false,
+        webhook_url: webhook_url.map(String::from),
+        platform_key: parsed_platform_key,
+        max_shadows,
+        metadata: BridgeRegistrationMetadata {
+            display_name: metadata_display_name.to_string(),
+            description: metadata_description.to_string(),
+            operator_contact: metadata_operator_contact.to_string(),
+        },
     };
 
     let _event = register_bridge(&mut registry, request).map_err(|e| ScpPyError::ContextError {
@@ -375,6 +422,12 @@ mod tests {
                 "did:key:governance",
                 "discord",
                 "relay",
+                None,
+                None,
+                10_000,
+                "",
+                "",
+                "",
             )
             .unwrap();
             let dict = result.bind(py);
@@ -403,6 +456,59 @@ mod tests {
                 "did:key:operator",
                 "discord",
                 "relay",
+                None,
+                None,
+                10_000,
+                "",
+                "",
+                "",
+            );
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn register_bridge_with_optional_fields() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let result = py_bridge_register(
+                py,
+                "ctx-test",
+                "did:key:operator",
+                "did:key:governance",
+                "discord",
+                "cooperative",
+                Some("https://example.com/webhook"),
+                Some(vec![42u8; 32]),
+                500,
+                "My Discord Bridge",
+                "Bridges #general channel",
+                "admin@example.com",
+            )
+            .unwrap();
+            let dict = result.bind(py);
+            let status: String = dict.get_item("status").unwrap().unwrap().extract().unwrap();
+            assert_eq!(status, "active");
+        });
+    }
+
+    #[test]
+    fn register_bridge_rejects_invalid_platform_key_length() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let result = py_bridge_register(
+                py,
+                "ctx-test",
+                "did:key:operator",
+                "did:key:governance",
+                "discord",
+                "cooperative",
+                None,
+                Some(vec![42u8; 16]), // wrong length
+                10_000,
+                "",
+                "",
+                "",
             );
             assert!(result.is_err());
         });
