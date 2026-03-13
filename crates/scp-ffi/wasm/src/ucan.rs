@@ -35,6 +35,26 @@ const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 /// Maximum delegation chain depth to prevent infinite loops.
 const MAX_CHAIN_DEPTH: usize = 32;
 
+/// Clock skew tolerance in seconds (spec section 9.14). Accommodates NTP
+/// desynchronization between issuer and validator in distributed deployments.
+/// Must match `scp-core::crypto::ucan::validate::CLOCK_SKEW_TOLERANCE_SECS`.
+const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
+
+/// Category A resource types — the closed set of UCAN capability resource
+/// types that modify the DID document (ADR-039).
+///
+/// Must match `scp-core::trust::custody_violation::CATEGORY_A_RESOURCES`.
+const CATEGORY_A_RESOURCES: &[&str] = &[
+    "did_document",
+    "verification_method",
+    "identity",
+    "pre_rotation",
+    "service",
+    "relay_config",
+    "did_migration",
+    "key_management",
+];
+
 // ---------------------------------------------------------------------------
 // UCAN data structures (mirrors scp-core/crypto/ucan/mod.rs)
 // ---------------------------------------------------------------------------
@@ -44,6 +64,13 @@ struct UcanHeader {
     alg: String,
     typ: String,
     ucv: String,
+    /// Optional Key ID per RFC 7515 (ADR-039). Identifies which verification
+    /// method on the issuer's DID document signed this token. Values are
+    /// verification method fragment identifiers: `"#active"` for the human
+    /// signing key, `"#agent"` for the agent signing key. When absent,
+    /// verifiers default to `#active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kid: Option<String>,
 }
 
 impl UcanHeader {
@@ -243,8 +270,34 @@ fn resolve_public_key(did: &str) -> Result<[u8; 32], String> {
     Err(format!("unsupported DID method: {did} (expected did:dht:)"))
 }
 
+/// Resolves a specific verification method key by `kid` fragment identifier
+/// (ADR-039, SCP-AB-013). Dispatches to the identity registry for kid-specific
+/// resolution, falling back to DID-embedded key resolution for `#active`.
+///
+/// Must match `scp-core::crypto::ucan::validate::DidResolver::resolve_public_key_by_kid`.
+fn resolve_public_key_by_kid(did: &str, kid: &str) -> Result<[u8; 32], String> {
+    // Try the identity registry first — it has both #active and #agent keys.
+    match crate::identity::resolve_verification_method_key(did, kid) {
+        Ok(pk) => return Ok(pk),
+        Err(_) if kid == "#active" => {
+            // Fall through to DID-embedded key extraction for #active when the
+            // DID is not in the local registry (e.g., remote DIDs).
+        }
+        Err(e) => return Err(e),
+    }
+
+    // For #active, fall back to extracting the key from the DID string itself
+    // (works for remote DIDs not in the local registry).
+    resolve_public_key(did)
+}
+
 fn verify_signature(token: &ParsedUcanToken) -> Result<(), String> {
-    let pk_bytes = resolve_public_key(&token.payload.iss)?;
+    // When kid is present in the header, resolve the specific verification
+    // method from the DID document (ADR-039, SCP-AB-013).
+    let pk_bytes = match &token.header.kid {
+        Some(kid) => resolve_public_key_by_kid(&token.payload.iss, kid)?,
+        None => resolve_public_key(&token.payload.iss)?,
+    };
 
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
         .map_err(|e| format!("invalid public key: {e}"))?;
@@ -330,6 +383,104 @@ fn zbase32_decode(input: &str) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013)
+// ---------------------------------------------------------------------------
+
+/// Extracts the `scp_key_scope` value from a UCAN payload's facts.
+///
+/// Returns `Some(scope)` if `fct.scp_key_scope` exists and is a string,
+/// `None` otherwise (backward compatibility — legacy tokens without key
+/// scope skip step 5b).
+///
+/// Must match `scp-core::crypto::ucan::validate::extract_key_scope`.
+fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
+    payload
+        .fct
+        .as_ref()
+        .and_then(|fct| fct.get("scp_key_scope"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Validates key scope constraints on a UCAN token (steps 5a and 5b).
+///
+/// - **Step 5a (self-delegation):** If `iss == aud` and no `scp_key_scope`
+///   is present in `fct`, the token is rejected. Self-delegation is only
+///   meaningful when scoping to a specific verification method.
+///
+/// - **Step 5b (key scope match):** If `fct.scp_key_scope` is present, the
+///   `kid` header (defaulting to `#active` when absent) must match the
+///   declared scope.
+///
+/// Must match `scp-core::crypto::ucan::validate::validate_key_scope`.
+fn validate_key_scope(token: &ParsedUcanToken) -> Result<(), String> {
+    let key_scope = extract_key_scope(&token.payload);
+
+    // Step 5a: Self-delegation without key_scope is a safety violation.
+    if token.payload.iss == token.payload.aud && key_scope.is_none() {
+        return Err(
+            "self-delegation (iss == aud) without scp_key_scope is not permitted".to_owned(),
+        );
+    }
+
+    // Step 5b: If key_scope is present, verify kid matches.
+    if let Some(ref scope) = key_scope {
+        let actual_kid = token.header.kid.as_deref().unwrap_or("#active");
+        if actual_kid != scope {
+            return Err(format!(
+                "key scope mismatch: token declares scp_key_scope '{scope}' but kid is '{actual_kid}'"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 6b: Category A enforcement (ADR-039)
+// ---------------------------------------------------------------------------
+
+/// Enforces Category A restrictions on a UCAN token (ADR-039 Enforcement
+/// Stack layer 3).
+///
+/// If the token is signed by `#agent` (indicated by the `kid` header field)
+/// and any granted capability is a Category A action (DID document
+/// modification), the token is rejected.
+///
+/// Must match `scp-core::crypto::ucan::validate::enforce_ucan_category_a`.
+fn enforce_ucan_category_a(
+    token: &ParsedUcanToken,
+    granted_caps: &[CapabilityUri],
+) -> Result<(), String> {
+    let kid_str = token.header.kid.as_deref().unwrap_or("#active");
+
+    // Only #active and #agent are valid UCAN signing keys.
+    // Unknown kid values are rejected fail-closed.
+    let is_agent = match kid_str {
+        "#active" => false,
+        "#agent" => true,
+        _ => {
+            return Err(format!("unrecognized signing key ID (kid): {kid_str}"));
+        }
+    };
+
+    if !is_agent {
+        return Ok(());
+    }
+
+    for cap in granted_caps {
+        if CATEGORY_A_RESOURCES.contains(&cap.resource.as_str()) {
+            return Err(format!(
+                "Category A violation: agent key (#agent) cannot grant '{}' capability",
+                cap.capability_name()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Full 11-step validation pipeline (delegates state ops to WasmContextManager)
 // ---------------------------------------------------------------------------
 
@@ -380,6 +531,10 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
         ));
     }
 
+    // Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013).
+    // Rejects self-delegation without key_scope and key_scope/kid mismatches.
+    validate_key_scope(token)?;
+
     // Step 6: Capability match with prefix-collision protection (RED-105 fix).
     let required_cap = CapabilityUri::parse(capability)?;
 
@@ -403,6 +558,11 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
     if !matched {
         return Err(format!("capability not granted: {capability}"));
     }
+
+    // Step 6b: Category A enforcement (ADR-039 Enforcement Stack layer 3).
+    // If the token is signed by #agent, reject any Category A capabilities
+    // (DID document modifications, pre-rotation, identity migration).
+    enforce_ucan_category_a(token, &granted_caps)?;
 
     // Step 7: Attenuation enforcement.
     if !token.payload.prf.is_empty() {
@@ -438,29 +598,42 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
 }
 
 fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
-    let now = now_secs();
-
-    if let Some(nbf) = token.payload.nbf {
-        if now < nbf {
-            return Err("token not yet valid (nbf > now)".to_owned());
-        }
-        if nbf >= token.payload.exp {
-            return Err(format!(
-                "invalid time range: nbf ({nbf}) must be less than exp ({})",
-                token.payload.exp
-            ));
-        }
+    // Check nbf < exp first — a token with nbf >= exp is inherently invalid
+    // regardless of the current time or tolerance.
+    if let Some(nbf) = token.payload.nbf
+        && nbf >= token.payload.exp
+    {
+        return Err(format!(
+            "invalid time range: nbf ({nbf}) must be less than exp ({})",
+            token.payload.exp
+        ));
     }
 
-    if now >= token.payload.exp {
+    let now = now_secs();
+
+    // exp check with tolerance: allow tokens that expired within the tolerance
+    // window. `exp + tolerance <= now` means the token is expired beyond the
+    // tolerance. Must match scp-core's `verify_expiry` logic.
+    if token.payload.exp + CLOCK_SKEW_TOLERANCE_SECS <= now {
         return Err("token expired".to_owned());
     }
 
+    // ExpiryTooFar check — no tolerance applied. This bounds the maximum token
+    // lifetime; clock drift doesn't justify longer-lived tokens.
     if token.payload.exp > now + MAX_EXPIRY_SECS {
         return Err(format!(
             "expiry too far in the future: {}s exceeds 24h maximum",
             token.payload.exp - now
         ));
+    }
+
+    // nbf check with tolerance: allow tokens whose not-before is slightly in
+    // the future (within tolerance). Uses saturating subtraction to avoid
+    // underflow when nbf < tolerance. Must match scp-core's logic.
+    if let Some(nbf) = token.payload.nbf
+        && nbf.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) > now
+    {
+        return Err("token not yet valid (nbf > now)".to_owned());
     }
 
     Ok(())
@@ -519,14 +692,21 @@ fn verify_chain_recursive(
             ));
         }
 
-        verify_signature(parent)?;
-
+        // Verify parent's aud matches this token's iss.
+        // Must match scp-core's verify_chain_recursive ordering.
         if parent.payload.aud != token.payload.iss {
             return Err(format!(
                 "delegation chain broken: parent aud '{}' does not match child iss '{}'",
                 parent.payload.aud, token.payload.iss
             ));
         }
+
+        // Steps 5a/5b: Validate key scope on parent token (ADR-039, SCP-AB-013).
+        // An attacker could craft a parent with iss==aud and no key_scope that
+        // would pass chain checks if only the presented token were validated.
+        validate_key_scope(parent)?;
+
+        verify_signature(parent)?;
 
         verify_time_bounds(parent)?;
 
@@ -1102,4 +1282,553 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
 
         Ok(JsValue::UNDEFINED)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests (non-WASM target only — unit tests for pure-logic functions)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // extract_key_scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_key_scope_returns_scope_when_present() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+        };
+        assert_eq!(extract_key_scope(&payload), Some("#agent".to_owned()));
+    }
+
+    #[test]
+    fn extract_key_scope_returns_none_when_absent() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: None,
+        };
+        assert_eq!(extract_key_scope(&payload), None);
+    }
+
+    #[test]
+    fn extract_key_scope_returns_none_when_fct_has_no_key_scope() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: Some(serde_json::json!({"other_fact": "value"})),
+        };
+        assert_eq!(extract_key_scope(&payload), None);
+    }
+
+    #[test]
+    fn extract_key_scope_returns_none_when_scope_is_not_string() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": 42})),
+        };
+        assert_eq!(extract_key_scope(&payload), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5a: Self-delegation rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_key_scope_rejects_self_delegation_without_scope() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: None,
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkSame".to_owned(),
+                aud: "did:dht:z6MkSame".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let result = validate_key_scope(&token);
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
+        assert!(
+            err.contains("self-delegation"),
+            "expected self-delegation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_key_scope_accepts_self_delegation_with_scope() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#agent".to_owned()),
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkSame".to_owned(),
+                aud: "did:dht:z6MkSame".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let result = validate_key_scope(&token);
+        assert!(
+            result.is_ok(),
+            "self-delegation with key_scope should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_key_scope_accepts_different_iss_aud_without_scope() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: None,
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkIssuer".to_owned(),
+                aud: "did:dht:z6MkAudience".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let result = validate_key_scope(&token);
+        assert!(
+            result.is_ok(),
+            "different iss/aud without scope should be accepted: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5b: Key scope / kid mismatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_key_scope_rejects_kid_scope_mismatch() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#active".to_owned()),
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkSame".to_owned(),
+                aud: "did:dht:z6MkSame".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let result = validate_key_scope(&token);
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
+        assert!(
+            err.contains("key scope mismatch"),
+            "expected key scope mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_key_scope_defaults_kid_to_active() {
+        // kid absent, scope declares #active — should match (default kid = #active)
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: None,
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkSame".to_owned(),
+                aud: "did:dht:z6MkSame".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let result = validate_key_scope(&token);
+        assert!(
+            result.is_ok(),
+            "kid defaults to #active, matching scope: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 6b: Category A enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enforce_category_a_rejects_agent_with_did_document_cap() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#agent".to_owned()),
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkTest".to_owned(),
+                aud: "did:dht:z6MkOther".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![Attenuation {
+                    with: "scp:ctx:ctx-1/did_document:update".to_owned(),
+                    can: "update".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let caps = vec![CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "did_document".to_owned(),
+            action: "update".to_owned(),
+        }];
+        let result = enforce_ucan_category_a(&token, &caps);
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
+        assert!(
+            err.contains("Category A violation"),
+            "expected Category A violation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn enforce_category_a_allows_active_with_did_document_cap() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#active".to_owned()),
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkTest".to_owned(),
+                aud: "did:dht:z6MkOther".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let caps = vec![CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "did_document".to_owned(),
+            action: "update".to_owned(),
+        }];
+        let result = enforce_ucan_category_a(&token, &caps);
+        assert!(
+            result.is_ok(),
+            "#active key should be allowed Category A: {result:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_category_a_allows_agent_with_category_b() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#agent".to_owned()),
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkTest".to_owned(),
+                aud: "did:dht:z6MkOther".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let caps = vec![CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "messages".to_owned(),
+            action: "write".to_owned(),
+        }];
+        let result = enforce_ucan_category_a(&token, &caps);
+        assert!(
+            result.is_ok(),
+            "#agent key should be allowed Category B: {result:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_category_a_rejects_unknown_kid() {
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#unknown".to_owned()),
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkTest".to_owned(),
+                aud: "did:dht:z6MkOther".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let caps = vec![CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "messages".to_owned(),
+            action: "write".to_owned(),
+        }];
+        let result = enforce_ucan_category_a(&token, &caps);
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
+        assert!(
+            err.contains("unrecognized signing key ID"),
+            "expected unrecognized kid error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn enforce_category_a_defaults_kid_to_active() {
+        // kid absent → defaults to #active → Category A allowed
+        let token = ParsedUcanToken {
+            header: UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: None,
+            },
+            payload: UcanPayload {
+                iss: "did:dht:z6MkTest".to_owned(),
+                aud: "did:dht:z6MkOther".to_owned(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "test".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        let caps = vec![CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "did_document".to_owned(),
+            action: "update".to_owned(),
+        }];
+        let result = enforce_ucan_category_a(&token, &caps);
+        assert!(
+            result.is_ok(),
+            "absent kid defaults to #active, Category A allowed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_category_a_checks_all_resource_types() {
+        for resource in CATEGORY_A_RESOURCES {
+            let token = ParsedUcanToken {
+                header: UcanHeader {
+                    alg: "EdDSA".to_owned(),
+                    typ: "JWT".to_owned(),
+                    ucv: "0.10.0".to_owned(),
+                    kid: Some("#agent".to_owned()),
+                },
+                payload: UcanPayload {
+                    iss: "did:dht:z6MkTest".to_owned(),
+                    aud: "did:dht:z6MkOther".to_owned(),
+                    exp: 9_999_999_999,
+                    nbf: None,
+                    nnc: "test".to_owned(),
+                    att: vec![],
+                    prf: vec![],
+                    fct: None,
+                },
+                signature: vec![],
+                encoded: String::new(),
+            };
+            let caps = vec![CapabilityUri {
+                context_id: Some("ctx-1".to_owned()),
+                resource: (*resource).to_owned(),
+                action: "modify".to_owned(),
+            }];
+            let result = enforce_ucan_category_a(&token, &caps);
+            assert!(
+                result.is_err(),
+                "Category A resource '{resource}' must be rejected for #agent"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UcanHeader kid serialization round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ucan_header_kid_round_trip() -> Result<(), String> {
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some("#agent".to_owned()),
+        };
+        let json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
+        assert!(json.contains("\"kid\":\"#agent\""));
+        let parsed: UcanHeader = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        assert_eq!(parsed.kid, Some("#agent".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn ucan_header_kid_absent_round_trip() -> Result<(), String> {
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
+        assert!(!json.contains("kid"));
+        let parsed: UcanHeader = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        assert_eq!(parsed.kid, None);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_ucan now extracts kid from header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_ucan_extracts_kid_from_header() -> Result<(), String> {
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some("#agent".to_owned()),
+        };
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkOther".to_owned(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "test-nonce".to_owned(),
+            att: vec![],
+            prf: vec![],
+            fct: None,
+        };
+        let header_json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+        let payload_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        // Use a dummy signature (64 zero bytes)
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        let parsed = parse_ucan(&jwt)?;
+        assert_eq!(parsed.header.kid, Some("#agent".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_ucan_kid_none_when_absent() -> Result<(), String> {
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkOther".to_owned(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "test-nonce".to_owned(),
+            att: vec![],
+            prf: vec![],
+            fct: None,
+        };
+        let header_json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+        let payload_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        let parsed = parse_ucan(&jwt)?;
+        assert_eq!(parsed.header.kid, None);
+        Ok(())
+    }
 }
