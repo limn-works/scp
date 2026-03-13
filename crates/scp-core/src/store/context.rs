@@ -377,7 +377,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Scans for keys matching `context/*/full_snapshot` by listing all keys
     /// with the `context/` prefix and filtering for snapshot keys. Used by
-    /// [`ProtocolStorePersistence`] to implement
+    /// [`ProtocolStoreContextBridge`] to implement
     /// [`crate::context::manager::ContextPersistence::list_persisted_contexts`].
     ///
     /// The returned list is a point-in-time snapshot. In a concurrent
@@ -900,7 +900,7 @@ impl<S: Storage> ProtocolStore<S> {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStorePersistence — canonical bridge (SCP-PERSIST-021)
+// ProtocolStoreContextBridge — canonical bridge (SCP-PERSIST-021)
 // ---------------------------------------------------------------------------
 
 /// Canonical bridge from `ContextPersistence` (dyn-compatible) to the generic
@@ -913,11 +913,11 @@ impl<S: Storage> ProtocolStore<S> {
 /// tokio runtime context (after the `contexts` mutex is released).
 ///
 /// See SCP-PERSIST-021 and spec section 17.4.
-pub struct ProtocolStorePersistence<S: Storage> {
+pub struct ProtocolStoreContextBridge<S: Storage> {
     store: std::sync::Arc<ProtocolStore<S>>,
 }
 
-impl<S: Storage> ProtocolStorePersistence<S> {
+impl<S: Storage> ProtocolStoreContextBridge<S> {
     /// Creates a new bridge wrapping the given `ProtocolStore`.
     pub const fn new(store: std::sync::Arc<ProtocolStore<S>>) -> Self {
         Self { store }
@@ -925,7 +925,7 @@ impl<S: Storage> ProtocolStorePersistence<S> {
 }
 
 impl<S: Storage + 'static> crate::context::manager::ContextPersistence
-    for ProtocolStorePersistence<S>
+    for ProtocolStoreContextBridge<S>
 {
     fn persist_context(
         &self,
@@ -1015,7 +1015,7 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStoreEventLogPersistence — event log bridge (#636)
+// ProtocolStoreEventLogBridge — event log bridge (#636)
 // ---------------------------------------------------------------------------
 
 /// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] (synchronous) to the async
@@ -1026,11 +1026,11 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
 /// `tokio::task::block_in_place` + `Handle::block_on`.
 ///
 /// See GitHub issue #636.
-pub struct ProtocolStoreEventLogPersistence<S: Storage> {
+pub struct ProtocolStoreEventLogBridge<S: Storage> {
     store: std::sync::Arc<ProtocolStore<S>>,
 }
 
-impl<S: Storage> ProtocolStoreEventLogPersistence<S> {
+impl<S: Storage> ProtocolStoreEventLogBridge<S> {
     /// Creates a new bridge wrapping the given `ProtocolStore`.
     pub const fn new(store: std::sync::Arc<ProtocolStore<S>>) -> Self {
         Self { store }
@@ -1038,7 +1038,7 @@ impl<S: Storage> ProtocolStoreEventLogPersistence<S> {
 }
 
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
-    for ProtocolStoreEventLogPersistence<S>
+    for ProtocolStoreEventLogBridge<S>
 {
     fn persist_entry(
         &self,
@@ -1782,7 +1782,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // ProtocolStorePersistence bridge (SCP-PERSIST-021)
+    // ProtocolStoreContextBridge bridge (SCP-PERSIST-021)
     // -------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1790,7 +1790,7 @@ mod tests {
         use crate::context::manager::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStorePersistence::new(store);
+        let bridge = super::ProtocolStoreContextBridge::new(store);
 
         let snapshot = make_context_snapshot();
 
@@ -1809,7 +1809,7 @@ mod tests {
         use crate::context::manager::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStorePersistence::new(store);
+        let bridge = super::ProtocolStoreContextBridge::new(store);
 
         let snapshot = make_broadcast_snapshot();
 
@@ -1829,7 +1829,7 @@ mod tests {
         use crate::context::manager::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStorePersistence::new(store.clone());
+        let bridge = super::ProtocolStoreContextBridge::new(store.clone());
 
         // Use store_full_snapshot (the actual persistence path used by
         // ContextManager) instead of store_context_state, so
@@ -1860,15 +1860,15 @@ mod tests {
     #[test]
     fn protocol_store_persistence_is_object_safe() {
         // Compile-time dyn-compatibility check: verifies that
-        // ProtocolStorePersistence can be used as a trait object.
+        // ProtocolStoreContextBridge can be used as a trait object.
         fn assert_object_safe(_: &dyn crate::context::manager::ContextPersistence) {}
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStorePersistence::new(store);
+        let bridge = super::ProtocolStoreContextBridge::new(store);
         assert_object_safe(&bridge);
     }
 
     // -------------------------------------------------------------------
-    // ProtocolStoreEventLogPersistence bridge (#636)
+    // ProtocolStoreEventLogBridge bridge (#636)
     // -------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1876,7 +1876,7 @@ mod tests {
         use crate::context::providers::event_log::{EventLogEntry, EventLogPersistence};
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreEventLogPersistence::new(store);
+        let bridge = super::ProtocolStoreEventLogBridge::new(store);
 
         let entry0 = EventLogEntry {
             event: "ContextCreated".to_owned(),
@@ -1909,7 +1909,7 @@ mod tests {
         use crate::context::providers::event_log::{EventLogEntry, EventLogPersistence};
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreEventLogPersistence::new(store);
+        let bridge = super::ProtocolStoreEventLogBridge::new(store);
 
         let entries = vec![
             EventLogEntry {
@@ -1939,7 +1939,7 @@ mod tests {
         // Compile-time dyn-compatibility check.
         fn assert_object_safe(_: &dyn crate::context::providers::event_log::EventLogPersistence) {}
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreEventLogPersistence::new(store);
+        let bridge = super::ProtocolStoreEventLogBridge::new(store);
         assert_object_safe(&bridge);
     }
 

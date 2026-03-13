@@ -392,7 +392,7 @@ pub struct ContextSnapshot {
 /// for best-effort semantics: the `ContextManager` logs errors but does
 /// not abort mutations when persistence fails.
 ///
-/// The canonical implementation is `ProtocolStorePersistence<S>` which
+/// The canonical implementation is `ProtocolStoreContextBridge<S>` which
 /// wraps `Arc<ProtocolStore<S>>`.
 ///
 /// See spec section 17.4.
@@ -969,6 +969,167 @@ fn mint_governance_tokens(
 }
 
 // ---------------------------------------------------------------------------
+// ContextManagerBuilder
+// ---------------------------------------------------------------------------
+
+/// Step-by-step builder for [`ContextManager`].
+///
+/// Provides a more ergonomic API than the raw constructors. Required
+/// providers can be set individually, or use [`.storage()`](Self::storage)
+/// to auto-wire persistence and event log from a single `Storage` impl.
+///
+/// # Required
+///
+/// * `crypto` — always required (no sensible default for MLS operations).
+///
+/// # Optional with defaults
+///
+/// * `transport` — defaults to [`LocalTransportProvider`](super::builder::LocalTransportProvider) (all ops succeed).
+/// * `event_log` — defaults to [`MerkleEventLogProvider::new()`](super::providers::MerkleEventLogProvider::new) (in-memory).
+/// * `persistence` — defaults to `None` (no crash recovery).
+/// * `key_resolver` — defaults to a no-op resolver that returns `None`.
+///
+/// # `.storage()` convenience
+///
+/// Calling `.storage(my_storage)` auto-constructs:
+/// 1. A `ProtocolStore<S>` wrapping the storage.
+/// 2. A `ProtocolStoreContextBridge<S>` for context persistence.
+/// 3. A `ProtocolStoreEventLogBridge<S>` for event log persistence.
+/// 4. A `MerkleEventLogProvider` backed by that persistence.
+///
+/// This replaces ~8 lines of manual wiring with a single call.
+pub struct ContextManagerBuilder {
+    crypto: Option<Box<dyn ContextCryptoProvider>>,
+    transport: Option<Box<dyn ContextTransportProvider>>,
+    event_log: Option<Box<dyn ContextEventLogProvider>>,
+    persistence: Option<Box<dyn ContextPersistence>>,
+    key_resolver: Option<KeyResolver>,
+}
+
+impl ContextManagerBuilder {
+    /// Creates a new builder with all fields unset.
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            crypto: None,
+            transport: None,
+            event_log: None,
+            persistence: None,
+            key_resolver: None,
+        }
+    }
+
+    /// Sets the crypto provider (required).
+    #[must_use]
+    pub fn crypto(mut self, crypto: Box<dyn ContextCryptoProvider>) -> Self {
+        self.crypto = Some(crypto);
+        self
+    }
+
+    /// Sets the transport provider.
+    ///
+    /// If not called, defaults to [`LocalTransportProvider`](super::builder::LocalTransportProvider).
+    #[must_use]
+    pub fn transport(mut self, transport: Box<dyn ContextTransportProvider>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Sets the event log provider.
+    ///
+    /// If not called (and `.storage()` is not used), defaults to
+    /// [`MerkleEventLogProvider::new()`](super::providers::MerkleEventLogProvider::new) (in-memory, no persistence).
+    #[must_use]
+    pub fn event_log(mut self, event_log: Box<dyn ContextEventLogProvider>) -> Self {
+        self.event_log = Some(event_log);
+        self
+    }
+
+    /// Sets the context persistence provider.
+    ///
+    /// If not called, no persistence is configured (in-memory only).
+    #[must_use]
+    pub fn persistence(mut self, persistence: Box<dyn ContextPersistence>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Sets the key resolver for governance vote verification.
+    ///
+    /// If not called, defaults to a no-op resolver that returns `None`
+    /// for all DIDs (governance voting will not verify signatures).
+    #[must_use]
+    pub fn key_resolver(mut self, key_resolver: KeyResolver) -> Self {
+        self.key_resolver = Some(key_resolver);
+        self
+    }
+
+    /// Auto-wires persistence and event log from a single `Storage` impl.
+    ///
+    /// Constructs a [`ProtocolStore`](crate::store::ProtocolStore), then
+    /// creates both the context persistence bridge and event log persistence
+    /// bridge, plus a [`MerkleEventLogProvider`](super::providers::MerkleEventLogProvider)
+    /// backed by that persistence. This replaces ~8 lines of manual wiring.
+    ///
+    /// Calling this overwrites any previously set `persistence` and `event_log`.
+    #[must_use]
+    pub fn storage<S: scp_platform::EncryptedStorage + 'static>(mut self, storage: S) -> Self {
+        let store = std::sync::Arc::new(crate::store::ProtocolStore::new(storage));
+        let persistence = Box::new(crate::store::context::ProtocolStoreContextBridge::new(
+            store.clone(),
+        ));
+        let event_log_persistence = crate::store::context::ProtocolStoreEventLogBridge::new(store);
+        let event_log = Box::new(super::providers::MerkleEventLogProvider::with_persistence(
+            std::sync::Arc::new(event_log_persistence),
+        ));
+        self.persistence = Some(persistence);
+        self.event_log = Some(event_log);
+        self
+    }
+
+    /// Builds the [`ContextManager`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `crypto` provider was not set (the only
+    /// required field).
+    pub fn build(self) -> Result<ContextManager, ContextManagerBuildError> {
+        let crypto = self.crypto.ok_or(ContextManagerBuildError::MissingCrypto)?;
+
+        let transport: Box<dyn ContextTransportProvider> = self
+            .transport
+            .unwrap_or_else(|| Box::new(super::builder::LocalTransportProvider));
+
+        let event_log: Box<dyn ContextEventLogProvider> = self
+            .event_log
+            .unwrap_or_else(|| Box::new(super::providers::MerkleEventLogProvider::new()));
+
+        let key_resolver = self
+            .key_resolver
+            .unwrap_or_else(|| Arc::new(|_: &DID| None));
+
+        Ok(match self.persistence {
+            Some(persistence) => ContextManager::with_persistence(
+                crypto,
+                transport,
+                event_log,
+                persistence,
+                key_resolver,
+            ),
+            None => ContextManager::new(crypto, transport, event_log, key_resolver),
+        })
+    }
+}
+
+/// Error returned when [`ContextManagerBuilder::build`] fails.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextManagerBuildError {
+    /// The `crypto` provider is required but was not set.
+    #[error("crypto provider is required — call .crypto() before .build()")]
+    MissingCrypto,
+}
+
+// ---------------------------------------------------------------------------
 // ContextManager
 // ---------------------------------------------------------------------------
 
@@ -1099,6 +1260,25 @@ impl ContextManager {
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
         }
+    }
+
+    /// Returns a [`ContextManagerBuilder`] for step-by-step assembly.
+    ///
+    /// The builder provides a more ergonomic API than the raw constructors,
+    /// with optional defaults and a `.storage()` method that auto-wires
+    /// persistence and event log bridges from a single `Storage` impl.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let manager = ContextManager::builder()
+    ///     .crypto(Box::new(my_crypto))
+    ///     .storage(my_storage)  // auto-wires persistence + event log
+    ///     .build()?;
+    /// ```
+    #[must_use]
+    pub fn builder() -> ContextManagerBuilder {
+        ContextManagerBuilder::new()
     }
 
     /// Returns `true` if a persistence provider is configured.

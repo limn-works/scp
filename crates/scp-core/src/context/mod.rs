@@ -104,12 +104,13 @@ pub use roles::{
 // Re-export builder and manager types for convenience.
 pub use builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-    CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
+    CreationReceipt, EventLogHandle, LocalTransportProvider, MlsGroupHandle, SenderKeyHandle,
+    create_context,
 };
 pub use manager::{
-    ContentKeysRotatedResult, ContextManager, ContextPersistence, ContextSnapshot,
-    GovernanceActionResult, GovernanceReconfiguredResult, ProposalOutcome,
-    ReadAccessRestoredResult, ReadAccessRevokedResult, WriteAccessRestoredResult,
+    ContentKeysRotatedResult, ContextManager, ContextManagerBuildError, ContextManagerBuilder,
+    ContextPersistence, ContextSnapshot, GovernanceActionResult, GovernanceReconfiguredResult,
+    ProposalOutcome, ReadAccessRestoredResult, ReadAccessRevokedResult, WriteAccessRestoredResult,
     WriteAccessRevokedResult,
 };
 

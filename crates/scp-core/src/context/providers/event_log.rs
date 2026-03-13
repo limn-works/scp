@@ -553,6 +553,13 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         Ok(())
     }
 
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<EventLogEntry>>, crate::context::ContextError> {
+        Ok(self.entries(context_id))
+    }
+
     fn export_event_log_data(
         &self,
         context_id: &[u8; 32],

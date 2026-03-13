@@ -1,7 +1,7 @@
 //! Production [`ContextPersistence`] implementation.
 //!
 //! The canonical production implementation is
-//! [`ProtocolStorePersistence`],
+//! [`ProtocolStoreContextBridge`],
 //! which wraps `Arc<ProtocolStore<S>>` and implements the synchronous
 //! [`ContextPersistence`] trait by bridging to the async `ProtocolStore` methods.
 //!
@@ -18,7 +18,7 @@ use crate::context::broadcast::BroadcastContextSnapshot;
 use crate::context::manager::{ContextPersistence, ContextSnapshot};
 
 // Re-export the canonical implementation.
-pub use crate::store::context::ProtocolStorePersistence;
+pub use crate::store::context::ProtocolStoreContextBridge;
 
 /// In-memory [`ContextPersistence`] implementation for integration tests.
 ///
