@@ -42,7 +42,8 @@ interface MockContext {
   contextId: string;
   state: string;
   creatorDid: string;
-  events: Event[];
+  receiveBuffer: Event[];
+  eventLog: Event[];
   tools: Map<string, ToolDefinition & { handler?: (input: unknown) => unknown }>;
   members: Set<string>;
   subscriptions: MessageCallback[];
@@ -50,7 +51,6 @@ interface MockContext {
   revokedTokens: Set<string>;
   economicPolicy: string | null;
   ttlSecs: number | null;
-  drainedEvents: string[];
 }
 
 interface MockTransport {
@@ -218,7 +218,8 @@ export function createMockBridge(): Bridge & {
         contextId,
         state: "active",
         creatorDid: identity.did,
-        events: [],
+        receiveBuffer: [],
+        eventLog: [],
         tools: new Map(),
         members: new Set([identity.did]),
         subscriptions: [],
@@ -226,17 +227,18 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: params.ttlSeconds ?? null,
-        drainedEvents: [],
       };
 
       // Record ContextCreated event
-      ctx.events.push({
+      const createdEvent: Event = {
         eventType: "ContextCreated",
         actorDid: identity.did,
         timestamp: Math.floor(Date.now() / 1000),
         payload: { contextId },
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(createdEvent);
+      ctx.eventLog.push(createdEvent);
 
       contexts.set(contextId, ctx);
       return { contextId, state: "active", creatorDid: identity.did };
@@ -245,25 +247,29 @@ export function createMockBridge(): Bridge & {
     async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
       const ctx = getContext(handle);
       ctx.members.add(identityDid);
-      ctx.events.push({
+      const joinedEvent: Event = {
         eventType: "MemberJoined",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: { memberDid: identityDid },
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(joinedEvent);
+      ctx.eventLog.push(joinedEvent);
     },
 
     async contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void> {
       const ctx = getContext(handle);
       ctx.members.delete(identityDid);
-      ctx.events.push({
+      const leftEvent: Event = {
         eventType: "MemberLeft",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: { memberDid: identityDid },
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(leftEvent);
+      ctx.eventLog.push(leftEvent);
       // Notify subscriptions that context is done for this member
       for (const sub of ctx.subscriptions) {
         sub.onComplete();
@@ -273,13 +279,15 @@ export function createMockBridge(): Bridge & {
     async contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void> {
       const ctx = getContext(handle);
       ctx.state = "closed";
-      ctx.events.push({
+      const closedEvent: Event = {
         eventType: "ContextClosed",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: {},
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(closedEvent);
+      ctx.eventLog.push(closedEvent);
       for (const sub of ctx.subscriptions) {
         sub.onComplete();
       }
@@ -291,16 +299,18 @@ export function createMockBridge(): Bridge & {
       payload: Uint8Array,
     ): Promise<void> {
       const ctx = getContext(handle);
-      const sequence = ctx.events.length;
+      const sequence = ctx.eventLog.length;
       const timestamp = Math.floor(Date.now() / 1000);
 
-      ctx.events.push({
+      const sentEvent: Event = {
         eventType: "MessageSent",
         actorDid: identityDid,
         timestamp,
         payload: { size: payload.length },
         sequence,
-      });
+      };
+      ctx.receiveBuffer.push(sentEvent);
+      ctx.eventLog.push(sentEvent);
 
       // Deliver to subscribers
       for (const sub of ctx.subscriptions) {
@@ -332,13 +342,15 @@ export function createMockBridge(): Bridge & {
       const toolId = generateId("tool");
       ctx.tools.set(toolId, { ...definition });
 
-      ctx.events.push({
+      const registeredEvent: Event = {
         eventType: "ToolRegistered",
         actorDid: handle.creatorDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: { toolId, toolName: definition.name },
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(registeredEvent);
+      ctx.eventLog.push(registeredEvent);
 
       return toolId;
     },
@@ -378,13 +390,15 @@ export function createMockBridge(): Bridge & {
         result = { echo: input };
       }
 
-      ctx.events.push({
+      const invokedEvent: Event = {
         eventType: "ToolInvoked",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: { toolId, toolName: tool.name, ucanProvided: true },
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(invokedEvent);
+      ctx.eventLog.push(invokedEvent);
 
       return JSON.stringify(result);
     },
@@ -573,7 +587,7 @@ export function createMockBridge(): Bridge & {
       filter: EventFilter | undefined,
     ): Promise<readonly Event[]> {
       const ctx = getContext(handle);
-      let events = [...ctx.events];
+      let events = [...ctx.eventLog];
 
       if (filter !== undefined) {
         if (filter.eventType !== undefined) {
@@ -602,13 +616,13 @@ export function createMockBridge(): Bridge & {
       const ctx = getContext(handle);
 
       if (claim.type === "inclusion" && claim.leafIndex !== undefined) {
-        const exists = claim.leafIndex < ctx.events.length;
+        const exists = claim.leafIndex < ctx.eventLog.length;
         return {
           verified: exists,
           proofType: "inclusion",
           details: {
             leafIndex: claim.leafIndex,
-            treeSize: ctx.events.length,
+            treeSize: ctx.eventLog.length,
           },
         };
       }
@@ -623,10 +637,10 @@ export function createMockBridge(): Bridge & {
     async eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint> {
       const ctx = getContext(handle);
       // Compute a simple mock root hash from event count
-      const root = Buffer.from(`mock-root-${ctx.events.length}`).toString("hex");
+      const root = Buffer.from(`mock-root-${ctx.eventLog.length}`).toString("hex");
       return {
         root,
-        eventCount: ctx.events.length,
+        eventCount: ctx.eventLog.length,
         timestamp: Math.floor(Date.now() / 1000),
       };
     },
@@ -647,13 +661,15 @@ export function createMockBridge(): Bridge & {
     async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
       const ctx = getContext(handle);
       ctx.state = "expired";
-      ctx.events.push({
+      const expiredEvent: Event = {
         eventType: "TtlExpired",
         actorDid: ctx.creatorDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: {},
-        sequence: ctx.events.length,
-      });
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(expiredEvent);
+      ctx.eventLog.push(expiredEvent);
       for (const sub of ctx.subscriptions) {
         sub.onComplete();
       }
@@ -688,7 +704,7 @@ export function createMockBridge(): Bridge & {
           creator_did: ctx.creatorDid,
           state: ctx.state,
           members: [...ctx.members],
-          event_count: ctx.events.length,
+          event_count: ctx.eventLog.length,
         },
       };
       return new TextEncoder().encode(JSON.stringify(exportData));
@@ -713,7 +729,8 @@ export function createMockBridge(): Bridge & {
         contextId,
         state: "active",
         creatorDid,
-        events: [],
+        receiveBuffer: [],
+        eventLog: [],
         tools: new Map(),
         members: new Set(members),
         subscriptions: [],
@@ -721,22 +738,24 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: null,
-        drainedEvents: [],
       };
-      ctx.events.push({
+      const importedEvent: Event = {
         eventType: "ContextImported",
         actorDid: creatorDid,
         timestamp: Math.floor(Date.now() / 1000),
         payload: { contextId },
         sequence: 0,
-      });
+      };
+      ctx.receiveBuffer.push(importedEvent);
+      ctx.eventLog.push(importedEvent);
       contexts.set(contextId, ctx);
       return contextId;
     },
 
     async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
       const ctx = getContext(handle);
-      const events = ctx.events.map((e) => JSON.stringify(e));
+      const events = ctx.receiveBuffer.map((e) => JSON.stringify(e));
+      ctx.receiveBuffer.length = 0;
       return events;
     },
 

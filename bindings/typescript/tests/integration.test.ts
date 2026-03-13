@@ -1009,6 +1009,25 @@ describe("Drain events (mock bridge)", () => {
       expect(parsed.eventType).toBeTruthy();
     }
   });
+
+  it("drain clears receive buffer but preserves event log", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+    );
+
+    await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg1"));
+
+    const drained = await mockBridge.contextDrainEvents(ctx);
+    expect(drained.length).toBeGreaterThan(0);
+
+    const drained2 = await mockBridge.contextDrainEvents(ctx);
+    expect(drained2.length).toBe(0);
+
+    const logEvents = await mockBridge.eventLogQuery(ctx, undefined);
+    expect(logEvents.length).toBe(drained.length);
+  });
 });
 
 // ---------------------------------------------------------------------------
