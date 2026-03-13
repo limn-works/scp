@@ -22,242 +22,44 @@
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use napi_derive::napi;
 
-use scp_core::discovery::addressing::{
-    AddressResolution, AddressType, HandleQuerier, HandleTarget, ParsedAddress, ResolutionLayer,
-    ResolutionPath, TrustLevel,
-};
+use scp_core::discovery::addressing::{HandleTarget, ParsedAddress};
 use scp_core::discovery::handles::{
-    HandleDeregisterParams, HandleEntry, HandleLookupParams, HandleMetadata, HandleRegisterParams,
+    HandleDeregisterParams, HandleLookupParams, HandleMetadata, HandleRegisterParams,
     HandleRegistry, HandleTypeFilter,
 };
-use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
 use scp_identity::DID;
+
+use scp_ffi_common::petname_helpers::{
+    self, LocalHandleQuerier, address_resolution_to_json, handle_registries, petname_maps,
+};
 
 use crate::error::ScpNapiError;
 
 // ---------------------------------------------------------------------------
-// Global state for petnames and handles
+// Test-only reset helpers
 // ---------------------------------------------------------------------------
 
-fn petname_maps() -> &'static Mutex<HashMap<String, PetnameMap>> {
-    static MAPS: OnceLock<Mutex<HashMap<String, PetnameMap>>> = OnceLock::new();
-    MAPS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
-    static REGISTRIES: OnceLock<Mutex<HashMap<String, HandleRegistry>>> = OnceLock::new();
-    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Removes a specific owner's petname map. Test-only — ensures each test starts
-/// with clean state even if a previous test panicked before manual cleanup.
 #[cfg(test)]
 fn reset_petname_map_for(owner_did: &str) {
-    if let Ok(mut guard) = petname_maps().lock() {
-        guard.remove(owner_did);
-    }
+    petname_helpers::reset_petname_map_for(owner_did);
 }
 
-/// Removes a specific context's handle registry. Test-only — ensures each test starts
-/// with clean state even if a previous test panicked before manual cleanup.
 #[cfg(test)]
 fn reset_handle_registry_for(context_id: &str) {
-    if let Ok(mut guard) = handle_registries().lock() {
-        guard.remove(context_id);
-    }
-}
-
-struct LocalHandleQuerier;
-
-impl HandleQuerier for LocalHandleQuerier {
-    async fn lookup_handle(
-        &self,
-        context_id: &String,
-        handle: &str,
-        type_filter: Option<AddressType>,
-    ) -> Vec<AddressResolution> {
-        let Ok(guard) = handle_registries().lock() else {
-            return Vec::new();
-        };
-        let Some(registry) = guard.get(context_id.as_str()) else {
-            return Vec::new();
-        };
-        let filter = type_filter.map(|tf| match tf {
-            AddressType::Identity => HandleTypeFilter::Identity,
-            AddressType::Context => HandleTypeFilter::Context,
-        });
-        let result = registry.lookup(&HandleLookupParams {
-            handle: handle.to_owned(),
-            type_filter: filter,
-        });
-        let now = scp_core::time::now_secs().unwrap_or(0);
-        result
-            .results
-            .into_iter()
-            .map(|entry| handle_entry_to_resolution(&entry, context_id, now))
-            .collect()
-    }
-
-    async fn lookup_domain_handle(&self, _domain: &str, _handle: &str) -> Vec<AddressResolution> {
-        Vec::new()
-    }
-
-    async fn lookup_attestation_handle(
-        &self,
-        _handle: &str,
-        _platform: Option<&str>,
-    ) -> Vec<AddressResolution> {
-        Vec::new()
-    }
-}
-
-fn handle_entry_to_resolution(
-    entry: &HandleEntry,
-    context_id: &str,
-    now: u64,
-) -> AddressResolution {
-    let resolution_path = ResolutionPath {
-        layer: ResolutionLayer::DiscoveryContext,
-        source: "local_registry".to_owned(),
-        source_id: Some(context_id.to_owned()),
-        resolved_at: now,
-    };
-    let trust_level = TrustLevel::DiscoveryContextVerified;
-    match &entry.target {
-        HandleTarget::Identity { did } => AddressResolution::Identity {
-            did: did.clone(),
-            trust_level,
-            resolution_path,
-        },
-        HandleTarget::Context {
-            context_id: ctx_id,
-            relay_urls,
-        } => AddressResolution::Context {
-            context_id: ctx_id.clone(),
-            relay_urls: relay_urls.clone(),
-            mode: None,
-            trust_level,
-            resolution_path,
-        },
-    }
-}
-
-fn address_resolution_to_json(resolution: &AddressResolution) -> serde_json::Value {
-    match resolution {
-        AddressResolution::Identity {
-            did,
-            trust_level,
-            resolution_path,
-        } => serde_json::json!({
-            "type": "Identity",
-            "did": did.to_string(),
-            "trust_level": trust_level_to_json(trust_level),
-            "resolution_path": resolution_path_to_json(resolution_path),
-        }),
-        AddressResolution::Context {
-            context_id,
-            relay_urls,
-            mode,
-            trust_level,
-            resolution_path,
-        } => serde_json::json!({
-            "type": "Context",
-            "context_id": context_id,
-            "relay_urls": relay_urls,
-            "mode": mode,
-            "trust_level": trust_level_to_json(trust_level),
-            "resolution_path": resolution_path_to_json(resolution_path),
-        }),
-    }
-}
-
-fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
-    match trust_level {
-        TrustLevel::DirectExchange => serde_json::json!({"kind": "DirectExchange"}),
-        TrustLevel::LocalPetname => serde_json::json!({"kind": "LocalPetname"}),
-        TrustLevel::MultiLayerCorroborated { sources } => serde_json::json!({
-            "kind": "MultiLayerCorroborated",
-            "sources": sources.iter().map(resolution_path_to_json).collect::<Vec<_>>(),
-        }),
-        TrustLevel::DomainVerified => serde_json::json!({"kind": "DomainVerified"}),
-        TrustLevel::AttestationVerified => serde_json::json!({"kind": "AttestationVerified"}),
-        TrustLevel::DiscoveryContextVerified => {
-            serde_json::json!({"kind": "DiscoveryContextVerified"})
-        }
-    }
-}
-
-fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
-    let layer = match path.layer {
-        ResolutionLayer::Petname => "Petname",
-        ResolutionLayer::DiscoveryContext => "DiscoveryContext",
-        ResolutionLayer::Attestation => "Attestation",
-        ResolutionLayer::Domain => "Domain",
-        ResolutionLayer::MultiLayerCorroborated => "MultiLayerCorroborated",
-    };
-    serde_json::json!({
-        "layer": layer,
-        "source": path.source,
-        "source_id": path.source_id,
-        "resolved_at": path.resolved_at,
-    })
+    petname_helpers::reset_handle_registry_for(context_id);
 }
 
 fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
-    let val: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+    petname_helpers::parse_handle_target(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
-            message: format!("invalid target_json: {e}"),
+            message: e.message,
             code: "SCP-VALID-7126".to_owned(),
         })
-    })?;
-    let target_type = val["type"].as_str().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: "target_json must have a 'type' field ('identity' or 'context')".to_owned(),
-            code: "SCP-VALID-7126".to_owned(),
-        })
-    })?;
-    match target_type {
-        "identity" => {
-            let did = val["did"].as_str().ok_or_else(|| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: "identity target must have a 'did' field".to_owned(),
-                    code: "SCP-VALID-7126".to_owned(),
-                })
-            })?;
-            Ok(HandleTarget::Identity {
-                did: DID::from(did),
-            })
-        }
-        "context" => {
-            let ctx_id = val["context_id"].as_str().ok_or_else(|| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: "context target must have a 'context_id' field".to_owned(),
-                    code: "SCP-VALID-7126".to_owned(),
-                })
-            })?;
-            let relay_urls = val["relay_urls"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(HandleTarget::Context {
-                context_id: ctx_id.to_owned(),
-                relay_urls,
-            })
-        }
-        other => Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!("invalid target type '{other}': expected 'identity' or 'context'"),
-            code: "SCP-VALID-7126".to_owned(),
-        })),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
