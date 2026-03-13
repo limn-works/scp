@@ -139,17 +139,34 @@ struct ContextTests {
 
     @Test("Context.create returns a context in active state")
     func createReturnsActiveContext() async throws {
-        let createFn: ContextBridge.CreateFn = { contextId, _ in
-            MockContextHandle(id: contextId, state: "active")
+        let capturedParams = Locked<ContextParams?>(nil)
+        let capturedIdentity = Locked<Identity?>(nil)
+        let createFn: ContextBridge.CreateFn = { identity, params in
+            capturedIdentity.withLock { $0 = identity }
+            capturedParams.withLock { $0 = params }
+            return MockContextHandle(
+                id: "ctx-create-test",
+                state: "active"
+            )
         }
         let noOpSend: ContextBridge.SendFn = { _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
         let noOpLeave: ContextBridge.LeaveFn = { _ in }
         let noOpClose: ContextBridge.CloseFn = { _ in }
 
-        let context = try await Context.create(
-            contextId: "ctx-create-test",
+        let identity = Identity(noPointer: .init())
+        let params = ContextParams(
             ceiling: ["messages:read", "messages:write"],
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            minProtocolVersion: 0
+        )
+
+        let context = try await Context.create(
+            identity: identity,
+            params: params,
             createFn: createFn,
             sendFn: noOpSend,
             subscribeFn: noOpSubscribe,
@@ -159,6 +176,17 @@ struct ContextTests {
 
         #expect(await context.contextId == "ctx-create-test")
         #expect(await context.state == .active)
+
+        // Verify the factory forwarded identity to the bridge function
+        let forwardedIdentity = capturedIdentity.current
+        #expect(forwardedIdentity != nil)
+
+        // Verify the factory forwarded params to the bridge function
+        let forwarded = capturedParams.current
+        #expect(forwarded != nil)
+        #expect(forwarded?.ttlSeconds == 3600)
+        #expect(forwarded?.governance == .singleAdmin)
+        #expect(forwarded?.ceiling == ["messages:read", "messages:write"])
     }
 
     @Test("Context.create propagates bridge errors")
@@ -171,10 +199,20 @@ struct ContextTests {
         let noOpLeave: ContextBridge.LeaveFn = { _ in }
         let noOpClose: ContextBridge.CloseFn = { _ in }
 
+        let identity = Identity(noPointer: .init())
+        let params = ContextParams(
+            ceiling: [],
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 0,
+            promotable: false,
+            minProtocolVersion: 0
+        )
+
         await #expect(throws: ScpError.self) {
             _ = try await Context.create(
-                contextId: "will-fail",
-                ceiling: [],
+                identity: identity,
+                params: params,
                 createFn: createFn,
                 sendFn: noOpSend,
                 subscribeFn: noOpSubscribe,
