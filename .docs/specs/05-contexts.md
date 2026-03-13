@@ -96,6 +96,7 @@ The following is the complete enumeration of capability categories available for
 | `childContext` | Create child contexts (§5.13) | Role permission |
 | `governancePropose` | Submit governance proposals (§5.9) | Role permission |
 | `governanceVote` | Vote on governance proposals (§5.9) | Role permission |
+| `contextClose` | Close context permanently (§5.4) | Role permission + governance |
 | `metadataEdit` | Edit context operational metadata (§5.7) | Role permission + governance |
 
 **Parameterized categories.** `toolInvoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `toolInvokeAll` grants invocation of all registered tools. A ceiling containing `toolInvokeAll` implicitly includes all `toolInvoke:{tool_id}` capabilities.

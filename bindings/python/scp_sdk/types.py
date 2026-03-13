@@ -206,27 +206,31 @@ class MemberRole(enum.Enum):
 class Capability(enum.Enum):
     """Protocol-defined capabilities within an SCP context.
 
-    Mirrors ``scp_core::context::roles::Capability``.  Parameterised
-    variants (``ToolInvoke(tool_id)``, ``Custom(name)``) are represented
-    as string values prefixed with their variant name.
+    Mirrors ``scp_core::context::roles::Capability``.  Values use the
+    colon-separated format expected by ``Capability::new()`` in Rust
+    (e.g. ``"messages:write"``).  Parameterised variants
+    (``ToolInvoke(tool_id)``, ``Custom(name)``) are produced by the
+    :meth:`tool_invoke` and :meth:`custom` static helpers.
     """
 
-    MESSAGES_READ = "MessagesRead"
-    MESSAGES_WRITE = "MessagesWrite"
-    TOOL_INVOKE_ALL = "ToolInvokeAll"
-    TOOL_REGISTER = "ToolRegister"
-    MEMBER_INVITE = "MemberInvite"
-    MEMBER_REMOVE = "MemberRemove"
-    ROLE_ASSIGN = "RoleAssign"
-    GOVERNANCE_PROPOSE = "GovernancePropose"
-    GOVERNANCE_VOTE = "GovernanceVote"
-    CONTEXT_CLOSE = "ContextClose"
-    CHILD_CONTEXT_CREATE = "ChildContextCreate"
-    TOOL_INTERFACE = "ToolInterface"
-    BRIDGING = "Bridging"
-    MEDIA_VOICE = "MediaVoice"
-    MEDIA_VIDEO = "MediaVideo"
-    MEDIA_SCREEN_SHARE = "MediaScreenShare"
+    MESSAGES_READ = "messages:read"
+    MESSAGES_WRITE = "messages:write"
+    TOOL_INVOKE_ALL = "tool:invoke:*"
+    TOOL_REGISTER = "tool:register"
+    MEMBER_INVITE = "member:invite"
+    MEMBER_REMOVE = "member:remove"
+    ROLE_ASSIGN = "role:assign"
+    GOVERNANCE_PROPOSE = "governance:propose"
+    GOVERNANCE_VOTE = "governance:vote"
+    CONTEXT_CLOSE = "context:close"
+    CHILD_CONTEXT_CREATE = "context:child:create"
+    TOOL_INTERFACE = "tool:interface"
+    BRIDGING = "bridging"
+    MEDIA_VOICE = "media:voice"
+    MEDIA_VIDEO = "media:video"
+    MEDIA_SCREEN_SHARE = "media:screen_share"
+    MEMBER_BAN = "member:ban"
+    METADATA_EDIT = "metadata:edit"
 
     @staticmethod
     def tool_invoke(tool_id: str) -> str:
@@ -235,12 +239,12 @@ class Capability(enum.Enum):
         Since Python enums cannot carry per-instance data, parameterised
         capabilities are represented as plain strings.
         """
-        return f"ToolInvoke({tool_id})"
+        return f"tool:invoke:{tool_id}"
 
     @staticmethod
     def custom(name: str) -> str:
         """Return the capability string for a custom capability."""
-        return f"Custom({name})"
+        return name
 
 
 # ---------------------------------------------------------------------------

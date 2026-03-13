@@ -461,19 +461,35 @@ class TestCapability:
     """Tests for the Capability enum."""
 
     def test_standard_capabilities(self) -> None:
-        assert Capability.MESSAGES_READ.value == "MessagesRead"
-        assert Capability.MESSAGES_WRITE.value == "MessagesWrite"
-        assert Capability.TOOL_INVOKE_ALL.value == "ToolInvokeAll"
-        assert Capability.CONTEXT_CLOSE.value == "ContextClose"
-        assert Capability.CHILD_CONTEXT_CREATE.value == "ChildContextCreate"
+        assert Capability.MESSAGES_READ.value == "messages:read"
+        assert Capability.MESSAGES_WRITE.value == "messages:write"
+        assert Capability.TOOL_INVOKE_ALL.value == "tool:invoke:*"
+        assert Capability.TOOL_REGISTER.value == "tool:register"
+        assert Capability.MEMBER_INVITE.value == "member:invite"
+        assert Capability.MEMBER_REMOVE.value == "member:remove"
+        assert Capability.ROLE_ASSIGN.value == "role:assign"
+        assert Capability.GOVERNANCE_PROPOSE.value == "governance:propose"
+        assert Capability.GOVERNANCE_VOTE.value == "governance:vote"
+        assert Capability.CONTEXT_CLOSE.value == "context:close"
+        assert Capability.CHILD_CONTEXT_CREATE.value == "context:child:create"
+        assert Capability.TOOL_INTERFACE.value == "tool:interface"
+        assert Capability.BRIDGING.value == "bridging"
+        assert Capability.MEDIA_VOICE.value == "media:voice"
+        assert Capability.MEDIA_VIDEO.value == "media:video"
+        assert Capability.MEDIA_SCREEN_SHARE.value == "media:screen_share"
+        assert Capability.MEMBER_BAN.value == "member:ban"
+        assert Capability.METADATA_EDIT.value == "metadata:edit"
+
+    def test_variant_count(self) -> None:
+        assert len(Capability) == 18
 
     def test_tool_invoke_parameterised(self) -> None:
         cap = Capability.tool_invoke("my-tool-id")
-        assert cap == "ToolInvoke(my-tool-id)"
+        assert cap == "tool:invoke:my-tool-id"
 
     def test_custom_parameterised(self) -> None:
         cap = Capability.custom("my-custom-cap")
-        assert cap == "Custom(my-custom-cap)"
+        assert cap == "my-custom-cap"
 
 
 # -----------------------------------------------------------------------
