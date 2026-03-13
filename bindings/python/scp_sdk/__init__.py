@@ -88,6 +88,8 @@ from scp_sdk.tools import (
 )
 from scp_sdk.transport import TransportConfig, TransportStatus, connect_relay, relay_status
 from scp_sdk.trust import (
+    PARTICIPATION_FACT_VARIANTS,
+    PARTICIPATION_THRESHOLD_OPERATORS,
     Attestation,
     BehavioralRecord,
     CapabilityValidation,
@@ -123,6 +125,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BRIDGE_ERROR_MAP",
+    "PARTICIPATION_FACT_VARIANTS",
+    "PARTICIPATION_THRESHOLD_OPERATORS",
     "Attestation",
     "BehavioralRecord",
     "BridgeMode",

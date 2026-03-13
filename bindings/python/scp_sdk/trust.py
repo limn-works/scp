@@ -19,6 +19,7 @@ See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -286,113 +287,244 @@ async def evaluate_trust(
 
 
 # ---------------------------------------------------------------------------
-# Participation types (spec section 9.3, SCP-BA-004)
+# Participation types (spec §7.3.2.1, SCP-BA-004)
 # ---------------------------------------------------------------------------
+
+#: Valid participation fact category names, matching the Rust
+#: ``ParticipationFact`` enum variants in ``scp-core``.
+PARTICIPATION_FACT_VARIANTS: frozenset[str] = frozenset(
+    {
+        "ParticipationDuration",
+        "GovernanceActionsAgainst",
+        "GovernanceActionsBy",
+        "ToolInvocationCount",
+        "ContextCreationCount",
+        "RoleProgressionCount",
+        "AttestationCount",
+    }
+)
+
+#: Valid participation threshold operator names, matching the Rust
+#: ``ParticipationThreshold`` enum variants in ``scp-core``.
+PARTICIPATION_THRESHOLD_OPERATORS: frozenset[str] = frozenset(
+    {
+        "GreaterThan",
+        "LessThan",
+        "AtLeast",
+        "AtMost",
+        "Equals",
+    }
+)
 
 
 @dataclass
 class ParticipationFact:
-    """A verified participation fact used in admission evaluation.
+    """Which category of participation fact to evaluate for admission.
 
-    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    Each variant corresponds to one of the 7 fact categories in a
+    :class:`ParticipationProfile`. See §7.3.2.1.
+
+    Valid ``name`` values (matching Rust ``ParticipationFact`` enum):
+
+    - ``"ParticipationDuration"`` -- total seconds of context participation.
+    - ``"GovernanceActionsAgainst"`` -- actions taken against the identity.
+    - ``"GovernanceActionsBy"`` -- actions initiated by the identity.
+    - ``"ToolInvocationCount"`` -- total tool invocations.
+    - ``"ContextCreationCount"`` -- number of contexts created.
+    - ``"RoleProgressionCount"`` -- number of role transitions.
+    - ``"AttestationCount"`` -- number of attestation events.
     """
 
-    #: Type of participation fact (e.g., ``"context_membership"``).
-    fact_type: str
+    #: The participation fact variant name.
+    name: str
 
-    #: DID of the participant this fact pertains to.
-    participant_did: str
-
-    #: Context ID where the fact was observed.
-    context_id: str
-
-    #: Numeric value of the fact (e.g., participation count).
-    value: float = 0.0
+    def __post_init__(self) -> None:
+        if self.name not in PARTICIPATION_FACT_VARIANTS:
+            msg = (
+                f"Invalid ParticipationFact name {self.name!r}. "
+                f"Valid: {sorted(PARTICIPATION_FACT_VARIANTS)}"
+            )
+            raise ValueError(msg)
 
 
 @dataclass
 class ParticipationThreshold:
-    """A threshold requirement for context admission.
+    """Comparison operator and value for participation admission thresholds.
 
-    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    Used in :class:`RequireParticipation` to specify the comparison a
+    fact value must satisfy. See §7.3.2.1.
+
+    Valid ``operator`` values (matching Rust ``ParticipationThreshold`` enum):
+
+    - ``"GreaterThan"`` -- value must be strictly greater than ``value``.
+    - ``"LessThan"`` -- value must be strictly less than ``value``.
+    - ``"AtLeast"`` -- value must be >= ``value``.
+    - ``"AtMost"`` -- value must be <= ``value``.
+    - ``"Equals"`` -- value must equal ``value`` exactly.
     """
 
-    #: The fact type this threshold applies to.
-    fact_type: str
+    #: The threshold operator name.
+    operator: str
 
-    #: Minimum value required to satisfy the threshold.
-    minimum: float
+    #: The threshold comparison value.
+    value: int
 
-    #: Optional maximum value constraint.
-    maximum: float | None = None
+    def __post_init__(self) -> None:
+        if self.operator not in PARTICIPATION_THRESHOLD_OPERATORS:
+            msg = (
+                f"Invalid ParticipationThreshold operator {self.operator!r}. "
+                f"Valid: {sorted(PARTICIPATION_THRESHOLD_OPERATORS)}"
+            )
+            raise ValueError(msg)
 
 
 @dataclass
 class ParticipationProfile:
-    """A participant's aggregated participation profile.
+    """A context-hosted participation profile attesting to a member's
+    verifiable participation facts.
 
-    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    Produced by contexts for opted-in members. The profile is signed
+    by a context-specific Ed25519 key (derived with domain separation)
+    so that verifiers cannot correlate which contexts share a signer.
+
+    See §7.3.2.1.
     """
 
-    #: DID of the participant.
-    participant_did: str
+    #: DID of the member this profile is about.
+    subject_did: str
 
-    #: Verified participation facts.
-    facts: list[ParticipationFact] = field(default_factory=list)
+    #: Total seconds of context participation.
+    participation_duration_secs: int = 0
+
+    #: Count of governance actions taken against this identity.
+    governance_actions_against: int = 0
+
+    #: Count of governance actions initiated by this identity.
+    governance_actions_by: int = 0
+
+    #: Total tool invocations across all tool types.
+    tool_invocation_count: int = 0
+
+    #: Number of contexts created.
+    context_creation_count: int = 0
+
+    #: Number of role transitions.
+    role_progression_count: int = 0
+
+    #: Number of attestation events.
+    attestation_count: int = 0
+
+    #: Unix timestamp (seconds) of the last update to this profile.
+    updated_at: int = 0
+
+    #: Merkle root of the context's event log at profile computation
+    #: time. 32-byte array as a list of integers.
+    event_log_root: list[int] = field(default_factory=lambda: [0] * 32)
+
+    #: Context-specific Ed25519 public key used to sign this profile.
+    #: 32-byte array as a list of integers.
+    signer_public_key: list[int] = field(default_factory=lambda: [0] * 32)
+
+    #: Ed25519 signature over all fields except this one.
+    #: 64-byte array as a list of integers.
+    signature: list[int] = field(default_factory=lambda: [0] * 64)
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the Rust ``ParticipationProfile``
+        serde JSON representation."""
+        return {
+            "subject_did": self.subject_did,
+            "participation_duration_secs": self.participation_duration_secs,
+            "governance_actions_against": self.governance_actions_against,
+            "governance_actions_by": self.governance_actions_by,
+            "tool_invocation_count": self.tool_invocation_count,
+            "context_creation_count": self.context_creation_count,
+            "role_progression_count": self.role_progression_count,
+            "attestation_count": self.attestation_count,
+            "updated_at": self.updated_at,
+            "event_log_root": self.event_log_root,
+            "signer_public_key": self.signer_public_key,
+            "signature": self.signature,
+        }
 
 
 @dataclass
 class RequireParticipation:
-    """Participation-based admission requirement for a context.
+    """A participation admission requirement declared by a context.
 
-    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    Contexts include one or more ``RequireParticipation`` entries in
+    their ``ContextParams`` admission requirements. Each entry
+    specifies a participation fact, a threshold, a freshness
+    requirement, and a minimum number of independent source contexts.
+
+    See §7.3.2.1.
     """
 
-    #: Thresholds that must be met for admission.
-    thresholds: list[ParticipationThreshold] = field(default_factory=list)
+    #: Which participation category to evaluate.
+    fact: ParticipationFact
 
-    #: Whether ALL thresholds must be met (True) or ANY (False).
-    require_all: bool = True
+    #: Comparison operator and value.
+    threshold: ParticipationThreshold
+
+    #: Maximum age in seconds for the profile's ``updated_at``
+    #: timestamp. Profiles older than this are rejected.
+    max_age_secs: int = 3600
+
+    #: Minimum number of independent source contexts (distinct
+    #: ``signer_public_key`` values) required.
+    min_contexts: int = 1
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the Rust ``RequireParticipation``
+        serde JSON representation."""
+        return {
+            "fact": self.fact.name,
+            "threshold": {self.threshold.operator: self.threshold.value},
+            "max_age_secs": self.max_age_secs,
+            "min_contexts": self.min_contexts,
+        }
 
 
 def verify_participation_requirements(
-    requirement: RequireParticipation,
-    profile: ParticipationProfile,
+    requirements: list[RequireParticipation],
+    profiles: list[ParticipationProfile],
 ) -> bool:
-    """Verify whether a participant meets participation requirements.
+    """Verify participation profiles against admission requirements.
 
-    Evaluates the participant's profile against the requirement's
-    thresholds. Returns ``True`` if the participant meets the
-    criteria, ``False`` otherwise.
+    Delegates to the Rust ``scp-core`` implementation via the PyO3
+    bridge, which performs the full verification including:
+
+    1. Signature verification on all participation profiles.
+    2. Freshness/staleness checking (``max_age_secs``).
+    3. Distinct signer counting (``min_contexts``).
+    4. Threshold operator semantics (``ParticipationThreshold``).
+    5. Diagnostic error reporting (``ParticipationAdmissionError``).
+    6. Typed field extraction (``ParticipationFact.extract_value``).
 
     Args:
-        requirement: The participation requirement to verify against.
-        profile: The participant's participation profile.
+        requirements: The participation requirements to verify against.
+        profiles: The participation profiles to evaluate.
 
     Returns:
-        ``True`` if requirements are met, ``False`` otherwise.
+        ``True`` if all requirements are satisfied.
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        RuntimeError: If verification fails (with diagnostic details
+            from ``ParticipationAdmissionError``).
+        ValueError: If JSON serialization or parsing fails.
     """
-    if not requirement.thresholds:
-        return True
+    bridge = _bridge()
 
-    results: list[bool] = []
-    for threshold in requirement.thresholds:
-        matching_facts = [f for f in profile.facts if f.fact_type == threshold.fact_type]
-        if not matching_facts:
-            results.append(False)
-            continue
+    profile_json = json.dumps([p._to_bridge_dict() for p in profiles])
+    requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
 
-        total_value = sum(f.value for f in matching_facts)
-        meets_min = total_value >= threshold.minimum
-        meets_max = threshold.maximum is None or total_value <= threshold.maximum
-        results.append(meets_min and meets_max)
-
-    if requirement.require_all:
-        return all(results)
-    return any(results)
+    return bridge.verify_participation_requirements(profile_json, requirements_json)
 
 
 __all__ = [
+    "PARTICIPATION_FACT_VARIANTS",
+    "PARTICIPATION_THRESHOLD_OPERATORS",
     "Attestation",
     "BehavioralRecord",
     "CapabilityValidation",
