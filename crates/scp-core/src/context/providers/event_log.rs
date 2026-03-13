@@ -553,6 +553,13 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         Ok(())
     }
 
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<EventLogEntry>>, crate::context::ContextError> {
+        Ok(self.entries(context_id))
+    }
+
     fn export_event_log_data(
         &self,
         context_id: &[u8; 32],
@@ -1014,6 +1021,25 @@ mod tests {
             assert_eq!(entries[3].prev_hash, entries[2].hash);
             assert!(provider.verify_chain(&ctx_id));
         }
+    }
+
+    #[test]
+    fn event_log_entries_via_dyn_dispatch() {
+        use crate::context::builder::ContextEventLogProvider;
+
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [19u8; 32];
+
+        provider.init_event_log(&ctx_id).unwrap();
+        provider.append_event(&ctx_id, "ContextCreated").unwrap();
+        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+
+        // Call event_log_entries through dyn dispatch.
+        let boxed: Box<dyn ContextEventLogProvider> = Box::new(provider);
+        let entries = boxed.event_log_entries(&ctx_id).unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event, "ContextCreated");
+        assert_eq!(entries[1].event, "MemberJoined");
     }
 
     #[test]

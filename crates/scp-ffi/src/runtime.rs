@@ -58,14 +58,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
+use scp_core::context::ContextError;
 use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence};
-use scp_core::context::providers::ProtocolStorePersistence;
+use scp_core::context::providers::ProtocolStoreContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
-use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolStore;
@@ -131,7 +131,7 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// `event_log.rs`).
 ///
 /// When the global storage provider (`STORAGE_PROVIDER`) has been
-/// initialized via [`init_storage`], a [`ProtocolStorePersistence`] is
+/// initialized via [`init_storage`], a [`ProtocolStoreContextBridge`] is
 /// constructed from it and injected into the `ContextManager`. This enables
 /// context state persistence across process restarts without requiring
 /// callers to manually wire persistence. See issue #329.
@@ -142,7 +142,7 @@ pub fn init_context_manager() {
         let persistence = build_persistence_provider();
         build_context_manager(
             Box::new(NoOpCryptoProvider),
-            Box::new(NoOpTransportProvider),
+            Box::new(LocalTransportProvider),
             Box::new(NoOpEventLogProvider),
             persistence,
         )
@@ -155,7 +155,7 @@ pub fn init_context_manager() {
 /// is already initialized, this is a no-op (first call wins).
 ///
 /// When `persistence` is `None` but the global storage provider has been
-/// initialized, a [`ProtocolStorePersistence`] is automatically constructed
+/// initialized, a [`ProtocolStoreContextBridge`] is automatically constructed
 /// from it. Pass `Some(...)` to override with a custom implementation.
 pub fn init_context_manager_with(
     crypto: Box<dyn ContextCryptoProvider>,
@@ -169,7 +169,7 @@ pub fn init_context_manager_with(
     });
 }
 
-/// Constructs a [`ProtocolStorePersistence`] from the global storage provider,
+/// Constructs a [`ProtocolStoreContextBridge`] from the global storage provider,
 /// if it has been initialized.
 ///
 /// Returns `None` if [`init_storage`] has not been called yet. This is
@@ -188,7 +188,7 @@ pub fn init_context_manager_with(
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
     STORAGE_PROVIDER.get().map(|storage| {
         let protocol_store = Arc::new(ProtocolStore::new(Arc::clone(storage)));
-        Box::new(ProtocolStorePersistence::new(protocol_store)) as Box<dyn ContextPersistence>
+        Box::new(ProtocolStoreContextBridge::new(protocol_store)) as Box<dyn ContextPersistence>
     })
 }
 
@@ -362,31 +362,8 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     }
 }
 
-/// No-op transport provider for bridge-layer `ContextManager` initialization.
-struct NoOpTransportProvider;
-
-impl ContextTransportProvider for NoOpTransportProvider {
-    fn is_connected(&self) -> bool {
-        true
-    }
-    fn publish_context(
-        &self,
-        _context_id: &[u8; 32],
-        _params: &ContextParams,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn send_message(
-        &self,
-        _context_id: &[u8; 32],
-        _encrypted_payload: &[u8],
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
+// Use the production no-op transport from scp-core.
+use scp_core::context::LocalTransportProvider;
 
 /// No-op event log provider for bridge-layer `ContextManager` initialization.
 struct NoOpEventLogProvider;

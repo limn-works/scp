@@ -416,6 +416,31 @@ pub trait ContextEventLogProvider: Send + Sync {
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
+    // -- Entry reading (symmetric with append) --------------------------------
+
+    /// Returns the event log entries for a context.
+    ///
+    /// Completes the read side of the event log interface: `append_event`
+    /// writes, `event_log_entries` reads. Without this method, callers holding
+    /// a `Box<dyn ContextEventLogProvider>` can write but not read.
+    ///
+    /// Returns `Ok(None)` if no log exists for the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if this provider does not
+    /// support entry reading.
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log entry reading not supported by this provider".into(),
+        ))
+    }
+
     // -- Export/import for context state portability (#363) -------------------
 
     /// Exports the event log entries for a context as serialized bytes
@@ -484,6 +509,46 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         // Default: initialize empty event log (no persistence).
         self.init_event_log(context_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LocalTransportProvider -- production no-op transport for single-user apps
+// ---------------------------------------------------------------------------
+
+/// No-op [`ContextTransportProvider`] for single-user or local-only applications.
+///
+/// All operations succeed immediately with no side effects. Use this when
+/// there is no relay to connect to — for example, in a single-user desktop
+/// app where all contexts are local.
+///
+/// Unlike the test-only `MockTransportProvider`, this type is available in
+/// production builds and carries no failure-injection machinery.
+pub struct LocalTransportProvider;
+
+impl ContextTransportProvider for LocalTransportProvider {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &super::ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), super::ContextError> {
+        Ok(())
     }
 }
 

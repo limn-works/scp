@@ -187,7 +187,7 @@ impl<S: EncryptedStorage> ProtocolStore<S> {
     /// data at rest satisfy this sealed bound. Production backends
     /// (`SqliteStorage`, `AppleStorage`) implement it directly. Custom
     /// backends can be wrapped in
-    /// [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter).
+    /// `scp_platform::encrypting_adapter::EncryptingAdapter`.
     ///
     /// For testing with unencrypted backends (`InMemoryStorage`), use
     /// `new_for_testing` (requires the

@@ -7,9 +7,9 @@
 //!   for real MLS group operations, sender key management, and encryption.
 //! - [`MerkleEventLogProvider`] — Merkle-chained event log with append-only
 //!   semantics and optional persistence (#636).
-//! - [`ProtocolStorePersistence`] — Wraps [`ProtocolStore`](crate::store::ProtocolStore)
+//! - [`ProtocolStoreContextBridge`] — Wraps [`ProtocolStore`](crate::store::ProtocolStore)
 //!   for context state persistence across process restarts.
-//! - [`ProtocolStoreEventLogPersistence`] — Wraps `ProtocolStore` for event
+//! - [`ProtocolStoreEventLogBridge`] — Wraps `ProtocolStore` for event
 //!   log entry persistence across process restarts (#636).
 //!
 //! The transport provider (`RelayTransportProvider`) lives in `scp-transport`
@@ -22,8 +22,8 @@ pub mod event_log;
 pub mod persistence;
 
 pub use crypto::MlsCryptoProvider;
-pub use event_log::{EventLogPersistence, MerkleEventLogProvider};
-pub use persistence::{InMemoryPersistence, ProtocolStorePersistence};
+pub use event_log::{EventLogEntry, EventLogPersistence, MerkleEventLogProvider};
+pub use persistence::{InMemoryPersistence, ProtocolStoreContextBridge};
 
 // Re-export the ProtocolStore bridge for event log persistence.
-pub use crate::store::context::ProtocolStoreEventLogPersistence;
+pub use crate::store::context::ProtocolStoreEventLogBridge;
