@@ -464,9 +464,23 @@ class TestCapability:
         assert Capability.MESSAGES_READ.value == "messages:read"
         assert Capability.MESSAGES_WRITE.value == "messages:write"
         assert Capability.TOOL_INVOKE_ALL.value == "tool:invoke:*"
+        assert Capability.TOOL_REGISTER.value == "tool:register"
+        assert Capability.MEMBER_INVITE.value == "member:invite"
+        assert Capability.MEMBER_REMOVE.value == "member:remove"
+        assert Capability.ROLE_ASSIGN.value == "role:assign"
+        assert Capability.GOVERNANCE_PROPOSE.value == "governance:propose"
+        assert Capability.GOVERNANCE_VOTE.value == "governance:vote"
         assert Capability.CONTEXT_CLOSE.value == "context:close"
         assert Capability.CHILD_CONTEXT_CREATE.value == "context:child:create"
+        assert Capability.TOOL_INTERFACE.value == "tool:interface"
+        assert Capability.BRIDGING.value == "bridging"
+        assert Capability.MEDIA_VOICE.value == "media:voice"
+        assert Capability.MEDIA_VIDEO.value == "media:video"
+        assert Capability.MEDIA_SCREEN_SHARE.value == "media:screen_share"
         assert Capability.MEMBER_BAN.value == "member:ban"
+
+    def test_variant_count(self) -> None:
+        assert len(Capability) == 17
 
     def test_tool_invoke_parameterised(self) -> None:
         cap = Capability.tool_invoke("my-tool-id")

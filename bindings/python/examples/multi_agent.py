@@ -35,9 +35,9 @@ async def main() -> None:
     ctx = await Context.create(
         identity=coordinator,
         params={
-            "ceiling": ["msg:send", "msg:receive", "tool:invoke"],
+            "ceiling": ["messages:write", "messages:read", "tool:invoke:*"],
             "roles": {
-                "agent": ["msg:send", "msg:receive", "tool:invoke"],
+                "agent": ["messages:write", "messages:read", "tool:invoke:*"],
             },
             "governance": "single_admin",
         },
@@ -48,13 +48,13 @@ async def main() -> None:
     await mint(
         issuer=coordinator,
         audience=agent_a.did,
-        capabilities=["msg:send", "msg:receive"],
+        capabilities=["messages:write", "messages:read"],
         context_id=ctx.context_id,
     )
     await mint(
         issuer=coordinator,
         audience=agent_b.did,
-        capabilities=["msg:send", "msg:receive"],
+        capabilities=["messages:write", "messages:read"],
         context_id=ctx.context_id,
     )
 
