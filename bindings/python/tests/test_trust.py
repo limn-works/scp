@@ -14,6 +14,7 @@ four-layer trust model.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -625,7 +626,7 @@ class TestVerifyParticipationRequirements:
     """
 
     def test_single_requirement_passes(self) -> None:
-        """Bridge returns True when a single requirement is satisfied."""
+        """Bridge returns without exception when a single requirement is satisfied."""
         req = RequireParticipation(
             fact=ParticipationFact(name="ParticipationDuration"),
             threshold=ParticipationThreshold(operator="AtLeast", value=100),
@@ -638,7 +639,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = verify_participation_requirements([req], [profile])
-        assert result is True
+        assert result is None
         mock_bridge.verify_participation_requirements.assert_called_once()
 
     def test_single_requirement_fails(self) -> None:
@@ -660,7 +661,7 @@ class TestVerifyParticipationRequirements:
                 verify_participation_requirements([req], [profile])
 
     def test_multiple_requirements_all_pass(self) -> None:
-        """Bridge returns True when multiple requirements are all satisfied."""
+        """Bridge returns without exception when multiple requirements are all satisfied."""
         reqs = [
             RequireParticipation(
                 fact=ParticipationFact(name="ParticipationDuration"),
@@ -680,7 +681,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = verify_participation_requirements(reqs, [profile])
-        assert result is True
+        assert result is None
 
     def test_multiple_profiles(self) -> None:
         """Bridge receives multiple profiles for min_contexts checking."""
@@ -703,7 +704,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = verify_participation_requirements([req], profiles)
-        assert result is True
+        assert result is None
 
     def test_serialization_format(self) -> None:
         """Verify JSON serialization matches Rust serde expectations."""
@@ -743,3 +744,81 @@ class TestVerifyParticipationRequirements:
         )
         assert req.max_age_secs == 3600
         assert req.min_contexts == 1
+
+
+# -----------------------------------------------------------------------
+# u64 upper-bound validation tests
+# -----------------------------------------------------------------------
+
+_U64_MAX = 0xFFFF_FFFF_FFFF_FFFF
+_U64_OVERFLOW = _U64_MAX + 1
+
+
+class TestU64UpperBoundValidation:
+    """Tests that u64 fields reject values exceeding 2^64 - 1."""
+
+    def test_participation_threshold_value_at_max(self) -> None:
+        """ParticipationThreshold.value accepts u64 max."""
+        pt = ParticipationThreshold(operator="AtLeast", value=_U64_MAX)
+        assert pt.value == _U64_MAX
+
+    def test_participation_threshold_value_overflow(self) -> None:
+        """ParticipationThreshold.value rejects u64 overflow."""
+        with pytest.raises(ValueError, match="must be <= 18446744073709551615"):
+            ParticipationThreshold(operator="AtLeast", value=_U64_OVERFLOW)
+
+    def test_require_participation_max_age_secs_at_max(self) -> None:
+        """RequireParticipation.max_age_secs accepts u64 max."""
+        req = RequireParticipation(
+            fact=ParticipationFact(name="ParticipationDuration"),
+            threshold=ParticipationThreshold(operator="AtLeast", value=0),
+            max_age_secs=_U64_MAX,
+        )
+        assert req.max_age_secs == _U64_MAX
+
+    def test_require_participation_max_age_secs_overflow(self) -> None:
+        """RequireParticipation.max_age_secs rejects u64 overflow."""
+        with pytest.raises(ValueError, match="must be <= 18446744073709551615"):
+            RequireParticipation(
+                fact=ParticipationFact(name="ParticipationDuration"),
+                threshold=ParticipationThreshold(operator="AtLeast", value=0),
+                max_age_secs=_U64_OVERFLOW,
+            )
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "participation_duration_secs",
+            "governance_actions_against",
+            "governance_actions_by",
+            "tool_invocation_count",
+            "context_creation_count",
+            "role_progression_count",
+            "attestation_count",
+            "updated_at",
+        ],
+    )
+    def test_participation_profile_u64_field_at_max(self, field_name: str) -> None:
+        """ParticipationProfile u64 fields accept u64 max."""
+        kwargs: dict[str, Any] = {"subject_did": "did:dht:zAlice", field_name: _U64_MAX}
+        profile = ParticipationProfile(**kwargs)
+        assert getattr(profile, field_name) == _U64_MAX
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "participation_duration_secs",
+            "governance_actions_against",
+            "governance_actions_by",
+            "tool_invocation_count",
+            "context_creation_count",
+            "role_progression_count",
+            "attestation_count",
+            "updated_at",
+        ],
+    )
+    def test_participation_profile_u64_field_overflow(self, field_name: str) -> None:
+        """ParticipationProfile u64 fields reject u64 overflow."""
+        kwargs: dict[str, Any] = {"subject_did": "did:dht:zAlice", field_name: _U64_OVERFLOW}
+        with pytest.raises(ValueError, match="must be <= 18446744073709551615"):
+            ParticipationProfile(**kwargs)

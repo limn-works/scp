@@ -348,7 +348,7 @@ class TestVerifyParticipationRequirements:
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = verify_participation_requirements(requirements, profiles)
 
-        assert result is True
+        assert result is None
         mock_bridge.verify_participation_requirements.assert_called_once()
 
         # Verify the JSON args are well-formed strings.
@@ -389,7 +389,7 @@ class TestVerifyParticipationRequirements:
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = verify_participation_requirements([], [])
 
-        assert result is True
+        assert result is None
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
