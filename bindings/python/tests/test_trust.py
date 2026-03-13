@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from scp_sdk.trust import (
     _PASSED_BEFORE,
     Attestation,
@@ -614,107 +616,130 @@ class TestTrustEvaluation:
 
 
 class TestVerifyParticipationRequirements:
-    """Tests for verify_participation_requirements."""
+    """Tests for verify_participation_requirements.
 
-    def test_empty_thresholds_passes(self) -> None:
-        req = RequireParticipation(thresholds=[])
-        profile = ParticipationProfile(participant_did="did:dht:zAlice")
-        assert verify_participation_requirements(req, profile) is True
+    The SDK function serializes RequireParticipation and
+    ParticipationProfile lists to JSON and delegates to the Rust
+    bridge. These tests verify correct construction, serialization,
+    and bridge delegation.
+    """
 
-    def test_single_threshold_met(self) -> None:
+    def test_single_requirement_passes(self) -> None:
+        """Bridge returns True when a single requirement is satisfied."""
         req = RequireParticipation(
-            thresholds=[ParticipationThreshold(fact_type="context_membership", minimum=1.0)],
+            fact=ParticipationFact(name="ParticipationDuration"),
+            threshold=ParticipationThreshold(operator="AtLeast", value=100),
         )
         profile = ParticipationProfile(
-            participant_did="did:dht:zAlice",
-            facts=[
-                ParticipationFact(
-                    fact_type="context_membership",
-                    participant_did="did:dht:zAlice",
-                    context_id="ctx-1",
-                    value=2.0,
-                ),
-            ],
+            subject_did="did:dht:zAlice",
+            participation_duration_secs=200,
         )
-        assert verify_participation_requirements(req, profile) is True
+        mock_bridge = MagicMock()
+        mock_bridge.verify_participation_requirements.return_value = True
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = verify_participation_requirements([req], [profile])
+        assert result is True
+        mock_bridge.verify_participation_requirements.assert_called_once()
 
-    def test_single_threshold_not_met(self) -> None:
+    def test_single_requirement_fails(self) -> None:
+        """Bridge raises RuntimeError when requirement is not met."""
         req = RequireParticipation(
-            thresholds=[ParticipationThreshold(fact_type="context_membership", minimum=5.0)],
+            fact=ParticipationFact(name="ParticipationDuration"),
+            threshold=ParticipationThreshold(operator="AtLeast", value=500),
         )
         profile = ParticipationProfile(
-            participant_did="did:dht:zAlice",
-            facts=[
-                ParticipationFact(
-                    fact_type="context_membership",
-                    participant_did="did:dht:zAlice",
-                    context_id="ctx-1",
-                    value=2.0,
-                ),
-            ],
+            subject_did="did:dht:zAlice",
+            participation_duration_secs=200,
         )
-        assert verify_participation_requirements(req, profile) is False
+        mock_bridge = MagicMock()
+        mock_bridge.verify_participation_requirements.side_effect = RuntimeError(
+            "threshold not met: ParticipationDuration AtLeast 500, got 200"
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(RuntimeError, match="threshold not met"):
+                verify_participation_requirements([req], [profile])
 
-    def test_require_all_true(self) -> None:
+    def test_multiple_requirements_all_pass(self) -> None:
+        """Bridge returns True when multiple requirements are all satisfied."""
+        reqs = [
+            RequireParticipation(
+                fact=ParticipationFact(name="ParticipationDuration"),
+                threshold=ParticipationThreshold(operator="AtLeast", value=100),
+            ),
+            RequireParticipation(
+                fact=ParticipationFact(name="ContextCreationCount"),
+                threshold=ParticipationThreshold(operator="GreaterThan", value=0),
+            ),
+        ]
+        profile = ParticipationProfile(
+            subject_did="did:dht:zAlice",
+            participation_duration_secs=200,
+            context_creation_count=3,
+        )
+        mock_bridge = MagicMock()
+        mock_bridge.verify_participation_requirements.return_value = True
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = verify_participation_requirements(reqs, [profile])
+        assert result is True
+
+    def test_multiple_profiles(self) -> None:
+        """Bridge receives multiple profiles for min_contexts checking."""
         req = RequireParticipation(
-            thresholds=[
-                ParticipationThreshold(fact_type="a", minimum=1.0),
-                ParticipationThreshold(fact_type="b", minimum=1.0),
-            ],
-            require_all=True,
+            fact=ParticipationFact(name="AttestationCount"),
+            threshold=ParticipationThreshold(operator="AtLeast", value=1),
+            min_contexts=2,
+        )
+        profiles = [
+            ParticipationProfile(
+                subject_did="did:dht:zAlice",
+                attestation_count=3,
+            ),
+            ParticipationProfile(
+                subject_did="did:dht:zAlice",
+                attestation_count=2,
+            ),
+        ]
+        mock_bridge = MagicMock()
+        mock_bridge.verify_participation_requirements.return_value = True
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = verify_participation_requirements([req], profiles)
+        assert result is True
+
+    def test_serialization_format(self) -> None:
+        """Verify JSON serialization matches Rust serde expectations."""
+        req = RequireParticipation(
+            fact=ParticipationFact(name="GovernanceActionsAgainst"),
+            threshold=ParticipationThreshold(operator="LessThan", value=3),
+            max_age_secs=7200,
+            min_contexts=1,
         )
         profile = ParticipationProfile(
-            participant_did="did:dht:zAlice",
-            facts=[
-                ParticipationFact(
-                    fact_type="a",
-                    participant_did="did:dht:zAlice",
-                    context_id="ctx-1",
-                    value=2.0,
-                ),
-            ],
+            subject_did="did:dht:zAlice",
+            governance_actions_against=1,
         )
-        # Only 'a' met, 'b' not met — require_all=True → False
-        assert verify_participation_requirements(req, profile) is False
+        mock_bridge = MagicMock()
+        mock_bridge.verify_participation_requirements.return_value = True
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            verify_participation_requirements([req], [profile])
 
-    def test_require_any(self) -> None:
-        req = RequireParticipation(
-            thresholds=[
-                ParticipationThreshold(fact_type="a", minimum=1.0),
-                ParticipationThreshold(fact_type="b", minimum=1.0),
-            ],
-            require_all=False,
-        )
-        profile = ParticipationProfile(
-            participant_did="did:dht:zAlice",
-            facts=[
-                ParticipationFact(
-                    fact_type="a",
-                    participant_did="did:dht:zAlice",
-                    context_id="ctx-1",
-                    value=2.0,
-                ),
-            ],
-        )
-        # Only 'a' met — require_all=False → True
-        assert verify_participation_requirements(req, profile) is True
+        call_args = mock_bridge.verify_participation_requirements.call_args
+        import json
 
-    def test_maximum_constraint(self) -> None:
+        profiles_json = json.loads(call_args[0][0])
+        reqs_json = json.loads(call_args[0][1])
+
+        assert profiles_json[0]["subject_did"] == "did:dht:zAlice"
+        assert profiles_json[0]["governance_actions_against"] == 1
+        assert reqs_json[0]["fact"] == "GovernanceActionsAgainst"
+        assert reqs_json[0]["threshold"] == {"LessThan": 3}
+        assert reqs_json[0]["max_age_secs"] == 7200
+        assert reqs_json[0]["min_contexts"] == 1
+
+    def test_max_age_secs_default(self) -> None:
+        """RequireParticipation defaults max_age_secs to 3600."""
         req = RequireParticipation(
-            thresholds=[
-                ParticipationThreshold(fact_type="a", minimum=1.0, maximum=3.0),
-            ],
+            fact=ParticipationFact(name="ToolInvocationCount"),
+            threshold=ParticipationThreshold(operator="Equals", value=10),
         )
-        profile = ParticipationProfile(
-            participant_did="did:dht:zAlice",
-            facts=[
-                ParticipationFact(
-                    fact_type="a",
-                    participant_did="did:dht:zAlice",
-                    context_id="ctx-1",
-                    value=5.0,
-                ),
-            ],
-        )
-        # value 5.0 > maximum 3.0 → False
-        assert verify_participation_requirements(req, profile) is False
+        assert req.max_age_secs == 3600
+        assert req.min_contexts == 1
