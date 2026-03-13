@@ -682,10 +682,11 @@ export function createMockBridge(): Bridge & {
     ): Promise<boolean> {
       const ctx = getContext(handle);
       // In the mock, single-member contexts auto-approve
-      if (ctx.ttlSecs !== null) {
+      const approved = ctx.members.size <= 1;
+      if (approved && ctx.ttlSecs !== null) {
         ctx.ttlSecs += extensionSecs;
       }
-      return ctx.members.size <= 1;
+      return approved;
     },
 
     async contextResetTtlTimer(
