@@ -1940,17 +1940,18 @@ mod wasm_ucan_mirror {
                 ));
             }
 
-            // Steps 5a/5b: Validate key scope on parent token (ADR-039).
-            validate_key_scope(parent)?;
-
-            verify_signature(parent)?;
-
+            // Verify parent's aud matches this token's iss.
             if parent.payload.aud != token.payload.iss {
                 return Err(format!(
                     "delegation chain broken: parent aud '{}' does not match child iss '{}'",
                     parent.payload.aud, token.payload.iss
                 ));
             }
+
+            // Steps 5a/5b: Validate key scope on parent token (ADR-039).
+            validate_key_scope(parent)?;
+
+            verify_signature(parent)?;
 
             // Verify parent token has not expired (spec 7.2).
             verify_time_bounds(parent)?;

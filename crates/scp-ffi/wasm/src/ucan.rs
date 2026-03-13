@@ -692,20 +692,21 @@ fn verify_chain_recursive(
             ));
         }
 
-        // Steps 5a/5b: Validate key scope on parent token (ADR-039, SCP-AB-013).
-        // An attacker could craft a parent with iss==aud and no key_scope that
-        // would pass chain checks if only the presented token were validated.
-        // Must match scp-core's verify_chain_recursive at line 903.
-        validate_key_scope(parent)?;
-
-        verify_signature(parent)?;
-
+        // Verify parent's aud matches this token's iss.
+        // Must match scp-core's verify_chain_recursive ordering.
         if parent.payload.aud != token.payload.iss {
             return Err(format!(
                 "delegation chain broken: parent aud '{}' does not match child iss '{}'",
                 parent.payload.aud, token.payload.iss
             ));
         }
+
+        // Steps 5a/5b: Validate key scope on parent token (ADR-039, SCP-AB-013).
+        // An attacker could craft a parent with iss==aud and no key_scope that
+        // would pass chain checks if only the presented token were validated.
+        validate_key_scope(parent)?;
+
+        verify_signature(parent)?;
 
         verify_time_bounds(parent)?;
 
