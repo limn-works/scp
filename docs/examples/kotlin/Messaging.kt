@@ -17,6 +17,7 @@ package works.limn.scp.examples
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.putJsonArray
 import works.limn.scp.CustodyType
@@ -32,10 +33,10 @@ fun messagingExample(bridge: CoroutineBridge) = runBlocking {
     // 2. Alice creates a context with messaging capabilities.
     val paramsJson = buildJsonObject {
         putJsonArray("ceiling") {
-            add("messages:read")
-            add("messages:write")
-            add("member:invite")
-            add("member:remove")
+            add(JsonPrimitive("messages:read"))
+            add(JsonPrimitive("messages:write"))
+            add(JsonPrimitive("member:invite"))
+            add(JsonPrimitive("member:remove"))
         }
     }.toString()
 

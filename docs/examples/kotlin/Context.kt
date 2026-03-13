@@ -14,6 +14,7 @@
 package works.limn.scp.examples
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
@@ -30,12 +31,12 @@ fun contextExample(bridge: CoroutineBridge) = runBlocking {
     //    passed through the FFI bridge.
     val paramsJson = buildJsonObject {
         putJsonArray("ceiling") {
-            add("messages:read")
-            add("messages:write")
-            add("member:invite")
-            add("member:remove")
-            add("tool:register")
-            add("tool:invoke_all")
+            add(JsonPrimitive("messages:read"))
+            add(JsonPrimitive("messages:write"))
+            add(JsonPrimitive("member:invite"))
+            add(JsonPrimitive("member:remove"))
+            add(JsonPrimitive("tool:register"))
+            add(JsonPrimitive("tool:invoke_all"))
         }
         put("mode", "Encrypted")
         put("memory_scope", "full")

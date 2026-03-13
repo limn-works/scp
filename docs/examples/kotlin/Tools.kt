@@ -14,6 +14,7 @@
 package works.limn.scp.examples
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
@@ -29,10 +30,10 @@ fun toolsExample(bridge: CoroutineBridge) = runBlocking {
     // 2. Create a context with tool capabilities.
     val paramsJson = buildJsonObject {
         putJsonArray("ceiling") {
-            add("messages:read")
-            add("messages:write")
-            add("tool:register")
-            add("tool:invoke_all")
+            add(JsonPrimitive("messages:read"))
+            add(JsonPrimitive("messages:write"))
+            add(JsonPrimitive("tool:register"))
+            add(JsonPrimitive("tool:invoke_all"))
         }
     }.toString()
 
@@ -53,16 +54,16 @@ fun toolsExample(bridge: CoroutineBridge) = runBlocking {
                 putJsonObject("op") {
                     put("type", "string")
                     putJsonArray("enum") {
-                        add("add")
-                        add("sub")
-                        add("mul")
+                        add(JsonPrimitive("add"))
+                        add(JsonPrimitive("sub"))
+                        add(JsonPrimitive("mul"))
                     }
                 }
             }
             putJsonArray("required") {
-                add("a")
-                add("b")
-                add("op")
+                add(JsonPrimitive("a"))
+                add(JsonPrimitive("b"))
+                add(JsonPrimitive("op"))
             }
         }
         putJsonObject("output_schema") {
@@ -70,7 +71,7 @@ fun toolsExample(bridge: CoroutineBridge) = runBlocking {
             putJsonObject("properties") {
                 putJsonObject("result") { put("type", "number") }
             }
-            putJsonArray("required") { add("result") }
+            putJsonArray("required") { add(JsonPrimitive("result")) }
         }
     }.toString()
 
