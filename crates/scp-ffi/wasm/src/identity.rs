@@ -137,6 +137,21 @@ const EXPORT_HMAC_DOMAIN: &[u8] = b"scp-context-export-integrity-v1";
 /// The HMAC key is derived via `HKDF-SHA256(ikm=signing_key, salt=[], info=EXPORT_HMAC_DOMAIN)`
 /// to ensure domain separation from the signing key's primary use (Ed25519
 /// signatures).
+pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpWasmError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let hmac_key = derive_export_hmac_key(did)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
+            message: format!("HMAC key init failed: {e}"),
+            code: "SCP-CTX-2020".to_owned(),
+        })?;
+    mac.update(data);
+    let result = mac.finalize();
+    Ok(hex::encode(result.into_bytes()))
+}
+
 /// Resolves a specific verification method key by `kid` fragment identifier
 /// for the given DID from the WASM-local identity registry (ADR-039).
 ///
@@ -170,21 +185,6 @@ pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u
             )),
         }
     })
-}
-
-pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpWasmError> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let hmac_key = derive_export_hmac_key(did)?;
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
-            message: format!("HMAC key init failed: {e}"),
-            code: "SCP-CTX-2020".to_owned(),
-        })?;
-    mac.update(data);
-    let result = mac.finalize();
-    Ok(hex::encode(result.into_bytes()))
 }
 
 /// Verifies an HMAC-SHA256 tag over `data` using a key derived from the
