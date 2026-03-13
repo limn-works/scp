@@ -245,9 +245,10 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 /// - `profile_json`: JSON array of `ParticipationProfile` objects.
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
 ///
-/// Uses the current system time for freshness checks. Returns `True` if all
-/// requirements are satisfied, raises `ScpError` with a diagnostic message
-/// if any requirement fails or if the JSON is malformed.
+/// Uses the current system time for freshness checks. Returns `Ok(true)` on
+/// success. The Python SDK wrapper discards the return value — success is
+/// indicated by returning without exception. Raises `ScpError` with a
+/// diagnostic message if any requirement fails or if the JSON is malformed.
 ///
 /// See §7.3.2.1.
 ///
