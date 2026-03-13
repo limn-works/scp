@@ -3598,6 +3598,7 @@ mod wasm_petname_mirror {
     /// WASM bridge (`scp-ffi-wasm/src/discovery.rs`). Must stay in sync with
     /// scp-core's `PetnameEvent` serde format.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[allow(clippy::enum_variant_names)] // Mirrors scp-core PetnameEvent naming exactly
     pub enum WasmPetnameEvent {
         SetPetname { did: String, name: String },
         RemovePetname { did: String },
