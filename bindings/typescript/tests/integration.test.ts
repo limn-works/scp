@@ -1241,3 +1241,156 @@ describe("UCAN delegation (SDK wrapper)", () => {
     expect(delegated.encoded).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Broadcast mutation operations (mock bridge)
+// ---------------------------------------------------------------------------
+
+describe("Broadcast mutation operations (mock bridge)", () => {
+  async function createBroadcastContext() {
+    _setBridge(mockBridge);
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Broadcast" }));
+    const ctx = Context._fromHandle(handle, identity.did);
+    return { identity, handle, ctx };
+  }
+
+  it("broadcastSubscribe adds a subscriber", async () => {
+    const { ctx } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(true);
+    expect(await ctx.broadcastSubscriberCount()).toBe(1);
+  });
+
+  it("broadcastSubscribe rejects non-broadcast context", async () => {
+    _setBridge(mockBridge);
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
+    const ctx = Context._fromHandle(handle, identity.did);
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("not a broadcast context");
+  });
+
+  it("broadcastUnsubscribe removes a subscriber", async () => {
+    const { ctx } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(true);
+
+    await ctx.broadcastUnsubscribe(subscriber.did);
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(false);
+    expect(await ctx.broadcastSubscriberCount()).toBe(0);
+  });
+
+  it("broadcastPublish succeeds for context member", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const payload = new Uint8Array([1, 2, 3]);
+
+    // Should not throw — identity is the creator (a member)
+    await ctx.broadcastPublish(payload, identity.did);
+  });
+
+  it("broadcastPublish rejects non-member author", async () => {
+    const { ctx } = await createBroadcastContext();
+    const nonMember = await mockBridge.identityCreate("in_memory");
+    const payload = new Uint8Array([1, 2, 3]);
+
+    expect(ctx.broadcastPublish(payload, nonMember.did)).rejects.toThrow("not a member");
+  });
+
+  it("broadcastBlockSubscriber removes and blocks a subscriber", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(true);
+
+    await ctx.broadcastBlockSubscriber(subscriber.did, identity.did);
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(false);
+    expect(await ctx.broadcastSubscriberCount()).toBe(0);
+  });
+
+  it("broadcastBlockSubscriber prevents re-subscribe", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    await ctx.broadcastBlockSubscriber(subscriber.did, identity.did);
+
+    // Attempting to re-subscribe a blocked DID should fail
+    expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("blocked");
+  });
+
+  it("broadcastUnblockSubscriber allows re-subscribe after unblock", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    await ctx.broadcastBlockSubscriber(subscriber.did, identity.did);
+
+    // Unblock
+    await ctx.broadcastUnblockSubscriber(subscriber.did, identity.did);
+
+    // Should be able to re-subscribe after unblock
+    await ctx.broadcastSubscribe(subscriber.did);
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(true);
+  });
+
+  it("broadcastHandleKeyRequest grants key to subscribed DID", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+
+    const decision = await ctx.broadcastHandleKeyRequest(identity.did, subscriber.did);
+    expect(decision).toBe("Granted");
+  });
+
+  it("broadcastHandleKeyRequest denies key to non-subscribed DID", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const nonSubscriber = await mockBridge.identityCreate("in_memory");
+
+    const decision = await ctx.broadcastHandleKeyRequest(identity.did, nonSubscriber.did);
+    expect(decision).toContain("Denied");
+  });
+
+  it("broadcastHandleKeyRequest denies key to blocked DID", async () => {
+    const { ctx, identity } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    await ctx.broadcastBlockSubscriber(subscriber.did, identity.did);
+
+    const decision = await ctx.broadcastHandleKeyRequest(identity.did, subscriber.did);
+    expect(decision).toContain("Denied");
+    expect(decision).toContain("Blocked");
+  });
+
+  it("broadcastSubscriberCount returns null for non-broadcast context", async () => {
+    _setBridge(mockBridge);
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    expect(await ctx.broadcastSubscriberCount()).toBeNull();
+  });
+
+  it("broadcastAdmission returns Open for broadcast context", async () => {
+    const { ctx } = await createBroadcastContext();
+    expect(await ctx.broadcastAdmission()).toBe("Open");
+  });
+
+  it("broadcastAdmission returns null for non-broadcast context", async () => {
+    _setBridge(mockBridge);
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    expect(await ctx.broadcastAdmission()).toBeNull();
+  });
+});
