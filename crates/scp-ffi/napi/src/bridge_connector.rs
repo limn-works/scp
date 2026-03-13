@@ -12,7 +12,8 @@ use napi_derive::napi;
 
 use scp_core::bridge::provenance::{evaluate_trust_level, mark_bridge_provenance};
 use scp_core::bridge::registration::{
-    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
+    BridgeRegistrationMetadata, BridgeRegistrationRequest, BridgeRegistry, approve_registration,
+    register_bridge,
 };
 use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_core::bridge::{
@@ -136,13 +137,19 @@ pub fn bridge_evaluate_trust(
 /// Returns a context error if the governance DID matches the operator DID
 /// (self-approval) or if registration fails.
 #[napi]
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn bridge_register(
     context_id: String,
     operator_did: String,
     governance_did: String,
     platform: String,
     mode: String,
+    webhook_url: Option<String>,
+    platform_key: Option<Vec<u8>>,
+    max_shadows: Option<u32>,
+    metadata_display_name: Option<String>,
+    metadata_description: Option<String>,
+    metadata_operator_contact: Option<String>,
 ) -> napi::Result<NapiBridgeRegistration> {
     scp_ffi_common::validate::validate_did(&operator_did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -150,6 +157,17 @@ pub fn bridge_register(
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let bridge_mode = parse_bridge_mode(&mode)?;
+
+    let parsed_platform_key = platform_key
+        .map(|k| {
+            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
+                    code: "SCP-VALID-7012".to_owned(),
+                })
+            })
+        })
+        .transpose()?;
 
     let mut registry = BridgeRegistry::new(context_id.clone());
 
@@ -164,6 +182,14 @@ pub fn bridge_register(
         context_id: context_id.clone(),
         requested_at: now_secs,
         self_hosted: false,
+        webhook_url,
+        platform_key: parsed_platform_key,
+        max_shadows: max_shadows.unwrap_or(10_000),
+        metadata: BridgeRegistrationMetadata {
+            display_name: metadata_display_name.unwrap_or_default(),
+            description: metadata_description.unwrap_or_default(),
+            operator_contact: metadata_operator_contact.unwrap_or_default(),
+        },
     };
 
     let _event = register_bridge(&mut registry, request).map_err(|e| {
@@ -301,6 +327,12 @@ mod tests {
             "did:key:governance".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(result.status, "active");
@@ -318,6 +350,12 @@ mod tests {
             "did:key:operator".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -325,6 +363,43 @@ mod tests {
             err.to_string().contains("approver cannot be the same"),
             "expected self-approval error, got: {err}"
         );
+    }
+
+    #[test]
+    fn register_bridge_with_optional_fields() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
+            "discord".to_owned(),
+            "cooperative".to_owned(),
+            Some("https://example.com/webhook".to_owned()),
+            Some(vec![42u8; 32]),
+            Some(500),
+            Some("My Discord Bridge".to_owned()),
+            Some("Bridges #general channel".to_owned()),
+            Some("admin@example.com".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(result.status, "active");
+    }
+
+    #[test]
+    fn register_bridge_rejects_invalid_platform_key_length() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "did:key:governance".to_owned(),
+            "discord".to_owned(),
+            "cooperative".to_owned(),
+            None,
+            Some(vec![42u8; 16]), // wrong length
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

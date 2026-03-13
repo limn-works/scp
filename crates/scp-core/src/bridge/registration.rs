@@ -94,6 +94,27 @@ pub enum BridgeRegistrationError {
 }
 
 // ---------------------------------------------------------------------------
+// BridgeRegistrationMetadata
+// ---------------------------------------------------------------------------
+
+/// Human-readable metadata for a bridge registration request (spec §12.2.1).
+///
+/// Carries display name, description, and operator contact info so that
+/// context governance can make informed approval decisions. Defaults to
+/// empty strings when not provided.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeRegistrationMetadata {
+    /// Human-readable display name for the bridge (e.g., `"Acme Discord Bridge"`).
+    pub display_name: String,
+
+    /// Free-text description of the bridge's purpose or scope.
+    pub description: String,
+
+    /// Contact information for the bridge operator (e.g., email, URL).
+    pub operator_contact: String,
+}
+
+// ---------------------------------------------------------------------------
 // BridgeRegistrationRequest
 // ---------------------------------------------------------------------------
 
@@ -101,6 +122,8 @@ pub enum BridgeRegistrationError {
 ///
 /// Created by the bridge operator via [`register_bridge`]. The request is
 /// presented to context governance for approval or rejection.
+///
+/// Fields align with the spec §12.2.1 `RegisterBridge` governance action.
 ///
 /// See ADR-023 acceptance criterion 2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +153,29 @@ pub struct BridgeRegistrationRequest {
     /// (puppet mode). The protocol treats self-hosted and managed bridges
     /// identically (ADR-023 acceptance criterion 11).
     pub self_hosted: bool,
+
+    /// For cooperative mode: the platform's webhook receiver URL (spec §12.2.1).
+    ///
+    /// Required for cooperative mode bridges; the bridge node uses this URL
+    /// to push events to the external platform. `None` for non-cooperative modes.
+    pub webhook_url: Option<String>,
+
+    /// For cooperative mode: the platform's Ed25519 public key (spec §12.2.1, §12.10.2).
+    ///
+    /// Used to verify webhook request signatures from the platform. Required
+    /// for cooperative mode; `None` for non-cooperative modes.
+    pub platform_key: Option<[u8; 32]>,
+
+    /// Governance-configured shadow limit for this bridge (spec §12.2.1).
+    ///
+    /// Overrides the default `max_shadows_per_bridge` (10,000) in the
+    /// `ShadowRegistry`. Contexts MAY set lower limits to prevent resource
+    /// exhaustion from unbounded shadow creation.
+    pub max_shadows: u32,
+
+    /// Human-readable metadata: display name, description, operator contact
+    /// (spec §12.2.1).
+    pub metadata: BridgeRegistrationMetadata,
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +682,10 @@ mod tests {
             context_id: context_id.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         }
     }
 
@@ -1173,6 +1223,10 @@ mod tests {
             context_id: CTX_B.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry_b, request_b).unwrap();
         approve_registration(
@@ -1227,6 +1281,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry_a, req_a).unwrap();
         approve_registration(
@@ -1245,6 +1303,10 @@ mod tests {
             context_id: CTX_B.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: true,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry_b, req_b).unwrap();
         approve_registration(
@@ -1281,6 +1343,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: true,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry, req_self).unwrap();
         let (self_hosted, _) = approve_registration(
@@ -1300,6 +1366,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry, req_managed).unwrap();
         let (managed, _) = approve_registration(
@@ -1509,6 +1579,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: true,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry, req_slack).unwrap();
         approve_registration(
@@ -1621,6 +1695,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry, req).unwrap();
         approve_registration(
@@ -1652,6 +1730,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry, req).unwrap();
         approve_registration(
@@ -1683,6 +1765,10 @@ mod tests {
             context_id: CTX_A.to_owned(),
             requested_at: 1_700_000_000,
             self_hosted: false,
+            webhook_url: None,
+            platform_key: None,
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
         };
         register_bridge(&mut registry, req).unwrap();
         approve_registration(
@@ -1745,6 +1831,10 @@ mod tests {
                 context_id: CTX_A.to_owned(),
                 requested_at: 1_700_000_000,
                 self_hosted: false,
+                webhook_url: None,
+                platform_key: None,
+                max_shadows: 10_000,
+                metadata: BridgeRegistrationMetadata::default(),
             };
             register_bridge(&mut registry, request).unwrap();
             let (connector, _) = approve_registration(

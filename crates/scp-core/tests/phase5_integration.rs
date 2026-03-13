@@ -319,6 +319,10 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         context_id: context_id.to_owned(),
         requested_at: 1_700_000_000,
         self_hosted: false,
+        webhook_url: None,
+        platform_key: None,
+        max_shadows: 10_000,
+        metadata: scp_core::bridge::registration::BridgeRegistrationMetadata::default(),
     };
 
     let reg_event = register_bridge(&mut bridge_registry, registration_request)
