@@ -794,15 +794,15 @@ export class Context implements AsyncDisposable {
   /**
    * Extends the TTL by the given number of seconds.
    *
-   * @param additionalSecs - Number of seconds to add to the TTL. Must be greater than zero.
+   * @param additionalSecs - Number of seconds to add to the TTL. Must be a finite positive number.
    * @returns `true` if the extension was applied.
    * @throws {ContextError} If the context has been disposed or extension fails.
-   * @throws {ContextError} If `additionalSecs` is zero or negative.
+   * @throws {ContextError} If `additionalSecs` is not a finite positive number.
    */
   async extendTtl(additionalSecs: number): Promise<boolean> {
     this.assertActive();
     if (!Number.isFinite(additionalSecs) || additionalSecs <= 0) {
-      throw new ContextError("additionalSecs must be greater than zero", "SCP-CTX-2031");
+      throw new ContextError("additionalSecs must be a finite positive number", "SCP-CTX-2031");
     }
     try {
       const bridge = await getBridge();
@@ -837,16 +837,16 @@ export class Context implements AsyncDisposable {
    * Records consent from the given member for extending the context's TTL.
    * Returns `true` if the extension was unanimously approved by all members.
    *
-   * @param extensionSecs - Number of seconds to extend the TTL by. Must be greater than zero.
+   * @param extensionSecs - Number of seconds to extend the TTL by. Must be a finite positive number.
    * @param proposerDid - DID of the proposer. Defaults to the context identity.
    * @returns `true` if the extension was unanimously approved.
    * @throws {ContextError} If the context is not active or the proposal fails (SCP-CTX-2005).
-   * @throws {ContextError} If `extensionSecs` is zero or negative.
+   * @throws {ContextError} If `extensionSecs` is not a finite positive number.
    */
   async proposeTtlExtension(extensionSecs: number, proposerDid?: string): Promise<boolean> {
     this.assertActive();
     if (!Number.isFinite(extensionSecs) || extensionSecs <= 0) {
-      throw new ContextError("extensionSecs must be greater than zero", "SCP-CTX-2031");
+      throw new ContextError("extensionSecs must be a finite positive number", "SCP-CTX-2031");
     }
     try {
       const bridge = await getBridge();
@@ -866,14 +866,14 @@ export class Context implements AsyncDisposable {
    * Replaces the current TTL countdown with a fresh timer of the specified
    * duration. Requires a core context handle.
    *
-   * @param newDurationSecs - The new TTL duration in seconds. Must be greater than zero.
+   * @param newDurationSecs - The new TTL duration in seconds. Must be a finite positive number.
    * @throws {ContextError} If the context does not have a core handle (SCP-CTX-2024).
-   * @throws {ContextError} If `newDurationSecs` is zero or negative.
+   * @throws {ContextError} If `newDurationSecs` is not a finite positive number.
    */
   async resetTtlTimer(newDurationSecs: number): Promise<void> {
     this.assertActive();
     if (!Number.isFinite(newDurationSecs) || newDurationSecs <= 0) {
-      throw new ContextError("newDurationSecs must be greater than zero", "SCP-CTX-2031");
+      throw new ContextError("newDurationSecs must be a finite positive number", "SCP-CTX-2031");
     }
     try {
       const bridge = await getBridge();
