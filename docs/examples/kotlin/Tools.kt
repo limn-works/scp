@@ -77,7 +77,7 @@ fun toolsExample(bridge: CoroutineBridge) = runBlocking {
     println("\nTool defined: calculator")
 
     // 4. Register the tool in the context.
-    val toolId = bridge.tool.register(contextHandle, definitionJson)
+    val toolId = bridge.tools.register(contextHandle, definitionJson)
     println("  Registered with ID: $toolId")
 
     // 5. Verify the tool against test vectors.
@@ -85,7 +85,7 @@ fun toolsExample(bridge: CoroutineBridge) = runBlocking {
     //    matches its declared input/output schemas.
     val verifyInput = """{"a": 2, "b": 3, "op": "add"}"""
     val verifyOutput = """{"result": 5}"""
-    val passed = bridge.tool.verify(toolId, verifyInput, verifyOutput)
+    val passed = bridge.tools.verify(toolId, verifyInput, verifyOutput)
     println("  Verification passed: $passed")
 
     // 6. Invoke the tool.
@@ -94,7 +94,7 @@ fun toolsExample(bridge: CoroutineBridge) = runBlocking {
     val inputJson = """{"a": 7, "b": 3, "op": "mul"}"""
     println("\nInvoking calculator with: $inputJson")
 
-    val resultJson = bridge.tool.invoke(contextHandle, toolId, inputJson)
+    val resultJson = bridge.tools.invoke(contextHandle, toolId, inputJson)
     println("  Result: $resultJson")
 
     // 7. UCAN authorization for tool invocation.

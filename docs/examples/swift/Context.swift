@@ -20,67 +20,70 @@ struct ContextExample {
         let alice = try await createIdentity(custody: "in_memory")
         print("Alice DID: \(alice.did())")
 
-        // 2. Define the capability ceiling for the context.
-        let ceiling = [
-            "messages:read",
-            "messages:write",
-            "member:invite",
-            "member:remove",
-            "tool:register",
-            "tool:invoke_all",
-        ]
-
-        // 3. Create the context.
-        //    Context is an actor -- all operations are async and thread-safe.
-        //    The injectable bridge pattern allows test injection of all
-        //    UniFFI functions.
-        let ctx = try await Context.create(
-            contextId: "demo-context",
-            ceiling: ceiling,
-            createFn: ContextBridge.defaultCreate,
-            sendFn: ContextBridge.defaultSend,
-            subscribeFn: ContextBridge.defaultSubscribe,
-            leaveFn: ContextBridge.defaultLeave,
-            closeFn: ContextBridge.defaultClose
+        // 2. Define context parameters.
+        //    ContextParams is a UniFFI-generated struct with governance,
+        //    memory scope, TTL, and capability ceiling.
+        let params = ContextParams(
+            ceiling: [
+                "messages:read",
+                "messages:write",
+                "member:invite",
+                "member:remove",
+                "tool:register",
+                "tool:invoke_all",
+            ],
+            governance: .singleAdmin,
+            memoryScope: .full,
+            ttlSeconds: 0,
+            promotable: false,
+            minProtocolVersion: 0
         )
 
-        print()
-        print("Context created: \(ctx.contextId)")
-        print("  Creator: \(ctx.creatorDid)")
+        // 3. Create the context via the UniFFI bridge.
+        //    Returns a ContextHandle -- the opaque reference to Rust state.
+        let handle = try await contextCreate(identity: alice, params: params)
 
-        let state = await ctx.state
+        print()
+        print("Context created: \(handle.contextId())")
+        print("  Creator: \(handle.creatorDid())")
+
+        let state = try handle.state()
         print("  State: \(state)")
 
         // 4. Send a message to the context.
         let payload = "Hello, context!".data(using: .utf8)!
-        try await ctx.send(payload)
+        try await contextSend(handle: handle, identity: alice, payload: payload)
         print("  Message sent successfully.")
 
-        // 5. Subscribe to incoming messages via AsyncStream.
-        //    In a real application, consume this in a long-running task:
+        // 5. Subscribe to incoming messages via the MessageListener callback.
+        //    In a real application, implement the MessageListener protocol and
+        //    consume messages asynchronously:
         //
-        //    let stream = try await ctx.messages
-        //    for await message in stream {
-        //        print("[\(message.senderDid)] \(message.payload)")
+        //    class MyListener: MessageListener {
+        //        func onMessage(message: Message) {
+        //            let text = String(data: message.payload, encoding: .utf8) ?? "<binary>"
+        //            print("[\(message.senderDid)] \(text)")
+        //        }
+        //        func onError(error: ScpError) { print("Error: \(error)") }
+        //        func onComplete() { print("Stream complete.") }
         //    }
+        //    try await contextSubscribe(handle: handle, listener: MyListener())
         //
-        //    The stream finishes when the context is closed or left.
         print("  (Message stream ready for consumption)")
 
         // 6. Bob joins the context.
         let bob = try await createIdentity(custody: "in_memory")
-        let handle = ctx.handle as! ContextHandle
-        try await joinContext(handle: handle, identity: bob)
+        try await contextJoin(handle: handle, identity: bob)
         print()
         print("Bob joined the context.")
 
         // 7. Leave the context gracefully.
         //    This sends a MemberLeft event and releases local resources.
-        try await ctx.leave()
+        try await contextLeave(handle: handle, identity: alice)
         print("Left the context.")
 
         // Alternatively, close the context for all members:
-        // try await ctx.close()
+        // try await contextClose(handle: handle, identity: alice)
 
         print()
         print("Context lifecycle complete.")

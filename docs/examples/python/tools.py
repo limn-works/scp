@@ -84,11 +84,11 @@ async def main() -> None:
         # 4. Mint a UCAN token authorizing tool invocation.
         #    The token grants tool_invoke:* capability for this context.
         ucan_token = await mint(
-            operator._handle,
-            operator.did,
-            '["tool_invoke:*"]',
+            audience=operator.did,
+            capabilities=["tool_invoke:*"],
+            context=ctx.context_id,
         )
-        print(f"\nUCAN minted (length: {len(ucan_token)})")
+        print(f"\nUCAN minted: {ucan_token.token_id}")
 
         # 5. Invoke the tool.
         #    In a real application, the context would have the tool
@@ -96,7 +96,7 @@ async def main() -> None:
         result = await ctx.invoke(
             tool="calculator",
             input={"a": 7, "b": 3, "op": "mul"},
-            ucan_token=ucan_token,
+            ucan_token=ucan_token.token_id,
             identity=operator,
         )
         print(f"\nInvoked calculator: 7 * 3")
@@ -118,7 +118,7 @@ async def main() -> None:
             session_id=session_id,
             input={"a": 10, "b": 5, "op": "sub"},
             invoker_did=operator.did,
-            ucan_token=ucan_token,
+            ucan_token=ucan_token.token_id,
         )
         print(f"  Session invoke: 10 - 5 = {session_result}")
 

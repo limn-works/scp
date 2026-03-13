@@ -46,17 +46,19 @@ swift run Tools
 |------|-------------|
 | `Identity.swift` | Create identity, resolve DID, inspect document, agent key management |
 | `Context.swift` | Create context, configure capabilities, join/leave, send messages |
-| `Messaging.swift` | Two-party message exchange with `AsyncStream` receive |
+| `Messaging.swift` | Two-party message exchange with `MessageListener` receive |
 | `Tools.swift` | Define tools with JSON schemas, register, verify, invoke, stateful sessions |
 
 ## Key Patterns
 
-- **Actor-based Context**: `Context` is a Swift actor for thread-safe state management.
-- **Injectable bridge**: All UniFFI calls are injected via `*Bridge` enums for testability.
-- **AsyncStream**: `ctx.messages` returns an `AsyncStream<Message>` for push-based delivery.
+- **UniFFI bridge functions**: Context operations use generated functions (`contextCreate`, `contextSend`, `contextJoin`, etc.) that delegate to Rust.
+- **ContextHandle**: Opaque handle to Rust context state, returned by `contextCreate`.
+- **ContextParams**: UniFFI-generated struct configuring governance, memory scope, TTL, and capability ceiling.
+- **MessageListener**: Callback protocol for receiving messages via `contextSubscribe`.
+- **Injectable bridge**: SDK wrapper layer uses `*Bridge` enums for testability.
 - **Structured concurrency**: All operations are `async throws` using Swift concurrency.
 - **Free functions**: Identity operations use top-level functions (`createIdentity`, `resolveIdentity`, etc.).
-- **Resource cleanup**: Call `ctx.close()` explicitly. `deinit` schedules a detached cleanup task as safety net.
+- **Resource cleanup**: Call `contextClose(handle:identity:)` when done with a context.
 
 ## Architecture Notes
 

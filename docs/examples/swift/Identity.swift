@@ -30,11 +30,12 @@ struct IdentityExample {
 
         print("DID Document:")
         print("  ID: \(doc.id)")
-        print("  Verification methods: \(doc.verificationMethods.count)")
-        for vm in doc.verificationMethods {
-            print("    - \(vm.id) (type: \(vm.methodType))")
+        print("  Authentication methods: \(doc.authentication.count)")
+        for vmId in doc.authentication {
+            print("    - \(vmId)")
         }
-        print("  Services: \(doc.services.count)")
+        print("  Assertion methods: \(doc.assertionMethods.count)")
+        print("  Service endpoints: \(doc.serviceEndpoints.count)")
         print()
 
         // 3. Create an identity with an agent signing key (ADR-039).

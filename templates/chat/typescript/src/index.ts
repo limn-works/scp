@@ -9,7 +9,7 @@
  *   Open index.html in a browser (or run `bun run serve`)
  */
 
-import { Context, Identity, Transport } from "@limn-works/scp-ts";
+import { Context, Identity } from "@limn-works/scp-ts";
 import type { Message } from "@limn-works/scp-ts";
 
 // ---------------------------------------------------------------------------

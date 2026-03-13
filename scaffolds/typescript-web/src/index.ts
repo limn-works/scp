@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   log("Message sent.");
 
   // 4. Clean up.
-  await ctx.leave(identity);
+  await ctx.leave();
   log("\nBrowser app complete.");
 }
 

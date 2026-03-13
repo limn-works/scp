@@ -33,7 +33,7 @@ async function main(): Promise<void> {
   for (const vm of doc.verificationMethods) {
     console.log(`    - ${vm.id} (type: ${vm.type})`);
   }
-  console.log(`  Services: ${doc.services.length}`);
+  console.log(`  Service endpoints: ${doc.serviceEndpoints.length}`);
   console.log();
 
   // 3. Create an identity with an agent signing key (ADR-039).

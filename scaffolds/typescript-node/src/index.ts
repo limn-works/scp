@@ -21,14 +21,13 @@ async function main(): Promise<void> {
     memoryScope: "ephemeral",
   });
   console.log(`Created context: ${ctx.contextId}`);
-  console.log(`  State: ${ctx.state}`);
 
   // 3. Send a message.
   await ctx.send("Hello, SCP!");
   console.log("  Message sent.");
 
   // 4. Clean up.
-  await ctx.leave(identity);
+  await ctx.leave();
   console.log("\nAgent complete.");
 }
 

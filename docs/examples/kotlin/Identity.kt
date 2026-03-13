@@ -43,37 +43,39 @@ fun identityExample(bridge: CoroutineBridge) = runBlocking {
     println()
 
     // 4. Agent key management (ADR-039).
+    //    Requires CoroutineBridge constructed with ExtendedBindings
+    //    that include IdentityAdvancedBindings.
+    //    bridge.identityAdvanced is nullable; here we assert non-null
+    //    because we know extended bindings were provided.
+    val advanced = bridge.identityAdvanced
+        ?: error("identityAdvanced requires ExtendedBindings")
+
     //    Create an identity with an agent signing key for
     //    human+agent shared DID patterns.
-    val agentHandle = bridge.identityAdvanced.createWithAgentKey(
-        CustodyType.IN_MEMORY,
-    )
+    val agentHandle = advanced.createWithAgentKey(CustodyType.IN_MEMORY)
     println("Agent identity handle: $agentHandle")
 
     // 5. Add an agent key to an existing identity.
-    val withAgent = bridge.identityAdvanced.addAgentKey(identityHandle)
+    val withAgent = advanced.addAgentKey(identityHandle)
     println("Added agent key, new handle: $withAgent")
 
     // 6. Rotate the agent key.
-    val rotated = bridge.identityAdvanced.rotateAgentKey(withAgent)
+    val rotated = advanced.rotateAgentKey(withAgent)
     println("Rotated agent key, new handle: $rotated")
 
     // 7. Remove the agent key.
-    val cleaned = bridge.identityAdvanced.removeAgentKey(rotated)
+    val cleaned = advanced.removeAgentKey(rotated)
     println("Removed agent key, new handle: $cleaned")
 
     // 8. Migrate identity to a new DID (Layer 2 rotation).
-    val migrated = bridge.identityAdvanced.migrate(identityHandle)
+    val migrated = advanced.migrate(identityHandle)
     println("Migrated identity, new handle: $migrated")
 
     // 9. Device attestation (section 9.3).
-    val token = bridge.identityAdvanced.attestDevice(identityHandle)
+    val token = advanced.attestDevice(identityHandle)
     println("\nDevice attestation token: ${token.take(40)}...")
 
-    val valid = bridge.identityAdvanced.verifyDeviceAttestation(
-        didString,
-        token,
-    )
+    val valid = advanced.verifyDeviceAttestation(didString, token)
     println("Attestation valid: $valid")
 
     println()

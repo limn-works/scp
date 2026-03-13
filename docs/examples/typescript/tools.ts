@@ -87,18 +87,18 @@ async function main(): Promise<void> {
   // 6. Mint a UCAN token authorizing tool invocation.
   //    The token grants tool_invoke:* capability for this context.
   const ucanToken = await mintUcan(
-    operator._handle,
+    ctx,
     operator.did,
-    JSON.stringify(["tool_invoke:*"]),
+    ["tool:invoke", "tool:invoke:*"],
   );
-  console.log(`\nUCAN minted (length: ${ucanToken.length})`);
+  console.log(`\nUCAN minted: ${ucanToken.id}`);
 
   // 7. Invoke the tool with UCAN authorization.
   const result = await ctx.invokeTool(
     toolId,
     { a: 7, b: 3, op: "mul" },
     operator,
-    ucanToken,
+    ucanToken.encoded,
   );
   console.log(`\nInvoked calculator: 7 * 3`);
   console.log(`  Result: ${JSON.stringify(result)}`);

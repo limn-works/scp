@@ -1,7 +1,7 @@
 /// Tool registration and invocation within a context.
 ///
 /// Demonstrates defining a tool with a JSON schema, registering it
-/// in a context, and invoking it with UCAN authorization.
+/// in a context, and invoking it with the UniFFI bridge functions.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project
@@ -21,23 +21,22 @@ struct ToolsExample {
         print("Operator DID: \(operator_.did())")
 
         // 2. Create a context with tool capabilities.
-        let ceiling = [
-            "messages:read",
-            "messages:write",
-            "tool:register",
-            "tool:invoke_all",
-        ]
-
-        let ctx = try await Context.create(
-            contextId: "tool-demo",
-            ceiling: ceiling,
-            createFn: ContextBridge.defaultCreate,
-            sendFn: ContextBridge.defaultSend,
-            subscribeFn: ContextBridge.defaultSubscribe,
-            leaveFn: ContextBridge.defaultLeave,
-            closeFn: ContextBridge.defaultClose
+        let params = ContextParams(
+            ceiling: [
+                "messages:read",
+                "messages:write",
+                "tool:register",
+                "tool:invoke_all",
+            ],
+            governance: .singleAdmin,
+            memoryScope: .full,
+            ttlSeconds: 0,
+            promotable: false,
+            minProtocolVersion: 0
         )
-        print("Context: \(ctx.contextId)")
+
+        let handle = try await contextCreate(identity: operator_, params: params)
+        print("Context: \(handle.contextId())")
 
         // 3. Define a calculator tool.
         //    ToolDefinition is a UniFFI-generated type with JSON schema fields.
@@ -82,11 +81,11 @@ struct ToolsExample {
         print("  Description: \(definition.description)")
 
         // 4. Register the tool in the context.
-        let toolId = try await ctx.registerTool(definition)
+        let toolId = try await toolRegister(handle: handle, definition: definition)
         print("  Registered with ID: \(toolId)")
 
         // 5. Verify the tool against its test vectors.
-        let verification = try await ctx.verifyTool(toolId)
+        let verification = try await toolVerify(handle: handle, toolId: toolId)
         print("  Verification passed: \(verification.passed)")
         if !verification.failures.isEmpty {
             for failure in verification.failures {
@@ -95,51 +94,49 @@ struct ToolsExample {
         }
 
         // 6. Invoke the tool.
-        //    Tool input is passed as serialized JSON Data.
-        let input = #"{"a": 7, "b": 3, "op": "mul"}"#.data(using: .utf8)!
+        //    Tool input and output are JSON strings at the bridge level.
+        let inputJson = #"{"a": 7, "b": 3, "op": "mul"}"#
 
-        let result = try await ctx.invokeTool(
-            "calculator",
-            input: input,
-            identity: operator_
+        let outputJson = try await toolInvoke(
+            handle: handle,
+            toolId: "calculator",
+            inputJson: inputJson,
+            identity: operator_,
+            ucanToken: nil,
+            proofTokens: nil
         )
 
         print("\nInvoked calculator: 7 * 3")
-        if let outputString = String(data: result.output, encoding: .utf8) {
-            print("  Result: \(outputString)")
-        }
-        print("  Invoker: \(result.invokerDid)")
-        print("  Context: \(result.contextId)")
-        print("  Timestamp: \(result.timestamp)")
+        print("  Result: \(outputJson)")
 
         // 7. Stateful tool sessions (spec section 6.2.1).
         //    Sessions enable multi-turn workflows with state preservation.
-        let session = try await ctx.createToolSession(
+        let sessionId = try await toolSessionCreate(
+            handle: handle,
             toolId: toolId,
-            sourceContextId: ctx.contextId,
+            sourceContextId: handle.contextId(),
             ttlSeconds: 300  // 5-minute session
         )
-        print("\nSession created: \(session.sessionId)")
+        print("\nSession created: \(sessionId)")
 
         // Invoke within the session.
-        let sessionInput = #"{"a": 10, "b": 5, "op": "sub"}"#.data(using: .utf8)!
-        let sessionResult = try await ctx.invokeToolSession(
-            sessionId: session.sessionId,
-            input: sessionInput,
+        let sessionInputJson = #"{"a": 10, "b": 5, "op": "sub"}"#
+        let sessionOutputJson = try await toolSessionInvoke(
+            handle: handle,
+            sessionId: sessionId,
+            inputJson: sessionInputJson,
             identity: operator_,
-            ucanToken: "placeholder-token"
+            ucanToken: "placeholder-token",
+            proofTokens: nil
         )
-
-        if let output = String(data: sessionResult.output, encoding: .utf8) {
-            print("  Session invoke: 10 - 5 = \(output)")
-        }
+        print("  Session invoke: 10 - 5 = \(sessionOutputJson)")
 
         // Close the session.
-        try await ctx.closeToolSession(sessionId: session.sessionId)
+        try await toolSessionClose(handle: handle, sessionId: sessionId)
         print("  Session closed.")
 
         // 8. Clean up.
-        try await ctx.close()
+        try await contextClose(handle: handle, identity: operator_)
         print("\nTool operations complete.")
     }
 }
