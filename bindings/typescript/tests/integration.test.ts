@@ -1272,7 +1272,7 @@ describe("Broadcast mutation operations (mock bridge)", () => {
     const ctx = Context._fromHandle(handle, identity.did);
     const subscriber = await mockBridge.identityCreate("in_memory");
 
-    expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("not a broadcast context");
+    await expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("not a broadcast context");
   });
 
   it("broadcastUnsubscribe removes a subscriber", async () => {
@@ -1300,7 +1300,7 @@ describe("Broadcast mutation operations (mock bridge)", () => {
     const nonMember = await mockBridge.identityCreate("in_memory");
     const payload = new Uint8Array([1, 2, 3]);
 
-    expect(ctx.broadcastPublish(payload, nonMember.did)).rejects.toThrow("not a member");
+    await expect(ctx.broadcastPublish(payload, nonMember.did)).rejects.toThrow("not a member");
   });
 
   it("broadcastBlockSubscriber removes and blocks a subscriber", async () => {
@@ -1323,7 +1323,7 @@ describe("Broadcast mutation operations (mock bridge)", () => {
     await ctx.broadcastBlockSubscriber(subscriber.did, identity.did);
 
     // Attempting to re-subscribe a blocked DID should fail
-    expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("blocked");
+    await expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("blocked");
   });
 
   it("broadcastUnblockSubscriber allows re-subscribe after unblock", async () => {
