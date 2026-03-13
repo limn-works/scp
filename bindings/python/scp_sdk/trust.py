@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from scp_sdk.errors import ContextError, ScpError, UcanPermissionError
+from scp_sdk.errors import ContextError, ScpError
 
 logger = logging.getLogger("scp_sdk")
 
@@ -44,6 +44,163 @@ def _bridge() -> Any:
             "Install scp-python with: pip install scp-python",
             code="SCP-UNKNOWN-0001",
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# UCAN error classification for Layer 1 independent checks
+# ---------------------------------------------------------------------------
+
+# Error message prefixes that indicate an early token structure failure.
+# Maps to CapabilityValidation.tokens_valid.
+# Pipeline step 1 (parse/header validation) — fails before any other
+# check has run.
+_TOKEN_PARSE_PREFIXES: tuple[str, ...] = (
+    "malformed token:",
+    "deserialization failed:",
+    "unsupported algorithm:",
+    "unsupported UCAN version:",
+)
+
+# Error message prefixes that indicate a signature/chain integrity failure.
+# Maps to CapabilityValidation.signatures_valid.
+# Pipeline steps: 2 (signature), 3 (chain), 4 (root issuer),
+#   5 (audience), 5a/5b (key scope), 6b (category A), 7 (attenuation).
+_SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
+    "signature verification failed",
+    "invalid issuer:",
+    "audience mismatch:",
+    "delegation chain broken:",
+    "circular delegation detected:",
+    "attenuation violation:",
+    "key scope mismatch:",
+    "self-delegation",
+    "Category A violation:",
+)
+
+# Error message prefixes that indicate a capability ceiling/scope failure.
+# Maps to CapabilityValidation.within_ceiling.
+# Pipeline steps: 6 (capability match), 8 (ceiling compliance).
+_CAPABILITY_CEILING_PREFIXES: tuple[str, ...] = (
+    "capability outside ceiling:",
+    "capability not granted:",
+)
+
+# Error message prefixes for nonce failures (step 9).
+# Maps to CapabilityValidation.tokens_valid.
+# By step 9, signature and ceiling checks have already passed.
+_NONCE_PREFIXES: tuple[str, ...] = (
+    "nonce reused:",
+    "nonce too old:",
+    "nonce from the future:",
+    "invalid nonce format:",
+    "nonce tracker full:",
+    "system clock error:",
+)
+
+# Error message prefixes that indicate a revocation failure.
+# Maps to CapabilityValidation.not_revoked.
+# Pipeline step: 10 (revocation check).
+_REVOCATION_PREFIXES: tuple[str, ...] = ("token revoked:",)
+
+# Error message prefixes for expiry/time-bounds failures (step 11).
+# Maps to CapabilityValidation.tokens_valid.
+# By step 11, all other checks have passed.
+_EXPIRY_PREFIXES: tuple[str, ...] = (
+    "token expired",
+    "token not yet valid",
+    "invalid time range:",
+    "expiry too far in the future:",
+)
+
+
+def _extract_core_error(error_message: str) -> str:
+    """Extract the core UcanError Display text from a bridge error message.
+
+    The Rust bridge formats UCAN errors as::
+
+        [SCP-PERM-3001] permission error: <UcanError Display> \u2014 <advice>
+
+    This strips the code prefix and trailing advice to yield the raw
+    ``UcanError`` Display text for prefix matching.
+    """
+    core = error_message
+    if "] permission error: " in core:
+        core = core.split("] permission error: ", 1)[1]
+    # Strip the trailing advice suffix added by the Rust From<UcanError> impl.
+    if " \u2014 " in core:
+        core = core.split(" \u2014 ", 1)[0]
+    return core
+
+
+def _classify_ucan_error(error_message: str) -> str:
+    """Classify a UCAN validation error into a fine-grained pipeline stage.
+
+    Returns one of:
+    - ``"token_parse"`` — step 1 (parse/header) failed
+    - ``"signatures"`` — steps 2-7 (signature, chain, issuer, audience,
+      key scope, attenuation) failed
+    - ``"ceiling"`` — steps 6/8 (capability match, ceiling) failed
+    - ``"nonce"`` — step 9 (nonce validation) failed
+    - ``"revoked"`` — step 10 (revocation check) failed
+    - ``"expiry"`` — step 11 (time bounds) failed
+    - ``"unknown"`` — unrecognized error
+    """
+    core = _extract_core_error(error_message)
+
+    for prefix in _TOKEN_PARSE_PREFIXES:
+        if core.startswith(prefix):
+            return "token_parse"
+
+    for prefix in _SIGNATURE_CHAIN_PREFIXES:
+        if core.startswith(prefix):
+            return "signatures"
+
+    for prefix in _CAPABILITY_CEILING_PREFIXES:
+        if core.startswith(prefix):
+            return "ceiling"
+
+    for prefix in _NONCE_PREFIXES:
+        if core.startswith(prefix):
+            return "nonce"
+
+    for prefix in _REVOCATION_PREFIXES:
+        if core.startswith(prefix):
+            return "revoked"
+
+    for prefix in _EXPIRY_PREFIXES:
+        if core.startswith(prefix):
+            return "expiry"
+
+    return "unknown"
+
+
+# Maps pipeline stages to which CapabilityValidation fields are known
+# to have passed when that stage fails, based on the 11-step sequential
+# pipeline in validate.rs:
+#
+#   parse(1) → sig(2) → chain(3-5) → key_scope(5a/b) → cap_match(6)
+#   → cat_A(6b) → attenuation(7) → ceiling(8) → nonce(9)
+#   → revocation(10) → expiry(11)
+#
+# Each value lists the fields that PASSED before the failure point.
+# The failing field is NOT in the set — it will be set to False.
+# Fields after the failure are also not in the set (never ran).
+_PASSED_BEFORE: dict[str, set[str]] = {
+    # Step 1: parse fails — nothing passed.
+    "token_parse": set(),
+    # Steps 2-7: signature/chain fails — parse passed.
+    "signatures": {"tokens_valid"},
+    # Steps 6/8: capability/ceiling fails — parse + sig passed.
+    "ceiling": {"tokens_valid", "signatures_valid"},
+    # Step 9: nonce fails — parse + sig + ceiling all passed.
+    "nonce": {"signatures_valid", "within_ceiling"},
+    # Step 10: revocation fails — parse + sig + ceiling + nonce passed.
+    "revoked": {"tokens_valid", "signatures_valid", "within_ceiling"},
+    # Step 11: expiry fails — parse + sig + ceiling + nonce + revocation passed.
+    "expiry": {"signatures_valid", "within_ceiling", "not_revoked"},
+    # Unknown: conservatively nothing passed.
+    "unknown": set(),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -244,19 +401,36 @@ async def evaluate_trust(
     bridge = _bridge()
 
     # Layer 1: Validate capability tokens if provided.
+    # Each of the four CapabilityValidation fields is set independently
+    # based on which specific check failed (ADR-017, spec section 9.3).
+    # The bridge's ucan_validate runs an 11-step pipeline that returns
+    # on the first failure. We classify the error to determine which
+    # check failed, and infer which earlier checks passed based on
+    # the pipeline execution order.
     cap_validation = CapabilityValidation()
     if capability_tokens:
-        all_valid = True
+        # Start optimistic: assume all pass until a failure proves otherwise.
+        cap_validation.tokens_valid = True
+        cap_validation.signatures_valid = True
+        cap_validation.within_ceiling = True
+        cap_validation.not_revoked = True
+
         for token in capability_tokens:
             try:
                 bridge.ucan_validate(context_id, token, "*")
-            except UcanPermissionError:
-                all_valid = False
+            except Exception as exc:
+                error_msg = str(exc)
+                failed_category = _classify_ucan_error(error_msg)
+                passed = _PASSED_BEFORE.get(failed_category, set())
+
+                # The failing category is definitely False.
+                # Categories before it in the pipeline passed.
+                # Categories after it are unknown (never ran) — set False.
+                cap_validation.tokens_valid = "tokens_valid" in passed
+                cap_validation.signatures_valid = "signatures_valid" in passed
+                cap_validation.within_ceiling = "within_ceiling" in passed
+                cap_validation.not_revoked = "not_revoked" in passed
                 break
-        cap_validation.tokens_valid = all_valid
-        cap_validation.signatures_valid = all_valid
-        cap_validation.within_ceiling = all_valid
-        cap_validation.not_revoked = all_valid
 
     # Layer 2: Query behavioral record from event log.
     behavioral: BehavioralRecord | None = None
