@@ -50,7 +50,6 @@ interface MockContext {
   revokedTokens: Set<string>;
   economicPolicy: string | null;
   ttlSecs: number | null;
-  drainedEvents: string[];
 }
 
 interface MockTransport {
@@ -226,7 +225,6 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: params.ttlSeconds ?? null,
-        drainedEvents: [],
       };
 
       // Record ContextCreated event
@@ -666,10 +664,11 @@ export function createMockBridge(): Bridge & {
     ): Promise<boolean> {
       const ctx = getContext(handle);
       // In the mock, single-member contexts auto-approve
-      if (ctx.ttlSecs !== null) {
+      const approved = ctx.members.size <= 1;
+      if (approved && ctx.ttlSecs !== null) {
         ctx.ttlSecs += extensionSecs;
       }
-      return ctx.members.size <= 1;
+      return approved;
     },
 
     async contextResetTtlTimer(
@@ -721,7 +720,6 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: null,
-        drainedEvents: [],
       };
       ctx.events.push({
         eventType: "ContextImported",
@@ -737,6 +735,7 @@ export function createMockBridge(): Bridge & {
     async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
       const ctx = getContext(handle);
       const events = ctx.events.map((e) => JSON.stringify(e));
+      ctx.events.length = 0;
       return events;
     },
 

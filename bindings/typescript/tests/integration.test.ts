@@ -924,7 +924,7 @@ describe("TTL operations (mock bridge)", () => {
     expect(mockBridge._contexts.get(ctx.contextId)?.ttlSecs).toBe(420);
   });
 
-  it("proposeTtlExtension returns false for multi-member context", async () => {
+  it("proposeTtlExtension returns false for multi-member context and does not change TTL", async () => {
     const alice = await mockBridge.identityCreate("in_memory");
     const bob = await mockBridge.identityCreate("in_memory");
     const ctx = await mockBridge.contextCreate(
@@ -935,6 +935,8 @@ describe("TTL operations (mock bridge)", () => {
 
     const approved = await mockBridge.contextProposeTtlExtension(ctx, alice.did, 120);
     expect(approved).toBe(false);
+    // TTL must remain unchanged when proposal is rejected
+    expect(mockBridge._contexts.get(ctx.contextId)?.ttlSecs).toBe(300);
   });
 
   it("resetTtlTimer replaces TTL with new duration", async () => {
@@ -1008,6 +1010,22 @@ describe("Drain events (mock bridge)", () => {
       const parsed = JSON.parse(e);
       expect(parsed.eventType).toBeTruthy();
     }
+  });
+
+  it("second drain returns empty after first drain consumes events", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+    );
+
+    await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
+
+    const first = await mockBridge.contextDrainEvents(ctx);
+    expect(first.length).toBe(2); // ContextCreated + MessageSent
+
+    const second = await mockBridge.contextDrainEvents(ctx);
+    expect(second.length).toBe(0);
   });
 });
 
