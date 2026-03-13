@@ -125,6 +125,21 @@ class TestClassifyUcanError:
         msg = "malformed token: DID not found: did:dht:z6MkMissing"
         assert _classify_ucan_error(msg) == "signatures"
 
+    def test_invalid_did_document(self) -> None:
+        """MalformedToken from invalid DID document (step 2) → signatures."""
+        msg = "malformed token: invalid DID document: BEP44 signature invalid"
+        assert _classify_ucan_error(msg) == "signatures"
+
+    def test_network_unavailable(self) -> None:
+        """MalformedToken from network unavailable (step 2) → signatures."""
+        msg = "malformed token: network unavailable: all resolvers timed out"
+        assert _classify_ucan_error(msg) == "signatures"
+
+    def test_did_revoked_downgraded(self) -> None:
+        """MalformedToken from DID revoked/downgraded (step 2) → signatures."""
+        msg = "malformed token: DID revoked/downgraded: stale sequence for did:dht:zTest"
+        assert _classify_ucan_error(msg) == "signatures"
+
     # -- Capability/ceiling errors (steps 6, 8) --
 
     def test_capability_outside_ceiling(self) -> None:
@@ -253,10 +268,17 @@ class TestCapabilityValidationFieldIndependence:
     field-setting logic in evaluate_trust.
     """
 
+    # Sentinel exception class that simulates _scp_core.UcanError for
+    # tests.  The production code catches ``bridge.UcanError``; the mock
+    # bridge exposes this class so the except clause can match it.
+    class _MockUcanError(Exception):
+        pass
+
     def _run(self, error_msg: str) -> CapabilityValidation:
         """Helper: mock bridge.ucan_validate to raise with given message."""
         mock_bridge = MagicMock()
-        mock_bridge.ucan_validate.side_effect = Exception(error_msg)
+        mock_bridge.UcanError = self._MockUcanError
+        mock_bridge.ucan_validate.side_effect = self._MockUcanError(error_msg)
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = asyncio.run(
@@ -270,6 +292,7 @@ class TestCapabilityValidationFieldIndependence:
 
     def test_all_pass_when_validation_succeeds(self) -> None:
         mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
         mock_bridge.ucan_validate.return_value = None
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
@@ -344,6 +367,7 @@ class TestCapabilityValidationFieldIndependence:
     def test_no_tokens_all_default_false(self) -> None:
         """When no tokens are provided, all fields stay at default (False)."""
         mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             result = asyncio.run(
@@ -379,6 +403,30 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.not_revoked is False
 
+    def test_invalid_did_document_classified_as_signature(self) -> None:
+        """Invalid DID document (step 2) → tokens_valid=True, signatures_valid=False."""
+        cv = self._run("malformed token: invalid DID document: BEP44 signature invalid")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.not_revoked is False
+
+    def test_network_unavailable_classified_as_signature(self) -> None:
+        """Network unavailable (step 2) → tokens_valid=True, signatures_valid=False."""
+        cv = self._run("malformed token: network unavailable: all resolvers timed out")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.not_revoked is False
+
+    def test_did_revoked_downgraded_classified_as_signature(self) -> None:
+        """DID revoked/downgraded (step 2) → tokens_valid=True, signatures_valid=False."""
+        cv = self._run("malformed token: DID revoked/downgraded: stale sequence")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.not_revoked is False
+
     def test_unparseable_capability_classified_as_ceiling(self) -> None:
         """Capability URI parse failure (step 6) → tokens+sigs valid, ceiling=False."""
         cv = self._run("malformed token: unparseable capability URI in attestation: bad://uri")
@@ -394,6 +442,28 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.signatures_valid is False
         assert cv.within_ceiling is False
         assert cv.not_revoked is False
+
+    def test_non_ucan_exception_propagates(self) -> None:
+        """Non-UcanError exceptions (e.g. ValidationError) are NOT silently caught."""
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
+        # Raise a plain Exception — this should NOT be caught by
+        # ``except bridge.UcanError``, and must propagate to the caller.
+        mock_bridge.ucan_validate.side_effect = RuntimeError(
+            "[SCP-VALID-7001] validation error: context_id contains control characters"
+        )
+
+        import pytest
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(RuntimeError, match="control characters"):
+                asyncio.run(
+                    evaluate_trust(
+                        subject_did="did:dht:z6MkBob",
+                        context_id="ctx\x00bad",
+                        capability_tokens=["fake-token"],
+                    )
+                )
 
 
 # -----------------------------------------------------------------------

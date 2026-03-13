@@ -81,7 +81,13 @@ _SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
     "key scope mismatch:",
     "self-delegation",
     "Category A violation:",
+    # DID resolution failures (step 2) — all ResolutionError variants become
+    # MalformedToken("...") via From<ResolutionError> for UcanError.
+    # See crates/scp-ffi/common/src/resolvers.rs.
     "malformed token: DID not found",
+    "malformed token: invalid DID document",
+    "malformed token: network unavailable",
+    "malformed token: DID revoked/downgraded",
 )
 
 # Error message prefixes that indicate a capability ceiling/scope failure.
@@ -436,7 +442,7 @@ async def evaluate_trust(
         for token in capability_tokens:
             try:
                 bridge.ucan_validate(context_id, token, "*")
-            except Exception as exc:
+            except bridge.UcanError as exc:
                 error_msg = str(exc)
                 failed_category = _classify_ucan_error(error_msg)
                 passed = _PASSED_BEFORE.get(failed_category, set())
