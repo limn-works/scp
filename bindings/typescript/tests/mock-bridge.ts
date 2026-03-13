@@ -17,6 +17,7 @@ import type {
   MessageCallback,
 } from "../src/internal/bridge";
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
@@ -51,6 +52,10 @@ interface MockContext {
   revokedTokens: Set<string>;
   economicPolicy: string | null;
   ttlSecs: number | null;
+  mode: string;
+  broadcastSubscribers: Set<string>;
+  broadcastBlockedSubscribers: Set<string>;
+  broadcastAdmission: BroadcastAdmissionPolicy | null;
 }
 
 interface MockTransport {
@@ -212,8 +217,9 @@ export function createMockBridge(): Bridge & {
       identity: BridgeIdentityHandle,
       paramsJson: string,
     ): Promise<BridgeContextHandle> {
-      const params = JSON.parse(paramsJson) as { ttlSeconds?: number };
+      const params = JSON.parse(paramsJson) as { ttlSeconds?: number; mode?: string };
       const contextId = generateId("ctx");
+      const mode = params.mode ?? "Encrypted";
       const ctx: MockContext = {
         contextId,
         state: "active",
@@ -227,6 +233,10 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: params.ttlSeconds ?? null,
+        mode,
+        broadcastSubscribers: new Set(),
+        broadcastBlockedSubscribers: new Set(),
+        broadcastAdmission: mode === "Broadcast" ? "Open" : null,
       };
 
       // Record ContextCreated event
@@ -739,6 +749,10 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: null,
+        mode: "Encrypted",
+        broadcastSubscribers: new Set(),
+        broadcastBlockedSubscribers: new Set(),
+        broadcastAdmission: null,
       };
       const importedEvent: Event = {
         eventType: "ContextImported",
@@ -769,6 +783,116 @@ export function createMockBridge(): Bridge & {
     async contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null> {
       const ctx = getContext(handle);
       return ctx.economicPolicy;
+    },
+
+    // Broadcast operations
+    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      if (ctx.broadcastBlockedSubscribers.has(subscriberDid)) {
+        throw new Error("[SCP-CTX-2001] Subscriber is blocked");
+      }
+      ctx.broadcastSubscribers.add(subscriberDid);
+    },
+
+    async broadcastUnsubscribe(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      _rotateKeys?: boolean,
+    ): Promise<void> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      ctx.broadcastSubscribers.delete(subscriberDid);
+    },
+
+    async broadcastPublish(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      _payload: Uint8Array,
+    ): Promise<void> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      if (!ctx.members.has(authorDid)) {
+        throw new Error("[SCP-CTX-2001] Author is not a member of the context");
+      }
+    },
+
+    async broadcastBlockSubscriber(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      _blockerDid: string,
+    ): Promise<void> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      ctx.broadcastSubscribers.delete(subscriberDid);
+      ctx.broadcastBlockedSubscribers.add(subscriberDid);
+    },
+
+    async broadcastUnblockSubscriber(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      _unblockerDid: string,
+    ): Promise<void> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      ctx.broadcastBlockedSubscribers.delete(subscriberDid);
+    },
+
+    async broadcastHandleKeyRequest(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      requesterDid: string,
+    ): Promise<string> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      if (!ctx.members.has(authorDid)) {
+        throw new Error("[SCP-CTX-2001] Author is not a member of the context");
+      }
+      if (ctx.broadcastBlockedSubscribers.has(requesterDid)) {
+        return "Denied(Blocked)";
+      }
+      if (ctx.broadcastSubscribers.has(requesterDid)) {
+        return "Granted";
+      }
+      return "Denied(NotSubscribed)";
+    },
+
+    async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx === undefined || ctx.mode !== "Broadcast") {
+        return null;
+      }
+      return ctx.broadcastSubscribers.size;
+    },
+
+    async broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx === undefined || ctx.mode !== "Broadcast") {
+        return false;
+      }
+      return ctx.broadcastSubscribers.has(did);
+    },
+
+    async broadcastAdmission(
+      handle: BridgeContextHandle,
+    ): Promise<BroadcastAdmissionPolicy | null> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx === undefined || ctx.mode !== "Broadcast") {
+        return null;
+      }
+      return ctx.broadcastAdmission;
     },
 
     // Lifecycle
