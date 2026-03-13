@@ -20,7 +20,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 try:
-    import _scp_core
+    from scp_sdk import _scp_core  # installed as scp_sdk._scp_core by maturin
 except (ImportError, AttributeError):
     pytest.skip(
         "Native _scp_core extension not available — run maturin develop first",
