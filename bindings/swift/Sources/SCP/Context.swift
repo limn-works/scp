@@ -16,10 +16,18 @@ import Foundation
 /// pattern (every Swift SDK method calls exactly one bridge function).
 public enum ContextBridge {
     /// The closure type for context creation. Injected for testability.
+    ///
+    /// Matches the UniFFI `contextCreate(identity:params:)` bridge function.
+    /// Takes the creating identity and context parameters, returns a handle.
     public typealias CreateFn = @Sendable (
-        _ contextId: String,
-        _ ceiling: [String]
+        _ identity: Identity,
+        _ params: ContextParams
     ) async throws -> any ContextHandleProtocol
+
+    /// Default create function — delegates to UniFFI ``contextCreate(identity:params:)``.
+    public static let defaultCreate: CreateFn = { identity, params in
+        try await contextCreate(identity: identity, params: params)
+    }
 
     /// The closure type for sending a message. Injected for testability.
     public typealias SendFn = @Sendable (
@@ -139,7 +147,7 @@ private final class MessageListenerAdapter: MessageListener, @unchecked Sendable
 ///
 /// ## Lifecycle
 ///
-/// Create a context via the ``create(contextId:ceiling:)`` factory method (or,
+/// Create a context via the ``create(identity:params:)`` factory method (or,
 /// in production, via `SCP.createContext(params:)` from ADR-026). Use
 /// ``send(_:)`` to publish messages and ``messages`` to consume them as an
 /// `AsyncStream`. Call ``leave()`` to depart gracefully or ``close()`` to
@@ -292,11 +300,11 @@ public actor Context {
     /// this method after injecting the identity and bridge functions.
     ///
     /// - Parameters:
-    ///   - contextId: A unique identifier for the new context.
-    ///   - ceiling: The capability ceiling for this context (e.g.,
-    ///     `["messages:read", "messages:write"]`).
-    ///   - createFn: Bridge function for context creation. Defaults to a
-    ///     placeholder that will be replaced by real UniFFI bindings.
+    ///   - identity: The ``Identity`` of the context creator. Provides the DID
+    ///     and key material for MLS group formation.
+    ///   - params: The ``ContextParams`` governing the new context (ceiling,
+    ///     governance, memory scope, TTL, promotability, min protocol version).
+    ///   - createFn: Bridge function for context creation.
     ///   - sendFn: Bridge function for sending messages.
     ///   - subscribeFn: Bridge function for subscribing to messages.
     ///   - leaveFn: Bridge function for leaving the context.
@@ -304,9 +312,9 @@ public actor Context {
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
     /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
     static func create( // swiftlint:disable:this function_parameter_count
-        contextId: String,
-        ceiling: [String],
-        createFn: ContextBridge.CreateFn,
+        identity: Identity,
+        params: ContextParams,
+        createFn: ContextBridge.CreateFn = ContextBridge.defaultCreate,
         sendFn: @escaping ContextBridge.SendFn,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
         leaveFn: @escaping ContextBridge.LeaveFn,
@@ -316,7 +324,7 @@ public actor Context {
         getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
             = ContextBridge.defaultGetEconomicPolicy
     ) async throws -> Context {
-        let handle = try await createFn(contextId, ceiling)
+        let handle = try await createFn(identity, params)
         return Context(
             handle: handle,
             sendFn: sendFn,

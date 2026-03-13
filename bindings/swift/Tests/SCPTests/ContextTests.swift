@@ -139,17 +139,30 @@ struct ContextTests {
 
     @Test("Context.create returns a context in active state")
     func createReturnsActiveContext() async throws {
-        let createFn: ContextBridge.CreateFn = { contextId, _ in
-            MockContextHandle(id: contextId, state: "active")
+        let createFn: ContextBridge.CreateFn = { _, _ in
+            MockContextHandle(
+                id: "ctx-create-test",
+                state: "active"
+            )
         }
         let noOpSend: ContextBridge.SendFn = { _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
         let noOpLeave: ContextBridge.LeaveFn = { _ in }
         let noOpClose: ContextBridge.CloseFn = { _ in }
 
-        let context = try await Context.create(
-            contextId: "ctx-create-test",
+        let identity = Identity(noPointer: .init())
+        let params = ContextParams(
             ceiling: ["messages:read", "messages:write"],
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            minProtocolVersion: 0
+        )
+
+        let context = try await Context.create(
+            identity: identity,
+            params: params,
             createFn: createFn,
             sendFn: noOpSend,
             subscribeFn: noOpSubscribe,
@@ -171,10 +184,20 @@ struct ContextTests {
         let noOpLeave: ContextBridge.LeaveFn = { _ in }
         let noOpClose: ContextBridge.CloseFn = { _ in }
 
+        let identity = Identity(noPointer: .init())
+        let params = ContextParams(
+            ceiling: [],
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 0,
+            promotable: false,
+            minProtocolVersion: 0
+        )
+
         await #expect(throws: ScpError.self) {
             _ = try await Context.create(
-                contextId: "will-fail",
-                ceiling: [],
+                identity: identity,
+                params: params,
                 createFn: createFn,
                 sendFn: noOpSend,
                 subscribeFn: noOpSubscribe,
