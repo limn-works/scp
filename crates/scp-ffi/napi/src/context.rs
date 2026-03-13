@@ -231,6 +231,34 @@ impl Drop for NapiContextHandle {
     }
 }
 
+#[cfg(test)]
+impl NapiContextHandle {
+    /// Creates a minimal active handle for cross-module tests.
+    ///
+    /// The handle is in `Active` state with default parameters and no
+    /// `core_handle`. Suitable for testing bridge functions that only need
+    /// UCAN state (set up via `ensure_registered`).
+    pub(crate) fn test_active(context_id: String, creator_did: String) -> Self {
+        increment_handle_count();
+        Self {
+            context_id,
+            state: std::sync::Mutex::new(ContextState::Active),
+            creator_did,
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            signing_key: None,
+            core_handle: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NapiMessage — incoming message from an SCP context
 // ---------------------------------------------------------------------------

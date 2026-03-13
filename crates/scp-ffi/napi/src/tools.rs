@@ -1044,94 +1044,35 @@ mod tests {
         assert!(msg.contains("got 0"));
     }
 
-    /// `registered_at` on a tool registered through the NAPI bridge's
-    /// registration path must be a seconds-epoch timestamp, not milliseconds
-    /// or hardcoded 0. Registers UCAN state and calls `register_tool` through
-    /// `runtime::with_context` — the same code path `tool_register` uses
-    /// internally. Catches the original bug from issue #871.
-    ///
-    /// Note: This test exercises the Rust-side registration logic directly
-    /// rather than calling the `#[napi]` `tool_register` function, because
-    /// napi-rs functions require a live Node.js/Bun JS runtime (`Env`) that
-    /// is not available in `cargo test`. The timestamp assignment and
-    /// `register_tool` call are identical to the bridge entry point.
-    #[test]
-    fn registered_at_is_seconds_epoch() {
-        use scp_core::context::roles::{ContextRoleState, default_ceiling};
-        use scp_core::context::tools::{ToolRegistry, ToolSchema};
-        use scp_core::crypto::ucan::nonce::NonceTracker;
-        use scp_core::crypto::ucan::revoke::RevocationList;
-        use scp_event_log::EventLog;
-        use scp_identity::cache::SystemClock;
+    /// `registered_at` on a tool registered via the NAPI bridge must be a
+    /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
+    /// Calls the actual `tool_register` bridge function and inspects the
+    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    #[tokio::test]
+    async fn registered_at_is_seconds_epoch() {
+        use crate::context::NapiContextHandle;
 
         let ctx_id = format!("ctx-napi-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiTsTest";
 
-        // Manually register UCAN state — same as ensure_registered(handle).
-        let ceiling = default_ceiling();
-        let ceiling_strings = ceiling
-            .capabilities
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<std::collections::HashSet<String>>();
-        let role_state =
-            ContextRoleState::new(&ctx_id, creator_did, default_ceiling(), vec![]).unwrap();
-        let state = crate::runtime::UcanContextState {
-            revocation_list: RevocationList::new(ctx_id.clone()),
-            nonce_tracker: NonceTracker::new(ctx_id.clone(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
-            event_log: EventLog::new(ctx_id.clone()),
-            role_state,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: std::collections::HashMap::new(),
-            session_store: scp_core::context::tools::SessionStore::new(),
-        };
-        crate::runtime::insert_test_state(&ctx_id, state);
+        let handle =
+            NapiContextHandle::test_active(ctx_id.clone(), creator_did.to_owned());
 
-        // Build ToolRegistration using the same code path as tool_register.
-        let tool_name = "napi-timestamp-probe";
-        let tool_id = format!("tool-{}", tool_name.replace(' ', "-").to_lowercase());
-        let core_registration = scp_core::context::tools::ToolRegistration {
-            tool_id: tool_id.clone(),
-            name: tool_name.to_owned(),
+        let definition = NapiToolDefinition {
+            name: "napi-timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
-            schema: ToolSchema {
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "a": {"type": "string"},
-                        "b": {"type": "number"}
-                    }
-                }),
-                output_schema: serde_json::json!({"type": "object"}),
-            },
-            implementation_hash: [0u8; 32],
-            test_vectors: vec![],
-            operator_did: creator_did.into(),
-            economic_metadata: None,
-            registered_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            signature: Vec::new(),
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: creator_did.to_owned(),
         };
 
-        // Register through the runtime, same path as tool_register.
-        crate::runtime::with_context(&ctx_id, |rt| {
-            let (_, _event) = scp_core::context::tools::register_tool(
-                &mut rt.tool_registry,
-                &rt.role_state,
-                core_registration,
-                creator_did,
-            )
-            .map_err(|e| ScpNapiError::Tool {
-                message: format!("tool registration failed: {e}"),
-                code: "SCP-TOOL-6001".to_owned(),
-            })?;
-            Ok(())
-        })
-        .unwrap();
+        let tool_id = tool_register(&handle, definition)
+            .await
+            .expect("tool_register should succeed");
 
         // Read the stored registration back and verify registered_at.
         let registered_at = crate::runtime::with_context(&ctx_id, |rt| {
