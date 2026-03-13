@@ -65,6 +65,12 @@ _WRITE_FMT_RE = re.compile(r'write!\(f,\s*"([^"]+)"')
 # Uses re.DOTALL so \s matches newlines in multi-line format! calls.
 _MALFORMED_TOKEN_FMT_RE = re.compile(r'MalformedToken\(format!\(\s*"([^"]+)"', re.DOTALL)
 
+# Matches runtime MalformedToken("...".to_owned()) constructions —
+# string-literal variants without format!().  For example:
+#   MalformedToken("missing signature segment".to_owned())
+# Captures the string literal inside the quotes.
+_MALFORMED_TOKEN_LITERAL_RE = re.compile(r'MalformedToken\(\s*"([^"]+)"\.to_owned\(\)', re.DOTALL)
+
 
 def _extract_error_prefixes_from_thiserror(source: str) -> list[str]:
     """Extract the static prefix of each ``#[error("...")]`` annotation.
@@ -87,17 +93,21 @@ def _extract_error_prefixes_from_thiserror(source: str) -> list[str]:
 
 
 def _extract_runtime_malformed_token_prefixes(source: str) -> list[str]:
-    """Extract static prefixes from ``MalformedToken(format!("..."))`` calls.
+    """Extract static prefixes from runtime ``MalformedToken`` constructions.
 
-    These are runtime error constructions in ``validate.rs`` and
-    ``resolvers.rs`` that produce ``MalformedToken`` variants with
-    dynamic format strings.  The Display output is
-    ``"malformed token: <format string expanded>"`` because
+    Handles two patterns:
+
+    1. ``MalformedToken(format!("...", ...))`` — dynamic format strings.
+    2. ``MalformedToken("...".to_owned())`` — string-literal constructions.
+
+    The Display output is ``"malformed token: <inner string>"`` because
     ``MalformedToken(String)`` has ``#[error("malformed token: {0}")]``.
 
     Returns the ``"malformed token: <static prefix>"`` for each call.
     """
     prefixes: list[str] = []
+
+    # Pattern 1: format!() constructions.
     for match in _MALFORMED_TOKEN_FMT_RE.finditer(source):
         fmt = match.group(1)
         brace_idx = fmt.find("{")
@@ -107,6 +117,12 @@ def _extract_runtime_malformed_token_prefixes(source: str) -> list[str]:
             static_part = fmt[:brace_idx]
         # The Display impl wraps with "malformed token: " prefix.
         prefixes.append(f"malformed token: {static_part}")
+
+    # Pattern 2: "...".to_owned() literal constructions.
+    for match in _MALFORMED_TOKEN_LITERAL_RE.finditer(source):
+        literal = match.group(1)
+        prefixes.append(f"malformed token: {literal}")
+
     return prefixes
 
 
@@ -117,9 +133,36 @@ def _extract_resolution_error_prefixes(source: str) -> list[str]:
     hand-written Display impl.  Each becomes ``MalformedToken("DID not found: ...")``
     via ``From<ResolutionError> for CoreUcanError``, so the Python-visible
     prefix is ``"malformed token: DID not found: "`` etc.
+
+    The search is scoped to the ``impl Display for ResolutionError`` block
+    to avoid false-positive matches if other ``write!(f, ...)`` calls are
+    added elsewhere in the file.
     """
+    # Extract the impl Display for ResolutionError block.
+    display_block_re = re.compile(
+        r"impl\s+(?:(?:std::)?fmt::)?Display\s+for\s+ResolutionError\s*\{",
+    )
+    m = display_block_re.search(source)
+    if m is None:
+        return []
+
+    # Find the matching closing brace by tracking brace depth.
+    start = m.start()
+    depth = 0
+    block_end = len(source)
+    for i in range(m.end() - 1, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                block_end = i + 1
+                break
+
+    display_source = source[start:block_end]
+
     prefixes: list[str] = []
-    for match in _WRITE_FMT_RE.finditer(source):
+    for match in _WRITE_FMT_RE.finditer(display_source):
         fmt = match.group(1)
         brace_idx = fmt.find("{")
         if brace_idx == -1:
@@ -219,9 +262,36 @@ class TestEveryPythonPrefixMatchesRust:
         ucan_source = _RUST_UCAN_MOD.read_text()
         return [m.group(1) for m in _ERROR_ATTR_RE.finditer(ucan_source)]
 
-    def test_each_python_prefix_has_rust_match(self, rust_prefixes: set[str]) -> None:
+    @pytest.fixture(scope="class")
+    def rust_runtime_prefixes(self) -> set[str]:
+        """All runtime MalformedToken prefixes from validate.rs and resolvers.rs.
+
+        Used to verify that Python sub-prefixes under a generic thiserror
+        prefix (e.g. ``"malformed token: "``) match a specific runtime
+        construction, not just the generic prefix.
+        """
+        validate_source = _RUST_VALIDATE.read_text()
+        resolver_source = _RUST_RESOLVERS.read_text()
+
+        validate_rt = _extract_runtime_malformed_token_prefixes(validate_source)
+        resolver_rt = _extract_runtime_malformed_token_prefixes(resolver_source)
+        resolution_display = _extract_resolution_error_prefixes(resolver_source)
+
+        return set(validate_rt) | set(resolver_rt) | set(resolution_display)
+
+    def test_each_python_prefix_has_rust_match(
+        self, rust_prefixes: set[str], rust_runtime_prefixes: set[str]
+    ) -> None:
         """For each Python prefix, at least one Rust prefix must start with it
-        (or vice versa — the Python prefix starts with a Rust prefix)."""
+        (or vice versa --- the Python prefix starts with a Rust prefix).
+
+        Additionally, when a Python prefix matches only via the "starts with
+        a generic Rust prefix" path (e.g. ``"malformed token: DID not found"``
+        matching ``"malformed token: "``), the Python prefix must also match
+        at least one *specific* runtime construction from validate.rs or
+        resolvers.rs.  This prevents typos in Python sub-prefixes from
+        silently passing.
+        """
         unmatched: list[str] = []
         for py_prefix in sorted(_FLAT_PYTHON_PREFIXES):
             # A Python prefix matches a Rust error if:
@@ -230,17 +300,33 @@ class TestEveryPythonPrefixMatchesRust:
             # The second case handles sub-patterns like
             #   "malformed token: DID not found" matching Rust
             #   "malformed token: " (the MalformedToken variant).
-            matched = any(
-                rust_pfx.startswith(py_prefix) or py_prefix.startswith(rust_pfx)
-                for rust_pfx in rust_prefixes
-            )
-            if not matched:
+            has_exact = any(rust_pfx.startswith(py_prefix) for rust_pfx in rust_prefixes)
+            if has_exact:
+                continue
+
+            has_generic = any(py_prefix.startswith(rust_pfx) for rust_pfx in rust_prefixes)
+            if not has_generic:
                 unmatched.append(py_prefix)
+                continue
+
+            # The Python prefix matched only via a generic Rust prefix
+            # (e.g. "malformed token: ").  Verify it also matches a specific
+            # runtime construction to catch typos.
+            has_specific = any(
+                rt_pfx.startswith(py_prefix) or py_prefix.startswith(rt_pfx)
+                for rt_pfx in rust_runtime_prefixes
+            )
+            if not has_specific:
+                unmatched.append(py_prefix)
+
         assert not unmatched, (
             "Python prefixes with no matching Rust error pattern:\n"
             + "\n".join(f"  - {p!r}" for p in unmatched)
             + "\n\nEither the Rust error message changed (update the Python "
-            "prefix) or the Python prefix is stale (remove it)."
+            "prefix) or the Python prefix is stale (remove it).\n"
+            "Note: sub-prefixes under generic Rust prefixes (e.g. "
+            "'malformed token: ...') must match a specific runtime "
+            "construction in validate.rs or resolvers.rs."
         )
 
 
@@ -383,14 +469,24 @@ class TestResolutionErrorClassification:
 
 
 class TestRuntimeMalformedTokenCoverage:
-    """Runtime ``MalformedToken(format!(...))`` constructions in validate.rs and
-    resolvers.rs must be covered by specific Python sub-prefixes.
+    """Runtime ``MalformedToken(format!(...))`` and ``MalformedToken("...".to_owned())``
+    constructions in validate.rs and resolvers.rs must be covered by specific
+    Python sub-prefixes.
 
     These runtime messages are wrapped by the ``#[error("malformed token: {0}")]``
     Display impl, so the Python-visible prefix is ``"malformed token: <static part>"``.
     Without specific sub-prefixes, they all fall through to the generic
     ``"malformed token:"`` catch-all in ``_TOKEN_PARSE_PREFIXES`` and classify
     as ``token_parse`` instead of the correct pipeline stage.
+
+    **Scope note:** ``mint.rs`` and ``nonce.rs`` are intentionally excluded.
+    ``MalformedToken`` constructions in ``mint.rs`` occur during token
+    *minting* (not validation) and do not flow through
+    ``_classify_ucan_error``.  ``nonce.rs`` is also excluded — its
+    ``MalformedToken`` constructions are storage/persistence operations
+    (serialization/deserialization), not validation-pipeline errors.  Only
+    ``validate.rs`` and ``resolvers.rs`` produce runtime ``MalformedToken``
+    errors that reach the Python validation pipeline.
     """
 
     @pytest.fixture(scope="class")
@@ -404,6 +500,27 @@ class TestRuntimeMalformedTokenCoverage:
         """Extract runtime MalformedToken prefixes from resolvers.rs."""
         source = _RUST_RESOLVERS.read_text()
         return _extract_runtime_malformed_token_prefixes(source)
+
+    def test_both_format_and_literal_patterns_extracted(
+        self, validate_runtime_prefixes: list[str]
+    ) -> None:
+        """Verify that both ``format!()`` and ``.to_owned()`` constructions
+        are extracted from validate.rs.
+
+        validate.rs contains at least one ``MalformedToken("...".to_owned())``
+        at line 792 (``"missing signature segment"``).  If the literal regex
+        stops matching, this test catches it.
+        """
+        literal_prefix = "malformed token: missing signature segment"
+        assert literal_prefix in validate_runtime_prefixes, (
+            f"Expected {literal_prefix!r} from .to_owned() pattern, "
+            f"but only found: {validate_runtime_prefixes}"
+        )
+        # Also verify we have at least one format!() prefix (there are many).
+        format_prefixes = [p for p in validate_runtime_prefixes if p != literal_prefix]
+        assert len(format_prefixes) > 0, (
+            "Expected at least one format!() runtime prefix from validate.rs"
+        )
 
     def test_each_validate_runtime_prefix_covered(
         self, validate_runtime_prefixes: list[str]
@@ -485,11 +602,10 @@ class TestPrefixCountsMatchExpected:
     def test_resolution_error_variant_count(self) -> None:
         """ResolutionError should have exactly 4 Display arms."""
         resolver_source = _RUST_RESOLVERS.read_text()
-        # Count write!(f, "...") patterns in the Display impl.
-        # The regex is file-global, so this is an exact count of all
-        # write!(f, "...") calls in the file (currently only in the
-        # ResolutionError Display impl).
-        resolution_count = len(_WRITE_FMT_RE.findall(resolver_source))
+        # Count prefixes extracted from the impl Display for ResolutionError
+        # block.  _extract_resolution_error_prefixes scopes the search to
+        # that specific impl block, not the entire file.
+        resolution_count = len(_extract_resolution_error_prefixes(resolver_source))
         assert resolution_count == 4, (
             f"Expected exactly 4 ResolutionError Display arms, found "
             f"{resolution_count}. If variants were added or removed, "
