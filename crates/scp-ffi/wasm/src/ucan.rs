@@ -1289,6 +1289,7 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1372,7 +1373,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkSame".to_owned(),
                 aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1384,9 +1385,10 @@ mod tests {
         };
         let result = validate_key_scope(&token);
         assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
         assert!(
-            result.as_ref().unwrap_err().contains("self-delegation"),
-            "expected self-delegation error, got: {result:?}"
+            err.contains("self-delegation"),
+            "expected self-delegation error, got: {err}"
         );
     }
 
@@ -1402,7 +1404,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkSame".to_owned(),
                 aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1431,7 +1433,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkIssuer".to_owned(),
                 aud: "did:dht:z6MkAudience".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1464,7 +1466,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkSame".to_owned(),
                 aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1476,9 +1478,10 @@ mod tests {
         };
         let result = validate_key_scope(&token);
         assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
         assert!(
-            result.as_ref().unwrap_err().contains("key scope mismatch"),
-            "expected key scope mismatch error, got: {result:?}"
+            err.contains("key scope mismatch"),
+            "expected key scope mismatch error, got: {err}"
         );
     }
 
@@ -1495,7 +1498,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkSame".to_owned(),
                 aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1528,7 +1531,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkTest".to_owned(),
                 aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![Attenuation {
@@ -1548,12 +1551,10 @@ mod tests {
         }];
         let result = enforce_ucan_category_a(&token, &caps);
         assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
         assert!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .contains("Category A violation"),
-            "expected Category A violation, got: {result:?}"
+            err.contains("Category A violation"),
+            "expected Category A violation, got: {err}"
         );
     }
 
@@ -1569,7 +1570,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkTest".to_owned(),
                 aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1603,7 +1604,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkTest".to_owned(),
                 aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1637,7 +1638,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkTest".to_owned(),
                 aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1654,12 +1655,10 @@ mod tests {
         }];
         let result = enforce_ucan_category_a(&token, &caps);
         assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
         assert!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .contains("unrecognized signing key ID"),
-            "expected unrecognized kid error, got: {result:?}"
+            err.contains("unrecognized signing key ID"),
+            "expected unrecognized kid error, got: {err}"
         );
     }
 
@@ -1676,7 +1675,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkTest".to_owned(),
                 aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9999999999,
+                exp: 9_999_999_999,
                 nbf: None,
                 nnc: "test".to_owned(),
                 att: vec![],
@@ -1711,7 +1710,7 @@ mod tests {
                 payload: UcanPayload {
                     iss: "did:dht:z6MkTest".to_owned(),
                     aud: "did:dht:z6MkOther".to_owned(),
-                    exp: 9999999999,
+                    exp: 9_999_999_999,
                     nbf: None,
                     nnc: "test".to_owned(),
                     att: vec![],
@@ -1739,31 +1738,33 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ucan_header_kid_round_trip() {
+    fn ucan_header_kid_round_trip() -> Result<(), String> {
         let header = UcanHeader {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
             ucv: "0.10.0".to_owned(),
             kid: Some("#agent".to_owned()),
         };
-        let json = serde_json::to_string(&header).unwrap();
+        let json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
         assert!(json.contains("\"kid\":\"#agent\""));
-        let parsed: UcanHeader = serde_json::from_str(&json).unwrap();
+        let parsed: UcanHeader = serde_json::from_str(&json).map_err(|e| e.to_string())?;
         assert_eq!(parsed.kid, Some("#agent".to_owned()));
+        Ok(())
     }
 
     #[test]
-    fn ucan_header_kid_absent_round_trip() {
+    fn ucan_header_kid_absent_round_trip() -> Result<(), String> {
         let header = UcanHeader {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
             ucv: "0.10.0".to_owned(),
             kid: None,
         };
-        let json = serde_json::to_string(&header).unwrap();
+        let json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
         assert!(!json.contains("kid"));
-        let parsed: UcanHeader = serde_json::from_str(&json).unwrap();
+        let parsed: UcanHeader = serde_json::from_str(&json).map_err(|e| e.to_string())?;
         assert_eq!(parsed.kid, None);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1771,7 +1772,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_ucan_extracts_kid_from_header() {
+    fn parse_ucan_extracts_kid_from_header() -> Result<(), String> {
         let header = UcanHeader {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
@@ -1781,27 +1782,28 @@ mod tests {
         let payload = UcanPayload {
             iss: "did:dht:z6MkTest".to_owned(),
             aud: "did:dht:z6MkOther".to_owned(),
-            exp: 9999999999,
+            exp: 9_999_999_999,
             nbf: None,
             nnc: "test-nonce".to_owned(),
             att: vec![],
             prf: vec![],
             fct: None,
         };
-        let header_json = serde_json::to_vec(&header).unwrap();
-        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let header_json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+        let payload_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
         let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
         // Use a dummy signature (64 zero bytes)
         let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
         let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
 
-        let parsed = parse_ucan(&jwt).unwrap();
+        let parsed = parse_ucan(&jwt)?;
         assert_eq!(parsed.header.kid, Some("#agent".to_owned()));
+        Ok(())
     }
 
     #[test]
-    fn parse_ucan_kid_none_when_absent() {
+    fn parse_ucan_kid_none_when_absent() -> Result<(), String> {
         let header = UcanHeader {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
@@ -1811,21 +1813,22 @@ mod tests {
         let payload = UcanPayload {
             iss: "did:dht:z6MkTest".to_owned(),
             aud: "did:dht:z6MkOther".to_owned(),
-            exp: 9999999999,
+            exp: 9_999_999_999,
             nbf: None,
             nnc: "test-nonce".to_owned(),
             att: vec![],
             prf: vec![],
             fct: None,
         };
-        let header_json = serde_json::to_vec(&header).unwrap();
-        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let header_json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+        let payload_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
         let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
         let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
         let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
 
-        let parsed = parse_ucan(&jwt).unwrap();
+        let parsed = parse_ucan(&jwt)?;
         assert_eq!(parsed.header.kid, None);
+        Ok(())
     }
 }

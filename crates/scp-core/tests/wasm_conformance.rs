@@ -4,6 +4,9 @@
     clippy::items_after_statements,
     clippy::unused_async,
     clippy::redundant_field_names,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
     dead_code
 )]
 //! WASM conformance tests (RED-014).
@@ -17,8 +20,6 @@
 //! If either implementation changes without updating the other, these tests
 //! will fail -- providing the minimum viable safety net against silent
 //! divergence.
-
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
@@ -1838,13 +1839,13 @@ mod wasm_ucan_mirror {
 
     pub fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
         // Check nbf < exp first — inherently invalid regardless of time/tolerance.
-        if let Some(nbf) = token.payload.nbf {
-            if nbf >= token.payload.exp {
-                return Err(format!(
-                    "invalid time range: nbf ({nbf}) must be less than exp ({})",
-                    token.payload.exp
-                ));
-            }
+        if let Some(nbf) = token.payload.nbf
+            && nbf >= token.payload.exp
+        {
+            return Err(format!(
+                "invalid time range: nbf ({nbf}) must be less than exp ({})",
+                token.payload.exp
+            ));
         }
 
         let now = now_secs();
@@ -1863,10 +1864,10 @@ mod wasm_ucan_mirror {
         }
 
         // nbf check with tolerance.
-        if let Some(nbf) = token.payload.nbf {
-            if nbf.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) > now {
-                return Err("token not yet valid (nbf > now)".to_owned());
-            }
+        if let Some(nbf) = token.payload.nbf
+            && nbf.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) > now
+        {
+            return Err("token not yet valid (nbf > now)".to_owned());
         }
 
         Ok(())
@@ -2608,7 +2609,7 @@ fn make_signed_ucan(
 }
 
 /// Helper: creates a signed UCAN JWT with an optional `kid` header field.
-/// Used by chain-level key_scope conformance tests.
+/// Used by chain-level `key_scope` conformance tests.
 fn make_signed_ucan_with_kid(
     payload: &wasm_ucan_mirror::UcanPayload,
     signing_key: &ed25519_dalek::SigningKey,
@@ -5160,8 +5161,7 @@ fn wasm_core_self_delegation_without_key_scope_both_reject() {
             .as_ref()
             .unwrap_err()
             .contains("self-delegation"),
-        "WASM error must mention self-delegation: {:?}",
-        wasm_result
+        "WASM error must mention self-delegation: {wasm_result:?}"
     );
 
     // scp-core side — validate_key_scope is internal, but the behavior is
@@ -5234,8 +5234,7 @@ fn wasm_core_key_scope_mismatch_both_reject() {
             .as_ref()
             .unwrap_err()
             .contains("key scope mismatch"),
-        "WASM error must mention key scope mismatch: {:?}",
-        wasm_result
+        "WASM error must mention key scope mismatch: {wasm_result:?}"
     );
 }
 
@@ -5377,8 +5376,7 @@ fn wasm_core_category_a_agent_rejected() {
                 .as_ref()
                 .unwrap_err()
                 .contains("Category A violation"),
-            "Error for '{resource}' must mention Category A violation: {:?}",
-            result
+            "Error for '{resource}' must mention Category A violation: {result:?}"
         );
     }
 }
@@ -5499,8 +5497,7 @@ fn wasm_core_category_a_unknown_kid_rejected() {
             .as_ref()
             .unwrap_err()
             .contains("unrecognized signing key ID"),
-        "Error must mention unrecognized kid: {:?}",
-        result
+        "Error must mention unrecognized kid: {result:?}"
     );
 }
 
@@ -5552,7 +5549,7 @@ fn wasm_ucan_header_kid_parsed_from_jwt() {
     let payload = wasm_ucan_mirror::UcanPayload {
         iss: "did:dht:z6MkTest".to_owned(),
         aud: "did:dht:z6MkOther".to_owned(),
-        exp: 9999999999,
+        exp: 9_999_999_999,
         nbf: None,
         nnc: "test".to_owned(),
         att: vec![],
@@ -5582,7 +5579,7 @@ fn wasm_ucan_header_kid_parsed_from_jwt() {
 // reachable before any other check.
 // ===========================================================================
 
-/// Test: parent token with key_scope / kid mismatch is rejected during chain
+/// Test: parent token with `key_scope` / kid mismatch is rejected during chain
 /// traversal (step 5b). The parent is a normal delegation (iss != aud) but
 /// declares `scp_key_scope: "#agent"` in fct while the header has
 /// `kid: "#active"`. This mismatch must be caught by `validate_key_scope` on
@@ -5601,7 +5598,7 @@ fn wasm_chain_rejects_parent_key_scope_kid_mismatch() {
     // Parent token: normal delegation (iss != aud), but key_scope/kid mismatch.
     // kid="#active" but scope="#agent" — step 5b violation.
     let parent_payload = wasm_ucan_mirror::UcanPayload {
-        iss: root_did.clone(),
+        iss: root_did,
         aud: child_did.clone(), // iss != aud: normal delegation
         exp: now + 3600,
         nbf: None,
@@ -5653,7 +5650,7 @@ fn wasm_chain_rejects_parent_key_scope_kid_mismatch() {
     );
 }
 
-/// Test: parent token with valid key_scope / kid match is accepted during
+/// Test: parent token with valid `key_scope` / kid match is accepted during
 /// chain traversal (step 5b passes).
 #[test]
 fn wasm_chain_accepts_parent_valid_key_scope_kid_match() {
@@ -5715,9 +5712,9 @@ fn wasm_chain_accepts_parent_valid_key_scope_kid_match() {
     );
 }
 
-/// Test: 3-level chain where the middle parent has key_scope/kid mismatch.
-/// Root → Intermediary (key_scope mismatch) → Child. The intermediary's
-/// key_scope violation must be caught during chain traversal.
+/// Test: 3-level chain where the middle parent has `key_scope`/kid mismatch.
+/// Root → Intermediary (`key_scope` mismatch) → Child. The intermediary's
+/// `key_scope` violation must be caught during chain traversal.
 #[test]
 fn wasm_chain_rejects_intermediary_key_scope_kid_mismatch() {
     use std::collections::HashSet;
