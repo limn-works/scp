@@ -24,7 +24,7 @@ use scp_core::context::{
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
 use scp_identity::cache::DidCache;
-use scp_identity::DidMethod;
+use scp_identity::{DidMethod, DID};
 use scp_platform::testing::InMemoryKeyCustody;
 
 #[tokio::main]
@@ -49,7 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key_resolver,
     );
 
-    manager.register_local_did(identity.did.clone()).await;
+    let did = DID(identity.did.clone());
+    manager.register_local_did(did.clone()).await;
 
     // ── 3. Create an encrypted context ────────────────────────────
     let params = ContextParams {
@@ -65,13 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let handle = manager
-        .create_context("my-context".to_owned(), params, identity.did.clone())
+        .create_context("my-context".to_owned(), params, did.clone())
         .await?;
     println!("Created context: {}", handle.context_id());
 
     // ── 4. Send a message ─────────────────────────────────────────
     manager
-        .send_message(&handle, &identity.did, b"Hello, SCP!", None)
+        .send_message(&handle, &did, b"Hello, SCP!", None)
         .await?;
     println!("Message sent.");
 
