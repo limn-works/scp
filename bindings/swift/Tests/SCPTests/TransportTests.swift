@@ -214,15 +214,16 @@ struct TransportTests {
         let handle = MockTransportContextHandle(id: "transport-ctx", state: "active")
         var sentPayload: Data?
 
-        let sendFn: ContextBridge.SendFn = { _, payload in
+        let sendFn: ContextBridge.SendFn = { _, _, payload in
             sentPayload = payload
         }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
-        let leaveFn: ContextBridge.LeaveFn = { _ in }
-        let closeFn: ContextBridge.CloseFn = { _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _, _ in }
+        let closeFn: ContextBridge.CloseFn = { _, _ in }
 
         let context = Context(
             handle: handle,
+            identity: Identity(noPointer: .init()),
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -242,16 +243,17 @@ struct TransportTests {
         var subscribed = false
         let handle = MockTransportContextHandle(id: "subscribe-ctx", state: "active")
 
-        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, listener in
             subscribed = true
             listener.onComplete()
         }
-        let leaveFn: ContextBridge.LeaveFn = { _ in }
-        let closeFn: ContextBridge.CloseFn = { _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _, _ in }
+        let closeFn: ContextBridge.CloseFn = { _, _ in }
 
         let context = Context(
             handle: handle,
+            identity: Identity(noPointer: .init()),
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,

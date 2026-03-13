@@ -90,8 +90,9 @@ struct ContextTests {
         captureListener: (@Sendable (any MessageListener) -> Void)? = nil
     ) -> Context {
         let handle = MockContextHandle(id: contextId, state: state)
+        let identity = Identity(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, payload in
+        let sendFn: ContextBridge.SendFn = { _, _, payload in
             onSend?(payload)
         }
 
@@ -99,16 +100,17 @@ struct ContextTests {
             captureListener?(listener)
         }
 
-        let leaveFn: ContextBridge.LeaveFn = { _ in
+        let leaveFn: ContextBridge.LeaveFn = { _, _ in
             onLeave?()
         }
 
-        let closeFn: ContextBridge.CloseFn = { _ in
+        let closeFn: ContextBridge.CloseFn = { _, _ in
             onClose?()
         }
 
         return Context(
             handle: handle,
+            identity: identity,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -149,10 +151,10 @@ struct ContextTests {
                 state: "active"
             )
         }
-        let noOpSend: ContextBridge.SendFn = { _, _ in }
+        let noOpSend: ContextBridge.SendFn = { _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
-        let noOpLeave: ContextBridge.LeaveFn = { _ in }
-        let noOpClose: ContextBridge.CloseFn = { _ in }
+        let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
+        let noOpClose: ContextBridge.CloseFn = { _, _ in }
 
         let identity = Identity(noPointer: .init())
         let params = ContextParams(
@@ -194,10 +196,10 @@ struct ContextTests {
         let createFn: ContextBridge.CreateFn = { _, _ in
             throw ScpError.Context(message: "creation failed", code: "SCP-CTX-2100")
         }
-        let noOpSend: ContextBridge.SendFn = { _, _ in }
+        let noOpSend: ContextBridge.SendFn = { _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
-        let noOpLeave: ContextBridge.LeaveFn = { _ in }
-        let noOpClose: ContextBridge.CloseFn = { _ in }
+        let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
+        let noOpClose: ContextBridge.CloseFn = { _, _ in }
 
         let identity = Identity(noPointer: .init())
         let params = ContextParams(
@@ -662,10 +664,11 @@ struct ContextTests {
         let handle = MockContextHandle()
         let context = Context(
             handle: handle,
-            sendFn: { _, _ in },
+            identity: Identity(noPointer: .init()),
+            sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
-            leaveFn: { _ in },
-            closeFn: { _ in },
+            leaveFn: { _, _ in },
+            closeFn: { _, _ in },
             setEconomicPolicyFn: setFn,
             getEconomicPolicyFn: getFn
         )

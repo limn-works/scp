@@ -22,13 +22,14 @@ struct GovernanceTests {
     /// succeeds inside governance/membership/broadcast methods.
     private func makeActiveContext() -> Context {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
-        let leaveFn: ContextBridge.LeaveFn = { _ in }
-        let closeFn: ContextBridge.CloseFn = { _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _, _ in }
+        let closeFn: ContextBridge.CloseFn = { _, _ in }
 
         return Context(
             handle: handle,
+            identity: Identity(noPointer: .init()),
             contextId: "test-ctx",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
