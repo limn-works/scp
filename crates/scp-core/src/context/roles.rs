@@ -1137,9 +1137,6 @@ mod tests {
         // Custom variants must also roundtrip through Display → new.
         // This was a bug: Display output "custom:my-cap" but new() didn't
         // strip the "custom:" prefix, creating Custom("custom:my-cap").
-        // Custom variants must also roundtrip through Display → new.
-        // This was a bug: Display output "custom:my-cap" but new() didn't
-        // strip the "custom:" prefix, creating Custom("custom:my-cap").
         //
         // Note: Custom names starting with "custom:" are ambiguous through
         // new() — the prefix is always stripped. Avoid such names.
