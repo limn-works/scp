@@ -905,16 +905,34 @@ mod tests_native {
 
     #[test]
     fn source_type_from_str_pascal_case() {
-        assert!(matches!(SourceType::from_str("Persistent"), Some(SourceType::Persistent)));
-        assert!(matches!(SourceType::from_str("Ephemeral"), Some(SourceType::Ephemeral)));
-        assert!(matches!(SourceType::from_str("Summary"), Some(SourceType::Summary)));
+        assert!(matches!(
+            SourceType::from_str("Persistent"),
+            Some(SourceType::Persistent)
+        ));
+        assert!(matches!(
+            SourceType::from_str("Ephemeral"),
+            Some(SourceType::Ephemeral)
+        ));
+        assert!(matches!(
+            SourceType::from_str("Summary"),
+            Some(SourceType::Summary)
+        ));
     }
 
     #[test]
     fn source_type_from_str_lowercase() {
-        assert!(matches!(SourceType::from_str("persistent"), Some(SourceType::Persistent)));
-        assert!(matches!(SourceType::from_str("ephemeral"), Some(SourceType::Ephemeral)));
-        assert!(matches!(SourceType::from_str("summary"), Some(SourceType::Summary)));
+        assert!(matches!(
+            SourceType::from_str("persistent"),
+            Some(SourceType::Persistent)
+        ));
+        assert!(matches!(
+            SourceType::from_str("ephemeral"),
+            Some(SourceType::Ephemeral)
+        ));
+        assert!(matches!(
+            SourceType::from_str("summary"),
+            Some(SourceType::Summary)
+        ));
     }
 
     #[test]
@@ -928,7 +946,10 @@ mod tests_native {
 
     #[test]
     fn context_state_from_str_pascal_case() {
-        assert!(matches!(ContextState::from_str("Active"), Some(ContextState::Active)));
+        assert!(matches!(
+            ContextState::from_str("Active"),
+            Some(ContextState::Active)
+        ));
         assert!(matches!(
             ContextState::from_str("ClosedWithSummaryVerified"),
             Some(ContextState::ClosedWithSummaryVerified)
@@ -941,12 +962,18 @@ mod tests_native {
             ContextState::from_str("ClosedEphemeral"),
             Some(ContextState::ClosedEphemeral)
         ));
-        assert!(matches!(ContextState::from_str("Unknown"), Some(ContextState::Unknown)));
+        assert!(matches!(
+            ContextState::from_str("Unknown"),
+            Some(ContextState::Unknown)
+        ));
     }
 
     #[test]
     fn context_state_from_str_snake_case() {
-        assert!(matches!(ContextState::from_str("active"), Some(ContextState::Active)));
+        assert!(matches!(
+            ContextState::from_str("active"),
+            Some(ContextState::Active)
+        ));
         assert!(matches!(
             ContextState::from_str("closed_with_summary_verified"),
             Some(ContextState::ClosedWithSummaryVerified)
@@ -959,7 +986,10 @@ mod tests_native {
             ContextState::from_str("closed_ephemeral"),
             Some(ContextState::ClosedEphemeral)
         ));
-        assert!(matches!(ContextState::from_str("unknown"), Some(ContextState::Unknown)));
+        assert!(matches!(
+            ContextState::from_str("unknown"),
+            Some(ContextState::Unknown)
+        ));
     }
 
     #[test]
@@ -973,16 +1003,34 @@ mod tests_native {
 
     #[test]
     fn memory_scope_from_str_pascal_case() {
-        assert!(matches!(MemoryScope::from_str("Full"), Some(MemoryScope::Full)));
-        assert!(matches!(MemoryScope::from_str("Summary"), Some(MemoryScope::Summary)));
-        assert!(matches!(MemoryScope::from_str("Ephemeral"), Some(MemoryScope::Ephemeral)));
+        assert!(matches!(
+            MemoryScope::from_str("Full"),
+            Some(MemoryScope::Full)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("Summary"),
+            Some(MemoryScope::Summary)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("Ephemeral"),
+            Some(MemoryScope::Ephemeral)
+        ));
     }
 
     #[test]
     fn memory_scope_from_str_lowercase() {
-        assert!(matches!(MemoryScope::from_str("full"), Some(MemoryScope::Full)));
-        assert!(matches!(MemoryScope::from_str("summary"), Some(MemoryScope::Summary)));
-        assert!(matches!(MemoryScope::from_str("ephemeral"), Some(MemoryScope::Ephemeral)));
+        assert!(matches!(
+            MemoryScope::from_str("full"),
+            Some(MemoryScope::Full)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("summary"),
+            Some(MemoryScope::Summary)
+        ));
+        assert!(matches!(
+            MemoryScope::from_str("ephemeral"),
+            Some(MemoryScope::Ephemeral)
+        ));
     }
 
     #[test]
