@@ -58,6 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
+use scp_core::context::ContextError;
 use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
@@ -65,7 +66,6 @@ use scp_core::context::manager::{ContextManager, ContextPersistence};
 use scp_core::context::providers::ProtocolStoreContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
-use scp_core::context::ContextError;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolStore;

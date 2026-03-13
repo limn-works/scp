@@ -6,7 +6,7 @@ Implements context lifecycle, MLS group encryption, UCAN capability authorizatio
 
 ## Quick Start
 
-```rust
+```rust,ignore
 use scp_core::context::{
     ContextManager, ContextParams, LocalTransportProvider,
 };
@@ -27,7 +27,7 @@ let manager = ContextManager::builder()
 Pass an `EncryptedStorage` implementation to `.storage()` and the builder auto-wires
 `ProtocolStore`, context persistence, and event log persistence:
 
-```rust
+```rust,ignore
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::testing::InMemoryStorage;
 use zeroize::Zeroizing;
@@ -47,7 +47,7 @@ For production, replace `InMemoryStorage` with `SqliteStorage` or
 
 ## Create a Context
 
-```rust
+```rust,ignore
 let params = ContextParams::default(); // encrypted mode, 7-day TTL
 
 let handle = manager
@@ -59,7 +59,7 @@ assert_eq!(handle.state().await, ContextState::Active);
 
 ## Send a Message
 
-```rust
+```rust,ignore
 manager
     .send_message(&handle, &"did:dht:z6Mk...sender".into(), b"hello world", None)
     .await?;
@@ -70,7 +70,7 @@ manager
 The `ContextEventLogProvider` trait includes `event_log_entries()` for
 reading entries through a trait object — no need to downcast:
 
-```rust
+```rust,ignore
 use scp_core::context::ContextEventLogProvider;
 
 // Works through Box<dyn ContextEventLogProvider>:
@@ -89,7 +89,7 @@ When `.storage()` or `.persistence()` is set, the manager persists context
 state after every mutation (best-effort). To restore after a process
 restart:
 
-```rust
+```rust,ignore
 // Same storage backend as before (same database file / same in-memory state).
 let manager = ContextManager::builder()
     .crypto(Box::new(my_crypto_provider))
@@ -105,7 +105,7 @@ manager.restore_all_contexts().await?;
 If you need full control (custom transport, custom event log), use the
 raw constructors instead of the builder:
 
-```rust
+```rust,ignore
 use scp_core::context::ContextManager;
 use scp_core::context::governance::KeyResolver;
 
@@ -134,7 +134,7 @@ let manager = ContextManager::with_persistence(
 
 ## Type Hierarchy
 
-```
+```text
 Platform layer (scp-platform)
   Storage trait              async key-value store
   EncryptedStorage trait     sealed — use EncryptingAdapter<S> to wrap any Storage
