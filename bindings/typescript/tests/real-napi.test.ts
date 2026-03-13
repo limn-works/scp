@@ -438,8 +438,7 @@ if (bridge === null) {
       );
       await napi.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
-      const events = await napi.eventLogQuery(ctx, JSON.stringify({ eventType: "MessageSent" }));
-      // The filter is JSON-serialized, so the bridge should accept it.
+      const events = await napi.eventLogQuery(ctx, { eventType: "MessageSent" });
       expect(Array.isArray(events)).toBe(true);
     });
 
@@ -450,8 +449,7 @@ if (bridge === null) {
         JSON.stringify({ ceiling: ["messages:read"] }),
       );
 
-      const claim = JSON.stringify({ type: "inclusion", leafIndex: 0 });
-      const proof = await napi.eventLogVerify(ctx, claim);
+      const proof = await napi.eventLogVerify(ctx, { type: "inclusion", leafIndex: 0 });
       expect(typeof proof.verified).toBe("boolean");
       expect(typeof proof.proofType).toBe("string");
     });
