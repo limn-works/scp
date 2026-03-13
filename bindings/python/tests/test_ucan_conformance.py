@@ -479,11 +479,14 @@ class TestRuntimeMalformedTokenCoverage:
     ``"malformed token:"`` catch-all in ``_TOKEN_PARSE_PREFIXES`` and classify
     as ``token_parse`` instead of the correct pipeline stage.
 
-    **Scope note:** ``mint.rs`` is intentionally excluded.  ``MalformedToken``
-    constructions in ``mint.rs`` occur during token *minting* (not validation)
-    and do not flow through ``_classify_ucan_error``.  Only ``validate.rs``
-    and ``resolvers.rs`` produce runtime ``MalformedToken`` errors that reach
-    the Python validation pipeline.
+    **Scope note:** ``mint.rs`` and ``nonce.rs`` are intentionally excluded.
+    ``MalformedToken`` constructions in ``mint.rs`` occur during token
+    *minting* (not validation) and do not flow through
+    ``_classify_ucan_error``.  ``nonce.rs`` is also excluded — its
+    ``MalformedToken`` constructions are storage/persistence operations
+    (serialization/deserialization), not validation-pipeline errors.  Only
+    ``validate.rs`` and ``resolvers.rs`` produce runtime ``MalformedToken``
+    errors that reach the Python validation pipeline.
     """
 
     @pytest.fixture(scope="class")
