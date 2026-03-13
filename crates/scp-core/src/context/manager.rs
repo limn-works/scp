@@ -4688,11 +4688,11 @@ impl ContextManager {
         context_id: &str,
         additional_secs: u64,
         approvals: &[super::governance::SignedVote],
-        _proposal_id: ProposalId,
+        proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let (snapshot, new_remaining, handle) = {
+        let (snapshot, new_remaining, handle, old_deadline, new_deadline, consenting_members) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -4709,6 +4709,16 @@ impl ContextManager {
                 approvals.iter().map(|v| &*v.voter_did).collect();
             let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
             if !missing.is_empty() {
+                // §5.10.1 step 6: Record TTLExtensionRejected event with
+                // proposal ID and rejecting member DIDs.
+                let rejecting_members: Vec<&str> = missing.clone();
+                let rejected_payload = serde_json::json!({
+                    "event": "TTLExtensionRejected",
+                    "proposal_id": hex::encode(proposal_id),
+                    "rejecting_members": rejecting_members,
+                });
+                self.event_log
+                    .append_context_event(&context_id_bytes, &rejected_payload.to_string())?;
                 return Err(ContextError::PermissionDenied(format!(
                     "TTL extension requires unanimous consent — {} of {} members have not approved",
                     missing.len(),
@@ -4716,9 +4726,16 @@ impl ContextManager {
                 )));
             }
 
+            // Collect consenting member DIDs for the structured event
+            // payload (§5.10.1 step 5).
+            let consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
+
             // Cancel the existing TTL timer task so it does not fire at
             // the original deadline.
             ctx.ttl_timer.cancel();
+
+            // Capture old deadline before mutation for structured event.
+            let old_dl = ctx.ttl_timer.deadline_unix_secs.unwrap_or(0);
 
             // Extend the TTL deadline and compute the remaining duration
             // for the replacement timer task.
@@ -4731,6 +4748,9 @@ impl ContextManager {
                 deadline.saturating_sub(now)
             });
 
+            // Capture new deadline after mutation.
+            let new_dl = ctx.ttl_timer.deadline_unix_secs.unwrap_or(0);
+
             // Reset the cancel signal so the replacement timer task can be
             // cancelled independently of the old one.
             ctx.ttl_timer.cancel = Arc::new(tokio::sync::Notify::new());
@@ -4742,7 +4762,7 @@ impl ContextManager {
             } else {
                 None
             };
-            (snap, remaining_secs, h)
+            (snap, remaining_secs, h, old_dl, new_dl, consenting)
         };
 
         // Respawn the TTL timer with the updated remaining duration.
@@ -4754,8 +4774,19 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
+
+        // §5.10.1 step 5: Record TTLExtended event with structured payload
+        // containing old deadline, new deadline, proposal ID, and
+        // consenting members.
+        let extended_payload = serde_json::json!({
+            "event": "TTLExtended",
+            "old_deadline_unix": old_deadline,
+            "new_deadline_unix": new_deadline,
+            "proposal_id": hex::encode(proposal_id),
+            "consenting_members": consenting_members,
+        });
         self.event_log
-            .append_context_event(&context_id_bytes, "TtlExtended")?;
+            .append_context_event(&context_id_bytes, &extended_payload.to_string())?;
         Ok(())
     }
 
