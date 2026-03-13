@@ -1,0 +1,17 @@
+{
+  "name": "scp-collaborative-workspace",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Multi-party governed workspace with roles, tools, and governance voting over SCP",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@limn-works/scp-ts": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,12 @@
+[project]
+name = "scp-broadcast-feed"
+version = "0.1.0"
+description = "Broadcast feed with subscriber management over SCP"
+requires-python = ">=3.12"
+dependencies = [
+    "scp-python",
+]
+
+[project.scripts]
+scp-broadcast-feed = "feed:main"
+scp-broadcast-subscriber = "subscriber:main"

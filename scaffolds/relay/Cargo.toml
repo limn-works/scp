@@ -1,0 +1,15 @@
+[package]
+name = "scp-relay-scaffold"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+scp-node = { path = "../../crates/scp-node" }
+scp-transport = { path = "../../crates/scp-transport", features = ["sqlite-blob"] }
+scp-core = { path = "../../crates/scp-core" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace]
