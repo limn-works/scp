@@ -137,6 +137,41 @@ const EXPORT_HMAC_DOMAIN: &[u8] = b"scp-context-export-integrity-v1";
 /// The HMAC key is derived via `HKDF-SHA256(ikm=signing_key, salt=[], info=EXPORT_HMAC_DOMAIN)`
 /// to ensure domain separation from the signing key's primary use (Ed25519
 /// signatures).
+/// Resolves a specific verification method key by `kid` fragment identifier
+/// for the given DID from the WASM-local identity registry (ADR-039).
+///
+/// - `#active` — returns the identity/active public key bytes.
+/// - `#agent` — returns the agent public key bytes (derived from the stored
+///   agent signing key). Returns an error if no agent key is bound.
+/// - Any other `kid` value is rejected fail-closed.
+///
+/// Returns `Err` if the DID is not in the registry or the kid is invalid.
+/// Used by [`crate::ucan::resolve_public_key_by_kid`] for kid-aware signature
+/// verification.
+pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u8; 32], String> {
+    IDENTITY_REGISTRY.with(|reg| {
+        let map = reg.borrow();
+        let entry = map
+            .get(did)
+            .ok_or_else(|| format!("DID '{did}' not found in identity registry"))?;
+
+        match kid {
+            "#active" => Ok(entry.public_key_bytes),
+            "#agent" => {
+                let agent_sk_bytes = entry.agent_signing_key_bytes.as_ref().ok_or_else(|| {
+                    format!("no agent key bound for DID '{did}' — cannot verify kid '#agent'")
+                })?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(agent_sk_bytes);
+                Ok(sk.verifying_key().to_bytes())
+            }
+            _ => Err(format!(
+                "unrecognized verification method '{kid}' on DID '{did}' \
+                 (expected '#active' or '#agent')"
+            )),
+        }
+    })
+}
+
 pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpWasmError> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;

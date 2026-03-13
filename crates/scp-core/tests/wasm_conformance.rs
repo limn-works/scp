@@ -1833,13 +1833,12 @@ mod wasm_ucan_mirror {
             .as_secs()
     }
 
-    pub fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
-        let now = now_secs();
+    /// Clock skew tolerance in seconds (spec section 9.14).
+    const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 
+    pub fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
+        // Check nbf < exp first — inherently invalid regardless of time/tolerance.
         if let Some(nbf) = token.payload.nbf {
-            if now < nbf {
-                return Err("token not yet valid (nbf > now)".to_owned());
-            }
             if nbf >= token.payload.exp {
                 return Err(format!(
                     "invalid time range: nbf ({nbf}) must be less than exp ({})",
@@ -1848,15 +1847,26 @@ mod wasm_ucan_mirror {
             }
         }
 
-        if now >= token.payload.exp {
+        let now = now_secs();
+
+        // exp check with tolerance.
+        if token.payload.exp + CLOCK_SKEW_TOLERANCE_SECS <= now {
             return Err("token expired".to_owned());
         }
 
+        // ExpiryTooFar — no tolerance applied.
         if token.payload.exp > now + MAX_EXPIRY_SECS {
             return Err(format!(
                 "expiry too far in the future: {}s exceeds 24h maximum",
                 token.payload.exp - now
             ));
+        }
+
+        // nbf check with tolerance.
+        if let Some(nbf) = token.payload.nbf {
+            if nbf.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) > now {
+                return Err("token not yet valid (nbf > now)".to_owned());
+            }
         }
 
         Ok(())
@@ -1929,6 +1939,9 @@ mod wasm_ucan_mirror {
                     parent.payload.iss
                 ));
             }
+
+            // Steps 5a/5b: Validate key scope on parent token (ADR-039).
+            validate_key_scope(parent)?;
 
             verify_signature(parent)?;
 
@@ -2582,6 +2595,33 @@ fn make_signed_ucan(
         typ: "JWT".to_owned(),
         ucv: "0.10.0".to_owned(),
         kid: None,
+    };
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    format!("{signing_input}.{sig_b64}")
+}
+
+/// Helper: creates a signed UCAN JWT with an optional `kid` header field.
+/// Used by chain-level key_scope conformance tests.
+fn make_signed_ucan_with_kid(
+    payload: &wasm_ucan_mirror::UcanPayload,
+    signing_key: &ed25519_dalek::SigningKey,
+    kid: Option<String>,
+) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::Signer;
+
+    let header = wasm_ucan_mirror::UcanHeader {
+        alg: "EdDSA".to_owned(),
+        typ: "JWT".to_owned(),
+        ucv: "0.10.0".to_owned(),
+        kid,
     };
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
@@ -5525,4 +5565,239 @@ fn wasm_ucan_header_kid_parsed_from_jwt() {
 
     let parsed = wasm_ucan_mirror::parse_ucan(&jwt).unwrap();
     assert_eq!(parsed.header.kid, Some("#agent".to_owned()));
+}
+
+// ===========================================================================
+// Chain-level key_scope conformance tests (issue #558)
+//
+// Verifies that `validate_key_scope` is called on parent tokens during
+// `verify_chain_recursive`, matching scp-core behavior (validate.rs line 903).
+//
+// Note: Self-delegating parent tokens (iss==aud) in a chain inherently trigger
+// circular delegation detection first (parent.iss == child.iss, since
+// parent.aud == child.iss for chain linkage). The key_scope check is defense-
+// in-depth — it fires after circular detection. These tests focus on step 5b
+// (key_scope/kid mismatch) on non-self-delegating parent tokens, which IS
+// reachable before any other check.
+// ===========================================================================
+
+/// Test: parent token with key_scope / kid mismatch is rejected during chain
+/// traversal (step 5b). The parent is a normal delegation (iss != aud) but
+/// declares `scp_key_scope: "#agent"` in fct while the header has
+/// `kid: "#active"`. This mismatch must be caught by `validate_key_scope` on
+/// the parent during `verify_chain_recursive`.
+#[test]
+fn wasm_chain_rejects_parent_key_scope_kid_mismatch() {
+    use std::collections::HashSet;
+
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[24u8; 32]);
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Parent token: normal delegation (iss != aud), but key_scope/kid mismatch.
+    // kid="#active" but scope="#agent" — step 5b violation.
+    let parent_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did.clone(),
+        aud: child_did.clone(), // iss != aud: normal delegation
+        exp: now + 3600,
+        nbf: None,
+        nnc: "parent-nonce-558-b".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+    };
+    // Sign with kid="#active" — mismatches the declared scope "#agent".
+    let parent_jwt =
+        make_signed_ucan_with_kid(&parent_payload, &root_key, Some("#active".to_owned()));
+    let parent_cid = wasm_ucan_mirror::compute_token_cid(&parent_jwt);
+
+    let grandchild_key = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
+    let grandchild_did = wasm_ucan_mirror::did_from_key(&grandchild_key);
+
+    // Child token: valid, references the parent with key_scope/kid mismatch.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: grandchild_did,
+        exp: now + 3600,
+        nbf: None,
+        nnc: "child-nonce-558-b".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result =
+        wasm_ucan_mirror::verify_delegation_chain(&child_token, Some(&[parent_jwt]), &revoked_cids);
+
+    assert!(
+        result.is_err(),
+        "parent with key_scope/kid mismatch must be rejected: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("key scope mismatch"),
+        "error must mention key scope mismatch, got: {err}"
+    );
+}
+
+/// Test: parent token with valid key_scope / kid match is accepted during
+/// chain traversal (step 5b passes).
+#[test]
+fn wasm_chain_accepts_parent_valid_key_scope_kid_match() {
+    use std::collections::HashSet;
+
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[25u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[26u8; 32]);
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Parent token: normal delegation with matching key_scope/kid.
+    let parent_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did,
+        aud: child_did.clone(), // iss != aud: normal delegation
+        exp: now + 3600,
+        nbf: None,
+        nnc: "parent-nonce-558-c".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
+    };
+    // kid="#active" matches scope="#active" — valid.
+    let parent_jwt =
+        make_signed_ucan_with_kid(&parent_payload, &root_key, Some("#active".to_owned()));
+    let parent_cid = wasm_ucan_mirror::compute_token_cid(&parent_jwt);
+
+    let grandchild_key = ed25519_dalek::SigningKey::from_bytes(&[28u8; 32]);
+    let grandchild_did = wasm_ucan_mirror::did_from_key(&grandchild_key);
+
+    // Child token: references the valid parent.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: grandchild_did,
+        exp: now + 3600,
+        nbf: None,
+        nnc: "child-nonce-558-c".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![parent_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result =
+        wasm_ucan_mirror::verify_delegation_chain(&child_token, Some(&[parent_jwt]), &revoked_cids);
+
+    assert!(
+        result.is_ok(),
+        "parent with valid key_scope/kid should pass: {result:?}"
+    );
+}
+
+/// Test: 3-level chain where the middle parent has key_scope/kid mismatch.
+/// Root → Intermediary (key_scope mismatch) → Child. The intermediary's
+/// key_scope violation must be caught during chain traversal.
+#[test]
+fn wasm_chain_rejects_intermediary_key_scope_kid_mismatch() {
+    use std::collections::HashSet;
+
+    let root_key = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+    let mid_key = ed25519_dalek::SigningKey::from_bytes(&[32u8; 32]);
+    let child_key = ed25519_dalek::SigningKey::from_bytes(&[33u8; 32]);
+    let root_did = wasm_ucan_mirror::did_from_key(&root_key);
+    let mid_did = wasm_ucan_mirror::did_from_key(&mid_key);
+    let child_did = wasm_ucan_mirror::did_from_key(&child_key);
+
+    let now = wasm_ucan_mirror::now_secs();
+
+    // Root token: valid, no key_scope issues.
+    let root_payload = wasm_ucan_mirror::UcanPayload {
+        iss: root_did,
+        aud: mid_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "root-nonce-558-d".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![],
+        fct: None,
+    };
+    let root_jwt = make_signed_ucan(&root_payload, &root_key);
+    let root_cid = wasm_ucan_mirror::compute_token_cid(&root_jwt);
+
+    // Intermediary token: key_scope/kid mismatch (scope="#agent", kid="#active").
+    let mid_payload = wasm_ucan_mirror::UcanPayload {
+        iss: mid_did,
+        aud: child_did.clone(),
+        exp: now + 3600,
+        nbf: None,
+        nnc: "mid-nonce-558-d".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![root_cid],
+        fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+    };
+    let mid_jwt = make_signed_ucan_with_kid(&mid_payload, &mid_key, Some("#active".to_owned()));
+    let mid_cid = wasm_ucan_mirror::compute_token_cid(&mid_jwt);
+
+    let grandchild_key = ed25519_dalek::SigningKey::from_bytes(&[34u8; 32]);
+    let grandchild_did = wasm_ucan_mirror::did_from_key(&grandchild_key);
+
+    // Child token: valid, references the bad intermediary.
+    let child_payload = wasm_ucan_mirror::UcanPayload {
+        iss: child_did,
+        aud: grandchild_did,
+        exp: now + 3600,
+        nbf: None,
+        nnc: "child-nonce-558-d".to_owned(),
+        att: vec![wasm_ucan_mirror::Attenuation {
+            with: "scp:ctx:test-ctx/messages:write".to_owned(),
+            can: "messages:write".to_owned(),
+        }],
+        prf: vec![mid_cid],
+        fct: None,
+    };
+    let child_jwt = make_signed_ucan(&child_payload, &child_key);
+    let child_token = wasm_ucan_mirror::parse_ucan(&child_jwt).unwrap();
+
+    let revoked_cids = HashSet::new();
+    let result = wasm_ucan_mirror::verify_delegation_chain(
+        &child_token,
+        Some(&[root_jwt, mid_jwt]),
+        &revoked_cids,
+    );
+
+    assert!(
+        result.is_err(),
+        "intermediary with key_scope/kid mismatch must be rejected: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("key scope mismatch"),
+        "error must mention key scope mismatch, got: {err}"
+    );
 }
