@@ -108,5 +108,5 @@ The `release.yml` workflow enforces a 7-step checklist:
 3. Version tags created (`scp-core@{version}`, per-SDK tags)
 4. Build all artifacts via `build-matrix.yml` (workflow_call)
 5. Sign artifacts per platform requirements
-6. Publish to registries (crates.io, PyPI, npm, SPM, Maven Central, NuGet, Go proxy)
+6. Publish to registries (crates.io, PyPI, npm, SPM, Maven Central)
 7. GitHub Release with binary attachments

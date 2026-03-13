@@ -3905,7 +3905,8 @@ pub async fn ucan_validate(
 /// # Errors
 ///
 /// Returns `ScpError::Validation` if `member_did` is not a valid DID string
-/// (empty, missing `did:{method}:{id}` structure, or contains control characters).
+/// (empty, exceeds 512 bytes, missing `did:{method}:{id}` structure, method
+/// not lowercase alphanumeric, or contains control characters).
 ///
 /// Returns `ScpError::Permission` if the context does not have key custody
 /// (created from an `identity_load` handle without key material) or if
@@ -4081,7 +4082,8 @@ pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<()
 /// # Errors
 ///
 /// Returns `ScpError::Validation` if `delegator_did` or `delegatee_did` is
-/// not a valid DID string (empty, missing `did:{method}:{id}` structure, or
+/// not a valid DID string (empty, exceeds 512 bytes, missing
+/// `did:{method}:{id}` structure, method not lowercase alphanumeric, or
 /// contains control characters), if `parent_token` is empty or contains
 /// control characters, or if any capability URI in `capabilities` is empty
 /// or contains control characters.
@@ -7529,8 +7531,9 @@ pub struct ShadowIdentityResult {
 /// # Errors
 ///
 /// Returns `ScpError::Validation` if `operator_did` or `governance_did`
-/// is not a valid DID string (empty, missing `did:{method}:{id}` structure,
-/// or contains control characters), or if `mode` is not recognized. Returns
+/// is not a valid DID string (empty, exceeds 512 bytes, missing
+/// `did:{method}:{id}` structure, method not lowercase alphanumeric, or
+/// contains control characters), or if `mode` is not recognized. Returns
 /// `ScpError::Context` if registration or approval fails (including
 /// self-approval).
 ///

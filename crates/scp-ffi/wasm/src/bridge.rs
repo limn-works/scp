@@ -315,8 +315,9 @@ pub fn bridge_evaluate_trust(
 /// # Errors
 ///
 /// Returns `JsError` if `operator_did` or `governance_did` is not a valid
-/// DID string (empty, missing `did:{method}:{id}` structure, or contains
-/// control characters), if `mode` is invalid, if other inputs are empty, or
+/// DID string (empty, exceeds 512 bytes, missing `did:{method}:{id}`
+/// structure, method not lowercase alphanumeric, or contains control
+/// characters), if `mode` is invalid, if other inputs are empty, or
 /// if `governance_did` equals `operator_did` (self-approval).
 ///
 /// # JS usage
