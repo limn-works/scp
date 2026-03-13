@@ -1080,6 +1080,18 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
     await expect(ctx.resetTtlTimer(-5)).rejects.toThrow(ContextError);
   });
 
+  it("extendTtl rejects zero or negative seconds", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const handle = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
+    );
+    const ctx = Context._fromHandle(handle, identity.did);
+
+    await expect(ctx.extendTtl(0)).rejects.toThrow(ContextError);
+    await expect(ctx.extendTtl(-10)).rejects.toThrow(ContextError);
+  });
+
   it("extendTtl rejects Infinity and -Infinity", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const handle = await mockBridge.contextCreate(
