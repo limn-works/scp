@@ -1034,7 +1034,7 @@ No existing standard combines UCAN delegation chains with payment semantics. L40
   - `scp-core/src/ucan/` — add `SpendingCapability` variant to capability types, AND-composition logic
   - `scp-core/src/context/` — add `economic_policy: Option<EconomicPolicy>` to `ContextParams`, auto-accept guard for paid contexts
   - `scp-core/src/event/` — add `PaymentReceived`, `EconomicPolicyChanged`, `SpendingUcanGranted`, `SpendingUcanRevoked` event types
-  - `scp-core/src/store/` — add `ProtocolStore` methods for economic data (economic_policy, payment_receipt, spending_ucan storage keys per §17.3)
+  - `scp-core/src/store/` — add `ProtocolRepository` methods for economic data (economic_policy, payment_receipt, spending_ucan storage keys per §17.3)
   - `scp-testing/src/conformance/payment.rs` — `payment_adapter_conformance!()` macro (§16.12.7)
   - `scp-testing/src/` — `TestAdapter` in-memory reference payment adapter
   - `scp-transport/native/` — extend `.well-known/scp` relay config parsing with economic fields

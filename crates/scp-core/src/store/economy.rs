@@ -1,4 +1,4 @@
-//! Economic governance storage operations for `ProtocolStore`.
+//! Economic governance storage operations for `ProtocolRepository`.
 //!
 //! Implements adapter credential storage, economic policy, payment receipts,
 //! and spending UCAN persistence following the key convention from spec
@@ -23,7 +23,7 @@ use scp_platform::traits::Storage;
 use crate::economy::credentials::{AdapterCredential, AdapterCredentialStore, CredentialError};
 use scp_identity::DID;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -96,10 +96,10 @@ fn spending_ucans_prefix(context_id: &str) -> Result<String, super::StoreError> 
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — adapter credential methods
+// ProtocolRepository — adapter credential methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores adapter credentials for an identity.
     ///
     /// Serializes credential bytes under
@@ -341,10 +341,10 @@ impl<S: Storage> ProtocolStore<S> {
 }
 
 // ---------------------------------------------------------------------------
-// AdapterCredentialStore impl for ProtocolStore
+// AdapterCredentialStore impl for ProtocolRepository
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> AdapterCredentialStore for ProtocolStore<S> {
+impl<S: Storage> AdapterCredentialStore for ProtocolRepository<S> {
     fn store_adapter_credential(
         &self,
         credential: &AdapterCredential,
@@ -430,12 +430,12 @@ mod tests {
         DID::from("did:dht:z6MkOtherHuman")
     }
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     // -------------------------------------------------------------------
-    // Raw byte storage tests (ProtocolStore methods)
+    // Raw byte storage tests (ProtocolRepository methods)
     // -------------------------------------------------------------------
 
     #[tokio::test]

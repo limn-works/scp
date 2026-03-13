@@ -1,9 +1,9 @@
 //! Production [`ContextPersistence`] implementation.
 //!
 //! The canonical production implementation is
-//! [`ProtocolStoreContextBridge`],
-//! which wraps `Arc<ProtocolStore<S>>` and implements the synchronous
-//! [`ContextPersistence`] trait by bridging to the async `ProtocolStore` methods.
+//! [`ProtocolRepositoryContextBridge`],
+//! which wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
+//! [`ContextPersistence`] trait by bridging to the async `ProtocolRepository` methods.
 //!
 //! This module re-exports the canonical implementation for convenience and
 //! provides an additional in-memory implementation suitable for integration
@@ -18,14 +18,14 @@ use crate::context::broadcast::BroadcastContextSnapshot;
 use crate::context::manager::{ContextPersistence, ContextSnapshot};
 
 // Re-export the canonical implementation.
-pub use crate::store::context::ProtocolStoreContextBridge;
+pub use crate::store::context::ProtocolRepositoryContextBridge;
 
 /// In-memory [`ContextPersistence`] implementation for integration tests.
 ///
 /// Stores context and broadcast snapshots in `HashMap`s protected by
 /// `std::sync::Mutex`. Suitable for integration tests that need persistence
 /// semantics (e.g., persist-drop-restore round-trip tests) without requiring
-/// a `ProtocolStore` or storage backend.
+/// a `ProtocolRepository` or storage backend.
 ///
 /// # Thread Safety
 ///

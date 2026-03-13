@@ -474,12 +474,12 @@ The `subscribe()` implementation wraps the relay's `mpsc::UnboundedReceiver<Rela
 
 ## 16.6 SimulatedIdentity
 
-Wraps identity primitives (DID, key custody, storage, protocol store) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
+Wraps identity primitives (DID, key custody, storage, protocol repository) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
 
 ```rust
 /// scp-testing/src/simulator/identity.rs
 
-/// A test identity with custody, storage, and protocol store pre-wired.
+/// A test identity with custody, storage, and protocol repository pre-wired.
 pub struct SimulatedIdentity {
     /// The DID for this identity.
     did: DID,
@@ -487,14 +487,14 @@ pub struct SimulatedIdentity {
     custody: Arc<InMemoryKeyCustody>,
     /// Direct storage access for tests.
     storage: InMemoryStorage,
-    /// Protocol store wrapping its own storage instance.
-    protocol_store: ProtocolStore<InMemoryStorage>,
+    /// Protocol repository wrapping its own storage instance.
+    protocol_repository: ProtocolRepository<InMemoryStorage>,
     /// Human-readable label for this identity.
     label: String,
 }
 
 impl SimulatedIdentity {
-    /// Creates a new simulated identity. The ProtocolStore is created from a
+    /// Creates a new simulated identity. The ProtocolRepository is created from a
     /// fresh InMemoryStorage instance. The `storage` parameter is retained
     /// separately for direct test access.
     pub fn new(
@@ -516,8 +516,8 @@ impl SimulatedIdentity {
     /// Returns a reference to the direct storage instance.
     pub const fn storage(&self) -> &InMemoryStorage;
 
-    /// Returns a reference to the protocol store.
-    pub const fn protocol_store(&self) -> &ProtocolStore<InMemoryStorage>;
+    /// Returns a reference to the protocol repository.
+    pub const fn protocol_repository(&self) -> &ProtocolRepository<InMemoryStorage>;
 }
 ```
 
@@ -714,7 +714,7 @@ impl ScenarioBuilder {
     /// 1. Creates the SimulatedClock at clock_start.
     /// 2. Creates InMemoryRelay instances with specified behaviors.
     /// 3. Creates SimulatedIdentity instances with InMemoryKeyCustody, InMemoryStorage,
-    ///    ProtocolStore (wrapping InMemoryStorage, §17.4), and InMemoryTransport
+    ///    ProtocolRepository (wrapping InMemoryStorage, §17.4), and InMemoryTransport
     ///    instances connected to reachable relays.
     /// 4. Creates MLS groups for each context.
     /// 5. Adds members to MLS groups (Welcome + Commit flow).
@@ -1460,9 +1460,9 @@ Meta-tests that verify the simulation framework is correct before trusting it fo
 | `different_seed_different_faults` | Different seeds produce different fault injection patterns |
 | `seed_printed_on_failure` | Test failure output includes the seed for reproduction |
 
-### 16.13.7 ProtocolStore Correctness
+### 16.13.7 ProtocolRepository Correctness
 
-Tests that verify the protocol layer's typed domain methods (§17.4) correctly persist and retrieve state through the `Storage` trait. These exercise key conventions (§17.3), serialization (§17.5), and the `ProtocolStore` domain API — not the storage adapters themselves. Run against `InMemoryStorage` (fast, deterministic); also gated against `SqliteStorage` in Phase 2.
+Tests that verify the protocol layer's typed domain methods (§17.4) correctly persist and retrieve state through the `Storage` trait. These exercise key conventions (§17.3), serialization (§17.5), and the `ProtocolRepository` domain API — not the storage adapters themselves. Run against `InMemoryStorage` (fast, deterministic); also gated against `SqliteStorage` in Phase 2.
 
 | Test | Verifies |
 |------|----------|
@@ -1478,7 +1478,7 @@ Tests that verify the protocol layer's typed domain methods (§17.4) correctly p
 
 ### 16.13.8 MlsStorageBridge Correctness
 
-Tests that verify OpenMLS group state persists correctly through the `MlsStorageBridge` → `ProtocolStore` → `Storage` chain (§17.9). These confirm that the bridge's key prefix mapping and serialization produce correct roundtrips for MLS-internal state.
+Tests that verify OpenMLS group state persists correctly through the `MlsStorageBridge` → `ProtocolRepository` → `Storage` chain (§17.9). These confirm that the bridge's key prefix mapping and serialization produce correct roundtrips for MLS-internal state.
 
 | Test | Verifies |
 |------|----------|
@@ -1548,8 +1548,8 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `push_conformance!()` | ADR-006 | Push contract |
 | `blob_store_conformance!()` | §16.4.1, §17.7 | BlobStore contract (5 methods, TTL, concurrent access) |
 | `payment_adapter_conformance!()` | §19.2, §19.2.6 | PaymentAdapter contract (authorize/capture/void/verify/refund, error conditions) |
-| ProtocolStore integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
-| MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolStore |
+| ProtocolRepository integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
+| MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolRepository |
 | Assertion library meta-tests | §16.10, §16.13.9 | Assertion functions detect violations correctly |
 | Preset scenario meta-tests | §16.11, §16.13.10 | Preset factories produce valid, deterministic simulators |
 
@@ -1585,7 +1585,7 @@ Tier 2 includes all Tier 1 checks plus the `scp-testing` harness meta-tests and 
 | §16.13.4 | NetworkTopology correctness (4 tests) | Validates partition/heal simulation |
 | §16.13.5 | ScenarioBuilder correctness (6 tests) | Validates builder produces valid simulators |
 | §16.13.6 | Determinism (3 tests) | Validates seed-based reproducibility |
-| §16.13.7 | ProtocolStore correctness (9 tests) | Validates protocol-layer persistence against InMemoryStorage |
+| §16.13.7 | ProtocolRepository correctness (9 tests) | Validates protocol-layer persistence against InMemoryStorage |
 | §16.13.8 | MlsStorageBridge correctness (2 tests) | Validates OpenMLS state persistence chain |
 | §16.13.9 | Assertion library meta-tests (15 tests) | Validates assertion functions before trusting them |
 | §16.13.10 | Preset scenario meta-tests (5 tests) | Validates preset factories |
@@ -1657,7 +1657,7 @@ Every §16.13 subsection is assigned to exactly one tier. No test is unassigned.
 | §16.13.4 NetworkTopology | 2 | `ci-tier2` |
 | §16.13.5 ScenarioBuilder | 2 | `ci-tier2` |
 | §16.13.6 Determinism | 2 | `ci-tier2` |
-| §16.13.7 ProtocolStore | 2 | `ci-tier2` |
+| §16.13.7 ProtocolRepository | 2 | `ci-tier2` |
 | §16.13.8 MlsStorageBridge | 2 | `ci-tier2` |
 | §16.13.9 Assertion library | 2 | `ci-tier2` |
 | §16.13.10 Preset scenarios | 2 | `ci-tier2` |

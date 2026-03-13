@@ -1054,7 +1054,7 @@
         "Implement log_custody_violation()",
         "Implement get_violations_for_did()",
         "Implement publish_counter_attestation()",
-        "Persist violations to ProtocolStore with append-only semantics",
+        "Persist violations to ProtocolRepository with append-only semantics",
         "Update trust/mod.rs exports",
         "Add unit tests"
       ],

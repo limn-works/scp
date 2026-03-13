@@ -1,4 +1,4 @@
-//! Identity storage operations for `ProtocolStore`.
+//! Identity storage operations for `ProtocolRepository`.
 //!
 //! Implements identity state CRUD following the key convention from
 //! spec section 17.3:
@@ -18,7 +18,7 @@ use scp_identity::DID;
 
 use crate::identity::block_list::{BlockListEvent, BlockListState};
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -114,10 +114,10 @@ struct CachedDidDocument {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — identity methods
+// ProtocolRepository — identity methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores an identity's DID document.
     ///
     /// Serializes the document bytes under `identity/{did}/document` wrapped
@@ -444,8 +444,8 @@ mod tests {
         DID::from("did:dht:z6MkTestIdentity")
     }
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     #[tokio::test]
@@ -948,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn block_list_commutativity_via_store() {
         // Verify that appending events in different orders produces the
-        // same derived state when queried through ProtocolStore.
+        // same derived state when queried through ProtocolRepository.
         let store_a = make_store();
         let store_b = make_store();
         let did = test_did();

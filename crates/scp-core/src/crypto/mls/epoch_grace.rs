@@ -82,7 +82,7 @@ pub type OnEpochExpired = Box<dyn FnMut(&[u64]) + Send>;
 
 /// A persistable grace window entry for crash recovery (§23.11).
 ///
-/// This struct is serialized to `ProtocolStore` under
+/// This struct is serialized to `ProtocolRepository` under
 /// `context/{context_id}/grace/{epoch:020d}` and loaded on startup to restore
 /// the [`EpochGraceStore`] after crashes. The `expires_at_unix_secs` field
 /// records the absolute wall-clock expiration time so that recovery can compare

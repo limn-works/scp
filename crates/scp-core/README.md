@@ -25,7 +25,7 @@ let manager = ContextManager::builder()
 ## With Persistence (crash recovery)
 
 Pass an `EncryptedStorage` implementation to `.storage()` and the builder auto-wires
-`ProtocolStore`, context persistence, and event log persistence:
+`ProtocolRepository`, context persistence, and event log persistence:
 
 ```rust,ignore
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -140,9 +140,9 @@ Platform layer (scp-platform)
   EncryptedStorage trait     sealed — use EncryptingAdapter<S> to wrap any Storage
 
 Core layer (scp-core)
-  ProtocolStore<S>           typed domain wrapper over Storage (100+ async methods)
-  ProtocolStoreContextBridge<S>    sync bridge: ProtocolStore → ContextPersistence trait
-  ProtocolStoreEventLogBridge<S>   sync bridge: ProtocolStore → EventLogPersistence trait
+  ProtocolRepository<S>           typed domain wrapper over Storage (100+ async methods)
+  ProtocolRepositoryContextBridge<S>    sync bridge: ProtocolRepository → ContextPersistence trait
+  ProtocolRepositoryEventLogBridge<S>   sync bridge: ProtocolRepository → EventLogPersistence trait
 
 Provider layer (scp-core::context)
   ContextCryptoProvider      MLS group + sender key operations

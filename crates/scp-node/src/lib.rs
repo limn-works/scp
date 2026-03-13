@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scp_core::store::{CURRENT_STORE_VERSION, ProtocolStore, StoredValue};
+use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::EncryptedStorage;
@@ -211,8 +211,8 @@ pub struct ApplicationNode<S: Storage> {
     relay: RelayHandle,
     /// Handle to the node's identity.
     identity: IdentityHandle,
-    /// The protocol store wrapping the storage backend.
-    storage: Arc<ProtocolStore<S>>,
+    /// The protocol repository wrapping the storage backend.
+    storage: Arc<ProtocolRepository<S>>,
     /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
     state: Arc<http::NodeState>,
     /// Handle to the periodic tier re-evaluation background task (§10.12.1, SCP-243).
@@ -262,9 +262,9 @@ impl<S: Storage> ApplicationNode<S> {
         &self.identity
     }
 
-    /// Returns a reference to the protocol store.
+    /// Returns a reference to the protocol repository.
     #[must_use]
-    pub fn storage(&self) -> &ProtocolStore<S> {
+    pub fn storage(&self) -> &ProtocolRepository<S> {
         &self.storage
     }
 
@@ -547,10 +547,10 @@ const IDENTITY_STORAGE_KEY: &str = "scp/identity";
 ///
 /// Stored as `MessagePack` (`rmp-serde`) under [`IDENTITY_STORAGE_KEY`], wrapped
 /// in a [`StoredValue<PersistedIdentity>`] version envelope per spec §17.5.
-/// Uses the `Storage` trait directly (NOT through [`ProtocolStore`] domain
+/// Uses the `Storage` trait directly (NOT through [`ProtocolRepository`] domain
 /// methods) because identity bootstrap persistence is a pre-DID operation:
 /// the identity must be loaded before any DID is known, before contexts exist,
-/// and before `ProtocolStore` domain methods can be used (since they are keyed
+/// and before `ProtocolRepository` domain methods can be used (since they are keyed
 /// by DID or `context_id`). This is documented as a second legitimate exception
 /// in spec §17.4, alongside the MLS bridge (§17.9).
 ///
@@ -1826,8 +1826,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: EncryptedStorage + 'sta
             .storage
             .take()
             .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_store = Arc::new(ProtocolStore::new(storage));
-        self.build_with_store(protocol_store).await
+        let protocol_repository = Arc::new(ProtocolRepository::new(storage));
+        self.build_with_store(protocol_repository).await
     }
 }
 
@@ -1848,19 +1848,19 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             .storage
             .take()
             .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_store = Arc::new(ProtocolStore::new_for_testing(storage));
-        self.build_with_store(protocol_store).await
+        let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
+        self.build_with_store(protocol_repository).await
     }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
 {
-    /// Shared build logic after `ProtocolStore` has been constructed.
+    /// Shared build logic after `ProtocolRepository` has been constructed.
     #[allow(clippy::too_many_lines)] // builder with many config steps
     async fn build_with_store(
         self,
-        protocol_store: Arc<ProtocolStore<S>>,
+        protocol_repository: Arc<ProtocolRepository<S>>,
     ) -> Result<ApplicationNode<S>, NodeError> {
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self
@@ -1869,7 +1869,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let persist = self.persist_identity;
 
         let (identity, document, did_method) =
-            resolve_identity_persistent(identity_source, persist, protocol_store.storage()).await?;
+            resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
+                .await?;
         let bridge_secret = generate_bridge_secret();
         let bind_addr = self
             .bind_addr
@@ -1894,7 +1895,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let tls_provider = resolve_tls(
             self.tls_provider,
             &domain,
-            &protocol_store,
+            &protocol_repository,
             self.acme_email.as_ref(),
         );
 
@@ -1911,7 +1912,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     identity,
                     document,
                     did_method,
-                    protocol_store,
+                    protocol_repository,
                     shutdown_handle,
                     bound_addr,
                     bridge_secret,
@@ -1947,7 +1948,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     identity,
                     document,
                     did_method,
-                    protocol_store,
+                    protocol_repository,
                     shutdown_handle,
                     bound_addr,
                     strategy,
@@ -2204,7 +2205,7 @@ fn generate_dev_token(addr: SocketAddr) -> String {
 fn resolve_tls<S: Storage + 'static>(
     provider: Option<Arc<dyn TlsProvider>>,
     domain: &str,
-    storage: &Arc<ProtocolStore<S>>,
+    storage: &Arc<ProtocolRepository<S>>,
     acme_email: Option<&String>,
 ) -> Arc<dyn TlsProvider> {
     provider.unwrap_or_else(|| {
@@ -2359,7 +2360,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
-    storage: Arc<ProtocolStore<S>>,
+    storage: Arc<ProtocolRepository<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
     bridge_secret: Zeroizing<[u8; 32]>,
@@ -2445,7 +2446,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
-    storage: Arc<ProtocolStore<S>>,
+    storage: Arc<ProtocolRepository<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
     nat_strategy: Arc<dyn NatStrategy>,
@@ -2590,8 +2591,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: EncryptedStorage + 'sta
             .storage
             .take()
             .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_store = Arc::new(ProtocolStore::new(storage));
-        self.build_with_store(protocol_store).await
+        let protocol_repository = Arc::new(ProtocolRepository::new(storage));
+        self.build_with_store(protocol_repository).await
     }
 }
 
@@ -2611,18 +2612,18 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             .storage
             .take()
             .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_store = Arc::new(ProtocolStore::new_for_testing(storage));
-        self.build_with_store(protocol_store).await
+        let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
+        self.build_with_store(protocol_repository).await
     }
 }
 
 impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
 {
-    /// Shared build logic for no-domain mode after `ProtocolStore` creation.
+    /// Shared build logic for no-domain mode after `ProtocolRepository` creation.
     async fn build_with_store(
         self,
-        protocol_store: Arc<ProtocolStore<S>>,
+        protocol_repository: Arc<ProtocolRepository<S>>,
     ) -> Result<ApplicationNode<S>, NodeError> {
         let identity_source = self
             .identity_source
@@ -2630,7 +2631,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let persist = self.persist_identity;
 
         let (identity, document, did_method) =
-            resolve_identity_persistent(identity_source, persist, protocol_store.storage()).await?;
+            resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
+                .await?;
 
         // 3. Start relay server.
         let bind_addr = self
@@ -2668,7 +2670,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             identity,
             document,
             did_method,
-            protocol_store,
+            protocol_repository,
             shutdown_handle,
             bound_addr,
             strategy,

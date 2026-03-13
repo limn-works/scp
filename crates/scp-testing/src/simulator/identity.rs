@@ -1,6 +1,6 @@
 //! Simulated identity for test scenarios.
 //!
-//! Wraps identity primitives (DID, key custody, storage, protocol store) into
+//! Wraps identity primitives (DID, key custody, storage, protocol repository) into
 //! a single container for convenient test setup. Does NOT create real MLS
 //! groups or sender key stores -- those are complex and should be used directly
 //! in integration tests.
@@ -9,14 +9,14 @@
 
 use std::sync::Arc;
 
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_identity::DID;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
-/// A test identity with custody, storage, and protocol store pre-wired.
+/// A test identity with custody, storage, and protocol repository pre-wired.
 ///
 /// Provides convenient access to all identity-related components needed for
-/// protocol-level testing. The protocol store wraps its own `InMemoryStorage`
+/// protocol-level testing. The protocol repository wraps its own `InMemoryStorage`
 /// instance; the `storage` field is a separate instance for direct storage
 /// access in tests.
 pub struct SimulatedIdentity {
@@ -26,8 +26,8 @@ pub struct SimulatedIdentity {
     custody: Arc<InMemoryKeyCustody>,
     /// Direct storage access for tests.
     storage: InMemoryStorage,
-    /// Protocol store wrapping its own storage instance.
-    protocol_store: ProtocolStore<InMemoryStorage>,
+    /// Protocol repository wrapping its own storage instance.
+    protocol_repository: ProtocolRepository<InMemoryStorage>,
     /// Human-readable label for this identity.
     label: String,
 }
@@ -35,7 +35,7 @@ pub struct SimulatedIdentity {
 impl SimulatedIdentity {
     /// Creates a new simulated identity.
     ///
-    /// The `ProtocolStore` is created from a fresh `InMemoryStorage` instance.
+    /// The `ProtocolRepository` is created from a fresh `InMemoryStorage` instance.
     /// The `storage` parameter is retained separately for direct test access.
     #[must_use]
     pub fn new(
@@ -44,12 +44,12 @@ impl SimulatedIdentity {
         custody: Arc<InMemoryKeyCustody>,
         storage: InMemoryStorage,
     ) -> Self {
-        let protocol_store = ProtocolStore::new_for_testing(InMemoryStorage::new());
+        let protocol_repository = ProtocolRepository::new_for_testing(InMemoryStorage::new());
         Self {
             did,
             custody,
             storage,
-            protocol_store,
+            protocol_repository,
             label: label.into(),
         }
     }
@@ -78,9 +78,9 @@ impl SimulatedIdentity {
         &self.storage
     }
 
-    /// Returns a reference to the protocol store.
+    /// Returns a reference to the protocol repository.
     #[must_use]
-    pub const fn protocol_store(&self) -> &ProtocolStore<InMemoryStorage> {
-        &self.protocol_store
+    pub const fn protocol_repository(&self) -> &ProtocolRepository<InMemoryStorage> {
+        &self.protocol_repository
     }
 }

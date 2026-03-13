@@ -1,8 +1,8 @@
-//! Protocol store for SCP client-side persistence.
+//! Protocol repository for SCP client-side persistence.
 //!
-//! `ProtocolStore<S>` wraps a `Storage` implementation and provides typed
+//! `ProtocolRepository<S>` wraps a `Storage` implementation and provides typed
 //! domain methods for all protocol state. Storage adapters implement the
-//! thin `Storage` trait (six methods); `ProtocolStore` handles all structured
+//! thin `Storage` trait (six methods); `ProtocolRepository` handles all structured
 //! domain logic and key conventions.
 //!
 //! # Key Convention
@@ -12,7 +12,7 @@
 //!
 //! # Module Structure
 //!
-//! Each domain area has its own submodule with the `ProtocolStore` impl
+//! Each domain area has its own submodule with the `ProtocolRepository` impl
 //! methods for that area. This keeps the impl blocks organized and
 //! focused.
 //!
@@ -64,7 +64,7 @@ pub fn sanitize_key_component(s: &str) -> Result<&str, StoreError> {
 // StoreError
 // ---------------------------------------------------------------------------
 
-/// Errors produced by `ProtocolStore` operations.
+/// Errors produced by `ProtocolRepository` operations.
 ///
 /// Wraps platform storage errors and adds protocol-level error variants
 /// for serialization/deserialization failures and missing data.
@@ -96,9 +96,9 @@ pub enum StoreError {
 // StoredValue
 // ---------------------------------------------------------------------------
 
-/// Version envelope for all values persisted by `ProtocolStore`.
+/// Version envelope for all values persisted by `ProtocolRepository`.
 ///
-/// Every value written by `ProtocolStore` is wrapped in `StoredValue`.
+/// Every value written by `ProtocolRepository` is wrapped in `StoredValue`.
 /// On read, `version` is checked before deserializing `data`. This enables
 /// lazy on-read migration (spec section 17.10) without requiring
 /// schema-level versioning in the storage backend.
@@ -120,7 +120,7 @@ pub const CURRENT_STORE_VERSION: u16 = 2;
 
 /// Current key-space schema version.
 ///
-/// Used by `ProtocolStore::initialize()` to detect whether key-space
+/// Used by `ProtocolRepository::initialize()` to detect whether key-space
 /// migrations need to run on startup. Incremented when the key
 /// convention changes (e.g., key format changes, key renames).
 ///
@@ -138,7 +138,7 @@ pub const CURRENT_SCHEMA_VERSION: u16 = 1;
 /// older version to the current version. Migration functions are pure --
 /// no I/O, no side effects, independently testable.
 ///
-/// On read, `ProtocolStore` checks the stored `StoredValue.version`. If it
+/// On read, `ProtocolRepository` checks the stored `StoredValue.version`. If it
 /// is behind `CURRENT_VERSION`, the migration chain is applied iteratively
 /// and the upgraded value is written back to storage. If the version is
 /// ahead, `StoreError::IncompatibleVersion` is returned.
@@ -160,27 +160,27 @@ pub trait Migratable: Sized + Serialize + DeserializeOwned {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore
+// ProtocolRepository
 // ---------------------------------------------------------------------------
 
-/// Concrete protocol store wrapping a platform `Storage` implementation.
+/// Concrete protocol repository wrapping a platform `Storage` implementation.
 ///
 /// Provides typed domain methods for all protocol state. Storage adapters
-/// implement the thin `Storage` trait; `ProtocolStore` handles all structured
+/// implement the thin `Storage` trait; `ProtocolRepository` handles all structured
 /// domain logic, key conventions, and serialization.
 ///
 /// The type parameter `S` is the concrete storage backend (e.g.,
 /// `InMemoryStorage`, `SqliteStorage`). The `Storage` trait uses RPITIT
 /// (return-position `impl Trait` in traits) and is not dyn-compatible,
-/// so `ProtocolStore` is generic rather than using `Arc<dyn Storage>`.
+/// so `ProtocolRepository` is generic rather than using `Arc<dyn Storage>`.
 ///
 /// See spec section 17.4.
-pub struct ProtocolStore<S: Storage> {
+pub struct ProtocolRepository<S: Storage> {
     storage: S,
 }
 
-impl<S: EncryptedStorage> ProtocolStore<S> {
-    /// Creates a new `ProtocolStore` wrapping the given encrypted storage
+impl<S: EncryptedStorage> ProtocolRepository<S> {
+    /// Creates a new `ProtocolRepository` wrapping the given encrypted storage
     /// backend.
     ///
     /// Requires `S: EncryptedStorage` — only storage backends that encrypt
@@ -205,8 +205,8 @@ impl<S: EncryptedStorage> ProtocolStore<S> {
 /// `testing` feature bundles `allow_unencrypted_storage` so all test
 /// configurations get it automatically.
 #[cfg(any(test, feature = "allow_unencrypted_storage"))]
-impl<S: Storage> ProtocolStore<S> {
-    /// Creates a `ProtocolStore` wrapping a storage backend that may not
+impl<S: Storage> ProtocolRepository<S> {
+    /// Creates a `ProtocolRepository` wrapping a storage backend that may not
     /// encrypt at rest.
     ///
     /// **Testing only.** Production code must use [`new`](Self::new) with
@@ -217,7 +217,7 @@ impl<S: Storage> ProtocolStore<S> {
     }
 }
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Returns a reference to the underlying storage backend.
     ///
     /// Used by [`MlsStorageBridge`](crate::crypto::mls::storage::MlsStorageBridge)
@@ -424,7 +424,7 @@ impl<S: Storage> ProtocolStore<S> {
     // Schema version startup check (SCP-PERSIST-019)
     // -----------------------------------------------------------------------
 
-    /// Initializes the `ProtocolStore`, checking and setting the schema version.
+    /// Initializes the `ProtocolRepository`, checking and setting the schema version.
     ///
     /// On startup:
     /// - If `_meta/schema_version` is missing, writes the current version.
@@ -519,10 +519,11 @@ mod tests {
     #[test]
     fn serialize_deserialize_roundtrip() {
         let value = vec![1u32, 2, 3, 4, 5];
-        let bytes =
-            ProtocolStore::<scp_platform::testing::InMemoryStorage>::serialize(&value).unwrap();
+        let bytes = ProtocolRepository::<scp_platform::testing::InMemoryStorage>::serialize(&value)
+            .unwrap();
         let decoded: Vec<u32> =
-            ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize(&bytes).unwrap();
+            ProtocolRepository::<scp_platform::testing::InMemoryStorage>::deserialize(&bytes)
+                .unwrap();
         assert_eq!(decoded, value);
     }
 
@@ -533,8 +534,9 @@ mod tests {
             data: "future",
         };
         let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
-        let result =
-            ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize::<String>(&bytes);
+        let result = ProtocolRepository::<scp_platform::testing::InMemoryStorage>::deserialize::<
+            String,
+        >(&bytes);
         assert!(matches!(
             result,
             Err(StoreError::IncompatibleVersion { .. })
@@ -543,7 +545,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_value_and_load_value_roundtrip() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let value = vec![42u64, 100, 999];
         store.store_value("test/key", &value).await.unwrap();
         let loaded: Option<Vec<u64>> = store.load_value("test/key").await.unwrap();
@@ -552,7 +555,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_value_returns_none_for_missing_key() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let loaded: Option<String> = store.load_value("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
@@ -602,7 +606,8 @@ mod tests {
 
     #[tokio::test]
     async fn migratable_current_version_roundtrip() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let original = TestMigratable {
             value: "hello".to_owned(),
             extra: 42,
@@ -619,7 +624,8 @@ mod tests {
 
     #[tokio::test]
     async fn migratable_migration_from_v1() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         // Manually store a v1 value (just a String).
         let v1_data = "migrated-value".to_owned();
@@ -649,7 +655,8 @@ mod tests {
 
     #[tokio::test]
     async fn migratable_rejects_future_version() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         // Manually store a future version.
         let envelope = StoredValue {
@@ -671,14 +678,16 @@ mod tests {
 
     #[tokio::test]
     async fn migratable_returns_none_for_missing() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let loaded: Option<TestMigratable> = store.load_migratable("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
 
     #[tokio::test]
     async fn migratable_migration_from_v2() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         // Manually store a v2 value: (String, u32) tuple.
         let v2_data = ("from-v2".to_owned(), 77u32);
@@ -716,7 +725,8 @@ mod tests {
         // Verifies that iterative chain migration works: v1 -> v2 -> v3.
         // The v1 migrate step produces a TestMigratable (at v2 semantics),
         // which is then re-serialized at v2 and fed into the v2 migrate step.
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         // Store a v1 value.
         let v1_data = "chain-test".to_owned();
@@ -748,7 +758,8 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_writes_version_on_fresh_store() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         store.initialize().await.unwrap();
 
         let version: Option<u16> = store.load_value("_meta/schema_version").await.unwrap();
@@ -757,7 +768,8 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_proceeds_on_matching_version() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         // Pre-set the version.
         store
@@ -771,7 +783,8 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_errors_on_future_version() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         let future_version: u16 = CURRENT_SCHEMA_VERSION + 5;
         store
@@ -788,7 +801,8 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_triggers_migration_for_old_version() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
 
         // Set a behind version. Currently no migrations exist, but the
         // hook should still execute and update to current.
@@ -847,7 +861,8 @@ mod tests {
 
     #[tokio::test]
     async fn context_store_rejects_traversal_context_id() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store
             .store_context_state("../identity/victim", b"bad")
             .await;
@@ -856,14 +871,16 @@ mod tests {
 
     #[tokio::test]
     async fn context_store_rejects_null_byte_context_id() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store.store_context_state("evil\0ctx", b"bad").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn identity_store_rejects_traversal_did() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let malicious_did = scp_identity::DID::from("../context/victim");
         let result = store.store_identity_document(&malicious_did, b"bad").await;
         assert!(result.is_err());
@@ -871,7 +888,8 @@ mod tests {
 
     #[tokio::test]
     async fn identity_store_rejects_backslash_did() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let malicious_did = scp_identity::DID::from("evil\\did");
         let result = store.store_identity_document(&malicious_did, b"bad").await;
         assert!(result.is_err());
@@ -879,7 +897,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_store_rejects_traversal_tool_id() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store
             .store_tool("ctx-1", "../ucan_token/steal", b"bad")
             .await;
@@ -888,14 +907,16 @@ mod tests {
 
     #[tokio::test]
     async fn tool_store_rejects_null_byte_session_id() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store.store_tool_session("ctx-1", "sess\0ion", b"bad").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn economy_store_rejects_traversal_adapter_id() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let did = scp_identity::DID::from("did:dht:z6MkTest");
         let result = store
             .store_adapter_credentials(&did, "../document", b"bad")
@@ -905,7 +926,8 @@ mod tests {
 
     #[tokio::test]
     async fn ucan_store_rejects_traversal_context_id() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store
             .store_ucan_token("../identity/victim", "tok-1", b"bad")
             .await;
@@ -914,7 +936,8 @@ mod tests {
 
     #[tokio::test]
     async fn well_formed_identifiers_succeed_across_all_domains() {
-        let store = ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+        let store =
+            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let did = scp_identity::DID::from("did:dht:z6MkTest");
 
         // Context domain

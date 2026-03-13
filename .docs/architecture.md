@@ -259,7 +259,7 @@ scp/
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
 │   │   ├── event_log/         # Append-only verifiable log
-│   │   ├── store/             # ProtocolStore — typed domain storage (§17.4)
+│   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
 │   │   ├── bridge/            # Bridge connector protocol types (§12)
 │   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
 │   │   └── sync/              # Offline/sync strategy (§23)
@@ -367,7 +367,7 @@ scp/
 
 Each component has a defined responsibility boundary and communicates with others through typed Rust interfaces.
 
-**ProtocolStore** — typed domain storage layer (§17.4):
+**ProtocolRepository** — typed domain storage layer (§17.4):
 
 ```
 Responsibilities:
@@ -383,7 +383,7 @@ Depends on:
   • Platform Adapter (Storage trait — 6 async methods)
 
 State:
-  • All protocol state flows through ProtocolStore to Storage:
+  • All protocol state flows through ProtocolRepository to Storage:
     context state, membership, sender keys, event logs, nonces,
     DID cache, TOFU records, tools, sessions, relay scores, identity
 ```
@@ -406,10 +406,10 @@ Depends on:
   • Identity Manager (DID resolution, agent instantiation)
   • Transport Adapter (envelope delivery)
   • Event Log (append events, generate proofs)
-  • ProtocolStore (context state persistence — §17.4)
+  • ProtocolRepository (context state persistence — §17.4)
 
 State:
-  • Active contexts (in-memory + persisted via ProtocolStore)
+  • Active contexts (in-memory + persisted via ProtocolRepository)
   • TTL timers
   • Role/capability maps per context
 ```
@@ -969,7 +969,7 @@ Build:
   • scp-transport/native/ — SCP native relay adapter (single relay)
   • scp-transport/native/blob_store.rs — BlobStore trait (§16.4.1)
   • scp-platform/testing/ — In-memory key storage (delete_prefix, exists — §17.2)
-  • scp-core/store/ — Skeleton ProtocolStore (§17.4)
+  • scp-core/store/ — Skeleton ProtocolRepository (§17.4)
   • scp-core/crypto/mls/storage.rs — MlsStorageBridge (§17.9)
   • scp-testing/ — Network simulation harness (§16): InMemoryRelay, InMemoryTransport,
     SimulatedClock, ScenarioBuilder, assertion library, trait conformance macros, presets
@@ -1002,7 +1002,7 @@ Build:
   • scp-core/context/ — role assignment, capability ceiling enforcement
   • scp-core/context/ — tool registration and invocation
   • scp-core/event_log/ — Merkle tree, append, prove, verify
-  • scp-core/store/ — Full ProtocolStore with all domain methods (§17.4)
+  • scp-core/store/ — Full ProtocolRepository with all domain methods (§17.4)
   • scp-platform/ — SqliteStorage (bundled-sqlcipher, WAL mode — §17.6)
   • scp-platform/ — FilesystemStorage (§17.6)
   • scp-transport/ — transport abstraction trait
@@ -1019,7 +1019,7 @@ Test:
   • Event log integrity verification
   • Multi-relay delivery (send to 3 relays, receive from any)
   • Context state persists across process restarts (SqliteStorage)
-  • ProtocolStore integration tests: lifecycle, nonces, event range queries (§17.13)
+  • ProtocolRepository integration tests: lifecycle, nonces, event range queries (§17.13)
   • MlsStorageBridge tests (§16.13.8) gated against SqliteStorage
   • All new Storage/BlobStore adapters pass conformance suites
   • Block enforcement: assert_block_enforced (§16.10.6) — sender key rotation
@@ -1081,7 +1081,7 @@ Test:
     verify ephemeral context keys are unrecoverable via MLS group state query
   • Advanced memory scope: governance-driven memory scope policy changes, nested context
     TTL inheritance, memory scope enforcement across multi-parent children
-  • Trust evaluation: behavioral records persisted via ProtocolStore, trust scores
+  • Trust evaluation: behavioral records persisted via ProtocolRepository, trust scores
     affect context admission decisions, tested through N-party simulation
   • Discovery: tool-interface discovery (§6.2.2) returns correct results across
     contexts with different capability ceilings

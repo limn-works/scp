@@ -13,7 +13,7 @@
 //!
 //! # Persistence
 //!
-//! TOFU records are persisted via `ProtocolStore` under the `tofu/{did}`
+//! TOFU records are persisted via `ProtocolRepository` under the `tofu/{did}`
 //! key namespace. The store module (`store::tofu`) provides the typed
 //! read/write methods. This module provides the types and comparison logic.
 //!

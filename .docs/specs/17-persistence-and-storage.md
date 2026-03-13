@@ -9,14 +9,14 @@ SCP has two independent persistence surfaces: client-side storage for SDK state 
 ```
 Protocol Engine (structured domain operations)
         |
-ProtocolStore (key conventions + serde serialization)
+ProtocolRepository (key conventions + serde serialization)
         |
 Storage trait (flat KV: store/retrieve/delete/list_keys/delete_prefix/exists)
         |
 Backend adapter (SQLite, wa-sqlite, filesystem, in-memory)
 ```
 
-The `Storage` trait (defined in `scp-platform`) is deliberately thin — six async methods operating on `(key: &str, data: &[u8])` pairs. All structured protocol operations (context state, membership, event logs, nonces, caches) are mapped to flat KV operations by `ProtocolStore` in `scp-core`. Adapter authors implement six methods. The protocol layer handles all domain logic and is tested once.
+The `Storage` trait (defined in `scp-platform`) is deliberately thin — six async methods operating on `(key: &str, data: &[u8])` pairs. All structured protocol operations (context state, membership, event logs, nonces, caches) are mapped to flat KV operations by `ProtocolRepository` in `scp-core`. Adapter authors implement six methods. The protocol layer handles all domain logic and is tested once.
 
 ### Relay Storage Stack
 
@@ -138,7 +138,7 @@ tls/private_key
 mls/{context_id}/...
 ```
 
-**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` containing the node's `ScpIdentity` and `DidDocument`. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolStore` domain methods (see §17.4 for the exception rationale).
+**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` containing the node's `ScpIdentity` and `DidDocument`. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 
@@ -153,24 +153,24 @@ mls/{context_id}/...
 1. **At startup.** `restore_all_contexts` calls `prune_expired_nonces` for each restored context, clearing the backlog accumulated during the previous process lifetime.
 2. **Time-gated inline.** `check_and_record_nonce` tracks the last prune time per context via a storage key (`context/{context_id}/nonce/_last_prune`). If more than 1 hour has elapsed since the last prune, a full prune pass runs before the nonce check. This adds one extra storage read per nonce check (the last-prune timestamp), which is negligible relative to the two reads and one write the nonce check already performs. The expensive full scan only runs hourly.
 
-The in-memory `NonceTracker` remains the primary, synchronised replay defense on the hot path. `ProtocolStore` nonce tracking is defense-in-depth for crash recovery. The time-gated prune ensures the persistent nonce store does not grow without bound even in long-running processes that never restart.
+The in-memory `NonceTracker` remains the primary, synchronised replay defense on the hot path. `ProtocolRepository` nonce tracking is defense-in-depth for crash recovery. The time-gated prune ensures the persistent nonce store does not grow without bound even in long-running processes that never restart.
 
 **Context cleanup.** When a context is closed or expired, `delete_prefix("context/{context_id}/")` removes all context state atomically. No enumeration required.
 
-## 17.4 ProtocolStore
+## 17.4 ProtocolRepository
 
-`ProtocolStore` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolStore` is the primary interface between protocol logic and persistent storage, with two documented exceptions (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolStore` is generic rather than using `Arc<dyn Storage>`.
+`ProtocolRepository` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolRepository` is the primary interface between protocol logic and persistent storage, with two documented exceptions (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolRepository` is generic rather than using `Arc<dyn Storage>`.
 
 ```rust
 /// scp-core/src/store/mod.rs
 
-pub struct ProtocolStore<S: Storage> {
+pub struct ProtocolRepository<S: Storage> {
     storage: S,
 }
 
 /// Production constructor — requires EncryptedStorage (sealed marker trait).
 /// Only storage backends that encrypt at rest satisfy this bound.
-impl<S: EncryptedStorage> ProtocolStore<S> {
+impl<S: EncryptedStorage> ProtocolRepository<S> {
     pub fn new(storage: S) -> Self;
 }
 
@@ -179,11 +179,11 @@ impl<S: EncryptedStorage> ProtocolStore<S> {
 /// feature flag. Production code must use `new()` with an EncryptedStorage
 /// backend (e.g., SqliteStorage, EncryptingAdapter<InMemoryStorage>).
 #[cfg(any(test, feature = "allow_unencrypted_storage"))]
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     pub fn new_for_testing(storage: S) -> Self;
 }
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     // --- Context state ---
     pub async fn store_context_state(&self, context_id: &ContextId, state: &ContextState) -> Result<(), StoreError>;
     pub async fn load_context_state(&self, context_id: &ContextId) -> Result<Option<ContextState>, StoreError>;
@@ -291,19 +291,19 @@ impl<S: Storage> ProtocolStore<S> {
 }
 ```
 
-Every `ProtocolStore` method translates to one or two `Storage` trait calls using the key convention from section 17.3. There is no query optimizer, no batch API, no transaction boundary beyond what `delete_prefix` provides. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
+Every `ProtocolRepository` method translates to one or two `Storage` trait calls using the key convention from section 17.3. There is no query optimizer, no batch API, no transaction boundary beyond what `delete_prefix` provides. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
 
-**Exceptions to `ProtocolStore` as the single interface.** Two subsystems access `Storage` directly rather than through `ProtocolStore` domain methods:
+**Exceptions to `ProtocolRepository` as the single interface.** Two subsystems access `Storage` directly rather than through `ProtocolRepository` domain methods:
 
 1. **MLS bridge (§17.9).** `MlsStorageBridge` accesses raw `Storage` because OpenMLS owns the storage contract and the `StorageProvider` trait dictates serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
 
-2. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolStore` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
+2. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolRepository` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
 
 ### Module Structure
 
 ```
 scp-core/src/store/
-    mod.rs          # ProtocolStore struct, StoreError type, re-exports
+    mod.rs          # ProtocolRepository struct, StoreError type, re-exports
     context.rs      # Context state, params, membership, sender keys
     event_log.rs    # Event log persistence, tree nodes, roots
     identity.rs     # Identity documents, private state, TOFU, DID cache
@@ -330,7 +330,7 @@ pub struct StoredValue<T> {
 }
 ```
 
-Every value written by `ProtocolStore` is wrapped in `StoredValue`. On read, `version` is checked before deserializing `data`. This enables lazy migration (section 17.10) without requiring schema-level versioning in the storage backend.
+Every value written by `ProtocolRepository` is wrapped in `StoredValue`. On read, `version` is checked before deserializing `data`. This enables lazy migration (section 17.10) without requiring schema-level versioning in the storage backend.
 
 **Encryption at rest** is a platform concern enforced at compile time by the sealed `EncryptedStorage` marker trait.
 
@@ -350,7 +350,7 @@ pub trait EncryptedStorage: Storage + private::Sealed {}
 
 The seal mechanism uses a `pub(crate)` supertrait (`Sealed`) that external code cannot access. Any attempt to implement `EncryptedStorage` outside `scp-platform` fails at compile time. This ensures the encryption invariant is enforced by the type system, not by documentation or convention.
 
-**Production constructors require `EncryptedStorage`.** `ProtocolStore::new()` is bounded on `EncryptedStorage` (see §17.4). The testing constructor `ProtocolStore::new_for_testing()` accepts any `Storage` but is gated behind `#[cfg(test)]` and the `allow_unencrypted_storage` feature flag, preventing accidental use in production builds.
+**Production constructors require `EncryptedStorage`.** `ProtocolRepository::new()` is bounded on `EncryptedStorage` (see §17.4). The testing constructor `ProtocolRepository::new_for_testing()` accepts any `Storage` but is gated behind `#[cfg(test)]` and the `allow_unencrypted_storage` feature flag, preventing accidental use in production builds.
 
 **Implementations:**
 
@@ -377,7 +377,7 @@ nonce (12 bytes) || ciphertext || tag (16 bytes)
 - **AAD (Additional Authenticated Data):** The storage key string (UTF-8 bytes). This binds each encrypted value to its key path, preventing relocation attacks (moving a ciphertext from one key to another causes decryption failure).
 - **Tag:** 128-bit GCM authentication tag, appended after the ciphertext.
 
-**Key names are NOT encrypted** — they pass through to the inner backend unmodified. The `ProtocolStore` key convention is deterministic and not secret. Only values are encrypted.
+**Key names are NOT encrypted** — they pass through to the inner backend unmodified. The `ProtocolRepository` key convention is deterministic and not secret. Only values are encrypted.
 
 **Usage pattern (matching `scp-node` ephemeral mode):**
 
@@ -389,12 +389,12 @@ use zeroize::Zeroizing;
 let mut key = Zeroizing::new([0u8; 32]);
 OsRng.fill_bytes(&mut *key);
 let encrypted = EncryptingAdapter::new(InMemoryStorage::new(), key);
-// `encrypted` implements EncryptedStorage — pass to ProtocolStore::new().
+// `encrypted` implements EncryptedStorage — pass to ProtocolRepository::new().
 ```
 
 ### `allow_unencrypted_storage` Feature Gate
 
-The `allow_unencrypted_storage` feature flag in `scp-core` exposes `ProtocolStore::new_for_testing()`, which accepts any `Storage` without the `EncryptedStorage` bound. This is intended for:
+The `allow_unencrypted_storage` feature flag in `scp-core` exposes `ProtocolRepository::new_for_testing()`, which accepts any `Storage` without the `EncryptedStorage` bound. This is intended for:
 
 - **Unit tests** (`#[cfg(test)]`) — crate-internal tests get it automatically.
 - **Integration test crates** — enable the feature flag in `[dev-dependencies]`.
@@ -576,18 +576,18 @@ Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
-OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolStore` and delegates to the `mls/{context_id}/...` key prefix.
+OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
 
 ```rust
 /// scp-core/src/crypto/mls/storage.rs
 
 pub struct MlsStorageBridge<S: Storage> {
-    store: Arc<ProtocolStore<S>>,
+    store: Arc<ProtocolRepository<S>>,
     context_id: ContextId,
 }
 
 impl<S: Storage> MlsStorageBridge<S> {
-    pub fn new(store: Arc<ProtocolStore<S>>, context_id: ContextId) -> Self;
+    pub fn new(store: Arc<ProtocolRepository<S>>, context_id: ContextId) -> Self;
 }
 
 impl<S: Storage> openmls_traits::storage::StorageProvider for MlsStorageBridge<S> {
@@ -610,10 +610,10 @@ mls/{context_id}/encryption_key/{epoch}/{generation}
 
 The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signatures. The bridge is a thin translation layer — it adds no behavior beyond key construction and serialization.
 
-**Why this bypasses `ProtocolStore` domain methods.** Every other domain area stores data through typed `ProtocolStore` methods that apply `StoredValue` version envelopes. The MLS bridge is one of two documented exceptions that access raw `Storage` directly (the other is identity bootstrap persistence — see §17.4). This is intentional:
+**Why this bypasses `ProtocolRepository` domain methods.** Every other domain area stores data through typed `ProtocolRepository` methods that apply `StoredValue` version envelopes. The MLS bridge is one of two documented exceptions that access raw `Storage` directly (the other is identity bootstrap persistence — see §17.4). This is intentional:
 
 - **OpenMLS owns the storage contract.** The `StorageProvider` trait dictates what gets stored, key structure, and serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
-- **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolStore wrapper methods would be pure indirection.
+- **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolRepository wrapper methods would be pure indirection.
 - **Migration is OpenMLS's concern.** MLS state serialization is governed by the OpenMLS version, not SCP's `StoredValue` versioning. Format changes across OpenMLS upgrades follow OpenMLS's own compatibility guarantees.
 
 ### 17.9.1 MLS Crypto State Snapshot
@@ -643,7 +643,7 @@ The snapshot approach ensures atomicity: all crypto state is persisted and resto
 
 ## 17.10 Migration Strategy
 
-**Lazy on-read migration.** `ProtocolStore` checks the version envelope on every read:
+**Lazy on-read migration.** `ProtocolRepository` checks the version envelope on every read:
 
 - `version == current` -> deserialize directly
 - `version < current` -> apply migration chain, write back upgraded value
@@ -664,7 +664,7 @@ pub trait Migratable: Sized + Serialize + DeserializeOwned {
 
 **Migration functions are pure.** No I/O, no side effects, independently testable. Each migration step transforms bytes from version N to version N+1. The chain is applied iteratively until reaching `CURRENT_VERSION`.
 
-**Key-space migrations** (changing the key convention itself) are rare and handled differently. On startup, `ProtocolStore` checks a `_meta/schema_version` key. If the key-space version is behind, a one-time startup migration runs before normal operation. Key-space migrations are the only blocking startup operation.
+**Key-space migrations** (changing the key convention itself) are rare and handled differently. On startup, `ProtocolRepository` checks a `_meta/schema_version` key. If the key-space version is behind, a one-time startup migration runs before normal operation. Key-space migrations are the only blocking startup operation.
 
 **No downgrade support.** Once data is migrated forward, it cannot be read by older SCP versions. This is intentional — downgrade paths create combinatorial testing requirements and invite data corruption. Users who need to roll back must restore from backup.
 
@@ -755,7 +755,7 @@ async fn list_keys_prefix_returns_sorted() {
 }
 ```
 
-### ProtocolStore Integration Tests
+### ProtocolRepository Integration Tests
 
 These test the protocol layer's use of storage, not the storage adapters themselves. They run against `InMemoryStorage` (fast, deterministic) and should also be run against `SqliteStorage` as a secondary gate.
 
@@ -778,25 +778,25 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 ### Phase 1
 
 - `InMemoryStorage` implements all 6 `Storage` methods including `delete_prefix` and `exists`
-- Skeleton `ProtocolStore` with context state, membership, and nonce methods
+- Skeleton `ProtocolRepository` with context state, membership, and nonce methods
 - `MlsStorageBridge` skeleton (OpenMLS `StorageProvider` implementation)
 - `storage_conformance!()` macro covers all 6 methods, ordering, and concurrency
 - `InMemoryStorage` passes full conformance suite
 
 ### Phase 2
 
-- Full `ProtocolStore` with all domain methods
+- Full `ProtocolRepository` with all domain methods
 - `SqliteStorage` (bundled-sqlcipher, WAL mode)
 - `FilesystemStorage`
 - `SqliteBlobStore` for relay storage
 - `RedbBlobStore` for relay storage
-- ADR-008 context lifecycle uses `ProtocolStore` for state persistence
-- ADR-011 event log uses `ProtocolStore` for Merkle tree persistence
+- ADR-008 context lifecycle uses `ProtocolRepository` for state persistence
+- ADR-011 event log uses `ProtocolRepository` for Merkle tree persistence
 - All new adapters pass their respective conformance suites
 
 ### Phase 3
 
-- Python SDK uses `ProtocolStore` via FFI (SQLite default, auto-configured)
+- Python SDK uses `ProtocolRepository` via FFI (SQLite default, auto-configured)
 - Python `Storage` adapter configuration via `scp.Config`
 
 ### Phase 4
@@ -816,4 +816,4 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 - Event log pruning and checkpointing (compact old events behind Merkle root)
 - Performance optimization: batch writes, connection pooling
-- `ProtocolStore` profiling and hot-path optimization
+- `ProtocolRepository` profiling and hot-path optimization

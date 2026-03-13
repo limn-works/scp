@@ -77,8 +77,8 @@ name = "persistence_advanced"
 path = "tests/integration/persistence_advanced.rs"
 
 [[test]]
-name = "protocol_store"
-path = "tests/integration/protocol_store.rs"
+name = "protocol_repository"
+path = "tests/integration/protocol_repository.rs"
 
 [[test]]
 name = "identity"

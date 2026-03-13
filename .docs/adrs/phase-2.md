@@ -53,7 +53,7 @@ Implement the context lifecycle as a five-state finite state machine in `scp-cor
 - **Crate:** `scp-core`
 - **Module:** `scp-core/context/`
 - **Async runtime:** tokio (TTL timers, MLS operations, transport)
-- **State persistence:** Via `ProtocolStore` (§17.4), which wraps the `scp-platform` `Storage` trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.
+- **State persistence:** Via `ProtocolRepository` (§17.4), which wraps the `scp-platform` `Storage` trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.
 
 ### Dependencies
 
@@ -694,7 +694,7 @@ Implement an append-only Merkle tree per context in `scp-core/event_log/`. The t
 
 - **Language:** Rust
 - **Hashing:** SHA-256 via `sha2` crate
-- **Storage:** In-memory for Phase 2 initial development, backed by `ProtocolStore` (§17.4) for persistence. Event log keys follow the convention in §17.3: `context/{context_id}/event/{seq:020d}` for events, `context/{context_id}/event_tree/{level}/{index}` for Merkle tree nodes.
+- **Storage:** In-memory for Phase 2 initial development, backed by `ProtocolRepository` (§17.4) for persistence. Event log keys follow the convention in §17.3: `context/{context_id}/event/{seq:020d}` for events, `context/{context_id}/event_tree/{level}/{index}` for Merkle tree nodes.
 - **Crate:** `scp-core`
 - **Module:** `scp-core/event_log/`
 - **Proof format:** Binary serialization of inclusion proof paths (sibling hashes + left/right indicators).

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_platform::traits::Storage;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
@@ -306,8 +306,8 @@ impl ResolvesServerCert for CertResolver {
 pub struct AcmeProvider<S: Storage> {
     /// The domain to provision a certificate for.
     domain: String,
-    /// Protocol store wrapping the platform storage backend.
-    storage: Arc<ProtocolStore<S>>,
+    /// Protocol repository wrapping the platform storage backend.
+    storage: Arc<ProtocolRepository<S>>,
     /// Optional contact email for the ACME account.
     email: Option<String>,
     /// ACME directory URL (defaults to Let's Encrypt production).
@@ -339,7 +339,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     /// Uses the Let's Encrypt production directory by default. Call
     /// [`with_directory_url`](Self::with_directory_url) to change.
     #[must_use]
-    pub fn new(domain: &str, storage: Arc<ProtocolStore<S>>) -> Self {
+    pub fn new(domain: &str, storage: Arc<ProtocolRepository<S>>) -> Self {
         Self {
             domain: domain.to_owned(),
             storage,
@@ -381,7 +381,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
         Arc::clone(&self.challenges)
     }
 
-    /// Load a TLS certificate from the protocol store, converting to
+    /// Load a TLS certificate from the protocol repository, converting to
     /// [`CertificateData`].
     async fn load_tls_cert(&self) -> Result<Option<CertificateData>, TlsError> {
         match self
@@ -1000,11 +1000,11 @@ mod tests {
         }
     }
 
-    // -- Storage round-trip (through ProtocolStore domain methods) --
+    // -- Storage round-trip (through ProtocolRepository domain methods) --
 
     #[tokio::test]
     async fn certificate_storage_roundtrip() {
-        let store = ProtocolStore::new_for_testing(InMemoryStorage::new());
+        let store = ProtocolRepository::new_for_testing(InMemoryStorage::new());
         let original = generate_self_signed("roundtrip.example.com").unwrap();
 
         // Store via domain method.
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_certificate_returns_none_when_empty() {
-        let store = ProtocolStore::new_for_testing(InMemoryStorage::new());
+        let store = ProtocolRepository::new_for_testing(InMemoryStorage::new());
         let result = store.load_tls_certificate().await.unwrap();
         assert!(result.is_none());
     }
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     fn acme_provider_new_sets_defaults() {
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage);
 
         assert_eq!(provider.domain, "example.com");
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn acme_provider_with_email() {
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage).with_email("admin@example.com");
 
         assert_eq!(provider.email.as_deref(), Some("admin@example.com"));
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn acme_provider_with_directory_url() {
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage)
             .with_directory_url("https://acme-staging-v02.api.letsencrypt.org/directory");
 
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn acme_provider_with_cert_resolver() {
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let cert = generate_self_signed("example.com").unwrap();
         let certs = cert.certificate_chain_der().unwrap();
         let key = cert.private_key_der().unwrap();
@@ -1130,7 +1130,7 @@ mod tests {
 
     #[test]
     fn acme_provider_challenges_returns_shared_map() {
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage);
 
         let challenges_a = provider.challenges();
@@ -1148,7 +1148,7 @@ mod tests {
 
         // Simulate the provision() flow: write to the shared challenge map,
         // then verify the router serves the key authorization (AC6/AC7).
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage);
         let challenges = provider.challenges();
 
@@ -1189,7 +1189,7 @@ mod tests {
         // rustls usage. Ignore errors if already installed by another test.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("test.example.com", storage)
             // Point to a non-existent ACME directory so it fails fast.
             .with_directory_url("http://127.0.0.1:1/nonexistent");
@@ -1218,7 +1218,7 @@ mod tests {
         use tower::ServiceExt;
 
         // Create an AcmeProvider and get its shared challenge map.
-        let storage = Arc::new(ProtocolStore::new_for_testing(InMemoryStorage::new()));
+        let storage = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
         let provider = AcmeProvider::new("test.example.com", storage);
         let challenges = provider.challenges();
 

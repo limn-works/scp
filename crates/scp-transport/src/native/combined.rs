@@ -1,7 +1,7 @@
 //! Combined client + relay storage in a single `SQLite` database.
 //!
 //! [`CombinedNodeStorage`] implements both [`Storage`] (key-value store for
-//! client state via `ProtocolStore`) and [`BlobStorage`] (blob store for relay
+//! client state via `ProtocolRepository`) and [`BlobStorage`] (blob store for relay
 //! state) in one `SQLCipher`-encrypted `SQLite` database. This enables the
 //! "personal node" deployment pattern where one directory = complete node state.
 //!
@@ -82,7 +82,7 @@ fn prefix_successor(prefix: &str) -> Option<String> {
 /// `SQLite` database.
 ///
 /// The database contains two tables:
-/// - `kv` — key-value store implementing [`Storage`] (client `ProtocolStore`)
+/// - `kv` — key-value store implementing [`Storage`] (client `ProtocolRepository`)
 /// - `blobs` — blob store implementing [`BlobStorage`] (relay blob storage)
 ///
 /// Uses `Arc<std::sync::Mutex<Connection>>` (not `tokio::sync::Mutex`) because

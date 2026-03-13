@@ -274,7 +274,7 @@ pub struct SubscriptionResult {
 /// Contains the new broadcast key and epoch after rotation, which the caller
 /// must distribute to non-blocked subscribers. Also includes the author DID
 /// and the full block list so the caller can persist block state via
-/// `ProtocolStore::store_broadcast_block_list`. See RED-016.
+/// `ProtocolRepository::store_broadcast_block_list`. See RED-016.
 #[derive(Debug)]
 pub struct BlockResult {
     /// The new AES-256-GCM broadcast key after rotation.
@@ -295,7 +295,7 @@ pub struct BlockResult {
 ///
 /// Contains the author DID and the full block list after the unblock operation
 /// so the caller can persist the updated block state via
-/// `ProtocolStore::store_broadcast_block_list`. Unlike [`BlockResult`], this
+/// `ProtocolRepository::store_broadcast_block_list`. Unlike [`BlockResult`], this
 /// does NOT contain a new key or epoch — unblocking does not rotate keys
 /// (§9.16.8).
 #[derive(Debug)]
@@ -908,7 +908,7 @@ impl BroadcastContext {
     /// Restores a previously persisted block list for an author.
     ///
     /// Called during initialization to rehydrate block state from
-    /// `ProtocolStore::load_broadcast_block_list`. If the author is not
+    /// `ProtocolRepository::load_broadcast_block_list`. If the author is not
     /// registered, returns an error. See RED-016.
     ///
     /// # Errors
@@ -1367,7 +1367,7 @@ impl BroadcastContext {
     /// Creates a serializable snapshot of the broadcast context state.
     ///
     /// Captures authors (with key material and epochs), subscribers, and
-    /// admission policy. Used by `ProtocolStore::store_broadcast_state` to
+    /// admission policy. Used by `ProtocolRepository::store_broadcast_state` to
     /// persist broadcast context state across process restarts.
     ///
     /// See spec section 5.14 and RED-016.
@@ -1439,7 +1439,7 @@ impl BroadcastContext {
 ///
 /// Captures the full broadcast context state: admission policy, subscriber
 /// roster, and per-author key state (including key material, epochs, and
-/// block lists). Stored via `ProtocolStore::store_broadcast_state` under the
+/// block lists). Stored via `ProtocolRepository::store_broadcast_state` under the
 /// key `context/{context_id}/broadcast_state`.
 ///
 /// This is separate from `BroadcastContext` because `AuthorState` contains

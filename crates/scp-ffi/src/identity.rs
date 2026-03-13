@@ -386,7 +386,7 @@ fn identity_state_key(did: &str) -> String {
 /// here — it remains within the [`KeyCustody`](scp_platform::KeyCustody)
 /// boundary.
 ///
-/// Uses a simple `did\ncustody` text format. When `ProtocolStore`'s identity
+/// Uses a simple `did\ncustody` text format. When `ProtocolRepository`'s identity
 /// module lands (spec 17.4), this will migrate to `StoredValue<T>` with
 /// `MessagePack` serialization.
 fn serialize_identity_state(did: &str, custody: &str) -> Vec<u8> {
@@ -1262,6 +1262,7 @@ mod tests {
     /// confirm the signer is properly wired and migration produces a
     /// valid new identity.
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn py_identity_migrate_succeeds_with_signer() {
         setup();
 

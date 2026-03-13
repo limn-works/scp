@@ -1272,7 +1272,7 @@ When the SDK detects disconnection (all relay WebSocket connections lost), outbo
 
 The outbound queue operates as follows:
 
-- Messages are serialized to their inner envelope form (signed, padded) and stored in `ProtocolStore` under `queue/{context_id}/{seq:020d}`. The inner envelope is fully constructed (including signature and padding) but NOT MLS-encrypted — MLS encryption requires the current epoch's key schedule, which may advance while offline. MLS encryption is applied at drain time using the then-current epoch.
+- Messages are serialized to their inner envelope form (signed, padded) and stored in `ProtocolRepository` under `queue/{context_id}/{seq:020d}`. The inner envelope is fully constructed (including signature and padding) but NOT MLS-encrypted — MLS encryption requires the current epoch's key schedule, which may advance while offline. MLS encryption is applied at drain time using the then-current epoch.
 - The queue is bounded at 1,000 messages per context and 10,000 messages total across all contexts. When full, the oldest messages are dropped with a `QueueOverflow` event emitted to the application layer.
 - Queue entries include a `queued_at` timestamp. On reconnection, entries older than the context's `blob_ttl` (or 7 days if no TTL) are discarded — they would expire on relays before delivery anyway.
 - The queue drains automatically on reconnection, after MLS epoch catch-up completes. Messages are MLS-encrypted with the current epoch's key schedule and sent in queue order.
@@ -1286,7 +1286,7 @@ pub struct QueuedMessage {
 }
 
 pub struct OutboundQueue {
-    store: Arc<ProtocolStore>,
+    store: Arc<ProtocolRepository>,
     per_context_limit: usize,     // Default: 1_000
     total_limit: usize,           // Default: 10_000
 }
@@ -1368,7 +1368,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
 **Trigger conditions (any one triggers reset):**
 
-1. Offline duration exceeds 7 days (measured from last successful relay interaction timestamp, persisted in `ProtocolStore`).
+1. Offline duration exceeds 7 days (measured from last successful relay interaction timestamp, persisted in `ProtocolRepository`).
 2. Epoch catch-up fails: relay backfill, peer request, and Welcome-based fast-forward all failed.
 3. The context's governance model explicitly requests reset (future: ADR-031 governance action).
 
@@ -1513,7 +1513,7 @@ The alternative approaches (vector clocks, CRDTs, consensus protocols) all add c
 - **Async runtime:** tokio (reconnection timers, concurrent relay catch-up, queue drain)
 - **Crate:** `scp-core`
 - **Module:** `scp-core/sync/`
-- **Persistence:** Via `ProtocolStore` (§17.4) for queue state, last-seen timestamps, and catch-up progress. Key conventions:
+- **Persistence:** Via `ProtocolRepository` (§17.4) for queue state, last-seen timestamps, and catch-up progress. Key conventions:
   - `queue/{context_id}/{seq:020d}` — queued outbound messages
   - `sync/{context_id}/last_relay_contact` — last successful relay interaction timestamp
   - `sync/{context_id}/catch_up_state` — in-progress catch-up state (survives process restart)
@@ -1526,7 +1526,7 @@ The alternative approaches (vector clocks, CRDTs, consensus protocols) all add c
 - **ADR-008 (Context Lifecycle):** Context state machine determines valid operations during catch-up. Context closure/expiry events discovered during reconnection trigger local cleanup.
 - **ADR-011 (Event Log):** Merkle tree consistency checkpoints for state reconciliation. Inclusion proofs for verifying recovered events. Event log as authoritative ordering for conflict resolution.
 - **ADR-012 (Multi-Transport):** Multi-relay subscription recovery. Relay reliability scoring — degraded relays that failed to retain messages during offline period are penalized.
-- **ProtocolStore (§17.4):** Queue persistence, sync state persistence, event log range queries for catch-up.
+- **ProtocolRepository (§17.4):** Queue persistence, sync state persistence, event log range queries for catch-up.
 
 ### Acceptance Criteria
 
@@ -1534,13 +1534,13 @@ The alternative approaches (vector clocks, CRDTs, consensus protocols) all add c
 
 ```rust
 pub struct OutboundQueue {
-    store: Arc<ProtocolStore>,
+    store: Arc<ProtocolRepository>,
     per_context_limit: usize,
     total_limit: usize,
 }
 
 impl OutboundQueue {
-    pub fn new(store: Arc<ProtocolStore>) -> Self;
+    pub fn new(store: Arc<ProtocolRepository>) -> Self;
     pub async fn enqueue(&self, msg: QueuedMessage) -> Result<(), QueueError>;
     pub async fn drain(&self, context_id: &ContextId, mls_group: &mut MlsGroup) -> Result<Vec<OuterEnvelope>, QueueError>;
     pub async fn discard_expired(&self, context_id: &ContextId, max_age_secs: u64) -> Result<u64, QueueError>;
@@ -1550,7 +1550,7 @@ impl OutboundQueue {
 }
 ```
 
-   - `enqueue` stores a `QueuedMessage` in `ProtocolStore`. Returns `QueueError::ContextFull` or `QueueError::TotalFull` if limits are reached (oldest messages dropped).
+   - `enqueue` stores a `QueuedMessage` in `ProtocolRepository`. Returns `QueueError::ContextFull` or `QueueError::TotalFull` if limits are reached (oldest messages dropped).
    - `drain` MLS-encrypts each queued message with the current epoch and returns sealed outer envelopes ready for transport. Drains in queue order. Removes drained entries from storage.
    - `discard_expired` removes entries older than `max_age_secs`. Returns count discarded.
    - `discard_context` removes all entries for a context (used on context closure/expiry). Returns count discarded.
@@ -1562,7 +1562,7 @@ pub struct ReconnectionCoordinator {
     context_manager: Arc<ContextManager>,
     transport_manager: Arc<TransportManager>,
     queue: Arc<OutboundQueue>,
-    store: Arc<ProtocolStore>,
+    store: Arc<ProtocolRepository>,
 }
 
 impl ReconnectionCoordinator {
@@ -1736,7 +1736,7 @@ The core tension is that pruning contradicts the append-only property that makes
 - State reconstruction: loading a checkpoint and replaying post-checkpoint events to recover current state.
 - Merkle proof interaction: how pruning affects proof validity and how "pruned proofs" work.
 - Governance of pruning policies: how contexts configure and enforce pruning rules.
-- Storage key management: how pruning interacts with the `ProtocolStore` key convention (§17.3).
+- Storage key management: how pruning interacts with the `ProtocolRepository` key convention (§17.3).
 
 **What this ADR does NOT cover:**
 
@@ -1987,7 +1987,7 @@ When a member joins a context with a long history, or when a member's local stat
 
 ```rust
 pub struct StateReconstructor {
-    store: Arc<ProtocolStore>,
+    store: Arc<ProtocolRepository>,
 }
 
 impl StateReconstructor {
@@ -2084,7 +2084,7 @@ Pruning is a local operation performed by the SDK. It is never triggered by rela
 
 ```rust
 pub struct PruningExecutor {
-    store: Arc<ProtocolStore>,
+    store: Arc<ProtocolRepository>,
 }
 
 impl PruningExecutor {
@@ -2126,7 +2126,7 @@ pub enum PruneError {
 2. Determine the eligible pruning boundary: `min(checkpoint_seq, oldest_event_meeting_retention_criteria)`. Events beyond the checkpoint cannot be pruned (no checkpoint to anchor proofs). Events within the retention window cannot be pruned.
 3. For each event from the oldest to the pruning boundary:
    a. Check event-type retention: if the event is structural and within the structural retention window, skip.
-   b. Delete the event payload from `ProtocolStore` (key: `context/{context_id}/event/{seq:020d}`).
+   b. Delete the event payload from `ProtocolRepository` (key: `context/{context_id}/event/{seq:020d}`).
    c. Retain the leaf hash in a compact index (key: `context/{context_id}/pruned_leaf/{seq:020d}`, value: 32-byte hash). This enables pruned proofs.
 4. Update the prune cursor: `context/{context_id}/prune_cursor` = highest pruned sequence number.
 5. Optionally compact interior tree nodes (Phase 6 optimization — retain all by default).
@@ -2165,7 +2165,7 @@ The "member autonomy" principle ensures that pruning is a storage optimization, 
 - **Async runtime:** tokio (background pruning task, checkpoint creation)
 - **Crate:** `scp-core`
 - **Module:** `scp-core/event_log/` (extends existing event log module from ADR-011)
-- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+- **Persistence:** Via `ProtocolRepository` (§17.4). Key conventions:
   - `context/{context_id}/checkpoint/{seq:020d}` — serialized `Checkpoint` structs
   - `context/{context_id}/checkpoint_meta/latest` — latest checkpoint sequence number
   - `context/{context_id}/pruning_policy` — serialized `PruningPolicy`
@@ -2178,7 +2178,7 @@ The "member autonomy" principle ensures that pruning is a storage optimization, 
 - **ADR-008 (Context Lifecycle):** Pruning policy is a context parameter. Context creation includes optional `PruningPolicy` in `ContextParameters`. Context closure triggers final checkpoint creation before key destruction (for ephemeral/summary memory scopes).
 - **ADR-009 (Roles):** Checkpoint creation requires the admin role (or governance quorum in multi-admin contexts).
 - **ADR-029 (Offline/Sync):** State reconstruction from checkpoints provides the fast-start path for members who missed many events during extended offline periods. The `StateReconstructor` complements the `ReconnectionCoordinator` — reconnecting members can load the latest checkpoint instead of replaying the full log.
-- **ProtocolStore (§17.4):** Storage and retrieval of checkpoints, pruning policy, prune cursor, and retained leaf hashes. Range queries via `list_keys` with zero-padded sequence numbers.
+- **ProtocolRepository (§17.4):** Storage and retrieval of checkpoints, pruning policy, prune cursor, and retained leaf hashes. Range queries via `list_keys` with zero-padded sequence numbers.
 
 ### Acceptance Criteria
 
@@ -2199,7 +2199,7 @@ Checkpoint {
    - Serializes the full `ContextStateSnapshot` deterministically.
    - Signs the checkpoint with the provided signing key (admin's Active Signing Key or Agent Signing Key per ADR-039).
    - Appends the checkpoint as a `Checkpoint` event to the event log.
-   - Persists the checkpoint to `ProtocolStore` at `context/{id}/checkpoint/{seq:020d}`.
+   - Persists the checkpoint to `ProtocolRepository` at `context/{id}/checkpoint/{seq:020d}`.
    - Updates `context/{id}/checkpoint_meta/latest`.
    - Returns the signed checkpoint.
 
@@ -2219,7 +2219,7 @@ Checkpoint {
    - Loads the latest checkpoint. Returns `PruneError::NoCheckpoint` if none exists.
    - Computes the pruning boundary from the intersection of checkpoint coverage and retention policy.
    - Iterates events from oldest to boundary, respecting event-type retention tiers.
-   - Deletes event payloads from `ProtocolStore`.
+   - Deletes event payloads from `ProtocolRepository`.
    - Retains leaf hashes at `context/{id}/pruned_leaf/{seq:020d}`.
    - Updates `prune_cursor`.
    - Returns a `PruneReport` with statistics.
@@ -2260,7 +2260,7 @@ Checkpoint {
 6. Simulate time advance of 31 days.
 7. Run pruning. Verify: events 0-199 (behind the checkpoint at 200, older
    than 30 days) are pruned. Events 200-249 are retained.
-8. Verify: event payloads for 0-199 are gone from ProtocolStore.
+8. Verify: event payloads for 0-199 are gone from ProtocolRepository.
 9. Verify: leaf hashes for 0-199 are retained in pruned_leaf/ keys.
 10. Generate a pruned inclusion proof for event 50 against checkpoint at 200.
     Verify it succeeds.
@@ -2481,7 +2481,7 @@ Every governance action goes through the proposal lifecycle. In `SingleAdmin`, t
 pub type ProposalId = [u8; 32];
 
 /// A governance proposal. Created by `propose()`, stored in the event log
-/// and in `ProtocolStore` for active tracking.
+/// and in `ProtocolRepository` for active tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceProposal {
     pub proposal_id: ProposalId,
@@ -2843,7 +2843,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 - **Async runtime:** tokio (voting window timers, deadlock detection background task)
 - **Crate:** `scp-core`
 - **Module:** `scp-core/governance/`
-- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+- **Persistence:** Via `ProtocolRepository` (§17.4). Key conventions:
   - `context/{context_id}/governance/config` — serialized `GovernanceModelConfig`
   - `context/{context_id}/governance/proposal/{proposal_id_hex}` — active proposals
   - `context/{context_id}/governance/proposal_index/pending` — list of pending proposal IDs
@@ -2877,7 +2877,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
    - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
    - `GovernanceAction` with all 28 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys; broadcast action: BlockAuthor; economic actions: SetEconomicPolicy, ApproveSpend, LockEconomicPolicy) and `RevocationScope` enum (Full, FutureOnly).
    - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
-   - Proposals are persisted to `ProtocolStore` on creation and on every status change.
+   - Proposals are persisted to `ProtocolRepository` on creation and on every status change.
 
 3. **`SingleAdminEngine` implementation:**
 
@@ -3276,7 +3276,7 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
 - **Async runtime:** tokio (for pull-based key distribution)
 - **Crate:** `scp-core`
 - **Module:** `scp-core/crypto/access_keys/`
-- **Persistence:** Via `ProtocolStore` (§17.4). Key conventions:
+- **Persistence:** Via `ProtocolRepository` (§17.4). Key conventions:
   - `context/{context_id}/access_key/{did_hex}` — member's access key (encrypted at rest)
   - `context/{context_id}/access_key/{did_hex}/epoch` — current epoch counter
   - `context/{context_id}/access_key/exclusion_list` — DIDs excluded from future wrapping

@@ -7,21 +7,21 @@
 //!
 //! # Architecture
 //!
-//! [`MlsStorageBridge`] wraps an `Arc<ProtocolStore<S>>` and a context ID.
+//! [`MlsStorageBridge`] wraps an `Arc<ProtocolRepository<S>>` and a context ID.
 //! All keys are prefixed with `mls/{context_id}/...` per spec section 17.9.
 //! `OpenMLS` key types are serialized via `MessagePack` for sub-key construction;
 //! entity values are serialized via `MessagePack` and stored as raw bytes through
-//! the `ProtocolStore`'s underlying `Storage` backend.
+//! the `ProtocolRepository`'s underlying `Storage` backend.
 //!
 //! [`ScpMlsProvider`] combines `RustCrypto` (crypto + randomness) with
 //! `MlsStorageBridge<S>` for a complete `OpenMlsProvider` implementation.
 //!
-//! # Why this bypasses `ProtocolStore` domain methods
+//! # Why this bypasses `ProtocolRepository` domain methods
 //!
 //! Every other domain area (contexts, identity, TLS, UCANs, etc.) stores
-//! data through typed `ProtocolStore` methods that apply `StoredValue`
+//! data through typed `ProtocolRepository` methods that apply `StoredValue`
 //! version envelopes and follow SCP key conventions. This module is the
-//! sole exception: it accesses `ProtocolStore::storage()` to call raw
+//! sole exception: it accesses `ProtocolRepository::storage()` to call raw
 //! `Storage` trait methods directly. This is intentional because:
 //!
 //! 1. **`OpenMLS` owns the storage contract.** The `StorageProvider` trait
@@ -32,10 +32,10 @@
 //! 2. **The bridge *is* the domain layer for MLS.** It constructs
 //!    namespaced keys (`mls/{context_id}/{label}/{hex_key}`), validates
 //!    context IDs via `sanitize_key_component`, and handles serialization.
-//!    Adding `ProtocolStore` wrapper methods would be indirection with no
+//!    Adding `ProtocolRepository` wrapper methods would be indirection with no
 //!    added value — they would just call `self.storage.store(key, value)`.
 //!
-//! 3. **Migration is `OpenMLS`'s concern.** `ProtocolStore`'s version
+//! 3. **Migration is `OpenMLS`'s concern.** `ProtocolRepository`'s version
 //!    envelopes and `Migratable` trait enable lazy on-read migration for
 //!    SCP-owned data. MLS state serialization is governed by the `OpenMLS`
 //!    version. If the format changes across `OpenMLS` upgrades, migration
@@ -60,7 +60,7 @@ use serde::Serialize;
 
 use scp_platform::traits::Storage;
 
-use crate::store::ProtocolStore;
+use crate::store::ProtocolRepository;
 
 /// Context identifier type alias for consistency with the rest of scp-core.
 type ContextId = String;
@@ -120,7 +120,7 @@ pub enum MlsStorageBridgeError {
 // MlsStorageBridge
 // ---------------------------------------------------------------------------
 
-/// Bridges `OpenMLS` `StorageProvider` to scp-platform `Storage` via `ProtocolStore`.
+/// Bridges `OpenMLS` `StorageProvider` to scp-platform `Storage` via `ProtocolRepository`.
 ///
 /// All keys are prefixed with `mls/{context_id}/` per spec section 17.9.
 /// `OpenMLS` key types are serialized to hex-encoded `MessagePack` bytes for sub-key
@@ -131,7 +131,7 @@ pub enum MlsStorageBridgeError {
 ///
 /// See spec section 17.9. See SCP-PERSIST-050.
 pub struct MlsStorageBridge<S: Storage> {
-    store: Arc<ProtocolStore<S>>,
+    store: Arc<ProtocolRepository<S>>,
     context_id: ContextId,
 }
 
@@ -147,7 +147,7 @@ impl<S: Storage> MlsStorageBridge<S> {
     /// Returns [`MlsStorageBridgeError::Serialization`] if the context ID
     /// contains forbidden characters (`/`, `\`, `..`, or null bytes).
     pub fn new(
-        store: Arc<ProtocolStore<S>>,
+        store: Arc<ProtocolRepository<S>>,
         context_id: ContextId,
     ) -> Result<Self, MlsStorageBridgeError> {
         crate::store::sanitize_key_component(&context_id).map_err(|e| {
@@ -987,7 +987,7 @@ impl<S: Storage> ScpMlsProvider<S> {
     /// Returns [`MlsStorageBridgeError`] if the context ID contains
     /// forbidden characters.
     pub fn new(
-        store: Arc<ProtocolStore<S>>,
+        store: Arc<ProtocolRepository<S>>,
         context_id: ContextId,
     ) -> Result<Self, MlsStorageBridgeError> {
         Ok(Self {
@@ -1060,9 +1060,9 @@ mod tests {
     use openmls::group::MlsGroupState;
     use openmls_traits::storage::StorageProvider;
 
-    /// Helper to create a test `ProtocolStore` with `InMemoryStorage`.
-    fn test_store() -> Arc<ProtocolStore<scp_platform::testing::InMemoryStorage>> {
-        Arc::new(ProtocolStore::new_for_testing(
+    /// Helper to create a test `ProtocolRepository` with `InMemoryStorage`.
+    fn test_store() -> Arc<ProtocolRepository<scp_platform::testing::InMemoryStorage>> {
+        Arc::new(ProtocolRepository::new_for_testing(
             scp_platform::testing::InMemoryStorage::new(),
         ))
     }

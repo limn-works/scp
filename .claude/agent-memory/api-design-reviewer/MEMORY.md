@@ -27,14 +27,14 @@
 - Recurring issues from PR #86 still open: PyO3 context state is still String not enum, WASM payload still base64 not Uint8Array
 - New pattern: UniFFI ContextHandle.state() and Identity.custody_type() return String despite having proper enums defined in same file -- loses type safety at the accessor level
 - Good patterns: InnerEnvelopeParams eliminates u64 transposition risk, BroadcastKey uses Zeroize/ZeroizeOnDrop, StoredValue version envelope for migration, Kotlin two-tier streaming (cold/hot), trust renewal re-verifies before updating timestamp
-- ProtocolStore takes raw &[u8] for context state/params -- should accept typed domain objects
+- ProtocolRepository takes raw &[u8] for context state/params -- should accept typed domain objects
 - AddressResolver.cache is needlessly public
 - Cross-SDK creation params diverge: PyO3 dict, NAPI JSON string, UniFFI typed record, WASM DID string + JSON
 
 ## Persistence Layer Review (feat/persistence-layer, 2026-03-03)
 - 61 files, 18k+ lines. 9 changes, 10 observations. Verdict: NEEDS REVISION
-- High: (1) Two incompatible `ClockFn` type aliases in same crate (Arc vs Box, infallible vs Result), (2) ProtocolStore domain methods still accept raw &[u8] (recurring from PR #127)
+- High: (1) Two incompatible `ClockFn` type aliases in same crate (Arc vs Box, infallible vs Result), (2) ProtocolRepository domain methods still accept raw &[u8] (recurring from PR #127)
 - Medium: BlobStorage::store has 3 positional [u8;32] params (transposition risk), StoredValue fields are pub (bypass version management), constructor naming inconsistent (new vs open for I/O operations), ContextPersistence sync-trait has undocumented runtime panic condition
 - Good: Storage trait is minimal (6 methods), conformance macros excellent DX, sanitize_key_component applied consistently, Migratable trait + StoredValue envelope is sound migration design, zeroize-on-write for key material, TypeScript StorageInterface 1:1 match with Rust
-- Pattern: thin trait (Storage 6 methods) + thick coordinator (ProtocolStore 50+ methods) is the right layering. Conformance macros (storage_conformance!, blob_store_conformance!) validate adapter implementations with one-liner invocation
-- Convention established: `store_X/load_X/delete_X/list_X` naming across all 8 ProtocolStore domain modules
+- Pattern: thin trait (Storage 6 methods) + thick coordinator (ProtocolRepository 50+ methods) is the right layering. Conformance macros (storage_conformance!, blob_store_conformance!) validate adapter implementations with one-liner invocation
+- Convention established: `store_X/load_X/delete_X/list_X` naming across all 8 ProtocolRepository domain modules

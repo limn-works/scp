@@ -50,7 +50,7 @@ use crate::serde_util::{serde_hpke_sealed_60, serde_pubkey_32, serde_signature_6
 /// suspected compromise.
 ///
 /// Returns `(public_key, secret_key)` as raw 32-byte arrays. The secret key
-/// should be persisted via `ProtocolStore::store_wrapping_keypair` and the
+/// should be persisted via `ProtocolRepository::store_wrapping_keypair` and the
 /// public key included in the `LeafNode` extension via `make_wrapping_key_extension`.
 ///
 /// See spec §9.16.1.

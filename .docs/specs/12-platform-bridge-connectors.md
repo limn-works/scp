@@ -741,7 +741,7 @@ Bridge credentials pass through five phases:
    The `bridge_credential_key` is generated and stored as follows:
    ```
    bridge_credential_key = CSPRNG(32)  // generated once at bridge provisioning
-   // Stored in ProtocolStore under: custody/{did}/bridge_credential_key/{bridge_id}
+   // Stored in ProtocolRepository under: custody/{did}/bridge_credential_key/{bridge_id}
    // Protected by the same custody boundary as identity keys
    ```
 
@@ -758,7 +758,7 @@ Bridge credentials pass through five phases:
 
    This design avoids coupling credential encryption to any key that rotates (`#active`) or that hardware custody may prevent exporting (`#0`). The `bridge_credential_key` is a standalone secret with the same lifecycle as the bridge instance — created at provisioning, destroyed at revocation (Phase 5).
 
-   Credentials MUST be stored separately from the operator's SCP identity keys — the credential store is a distinct storage domain under `bridge/{bridge_id}/credential/{credential_type}` in `ProtocolStore`, not a field on the bridge entity.
+   Credentials MUST be stored separately from the operator's SCP identity keys — the credential store is a distinct storage domain under `bridge/{bridge_id}/credential/{credential_type}` in `ProtocolRepository`, not a field on the bridge entity.
 
 3. **Use.** The bridge authenticates to the external platform using stored credentials. Credential access is scoped to the bridge instance — a bridge registered in Context A cannot use credentials provisioned for a bridge in Context B, even if operated by the same DID.
 

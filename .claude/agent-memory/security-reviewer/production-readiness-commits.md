@@ -18,7 +18,7 @@ Commits: 7f341b8, 53ed083, 26e2222, d174211, 2444c9a, af4192c, 38fe1cf
 - CLEAN: Correct hardening for signed type
 - NOTE: SenderKeyEpochAdvance, SenderKeyRequest, BlockNotification (also signed) still lack deny_unknown_fields
 
-### d174211 -- ProtocolStore named MessagePack
+### d174211 -- ProtocolRepository named MessagePack
 - CLEAN: Both serialize() and store_migratable() changed; backward-compatible read
 
 ### 2444c9a -- dedup cache TTL 1h->24h

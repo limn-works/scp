@@ -1,4 +1,4 @@
-//! Wrapping key storage operations for `ProtocolStore`.
+//! Wrapping key storage operations for `ProtocolRepository`.
 //!
 //! Persists X25519 wrapping keypairs per context per DID, following the key
 //! convention from spec section 17.3:
@@ -15,7 +15,7 @@ use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -76,10 +76,10 @@ impl std::fmt::Debug for StoredWrappingSecretKey {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore methods
+// ProtocolRepository methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a wrapping keypair for a member in a context.
     ///
     /// Both the public and secret key are stored under separate keys.
@@ -197,8 +197,8 @@ mod tests {
 
     use super::*;
 
-    fn test_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn test_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     #[tokio::test]

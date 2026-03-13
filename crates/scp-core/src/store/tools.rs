@@ -1,4 +1,4 @@
-//! Tool storage operations for `ProtocolStore`.
+//! Tool storage operations for `ProtocolRepository`.
 //!
 //! Implements tool registration and session persistence following the key
 //! convention from spec section 17.3:
@@ -12,7 +12,7 @@
 
 use scp_platform::traits::Storage;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Type aliases (matching the codebase convention)
@@ -55,10 +55,10 @@ fn tool_session_key(context_id: &str, session_id: &str) -> Result<String, super:
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — tool methods
+// ProtocolRepository — tool methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a tool registration within a context.
     ///
     /// The registration data is serialized under
@@ -190,8 +190,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     // -------------------------------------------------------------------

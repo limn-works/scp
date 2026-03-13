@@ -1,4 +1,4 @@
-//! Access key storage operations for `ProtocolStore`.
+//! Access key storage operations for `ProtocolRepository`.
 //!
 //! Implements access key persistence following the key convention from
 //! spec section 17.3:
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::access_keys::AccessKey;
 
-use super::{ProtocolStore, StoreError, sanitize_key_component};
+use super::{ProtocolRepository, StoreError, sanitize_key_component};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -55,10 +55,10 @@ fn access_key_epoch_key(context_id: &str, member_did: &str) -> Result<String, St
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore impl
+// ProtocolRepository impl
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a member's access key.
     ///
     /// Uses zeroizing storage to prevent key material from lingering in
@@ -154,8 +154,8 @@ mod tests {
     use super::*;
     use crate::crypto::access_keys::generate_access_key;
 
-    fn make_store() -> ProtocolStore<scp_platform::testing::InMemoryStorage> {
-        ProtocolStore::new_for_testing(scp_platform::testing::InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<scp_platform::testing::InMemoryStorage> {
+        ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new())
     }
 
     #[tokio::test]

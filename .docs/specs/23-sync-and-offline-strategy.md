@@ -34,7 +34,7 @@ When the SDK detects disconnection (all relay WebSocket connections lost), outbo
 
 **Queue mechanics:**
 
-- Messages are serialized to their inner envelope form (signed, padded) and stored in `ProtocolStore` under `queue/{context_id}/{seq:020d}`. The inner envelope is fully constructed (including signature and padding) but NOT MLS-encrypted -- MLS encryption requires the current epoch's key schedule, which may advance while offline. MLS encryption is applied at drain time using the then-current epoch.
+- Messages are serialized to their inner envelope form (signed, padded) and stored in `ProtocolRepository` under `queue/{context_id}/{seq:020d}`. The inner envelope is fully constructed (including signature and padding) but NOT MLS-encrypted -- MLS encryption requires the current epoch's key schedule, which may advance while offline. MLS encryption is applied at drain time using the then-current epoch.
 - The queue is bounded at **1,000 messages per context** and **10,000 messages total** across all contexts. When full, the oldest messages are dropped with a `QueueOverflow` event emitted to the application layer.
 - Queue entries include a `queued_at` timestamp. On reconnection, entries older than the context's `blob_ttl` (or 7 days if no TTL) are discarded -- they would expire on relays before delivery anyway.
 - The queue drains automatically on reconnection, after MLS epoch catch-up completes. Messages are MLS-encrypted with the current epoch's key schedule and sent in queue order.
@@ -98,7 +98,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
 Any one of the following triggers a group state reset:
 
-1. Offline duration exceeds 7 days (measured from last successful relay interaction timestamp, persisted in `ProtocolStore`).
+1. Offline duration exceeds 7 days (measured from last successful relay interaction timestamp, persisted in `ProtocolRepository`).
 2. Epoch catch-up fails: relay backfill, peer request, and Welcome-based fast-forward all failed.
 3. The context's governance model explicitly requests reset (governance action).
 
@@ -198,8 +198,8 @@ The `EpochGraceStore` (ADR-001) holds old epoch keys in memory during the grace 
 
 **Transactional persistence with MLS group state.** EpochGraceStore state -- specifically the set of epoch numbers with active grace windows and their expiration timestamps -- MUST be persisted transactionally with the MLS group state update. When a Commit is processed and the epoch advances, the following MUST occur in a single database transaction:
 
-1. The new MLS group state is written to `ProtocolStore`.
-2. The grace window entries are persisted atomically within the `ContextSnapshot` blob alongside all other context state (membership, roles, governance, TTL, etc.). This ensures transactional consistency: either the entire snapshot (including grace entries) is written, or none of it is. Individual grace entry CRUD methods (`store_grace_entry`, `load_grace_entries`, `delete_grace_entry`) are available on `ProtocolStore` under `context/{context_id}/grace/{epoch:020d}` for direct-access patterns, but the snapshot path is the primary production persistence mechanism.
+1. The new MLS group state is written to `ProtocolRepository`.
+2. The grace window entries are persisted atomically within the `ContextSnapshot` blob alongside all other context state (membership, roles, governance, TTL, etc.). This ensures transactional consistency: either the entire snapshot (including grace entries) is written, or none of it is. Individual grace entry CRUD methods (`store_grace_entry`, `load_grace_entries`, `delete_grace_entry`) are available on `ProtocolRepository` under `context/{context_id}/grace/{epoch:020d}` for direct-access patterns, but the snapshot path is the primary production persistence mechanism.
 3. Any expired grace window entries are excluded from the snapshot within the same transaction.
 
 If the transaction fails, neither the MLS group state nor the grace window entries are persisted -- the node remains at the previous epoch.

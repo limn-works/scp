@@ -1,4 +1,4 @@
-//! UCAN storage operations for `ProtocolStore`.
+//! UCAN storage operations for `ProtocolRepository`.
 //!
 //! Implements UCAN token persistence and revocation tracking following
 //! the key convention from spec section 17.3:
@@ -15,7 +15,7 @@
 
 use scp_platform::traits::Storage;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -50,10 +50,10 @@ fn revocation_key(context_id: &str, token_id: &str) -> Result<String, super::Sto
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — UCAN methods
+// ProtocolRepository — UCAN methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a UCAN token body within a context.
     ///
     /// Persists the raw token bytes under
@@ -167,8 +167,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     // -------------------------------------------------------------------

@@ -527,10 +527,10 @@ pub trait Storage: Send + Sync {
 /// Blanket implementation of [`Storage`] for `Arc<T>` where `T: Storage`.
 ///
 /// Enables sharing a single storage backend across multiple owners (e.g.,
-/// `ProtocolStore`, identity layer, and FFI bridge) via `Arc`. Delegates all
+/// `ProtocolRepository`, identity layer, and FFI bridge) via `Arc`. Delegates all
 /// operations to the inner `T` via `Deref`.
 ///
-/// This is essential for `ProtocolStore<Arc<S>>` to work when the storage
+/// This is essential for `ProtocolRepository<Arc<S>>` to work when the storage
 /// backend is shared via `Arc` (e.g., the FFI bridge's global
 /// `STORAGE_PROVIDER`). See issue #329.
 #[allow(clippy::manual_async_fn)]

@@ -31,7 +31,7 @@ The findings are organized per-file, then by severity.
 ### [17.3] Missing Maximum Value Size
 - **Category**: Missing constants/defaults
 - **Location**: Section 17.3-17.4
-- **What's missing**: No maximum value size is specified for `store()`. The `ProtocolStore` methods accept `&[u8]` values with no documented upper bound. Context state, MLS group state, and tool registrations could theoretically be arbitrarily large.
+- **What's missing**: No maximum value size is specified for `store()`. The `ProtocolRepository` methods accept `&[u8]` values with no documented upper bound. Context state, MLS group state, and tool registrations could theoretically be arbitrarily large.
 - **Why it matters**: Without a value size limit, a malicious or buggy protocol layer could cause OOM in storage backends that buffer the full value in memory. The streaming API exists for `BlobStorage` but not for `Storage`.
 - **Severity**: MEDIUM
 
@@ -101,7 +101,7 @@ The findings are organized per-file, then by severity.
 ### [17.10] Key-Space Migration Schema Version Not Initialized
 - **Category**: Missing edge cases
 - **Location**: Section 17.10, lines 501-503
-- **What's missing**: "On startup, `ProtocolStore` checks a `_meta/schema_version` key." What happens when this key does not exist (first run, or migration from before this mechanism was introduced)? Is the absence of the key treated as version 0? Version 1? Error?
+- **What's missing**: "On startup, `ProtocolRepository` checks a `_meta/schema_version` key." What happens when this key does not exist (first run, or migration from before this mechanism was introduced)? Is the absence of the key treated as version 0? Version 1? Error?
 - **Why it matters**: The bootstrapping case is undefined. Every storage backend will encounter this on first initialization.
 - **Severity**: LOW
 
@@ -235,7 +235,7 @@ The findings are organized per-file, then by severity.
 ### [19.2.1] PaymentAuthorization adapter_state Size Limit Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 19.2.1, line 159
-- **What's missing**: `adapter_state: Vec<u8>` is "adapter-specific opaque state" with no size limit. Since `PaymentAuthorization` is persisted in `ProtocolStore` and potentially serialized in envelopes, unbounded opaque state is a DoS vector.
+- **What's missing**: `adapter_state: Vec<u8>` is "adapter-specific opaque state" with no size limit. Since `PaymentAuthorization` is persisted in `ProtocolRepository` and potentially serialized in envelopes, unbounded opaque state is a DoS vector.
 - **Why it matters**: A malicious adapter could return a multi-megabyte `adapter_state`, causing storage bloat and serialization overhead.
 - **Severity**: MEDIUM
 
@@ -460,8 +460,8 @@ The findings are organized per-file, then by severity.
 ### [23.2] Outbound Queue Storage Key Not in Key Convention
 - **Category**: Cross-reference inconsistencies
 - **Location**: Section 23.2, line 37
-- **What's missing**: "Messages are serialized... and stored in `ProtocolStore` under `queue/{context_id}/{seq:020d}`." But the key convention in section 17.3 does not list `queue/` as a namespace. The `ProtocolStore` API in section 17.4 has no `store_queued_message` or `load_queue` methods.
-- **Why it matters**: The queue keys are specified in section 23 but not reflected in the storage key convention (section 17.3) or the `ProtocolStore` API (section 17.4). An implementor following section 17 alone would not know about queue storage.
+- **What's missing**: "Messages are serialized... and stored in `ProtocolRepository` under `queue/{context_id}/{seq:020d}`." But the key convention in section 17.3 does not list `queue/` as a namespace. The `ProtocolRepository` API in section 17.4 has no `store_queued_message` or `load_queue` methods.
+- **Why it matters**: The queue keys are specified in section 23 but not reflected in the storage key convention (section 17.3) or the `ProtocolRepository` API (section 17.4). An implementor following section 17 alone would not know about queue storage.
 - **Severity**: MEDIUM
 
 ### [23.2] Queue Overflow Eviction Policy Not Deterministic
@@ -661,11 +661,11 @@ The findings are organized per-file, then by severity.
 
 ## Cross-Cutting Findings
 
-### [17/23] Queue Storage Not Reflected in ProtocolStore
+### [17/23] Queue Storage Not Reflected in ProtocolRepository
 - **Category**: Cross-reference inconsistencies
 - **Location**: Sections 17.3-17.4 and 23.2
-- **What's missing**: Section 23.2 specifies that queued messages are stored under `queue/{context_id}/{seq:020d}` but this key prefix does not appear in the key convention (section 17.3) and no queue-related methods appear in `ProtocolStore` (section 17.4). The queue is a protocol-level concern that should be in `ProtocolStore`, not raw `Storage` access.
-- **Why it matters**: Breaks the architectural invariant that "all structured protocol operations are mapped to flat KV operations by `ProtocolStore`."
+- **What's missing**: Section 23.2 specifies that queued messages are stored under `queue/{context_id}/{seq:020d}` but this key prefix does not appear in the key convention (section 17.3) and no queue-related methods appear in `ProtocolRepository` (section 17.4). The queue is a protocol-level concern that should be in `ProtocolRepository`, not raw `Storage` access.
+- **Why it matters**: Breaks the architectural invariant that "all structured protocol operations are mapped to flat KV operations by `ProtocolRepository`."
 - **Severity**: MEDIUM
 
 ### [17/19] Economic Storage Methods Accept Opaque Bytes

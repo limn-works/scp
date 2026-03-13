@@ -1,4 +1,4 @@
-//! Transport storage operations for `ProtocolStore`.
+//! Transport storage operations for `ProtocolRepository`.
 //!
 //! Implements relay score and key package persistence following the key
 //! convention from spec section 17.3:
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::Storage;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 /// A relay score entry with the original URL preserved.
 ///
@@ -91,10 +91,10 @@ fn cert_pin_key(relay_url: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — transport methods
+// ProtocolRepository — transport methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a relay score for a relay URL.
     ///
     /// Serializes a [`RelayScoreEntry`] (URL + score bytes) under
@@ -287,8 +287,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     // -------------------------------------------------------------------
@@ -297,14 +297,14 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_load_relay_score_roundtrip() {
-        let protocol_store = make_store();
+        let protocol_repository = make_store();
         let score_data = b"score-data-for-relay".to_vec();
 
-        protocol_store
+        protocol_repository
             .store_relay_score("https://relay.example.com/v1", &score_data)
             .await
             .unwrap();
-        let loaded = protocol_store
+        let loaded = protocol_repository
             .load_relay_score("https://relay.example.com/v1")
             .await
             .unwrap();

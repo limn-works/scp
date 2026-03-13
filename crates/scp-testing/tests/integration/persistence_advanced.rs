@@ -2,17 +2,17 @@
 //!
 //! Tests advanced persistence scenarios beyond basic lifecycle (SCP-PERSIST-070):
 //!
-//! 1. **Sync roundtrip** -- two `ProtocolStore` instances backed by separate
+//! 1. **Sync roundtrip** -- two `ProtocolRepository` instances backed by separate
 //!    `InMemoryStorage`, mutations on store A exported and applied to store B,
 //!    verify B matches A.
 //! 2. **Relay restart** -- subscription routing IDs and blob data persisted
-//!    via `ProtocolStore` and `BlobStorage` survive across operations; verifies
+//!    via `ProtocolRepository` and `BlobStorage` survive across operations; verifies
 //!    the data flow that `StorageRelayPersistence` will automate in Gate 6.
-//! 3. **Combined node** -- client contexts (`Storage`/`ProtocolStore`) and relay
+//! 3. **Combined node** -- client contexts (`Storage`/`ProtocolRepository`) and relay
 //!    blobs (`BlobStorage`) coexist and operate independently, validating the
 //!    pattern `CombinedNodeStorage` will implement in Gate 6.
 //! 4. **`executed_proposals` replay protection** -- proposal ID sets persist
-//!    via `MessagePack` serialization through `ProtocolStore` and survive
+//!    via `MessagePack` serialization through `ProtocolRepository` and survive
 //!    load/store cycles, ensuring replay detection works across restarts.
 //!
 //! See `.docs/prds/persistence.json` story SCP-PERSIST-071.
@@ -25,7 +25,7 @@ use scp_core::context::broadcast::{
     AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
 };
 use scp_core::crypto::sender_keys::generate_sender_key;
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
@@ -34,9 +34,9 @@ use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Creates a test [`ProtocolStore`] backed by a fresh [`InMemoryStorage`].
-fn make_store() -> ProtocolStore<InMemoryStorage> {
-    ProtocolStore::new_for_testing(InMemoryStorage::new())
+/// Creates a test [`ProtocolRepository`] backed by a fresh [`InMemoryStorage`].
+fn make_store() -> ProtocolRepository<InMemoryStorage> {
+    ProtocolRepository::new_for_testing(InMemoryStorage::new())
 }
 
 /// Creates a deterministic test DID from a suffix.
@@ -100,7 +100,7 @@ fn make_blob_id(data: &[u8]) -> [u8; 32] {
 // Test 1: Sync roundtrip
 // =========================================================================
 
-/// Two `ProtocolStore` instances backed by separate `InMemoryStorage` instances.
+/// Two `ProtocolRepository` instances backed by separate `InMemoryStorage` instances.
 /// Mutations on store A are exported (state read from store A), then applied
 /// to store B. After sync, B must contain identical state to A.
 ///
@@ -259,11 +259,11 @@ async fn sync_roundtrip_broadcast_state_transfers() {
 // Test 2: Relay restart -- subscription and blob persistence
 // =========================================================================
 
-/// Persists subscription routing IDs via `ProtocolStore` and verifies they
+/// Persists subscription routing IDs via `ProtocolRepository` and verifies they
 /// can be loaded back, simulating the `StorageRelayPersistence` pattern.
 ///
 /// The relay stores its subscription set, then "restarts" (creates a new
-/// `ProtocolStore` over the same storage), and loads the subscriptions back.
+/// `ProtocolRepository` over the same storage), and loads the subscriptions back.
 /// Since `InMemoryStorage` is ephemeral, we test the full persist/load
 /// roundtrip within a single session. Production would use `SqliteStorage`
 /// for true restart survival.
@@ -333,7 +333,7 @@ async fn relay_blobs_queryable_without_resubscribe() {
     assert_eq!(retrieved_2.blob, blob_data_2);
 }
 
-/// Persists rate limit state as a `ProtocolStore` value, simulating the
+/// Persists rate limit state as a `ProtocolRepository` value, simulating the
 /// `StorageRelayPersistence::persist_rate_limit` / `load_rate_limit` pattern.
 #[tokio::test]
 async fn relay_rate_limit_state_persist_load_roundtrip() {
@@ -362,13 +362,13 @@ async fn relay_rate_limit_state_persist_load_roundtrip() {
 // Test 3: Combined node -- client contexts + relay blobs coexist
 // =========================================================================
 
-/// Verifies that client context state (via `ProtocolStore`/`Storage`) and relay
+/// Verifies that client context state (via `ProtocolRepository`/`Storage`) and relay
 /// blob data (via `BlobStorage`) can coexist and operate independently. This
 /// is the pattern `CombinedNodeStorage` will implement: a single directory
 /// holding both KV (client) and blob (relay) tables.
 #[tokio::test]
 async fn combined_node_client_and_relay_data_coexist() {
-    // Client-side: `ProtocolStore` backed by `InMemoryStorage`.
+    // Client-side: `ProtocolRepository` backed by `InMemoryStorage`.
     let client_store = make_store();
 
     // Relay-side: InMemoryBlobStorage.
@@ -586,13 +586,13 @@ async fn combined_node_multiple_contexts_independent() {
 // Test 4: executed_proposals replay protection across restart
 // =========================================================================
 
-/// Persists a set of executed proposal IDs via `ProtocolStore`, then loads
+/// Persists a set of executed proposal IDs via `ProtocolRepository`, then loads
 /// them back and verifies the set is faithfully restored. This proves that
 /// replay protection data survives the persist/load cycle.
 ///
 /// In production, `ContextPersistence::persist_context` will include
 /// `executed_proposals` in the `ContextSnapshot`. Here we test the
-/// serialization roundtrip through `ProtocolStore` directly.
+/// serialization roundtrip through `ProtocolRepository` directly.
 #[tokio::test]
 async fn executed_proposals_persist_load_roundtrip() {
     let store = make_store();
@@ -608,7 +608,7 @@ async fn executed_proposals_persist_load_roundtrip() {
     executed.insert(proposal_2);
     executed.insert(proposal_3);
 
-    // Persist the executed proposals set via ProtocolStore.
+    // Persist the executed proposals set via ProtocolRepository.
     let serialized = rmp_serde::to_vec(&executed).unwrap();
     store
         .store_context_state(ctx_id, &serialized)

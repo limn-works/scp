@@ -23,7 +23,7 @@
 //!
 //! # Key conventions
 //!
-//! Keys follow the `ProtocolStore` key conventions from `scp-core/store/`:
+//! Keys follow the `ProtocolRepository` key conventions from `scp-core/store/`:
 //! - `identity/{did}` — identity state
 //! - `context/{context_id}` — context state
 //! - `key/{key_id}` — key material envelopes

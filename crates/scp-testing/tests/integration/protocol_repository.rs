@@ -1,7 +1,7 @@
-//! `ProtocolStore` module integration tests (SCP-PERSIST-072).
+//! `ProtocolRepository` module integration tests (SCP-PERSIST-072).
 //!
-//! Tests each `ProtocolStore` domain module through the full
-//! `ProtocolStore -> Storage -> Backend` path using `InMemoryStorage`.
+//! Tests each `ProtocolRepository` domain module through the full
+//! `ProtocolRepository -> Storage -> Backend` path using `InMemoryStorage`.
 //!
 //! Coverage:
 //! - **Context**: membership store/load/list/remove roundtrip; role CRUD;
@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use scp_core::crypto::mls::MlsStorageBridge;
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 
@@ -35,9 +35,9 @@ use scp_platform::testing::InMemoryStorage;
 // Helper
 // ---------------------------------------------------------------------------
 
-/// Creates a fresh `ProtocolStore<InMemoryStorage>` for each test.
-fn make_store() -> ProtocolStore<InMemoryStorage> {
-    ProtocolStore::new_for_testing(InMemoryStorage::new())
+/// Creates a fresh `ProtocolRepository<InMemoryStorage>` for each test.
+fn make_store() -> ProtocolRepository<InMemoryStorage> {
+    ProtocolRepository::new_for_testing(InMemoryStorage::new())
 }
 
 // =========================================================================

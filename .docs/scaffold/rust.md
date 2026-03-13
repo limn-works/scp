@@ -20,8 +20,8 @@ crates/
         sender_keys/        # ADR-007: Sender-side key layer
           key_protocol.rs   # Pull-based key distribution: SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse
         ucan/               # ADR-009/016: UCAN validation
-      store/                # §17.4: ProtocolStore — typed domain storage layer
-        mod.rs              # ProtocolStore struct, StoreError, StoredValue<T>
+      store/                # §17.4: ProtocolRepository — typed domain storage layer
+        mod.rs              # ProtocolRepository struct, StoreError, StoredValue<T>
         context.rs          # Context state, params, membership, sender keys
         event_log.rs        # Event log persistence, tree nodes, roots
         identity.rs         # Identity documents, private state, TOFU, DID cache
@@ -184,7 +184,7 @@ redb = "2"
 | `tokio-tungstenite` | latest | scp-transport | WebSocket (native relay) |
 | `serde` | 1.x | all crates | Serialization framework |
 | `serde_json` | 1.x | scp-core, scp-mcp | JSON serialization |
-| `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol, ProtocolStore §17.5) |
+| `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol, ProtocolRepository §17.5) |
 | `rusqlite` | latest, `bundled-sqlcipher` feature | scp-platform, scp-transport | SQLite storage: `SqliteStorage` (§17.6), `SqliteBlobStore` (§17.7). Bundled SQLCipher for encryption at rest. |
 | `redb` | latest stable (v3+ on-disk format) | scp-transport | `RedbBlobStore` (§17.7) — pure Rust B-tree DB for medium relay deployments |
 | `pkarr` | 5.0.3+ | scp-core | did:dht identity — BEP44 signed mutable items, DNS packets, Mainline DHT publish/resolve (ADR-003) |

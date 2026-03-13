@@ -52,7 +52,7 @@ These are interleaved within the same sections, sometimes within the same paragr
 2. **BlobStore::store signature:** Spec says store() computes blob_id internally; code's BlobStorage::store() receives blob_id from the caller. Protocol spec must define which is normative.
 3. **Handles field:** Spec §22.6.1 added a "handles" field to .well-known/scp, but this was written after SCP-143 (.well-known/scp story) was marked done. The spec is ahead of the implementation. Protocol spec should include it.
 4. **Handle query parameter:** Spec §22.9.1 added a "handle" query parameter to scp:// URIs, but SCP-142 (scp:// URI story) was already done. Same situation — spec is ahead.
-5. **ProtocolStore scope:** Spec §17.4 describes ProtocolStore as a thick abstraction layer with ~55+ typed methods covering all domain areas. Implementation has ProtocolStore with only the economy module complete. The protocol spec should not describe ProtocolStore at all — it's an implementation pattern, not a protocol requirement. The protocol should define key conventions and serialization format.
+5. **ProtocolRepository scope:** Spec §17.4 describes ProtocolRepository as a thick abstraction layer with ~55+ typed methods covering all domain areas. Implementation has ProtocolRepository with only the economy module complete. The protocol spec should not describe ProtocolRepository at all — it's an implementation pattern, not a protocol requirement. The protocol should define key conventions and serialization format.
 6. **Spec 13 (Versioning):** 10 lines of aspirational prose. No concrete version negotiation protocol, no ProtocolVersion type definition, no minimum version enforcement mechanism. This is a gap that needs to be filled before the protocol spec can be complete.
 7. **Spec 14 (Protocol Governance):** 9 lines about foundation governance trajectory. Not a protocol specification — it's a project governance statement. Does not belong in the protocol spec.
 8. **Spec §3.10.10 DidResolver trait:** The section defines the resolution protocol (§3.10.4) in language-agnostic terms AND defines a Rust trait. The protocol part is normative; the Rust trait is implementation. Need to separate.
@@ -106,10 +106,10 @@ Every section of every current spec file, classified as:
 | §3.4 Linking Existing Identities | **P** | Identity linking — normative |
 | §3.5 Identity Attestations | **P** | Attestation properties and flows — normative |
 | §3.6 Social Graph | **P** | Graph model, capability-gated queries, blocking (3 tiers) — normative |
-| §3.6 "ProtocolStore methods" block | **I** | Rust method signatures for block list queries — implementation. **The protocol requirement is "implementations must support these queries"; the Rust signatures are SDK design.** |
+| §3.6 "ProtocolRepository methods" block | **I** | Rust method signatures for block list queries — implementation. **The protocol requirement is "implementations must support these queries"; the Rust signatures are SDK design.** |
 | §3.7 Identity Private State | **P** | Private state model, encryption, sync, integrity — normative |
 | §3.7.1 Block List Storage | **P** | Event types, propagation protocol — normative |
-| §3.7.1 "ProtocolStore methods" block | **I** | Rust method signatures — implementation |
+| §3.7.1 "ProtocolRepository methods" block | **I** | Rust method signatures — implementation |
 | §3.8 DID Resolution Security | **P** | did:dht self-certification, did:web mitigations — normative |
 | §3.9 Key Lifecycle | **P** | Generation, distribution, rotation, destruction — normative |
 | §3.10 DID Resolution Layers | **P** | Dual-layer architecture — normative |
@@ -126,7 +126,7 @@ Every section of every current spec file, classified as:
 | §3.10.11 Bootstrap and Network Growth | **N** | Growth trajectory — informational |
 | §3.10.12 Phase Integration (table) | **I** | Build phase assignments — implementation |
 
-**Action:** Nearly all protocol content. Remove: ProtocolStore method blocks, DidResolver trait section, Phase Integration table. These are implementation artifacts.
+**Action:** Nearly all protocol content. Remove: ProtocolRepository method blocks, DidResolver trait section, Phase Integration table. These are implementation artifacts.
 
 **GAP IDENTIFIED:** §3.10 (dual-layer resolution) is one of the most protocol-pure sections in the spec and should extract cleanly into the SCP Identity document. However, the **multi-key verification method architecture** (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key / Agent Signing Key `#agent`) is described across §3.9, §3.10, §4.2, §4.5, and ADR-039 but lacks a formal wire format specification. The extracted protocol spec needs:
 - Explicit key commitment scheme (how the pre-rotation key hash is encoded in the DID document)
@@ -346,18 +346,18 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 ### Spec 17 — Persistence and Storage (618 lines)
 | Section | Classification | Notes |
 |---------|---------------|-------|
-| §17.1 Storage Architecture Overview | **P/I** | Client/relay storage split (normative); stack diagram with ProtocolStore (implementation) |
+| §17.1 Storage Architecture Overview | **P/I** | Client/relay storage split (normative); stack diagram with ProtocolRepository (implementation) |
 | §17.1 "Why Thin Trait + Thick Protocol Layer" | **I** | Implementation pattern rationale |
 | §17.2 Storage Trait Evolution | **I** | Rust trait definition — implementation |
 | §17.3 Key Convention | **P** | Key format specification — **normative** (implementations must use these keys) |
-| §17.4 ProtocolStore | **I** | Thick layer wrapping Storage — implementation pattern |
+| §17.4 ProtocolRepository | **I** | Thick layer wrapping Storage — implementation pattern |
 | §17.5-6 Backend adapters | **I** | SQLite, redb, filesystem — implementation |
 | §17.7 BlobStore backends | **P/I** | BlobStore interface is protocol; specific backends are implementation |
 | §17.8 Migratable trait | **I** | Migration pattern — implementation |
 | §17.9 Serialization | **P** | MessagePack with version envelopes — **normative** |
 | §17.10 MLS Storage Bridge | **I** | OpenMLS integration — implementation |
 
-**Action:** Extract key conventions (§17.3) and serialization format (§17.9) as normative. Extract abstract storage requirements (what operations a storage backend must support) without Rust syntax. Drop ProtocolStore, backend adapters, migration — all implementation.
+**Action:** Extract key conventions (§17.3) and serialization format (§17.9) as normative. Extract abstract storage requirements (what operations a storage backend must support) without Rust syntax. Drop ProtocolRepository, backend adapters, migration — all implementation.
 
 **CONFLICT FLAGGED:** §17.3 key conventions are defined with zero-padded sequence numbers (`{seq:020d}`) for lexicographic ordering. This is a protocol-level requirement (event ordering depends on it). The protocol spec must define this convention precisely.
 

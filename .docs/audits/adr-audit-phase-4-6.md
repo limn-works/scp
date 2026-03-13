@@ -163,7 +163,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-017] M2: Attestation Revocation Check Has No Specified Protocol
 - **Category**: Underspecified interfaces
 - **Location**: ADR-017, acceptance criterion 3, `verify_attestation`
-- **What's missing**: "Checks revocation: queries revocation status." How? Where is the revocation list? Is it per-context, per-DID, global? Is it a CRL, an OCSP-like protocol, or something else? The ProtocolStore integration mentions "Store revocation list state per context" but no query protocol is defined.
+- **What's missing**: "Checks revocation: queries revocation status." How? Where is the revocation list? Is it per-context, per-DID, global? Is it a CRL, an OCSP-like protocol, or something else? The ProtocolRepository integration mentions "Store revocation list state per context" but no query protocol is defined.
 - **Why it matters**: Without a revocation check protocol, attestation revocation is unenforceable.
 - **Severity**: MEDIUM
 

@@ -12,7 +12,7 @@
 
 ### Production Readiness Commits (2026-03-06)
 - See `production-readiness-commits.md` for full details
-- 7 commits reviewed: sender key msgpack, HPKE domain sep, deny_unknown_fields, ProtocolStore named msgpack, dedup TTL, serde rename, conflict pairs
+- 7 commits reviewed: sender key msgpack, HPKE domain sep, deny_unknown_fields, ProtocolRepository named msgpack, dedup TTL, serde rename, conflict pairs
 - MEDIUM x2 on 7f341b8 (future timestamp window + missing test); rest CLEAN
 - Pre-existing gaps: sender key wire types lack deny_unknown_fields; handle_sender_key_request no timestamp/nonce check; RestoreReadAccess self-conflict missing
 

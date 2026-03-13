@@ -15,8 +15,8 @@ categories = ["cryptography", "network-programming"]
 # integration tests that run outside `#[cfg(test)]`. Production builds
 # must never enable this feature. See issue #128.
 testing = ["allow_unencrypted_storage"]
-# Gates `ProtocolStore::new_for_testing()` — accepts any `Storage` backend
-# without the `EncryptedStorage` bound. Production `ProtocolStore::new()`
+# Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
+# without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
 # requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
 # in scp-ffi. See issue #695.
 allow_unencrypted_storage = []

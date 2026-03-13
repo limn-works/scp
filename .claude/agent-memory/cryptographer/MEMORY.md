@@ -75,7 +75,7 @@
 - configure_adapter overwrites created_at on rotation (loses original creation time)
 - validate_adapter checks: non-empty id, safe chars [a-zA-Z0-9_-], >= 1 currency
 - 34 tests, all passing; missing proptest for serialization roundtrips
-- ProtocolStore<S: Storage> wraps platform Storage trait for domain methods
+- ProtocolRepository<S: Storage> wraps platform Storage trait for domain methods
 
 ### scp-ffi Bridge Layer (reviewed 2026-02-28)
 - compute_simple_cid: SHA-256 + "bafyrei" prefix is NOT a valid CID v1 -- purely opaque internal ID
@@ -149,7 +149,7 @@
 - HPKE domain separator: "scp-sender-key-hpke-v1" -> "scp-sender-key-v1" per spec. Prefix matches but full info param still incomplete (see spec-audit)
 - PRE-EXISTING HIGH: hpke_seal/hpke_open pass only domain prefix to HKDF info, NOT context_id||sender_did||epoch_bytes per spec 9.16.2. No AAD on AES-GCM. Tracked in spec-audit.
 - InnerEnvelope: deny_unknown_fields added, SOUND. Provenance nested struct lacks it (mitigated by provenance_hash). Sender key wire types also lack it.
-- ProtocolStore: to_vec -> to_vec_named SOUND, backward-compatible deserialization
+- ProtocolRepository: to_vec -> to_vec_named SOUND, backward-compatible deserialization
 - Dedup cache TTL: 1h -> 24h per spec 9.8.2(b), SOUND
 - Wire format: 10 ref_id -> "ref" renames + event_type -> "type", comprehensive tests, SOUND
 - Conflict detection: RemoveMember same-target + RotateContentKeys self-conflict added, SOUND
@@ -178,7 +178,7 @@
 - `crates/scp-ffi/wasm/src/custody.rs` -- WASM key custody FFI boundary
 - `crates/scp-ffi/napi/src/identity.rs` -- Node/Bun identity bridge
 - `crates/scp-core/src/economy/credentials.rs` -- adapter credential management
-- `crates/scp-core/src/store/mod.rs` -- ProtocolStore definition
+- `crates/scp-core/src/store/mod.rs` -- ProtocolRepository definition
 - `crates/scp-core/src/store/economy.rs` -- adapter credential storage impl
 - `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/` -- Android adapters
 - `crates/scp-core/src/envelope/pseudonym.rs` -- pseudonym derivation spec (delegates to KeyCustody)

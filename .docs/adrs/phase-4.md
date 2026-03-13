@@ -202,7 +202,7 @@ pub struct TrustInput {
    - Computes threshold counts per attestation type.
    - Returns the complete `TrustInput` struct for agent-level evaluation.
 
-10. **ProtocolStore integration:**
+10. **ProtocolRepository integration:**
     - Cache verified attestations with TTL-based refresh.
     - Store revocation list state per context.
     - Persist challenge results with timestamps.
@@ -234,7 +234,7 @@ Spec §5.10 defines TTL semantics and §5.11 defines memory scope. Contexts gain
 
 ### Decision
 
-Implement TTL tracking and memory scope enforcement in `scp-core/context/`. TTL is tracked per-context via ProtocolStore. Memory scope drives key destruction behavior on context close. Promotion requires unanimous member consent because it changes the opt-in contract. Broadcast contexts are restricted to `Full` scope only — MLS-based forward secrecy is unavailable in broadcast mode.
+Implement TTL tracking and memory scope enforcement in `scp-core/context/`. TTL is tracked per-context via ProtocolRepository. Memory scope drives key destruction behavior on context close. Promotion requires unanimous member consent because it changes the opt-in contract. Broadcast contexts are restricted to `Full` scope only — MLS-based forward secrecy is unavailable in broadcast mode.
 
 ### Rationale
 

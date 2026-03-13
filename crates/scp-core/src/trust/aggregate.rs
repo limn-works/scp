@@ -1,13 +1,13 @@
-//! Trust input aggregation and `TrustProtocolStore` integration.
+//! Trust input aggregation and `TrustProtocolRepository` integration.
 //!
 //! [`aggregate_trust_input`] combines all trust engine layers into a single
 //! [`TrustInput`] struct for agent-level evaluation. The trust engine does not
 //! produce trust "scores" -- each agent applies its own criteria to the
 //! aggregated inputs.
 //!
-//! # `TrustProtocolStore` integration
+//! # `TrustProtocolRepository` integration
 //!
-//! [`TrustProtocolStore`] caches verified attestations with TTL-based refresh,
+//! [`TrustProtocolRepository`] caches verified attestations with TTL-based refresh,
 //! stores revocation list state per context, and persists challenge results
 //! with timestamps. This avoids redundant verification work across trust
 //! evaluations.
@@ -35,7 +35,7 @@ use super::participation::compute_participation_record;
 use super::{AttestationType, TrustError, TrustInput};
 
 // ---------------------------------------------------------------------------
-// TrustProtocolStore
+// TrustProtocolRepository
 // ---------------------------------------------------------------------------
 
 /// Persistent store for trust engine data.
@@ -46,7 +46,7 @@ use super::{AttestationType, TrustError, TrustInput};
 /// locking or cell types as appropriate).
 ///
 /// See ADR-017 acceptance criterion 10.
-pub trait TrustProtocolStore {
+pub trait TrustProtocolRepository {
     /// Retrieves cached verified attestations for a subject DID within a
     /// context. Returns only attestations whose cache entry has not expired.
     ///
@@ -157,7 +157,7 @@ const DEFAULT_ATTESTATION_TTL_SECS: u64 = 5 * 60;
 
 /// In-memory attestation cache with TTL-based refresh.
 ///
-/// Wraps a [`TrustProtocolStore`] and provides TTL-aware attestation retrieval.
+/// Wraps a [`TrustProtocolRepository`] and provides TTL-aware attestation retrieval.
 /// When cached entries are fresh, they are returned directly. When expired,
 /// attestations are re-verified and the cache is updated.
 ///
@@ -170,7 +170,7 @@ pub struct AttestationCache<S> {
     ttl_secs: u64,
 }
 
-impl<S: TrustProtocolStore> AttestationCache<S> {
+impl<S: TrustProtocolRepository> AttestationCache<S> {
     /// Creates a new attestation cache with the default TTL.
     #[must_use]
     pub const fn new(store: S) -> Self {
@@ -334,7 +334,7 @@ pub fn aggregate_trust_input<S, R, C>(
     ctx: &AggregationContext<'_, S, R, C>,
 ) -> Result<TrustInput, TrustError>
 where
-    S: TrustProtocolStore,
+    S: TrustProtocolRepository,
     R: DidPublicKeyResolver,
     C: Clock,
 {
@@ -458,7 +458,7 @@ mod tests {
     // Test helpers: InMemoryTrustStore
     // -----------------------------------------------------------------------
 
-    /// An in-memory implementation of [`TrustProtocolStore`] for testing.
+    /// An in-memory implementation of [`TrustProtocolRepository`] for testing.
     struct InMemoryTrustStore {
         attestations: Mutex<HashMap<(String, String), Vec<CachedAttestation>>>,
         revocations: Mutex<HashMap<String, HashMap<String, bool>>>,
@@ -475,7 +475,7 @@ mod tests {
         }
     }
 
-    impl TrustProtocolStore for InMemoryTrustStore {
+    impl TrustProtocolRepository for InMemoryTrustStore {
         fn get_cached_attestations(
             &self,
             context_id: &str,

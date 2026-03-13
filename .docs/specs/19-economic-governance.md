@@ -362,7 +362,7 @@ pub enum PricingMetric {
                            // events by the specific sender DID within the last 60 seconds.
                            // Window: trailing 60-second sliding window, evaluated at action time.)
     StorageUsage,          // context storage in bytes (measurement: sum of value sizes for all keys
-                           // under context/{context_id}/ in ProtocolStore. Measured on the payer's
+                           // under context/{context_id}/ in ProtocolRepository. Measured on the payer's
                            // local storage. Window: point-in-time snapshot at evaluation.)
 }
 ```
@@ -406,7 +406,7 @@ pub struct SpendingCapability {
 
 **`time_window` semantics.** The `time_window` is a rolling window measured from the current time backwards. The running total is the sum of all `PaymentReceipt.amount` values for receipts with `timestamp >= (now - time_window.as_secs())`. The window rolls forward continuously — old receipts age out as time passes. The window starts at UCAN issuance time (not at first spend).
 
-**Enforcement location.** `max_total` is enforced by the **payer's SDK** as a self-imposed spending limit. The payer SDK maintains a local spending ledger: a list of `(receipt_id, amount, timestamp)` tuples stored under `identity/{did}/spending_ledger/{ucan_token_id}/` in `ProtocolStore`. Before each `authorize()` call, the SDK sums receipts within `time_window` and rejects if `running_total + new_amount > max_total` with a `SpendingLimitExceeded` error. Payees do NOT enforce `max_total` — they cannot know the payer's total spending across all payees. This is a deliberate design choice: `SpendingCapability` is a self-governance mechanism for the human delegating spending authority to their agent, not a protocol-enforced global limit. The human trusts their own SDK to enforce the limit honestly. A compromised SDK that ignores the limit can overspend, but the blast radius is bounded by the UCAN's 24-hour expiry (§9.5) and the adapter's balance.
+**Enforcement location.** `max_total` is enforced by the **payer's SDK** as a self-imposed spending limit. The payer SDK maintains a local spending ledger: a list of `(receipt_id, amount, timestamp)` tuples stored under `identity/{did}/spending_ledger/{ucan_token_id}/` in `ProtocolRepository`. Before each `authorize()` call, the SDK sums receipts within `time_window` and rejects if `running_total + new_amount > max_total` with a `SpendingLimitExceeded` error. Payees do NOT enforce `max_total` — they cannot know the payer's total spending across all payees. This is a deliberate design choice: `SpendingCapability` is a self-governance mechanism for the human delegating spending authority to their agent, not a protocol-enforced global limit. The human trusts their own SDK to enforce the limit honestly. A compromised SDK that ignores the limit can overspend, but the blast radius is bounded by the UCAN's 24-hour expiry (§9.5) and the adapter's balance.
 
 **AND composition:** Action UCAN + spending UCAN both required for paid actions. Agent with `messagesWrite` but no spending UCAN cannot send paid messages. Agent with spending UCAN but no `messagesWrite` cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.
 

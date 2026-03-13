@@ -1,4 +1,4 @@
-//! Context storage operations for `ProtocolStore`.
+//! Context storage operations for `ProtocolRepository`.
 //!
 //! Implements context state CRUD following the key convention from
 //! spec section 17.3:
@@ -21,7 +21,7 @@ use zeroize::Zeroize;
 
 use scp_identity::DID;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Type aliases (matching the codebase convention)
@@ -253,10 +253,10 @@ fn grace_prefix(context_id: &str) -> Result<String, super::StoreError> {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — context methods
+// ProtocolRepository — context methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores the state for a context.
     ///
     /// Serializes context state bytes under `context/{context_id}/state`
@@ -377,7 +377,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// Scans for keys matching `context/*/full_snapshot` by listing all keys
     /// with the `context/` prefix and filtering for snapshot keys. Used by
-    /// [`ProtocolStoreContextBridge`] to implement
+    /// [`ProtocolRepositoryContextBridge`] to implement
     /// [`crate::context::manager::ContextPersistence::list_persisted_contexts`].
     ///
     /// The returned list is a point-in-time snapshot. In a concurrent
@@ -900,32 +900,32 @@ impl<S: Storage> ProtocolStore<S> {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStoreContextBridge — canonical bridge (SCP-PERSIST-021)
+// ProtocolRepositoryContextBridge — canonical bridge (SCP-PERSIST-021)
 // ---------------------------------------------------------------------------
 
 /// Canonical bridge from `ContextPersistence` (dyn-compatible) to the generic
-/// `ProtocolStore<S>`.
+/// `ProtocolRepository<S>`.
 ///
-/// Wraps `Arc<ProtocolStore<S>>` and implements the synchronous
-/// [`crate::context::manager::ContextPersistence`] trait by blocking on the async `ProtocolStore`
+/// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
+/// [`crate::context::manager::ContextPersistence`] trait by blocking on the async `ProtocolRepository`
 /// methods via `tokio::task::block_in_place` + `Handle::block_on`. This is
 /// safe because `ContextPersistence` methods are always called from within a
 /// tokio runtime context (after the `contexts` mutex is released).
 ///
 /// See SCP-PERSIST-021 and spec section 17.4.
-pub struct ProtocolStoreContextBridge<S: Storage> {
-    store: std::sync::Arc<ProtocolStore<S>>,
+pub struct ProtocolRepositoryContextBridge<S: Storage> {
+    store: std::sync::Arc<ProtocolRepository<S>>,
 }
 
-impl<S: Storage> ProtocolStoreContextBridge<S> {
-    /// Creates a new bridge wrapping the given `ProtocolStore`.
-    pub const fn new(store: std::sync::Arc<ProtocolStore<S>>) -> Self {
+impl<S: Storage> ProtocolRepositoryContextBridge<S> {
+    /// Creates a new bridge wrapping the given `ProtocolRepository`.
+    pub const fn new(store: std::sync::Arc<ProtocolRepository<S>>) -> Self {
         Self { store }
     }
 }
 
 impl<S: Storage + 'static> crate::context::manager::ContextPersistence
-    for ProtocolStoreContextBridge<S>
+    for ProtocolRepositoryContextBridge<S>
 {
     fn persist_context(
         &self,
@@ -1015,30 +1015,30 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStoreEventLogBridge — event log bridge (#636)
+// ProtocolRepositoryEventLogBridge — event log bridge (#636)
 // ---------------------------------------------------------------------------
 
 /// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] (synchronous) to the async
-/// `ProtocolStore` event log methods.
+/// `ProtocolRepository` event log methods.
 ///
-/// Wraps `Arc<ProtocolStore<S>>` and implements the synchronous
+/// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
 /// [`crate::context::providers::event_log::EventLogPersistence`] trait by blocking on async methods via
 /// `tokio::task::block_in_place` + `Handle::block_on`.
 ///
 /// See GitHub issue #636.
-pub struct ProtocolStoreEventLogBridge<S: Storage> {
-    store: std::sync::Arc<ProtocolStore<S>>,
+pub struct ProtocolRepositoryEventLogBridge<S: Storage> {
+    store: std::sync::Arc<ProtocolRepository<S>>,
 }
 
-impl<S: Storage> ProtocolStoreEventLogBridge<S> {
-    /// Creates a new bridge wrapping the given `ProtocolStore`.
-    pub const fn new(store: std::sync::Arc<ProtocolStore<S>>) -> Self {
+impl<S: Storage> ProtocolRepositoryEventLogBridge<S> {
+    /// Creates a new bridge wrapping the given `ProtocolRepository`.
+    pub const fn new(store: std::sync::Arc<ProtocolRepository<S>>) -> Self {
         Self { store }
     }
 }
 
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
-    for ProtocolStoreEventLogBridge<S>
+    for ProtocolRepositoryEventLogBridge<S>
 {
     fn persist_entry(
         &self,
@@ -1118,8 +1118,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     fn test_did() -> DID {
@@ -1782,15 +1782,15 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // ProtocolStoreContextBridge bridge (SCP-PERSIST-021)
+    // ProtocolRepositoryContextBridge bridge (SCP-PERSIST-021)
     // -------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn protocol_store_persistence_context_roundtrip() {
+    async fn protocol_repository_persistence_context_roundtrip() {
         use crate::context::manager::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreContextBridge::new(store);
+        let bridge = super::ProtocolRepositoryContextBridge::new(store);
 
         let snapshot = make_context_snapshot();
 
@@ -1805,11 +1805,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn protocol_store_persistence_broadcast_roundtrip() {
+    async fn protocol_repository_persistence_broadcast_roundtrip() {
         use crate::context::manager::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreContextBridge::new(store);
+        let bridge = super::ProtocolRepositoryContextBridge::new(store);
 
         let snapshot = make_broadcast_snapshot();
 
@@ -1825,11 +1825,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn protocol_store_persistence_delete_and_list() {
+    async fn protocol_repository_persistence_delete_and_list() {
         use crate::context::manager::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreContextBridge::new(store.clone());
+        let bridge = super::ProtocolRepositoryContextBridge::new(store.clone());
 
         // Use store_full_snapshot (the actual persistence path used by
         // ContextManager) instead of store_context_state, so
@@ -1858,17 +1858,17 @@ mod tests {
     }
 
     #[test]
-    fn protocol_store_persistence_is_object_safe() {
+    fn protocol_repository_persistence_is_object_safe() {
         // Compile-time dyn-compatibility check: verifies that
-        // ProtocolStoreContextBridge can be used as a trait object.
+        // ProtocolRepositoryContextBridge can be used as a trait object.
         fn assert_object_safe(_: &dyn crate::context::manager::ContextPersistence) {}
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreContextBridge::new(store);
+        let bridge = super::ProtocolRepositoryContextBridge::new(store);
         assert_object_safe(&bridge);
     }
 
     // -------------------------------------------------------------------
-    // ProtocolStoreEventLogBridge bridge (#636)
+    // ProtocolRepositoryEventLogBridge bridge (#636)
     // -------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1876,7 +1876,7 @@ mod tests {
         use crate::context::providers::event_log::{EventLogEntry, EventLogPersistence};
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreEventLogBridge::new(store);
+        let bridge = super::ProtocolRepositoryEventLogBridge::new(store);
 
         let entry0 = EventLogEntry {
             event: "ContextCreated".to_owned(),
@@ -1909,7 +1909,7 @@ mod tests {
         use crate::context::providers::event_log::{EventLogEntry, EventLogPersistence};
 
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreEventLogBridge::new(store);
+        let bridge = super::ProtocolRepositoryEventLogBridge::new(store);
 
         let entries = vec![
             EventLogEntry {
@@ -1939,7 +1939,7 @@ mod tests {
         // Compile-time dyn-compatibility check.
         fn assert_object_safe(_: &dyn crate::context::providers::event_log::EventLogPersistence) {}
         let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolStoreEventLogBridge::new(store);
+        let bridge = super::ProtocolRepositoryEventLogBridge::new(store);
         assert_object_safe(&bridge);
     }
 
@@ -2075,7 +2075,7 @@ mod tests {
 
     /// Integration test: epoch grace crash recovery (§23.11).
     ///
-    /// Simulates: add epochs -> persist via `ProtocolStore` -> crash ->
+    /// Simulates: add epochs -> persist via `ProtocolRepository` -> crash ->
     /// restart -> load entries -> restore grace store -> verify state.
     #[tokio::test]
     async fn crash_recovery_persist_and_restore() {
@@ -2099,7 +2099,7 @@ mod tests {
         // Phase 2: simulate crash — drop the in-memory grace store.
         drop(grace);
 
-        // Phase 3: recovery — load from ProtocolStore and restore.
+        // Phase 3: recovery — load from ProtocolRepository and restore.
         let persisted = store.load_grace_entries("ctx-crash").await.unwrap();
         assert_eq!(persisted.len(), 3);
 
