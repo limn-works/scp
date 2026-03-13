@@ -24,6 +24,11 @@ mod resolvers;
 #[cfg(feature = "resolvers")]
 pub use resolvers::*;
 
+// Discovery result mapping (ContextDiscoverySource → trust/resolution metadata).
+// Requires scp-core types. Not available for WASM (ADR-034).
+#[cfg(feature = "resolvers")]
+pub mod discovery;
+
 // Shared test helpers for FFI bridge tests (behind the `testing` feature).
 #[cfg(feature = "testing")]
 pub mod test_helpers;
