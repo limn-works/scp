@@ -109,5 +109,9 @@ required-features = ["testing"]
 name = "tools"
 required-features = ["testing"]
 
+[[example]]
+name = "messaging"
+required-features = ["testing"]
+
 [lints]
 workspace = true
