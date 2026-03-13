@@ -801,7 +801,7 @@ export class Context implements AsyncDisposable {
    */
   async extendTtl(additionalSecs: number): Promise<boolean> {
     this.assertActive();
-    if (additionalSecs <= 0 || Number.isNaN(additionalSecs)) {
+    if (!Number.isFinite(additionalSecs) || additionalSecs <= 0) {
       throw new ContextError("additionalSecs must be greater than zero", "SCP-CTX-2031");
     }
     try {
@@ -845,7 +845,7 @@ export class Context implements AsyncDisposable {
    */
   async proposeTtlExtension(extensionSecs: number, proposerDid?: string): Promise<boolean> {
     this.assertActive();
-    if (extensionSecs <= 0 || Number.isNaN(extensionSecs)) {
+    if (!Number.isFinite(extensionSecs) || extensionSecs <= 0) {
       throw new ContextError("extensionSecs must be greater than zero", "SCP-CTX-2031");
     }
     try {
@@ -872,7 +872,7 @@ export class Context implements AsyncDisposable {
    */
   async resetTtlTimer(newDurationSecs: number): Promise<void> {
     this.assertActive();
-    if (newDurationSecs <= 0 || Number.isNaN(newDurationSecs)) {
+    if (!Number.isFinite(newDurationSecs) || newDurationSecs <= 0) {
       throw new ContextError("newDurationSecs must be greater than zero", "SCP-CTX-2031");
     }
     try {
