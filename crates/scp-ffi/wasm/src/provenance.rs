@@ -894,7 +894,7 @@ mod tests {
     }
 }
 
-/// Tests that run on all targets (including native) to verify lowercase/snake_case
+/// Tests that run on all targets (including native) to verify `lowercase/snake_case`
 /// enum parsing without requiring wasm-bindgen types.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
