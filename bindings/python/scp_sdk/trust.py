@@ -54,6 +54,10 @@ def _bridge() -> Any:
 # Maps to CapabilityValidation.tokens_valid.
 # Pipeline step 1 (parse/header validation) — fails before any other
 # check has run.
+#
+# NOTE: More specific "malformed token:" sub-patterns (e.g. DID errors,
+# capability URI errors) are matched BEFORE this list in _classify_ucan_error
+# so they route to the correct pipeline stage.
 _TOKEN_PARSE_PREFIXES: tuple[str, ...] = (
     "malformed token:",
     "deserialization failed:",
@@ -65,6 +69,8 @@ _TOKEN_PARSE_PREFIXES: tuple[str, ...] = (
 # Maps to CapabilityValidation.signatures_valid.
 # Pipeline steps: 2 (signature), 3 (chain), 4 (root issuer),
 #   5 (audience), 5a/5b (key scope), 6b (category A), 7 (attenuation).
+# Also includes DID resolution failures (step 2) that the Rust bridge
+# wraps as MalformedToken.
 _SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
     "signature verification failed",
     "invalid issuer:",
@@ -75,19 +81,22 @@ _SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
     "key scope mismatch:",
     "self-delegation",
     "Category A violation:",
+    "malformed token: DID not found",
 )
 
 # Error message prefixes that indicate a capability ceiling/scope failure.
 # Maps to CapabilityValidation.within_ceiling.
 # Pipeline steps: 6 (capability match), 8 (ceiling compliance).
+# Also includes capability URI parse failures (step 6) that the Rust bridge
+# wraps as MalformedToken.
 _CAPABILITY_CEILING_PREFIXES: tuple[str, ...] = (
     "capability outside ceiling:",
     "capability not granted:",
+    "malformed token: unparseable capability",
 )
 
 # Error message prefixes for nonce failures (step 9).
-# Maps to CapabilityValidation.tokens_valid.
-# By step 9, signature and ceiling checks have already passed.
+# By step 9, parse, signature, and ceiling checks have already passed.
 _NONCE_PREFIXES: tuple[str, ...] = (
     "nonce reused:",
     "nonce too old:",
@@ -103,8 +112,7 @@ _NONCE_PREFIXES: tuple[str, ...] = (
 _REVOCATION_PREFIXES: tuple[str, ...] = ("token revoked:",)
 
 # Error message prefixes for expiry/time-bounds failures (step 11).
-# Maps to CapabilityValidation.tokens_valid.
-# By step 11, all other checks have passed.
+# By step 11, all other checks (parse, sig, ceiling, nonce, revocation) passed.
 _EXPIRY_PREFIXES: tuple[str, ...] = (
     "token expired",
     "token not yet valid",
@@ -147,10 +155,11 @@ def _classify_ucan_error(error_message: str) -> str:
     """
     core = _extract_core_error(error_message)
 
-    for prefix in _TOKEN_PARSE_PREFIXES:
-        if core.startswith(prefix):
-            return "token_parse"
-
+    # Check more-specific "malformed token:" sub-patterns BEFORE the
+    # generic _TOKEN_PARSE_PREFIXES catch-all, so that e.g.
+    # "malformed token: DID not found" → "signatures" (step 2) and
+    # "malformed token: unparseable capability" → "ceiling" (step 6)
+    # instead of falling through to "token_parse" (step 1).
     for prefix in _SIGNATURE_CHAIN_PREFIXES:
         if core.startswith(prefix):
             return "signatures"
@@ -158,6 +167,10 @@ def _classify_ucan_error(error_message: str) -> str:
     for prefix in _CAPABILITY_CEILING_PREFIXES:
         if core.startswith(prefix):
             return "ceiling"
+
+    for prefix in _TOKEN_PARSE_PREFIXES:
+        if core.startswith(prefix):
+            return "token_parse"
 
     for prefix in _NONCE_PREFIXES:
         if core.startswith(prefix):
@@ -193,11 +206,11 @@ _PASSED_BEFORE: dict[str, set[str]] = {
     # Steps 6/8: capability/ceiling fails — parse + sig passed.
     "ceiling": {"tokens_valid", "signatures_valid"},
     # Step 9: nonce fails — parse + sig + ceiling all passed.
-    "nonce": {"signatures_valid", "within_ceiling"},
+    "nonce": {"tokens_valid", "signatures_valid", "within_ceiling"},
     # Step 10: revocation fails — parse + sig + ceiling + nonce passed.
     "revoked": {"tokens_valid", "signatures_valid", "within_ceiling"},
     # Step 11: expiry fails — parse + sig + ceiling + nonce + revocation passed.
-    "expiry": {"signatures_valid", "within_ceiling", "not_revoked"},
+    "expiry": {"tokens_valid", "signatures_valid", "within_ceiling", "not_revoked"},
     # Unknown: conservatively nothing passed.
     "unknown": set(),
 }
@@ -415,6 +428,11 @@ async def evaluate_trust(
         cap_validation.within_ceiling = True
         cap_validation.not_revoked = True
 
+        # Multi-token evaluation uses fail-fast semantics: we stop at the
+        # first token that fails validation and report that failure.
+        # Remaining tokens are not evaluated.  This is intentional —
+        # the Rust bridge itself validates one token at a time, and a
+        # single invalid token is sufficient to fail the capability check.
         for token in capability_tokens:
             try:
                 bridge.ucan_validate(context_id, token, "*")

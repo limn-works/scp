@@ -120,6 +120,11 @@ class TestClassifyUcanError:
         msg = "Category A violation: did_document:update signed by agent key (kid=#agent)"
         assert _classify_ucan_error(msg) == "signatures"
 
+    def test_did_not_found(self) -> None:
+        """MalformedToken from DID resolver (step 2) → signatures, not token_parse."""
+        msg = "malformed token: DID not found: did:dht:z6MkMissing"
+        assert _classify_ucan_error(msg) == "signatures"
+
     # -- Capability/ceiling errors (steps 6, 8) --
 
     def test_capability_outside_ceiling(self) -> None:
@@ -127,6 +132,11 @@ class TestClassifyUcanError:
 
     def test_capability_not_granted(self) -> None:
         assert _classify_ucan_error("capability not granted: messages:write") == "ceiling"
+
+    def test_unparseable_capability_uri(self) -> None:
+        """MalformedToken from capability URI parse (step 6) → ceiling, not token_parse."""
+        msg = "malformed token: unparseable capability URI in attestation: bad://uri"
+        assert _classify_ucan_error(msg) == "ceiling"
 
     # -- Nonce errors (step 9) --
 
@@ -209,8 +219,8 @@ class TestPassedBeforeMapping:
     def test_ceiling_tokens_and_sigs_passed(self) -> None:
         assert _PASSED_BEFORE["ceiling"] == {"tokens_valid", "signatures_valid"}
 
-    def test_nonce_sigs_and_ceiling_passed(self) -> None:
-        assert _PASSED_BEFORE["nonce"] == {"signatures_valid", "within_ceiling"}
+    def test_nonce_tokens_sigs_and_ceiling_passed(self) -> None:
+        assert _PASSED_BEFORE["nonce"] == {"tokens_valid", "signatures_valid", "within_ceiling"}
 
     def test_revoked_all_except_revoked_passed(self) -> None:
         assert _PASSED_BEFORE["revoked"] == {
@@ -219,8 +229,9 @@ class TestPassedBeforeMapping:
             "within_ceiling",
         }
 
-    def test_expiry_all_except_tokens_passed(self) -> None:
+    def test_expiry_all_passed(self) -> None:
         assert _PASSED_BEFORE["expiry"] == {
+            "tokens_valid",
             "signatures_valid",
             "within_ceiling",
             "not_revoked",
@@ -292,9 +303,9 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is False
 
     def test_expired_token_has_valid_everything_else(self) -> None:
-        """An expired token shows all other checks passed."""
+        """An expired token shows all other checks passed (including parse)."""
         cv = self._run("token expired")
-        assert cv.tokens_valid is False
+        assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
         assert cv.not_revoked is True
@@ -315,9 +326,9 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is False
 
     def test_nonce_reused(self) -> None:
-        """Nonce reuse: sig and ceiling passed, but token is invalid."""
+        """Nonce reuse: parse, sig, and ceiling passed; nonce failed."""
         cv = self._run("nonce reused: abc-123")
-        assert cv.tokens_valid is False
+        assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
         assert cv.not_revoked is False
@@ -358,6 +369,22 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
+        assert cv.not_revoked is False
+
+    def test_did_not_found_classified_as_signature(self) -> None:
+        """DID resolution failure (step 2) → tokens_valid=True, signatures_valid=False."""
+        cv = self._run("malformed token: DID not found: did:dht:z6MkMissing")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.not_revoked is False
+
+    def test_unparseable_capability_classified_as_ceiling(self) -> None:
+        """Capability URI parse failure (step 6) → tokens+sigs valid, ceiling=False."""
+        cv = self._run("malformed token: unparseable capability URI in attestation: bad://uri")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is True
+        assert cv.within_ceiling is False
         assert cv.not_revoked is False
 
     def test_unknown_error_conservatively_all_false(self) -> None:
