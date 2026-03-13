@@ -118,6 +118,7 @@ impl Capability {
     /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
     /// `"media:screen_share"`, `"member:ban"`, `"metadata:edit"`.
     /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
+    /// Names starting with `"custom:"` are parsed as `Custom(remainder)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
     pub fn new(name: impl AsRef<str>) -> Self {
@@ -141,7 +142,12 @@ impl Capability {
             "member:ban" => Self::MemberBan,
             "metadata:edit" => Self::MetadataEdit,
             other => other.strip_prefix("tool:invoke:").map_or_else(
-                || Self::Custom(other.to_owned()),
+                || {
+                    other.strip_prefix("custom:").map_or_else(
+                        || Self::Custom(other.to_owned()),
+                        |custom_name| Self::Custom(custom_name.to_owned()),
+                    )
+                },
                 |tool_id| Self::ToolInvoke(tool_id.to_owned()),
             ),
         }
@@ -1088,6 +1094,57 @@ mod tests {
             format!("{}", Capability::Custom("x".to_owned())),
             "custom:x"
         );
+    }
+
+    #[test]
+    fn capability_display_new_roundtrip() {
+        // All standard variants must roundtrip through Display → new.
+        let standard_caps = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvoke("my-tool".to_owned()),
+            Capability::ToolInvokeAll,
+            Capability::ToolRegister,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::RoleAssign,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::ChildContextCreate,
+            Capability::ToolInterface,
+            Capability::Bridging,
+            Capability::MediaVoice,
+            Capability::MediaVideo,
+            Capability::MediaScreenShare,
+            Capability::MemberBan,
+            Capability::MetadataEdit,
+        ];
+        for cap in &standard_caps {
+            let displayed = cap.to_string();
+            let roundtripped = Capability::new(&displayed);
+            assert_eq!(
+                *cap, roundtripped,
+                "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
+            );
+        }
+
+        // Custom variants must also roundtrip through Display → new.
+        // This was a bug: Display output "custom:my-cap" but new() didn't
+        // strip the "custom:" prefix, creating Custom("custom:my-cap").
+        let custom_caps = vec![
+            Capability::Custom("my-cap".to_owned()),
+            Capability::Custom("x".to_owned()),
+            Capability::Custom("some:nested:name".to_owned()),
+        ];
+        for cap in &custom_caps {
+            let displayed = cap.to_string();
+            let roundtripped = Capability::new(&displayed);
+            assert_eq!(
+                *cap, roundtripped,
+                "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
+            );
+        }
     }
 
     #[test]
