@@ -1,4 +1,4 @@
-//! Protocol store for SCP client-side persistence.
+//! Protocol repository for SCP client-side persistence.
 //!
 //! `ProtocolRepository<S>` wraps a `Storage` implementation and provides typed
 //! domain methods for all protocol state. Storage adapters implement the
@@ -163,7 +163,7 @@ pub trait Migratable: Sized + Serialize + DeserializeOwned {
 // ProtocolRepository
 // ---------------------------------------------------------------------------
 
-/// Concrete protocol store wrapping a platform `Storage` implementation.
+/// Concrete protocol repository wrapping a platform `Storage` implementation.
 ///
 /// Provides typed domain methods for all protocol state. Storage adapters
 /// implement the thin `Storage` trait; `ProtocolRepository` handles all structured

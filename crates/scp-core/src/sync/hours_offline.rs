@@ -862,7 +862,7 @@ impl ReconnectionCoordinator {
     ///
     /// # Arguments
     ///
-    /// * `store` — The protocol store containing the outbound queue.
+    /// * `store` — The protocol repository containing the outbound queue.
     /// * `context_id` — The context to drain.
     /// * `now` — Current Unix timestamp (seconds).
     /// * `blob_ttl_secs` — The context's `blob_ttl` in seconds. If `None`,

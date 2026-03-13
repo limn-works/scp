@@ -888,7 +888,7 @@ impl ProposalStatus {
 /// A governance proposal with full lifecycle tracking.
 ///
 /// Created by [`GovernanceEngine::propose`], stored in the event log and in
-/// the protocol store for active tracking. The proposal tracks all votes and
+/// the protocol repository for active tracking. The proposal tracks all votes and
 /// the current status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceProposal {

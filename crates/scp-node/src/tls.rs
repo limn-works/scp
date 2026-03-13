@@ -306,7 +306,7 @@ impl ResolvesServerCert for CertResolver {
 pub struct AcmeProvider<S: Storage> {
     /// The domain to provision a certificate for.
     domain: String,
-    /// Protocol store wrapping the platform storage backend.
+    /// Protocol repository wrapping the platform storage backend.
     storage: Arc<ProtocolRepository<S>>,
     /// Optional contact email for the ACME account.
     email: Option<String>,
@@ -381,7 +381,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
         Arc::clone(&self.challenges)
     }
 
-    /// Load a TLS certificate from the protocol store, converting to
+    /// Load a TLS certificate from the protocol repository, converting to
     /// [`CertificateData`].
     async fn load_tls_cert(&self) -> Result<Option<CertificateData>, TlsError> {
         match self

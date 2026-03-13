@@ -474,12 +474,12 @@ The `subscribe()` implementation wraps the relay's `mpsc::UnboundedReceiver<Rela
 
 ## 16.6 SimulatedIdentity
 
-Wraps identity primitives (DID, key custody, storage, protocol store) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
+Wraps identity primitives (DID, key custody, storage, protocol repository) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
 
 ```rust
 /// scp-testing/src/simulator/identity.rs
 
-/// A test identity with custody, storage, and protocol store pre-wired.
+/// A test identity with custody, storage, and protocol repository pre-wired.
 pub struct SimulatedIdentity {
     /// The DID for this identity.
     did: DID,
@@ -487,7 +487,7 @@ pub struct SimulatedIdentity {
     custody: Arc<InMemoryKeyCustody>,
     /// Direct storage access for tests.
     storage: InMemoryStorage,
-    /// Protocol store wrapping its own storage instance.
+    /// Protocol repository wrapping its own storage instance.
     protocol_repository: ProtocolRepository<InMemoryStorage>,
     /// Human-readable label for this identity.
     label: String,
@@ -516,7 +516,7 @@ impl SimulatedIdentity {
     /// Returns a reference to the direct storage instance.
     pub const fn storage(&self) -> &InMemoryStorage;
 
-    /// Returns a reference to the protocol store.
+    /// Returns a reference to the protocol repository.
     pub const fn protocol_repository(&self) -> &ProtocolRepository<InMemoryStorage>;
 }
 ```

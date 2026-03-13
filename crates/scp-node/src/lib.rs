@@ -211,7 +211,7 @@ pub struct ApplicationNode<S: Storage> {
     relay: RelayHandle,
     /// Handle to the node's identity.
     identity: IdentityHandle,
-    /// The protocol store wrapping the storage backend.
+    /// The protocol repository wrapping the storage backend.
     storage: Arc<ProtocolRepository<S>>,
     /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
     state: Arc<http::NodeState>,
@@ -262,7 +262,7 @@ impl<S: Storage> ApplicationNode<S> {
         &self.identity
     }
 
-    /// Returns a reference to the protocol store.
+    /// Returns a reference to the protocol repository.
     #[must_use]
     pub fn storage(&self) -> &ProtocolRepository<S> {
         &self.storage
