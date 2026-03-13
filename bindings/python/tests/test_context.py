@@ -155,9 +155,9 @@ class TestContextCreate:
             creator = _MockIdentity()
             ctx = await Context.create(
                 creator=creator,
-                ceiling=["MessagesRead", "MessagesWrite"],
+                ceiling=["messages:read", "messages:write"],
                 tools=None,
-                roles={"admin": ["ContextClose"], "member": ["MessagesRead"]},
+                roles={"admin": ["context:close"], "member": ["messages:read"]},
                 ttl=300.0,
                 memory_scope="full",
                 governance="single_admin",
@@ -169,8 +169,8 @@ class TestContextCreate:
         call_args = mock_bridge.py_context_create.call_args
         assert call_args[0][0] == "did:dht:z6MkAlice"
         params = call_args[0][1]
-        assert params["ceiling"] == ["MessagesRead", "MessagesWrite"]
-        assert params["roles"] == {"admin": ["ContextClose"], "member": ["MessagesRead"]}
+        assert params["ceiling"] == ["messages:read", "messages:write"]
+        assert params["roles"] == {"admin": ["context:close"], "member": ["messages:read"]}
         assert params["ttl"] == 300.0
 
     async def test_create_uses_defaults(self) -> None:
@@ -180,7 +180,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
             )
 
         params = mock_bridge.py_context_create.call_args[0][1]
@@ -200,7 +200,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["ToolInvokeAll"],
+                ceiling=["tool:invoke:*"],
                 tools=[tool],
             )
 
@@ -214,7 +214,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 buffer_size=500,
             )
 
@@ -225,14 +225,14 @@ class TestContextCreate:
             with pytest.raises(ContextError, match="_scp_core"):
                 await Context.create(
                     creator=_MockIdentity(),
-                    ceiling=["MessagesRead"],
+                    ceiling=["messages:read"],
                 )
 
     async def test_create_rejects_invalid_buffer_size(self) -> None:
         with pytest.raises(ValueError, match="buffer_size"):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 buffer_size=50,
             )
 
@@ -243,7 +243,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 mode="broadcast",
             )
 
@@ -257,7 +257,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 ceiling_policy="governed",
             )
 
@@ -271,7 +271,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 promotion_policy="promotable",
             )
 
@@ -285,7 +285,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 template_id="PublicBroadcast",
             )
 
@@ -300,7 +300,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 economic_policy=ep_json,
             )
 
@@ -314,7 +314,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
             )
 
         params = mock_bridge.py_context_create.call_args[0][1]
@@ -333,7 +333,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 mode=ContextMode.BROADCAST,
             )
 
@@ -349,7 +349,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 ceiling_policy=CeilingPolicy.GOVERNED,
             )
 
@@ -365,7 +365,7 @@ class TestContextCreate:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 promotion_policy=PromotionPolicy.PROMOTABLE,
             )
 
@@ -983,7 +983,7 @@ class TestReceiveBufferConfigurable004:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 buffer_size=200,
             )
 
@@ -996,7 +996,7 @@ class TestReceiveBufferConfigurable004:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 buffer_size=_MIN_BUFFER_SIZE,
             )
 
@@ -1009,7 +1009,7 @@ class TestReceiveBufferConfigurable004:
         with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
             ctx = await Context.create(
                 creator=_MockIdentity(),
-                ceiling=["MessagesRead"],
+                ceiling=["messages:read"],
                 buffer_size=_MAX_BUFFER_SIZE,
             )
 
