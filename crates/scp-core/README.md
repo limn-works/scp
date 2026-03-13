@@ -24,7 +24,7 @@ let manager = ContextManager::builder()
 
 ## With Persistence (crash recovery)
 
-Pass a `Storage` implementation to `.storage()` and the builder auto-wires
+Pass an `EncryptedStorage` implementation to `.storage()` and the builder auto-wires
 `ProtocolStore`, context persistence, and event log persistence:
 
 ```rust

@@ -65,7 +65,7 @@ use scp_core::context::manager::{ContextManager, ContextPersistence};
 use scp_core::context::providers::ProtocolStoreContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
-use scp_core::context::{ContextError, ContextParams};
+use scp_core::context::ContextError;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolStore;
@@ -142,7 +142,7 @@ pub fn init_context_manager() {
         let persistence = build_persistence_provider();
         build_context_manager(
             Box::new(NoOpCryptoProvider),
-            Box::new(NoOpTransportProvider),
+            Box::new(LocalTransportProvider),
             Box::new(NoOpEventLogProvider),
             persistence,
         )
@@ -362,31 +362,8 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     }
 }
 
-/// No-op transport provider for bridge-layer `ContextManager` initialization.
-struct NoOpTransportProvider;
-
-impl ContextTransportProvider for NoOpTransportProvider {
-    fn is_connected(&self) -> bool {
-        true
-    }
-    fn publish_context(
-        &self,
-        _context_id: &[u8; 32],
-        _params: &ContextParams,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn send_message(
-        &self,
-        _context_id: &[u8; 32],
-        _encrypted_payload: &[u8],
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
+// Use the production no-op transport from scp-core.
+use scp_core::context::LocalTransportProvider;
 
 /// No-op event log provider for bridge-layer `ContextManager` initialization.
 struct NoOpEventLogProvider;

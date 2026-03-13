@@ -60,7 +60,7 @@ subtle = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"

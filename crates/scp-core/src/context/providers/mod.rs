@@ -22,7 +22,7 @@ pub mod event_log;
 pub mod persistence;
 
 pub use crypto::MlsCryptoProvider;
-pub use event_log::{EventLogPersistence, MerkleEventLogProvider};
+pub use event_log::{EventLogEntry, EventLogPersistence, MerkleEventLogProvider};
 pub use persistence::{InMemoryPersistence, ProtocolStoreContextBridge};
 
 // Re-export the ProtocolStore bridge for event log persistence.

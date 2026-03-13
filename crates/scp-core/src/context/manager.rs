@@ -976,7 +976,7 @@ fn mint_governance_tokens(
 ///
 /// Provides a more ergonomic API than the raw constructors. Required
 /// providers can be set individually, or use [`.storage()`](Self::storage)
-/// to auto-wire persistence and event log from a single `Storage` impl.
+/// to auto-wire persistence and event log from a single `EncryptedStorage` impl.
 ///
 /// # Required
 ///
@@ -1064,7 +1064,7 @@ impl ContextManagerBuilder {
         self
     }
 
-    /// Auto-wires persistence and event log from a single `Storage` impl.
+    /// Auto-wires persistence and event log from a single `EncryptedStorage` impl.
     ///
     /// Constructs a [`ProtocolStore`](crate::store::ProtocolStore), then
     /// creates both the context persistence bridge and event log persistence
@@ -16170,6 +16170,27 @@ mod tests {
         assert!(
             manager.persistence.is_some(),
             "persistence() should wire through to the manager"
+        );
+    }
+
+    #[test]
+    fn builder_storage_auto_wires_persistence_and_event_log() {
+        use scp_platform::encrypting_adapter::EncryptingAdapter;
+        use scp_platform::testing::InMemoryStorage;
+        use zeroize::Zeroizing;
+
+        let key = Zeroizing::new([0x42u8; 32]);
+        let storage = EncryptingAdapter::new(InMemoryStorage::new(), key);
+
+        let manager = ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .storage(storage)
+            .build()
+            .expect("builder with crypto + storage should succeed");
+
+        assert!(
+            manager.has_persistence(),
+            ".storage() should auto-wire persistence"
         );
     }
 }
