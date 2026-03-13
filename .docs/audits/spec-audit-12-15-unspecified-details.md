@@ -80,7 +80,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 ### [12.3-006] Shadow Identity Storage and Retrieval Not Specified in 17
 - **Category**: Cross-reference inconsistencies
 - **Location**: 12.3, 17.3
-- **What's missing**: Spec 17 (persistence) defines key conventions for all protocol state. Shadow identities are not mentioned in the ProtocolStore key convention. How are shadows stored? Under what key path? Are they part of context state or bridge state?
+- **What's missing**: Spec 17 (persistence) defines key conventions for all protocol state. Shadow identities are not mentioned in the ProtocolRepository key convention. How are shadows stored? Under what key path? Are they part of context state or bridge state?
 - **Why it matters**: Without a defined storage convention, implementations will use ad-hoc storage that may not interoperate with the version envelope system (StoredValue) or be included in context export/import flows.
 - **Severity**: MEDIUM
 

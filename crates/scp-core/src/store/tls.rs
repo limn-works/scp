@@ -1,4 +1,4 @@
-//! TLS certificate storage operations for `ProtocolStore`.
+//! TLS certificate storage operations for `ProtocolRepository`.
 //!
 //! Implements certificate chain and private key persistence following the
 //! key convention from spec section 17.3:
@@ -16,7 +16,7 @@
 use scp_platform::traits::Storage;
 use zeroize::Zeroizing;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -29,10 +29,10 @@ const CERT_CHAIN_KEY: &str = "tls/certificate_chain";
 const PRIVATE_KEY_KEY: &str = "tls/private_key";
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — TLS methods
+// ProtocolRepository — TLS methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a TLS certificate chain and private key.
     ///
     /// The certificate chain and private key are stored as PEM-encoded
@@ -103,8 +103,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     #[tokio::test]

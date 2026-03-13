@@ -1,4 +1,4 @@
-//! Client-side outbound queue storage for `ProtocolStore`.
+//! Client-side outbound queue storage for `ProtocolRepository`.
 //!
 //! When the SDK detects disconnection (all relay WebSocket connections lost),
 //! outbound messages are queued locally rather than dropped. Messages are
@@ -22,7 +22,7 @@
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Constants (spec section 23.2)
@@ -133,10 +133,10 @@ const QUEUE_GLOBAL_PREFIX: &str = "queue/";
 const QUEUE_GLOBAL_COUNT_KEY: &str = "_meta/queue_global_count";
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — outbound queue methods (spec §23.2, issue #583)
+// ProtocolRepository — outbound queue methods (spec §23.2, issue #583)
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Enqueues an outbound message for a context.
     ///
     /// The `inner_envelope` bytes must be the fully constructed inner envelope
@@ -502,8 +502,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     fn test_envelope(id: u8) -> Vec<u8> {
@@ -1046,8 +1046,9 @@ mod tests {
             queued_at: 1_700_000_000,
             content_hash: [0xAA; 32],
         };
-        let bytes = ProtocolStore::<InMemoryStorage>::serialize(&entry).unwrap();
-        let decoded: QueueEntry = ProtocolStore::<InMemoryStorage>::deserialize(&bytes).unwrap();
+        let bytes = ProtocolRepository::<InMemoryStorage>::serialize(&entry).unwrap();
+        let decoded: QueueEntry =
+            ProtocolRepository::<InMemoryStorage>::deserialize(&bytes).unwrap();
         assert_eq!(decoded, entry);
     }
 

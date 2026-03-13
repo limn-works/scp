@@ -734,7 +734,7 @@ impl ReconnectionCoordinator {
     /// * `member_did` — The DID of the reconnecting member.
     /// * `context_ids` — Active context IDs to sync.
     /// * `last_relay_contacts` — Per-context last relay contact timestamps
-    ///   (persisted in `ProtocolStore` under
+    ///   (persisted in `ProtocolRepository` under
     ///   `sync/{context_id}/last_relay_contact`).
     #[must_use]
     pub fn new(
@@ -757,7 +757,7 @@ impl ReconnectionCoordinator {
     /// * `member_did` — The DID of the reconnecting member.
     /// * `context_ids` — Active context IDs to sync.
     /// * `last_relay_contacts` — Per-context last relay contact timestamps
-    ///   (persisted in `ProtocolStore` under
+    ///   (persisted in `ProtocolRepository` under
     ///   `sync/{context_id}/last_relay_contact`).
     /// * `policy` — Sync policy governing recovery behavior.
     #[must_use]
@@ -877,7 +877,7 @@ impl ReconnectionCoordinator {
     ///
     /// Returns [`crate::store::StoreError`] if any storage operation fails.
     pub async fn drain_context_queue<S: scp_platform::traits::Storage>(
-        store: &crate::store::ProtocolStore<S>,
+        store: &crate::store::ProtocolRepository<S>,
         context_id: &str,
         now: u64,
         blob_ttl_secs: Option<u64>,
@@ -1950,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_context_queue_returns_entries_in_order() {
-        let store = crate::store::ProtocolStore::new_for_testing(
+        let store = crate::store::ProtocolRepository::new_for_testing(
             scp_platform::testing::InMemoryStorage::new(),
         );
 
@@ -1981,7 +1981,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_context_queue_prunes_expired_before_drain() {
-        let store = crate::store::ProtocolStore::new_for_testing(
+        let store = crate::store::ProtocolRepository::new_for_testing(
             scp_platform::testing::InMemoryStorage::new(),
         );
 
@@ -2013,7 +2013,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_context_queue_uses_default_ttl_when_none() {
-        let store = crate::store::ProtocolStore::new_for_testing(
+        let store = crate::store::ProtocolRepository::new_for_testing(
             scp_platform::testing::InMemoryStorage::new(),
         );
 
@@ -2039,7 +2039,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_empty_queue_returns_empty() {
-        let store = crate::store::ProtocolStore::new_for_testing(
+        let store = crate::store::ProtocolRepository::new_for_testing(
             scp_platform::testing::InMemoryStorage::new(),
         );
 

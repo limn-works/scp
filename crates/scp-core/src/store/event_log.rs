@@ -1,4 +1,4 @@
-//! Event log storage operations for `ProtocolStore`.
+//! Event log storage operations for `ProtocolRepository`.
 //!
 //! Implements event log persistence following the key convention from
 //! spec section 17.3:
@@ -28,7 +28,7 @@
 
 use scp_platform::traits::Storage;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -183,10 +183,10 @@ impl EventQueryFilter {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — event log methods (core: SCP-PERSIST-010)
+// ProtocolRepository — event log methods (core: SCP-PERSIST-010)
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Appends an event hash to the event log at the given sequence number.
     ///
     /// Stores the 32-byte SHA-256 event hash under
@@ -727,8 +727,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     fn test_hash(byte: u8) -> [u8; 32] {

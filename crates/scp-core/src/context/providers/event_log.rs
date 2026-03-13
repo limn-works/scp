@@ -111,10 +111,10 @@ fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8;
 /// Persistence adapter for `MerkleEventLogProvider` event log entries.
 ///
 /// Mirrors the [`ContextPersistence`](crate::context::manager::ContextPersistence)
-/// pattern: synchronous trait methods, bridged to async `ProtocolStore` via
+/// pattern: synchronous trait methods, bridged to async `ProtocolRepository` via
 /// `tokio::task::block_in_place` in production.
 ///
-/// All methods use `context_id` as a hex string (matching `ProtocolStore` key
+/// All methods use `context_id` as a hex string (matching `ProtocolRepository` key
 /// conventions).
 ///
 /// # Per-entry storage (#710)

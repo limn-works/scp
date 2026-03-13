@@ -24,7 +24,7 @@ use crate::crypto::sender_keys::{BlockNotification, SenderKeyStore, verify_block
 /// Result of revoking a member's access key.
 ///
 /// Contains the new epoch after revocation. The access key itself is
-/// deleted — the caller must remove it from the `ProtocolStore` and
+/// deleted — the caller must remove it from the `ProtocolRepository` and
 /// notify other members.
 ///
 /// See spec §9.17.2 step 3 and §9.17.5.
@@ -43,7 +43,7 @@ pub struct RevocationResult {
 /// deletion.
 ///
 /// The caller is responsible for:
-/// 1. Deleting the access key from `ProtocolStore`.
+/// 1. Deleting the access key from `ProtocolRepository`.
 /// 2. Broadcasting an `AccessKeyRevoked` event to all context members.
 /// 3. Each member's SDK purging the target's access key from their key store.
 ///

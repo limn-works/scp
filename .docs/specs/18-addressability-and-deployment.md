@@ -377,7 +377,7 @@ An `ApplicationNode` composes:
 |-----------|-------------|
 | **SCP Relay** | A relay server listening at `wss://<domain>/scp/v1` (ADR-004). Handles PUBLISH, SUBSCRIBE, QUERY, DELETE for all contexts hosted on this node. |
 | **Identity** | A DID identity (§3) with `SCPRelay` service entries pointing to this node's relay URL. Published to DHT on startup. |
-| **Storage** | `ProtocolStore` (§17.4) backed by `SqliteStorage` (§17.6). Stores identity state, context state, relay blobs, and TLS certificates. |
+| **Storage** | `ProtocolRepository` (§17.4) backed by `SqliteStorage` (§17.6). Stores identity state, context state, relay blobs, and TLS certificates. |
 | **HTTP Server** | Serves `.well-known/scp` (§18.3) and provides WebSocket upgrade at `/scp/v1`. Merges with application-provided routes. |
 | **TLS** | ACME-provisioned TLS certificates (§18.6.3). TLS 1.3 required (§9.13). |
 
@@ -398,8 +398,8 @@ impl<S: Storage> ApplicationNode<S> {
     /// The identity handle — for DID operations, context creation, messaging.
     pub fn identity(&self) -> &IdentityHandle;
 
-    /// The storage handle — for direct ProtocolStore access (§17.4).
-    pub fn storage(&self) -> &ProtocolStore<S>;
+    /// The storage handle — for direct ProtocolRepository access (§17.4).
+    pub fn storage(&self) -> &ProtocolRepository<S>;
 
     /// Returns an axum Router serving GET /.well-known/scp.
     /// Dynamically generated from node state (DID, relay URL, registered contexts).

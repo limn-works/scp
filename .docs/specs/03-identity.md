@@ -392,7 +392,7 @@ The current block list is derived by replaying the event log. Both operations ar
 
 Propagation is best-effort and idempotent — if the SDK is offline for some contexts, the block executes on next connection. The identity private state event log is the authoritative record; per-context enforcement is the mechanism.
 
-**ProtocolStore methods.** The `Storage` trait (§17) requires these methods for block list persistence:
+**ProtocolRepository methods.** The `Storage` trait (§17) requires these methods for block list persistence:
 
 - `get_global_block_list(did: &DID) -> Result<Vec<DID>>`
 - `is_globally_blocked(blocker: &DID, target: &DID) -> Result<bool>`
@@ -577,7 +577,7 @@ DeviceWrappedPsk {
 
 **Interaction with key rotation (§9.12).** Step 6 of the compromise recovery protocol specifies "re-encrypt identity private state under the new key." With PSK-based encryption, this means: (a) generate a new PSK, (b) wrap the new PSK to all enrolled devices via HPKE, (c) append a `PskRotated` event, (d) re-encrypt existing events under the new PSK incrementally. If the compromise involved a device (device stolen), that device is removed first (device removal protocol above), and the PSK rotation excludes the compromised device's X25519 public key.
 
-**ProtocolStore methods.** The `Storage` trait (§17) requires these additional methods for PSK and device management:
+**ProtocolRepository methods.** The `Storage` trait (§17) requires these additional methods for PSK and device management:
 
 - `store_private_state_key(did: &DID, psk: &Zeroizing<[u8; 32]>) -> Result<(), StoreError>`
 - `load_private_state_key(did: &DID) -> Result<Option<Zeroizing<[u8; 32]>>, StoreError>`

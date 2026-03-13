@@ -147,7 +147,7 @@ pub fn extract_own_wrapping_key(
 ///
 /// For the local member, reads `own_leaf_node()` directly which provides
 /// full access to the `LeafNode` extensions. For remote members, the wrapping
-/// public key should be obtained from the `ProtocolStore` where it was
+/// public key should be obtained from the `ProtocolRepository` where it was
 /// persisted at join time, since `OpenMLS` does not expose other members'
 /// `LeafNode` extensions through its public API.
 ///
@@ -155,7 +155,7 @@ pub fn extract_own_wrapping_key(
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
 /// Returns [`MlsError::MemberNotFound`] if the local member's DID does not
-///   match `target_did` (use `ProtocolStore::load_wrapping_public_key` for
+///   match `target_did` (use `ProtocolRepository::load_wrapping_public_key` for
 ///   remote members instead).
 /// Returns [`MlsError::ExtensionError`] if the extension data is malformed.
 pub fn extract_member_wrapping_key(
@@ -174,7 +174,7 @@ pub fn extract_member_wrapping_key(
     }
 
     // Remote members' extensions are not accessible through OpenMLS's public
-    // API. The caller should use ProtocolStore::load_wrapping_public_key()
+    // API. The caller should use ProtocolRepository::load_wrapping_public_key()
     // for remote members' wrapping keys.
     Err(MlsError::MemberNotFound(u32::MAX))
 }

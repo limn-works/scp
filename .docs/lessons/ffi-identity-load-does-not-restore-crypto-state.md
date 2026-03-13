@@ -28,7 +28,7 @@ This is a fundamental constraint of the in-memory testing adapter, not a code om
 requires one of:
 
 1. **Encrypted key material persistence** — serialize InMemoryKeyCustody's key map to storage,
-   restore on load. This is the right long-term path (spec §17 ProtocolStore) but requires
+   restore on load. This is the right long-term path (spec §17 ProtocolRepository) but requires
    encrypted blob storage, not plain `InMemoryStorage`.
 2. **Session-scoped identity** — document that `py_identity_load` only restores metadata for
    display purposes (DID display, custody label inspection). Crypto operations require a fresh
@@ -64,7 +64,7 @@ When reviewing a bridge function that reads from storage and returns an opaque h
 Two-step fix tracked in subsequent stories:
 1. Document `py_identity_load` as metadata-only (raises explicit error if caller attempts any
    crypto operation, rather than confusingly failing at the point of use).
-2. Design encrypted identity persistence (spec §17 ProtocolStore) with key material export/import
+2. Design encrypted identity persistence (spec §17 ProtocolRepository) with key material export/import
    so that a fully functional `py_identity_load` is possible.
 
 ## Related

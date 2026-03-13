@@ -392,8 +392,8 @@ pub struct ContextSnapshot {
 /// for best-effort semantics: the `ContextManager` logs errors but does
 /// not abort mutations when persistence fails.
 ///
-/// The canonical implementation is `ProtocolStoreContextBridge<S>` which
-/// wraps `Arc<ProtocolStore<S>>`.
+/// The canonical implementation is `ProtocolRepositoryContextBridge<S>` which
+/// wraps `Arc<ProtocolRepository<S>>`.
 ///
 /// See spec section 17.4.
 pub trait ContextPersistence: Send + Sync {
@@ -992,9 +992,9 @@ fn mint_governance_tokens(
 /// # `.storage()` convenience
 ///
 /// Calling `.storage(my_storage)` auto-constructs:
-/// 1. A `ProtocolStore<S>` wrapping the storage.
-/// 2. A `ProtocolStoreContextBridge<S>` for context persistence.
-/// 3. A `ProtocolStoreEventLogBridge<S>` for event log persistence.
+/// 1. A `ProtocolRepository<S>` wrapping the storage.
+/// 2. A `ProtocolRepositoryContextBridge<S>` for context persistence.
+/// 3. A `ProtocolRepositoryEventLogBridge<S>` for event log persistence.
 /// 4. A `MerkleEventLogProvider` backed by that persistence.
 ///
 /// This replaces ~8 lines of manual wiring with a single call.
@@ -1066,7 +1066,7 @@ impl ContextManagerBuilder {
 
     /// Auto-wires persistence and event log from a single `EncryptedStorage` impl.
     ///
-    /// Constructs a [`ProtocolStore`](crate::store::ProtocolStore), then
+    /// Constructs a [`ProtocolRepository`](crate::store::ProtocolRepository), then
     /// creates both the context persistence bridge and event log persistence
     /// bridge, plus a [`MerkleEventLogProvider`](super::providers::MerkleEventLogProvider)
     /// backed by that persistence. This replaces ~8 lines of manual wiring.
@@ -1074,11 +1074,12 @@ impl ContextManagerBuilder {
     /// Calling this overwrites any previously set `persistence` and `event_log`.
     #[must_use]
     pub fn storage<S: scp_platform::EncryptedStorage + 'static>(mut self, storage: S) -> Self {
-        let store = std::sync::Arc::new(crate::store::ProtocolStore::new(storage));
-        let persistence = Box::new(crate::store::context::ProtocolStoreContextBridge::new(
+        let store = std::sync::Arc::new(crate::store::ProtocolRepository::new(storage));
+        let persistence = Box::new(crate::store::context::ProtocolRepositoryContextBridge::new(
             store.clone(),
         ));
-        let event_log_persistence = crate::store::context::ProtocolStoreEventLogBridge::new(store);
+        let event_log_persistence =
+            crate::store::context::ProtocolRepositoryEventLogBridge::new(store);
         let event_log = Box::new(super::providers::MerkleEventLogProvider::with_persistence(
             std::sync::Arc::new(event_log_persistence),
         ));

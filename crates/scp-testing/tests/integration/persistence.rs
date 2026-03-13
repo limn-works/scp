@@ -1,6 +1,6 @@
 //! SCP-PERSIST-070: End-to-end integration tests for context persistence.
 //!
-//! Tests the full context lifecycle through `ProtocolStore`: create contexts
+//! Tests the full context lifecycle through `ProtocolRepository`: create contexts
 //! with members, messages, and roles -> persist -> "restart" (re-read from
 //! the same storage backend) -> verify state -> continue operations.
 //!
@@ -32,7 +32,7 @@ use scp_core::context::{
     Capability, ContextHandle, ContextMode, ContextParams, ContextState, MemoryScope,
 };
 use scp_core::crypto::sender_keys::generate_sender_key;
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 
@@ -45,9 +45,9 @@ use scp_platform::sqlite::SqliteStorage;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Creates a `ProtocolStore` wrapping fresh `InMemoryStorage`.
-fn make_store() -> ProtocolStore<InMemoryStorage> {
-    ProtocolStore::new_for_testing(InMemoryStorage::new())
+/// Creates a `ProtocolRepository` wrapping fresh `InMemoryStorage`.
+fn make_store() -> ProtocolRepository<InMemoryStorage> {
+    ProtocolRepository::new_for_testing(InMemoryStorage::new())
 }
 
 /// Creates a deterministic `BroadcastContextSnapshot` for testing.
@@ -158,7 +158,7 @@ macro_rules! persistence_tests {
                     .unwrap();
 
                 // --- Phase 2: "Restart" -- re-read from storage ---
-                // In production this would be a new ProtocolStore instance
+                // In production this would be a new ProtocolRepository instance
                 // wrapping the same durable backend (SQLite file, etc.).
                 // With InMemoryStorage, reading from the same instance
                 // proves the read path works correctly.
@@ -481,7 +481,7 @@ macro_rules! persistence_tests {
             /// Sequence numbers are stored as part of identity private state
             /// and survive a persist/load roundtrip.
             ///
-            /// The `ProtocolStore`'s identity module stores per-DID private state
+            /// The `ProtocolRepository`'s identity module stores per-DID private state
             /// at monotonic sequence numbers. This test verifies that the
             /// sequence ordering is preserved across writes and reads.
             #[tokio::test]
@@ -539,7 +539,7 @@ macro_rules! persistence_tests {
             // Broadcast context persistence
             // ---------------------------------------------------------------
 
-            /// Broadcast context snapshot roundtrips through `ProtocolStore`.
+            /// Broadcast context snapshot roundtrips through `ProtocolRepository`.
             #[tokio::test]
             async fn broadcast_snapshot_roundtrip() {
                 let store = $make_store;
@@ -849,7 +849,7 @@ persistence_tests!(sqlite, {
     let key = [0xABu8; 32];
     let dir_path = dir.path().to_path_buf();
     let _ = Box::leak(Box::new(dir));
-    ProtocolStore::new(SqliteStorage::new(&dir_path, &key).unwrap())
+    ProtocolRepository::new(SqliteStorage::new(&dir_path, &key).unwrap())
 });
 
 // FilesystemStorage -- gated behind `filesystem` feature.
@@ -858,7 +858,7 @@ persistence_tests!(filesystem, {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     let _ = Box::leak(Box::new(dir));
-    ProtocolStore::new_for_testing(FilesystemStorage::new(&dir_path).unwrap())
+    ProtocolRepository::new_for_testing(FilesystemStorage::new(&dir_path).unwrap())
 });
 
 // ---------------------------------------------------------------------------

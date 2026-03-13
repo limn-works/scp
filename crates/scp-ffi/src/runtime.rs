@@ -63,12 +63,12 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence};
-use scp_core::context::providers::ProtocolStoreContextBridge;
+use scp_core::context::providers::ProtocolRepositoryContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
@@ -131,7 +131,7 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// `event_log.rs`).
 ///
 /// When the global storage provider (`STORAGE_PROVIDER`) has been
-/// initialized via [`init_storage`], a [`ProtocolStoreContextBridge`] is
+/// initialized via [`init_storage`], a [`ProtocolRepositoryContextBridge`] is
 /// constructed from it and injected into the `ContextManager`. This enables
 /// context state persistence across process restarts without requiring
 /// callers to manually wire persistence. See issue #329.
@@ -155,7 +155,7 @@ pub fn init_context_manager() {
 /// is already initialized, this is a no-op (first call wins).
 ///
 /// When `persistence` is `None` but the global storage provider has been
-/// initialized, a [`ProtocolStoreContextBridge`] is automatically constructed
+/// initialized, a [`ProtocolRepositoryContextBridge`] is automatically constructed
 /// from it. Pass `Some(...)` to override with a custom implementation.
 pub fn init_context_manager_with(
     crypto: Box<dyn ContextCryptoProvider>,
@@ -169,7 +169,7 @@ pub fn init_context_manager_with(
     });
 }
 
-/// Constructs a [`ProtocolStoreContextBridge`] from the global storage provider,
+/// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
 /// if it has been initialized.
 ///
 /// Returns `None` if [`init_storage`] has not been called yet. This is
@@ -177,18 +177,19 @@ pub fn init_context_manager_with(
 /// without persistence until the storage provider is available.
 ///
 /// Uses `Arc<EncryptingAdapter<InMemoryStorage>>` as the storage backend
-/// for `ProtocolStore`, sharing the same underlying storage instance as
+/// for `ProtocolRepository`, sharing the same underlying storage instance as
 /// the identity layer. This ensures that identity and context data
 /// coexist in the same store, matching the `ApplicationNode` pattern in
 /// `scp-node`.
 ///
 /// The `EncryptingAdapter` wraps `InMemoryStorage` with per-value
 /// AES-256-GCM encryption, satisfying the sealed `EncryptedStorage`
-/// bound required by `ProtocolStore::new()`.
+/// bound required by `ProtocolRepository::new()`.
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
     STORAGE_PROVIDER.get().map(|storage| {
-        let protocol_store = Arc::new(ProtocolStore::new(Arc::clone(storage)));
-        Box::new(ProtocolStoreContextBridge::new(protocol_store)) as Box<dyn ContextPersistence>
+        let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+        Box::new(ProtocolRepositoryContextBridge::new(protocol_repository))
+            as Box<dyn ContextPersistence>
     })
 }
 
@@ -925,7 +926,7 @@ pub fn remove_identity(did: &str) {
 /// The storage backend is `InMemoryStorage` wrapped in
 /// [`EncryptingAdapter`] with a random AES-256-GCM key. This satisfies
 /// the sealed `EncryptedStorage` bound required by
-/// `ProtocolStore::new()`, matching the `scp-node` ephemeral mode
+/// `ProtocolRepository::new()`, matching the `scp-node` ephemeral mode
 /// pattern. Persistent backends (`SQLite` via [`SqliteStorage`]) will
 /// replace it when platform storage adapters land.
 ///
@@ -934,7 +935,7 @@ pub fn remove_identity(did: &str) {
 /// functions without lifetime issues.
 ///
 /// See spec section 17.3 for key conventions and section 17.4 for
-/// `ProtocolStore` design.
+/// `ProtocolRepository` design.
 ///
 /// # Safety: Single-Tenant Only
 ///

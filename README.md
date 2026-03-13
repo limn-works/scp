@@ -396,7 +396,7 @@ Chain depth is capped at 3 hops (protocol default) to bound amplification. The a
 ```
 crates/
   scp-core/          — Protocol engine (context, identity, trust, discovery managers)
-    store/           — ProtocolStore layer (thick), Storage trait (thin, 6 methods)
+    store/           — ProtocolRepository layer (thick), Storage trait (thin, 6 methods)
   scp-crypto/        — MLS (OpenMLS), UCAN (native impl), Merkle trees, HPKE, HKDF
   scp-transport/     — Transport adapter trait + SCP native relay adapter
   scp-relay/         — Reference relay implementation

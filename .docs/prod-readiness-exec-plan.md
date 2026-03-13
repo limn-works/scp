@@ -117,7 +117,7 @@ These spec findings **block** existing implementation work. Implementing the cod
 |---|---|---|
 | CRYPTO-14 (ParticipationProfile signing key KDF) | SCP-BA-001–006 | — |
 | CRYPTO-18 (broadcast key nonce) | #352 (BroadcastEnvelope fields) | — |
-| 03-IDENTITY-1/2 (private state encryption) | #329 (ProtocolStore persistence) | #372 |
+| 03-IDENTITY-1/2 (private state encryption) | #329 (ProtocolRepository persistence) | #372 |
 | 8.4/9.1 (app sandboxing) | SCP-ACR-* (capability registry) | #376 |
 | 15-001 (GDPR erasure — §15 clarification) | — | #379 |
 
@@ -359,7 +359,7 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 **Step 1:** #385 — Production provider implementations (ContextCrypto, Transport, EventLog, Persistence) — **COMPLETE** → cd90541 + 0e2dd00
   - Absorbs #300 (no production providers)
   - Pure scp-core/scp-transport, no FFI
-  - MlsCryptoProvider, RelayTransportProvider, MerkleEventLogProvider, InMemoryPersistence + ProtocolStoreContextBridge
+  - MlsCryptoProvider, RelayTransportProvider, MerkleEventLogProvider, InMemoryPersistence + ProtocolRepositoryContextBridge
   - 31 new tests
 **Step 2 (parallel):** Bridge rewrites — **COMPLETE**
   - #386 — PyO3 bridge rewrite → 83c6630 (ContextRuntime → ContextManager + FfiBridgeState)
@@ -612,7 +612,7 @@ PHASE 12: #291,#301,#303,#343,#344
 |-------|-------------|--------|
 | #328 | #356 | py_context_send routes through ContextManager |
 | #332 | #356 | py_context_receive fed by transport provider |
-| #329 | #356 | ProtocolStore wired via ContextPersistence |
+| #329 | #356 | ProtocolRepository wired via ContextPersistence |
 
 ---
 

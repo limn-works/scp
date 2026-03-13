@@ -154,7 +154,7 @@ pub fn update_pin_last_verified(pin: &CertificatePin, now_secs: u64) -> Certific
 /// Relay client implementations should call this method after the TLS
 /// handshake completes but before sending any application data. The
 /// `stored_pin` and storage operations are the caller's responsibility
-/// (typically via `ProtocolStore::load_cert_pin` / `store_cert_pin`).
+/// (typically via `ProtocolRepository::load_cert_pin` / `store_cert_pin`).
 ///
 /// # Arguments
 ///

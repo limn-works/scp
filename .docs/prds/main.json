@@ -1425,7 +1425,7 @@
         "ContextMode enum": "```rust\npub enum ContextMode {\n    Encrypted,\n    Broadcast,\n}\n```\nEncrypted: MLS-backed, sender-side keys, full forward secrecy (default).\nBroadcast: Per-author broadcast keys, no MLS, mandatory subscriber registration (§5.14).",
         "Broadcast mode acceptance criteria": "When `mode == Broadcast`:\n- No MLS group is created. Context uses per-author AES-256-GCM broadcast keys instead of MLS group keys.\n- Subscriber count is unlimited (no MLS group size bound).\n- The context's public `routing_id` is derived as `SHA-256(context_id)` — deterministic and discoverable by any agent that knows the context_id.\n- Authors are bounded participants who hold `MessagesWrite` capability. Each author maintains their own broadcast key with independent epoch rotation.\n- Subscribers hold `MessagesRead` capability and receive broadcast keys via HPKE-wrapped key distribution (no MLS Welcome messages).\n- `create_context` skips MLS group creation (step 2) and instead initializes the creator's broadcast key at epoch 0.\n- `join_context` for subscribers registers DID-authenticated subscription without MLS add_member.\n- `send_message` encrypts with the author's current broadcast key, wraps in `BroadcastEnvelope` (§5.14.5), and publishes to the public routing_id.\n- All other context lifecycle operations (close, expire, TTL, event log) operate identically regardless of mode.",
         "TemplateId enum": "```rust\npub enum TemplateId {\n    BilateralEphemeral,\n    BilateralPersistent,\n    Coordination,\n    GroupDiscussion,\n    PublicBroadcast,\n    GatedBroadcast,\n}\n```\nTemplates are protocol constants — not user-extensible. When present, all other ContextParams fields must match the template definition exactly.",
-        "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolStore (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
+        "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolRepository (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
         "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely."
       },
       "result": "Implemented context types: ContextState FSM, ContextHandle, ContextParams, all parameter enums. 52 tests."
@@ -2049,7 +2049,7 @@
         "EventLog struct": "```rust\npub struct EventLog {\n    leaves: Vec<[u8; 32]>,\n    tree: Vec<Vec<[u8; 32]>>,\n    context_id: ContextId,\n}\n```",
         "Event struct": "```rust\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct Event {\n    pub event_type: EventType,\n    pub actor_did: DID,\n    pub timestamp: u64,\n    pub sequence: u64,\n    pub payload: EventPayload,\n    pub prev_hash: [u8; 32],\n    pub signature: Ed25519Signature,\n}\n```",
         "EventType enum": "```rust\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub enum EventType {\n    ContextCreated,\n    ContextClosing,\n    ContextClosed,\n    ContextExpired,\n    MemberJoined,\n    MemberLeft,\n    RoleAssigned,\n    TokenRevoked,\n    MessageSent,\n    ToolRegistered,\n    ToolUpdated,\n    ToolInvoked,\n    ToolVerified,\n    ToolInterfaceEstablished,\n    GovernanceAction,\n    ConsistencyCheckpoint,\n    AbsenceProofRequested,\n    MemberBlocked,\n    KeyEpochAdvance,\n}\n```",
-        "Implementation notes": "Language: Rust. Hashing: SHA-256 via sha2 crate. Storage: In-memory for Phase 2 initial development, backed by ProtocolStore (§17.4) for persistence. Event log keys follow convention in §17.3: context/{context_id}/event/{seq:020d} for events, context/{context_id}/event_tree/{level}/{index} for Merkle tree nodes. Crate: scp-core. Module: scp-core/event_log/. Proof format: Binary serialization of inclusion proof paths (sibling hashes + left/right indicators)."
+        "Implementation notes": "Language: Rust. Hashing: SHA-256 via sha2 crate. Storage: In-memory for Phase 2 initial development, backed by ProtocolRepository (§17.4) for persistence. Event log keys follow convention in §17.3: context/{context_id}/event/{seq:020d} for events, context/{context_id}/event_tree/{level}/{index} for Merkle tree nodes. Crate: scp-core. Module: scp-core/event_log/. Proof format: Binary serialization of inclusion proof paths (sibling hashes + left/right indicators)."
       }
     },
     {
@@ -3742,7 +3742,7 @@
     },
     {
       "id": "SCP-065",
-      "title": "Implement trust input aggregation and ProtocolStore integration",
+      "title": "Implement trust input aggregation and ProtocolRepository integration",
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
@@ -3750,7 +3750,7 @@
       "files": [
         "crates/scp-core/trust/aggregate.rs"
       ],
-      "description": "Implement aggregate_trust_input that combines all trust engine layers into a single TrustInput struct for agent-level evaluation. Includes ProtocolStore integration for caching verified attestations with TTL-based refresh, storing revocation list state per context, and persisting challenge results with timestamps.",
+      "description": "Implement aggregate_trust_input that combines all trust engine layers into a single TrustInput struct for agent-level evaluation. Includes ProtocolRepository integration for caching verified attestations with TTL-based refresh, storing revocation list state per context, and persisting challenge results with timestamps.",
       "acceptanceCriteria": [
         "aggregate_trust_input(context, subject_did) -> Result<TrustInput, TrustError> computes participation record from event log",
         "aggregate_trust_input collects and verifies attestations from cache",
@@ -3758,23 +3758,23 @@
         "aggregate_trust_input collects consequence structure from context params",
         "aggregate_trust_input computes threshold counts per attestation type",
         "aggregate_trust_input returns the complete TrustInput struct for agent-level evaluation",
-        "ProtocolStore integration: cache verified attestations with TTL-based refresh",
-        "ProtocolStore integration: store revocation list state per context",
-        "ProtocolStore integration: persist challenge results with timestamps"
+        "ProtocolRepository integration: cache verified attestations with TTL-based refresh",
+        "ProtocolRepository integration: store revocation list state per context",
+        "ProtocolRepository integration: persist challenge results with timestamps"
       ],
       "actionItems": [
         "Create crates/scp-core/trust/aggregate.rs with aggregate_trust_input function",
         "Call compute_participation_record from participation.rs for the subject DID",
-        "Collect attestations from ProtocolStore cache, verify each via verify_attestation",
+        "Collect attestations from ProtocolRepository cache, verify each via verify_attestation",
         "Refresh stale attestations based on TTL",
-        "Collect challenge results from ProtocolStore with timestamps",
+        "Collect challenge results from ProtocolRepository with timestamps",
         "Extract consequence structure from context parameters",
         "Compute threshold counts per AttestationType from verified attestations",
         "Assemble and return complete TrustInput struct",
-        "Implement ProtocolStore cache layer for verified attestations with configurable TTL",
-        "Implement revocation list state storage per context in ProtocolStore",
-        "Implement challenge result persistence with timestamps in ProtocolStore",
-        "Write integration tests for aggregate_trust_input with mock ProtocolStore"
+        "Implement ProtocolRepository cache layer for verified attestations with configurable TTL",
+        "Implement revocation list state storage per context in ProtocolRepository",
+        "Implement challenge result persistence with timestamps in ProtocolRepository",
+        "Write integration tests for aggregate_trust_input with mock ProtocolRepository"
       ],
       "blockedBy": [
         "SCP-061",
@@ -3803,7 +3803,7 @@
       "files": [
         "crates/scp-core/context/ttl.rs"
       ],
-      "description": "Implement TTL tracking per-context via ProtocolStore. TTL is checked against Clock trait (§16.3) on every context action. TTL expiry triggers context close. Timer spawned at context creation via tokio, fires at expiry and calls handle_ttl_expiry(). Extension requires consent (all-member for bilateral, governance for multi-party) and is recorded as a context event in the Merkle log.",
+      "description": "Implement TTL tracking per-context via ProtocolRepository. TTL is checked against Clock trait (§16.3) on every context action. TTL expiry triggers context close. Timer spawned at context creation via tokio, fires at expiry and calls handle_ttl_expiry(). Extension requires consent (all-member for bilateral, governance for multi-party) and is recorded as a context event in the Merkle log.",
       "acceptanceCriteria": [
         "TtlPolicy enum defined with variants: None, Finite(Duration)",
         "TTL checked against Clock trait (§16.3) on every context action",
@@ -6102,7 +6102,7 @@
       "files": [
         ".docs/adrs/phase-6.md"
       ],
-      "description": "ADR-029 is currently a stub and is described as 'the hardest problem.' This story completes it with full Decision, Rationale, Implementation, Dependencies, and Acceptance Criteria sections. The ADR defines the offline/sync strategy: how clients handle disconnection, message queuing, state reconciliation, and conflict resolution. Depends on context lifecycle (ADR-008), event log (ADR-011), and persistence (ProtocolStore).",
+      "description": "ADR-029 is currently a stub and is described as 'the hardest problem.' This story completes it with full Decision, Rationale, Implementation, Dependencies, and Acceptance Criteria sections. The ADR defines the offline/sync strategy: how clients handle disconnection, message queuing, state reconciliation, and conflict resolution. Depends on context lifecycle (ADR-008), event log (ADR-011), and persistence (ProtocolRepository).",
       "acceptanceCriteria": [
         "ADR-029 has complete Decision section covering offline queuing, sync reconciliation, conflict resolution",
         "ADR-029 has complete Rationale section addressing the 'hardest problem' tensions",
@@ -7054,7 +7054,7 @@
           "ADR-011 — Event log design",
           "§10.3 — Protocol state footprint",
           "§7.3.1 — Verifiable event logs",
-          "§17.4 — ProtocolStore event log key convention"
+          "§17.4 — ProtocolRepository event log key convention"
         ]
       },
       "result": "CheckpointManager for periodic checkpoint creation. CheckpointedProof for post-checkpoint verification. TruncatedEventLog for pruned log operations. Cross-checkpoint consistency verification. ~40 tests."
@@ -7130,7 +7130,7 @@
         "Tests verify tier migration, cold fetch, and proof verification"
       ],
       "actionItems": [
-        "Implement hot tier: recent events on-device with ProtocolStore key convention from §17.4",
+        "Implement hot tier: recent events on-device with ProtocolRepository key convention from §17.4",
         "Implement cold tier: event offloading to relay storage",
         "Implement on-demand proof fetching from cold tier",
         "Implement client-side cryptographic verification of all fetched proofs",
@@ -7153,7 +7153,7 @@
         "designSpaceOption": "Tiered storage: hot (recent, on-device) + cold (old, relay-hosted, proof-fetchable)",
         "references": [
           "ADR-011 — Event log design",
-          "§17.4 — ProtocolStore event log key convention"
+          "§17.4 — ProtocolRepository event log key convention"
         ]
       },
       "result": "tiered_storage.rs: TieredEventLog, ColdTierProvider trait, TierConfig, hot/cold migration, proof verification. Tests pass."
@@ -7566,14 +7566,14 @@
         "Policy CRUD: `get_auto_accept_policy(identity: &DID) -> Result<Option<AutoAcceptPolicy>, StorageError>`",
         "Policy CRUD: `delete_auto_accept_policy(identity: &DID) -> Result<(), StorageError>`",
         "Unit test: set and get roundtrip succeeds",
-        "Unit test: policy persists across ProtocolStore re-initialization (survives restart)",
+        "Unit test: policy persists across ProtocolRepository re-initialization (survives restart)",
         "Unit test: absent policy returns None (opt-in model)",
         "On SDK initialization, policies are loaded from storage and applied to the invitation evaluation pipeline",
         "Hard rule: auto-accept NEVER applies to contexts with economic policy requiring payment (§19.3, §19.14). This is non-overridable — no auto-accept policy configuration can bypass it. Agents never silently incur costs"
       ],
       "actionItems": [
         "Create `crates/scp-core/context/policy.rs` with `AutoAcceptPolicy` struct and associated types",
-        "Add policy storage methods to `ProtocolStore` in `crates/scp-core/store/protocol_store.rs`",
+        "Add policy storage methods to `ProtocolRepository` in `crates/scp-core/store/protocol_repository.rs`",
         "Implement key convention `policy/{identity_did}/auto_accept` for Storage trait operations",
         "Write unit tests for policy CRUD and persistence across restarts",
         "Implement policy loading on SDK initialization: load all auto-accept policies from Storage and register them with the invitation evaluation pipeline"
@@ -8080,7 +8080,7 @@
         "crates/scp-node/src/lib.rs",
         "Cargo.toml"
       ],
-      "description": "Create the scp-node crate and implement the ApplicationNode builder as specified in §18.6 and ADR-032. ApplicationNode is a concrete SDK type that composes an SCP relay, an identity, and an HTTP server into a single deployable unit — the 'one box' deployment pattern.\n\nApplicationNode is NOT an HTTP framework — it exposes axum Router instances for composition with existing application code. The builder pattern wires: relay server start, DID publication with SCPRelay entries, storage initialization.\n\nComponents: SCP Relay (ADR-004 at wss://<domain>/scp/v1), Identity (§3 with SCPRelay service entries), Storage (ProtocolStore §17.4 backed by SqliteStorage §17.6), HTTP Server (.well-known/scp + WebSocket upgrade), TLS (ACME §18.6.3).",
+      "description": "Create the scp-node crate and implement the ApplicationNode builder as specified in §18.6 and ADR-032. ApplicationNode is a concrete SDK type that composes an SCP relay, an identity, and an HTTP server into a single deployable unit — the 'one box' deployment pattern.\n\nApplicationNode is NOT an HTTP framework — it exposes axum Router instances for composition with existing application code. The builder pattern wires: relay server start, DID publication with SCPRelay entries, storage initialization.\n\nComponents: SCP Relay (ADR-004 at wss://<domain>/scp/v1), Identity (§3 with SCPRelay service entries), Storage (ProtocolRepository §17.4 backed by SqliteStorage §17.6), HTTP Server (.well-known/scp + WebSocket upgrade), TLS (ACME §18.6.3).",
       "acceptanceCriteria": [
         "New crate scp-node exists at crates/scp-node/ with Cargo.toml",
         "scp-node is listed as workspace member in root Cargo.toml",
@@ -8090,7 +8090,7 @@
         ".build() initializes storage, loads or generates identity, starts relay server, publishes DID document with SCPRelay entry",
         "node.relay() returns relay handle for direct relay operations",
         "node.identity() returns identity handle for DID operations",
-        "node.storage() returns ProtocolStore reference",
+        "node.storage() returns ProtocolRepository reference",
         "ApplicationNode::builder().domain(\"example.com\").generate_identity().build() succeeds with relay listening and DID published",
         "Unit test: builder requires domain to be set before build",
         "Unit test: builder with generate_identity creates a new DID",
@@ -8101,7 +8101,7 @@
       "actionItems": [
         "Create crates/scp-node/ directory with Cargo.toml",
         "Add scp-node to workspace members in root Cargo.toml",
-        "Define ApplicationNode struct in lib.rs with RelayHandle, IdentityHandle, ProtocolStore fields",
+        "Define ApplicationNode struct in lib.rs with RelayHandle, IdentityHandle, ProtocolRepository fields",
         "Define ApplicationNodeBuilder with optional fields: domain, identity, storage, bind_addr, acme_email",
         "Implement builder methods (.domain(), .identity(), .generate_identity(), .storage(), etc.)",
         "Implement .build() async method: validate required fields, init storage, load/generate identity, start relay, publish DID with SCPRelay entries",
@@ -9283,9 +9283,9 @@
         "Adapters configured per-identity in SDK (not per-context)",
         "Identity may have multiple adapters simultaneously (e.g., x402 + Lightning + SPL)",
         "SCP.Identity.configureAdapter(adapter) function registers a payment adapter with the identity's SDK instance",
-        "configureAdapter stores adapter credentials via ProtocolStore.store_adapter_credentials (§17.3)",
+        "configureAdapter stores adapter credentials via ProtocolRepository.store_adapter_credentials (§17.3)",
         "configureAdapter validates adapter implements PaymentAdapter trait before accepting",
-        "Adapter credential retrieval via ProtocolStore.load_adapter_credentials for payment execution",
+        "Adapter credential retrieval via ProtocolRepository.load_adapter_credentials for payment execution",
         "list_adapter_credentials returns all configured adapter IDs for an identity",
         "Unit test: store and load adapter credentials roundtrip",
         "Unit test: credentials not accessible from context operations (isolation test)",
@@ -9293,7 +9293,7 @@
       ],
       "actionItems": [
         "Create credentials.rs in economy module",
-        "Implement AdapterCredentialStore wrapping ProtocolStore economic methods",
+        "Implement AdapterCredentialStore wrapping ProtocolRepository economic methods",
         "Implement configure_adapter function with validation",
         "Implement credential retrieval for payment execution flow",
         "Add credential isolation tests",
@@ -9329,7 +9329,7 @@
         "SPL-specific": "Human calls ApproveChecked granting agent's keypair delegate authority on their USDC ATA — single delegate per account, amount-capped.",
         "protocolSection": "§19.2.4, §19.2.5, §19.11"
       },
-      "result": "Implemented adapter credential management in economy/credentials.rs with AdapterCredential, CredentialStore trait, InMemoryCredentialStore, configure_adapter(), list_adapter_credentials(). Added store/ module with ProtocolStore trait and economy storage interface. 24 unit tests. Credentials bound to human identity, not agent."
+      "result": "Implemented adapter credential management in economy/credentials.rs with AdapterCredential, CredentialStore trait, InMemoryCredentialStore, configure_adapter(), list_adapter_credentials(). Added store/ module with ProtocolRepository trait and economy storage interface. 24 unit tests. Credentials bound to human identity, not agent."
     },
     {
       "id": "SCP-163",
@@ -9927,7 +9927,7 @@
         "crates/scp-ffi/src/runtime.rs",
         "crates/scp-ffi/src/lib.rs"
       ],
-      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the DID string with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolStore (scp-core/store) exist, and platform implementations are done (SCP-113 Android, SCP-093 Apple). What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolStore to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
+      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the DID string with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolRepository (scp-core/store) exist, and platform implementations are done (SCP-113 Android, SCP-093 Apple). What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolRepository to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
       "acceptanceCriteria": [
         "Python FFI bridge accepts a StorageProvider at initialization (analogous to KeyCustody injection in SCP-214)",
         "py_identity_create persists identity state (DID, custody type, key handles) via StorageProvider after successful creation",
@@ -9935,7 +9935,7 @@
         "py_identity_load returns an error if the DID is not found in storage (not a silent fallback to in_memory)",
         "Identity state survives process restart when backed by persistent storage (SQLite, Keychain, etc.)",
         "In-memory storage works for testing (InMemoryStorage from scp-platform/testing)",
-        "Storage key convention follows ProtocolStore patterns (e.g., identity/{did}/state)"
+        "Storage key convention follows ProtocolRepository patterns (e.g., identity/{did}/state)"
       ],
       "actionItems": [
         "Add StorageProvider injection to Python FFI initialization (py_init or module-level registration)",
@@ -9953,7 +9953,7 @@
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         }
       ],
       "details": {
@@ -10136,7 +10136,7 @@
     },
     {
       "id": "SCP-222",
-      "title": "Implement ProtocolStore typed domain layer over Storage trait",
+      "title": "Implement ProtocolRepository typed domain layer over Storage trait",
       "gate": "gate-audit",
       "status": "done",
       "blockedBy": [
@@ -10144,11 +10144,11 @@
       ],
       "files": [
         "crates/scp-core/src/store/mod.rs",
-        "crates/scp-core/src/store/protocol_store.rs"
+        "crates/scp-core/src/store/protocol_repository.rs"
       ],
-      "description": "Spec §17.4 defines a ProtocolStore that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
+      "description": "Spec §17.4 defines a ProtocolRepository that provides typed domain methods (60+) wrapping the raw Storage trait (SCP-001). This is the persistence layer that all higher-level code uses. Currently not implemented — higher-level code works with in-memory state only. Note: SCP-135 (auto-accept policy persistence) is a consumer of Storage, not a prerequisite.",
       "acceptanceCriteria": [
-        "ProtocolStore<S: Storage> struct wraps a generic Storage implementation with typed accessor methods",
+        "ProtocolRepository<S: Storage> struct wraps a generic Storage implementation with typed accessor methods",
         "Identity state CRUD: store/load/delete identity, key handles, DID documents",
         "Context state CRUD: store/load/delete context params, membership, roles, event log",
         "UCAN state: store/load/delete tokens, revocation lists, nonce tracker",
@@ -10162,7 +10162,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -10370,7 +10370,7 @@
     },
     {
       "id": "SCP-230",
-      "title": "Implement event_log store module for ProtocolStore",
+      "title": "Implement event_log store module for ProtocolRepository",
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
@@ -10382,7 +10382,7 @@
         "crates/scp-core/src/store/event_log.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Spec §17.4 defines an event_log.rs submodule of ProtocolStore with 8 methods for event log persistence, Merkle tree nodes, and roots. SCP-222 establishes the ProtocolStore struct and key conventions; this story implements the event log domain methods as an impl block on ProtocolStore<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (context/{context_id}/event/{seq:020d}, context/{context_id}/event_meta/count, context/{context_id}/event_meta/root, context/{context_id}/event_tree/{level}/{index}).",
+      "description": "Spec §17.4 defines an event_log.rs submodule of ProtocolRepository with 8 methods for event log persistence, Merkle tree nodes, and roots. SCP-222 establishes the ProtocolRepository struct and key conventions; this story implements the event log domain methods as an impl block on ProtocolRepository<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (context/{context_id}/event/{seq:020d}, context/{context_id}/event_meta/count, context/{context_id}/event_meta/root, context/{context_id}/event_tree/{level}/{index}).",
       "acceptanceCriteria": [
         "append_event(context_id, seq, event_hash) stores event data at context/{context_id}/event/{seq:020d}",
         "load_event(context_id, seq) retrieves event data by sequence number or returns None",
@@ -10396,7 +10396,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         }
       ],
       "actionItems": [],
@@ -10404,7 +10404,7 @@
     },
     {
       "id": "SCP-231",
-      "title": "Implement transport store module for ProtocolStore",
+      "title": "Implement transport store module for ProtocolRepository",
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
@@ -10416,7 +10416,7 @@
         "crates/scp-core/src/store/transport.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Spec §17.4 defines a transport.rs submodule of ProtocolStore with 6 methods for relay scores and key package persistence. SCP-222 establishes the ProtocolStore struct and key conventions; this story implements the transport domain methods as an impl block on ProtocolStore<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (relay_score/{relay_url}, key_package/{relay_url}/{index}).",
+      "description": "Spec §17.4 defines a transport.rs submodule of ProtocolRepository with 6 methods for relay scores and key package persistence. SCP-222 establishes the ProtocolRepository struct and key conventions; this story implements the transport domain methods as an impl block on ProtocolRepository<S>. Each method translates to one or two Storage trait calls using the key convention from §17.3 (relay_score/{relay_url}, key_package/{relay_url}/{index}).",
       "acceptanceCriteria": [
         "store_relay_score(relay_url, score) persists relay score data at relay_score/{relay_url}",
         "load_relay_score(relay_url) retrieves relay score data or returns None",
@@ -10428,7 +10428,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         }
       ],
       "actionItems": [],

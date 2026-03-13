@@ -279,7 +279,7 @@ impl ResetRequest {
 /// oldest-first eviction to prevent unbounded memory growth.
 ///
 /// This is the primary, synchronous anti-replay defense. The persistent
-/// `ProtocolStore` nonce tracking is a defence-in-depth layer for crash
+/// `ProtocolRepository` nonce tracking is a defence-in-depth layer for crash
 /// recovery (same pattern as UCAN `NonceTracker` in `crypto/ucan/nonce.rs`).
 ///
 /// See §23.5.2, ADR-029 section 4.

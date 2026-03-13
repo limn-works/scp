@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use scp_core::store::ProtocolStore;
+use scp_core::store::ProtocolRepository;
 use scp_identity::DID;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
@@ -27,7 +27,7 @@ pub struct SimulatedIdentity {
     /// Direct storage access for tests.
     storage: InMemoryStorage,
     /// Protocol store wrapping its own storage instance.
-    protocol_store: ProtocolStore<InMemoryStorage>,
+    protocol_repository: ProtocolRepository<InMemoryStorage>,
     /// Human-readable label for this identity.
     label: String,
 }
@@ -35,7 +35,7 @@ pub struct SimulatedIdentity {
 impl SimulatedIdentity {
     /// Creates a new simulated identity.
     ///
-    /// The `ProtocolStore` is created from a fresh `InMemoryStorage` instance.
+    /// The `ProtocolRepository` is created from a fresh `InMemoryStorage` instance.
     /// The `storage` parameter is retained separately for direct test access.
     #[must_use]
     pub fn new(
@@ -44,12 +44,12 @@ impl SimulatedIdentity {
         custody: Arc<InMemoryKeyCustody>,
         storage: InMemoryStorage,
     ) -> Self {
-        let protocol_store = ProtocolStore::new_for_testing(InMemoryStorage::new());
+        let protocol_repository = ProtocolRepository::new_for_testing(InMemoryStorage::new());
         Self {
             did,
             custody,
             storage,
-            protocol_store,
+            protocol_repository,
             label: label.into(),
         }
     }
@@ -80,7 +80,7 @@ impl SimulatedIdentity {
 
     /// Returns a reference to the protocol store.
     #[must_use]
-    pub const fn protocol_store(&self) -> &ProtocolStore<InMemoryStorage> {
-        &self.protocol_store
+    pub const fn protocol_repository(&self) -> &ProtocolRepository<InMemoryStorage> {
+        &self.protocol_repository
     }
 }

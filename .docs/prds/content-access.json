@@ -58,7 +58,7 @@
         "crates/scp-core/src/identity/mod.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Implement block list storage in identity private state per §3.7.1. Two granularities: global block list (Tier 2, cross-context) and per-context block list (Tier 1, single context). Block lists are append-only event logs with commutative operations (BlockDID/UnblockDID for global, BlockDIDInContext/UnblockDIDInContext for per-context). Current state is derived by replaying the event log.\n\nAdd ProtocolStore methods: get_global_block_list(), is_globally_blocked(), get_context_block_list(), is_blocked_in_context(). Implementations MAY maintain materialized views for query performance.\n\nMulti-device sync is conflict-free because all operations are commutative — two devices can independently add blocks and the union is correct.",
+      "description": "Implement block list storage in identity private state per §3.7.1. Two granularities: global block list (Tier 2, cross-context) and per-context block list (Tier 1, single context). Block lists are append-only event logs with commutative operations (BlockDID/UnblockDID for global, BlockDIDInContext/UnblockDIDInContext for per-context). Current state is derived by replaying the event log.\n\nAdd ProtocolRepository methods: get_global_block_list(), is_globally_blocked(), get_context_block_list(), is_blocked_in_context(). Implementations MAY maintain materialized views for query performance.\n\nMulti-device sync is conflict-free because all operations are commutative — two devices can independently add blocks and the union is correct.",
       "acceptanceCriteria": [
         "BlockListEvent enum has four variants: BlockDID { target_did, timestamp }, UnblockDID { target_did, timestamp }, BlockDIDInContext { target_did, context_id, timestamp }, UnblockDIDInContext { target_did, context_id, timestamp }",
         "get_global_block_list(did) returns Vec<DID> of all globally blocked DIDs",
@@ -68,7 +68,7 @@
         "Block list state is derived from append-only event log replay",
         "BlockDID followed by UnblockDID for the same target results in unblocked state",
         "Operations are commutative: BlockDID(X) then BlockDID(Y) == BlockDID(Y) then BlockDID(X)",
-        "Block list events are persisted to ProtocolStore under identity private state keys",
+        "Block list events are persisted to ProtocolRepository under identity private state keys",
         "All types derive Debug, Clone, Serialize, Deserialize",
         "Tests verify round-trip serialization of all BlockListEvent variants",
         "Tests verify block/unblock lifecycle for both global and per-context lists",
@@ -77,7 +77,7 @@
       "actionItems": [
         "Define BlockListEvent enum with four variants",
         "Implement block list event log append and replay",
-        "Add ProtocolStore key constants for block list storage",
+        "Add ProtocolRepository key constants for block list storage",
         "Implement get_global_block_list and is_globally_blocked",
         "Implement get_context_block_list and is_blocked_in_context",
         "Add unit tests for all operations"
@@ -224,21 +224,21 @@
         "crates/scp-core/src/crypto/mod.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Implement per-member access key generation, distribution, and storage per ADR-038 §2. Each context member holds an AES-256 access key generated at join time. Access keys are distributed via the pull-based protocol (same pattern as sender keys, §9.16.2): AccessKeyRequest/AccessKeyResponse wire types using HPKE with ephemeral X25519 keypairs.\n\nAccessKey struct: 32-byte AES-256 key, context_id, member_did, epoch counter. Key material uses Zeroize/ZeroizeOnDrop for secure cleanup. Persisted to ProtocolStore under context/{context_id}/access_key/{did_hex}.\n\nAccess key generation is triggered by AddMember governance action execution. The executor generates the key and distributes it to the new member.",
+      "description": "Implement per-member access key generation, distribution, and storage per ADR-038 §2. Each context member holds an AES-256 access key generated at join time. Access keys are distributed via the pull-based protocol (same pattern as sender keys, §9.16.2): AccessKeyRequest/AccessKeyResponse wire types using HPKE with ephemeral X25519 keypairs.\n\nAccessKey struct: 32-byte AES-256 key, context_id, member_did, epoch counter. Key material uses Zeroize/ZeroizeOnDrop for secure cleanup. Persisted to ProtocolRepository under context/{context_id}/access_key/{did_hex}.\n\nAccess key generation is triggered by AddMember governance action execution. The executor generates the key and distributes it to the new member.",
       "acceptanceCriteria": [
         "AccessKey struct with 32-byte key, context_id, member_did, epoch fields; derives Zeroize and ZeroizeOnDrop",
         "generate_access_key(context_id, member_did) returns a cryptographically random AccessKey with epoch 0",
         "AccessKeyRequest wire type with requester_did, context_id, wrapping_pubkey (ephemeral X25519), signature",
         "AccessKeyResponse wire type with context_id, member_did, epoch, hpke_sealed_key, ephemeral_pubkey",
         "Distribution uses HPKE: ECDH between ephemeral secret and requester wrapping pubkey, HKDF derive, AES-128-GCM encrypt the access key",
-        "Access key persisted to ProtocolStore under context/{context_id}/access_key/{did_hex}",
+        "Access key persisted to ProtocolRepository under context/{context_id}/access_key/{did_hex}",
         "Access key epoch counter persisted under context/{context_id}/access_key/{did_hex}/epoch",
         "Revocation deletes the access key and increments epoch (new key on restoration)",
         "Context-wide rotation generates new keys for all members, old keys retained for historical access",
         "All wire types derive Debug, Clone, Serialize, Deserialize",
         "Tests verify key generation produces 32 random bytes",
         "Tests verify HPKE distribution round-trip (request -> response -> unwrap)",
-        "Tests verify ProtocolStore persistence round-trip"
+        "Tests verify ProtocolRepository persistence round-trip"
       ],
       "actionItems": [
         "Create crypto/access_keys/ module directory",
@@ -246,7 +246,7 @@
         "Implement generate_access_key",
         "Define AccessKeyRequest and AccessKeyResponse wire types",
         "Implement HPKE-based distribution (reuse sender key distribution pattern)",
-        "Add ProtocolStore key constants and persistence methods",
+        "Add ProtocolRepository key constants and persistence methods",
         "Implement revocation (key deletion + epoch increment)",
         "Implement context-wide rotation",
         "Add unit tests"
@@ -348,8 +348,8 @@
         "Block notification signature is verified by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039",
         "Verification succeeds for both #active (Active Signing Key) and #agent (Agent Signing Key) paths",
         "Invalid block notification signature causes discard + anomaly log (no destruction)",
-        "Tests verify sender key deletion on verified block notification (all epochs for blocker DID purged from ProtocolStore)",
-        "Tests verify access key deletion on both sides (blocker and blocked) via ProtocolStore get returning None",
+        "Tests verify sender key deletion on verified block notification (all epochs for blocker DID purged from ProtocolRepository)",
+        "Tests verify access key deletion on both sides (blocker and blocked) via ProtocolRepository get returning None",
         "Tests verify invalid signature causes discard without destruction (sender keys and access keys unchanged)",
         "ContentAccessState enum with Full, ReadOnly, PresenceOnly, NonMember variants; derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize",
         "ContentAccessState transitions: Full -> ReadOnly (via RevokeWriteAccess), Full -> PresenceOnly (via RevokeReadAccess + RevokeWriteAccess), Full -> NonMember (via RemoveMember)",
@@ -525,7 +525,7 @@
         "Test creates a broadcast context with Author and Subscriber",
         "Broadcast test: governance RevokeWriteAccess removes Author. Subscribers cannot get Author's new key. RestoreWriteAccess restores Author, forward-only.",
         "Tier stacking test: both Alice (Tier 1) and governance (Tier 3) revoke Dave's access. Reversing only one does not restore access. Both must be reversed.",
-        "Layer verification: after Full revocation, target's access key is gone from ProtocolStore (Layer 3), cached sender keys are purged (Layer 2), and SenderKeyRequest returns denial (Layer 1)",
+        "Layer verification: after Full revocation, target's access key is gone from ProtocolRepository (Layer 3), cached sender keys are purged (Layer 2), and SenderKeyRequest returns denial (Layer 1)",
         "Forward-only verification: after unblock/restore, attempt to decrypt messages from block period returns CryptoError (key epochs permanently missed)"
       ],
       "actionItems": [

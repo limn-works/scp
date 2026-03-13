@@ -1,4 +1,4 @@
-//! UCAN nonce storage operations for `ProtocolStore`.
+//! UCAN nonce storage operations for `ProtocolRepository`.
 //!
 //! Implements nonce replay prevention following the key convention from
 //! spec section 17.3:
@@ -17,7 +17,7 @@
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
 /// Interval between automatic prune passes (in seconds).
 ///
@@ -79,10 +79,10 @@ fn last_prune_key(context_id: &str) -> Result<String, StoreError> {
 }
 
 // ---------------------------------------------------------------------------
-// ProtocolStore — nonce methods
+// ProtocolRepository — nonce methods
 // ---------------------------------------------------------------------------
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Checks and records a UCAN nonce for replay prevention.
     ///
     /// Returns `true` if this is a new nonce (first time seen),
@@ -113,7 +113,7 @@ impl<S: Storage> ProtocolStore<S> {
     ///
     /// 1. The in-memory `NonceTracker` provides the primary, synchronised
     ///    replay defense on the hot path.
-    /// 2. `ProtocolStore` nonce tracking is a defence-in-depth layer for
+    /// 2. `ProtocolRepository` nonce tracking is a defence-in-depth layer for
     ///    crash recovery — it re-populates the in-memory set on restart.
     /// 3. The race window is bounded by storage I/O latency (typically
     ///    sub-millisecond for `SQLite` WAL).
@@ -240,8 +240,8 @@ mod tests {
 
     use super::*;
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     fn test_nonce_hash() -> [u8; 32] {

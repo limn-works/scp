@@ -308,12 +308,12 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Why it matters**: Without a notification mechanism, Dave's SDK cannot know to rotate. This means Alice's side of the block is enforced but Dave's side is not -- leaving a period where Dave can still see Alice's pre-rotation content if he received Alice's old sender key before the block.
 - **Severity**: HIGH
 
-### [03-IDENTITY] Per-context block list ProtocolStore methods missing write operations
+### [03-IDENTITY] Per-context block list ProtocolRepository methods missing write operations
 
 - **Category**: Missing wire format details
 - **Location**: Section 3.7.1, lines 166-173
-- **What's missing**: The ProtocolStore methods listed are all read operations (get_global_block_list, is_globally_blocked, get_context_block_list, is_blocked_in_context). There are no write operations (add_to_global_block_list, remove_from_global_block_list, add_to_context_block_list, remove_from_context_block_list). The spec says "these methods derive current state from the identity private state event log" but does not specify the write path -- how are BlockDID/UnblockDID events written to the event log?
-- **Why it matters**: An implementor needs both read and write interfaces. The write path is the more complex one (it triggers propagation, sender key rotation, access key deletion) and is entirely missing from the ProtocolStore specification.
+- **What's missing**: The ProtocolRepository methods listed are all read operations (get_global_block_list, is_globally_blocked, get_context_block_list, is_blocked_in_context). There are no write operations (add_to_global_block_list, remove_from_global_block_list, add_to_context_block_list, remove_from_context_block_list). The spec says "these methods derive current state from the identity private state event log" but does not specify the write path -- how are BlockDID/UnblockDID events written to the event log?
+- **Why it matters**: An implementor needs both read and write interfaces. The write path is the more complex one (it triggers propagation, sender key rotation, access key deletion) and is entirely missing from the ProtocolRepository specification.
 - **Severity**: MEDIUM
 
 ### [03-IDENTITY] DID document structure for SCP -- field-level specification missing

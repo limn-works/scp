@@ -127,7 +127,7 @@ impl SequenceStore for InMemorySequenceStore {
 /// This is the integration point for TOFU key tracking (spec §9.11) and
 /// certificate pinning (spec §9.13). The `scp-core` crate provides an
 /// implementation that calls `check_tofu` and persists records via
-/// `ProtocolStore`. The identity crate defines this trait (rather than
+/// `ProtocolRepository`. The identity crate defines this trait (rather than
 /// importing from `scp-core`) to preserve `scp-identity`'s self-contained
 /// dependency graph.
 ///

@@ -22,7 +22,7 @@
 //! let key = Zeroizing::new([0x42u8; 32]);
 //! let inner = InMemoryStorage::new();
 //! let encrypted = EncryptingAdapter::new(inner, key);
-//! // `encrypted` implements EncryptedStorage and can be passed to ProtocolStore::new().
+//! // `encrypted` implements EncryptedStorage and can be passed to ProtocolRepository::new().
 //! ```
 //!
 //! See issue #695.
@@ -45,11 +45,11 @@ const TAG_LEN: usize = 16;
 /// delegating to the inner backend.
 ///
 /// Key names are passed through unencrypted (they are not secret — the
-/// `ProtocolStore` key convention is deterministic). Only values are
+/// `ProtocolRepository` key convention is deterministic). Only values are
 /// encrypted.
 ///
 /// Implements [`EncryptedStorage`] so it can be used with
-/// `ProtocolStore::new()`.
+/// `ProtocolRepository::new()`.
 pub struct EncryptingAdapter<S: Storage> {
     inner: S,
     key: Zeroizing<[u8; 32]>,

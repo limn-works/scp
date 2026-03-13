@@ -1,4 +1,4 @@
-//! TOFU (Trust On First Use) storage operations for `ProtocolStore`.
+//! TOFU (Trust On First Use) storage operations for `ProtocolRepository`.
 //!
 //! Provides typed persistence for [`TofuRecord`] values under the
 //! `tofu/{did}` key namespace. Wraps the raw byte-level `store_tofu_record`
@@ -18,9 +18,9 @@ use scp_platform::traits::Storage;
 
 use crate::crypto::tofu::TofuRecord;
 
-use super::{ProtocolStore, StoreError};
+use super::{ProtocolRepository, StoreError};
 
-impl<S: Storage> ProtocolStore<S> {
+impl<S: Storage> ProtocolRepository<S> {
     /// Stores a typed [`TofuRecord`] for a DID.
     ///
     /// Serializes the record via `MessagePack` wrapped in a `StoredValue`
@@ -83,14 +83,14 @@ mod tests {
     use scp_platform::testing::InMemoryStorage;
 
     use crate::crypto::tofu::{ObservedKeys, create_tofu_record};
-    use crate::store::ProtocolStore;
+    use crate::store::ProtocolRepository;
 
     fn test_did() -> scp_identity::DID {
         scp_identity::DID::from("did:dht:z6MkTofuTest")
     }
 
-    fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new_for_testing(InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<InMemoryStorage> {
+        ProtocolRepository::new_for_testing(InMemoryStorage::new())
     }
 
     fn sample_keys() -> ObservedKeys {

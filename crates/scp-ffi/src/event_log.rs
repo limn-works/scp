@@ -177,7 +177,7 @@ impl PyCheckpoint {
 
 /// Queries the context event log.
 ///
-/// Returns actual event data from the `ProtocolStore` when available,
+/// Returns actual event data from the `ProtocolRepository` when available,
 /// falling back to a `LogSummary` metadata event when storage is not
 /// initialized or no event payloads have been persisted.
 ///
@@ -196,7 +196,7 @@ impl PyCheckpoint {
 /// # Returns
 ///
 /// A list of [`PyEvent`] objects. Returns deserialized real events when
-/// event payloads have been persisted via `ProtocolStore`, or a single
+/// event payloads have been persisted via `ProtocolRepository`, or a single
 /// `LogSummary` event with Merkle root and event count as fallback.
 ///
 /// # Errors
@@ -231,8 +231,8 @@ pub fn py_event_log_query(
 
     // Attempt to load real events from storage if available.
     // Uses the Storage trait directly because the global storage is
-    // Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolStore requires
-    // an owned Storage impl. The key convention matches ProtocolStore's
+    // Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository requires
+    // an owned Storage impl. The key convention matches ProtocolRepository's
     // event_data key format (GitHub issue #303).
     if let Ok(storage) = crate::runtime::get_storage() {
         let rt = crate::runtime()?;
@@ -307,7 +307,7 @@ pub fn py_event_log_query(
         }
     }
 
-    // Fallback: Build a summary event with log metadata when ProtocolStore
+    // Fallback: Build a summary event with log metadata when ProtocolRepository
     // is unavailable or contains no event payloads for this context.
     let payload_json = serde_json::json!({
         "event_count": event_count,

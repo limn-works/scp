@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolStore modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, WASM, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
+  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, WASM, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
   "gates": [
     {
       "id": "gate-persist-0",
@@ -13,7 +13,7 @@
     },
     {
       "id": "gate-persist-1",
-      "name": "Missing ProtocolStore Modules",
+      "name": "Missing ProtocolRepository Modules",
       "priority": "P0",
       "status": "done",
       "stories": [
@@ -138,7 +138,7 @@
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         }
       ],
       "details": {
@@ -169,14 +169,14 @@
       "actionItems": [
         "Create `crates/scp-core/src/store/event_log.rs` with key construction helpers using 20-digit zero-padding",
         "Implement `append_event`, `load_event`, `load_event_range`, and `event_count`",
-        "Register the module in `store/mod.rs` and expose through ProtocolStore",
+        "Register the module in `store/mod.rs` and expose through ProtocolRepository",
         "Write unit tests for all 4 methods"
       ],
       "blockedBy": [],
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -224,7 +224,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -261,14 +261,14 @@
         "Create `crates/scp-core/src/store/transport.rs` with URL hashing helper using SHA-256 hex",
         "Implement `store_relay_score`, `load_relay_score`, `list_relay_scores`",
         "Implement `store_key_package`, `load_key_packages`, `delete_key_package` with 10-digit zero-padded index",
-        "Register the module in `store/mod.rs` and expose through ProtocolStore",
+        "Register the module in `store/mod.rs` and expose through ProtocolRepository",
         "Write unit tests for all 6 methods"
       ],
       "blockedBy": [],
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -314,7 +314,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -359,7 +359,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -399,7 +399,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -439,7 +439,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -481,7 +481,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -520,7 +520,7 @@
         "Define `StoredValue<T>` with version and data fields in store/mod.rs",
         "Define `Migratable` trait with CURRENT_VERSION and migrate method",
         "Add `StoreError::IncompatibleVersion` variant",
-        "Implement version-aware read/write helpers on ProtocolStore",
+        "Implement version-aware read/write helpers on ProtocolRepository",
         "Write unit tests for version roundtrip, migration, and rejection"
       ],
       "blockedBy": [],
@@ -549,9 +549,9 @@
       "files": [
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Implement the `_meta/schema_version` key-space versioning and startup check per section 17.10. On startup, `ProtocolStore` reads `_meta/schema_version`. If missing, writes current version. If behind, runs one-time key-space migration. If ahead, returns error. Key-space migrations are the only blocking startup operation. No downgrade support.",
+      "description": "Implement the `_meta/schema_version` key-space versioning and startup check per section 17.10. On startup, `ProtocolRepository` reads `_meta/schema_version`. If missing, writes current version. If behind, runs one-time key-space migration. If ahead, returns error. Key-space migrations are the only blocking startup operation. No downgrade support.",
       "acceptanceCriteria": [
-        "`ProtocolStore::initialize()` (or equivalent startup method) reads `_meta/schema_version`",
+        "`ProtocolRepository::initialize()` (or equivalent startup method) reads `_meta/schema_version`",
         "If key missing, writes current schema version and proceeds normally",
         "If schema version matches current, proceeds normally",
         "If schema version is behind current, executes registered key-space migrations in order (currently none registered; migration hook is functional, not a stub)",
@@ -559,7 +559,7 @@
         "Unit tests: fresh store writes version, matching version proceeds, future version errors, behind version triggers migration hook"
       ],
       "actionItems": [
-        "Add `_meta/schema_version` read to ProtocolStore startup/initialization path",
+        "Add `_meta/schema_version` read to ProtocolRepository startup/initialization path",
         "Implement version comparison logic: missing (write current), equal (proceed), behind (migration hook), ahead (error)",
         "Add key-space migration hook that can be extended in future versions",
         "Write unit tests for all startup scenarios"
@@ -609,7 +609,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -623,7 +623,7 @@
     },
     {
       "id": "SCP-PERSIST-021",
-      "title": "Implement ProtocolStoreContextBridge canonical bridge",
+      "title": "Implement ProtocolRepositoryContextBridge canonical bridge",
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
@@ -631,18 +631,18 @@
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Implement `ProtocolStoreContextBridge<S: Storage>` that wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`. `persist_context` stores the full `ContextSnapshot` under `context/{id}/full_snapshot` as a single atomic blob. `persist_broadcast` delegates to `ProtocolStore::store_broadcast_state`. Buffer zeroization for key material (defense-in-depth). This is the canonical bridge between the dyn-compatible trait and the generic ProtocolStore.",
+      "description": "Implement `ProtocolRepositoryContextBridge<S: Storage>` that wraps `Arc<ProtocolRepository<S>>` and implements `ContextPersistence`. `persist_context` stores the full `ContextSnapshot` under `context/{id}/full_snapshot` as a single atomic blob. `persist_broadcast` delegates to `ProtocolRepository::store_broadcast_state`. Buffer zeroization for key material (defense-in-depth). This is the canonical bridge between the dyn-compatible trait and the generic ProtocolRepository.",
       "acceptanceCriteria": [
-        "`ProtocolStoreContextBridge<S>` struct wraps `Arc<ProtocolStore<S>>` and implements `ContextPersistence`",
+        "`ProtocolRepositoryContextBridge<S>` struct wraps `Arc<ProtocolRepository<S>>` and implements `ContextPersistence`",
         "`persist_context` serializes full ContextSnapshot to single key, `load_context` deserializes from same key",
-        "`persist_broadcast` and `load_broadcast` delegate to existing ProtocolStore broadcast methods",
-        "`delete_context` calls `ProtocolStore::delete_context`, `list_persisted_contexts` calls `list_active_contexts`",
+        "`persist_broadcast` and `load_broadcast` delegate to existing ProtocolRepository broadcast methods",
+        "`delete_context` calls `ProtocolRepository::delete_context`, `list_persisted_contexts` calls `list_active_contexts`",
         "Serialized bytes zeroized after write (defense-in-depth for key material)",
         "Unit tests: persist/load roundtrip for both ContextSnapshot and BroadcastContextSnapshot"
       ],
       "actionItems": [
-        "Define `ProtocolStoreContextBridge<S: Storage>` struct wrapping `Arc<ProtocolStore<S>>`",
-        "Implement all 6 `ContextPersistence` trait methods with delegation to ProtocolStore",
+        "Define `ProtocolRepositoryContextBridge<S: Storage>` struct wrapping `Arc<ProtocolRepository<S>>`",
+        "Implement all 6 `ContextPersistence` trait methods with delegation to ProtocolRepository",
         "Add zeroize-on-drop for serialized byte buffers containing key material",
         "Write roundtrip unit tests for ContextSnapshot and BroadcastContextSnapshot"
       ],
@@ -652,7 +652,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -695,7 +695,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -743,7 +743,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -786,7 +786,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -833,7 +833,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -1128,14 +1128,14 @@
         "crates/scp-core/src/crypto/mls/storage.rs",
         "crates/scp-core/src/crypto/mls/mod.rs"
       ],
-      "description": "Implement the MLS StorageProvider bridge per section 17.9. `MlsStorageBridge<S: Storage>` wraps `Arc<ProtocolStore<S>>` and implements OpenMLS `StorageProvider`. Key prefix: `mls/{context_id}/group_state`, `mls/{context_id}/tree/{leaf_index}`, etc. `ScpMlsProvider<S>` combines RustCrypto + MlsStorageBridge for a complete OpenMLS provider.",
+      "description": "Implement the MLS StorageProvider bridge per section 17.9. `MlsStorageBridge<S: Storage>` wraps `Arc<ProtocolRepository<S>>` and implements OpenMLS `StorageProvider`. Key prefix: `mls/{context_id}/group_state`, `mls/{context_id}/tree/{leaf_index}`, etc. `ScpMlsProvider<S>` combines RustCrypto + MlsStorageBridge for a complete OpenMLS provider.",
       "acceptanceCriteria": [
-        "`MlsStorageBridge<S>` wraps `Arc<ProtocolStore<S>>` + context_id and implements `openmls_traits::storage::StorageProvider`",
+        "`MlsStorageBridge<S>` wraps `Arc<ProtocolRepository<S>>` + context_id and implements `openmls_traits::storage::StorageProvider`",
         "Key sub-prefixes per section 17.9: `mls/{id}/group_state`, `mls/{id}/tree/{leaf}`, `mls/{id}/key_schedule/{epoch}`, `mls/{id}/proposal/{hash}`, `mls/{id}/key_package/{hash}`, `mls/{id}/encryption_key/{epoch}/{gen}`",
         "All OpenMLS key types serialized via MessagePack before storage; `ScpMlsProvider<S>` combines crypto + storage",
         "Test: group state store/load roundtrip via the bridge",
-        "Test: context isolation — two bridges with different context_ids sharing one ProtocolStore do not leak state",
-        "Test: state survives simulated restart (drop bridge, recreate with same ProtocolStore, verify persisted)"
+        "Test: context isolation — two bridges with different context_ids sharing one ProtocolRepository do not leak state",
+        "Test: state survives simulated restart (drop bridge, recreate with same ProtocolRepository, verify persisted)"
       ],
       "actionItems": [
         "Create `crates/scp-core/src/crypto/mls/storage.rs` with `MlsStorageBridge<S>`",
@@ -1153,7 +1153,7 @@
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.4 ProtocolStore"
+          "section": "## 17.4 ProtocolRepository"
         }
       ],
       "details": {
@@ -1307,7 +1307,7 @@
         "crates/scp-transport/src/native/combined.rs",
         "crates/scp-transport/Cargo.toml"
       ],
-      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolStore) and `blobs` table (relay BlobStore). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag in `scp-transport`. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
+      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolRepository) and `blobs` table (relay BlobStore). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag in `scp-transport`. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
       "acceptanceCriteria": [
         "`CombinedNodeStorage` struct behind `combined` feature flag with single SQLite database containing both `kv` and `blobs` tables",
         "Implements `Storage` trait (delegates to kv table) and `BlobStorage` trait (delegates to blobs table)",
@@ -1610,7 +1610,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### ProtocolStore Integration Tests"
+          "section": "### ProtocolRepository Integration Tests"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1656,7 +1656,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### ProtocolStore Integration Tests"
+          "section": "### ProtocolRepository Integration Tests"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1670,7 +1670,7 @@
     },
     {
       "id": "SCP-PERSIST-072",
-      "title": "ProtocolStore module integration tests per section 17.13",
+      "title": "ProtocolRepository module integration tests per section 17.13",
       "gate": "gate-persist-7",
       "priority": "P0",
       "severity": "critical",
@@ -1678,7 +1678,7 @@
       "files": [
         "crates/scp-testing/tests/integration/persistence.rs"
       ],
-      "description": "Integration tests for individual ProtocolStore modules per section 17.13 ProtocolStore Integration Tests table. Each test exercises a ProtocolStore module's methods end-to-end through a real Storage backend. These complement the lifecycle tests in SCP-PERSIST-070 by verifying module-level correctness.",
+      "description": "Integration tests for individual ProtocolRepository modules per section 17.13 ProtocolRepository Integration Tests table. Each test exercises a ProtocolRepository module's methods end-to-end through a real Storage backend. These complement the lifecycle tests in SCP-PERSIST-070 by verifying module-level correctness.",
       "acceptanceCriteria": [
         "Test: event_log range query returns correct ordered subset across append/load_range",
         "Test: nonce replay rejected after check_and_record_nonce; prune removes only expired nonces",
@@ -1690,7 +1690,7 @@
       "actionItems": [
         "Create parameterized test helpers that run each module test against InMemory and SqliteStorage",
         "Implement event_log, nonce, membership, sender_key, DID cache, TOFU, relay_score, and MLS integration tests",
-        "Verify each test exercises the full ProtocolStore -> Storage -> Backend path"
+        "Verify each test exercises the full ProtocolRepository -> Storage -> Backend path"
       ],
       "blockedBy": [
         "SCP-PERSIST-010",
@@ -1703,7 +1703,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### ProtocolStore Integration Tests"
+          "section": "### ProtocolRepository Integration Tests"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",

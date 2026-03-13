@@ -918,7 +918,7 @@ impl ContextProvider for FfiBridgeProvider {
 
         // Re-acquire the DashMap lock briefly to append the event.
         // Returns (sequence, serialized_event_bytes) on success for
-        // ProtocolStore persistence (GitHub issue #303).
+        // ProtocolRepository persistence (GitHub issue #303).
         let append_result = crate::runtime::with_context(context_id, |rt| {
             let sequence = scp_event_log::tree::event_count(&rt.event_log);
             let prev_hash = if rt.event_log.leaves().is_empty() {
@@ -939,14 +939,14 @@ impl ContextProvider for FfiBridgeProvider {
                 signature: Vec::new(),
             };
 
-            // Serialize the event for ProtocolStore persistence.
+            // Serialize the event for ProtocolRepository persistence.
             let event_bytes = rmp_serde::to_vec(&event)
                 .map_err(|e| ScpPyError::context(format!("event serialization failed: {e}")))?;
 
             scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
                 .map_err(|e| ScpPyError::context(e.to_string()))?;
 
-            // Return the leaf hash (last appended leaf) for ProtocolStore.
+            // Return the leaf hash (last appended leaf) for ProtocolRepository.
             let leaf_hash: [u8; 32] = rt.event_log.leaves()[rt.event_log.leaves().len() - 1];
 
             Ok((sequence, event_bytes, leaf_hash))
@@ -959,9 +959,9 @@ impl ContextProvider for FfiBridgeProvider {
                 // instead of just a LogSummary (GitHub issue #303).
                 //
                 // Uses the Storage trait directly because the global storage
-                // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolStore
+                // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository
                 // requires an owned Storage impl. The key convention matches
-                // ProtocolStore's event_data_key format.
+                // ProtocolRepository's event_data_key format.
                 if let Ok(storage) = crate::runtime::get_storage()
                     && let Ok(rt) = crate::runtime()
                 {
