@@ -132,6 +132,15 @@ export class Context implements AsyncDisposable {
   }
 
   /**
+   * Constructs a Context from an existing bridge handle.
+   *
+   * @internal Testing only — not part of the public API.
+   */
+  static _fromHandle(handle: BridgeContextHandle, identityDid: string): Context {
+    return new Context(handle.contextId, handle, identityDid);
+  }
+
+  /**
    * Creates a new SCP context.
    *
    * The context is created in the `"active"` state. The creating identity
@@ -798,6 +807,142 @@ export class Context implements AsyncDisposable {
     try {
       const bridge = await getBridge();
       return await bridge.contextExtendTtl(this._handle, additionalSecs);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Handles automatic TTL expiry for this context.
+   *
+   * Triggers the TTL expiry lifecycle: transitions the context to expired
+   * state and notifies members. Typically called by a timer or scheduler
+   * when the context's TTL has elapsed.
+   *
+   * @throws {ContextError} If the context is not active (SCP-CTX-2005).
+   */
+  async handleTtlExpiry(): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.contextHandleTtlExpiry(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Proposes a TTL extension for this context.
+   *
+   * Records consent from the given member for extending the context's TTL.
+   * Returns `true` if the extension was unanimously approved by all members.
+   *
+   * @param extensionSecs - Number of seconds to extend the TTL by. Must be greater than zero.
+   * @param proposerDid - DID of the proposer. Defaults to the context identity.
+   * @returns `true` if the extension was unanimously approved.
+   * @throws {ContextError} If the context is not active or the proposal fails (SCP-CTX-2005).
+   * @throws {ContextError} If `extensionSecs` is zero or negative.
+   */
+  async proposeTtlExtension(extensionSecs: number, proposerDid?: string): Promise<boolean> {
+    this.assertActive();
+    if (extensionSecs <= 0 || Number.isNaN(extensionSecs)) {
+      throw new ContextError("extensionSecs must be greater than zero", "SCP-CTX-2031");
+    }
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextProposeTtlExtension(
+        this._handle,
+        proposerDid ?? this._identityDid,
+        extensionSecs,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Resets the TTL timer for this context to a new duration.
+   *
+   * Replaces the current TTL countdown with a fresh timer of the specified
+   * duration. Requires a core context handle.
+   *
+   * @param newDurationSecs - The new TTL duration in seconds. Must be greater than zero.
+   * @throws {ContextError} If the context does not have a core handle (SCP-CTX-2024).
+   * @throws {ContextError} If `newDurationSecs` is zero or negative.
+   */
+  async resetTtlTimer(newDurationSecs: number): Promise<void> {
+    this.assertActive();
+    if (newDurationSecs <= 0 || Number.isNaN(newDurationSecs)) {
+      throw new ContextError("newDurationSecs must be greater than zero", "SCP-CTX-2031");
+    }
+    try {
+      const bridge = await getBridge();
+      await bridge.contextResetTtlTimer(this._handle, newDurationSecs);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Export / Import
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Exports this context's full state as serialized bytes.
+   *
+   * Returns serialized `StoredValue<ContextExport>` bytes (spec section 17.5)
+   * suitable for backup, migration, or transfer to another node.
+   *
+   * @returns The serialized context export as a `Uint8Array`.
+   * @throws {ContextError} If the context has been disposed or export fails.
+   */
+  async export(): Promise<Uint8Array> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextExport(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Imports a context from serialized bytes.
+   *
+   * The bytes must be a `StoredValue<ContextExport>` envelope (spec section
+   * 17.5), as produced by {@link Context.prototype.export}.
+   *
+   * @param data - The serialized context export bytes.
+   * @returns The context ID of the imported context.
+   * @throws {ContextError} If deserialization, validation, or import fails.
+   */
+  static async import(data: Uint8Array): Promise<string> {
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextImport(data);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Drain events
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Drains all pending events from this context's receive buffer.
+   *
+   * Returns events as an array of JSON strings. This is a non-blocking
+   * alternative to the streaming `receive()` generator for batch processing.
+   *
+   * @returns An array of event JSON strings.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async drainEvents(): Promise<readonly string[]> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextDrainEvents(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
     }
