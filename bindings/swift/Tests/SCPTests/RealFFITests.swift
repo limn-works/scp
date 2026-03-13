@@ -1556,7 +1556,7 @@ struct RealFFITypeShapeTests {
                 sourceType: .persistent,
                 counterparties: ["did:dht:z6MkBob"],
                 purpose: nil,
-                discoveryMethod: .none,
+                discoveryMethod: .outOfBand,
                 ageSecs: 300,
                 memoryScope: .full,
                 chainDepth: 1,

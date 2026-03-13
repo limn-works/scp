@@ -85,8 +85,13 @@ pub enum DiscoveryMethod {
     /// Source was discovered through a discovery registry context.
     Registry(ContextId),
     /// No protocol-level discovery path. Data was introduced outside of SCP
-    /// discovery mechanisms.
-    None,
+    /// discovery mechanisms (out-of-band introduction).
+    ///
+    /// Renamed from `None` to avoid shadowing `Optional.none` in Swift
+    /// bindings (see issue #772). Accepts `"None"` on deserialization for
+    /// backward compatibility.
+    #[serde(alias = "None")]
+    OutOfBand,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,13 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn data_provenance_construction_with_none_discovery() {
+    fn data_provenance_construction_with_out_of_band_discovery() {
         let provenance = DataProvenance {
             source_context: "ctx-unknown".to_string(),
             source_type: SourceType::Summary,
             counterparties: vec![],
             purpose: None,
-            discovery_method: DiscoveryMethod::None,
+            discovery_method: DiscoveryMethod::OutOfBand,
             age: Duration::from_secs(0),
             memory_scope: MemoryScope::Summary,
             chain_depth: 0,
@@ -331,7 +336,7 @@ mod tests {
             payment_receipt_id: None,
         };
 
-        assert_eq!(provenance.discovery_method, DiscoveryMethod::None);
+        assert_eq!(provenance.discovery_method, DiscoveryMethod::OutOfBand);
         assert_eq!(provenance.source_type, SourceType::Summary);
         assert!(provenance.counterparties.is_empty());
     }
@@ -364,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_method_none_variant() {
-        let method = DiscoveryMethod::None;
-        assert_eq!(method, DiscoveryMethod::None);
+    fn discovery_method_out_of_band_variant() {
+        let method = DiscoveryMethod::OutOfBand;
+        assert_eq!(method, DiscoveryMethod::OutOfBand);
     }
 
     #[test]
@@ -490,7 +495,7 @@ mod tests {
         let methods = vec![
             DiscoveryMethod::SharedContext("ctx-1".to_string()),
             DiscoveryMethod::Registry("ctx-2".to_string()),
-            DiscoveryMethod::None,
+            DiscoveryMethod::OutOfBand,
         ];
         for method in methods {
             let json = serde_json::to_string(&method);
@@ -501,7 +506,7 @@ mod tests {
                 deserialized.is_ok(),
                 "deserialization of {method:?} should succeed"
             );
-            assert_eq!(deserialized.unwrap_or(DiscoveryMethod::None), method);
+            assert_eq!(deserialized.unwrap_or(DiscoveryMethod::OutOfBand), method);
         }
     }
 
@@ -536,7 +541,7 @@ mod tests {
             source_type: SourceType::Ephemeral,
             counterparties: vec![],
             purpose: None,
-            discovery_method: DiscoveryMethod::None,
+            discovery_method: DiscoveryMethod::OutOfBand,
             age: Duration::from_secs(0),
             memory_scope: MemoryScope::Ephemeral,
             chain_depth: 0,
@@ -558,7 +563,7 @@ mod tests {
             source_type: SourceType::Persistent,
             counterparties: vec!["did:dht:z6MkDeep".into()],
             purpose: None,
-            discovery_method: DiscoveryMethod::None,
+            discovery_method: DiscoveryMethod::OutOfBand,
             age: Duration::from_secs(1000),
             memory_scope: MemoryScope::Full,
             chain_depth: 3,

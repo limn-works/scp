@@ -148,7 +148,9 @@ class DiscoveryMethod(enum.Enum):
     SHARED_CONTEXT = "shared_context"
     #: Discovered through a discovery registry context.
     REGISTRY = "registry"
-    #: No protocol-level discovery path.
+    #: No protocol-level discovery path (out-of-band introduction).
+    OUT_OF_BAND = "out_of_band"
+    #: Backward-compatible alias for ``OUT_OF_BAND``.
     NONE = "none"
 
 
@@ -267,7 +269,7 @@ class Provenance:
     purpose: str | None = None
 
     #: How the data source was discovered.
-    discovery_method: DiscoveryMethod = DiscoveryMethod.NONE
+    discovery_method: DiscoveryMethod = DiscoveryMethod.OUT_OF_BAND
 
     #: Age of the data in seconds at the time provenance was attached.
     age_secs: float = 0.0

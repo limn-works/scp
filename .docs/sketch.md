@@ -1505,7 +1505,7 @@ DataProvenance {
   purpose: String,                   // declared purpose of source context
   discoveryMethod: .sharedContext(contextID)
                  | .registry(registryContextID)
-                 | .none,
+                 | .outOfBand,
   age: Duration,                     // how long ago the source interaction occurred
   memoryScope: MemoryScope,          // what memory scope the source context had
   chainDepth: uint,                  // number of context boundaries crossed (0 = originated here)
@@ -1530,7 +1530,7 @@ let result = try await SCP.ToolInterface.call(
     sourceType: .persistent,
     counterparties: [contextA.members],
     purpose: "Recipe database",
-    discoveryMethod: .none,          // tool interface discovery
+    discoveryMethod: .outOfBand,     // tool interface discovery
     age: .zero,                      // live query
     memoryScope: .full
   }

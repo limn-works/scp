@@ -259,7 +259,7 @@ class TestProvenance:
         assert prov.source_type == SourceType.PERSISTENT
         assert prov.counterparties == []
         assert prov.purpose is None
-        assert prov.discovery_method == DiscoveryMethod.NONE
+        assert prov.discovery_method == DiscoveryMethod.OUT_OF_BAND
         assert prov.age_secs == 0.0
         assert prov.memory_scope == MemoryScope.FULL
         assert prov.chain_depth == 0
@@ -433,6 +433,8 @@ class TestDiscoveryMethod:
     def test_all_variants_exist(self) -> None:
         assert DiscoveryMethod.SHARED_CONTEXT.value == "shared_context"
         assert DiscoveryMethod.REGISTRY.value == "registry"
+        assert DiscoveryMethod.OUT_OF_BAND.value == "out_of_band"
+        # Backward-compatible alias
         assert DiscoveryMethod.NONE.value == "none"
 
 

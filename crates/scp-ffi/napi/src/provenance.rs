@@ -49,7 +49,7 @@ pub async fn evaluate_provenance_quality(
             .map(scp_identity::DID::from)
             .collect(),
         purpose: None,
-        discovery_method: DiscoveryMethod::None,
+        discovery_method: DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: scp_core::context::MemoryScope::Full,
         chain_depth: 0,
@@ -103,7 +103,7 @@ pub fn provenance_attach(
         source_type: SourceType::Persistent,
         counterparties: vec![],
         purpose: None,
-        discovery_method: DiscoveryMethod::None,
+        discovery_method: DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: MemoryScope::Full,
         chain_depth: depth as u8,
@@ -128,7 +128,7 @@ pub fn provenance_attach(
         DiscoveryMethod::Registry(ctx_id) => {
             serde_json::json!({"Registry": ctx_id})
         }
-        DiscoveryMethod::None => serde_json::json!("None"),
+        DiscoveryMethod::OutOfBand => serde_json::json!("OutOfBand"),
     };
 
     let result = serde_json::json!({
@@ -169,7 +169,7 @@ pub fn provenance_check_chain_depth(chain_depth: u32, max_depth: Option<u32>) ->
         source_type: SourceType::Persistent,
         counterparties: vec![],
         purpose: None,
-        discovery_method: DiscoveryMethod::None,
+        discovery_method: DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
         memory_scope: MemoryScope::Full,
         chain_depth: depth,
@@ -241,15 +241,18 @@ fn parse_memory_scope(s: &str) -> napi::Result<MemoryScope> {
 /// Parses a discovery method string into a `DiscoveryMethod` enum (§24.2.3).
 ///
 /// Accepted formats:
-/// - `None` or absent → `DiscoveryMethod::None`
+/// - `OutOfBand`, `out_of_band`, `None`, `none`, or absent → `DiscoveryMethod::OutOfBand`
 /// - `shared_context:<context_id>` → `DiscoveryMethod::SharedContext(context_id)`
 /// - `registry:<context_id>` → `DiscoveryMethod::Registry(context_id)`
+///
+/// `"None"` is accepted for backward compatibility (renamed to `OutOfBand`
+/// in issue #772).
 fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
     let Some(s) = s else {
-        return Ok(DiscoveryMethod::None);
+        return Ok(DiscoveryMethod::OutOfBand);
     };
     match s {
-        "none" | "None" => Ok(DiscoveryMethod::None),
+        "none" | "None" | "OutOfBand" | "out_of_band" => Ok(DiscoveryMethod::OutOfBand),
         _ if s.starts_with("shared_context:") => {
             let ctx_id = &s["shared_context:".len()..];
             if ctx_id.is_empty() {
@@ -277,8 +280,8 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
         }
         other => Err(ScpNapiError::Validation {
             message: format!(
-                "invalid discovery_method '{other}': expected 'none', \
-                 'shared_context:<context_id>', or 'registry:<context_id>'"
+                "invalid discovery_method '{other}': expected 'OutOfBand', 'out_of_band', \
+                 'none', 'shared_context:<context_id>', or 'registry:<context_id>'"
             ),
             code: "SCP-VALID-7216".to_owned(),
         }
@@ -354,6 +357,6 @@ mod tests {
         assert!(matches!(registry, DiscoveryMethod::Registry(id) if id == "reg-456"));
 
         let none = parse_discovery_method(None).unwrap();
-        assert!(matches!(none, DiscoveryMethod::None));
+        assert!(matches!(none, DiscoveryMethod::OutOfBand));
     }
 }

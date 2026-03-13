@@ -491,7 +491,7 @@ async fn data_provenance_construction() {
     let methods = [
         DiscoveryMethod::SharedContext("ctx-1".to_string()),
         DiscoveryMethod::Registry("ctx-reg".to_string()),
-        DiscoveryMethod::None,
+        DiscoveryMethod::OutOfBand,
     ];
     for method in &methods {
         let json = serde_json::to_string(method).expect("serialize DiscoveryMethod");

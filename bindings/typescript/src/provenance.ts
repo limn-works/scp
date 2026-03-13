@@ -18,11 +18,13 @@ import { safeJsonParse } from "./internal/json-utils";
 /**
  * Discovery method describing how the data source was found (§24.2.3).
  *
- * - `"None"` — no protocol-level discovery path.
+ * - `"OutOfBand"` — no protocol-level discovery path (out-of-band introduction).
+ * - `"None"` — backward-compatible alias for `"OutOfBand"`.
  * - `{ SharedContext: string }` — found via shared context membership.
  * - `{ Registry: string }` — found via a discovery registry context.
  */
 export type DiscoveryMethod =
+  | "OutOfBand"
   | "None"
   | { readonly SharedContext: string }
   | { readonly Registry: string };
@@ -87,8 +89,9 @@ export async function evaluateProvenanceQuality(options: {
  * @param targetContextId - ID of the target context.
  * @param options - Optional additional provenance fields.
  * @param options.existingChainDepth - Chain depth of existing provenance (if any).
- * @param options.discoveryMethod - How the source was discovered: `"none"`,
- *   `"shared_context:<context_id>"`, or `"registry:<context_id>"`.
+ * @param options.discoveryMethod - How the source was discovered: `"OutOfBand"`,
+ *   `"none"` (backward-compatible), `"shared_context:<context_id>"`, or
+ *   `"registry:<context_id>"`.
  * @param options.purpose - Human-readable purpose of the cross-context data flow.
  * @param options.counterpartyPolicy - `"full"`, `"pseudonymized"`, or `"redacted"`.
  * @returns Parsed provenance record with all 12 spec fields (§24.2.1).
@@ -131,7 +134,7 @@ export async function provenanceAttach(
       memoryScope: parsed.memory_scope as string,
       chainPath: (parsed.chain_path as readonly string[]) ?? null,
       purpose: (parsed.purpose as string) ?? null,
-      discoveryMethod: (parsed.discovery_method as DiscoveryMethod) ?? "None",
+      discoveryMethod: (parsed.discovery_method as DiscoveryMethod) ?? "OutOfBand",
       paymentAmount: (parsed.payment_amount as number) ?? null,
       paymentAdapter: (parsed.payment_adapter as string) ?? null,
       paymentReceiptId: (parsed.payment_receipt_id as string) ?? null,

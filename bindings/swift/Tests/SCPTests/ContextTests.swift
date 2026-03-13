@@ -268,7 +268,7 @@ struct ContextTests {
                 sourceType: .persistent,
                 counterparties: ["did:dht:bob"],
                 purpose: nil,
-                discoveryMethod: .none,
+                discoveryMethod: .outOfBand,
                 ageSecs: 0,
                 memoryScope: .full,
                 chainDepth: 1,

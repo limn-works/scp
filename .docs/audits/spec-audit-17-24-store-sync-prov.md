@@ -608,10 +608,10 @@ The findings are organized per-file, then by severity.
 - **Why it matters**: The chain depth default max is 3, but it's "configurable per context" (section 24.4). A context with `max_chain_depth = 200` would allow a 200-entry `chain_path`. This is mostly a storage size concern.
 - **Severity**: LOW
 
-### [24.2.3] DiscoveryMethod::None Semantics Overlap with NoProvenance
+### [24.2.3] DiscoveryMethod::OutOfBand Semantics Overlap with NoProvenance
 - **Category**: Ambiguous state transitions
 - **Location**: Section 24.2.3 and 24.2.4
-- **What's missing**: `DiscoveryMethod::None` means "no protocol-level discovery path" -- data was introduced outside SCP discovery. But `NoProvenance` in the quality evaluation also covers "Data introduced without protocol-level origin tracking." If data has `discovery_method: None` but has a valid `source_context`, `counterparties`, etc., what quality tier does it get? The evaluation table (24.5.1) does not consider `discovery_method` as an input.
+- **What's missing**: `DiscoveryMethod::OutOfBand` (formerly `::None`, renamed in #772) means "no protocol-level discovery path" -- data was introduced outside SCP discovery. But `NoProvenance` in the quality evaluation also covers "Data introduced without protocol-level origin tracking." If data has `discovery_method: OutOfBand` but has a valid `source_context`, `counterparties`, etc., what quality tier does it get? The evaluation table (24.5.1) does not consider `discovery_method` as an input.
 - **Why it matters**: `DiscoveryMethod` is recorded but never used in quality evaluation, making its purpose unclear.
 - **Severity**: LOW
 

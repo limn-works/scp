@@ -4018,7 +4018,7 @@
       "acceptanceCriteria": [
         "DataProvenance struct defined with fields: source_context (ContextId), source_type (SourceType), counterparties (Vec<DID>), purpose (Option<String>), discovery_method (DiscoveryMethod), age (Duration), memory_scope (MemoryScope), chain_depth (u8), chain_path (Option<Vec<ContextId>>)",
         "SourceType enum defined with variants: Persistent (source context still open and verifiable), Ephemeral (source context closed, keys destroyed), Summary (source context closed, summary available)",
-        "DiscoveryMethod enum defined with variants: SharedContext(ContextId), Registry(ContextId), None",
+        "DiscoveryMethod enum defined with variants: SharedContext(ContextId), Registry(ContextId), OutOfBand",
         "ProvenanceQuality enum defined with variants ordered: NoProvenance < EphemeralKnownParties < SummaryVerified < PersistentVerifiable, implementing PartialOrd and Ord",
         "ProvenanceError type defined including ChainDepthExceeded variant",
         "Module re-exports all public types from submodules"
@@ -4046,7 +4046,7 @@
         "rustTypes": {
           "DataProvenance": "pub struct DataProvenance { pub source_context: ContextId, pub source_type: SourceType, pub counterparties: Vec<DID>, pub purpose: Option<String>, pub discovery_method: DiscoveryMethod, pub age: Duration, pub memory_scope: MemoryScope, pub chain_depth: u8, pub chain_path: Option<Vec<ContextId>> }",
           "SourceType": "pub enum SourceType { Persistent, Ephemeral, Summary }",
-          "DiscoveryMethod": "pub enum DiscoveryMethod { SharedContext(ContextId), Registry(ContextId), None }",
+          "DiscoveryMethod": "pub enum DiscoveryMethod { SharedContext(ContextId), Registry(ContextId), OutOfBand }",
           "ProvenanceQuality": "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] pub enum ProvenanceQuality { NoProvenance, EphemeralKnownParties, SummaryVerified, PersistentVerifiable }"
         }
       },
