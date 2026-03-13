@@ -214,7 +214,7 @@ public actor Context {
     /// Creates a `Context` wrapping an existing UniFFI handle.
     ///
     /// This initializer is `internal` — production callers use
-    /// ``create(contextId:ceiling:)`` or `SCP.createContext(params:)`.
+    /// ``create(identity:params:)`` or `SCP.createContext(params:)`.
     ///
     /// - Parameters:
     ///   - handle: The opaque UniFFI context handle.
