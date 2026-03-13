@@ -140,7 +140,7 @@ def _extract_resolution_error_prefixes(source: str) -> list[str]:
     """
     # Extract the impl Display for ResolutionError block.
     display_block_re = re.compile(
-        r"impl\s+(?:std::fmt::)?Display\s+for\s+ResolutionError\s*\{",
+        r"impl\s+(?:(?:std::)?fmt::)?Display\s+for\s+ResolutionError\s*\{",
     )
     m = display_block_re.search(source)
     if m is None:
