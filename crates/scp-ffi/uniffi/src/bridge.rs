@@ -5226,7 +5226,7 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
         })
         .await
         .map_err(|e| ScpError::Context {
-            message: format!("tokio task join error during tombstone: {e}"),
+            msg: format!("tokio task join error during tombstone: {e}"),
             code: "SCP-CTX-2050".to_owned(),
         })?
 }
@@ -5259,7 +5259,7 @@ pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String
         })
         .await
         .map_err(|e| ScpError::Context {
-            message: format!("tokio task join error during migration_state: {e}"),
+            msg: format!("tokio task join error during migration_state: {e}"),
             code: "SCP-CTX-2050".to_owned(),
         })?
 }
