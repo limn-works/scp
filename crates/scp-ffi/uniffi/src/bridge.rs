@@ -7317,7 +7317,7 @@ pub fn bridge_evaluate_trust(
         other => {
             return Err(ScpError::Validation {
                 msg: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-                code: "SCP-VALID-7043".to_owned(),
+                code: "SCP-VALID-7051".to_owned(),
             });
         }
     };
