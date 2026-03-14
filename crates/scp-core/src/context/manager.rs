@@ -7061,7 +7061,6 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if the message cannot be sent.
-    #[allow(clippy::unused_async)] // async by design: called via block_on_async from ProductionRecoveryBackend
     pub async fn recovery_send_notification(
         &self,
         context_id: &str,
@@ -7070,12 +7069,20 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Look up the current MLS epoch for this context. After an epoch
+        // advance in step 2, the epoch is > 0 — using the real value ensures
+        // receivers can validate the message against their local epoch state.
+        let current_epoch = {
+            let contexts = self.contexts.lock().await;
+            contexts.get(context_id).map_or(0, |ctx| ctx.mls_epoch)
+        };
+
         // Encrypt using the crypto provider.
         let encrypted = self.crypto.encrypt_message(
             &context_id_bytes,
             sender_did,
             payload,
-            0, // Recovery messages use epoch 0 as they follow an epoch reset.
+            current_epoch,
             0, // Sequence 0 — single notification per recovery.
         )?;
 
