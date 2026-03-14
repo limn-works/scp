@@ -10,7 +10,7 @@ This crate generates Swift and Kotlin bindings from a single Rust definition via
 
 A single `Arc<ContextManager>` (from `scp-core`) is created once via `OnceLock` and shared across all bridge functions. The `ContextManager` owns all per-context state (membership, roles, governance, broadcast, TTL) and the injected providers. This replaced the old `DashMap<String, ContextRuntime>` global registry.
 
-The manager is initialized with stub provider implementations (`FfiBridgeCrypto`, `FfiBridgeTransport`, `FfiBridgeEventLog`) that succeed by default, allowing the manager to track state while actual crypto/transport operations are handled by platform callbacks.
+The manager is initialized with stub provider implementations (`FfiBridgeCrypto`, `FfiBridgeTransport`) that succeed by default, plus a persistent `MerkleEventLogProvider` backed by `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). Actual crypto/transport operations are handled by platform callbacks.
 
 Bridge functions access the manager via `crate::runtime::context_manager()`.
 

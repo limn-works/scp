@@ -12,13 +12,14 @@
 //!   encryption is handled at the SDK layer above the FFI bridge.
 //! - `NapiBridgeTransportProvider` — Reports connected, no-op send/publish.
 //!   Real transport is handled via `NapiTransportManager`.
-//! - `NapiBridgeEventLogProvider` — Delegates to `scp_event_log::EventLog`
-//!   for Merkle tree operations.
+//! - `MerkleEventLogProvider` — Persistent Merkle-chained event log backed by
+//!   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484).
 //! - `NapiBridgePersistence` — In-memory persistence via `DashMap`.
 //!
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -27,12 +28,19 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
+use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
+use scp_core::store::ProtocolRepository;
+use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
+use scp_platform::Storage;
+use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::error::PlatformError;
+use zeroize::Zeroizing;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -95,11 +103,16 @@ fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// Initializes the manager on first call with bridge-local provider
 /// implementations. All NAPI bridge functions that need context operations
 /// call this function.
+///
+/// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
+/// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
+/// storage provider. This ensures event log entries are persisted on each
+/// append (issue #484 AC).
 pub fn context_manager() -> &'static Arc<ContextManager> {
     CONTEXT_MANAGER.get_or_init(|| {
         let crypto = Box::new(NapiBridgeCryptoProvider);
         let transport = Box::new(NapiBridgeTransportProvider);
-        let event_log = Box::new(NapiBridgeEventLogProvider::new());
+        let event_log = build_event_log_provider();
         let persistence = Box::new(NapiBridgePersistence::new());
         Arc::new(ContextManager::with_persistence(
             crypto,
@@ -109,6 +122,135 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             noop_key_resolver(),
         ))
     })
+}
+
+/// Constructs a persistent event log provider backed by encrypted in-memory
+/// storage.
+///
+/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
+/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
+/// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
+/// The resulting `MerkleEventLogProvider` persists entries on each append.
+///
+/// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
+/// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
+/// feature (which also exposes `InMemoryKeyCustody`) is not required in
+/// production builds. See issue #484.
+///
+/// SDK consumers requiring durable persistence across process restarts
+/// should provide a file-backed `Storage` implementation at the application
+/// layer (e.g., `SqliteStorage`). The in-memory default is suitable for the
+/// Node.js/Bun environment where process lifetime matches context lifetime.
+fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
+    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
+    let store = Arc::new(ProtocolRepository::new(encrypted));
+    let bridge = ProtocolRepositoryEventLogBridge::new(store);
+    Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+}
+
+// ---------------------------------------------------------------------------
+// BridgeInMemoryStorage — bridge-local Storage implementation
+//
+// This avoids pulling in `scp-platform/testing` (which also exposes
+// `InMemoryKeyCustody`) just for event log persistence. Production builds
+// must not compile `InMemoryKeyCustody` unconditionally.
+// ---------------------------------------------------------------------------
+
+/// In-memory `Storage` implementation for the NAPI bridge event log.
+///
+/// Identical in behavior to `scp_platform::testing::InMemoryStorage` but
+/// defined locally so the `testing` feature is not required in production
+/// dependencies. Only used as the backing store for the
+/// `EncryptingAdapter`-wrapped `ProtocolRepository` that feeds the
+/// `MerkleEventLogProvider`.
+struct BridgeInMemoryStorage {
+    data: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl BridgeInMemoryStorage {
+    fn new() -> Self {
+        Self {
+            data: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl Storage for BridgeInMemoryStorage {
+    fn store(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        let key = key.to_owned();
+        let data = data.to_vec();
+        async move {
+            self.data.lock().await.insert(key, data);
+            Ok(())
+        }
+    }
+
+    fn retrieve(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
+        let key = key.to_owned();
+        async move { Ok(self.data.lock().await.get(&key).cloned()) }
+    }
+
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        let key = key.to_owned();
+        async move {
+            self.data.lock().await.remove(&key);
+            Ok(())
+        }
+    }
+
+    fn list_keys(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
+        let prefix = prefix.to_owned();
+        async move {
+            let store = self.data.lock().await;
+            let mut keys: Vec<String> = store
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            drop(store);
+            keys.sort();
+            Ok(keys)
+        }
+    }
+
+    fn delete_prefix(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
+        let prefix = prefix.to_owned();
+        async move {
+            let mut store = self.data.lock().await;
+            let keys_to_delete: Vec<String> = store
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            let count = keys_to_delete.len() as u64;
+            for key in keys_to_delete {
+                store.remove(&key);
+            }
+            drop(store);
+            Ok(count)
+        }
+    }
+
+    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
+        let key = key.to_owned();
+        async move { Ok(self.data.lock().await.contains_key(&key)) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -581,41 +723,8 @@ impl ContextTransportProvider for NapiBridgeTransportProvider {
     }
 }
 
-// ---------------------------------------------------------------------------
-// NapiBridgeEventLogProvider — delegates to scp_event_log
-// ---------------------------------------------------------------------------
-
-/// Bridge event log provider for the NAPI layer.
-///
-/// No-op implementation. The `ContextManager` calls these methods during
-/// context creation and messaging. Real event log operations (Merkle proofs,
-/// queries) are handled by the UCAN registry's `EventLog` instances in
-/// `ensure_registered`/`with_context`.
-struct NapiBridgeEventLogProvider;
-
-impl NapiBridgeEventLogProvider {
-    const fn new() -> Self {
-        Self
-    }
-}
-
-impl ContextEventLogProvider for NapiBridgeEventLogProvider {
-    fn init_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn append_event(
-        &self,
-        _context_id: &[u8; 32],
-        _event_type: &str,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-}
+// NapiBridgeEventLogProvider removed — replaced by MerkleEventLogProvider
+// with ProtocolRepositoryEventLogBridge persistence (issue #484).
 
 // ---------------------------------------------------------------------------
 // NapiBridgePersistence — in-memory persistence

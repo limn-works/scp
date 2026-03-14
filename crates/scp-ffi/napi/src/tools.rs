@@ -1048,7 +1048,7 @@ mod tests {
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `tool_register` bridge function and inspects the
     /// stored `ToolRegistration`. Catches the original bug from issue #871.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_at_is_seconds_epoch() {
         use crate::context::NapiContextHandle;
 
