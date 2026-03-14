@@ -5099,6 +5099,7 @@ dependencies = [
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
+ "scp-mcp",
  "scp-media",
  "scp-platform",
  "scp-transport",
