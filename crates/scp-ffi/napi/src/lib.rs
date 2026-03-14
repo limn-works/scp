@@ -85,6 +85,7 @@ pub mod identity;
 pub mod mcp;
 pub mod provenance;
 pub mod runtime;
+pub mod scpid;
 pub mod sync;
 pub mod tools;
 pub mod transport;

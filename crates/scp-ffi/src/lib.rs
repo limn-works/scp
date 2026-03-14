@@ -62,6 +62,7 @@ pub mod identity;
 pub mod mcp;
 pub mod provenance;
 pub mod runtime;
+pub mod scpid;
 pub mod sync;
 pub mod tools;
 pub mod transport;
@@ -232,6 +233,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     trust::register_trust(m)?;
     bridge_connector::register_bridge_connector(m)?;
     sync::register_sync(m)?;
+    scpid::register_scpid(m)?;
 
     Ok(())
 }

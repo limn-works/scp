@@ -92,6 +92,8 @@ pub mod manager;
 pub mod provenance;
 /// WASM-local runtime registry (tool registry, event log, schema validation).
 pub mod runtime;
+/// SCPID authentication — challenge generation and signing (§3.11).
+pub mod scpid;
 /// JS-injected storage callback types (OPFS / `IndexedDB` integration).
 pub mod storage;
 /// State synchronization operations.
