@@ -433,6 +433,15 @@ pub enum DaysOfflineError {
         context_id: ContextId,
     },
 
+    /// Snapshot data was present but could not be deserialized.
+    #[error("snapshot deserialization failed for context {context_id}: {reason}")]
+    DeserializationFailed {
+        /// The context whose snapshot failed to deserialize.
+        context_id: ContextId,
+        /// Human-readable reason for the deserialization failure.
+        reason: String,
+    },
+
     /// The snapshot's context ID does not match the expected context.
     #[error("snapshot context mismatch: expected {expected}, got {actual}")]
     ContextMismatch {
@@ -971,8 +980,9 @@ impl<T: SnapshotTransport> DeltaSyncEngine for RelayBackedDeltaSyncEngine<T> {
         };
 
         let snapshot: ContextSnapshot =
-            rmp_serde::from_slice(&data).map_err(|_| DaysOfflineError::NoSnapshotAvailable {
+            rmp_serde::from_slice(&data).map_err(|e| DaysOfflineError::DeserializationFailed {
                 context_id: context_id.to_owned(),
+                reason: e.to_string(),
             })?;
 
         // Verify context ID matches.
@@ -1011,9 +1021,10 @@ impl<T: SnapshotTransport> DeltaSyncEngine for RelayBackedDeltaSyncEngine<T> {
     }
 
     async fn publish_snapshot(&self, snapshot: &ContextSnapshot) -> Result<(), DaysOfflineError> {
-        let data = rmp_serde::to_vec_named(snapshot).map_err(|_| {
-            DaysOfflineError::NoSnapshotAvailable {
+        let data = rmp_serde::to_vec_named(snapshot).map_err(|e| {
+            DaysOfflineError::DeserializationFailed {
                 context_id: snapshot.context_id.clone(),
+                reason: format!("serialization failed: {e}"),
             }
         })?;
 

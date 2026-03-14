@@ -1044,48 +1044,19 @@ impl ReconnectionCoordinator {
         };
 
         // Phase 2: MLS epoch reconciliation.
-        let local_epoch = driver.local_epoch(context_id).await.ok().flatten();
-        let target_epoch = driver
-            .observed_target_epoch(context_id, &messages)
-            .await
-            .ok()
-            .flatten();
-
-        let (epochs_caught_up, catch_up_outcome) = match (local_epoch, target_epoch) {
-            (Some(local), Some(target)) if target > local => {
-                match driver
-                    .epoch_reconciliation(context_id, local, target, &self.policy)
-                    .await
-                {
-                    Ok(state) => {
-                        let caught = state.commits_processed;
-                        let outcome = match &state.status {
-                            CatchUpStatus::Complete => SyncOutcome::FullyCaughtUp,
-                            CatchUpStatus::FastForwarded {
-                                skipped_from,
-                                skipped_to,
-                            } => SyncOutcome::FastForwarded {
-                                skipped_epochs: skipped_to.saturating_sub(*skipped_from),
-                            },
-                            CatchUpStatus::Failed { reason } => SyncOutcome::Failed {
-                                reason: reason.clone(),
-                            },
-                            CatchUpStatus::Processing => SyncOutcome::Failed {
-                                reason: "epoch reconciliation did not complete".to_owned(),
-                            },
-                        };
-                        (caught, outcome)
-                    }
-                    Err(e) => (
-                        0,
-                        SyncOutcome::Failed {
-                            reason: format!("epoch reconciliation failed: {e}"),
-                        },
-                    ),
-                }
-            }
-            _ => (0, SyncOutcome::FullyCaughtUp),
-        };
+        let local_epoch = Self::epoch_or_warn(
+            driver.local_epoch(context_id).await,
+            context_id,
+            "local_epoch",
+        );
+        let target_epoch = Self::epoch_or_warn(
+            driver.observed_target_epoch(context_id, &messages).await,
+            context_id,
+            "observed_target_epoch",
+        );
+        let (epochs_caught_up, catch_up_outcome) =
+            Self::reconcile_epoch(context_id, local_epoch, target_epoch, &self.policy, driver)
+                .await;
 
         // If epoch reconciliation failed, return early.
         if let SyncOutcome::Failed { .. } = &catch_up_outcome {
@@ -1102,19 +1073,44 @@ impl ReconnectionCoordinator {
         }
 
         // Phase 3: Event log sync.
-        let (events_recovered, sync_events) = driver
-            .event_log_sync(context_id)
-            .await
-            .unwrap_or((0, Vec::new()));
+        let (events_recovered, sync_events) = match driver.event_log_sync(context_id).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "Phase 3: event_log_sync failed, continuing with zero events recovered"
+                );
+                (0, Vec::new())
+            }
+        };
 
         // Phase 4: Sender key re-acquisition.
-        let messages_unrecoverable = driver
-            .sender_key_reacquire(context_id, &self.policy)
-            .await
-            .unwrap_or(0);
+        let messages_unrecoverable =
+            match driver.sender_key_reacquire(context_id, &self.policy).await {
+                Ok(count) => count,
+                Err(e) => {
+                    tracing::warn!(
+                        context_id,
+                        error = %e,
+                        "Phase 4: sender_key_reacquire failed, continuing with zero unrecoverable"
+                    );
+                    0
+                }
+            };
 
         // Phase 5: MLS Update.
-        let mls_update_issued = driver.mls_update(context_id).await.unwrap_or(false);
+        let mls_update_issued = match driver.mls_update(context_id).await {
+            Ok(issued) => issued,
+            Err(e) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "Phase 5: mls_update failed, continuing without MLS update"
+                );
+                false
+            }
+        };
 
         // Phase 6 is handled at the aggregate level in execute().
 
@@ -1146,6 +1142,77 @@ impl ReconnectionCoordinator {
             mls_update_issued: false,
             outcome,
             sync_events: Vec::new(),
+        }
+    }
+
+    /// Converts an epoch lookup result to `Option`, logging a warning on error.
+    ///
+    /// Used by Phase 2 to make epoch retrieval failures visible without
+    /// aborting the reconnection protocol.
+    fn epoch_or_warn(
+        result: Result<Option<u64>, SyncError>,
+        context_id: &str,
+        source: &str,
+    ) -> Option<u64> {
+        match result {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                tracing::warn!(
+                    context_id,
+                    source,
+                    error = %e,
+                    "Phase 2: epoch lookup failed, skipping epoch reconciliation"
+                );
+                None
+            }
+        }
+    }
+
+    /// Runs Phase 2 epoch reconciliation: compares local and target epochs,
+    /// processes Commits sequentially or falls back to Welcome-based fast-forward.
+    ///
+    /// Returns `(epochs_caught_up, outcome)`.
+    async fn reconcile_epoch<D: SyncPhaseDriver>(
+        context_id: &str,
+        local_epoch: Option<u64>,
+        target_epoch: Option<u64>,
+        policy: &SyncPolicy,
+        driver: &D,
+    ) -> (u64, SyncOutcome) {
+        match (local_epoch, target_epoch) {
+            (Some(local), Some(target)) if target > local => {
+                match driver
+                    .epoch_reconciliation(context_id, local, target, policy)
+                    .await
+                {
+                    Ok(state) => {
+                        let caught = state.commits_processed;
+                        let outcome = match &state.status {
+                            CatchUpStatus::Complete => SyncOutcome::FullyCaughtUp,
+                            CatchUpStatus::FastForwarded {
+                                skipped_from,
+                                skipped_to,
+                            } => SyncOutcome::FastForwarded {
+                                skipped_epochs: skipped_to.saturating_sub(*skipped_from),
+                            },
+                            CatchUpStatus::Failed { reason } => SyncOutcome::Failed {
+                                reason: reason.clone(),
+                            },
+                            CatchUpStatus::Processing => SyncOutcome::Failed {
+                                reason: "epoch reconciliation did not complete".to_owned(),
+                            },
+                        };
+                        (caught, outcome)
+                    }
+                    Err(e) => (
+                        0,
+                        SyncOutcome::Failed {
+                            reason: format!("epoch reconciliation failed: {e}"),
+                        },
+                    ),
+                }
+            }
+            _ => (0, SyncOutcome::FullyCaughtUp),
         }
     }
 
