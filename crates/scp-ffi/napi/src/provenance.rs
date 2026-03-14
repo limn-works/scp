@@ -1,12 +1,18 @@
 //! napi-rs bridge for provenance operations.
 //!
-//! Exposes SCP provenance quality evaluation to Node.js/Bun:
+//! Exposes SCP provenance quality evaluation and privacy operations to
+//! Node.js/Bun:
 //!
 //! - [`evaluate_provenance_quality`] -- Evaluate the provenance quality tier.
 //! - [`provenance_attach`] -- Attach provenance metadata at cross-context
 //!   boundaries.
 //! - [`provenance_check_chain_depth`] -- Check whether a provenance chain
 //!   depth is within the allowed limit.
+//! - [`provenance_redact_counterparties`] -- Remove counterparty DIDs (§24.3.5).
+//! - [`provenance_pseudonymize_counterparties`] -- Replace DIDs with
+//!   pseudonyms (§24.3.5).
+//! - [`provenance_update_source_type`] -- Update source type for state
+//!   changes (ADR-019 AC5).
 //!
 //! See spec section 24 (Provenance System) and ADR-019.
 
@@ -15,8 +21,9 @@ use napi_derive::napi;
 use scp_core::context::MemoryScope;
 use scp_core::provenance::attach::{
     DEFAULT_MAX_CHAIN_DEPTH, SourceContextInfo, attach_provenance, check_chain_depth,
+    pseudonymize_counterparties, redact_counterparties,
 };
-use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality};
+use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality, update_source_type};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
 use crate::error::ScpNapiError;
@@ -179,6 +186,95 @@ pub fn provenance_check_chain_depth(chain_depth: u32, max_depth: Option<u32>) ->
         payment_receipt_id: None,
     };
     check_chain_depth(&prov, max).is_ok()
+}
+
+/// Redacts counterparties from a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record, removes all counterparty DIDs,
+/// and returns the modified record as a JSON string.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result<String> {
+    let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })
+    })?;
+
+    redact_counterparties(&mut prov);
+
+    serde_json::to_string(&prov).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize provenance: {e}"),
+            code: "SCP-VALID-7051".to_owned(),
+        })
+    })
+}
+
+/// Pseudonymizes counterparties in a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record and a hex-encoded pseudonym key.
+/// Replaces real counterparty DIDs with deterministic context-scoped pseudonyms.
+/// Returns the modified record as a JSON string.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn provenance_pseudonymize_counterparties(
+    provenance_json: String,
+    pseudonym_key_hex: String,
+) -> napi::Result<String> {
+    let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })
+    })?;
+
+    let key = hex::decode(&pseudonym_key_hex).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid pseudonym_key_hex: {e}"),
+            code: "SCP-VALID-7052".to_owned(),
+        })
+    })?;
+
+    pseudonymize_counterparties(&mut prov, &key);
+
+    serde_json::to_string(&prov).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize provenance: {e}"),
+            code: "SCP-VALID-7051".to_owned(),
+        })
+    })
+}
+
+/// Updates the source type of a provenance record to reflect a new context
+/// state (ADR-019 AC5).
+///
+/// Accepts a JSON-serialized provenance record and a context state string.
+/// Returns the modified record as a JSON string.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn provenance_update_source_type(
+    provenance_json: String,
+    new_state: String,
+) -> napi::Result<String> {
+    let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })
+    })?;
+
+    let state = parse_context_state(&new_state)?;
+
+    update_source_type(&mut prov, &state);
+
+    serde_json::to_string(&prov).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize provenance: {e}"),
+            code: "SCP-VALID-7051".to_owned(),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -358,5 +454,127 @@ mod tests {
 
         let none = parse_discovery_method(None).unwrap();
         assert!(matches!(none, DiscoveryMethod::OutOfBand));
+    }
+
+    #[test]
+    fn redact_counterparties_removes_dids() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice", "did:dht:z6MkBob"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result = provenance_redact_counterparties(prov_json.to_string()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["counterparties"], serde_json::json!([]));
+        assert_eq!(parsed["source_context"], "ctx-test");
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_deterministic() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let key_hex = hex::encode(b"test-key");
+        let result1 =
+            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex.clone()).unwrap();
+        let result2 =
+            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex).unwrap();
+        assert_eq!(result1, result2);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        let parties = parsed["counterparties"].as_array().unwrap();
+        assert_eq!(parties.len(), 1);
+        assert!(parties[0].as_str().unwrap().starts_with("did:pseudo:"));
+    }
+
+    #[test]
+    fn update_source_type_changes_type() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result =
+            provenance_update_source_type(prov_json.to_string(), "closed_ephemeral".to_owned())
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Ephemeral");
+    }
+
+    #[test]
+    fn redact_counterparties_invalid_json_fails() {
+        assert!(provenance_redact_counterparties("not json".to_owned()).is_err());
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_invalid_hex_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        assert!(
+            provenance_pseudonymize_counterparties(prov_json.to_string(), "not-hex-zz".to_owned())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn update_source_type_invalid_state_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        assert!(
+            provenance_update_source_type(prov_json.to_string(), "invalid".to_owned()).is_err()
+        );
     }
 }

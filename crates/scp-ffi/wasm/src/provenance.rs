@@ -1,10 +1,14 @@
 //! `wasm-bindgen` bridge for provenance operations.
 //!
-//! Exposes provenance evaluation and attachment to JavaScript (browser target):
+//! Exposes provenance evaluation, attachment, and privacy operations to
+//! JavaScript (browser target):
 //!
 //! - `provenance_check_chain_depth` — Check if chain depth is within limits.
 //! - `evaluate_provenance_quality` — Evaluate provenance quality tier.
 //! - `provenance_attach` — Attach provenance metadata for cross-context data flow.
+//! - `provenance_redact_counterparties` — Remove counterparty DIDs (§24.3.5).
+//! - `provenance_pseudonymize_counterparties` — Replace DIDs with pseudonyms (§24.3.5).
+//! - `provenance_update_source_type` — Update source type for state changes (ADR-019 AC5).
 //!
 //! # WASM constraints
 //!
@@ -375,6 +379,172 @@ pub fn provenance_attach(
     });
 
     Ok(result.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// provenance_redact_counterparties
+// ---------------------------------------------------------------------------
+
+/// Redacts counterparties from a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record, removes all counterparty DIDs,
+/// and returns the modified record as a JSON string.
+///
+/// # Errors
+///
+/// Returns `JsError` if `provenance_json` is not valid JSON.
+///
+/// # JS usage
+///
+/// ```js
+/// const redacted = provenance_redact_counterparties(provenanceJson);
+/// console.log(JSON.parse(redacted).counterparties); // []
+/// ```
+#[wasm_bindgen]
+pub fn provenance_redact_counterparties(provenance_json: String) -> Result<String, JsError> {
+    let mut parsed: serde_json::Value = serde_json::from_str(&provenance_json)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7050] invalid provenance JSON: {e}")))?;
+
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert(
+            "counterparties".to_owned(),
+            serde_json::Value::Array(vec![]),
+        );
+    }
+
+    Ok(parsed.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// provenance_pseudonymize_counterparties
+// ---------------------------------------------------------------------------
+
+/// Pseudonymizes counterparties in a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record and a hex-encoded pseudonym key.
+/// Replaces real counterparty DIDs with deterministic context-scoped pseudonyms.
+/// Returns the modified record as a JSON string.
+///
+/// The pseudonym derivation is algorithm-identical to scp-core's
+/// `pseudonymize_did`: `SHA-256("SCP-PSEUDONYM-V1:" || len(key) || key ||
+/// len(context_id) || context_id || len(did) || did)` with each length as
+/// 4-byte big-endian.
+///
+/// # Errors
+///
+/// Returns `JsError` if `provenance_json` is not valid JSON or if
+/// `pseudonym_key_hex` is not valid hex.
+///
+/// # JS usage
+///
+/// ```js
+/// const pseudo = provenance_pseudonymize_counterparties(provenanceJson, keyHex);
+/// ```
+#[wasm_bindgen]
+pub fn provenance_pseudonymize_counterparties(
+    provenance_json: String,
+    pseudonym_key_hex: String,
+) -> Result<String, JsError> {
+    use sha2::{Digest, Sha256};
+
+    let mut parsed: serde_json::Value = serde_json::from_str(&provenance_json)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7050] invalid provenance JSON: {e}")))?;
+
+    let key = hex::decode(&pseudonym_key_hex)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7052] invalid pseudonym_key_hex: {e}")))?;
+
+    let context_id = parsed
+        .get("source_context")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    if let Some(parties) = parsed
+        .get_mut("counterparties")
+        .and_then(|v| v.as_array_mut())
+    {
+        #[allow(clippy::cast_possible_truncation)] // String/key lengths never exceed u32
+        let pseudonymized: Vec<serde_json::Value> = parties
+            .iter()
+            .map(|did_val| {
+                let did_str = did_val.as_str().unwrap_or("");
+                let did_bytes = did_str.as_bytes();
+                let mut hasher = Sha256::new();
+                hasher.update(b"SCP-PSEUDONYM-V1:");
+                hasher.update((key.len() as u32).to_be_bytes());
+                hasher.update(&key);
+                hasher.update((context_id.len() as u32).to_be_bytes());
+                hasher.update(context_id.as_bytes());
+                hasher.update((did_bytes.len() as u32).to_be_bytes());
+                hasher.update(did_bytes);
+                let hash = hasher.finalize();
+                serde_json::Value::String(format!("did:pseudo:{}", hex::encode(hash)))
+            })
+            .collect();
+        parsed["counterparties"] = serde_json::Value::Array(pseudonymized);
+    }
+
+    Ok(parsed.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// provenance_update_source_type
+// ---------------------------------------------------------------------------
+
+/// Updates the source type of a provenance record to reflect a new context
+/// state (ADR-019 AC5).
+///
+/// Accepts a JSON-serialized provenance record and a context state string.
+/// Returns the modified record as a JSON string.
+///
+/// State-to-source-type mapping (mirrors scp-core `update_source_type`):
+/// - `"active"` → `"Persistent"`
+/// - `"closed_with_summary_verified"` / `"closed_with_summary_unverified"` → `"Summary"`
+/// - `"closed_ephemeral"` → `"Ephemeral"`
+/// - `"unknown"` → no change (preserves existing source type)
+///
+/// # Errors
+///
+/// Returns `JsError` if `provenance_json` is not valid JSON or if
+/// `new_state` is not a recognized context state value.
+///
+/// # JS usage
+///
+/// ```js
+/// const updated = provenance_update_source_type(provenanceJson, "closed_ephemeral");
+/// ```
+#[wasm_bindgen]
+pub fn provenance_update_source_type(
+    provenance_json: String,
+    new_state: String,
+) -> Result<String, JsError> {
+    let mut parsed: serde_json::Value = serde_json::from_str(&provenance_json)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7050] invalid provenance JSON: {e}")))?;
+
+    let new_source_type = match new_state.as_str() {
+        "active" => Some("Persistent"),
+        "closed_with_summary_verified" | "closed_with_summary_unverified" => Some("Summary"),
+        "closed_ephemeral" => Some("Ephemeral"),
+        "unknown" => None, // preserve existing
+        other => {
+            return Err(JsError::new(&format!(
+                "[SCP-VALID-7053] invalid context_state '{other}': expected 'active', \
+                 'closed_with_summary_verified', 'closed_with_summary_unverified', \
+                 'closed_ephemeral', or 'unknown'"
+            )));
+        }
+    };
+
+    if let Some(st) = new_source_type
+        && let Some(obj) = parsed.as_object_mut()
+    {
+        obj.insert(
+            "source_type".to_owned(),
+            serde_json::Value::String(st.to_owned()),
+        );
+    }
+
+    Ok(parsed.to_string())
 }
 
 /// Parses a discovery method string into a JSON value (§24.2.3).
@@ -882,6 +1052,114 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["source_type"], "Summary");
         assert_eq!(json["memory_scope"], "Ephemeral");
+    }
+
+    // -- provenance privacy functions (#585) --
+
+    #[test]
+    fn redact_counterparties_removes_dids() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice", "did:dht:z6MkBob"],
+            "chain_depth": 0
+        });
+        let result = provenance_redact_counterparties(prov_json.to_string()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["counterparties"], serde_json::json!([]));
+        assert_eq!(parsed["source_context"], "ctx-test");
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_deterministic() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"]
+        });
+        let key_hex = hex::encode(b"test-key");
+        let result1 =
+            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex.clone()).unwrap();
+        let result2 =
+            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex).unwrap();
+        assert_eq!(result1, result2);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        let parties = parsed["counterparties"].as_array().unwrap();
+        assert_eq!(parties.len(), 1);
+        assert!(parties[0].as_str().unwrap().starts_with("did:pseudo:"));
+    }
+
+    #[test]
+    fn update_source_type_to_ephemeral() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": []
+        });
+        let result =
+            provenance_update_source_type(prov_json.to_string(), "closed_ephemeral".to_owned())
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Ephemeral");
+    }
+
+    #[test]
+    fn update_source_type_preserves_on_unknown() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Summary",
+            "counterparties": []
+        });
+        let result =
+            provenance_update_source_type(prov_json.to_string(), "unknown".to_owned()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Summary");
+    }
+
+    #[test]
+    fn update_source_type_to_summary() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": []
+        });
+        let result = provenance_update_source_type(
+            prov_json.to_string(),
+            "closed_with_summary_verified".to_owned(),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Summary");
+    }
+
+    #[test]
+    fn update_source_type_invalid_state_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": []
+        });
+        assert!(
+            provenance_update_source_type(prov_json.to_string(), "invalid".to_owned()).is_err()
+        );
+    }
+
+    #[test]
+    fn redact_counterparties_invalid_json_fails() {
+        assert!(provenance_redact_counterparties("not json".to_owned()).is_err());
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_invalid_hex_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "counterparties": ["did:dht:z6MkAlice"]
+        });
+        assert!(
+            provenance_pseudonymize_counterparties(prov_json.to_string(), "not-hex-zz".to_owned())
+                .is_err()
+        );
     }
 }
 
