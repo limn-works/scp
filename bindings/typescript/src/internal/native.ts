@@ -1031,12 +1031,9 @@ export function createNativeBridge(): Bridge {
       tier: string,
       contextIds: string[],
     ): Promise<string> {
-      if (typeof addon.identityExecuteRecovery === "function") {
-        return await (
-          addon.identityExecuteRecovery as (d: string, t: string, c: string[]) => Promise<string>
-        )(did, tier, contextIds);
-      }
-      throw new Error("identityExecuteRecovery not yet implemented in NAPI bridge");
+      return await (
+        addon.identityExecuteRecovery as (d: string, t: string, c: string[]) => Promise<string>
+      )(did, tier, contextIds);
     },
 
     async identityExecuteCustodyMigration(
@@ -1044,16 +1041,13 @@ export function createNativeBridge(): Bridge {
       target: string,
       contextIds: string[],
     ): Promise<string> {
-      if (typeof addon.identityExecuteCustodyMigration === "function") {
-        return await (
-          addon.identityExecuteCustodyMigration as (
-            d: string,
-            t: string,
-            c: string[],
-          ) => Promise<string>
-        )(did, target, contextIds);
-      }
-      throw new Error("identityExecuteCustodyMigration not yet implemented in NAPI bridge");
+      return await (
+        addon.identityExecuteCustodyMigration as (
+          d: string,
+          t: string,
+          c: string[],
+        ) => Promise<string>
+      )(did, target, contextIds);
     },
 
     // App Sandboxing (#595, spec §8.4.1, §8.4.2)
