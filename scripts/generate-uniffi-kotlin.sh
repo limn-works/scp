@@ -6,7 +6,7 @@
 # builds the library then invokes uniffi-bindgen to produce Kotlin source files.
 #
 # Usage:
-#   ./scripts/generate-uniffi-kotlin.sh [--release]
+#   ./scripts/generate-uniffi-kotlin.sh [--release] [--features=FEAT] [--skip-build]
 #
 # Output:
 #   bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
@@ -23,22 +23,39 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROFILE="debug"
-if [[ "${1:-}" == "--release" ]]; then
-    PROFILE="release"
-fi
+FEATURES=""
+SKIP_BUILD=false
+for arg in "$@"; do
+    case "$arg" in
+        --release) PROFILE="release" ;;
+        --features=*) FEATURES="${arg#--features=}" ;;
+        --skip-build) SKIP_BUILD=true ;;
+    esac
+done
 
 UNIFFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
 UDL_FILE="$UNIFFI_CRATE_DIR/src/scp.udl"
 OUTPUT_DIR="$REPO_ROOT/bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal"
 
-# Step 1: Build the Rust cdylib.
-echo "==> Building scp-ffi-uniffi ($PROFILE)..."
+# Step 1: Build the Rust cdylib (skip if --skip-build and library exists).
 if [[ "$PROFILE" == "release" ]]; then
-    cargo build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --release
     LIB_DIR="$REPO_ROOT/target/release"
 else
-    cargo build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml"
     LIB_DIR="$REPO_ROOT/target/debug"
+fi
+
+if [[ "$SKIP_BUILD" == "false" ]]; then
+    CARGO_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml")
+    if [[ "$PROFILE" == "release" ]]; then
+        CARGO_ARGS+=(--release)
+    fi
+    if [[ -n "$FEATURES" ]]; then
+        CARGO_ARGS+=(--features "$FEATURES")
+    fi
+    echo "==> Building scp-ffi-uniffi ($PROFILE)..."
+    cargo "${CARGO_ARGS[@]}"
+else
+    echo "==> Skipping build (--skip-build)"
 fi
 
 # Locate the compiled library (platform-dependent name).
@@ -59,7 +76,11 @@ fi
 
 # Step 2: Build the uniffi-bindgen binary from the crate.
 echo "==> Building uniffi-bindgen tool..."
-cargo build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --bin uniffi-bindgen
+BINDGEN_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --bin uniffi-bindgen)
+if [[ -n "$FEATURES" ]]; then
+    BINDGEN_ARGS+=(--features "$FEATURES")
+fi
+cargo "${BINDGEN_ARGS[@]}"
 
 BINDGEN_BIN="$REPO_ROOT/target/debug/uniffi-bindgen"
 if [[ ! -f "$BINDGEN_BIN" ]]; then
