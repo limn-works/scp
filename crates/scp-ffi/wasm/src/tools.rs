@@ -720,6 +720,10 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 /// `approved_by_target = false`. Requires the caller to be an admin of the
 /// source context (matching `scp-core::expose_tool` authorization).
 ///
+/// The admin DID is resolved from the context's membership state (the
+/// context creator), matching how PyO3/NAPI/UniFFI bridges pass
+/// `rt.creator_did` to `scp-core::expose_tool`.
+///
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the `ToolInterface` as a JSON string.
@@ -728,23 +732,32 @@ pub fn tool_interface_expose(
     context: &WasmContextHandle,
     tool_id: String,
     target_context_id: String,
-    identity_did: String,
     rate_limit_json: Option<String>,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         validate_tool_id(&tool_id).map_err(|e| ScpWasmError::from(e).into_js())?;
-        validate_did(&identity_did).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        // Resolve the admin DID from the context's creator — mirrors how
+        // PyO3/NAPI/UniFFI bridges use `rt.creator_did` internally.
+        let admin_did = with_manager(|mgr| {
+            mgr.context_creator(&context_id)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!("context '{context_id}' not found"),
+                    code: "SCP-CTX-2000".to_owned(),
+                })
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         // Require admin role — mirrors scp-core::expose_tool authorization.
-        let role = with_manager(|mgr| Ok(mgr.member_role(&context_id, &identity_did)))
+        let role = with_manager(|mgr| Ok(mgr.member_role(&context_id, &admin_did)))
             .map_err(ScpWasmError::into_js)?;
         match role.as_deref() {
             Some("admin") => {}
             _ => {
                 return Err(ScpWasmError::Permission {
                     message: format!(
-                        "tool interface expose requires admin role — '{identity_did}' \
+                        "tool interface expose requires admin role — '{admin_did}' \
                          is not an admin of context '{context_id}'"
                     ),
                     code: "SCP-PERM-3001".to_owned(),
@@ -818,6 +831,11 @@ pub fn tool_interface_expose(
 
 /// Accepts a cross-context tool interface (§6.2.0.1 step 4).
 ///
+/// Requires the caller to be an admin of the target context (matching
+/// `scp-core::accept_tool_interface` authorization). The admin DID is
+/// resolved from the context's membership state (the context creator),
+/// matching how PyO3/NAPI/UniFFI bridges pass `rt.creator_did`.
+///
 /// Verifies that the interface's `target_context` matches this context, then
 /// sets `approved_by_target = true`. Mirrors `scp-core::accept_tool_interface`
 /// context-mismatch check.
@@ -829,6 +847,35 @@ pub fn tool_interface_expose(
 pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
+        // Resolve the admin DID from the context's creator — mirrors how
+        // scp-core::accept_tool_interface checks has_admin_role(role_state, admin_did).
+        let admin_did = with_manager(|mgr| {
+            mgr.context_creator(&context_id)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!("context '{context_id}' not found"),
+                    code: "SCP-CTX-2000".to_owned(),
+                })
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        // Require admin role — mirrors scp-core::accept_tool_interface authorization.
+        let role = with_manager(|mgr| Ok(mgr.member_role(&context_id, &admin_did)))
+            .map_err(ScpWasmError::into_js)?;
+        match role.as_deref() {
+            Some("admin") => {}
+            _ => {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "tool interface accept requires admin role — '{admin_did}' \
+                         is not an admin of context '{context_id}'"
+                    ),
+                    code: "SCP-PERM-3001".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
+        }
+
         let mut interface: serde_json::Value =
             serde_json::from_str(&interface_json).map_err(|e| {
                 ScpWasmError::Validation {

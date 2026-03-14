@@ -92,6 +92,21 @@ interface WasmModule {
     handle: BridgeContextHandle,
     toolId: string,
   ) => Promise<{ toolId: string; passed: boolean; failuresJson: string }>;
+  // Cross-context tool interfaces (§6.2.0.1)
+  tool_interface_expose: (
+    handle: BridgeContextHandle,
+    toolId: string,
+    targetContextId: string,
+    rateLimitJson: string | undefined,
+  ) => Promise<string>;
+  tool_interface_accept: (
+    handle: BridgeContextHandle,
+    interfaceJson: string,
+  ) => Promise<string>;
+  tool_interface_revoke: (
+    handle: BridgeContextHandle,
+    interfaceIdHex: string,
+  ) => Promise<string>;
   transport_connect: (relayUrl: string) => Promise<{
     connected: boolean;
     relayUrl: string | null;
