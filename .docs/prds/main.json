@@ -8742,7 +8742,7 @@
         "ADR-033 criterion 8": "PricingFormula evaluation uses Amount(u64) and Coefficient(i64) exclusively — no f64 in any economic calculation path.",
         "ADR-033 criterion 9": "CostInsufficient error includes receiver's metric_snapshot so payer can see why costs diverged.",
         "ADR-033 criterion 10": "Auto-accept guard: ContextInvitation with EconomicPolicy requiring payment is never auto-accepted regardless of auto-accept policy configuration.",
-        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with toolInvocation in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
+        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with tool:invoke:* in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
       },
       "result": "EconomicPolicy evaluation, CostSchedule lookup, ObservableMetrics, CostInsufficient error, estimate_cost SDK function, policy lock, auto-accept guard all implemented with comprehensive tests."
     },
@@ -9231,8 +9231,8 @@
       ],
       "actionItems": [
         "Add PaidService and PaidBroadcast variants to TemplateId enum in crates/scp-core/src/context/templates.rs",
-        "Register paid-service template with properties: ceiling [messaging, toolInvocation], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
-        "Register paid-broadcast template with properties: mode Broadcast, ceiling [messaging], ceiling_policy immutable, memory_scope full, economic_policy required, subscriber admission gated",
+        "Register paid-service template with properties: ceiling [messages:read, messages:write, tool:invoke:*], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
+        "Register paid-broadcast template with properties: mode Broadcast, ceiling [messages:read, messages:write], ceiling_policy immutable, memory_scope full, economic_policy required, subscriber admission gated",
         "Implement validation for paid-service: reject creation when economic_policy is absent or per_tool_invoke is None",
         "Implement validation for paid-broadcast: reject creation when economic_policy is absent or per_period is None",
         "Wire template inheritance: paid-service extends tool-interface, paid-broadcast extends gated-broadcast",

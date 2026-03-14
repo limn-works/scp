@@ -3,7 +3,7 @@
 //! Implements the subscriber registration protocol from spec section 5.14.3
 //! and author-level blocking from spec section 5.14.8. Open broadcast contexts
 //! allow DID-authenticated registration without UCAN; gated contexts require a
-//! valid `messagesRead` UCAN. Blocking is per-author and cryptographic: the
+//! valid `messages:read` UCAN. Blocking is per-author and cryptographic: the
 //! author rotates their broadcast key, and the blocked subscriber receives no
 //! response to future key requests.
 
@@ -34,14 +34,14 @@ use scp_identity::DID;
 
 /// Admission policy for a broadcast context, derived from the template.
 ///
-/// Open contexts grant `messagesRead` on DID-authenticated registration.
-/// Gated contexts require an admin-issued UCAN with `messagesRead`.
+/// Open contexts grant `messages:read` on DID-authenticated registration.
+/// Gated contexts require an admin-issued UCAN with `messages:read`.
 /// See spec section 5.14.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BroadcastAdmission {
     /// Any DID can subscribe without a UCAN (public-broadcast template).
     Open,
-    /// Subscription requires a valid `messagesRead` UCAN (gated-broadcast).
+    /// Subscription requires a valid `messages:read` UCAN (gated-broadcast).
     Gated,
 }
 
@@ -70,7 +70,7 @@ pub struct SubscriberRegistration {
     #[serde(with = "serde_bytes")]
     pub wrapping_pubkey: Vec<u8>,
     /// Optional UCAN token. Required for gated broadcast contexts
-    /// (`gated-broadcast` template) — must grant `messagesRead`.
+    /// (`gated-broadcast` template) — must grant `messages:read`.
     /// `None` for open broadcast contexts (`public-broadcast` template).
     pub ucan: Option<UcanToken>,
     /// Unix timestamp (seconds) of registration request.
@@ -529,8 +529,8 @@ impl BroadcastContext {
 
     /// Registers an author with a freshly generated broadcast key at epoch 0.
     ///
-    /// Authors hold `messagesWrite` capability. This is called when a
-    /// `roleAssigned` event with role `author` is processed.
+    /// Authors hold `messages:write` capability. This is called when a
+    /// `role:assigned` event with role `author` is processed.
     ///
     /// # Errors
     ///
@@ -665,7 +665,7 @@ impl BroadcastContext {
     ///
     /// For open broadcast contexts (`BroadcastAdmission::Open`), any DID can
     /// subscribe with `ucan = None`. For gated contexts
-    /// (`BroadcastAdmission::Gated`), a valid `messagesRead` UCAN must be
+    /// (`BroadcastAdmission::Gated`), a valid `messages:read` UCAN must be
     /// provided and is validated through the full 11-step UCAN validation
     /// pipeline (signature, delegation chain, expiry, revocation, nonce —
     /// see ADR-016).
@@ -1049,9 +1049,9 @@ impl BroadcastContext {
     // Capability checks (spec section 5.14.9)
     // -----------------------------------------------------------------------
 
-    /// Checks whether a DID holds `messagesWrite` (is a registered author).
+    /// Checks whether a DID holds `messages:write` (is a registered author).
     ///
-    /// In broadcast contexts, `messagesWrite` is restricted to authors.
+    /// In broadcast contexts, `messages:write` is restricted to authors.
     #[must_use]
     pub fn can_write(&self, did: &str) -> bool {
         self.authors.contains_key(did)
@@ -1123,7 +1123,7 @@ impl BroadcastContext {
     ) -> Result<BroadcastPublishMetadata<'_>, ContextError> {
         if !self.can_write(author_did) {
             return Err(ContextError::PermissionDenied(format!(
-                "{author_did} is not an author (messagesWrite required)"
+                "{author_did} is not an author (messages:write required)"
             )));
         }
 
@@ -1144,7 +1144,7 @@ impl BroadcastContext {
     // -----------------------------------------------------------------------
 
     /// Encrypts a payload as a broadcast message after verifying that the
-    /// caller holds `messagesWrite` (is a registered author).
+    /// caller holds `messages:write` (is a registered author).
     ///
     /// This is the capability-enforced publish path: it combines the
     /// `can_write` check with [`seal_broadcast`] in a single operation so
@@ -1170,7 +1170,7 @@ impl BroadcastContext {
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if `author_did` is not a
-    ///   registered author (does not hold `messagesWrite`).
+    ///   registered author (does not hold `messages:write`).
     /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal operation
     ///   fails.
     ///
@@ -1186,7 +1186,7 @@ impl BroadcastContext {
     ) -> Result<BroadcastEnvelope, ContextError> {
         if !self.can_write(author_did) {
             return Err(ContextError::PermissionDenied(format!(
-                "{author_did} is not an author (messagesWrite required)"
+                "{author_did} is not an author (messages:write required)"
             )));
         }
 
@@ -1338,7 +1338,7 @@ impl BroadcastContext {
 
         // For gated contexts, the subscriber must have presented a UCAN at
         // registration time. Authors requesting keys from other authors are
-        // always allowed (they hold messagesWrite which implies messagesRead).
+        // always allowed (they hold messages:write which implies messages:read).
         if self.admission == BroadcastAdmission::Gated
             && let Some(record) = self.subscribers.get(requester_did)
             && !record.has_ucan
@@ -1483,7 +1483,7 @@ pub struct AuthorStateSnapshot {
 // UCAN validation helper
 // ---------------------------------------------------------------------------
 
-/// Validates that a UCAN token grants `messagesRead` for the given context
+/// Validates that a UCAN token grants `messages:read` for the given context
 /// using the full 11-step UCAN validation pipeline from ADR-016.
 ///
 /// Delegates to [`validate_ucan`] which performs: (1) JWT parse + header
@@ -4288,7 +4288,7 @@ mod tests {
     #[test]
     fn register_subscriber_gated_without_ucan_rejected() {
         // AC: submit SubscriberRegistration to gated broadcast with ucan: None
-        // → rejected with error specifying "messagesRead UCAN required for
+        // → rejected with error specifying "messages:read UCAN required for
         // gated broadcast".
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
@@ -4331,7 +4331,7 @@ mod tests {
 
     #[test]
     fn register_subscriber_gated_with_valid_ucan_succeeds() {
-        // AC: gated broadcast with valid messagesRead UCAN passes full
+        // AC: gated broadcast with valid messages:read UCAN passes full
         // 11-step validation.
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
@@ -4460,18 +4460,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AC: Round-trip test — mint messagesRead UCAN → validate (#299)
+    // AC: Round-trip test — mint messages:read UCAN → validate (#299)
     // -----------------------------------------------------------------------
 
     #[test]
     fn roundtrip_open_broadcast_mint_validate_ucan() {
-        // AC: mint a messagesRead UCAN for a subscriber in open broadcast →
+        // AC: mint a messages:read UCAN for a subscriber in open broadcast →
         // validate it via validate_ucan() → passes all 11 steps.
         let setup = GatedTestSetup::new();
         let sub_did = "did:example:subscriber";
         let context_id = "ctx-broadcast-roundtrip";
 
-        // Mint a valid messagesRead UCAN.
+        // Mint a valid messages:read UCAN.
         let ucan = make_signed_ucan(context_id, &setup.issuer_did, sub_did, &setup.signing_key);
 
         // Validate it through the full 11-step pipeline.
