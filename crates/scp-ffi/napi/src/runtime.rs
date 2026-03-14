@@ -100,16 +100,39 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 
 /// Returns a reference to the shared `ContextManager`.
 ///
-/// Initializes the manager on first call with bridge-local provider
-/// implementations. All NAPI bridge functions that need context operations
-/// call this function.
+/// # Errors
+///
+/// Returns `napi::Error` if the manager has not been initialized via
+/// [`init_context_manager`]. Matches the `PyO3` bridge pattern: callers
+/// must explicitly initialize the manager (typically during
+/// `context_create`) rather than silently auto-initializing with
+/// potentially invalid state.
+pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
+    CONTEXT_MANAGER.get().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Context {
+            message: "ContextManager not initialized — call context_create or \
+                      init_context_manager first"
+                .to_owned(),
+            code: "SCP-CTX-2000".to_owned(),
+        })
+    })
+}
+
+/// Initializes the global [`ContextManager`] with bridge-local providers.
+///
+/// Uses `NapiBridgeCryptoProvider` (no-op), `NotConfiguredTransportProvider`,
+/// `MerkleEventLogProvider` (persistent, #484), and `NapiBridgePersistence`.
+/// This is called during `context_create` to ensure the manager is ready
+/// before any context operations.
 ///
 /// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
 /// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
 /// storage provider. This ensures event log entries are persisted on each
 /// append (issue #484 AC).
-pub fn context_manager() -> &'static Arc<ContextManager> {
-    CONTEXT_MANAGER.get_or_init(|| {
+///
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn init_context_manager() {
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
         let crypto = Box::new(NapiBridgeCryptoProvider);
         let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
         let event_log = build_event_log_provider();
@@ -121,7 +144,7 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             persistence,
             not_configured_key_resolver(),
         ))
-    })
+    });
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
@@ -521,7 +544,10 @@ pub fn remove_context(context_id: &str) {
 /// Returns `ScpNapiError` if the context is not registered in either the
 /// manager or the UCAN state registry.
 pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpNapiError> {
-    let mgr = context_manager();
+    let mgr = CONTEXT_MANAGER.get().ok_or_else(|| ScpNapiError::Context {
+        message: "ContextManager not initialized — call context_create first".to_owned(),
+        code: "SCP-CTX-2000".to_owned(),
+    })?;
     let new_role_state =
         mgr.get_role_state(context_id)
             .await

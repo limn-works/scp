@@ -103,25 +103,59 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     })
 }
 
-/// Returns (or lazily initializes) the shared `ContextManager`.
+/// Returns a reference to the shared `ContextManager`.
 ///
-/// The manager is created with stub provider implementations that delegate
-/// to no-op operations for crypto and transport. Event log persistence is
-/// wired via `MerkleEventLogProvider::with_persistence` backed by a
-/// `ProtocolRepositoryEventLogBridge` over an encrypted in-memory storage
-/// provider. This ensures event log entries are persisted on each append
-/// (issue #484 AC). Mobile apps (Swift/Kotlin) are killed aggressively by
+/// # Errors
+///
+/// Returns `ScpError::Context` if the manager has not been initialized via
+/// [`init_context_manager`]. Matches the `PyO3` bridge pattern: callers
+/// must explicitly initialize the manager (typically during
+/// `context_create`) rather than silently auto-initializing with
+/// potentially invalid state.
+pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
+    CONTEXT_MANAGER.get().ok_or_else(|| crate::ScpError::Context {
+        message: "ContextManager not initialized — call context_create or \
+                  init_context_manager first"
+            .to_owned(),
+        code: "SCP-CTX-2000".to_owned(),
+    })
+}
+
+/// Returns a reference to the shared `ContextManager` for infallible contexts.
+///
+/// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
+/// Option, ()), this provides a fallback that logs an error and returns
+/// a default-initialized manager rather than panicking. Callers should
+/// prefer [`context_manager`] when the return type supports `Result`.
+pub fn context_manager_or_init() -> &'static Arc<ContextManager> {
+    if let Some(mgr) = CONTEXT_MANAGER.get() {
+        return mgr;
+    }
+    tracing::warn!(
+        "context_manager_or_init: ContextManager not explicitly initialized — \
+         auto-initializing with default providers. Call context_create first."
+    );
+    init_context_manager();
+    CONTEXT_MANAGER
+        .get()
+        .unwrap_or_else(|| unreachable!("init_context_manager just set CONTEXT_MANAGER"))
+}
+
+/// Initializes the global [`ContextManager`] with bridge-local providers.
+///
+/// Uses `FfiBridgeCrypto` (no-op), `NotConfiguredTransportProvider`,
+/// `MerkleEventLogProvider` (persistent, #484), and a not-configured key
+/// resolver. This is called during `context_create` to ensure the manager
+/// is ready before any context operations.
+///
+/// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
+/// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
+/// storage provider. Mobile apps (Swift/Kotlin) are killed aggressively by
 /// the OS, making persistence critical for data durability.
 ///
-/// SDK consumers requiring durable persistence across app restarts should
-/// provide a file-backed `Storage` implementation at the application layer
-/// (e.g., `SqliteStorage`). The in-memory default provides the persistence
-/// wiring so the `MerkleEventLogProvider` records entries; app-level storage
-/// makes them survive process termination.
-///
-/// Thread-safe: `OnceLock` guarantees initialization happens exactly once.
-pub fn context_manager() -> &'static Arc<ContextManager> {
-    CONTEXT_MANAGER.get_or_init(|| {
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn init_context_manager() {
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
         let event_log = build_event_log_provider();
         Arc::new(ContextManager::new(
             Box::new(FfiBridgeCrypto),
@@ -129,7 +163,7 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             event_log,
             not_configured_key_resolver(),
         ))
-    })
+    });
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
@@ -365,7 +399,7 @@ pub fn remove_ucan_state(context_id: &str) {
 /// Syncs role state from the `ContextManager` after governance operations.
 ///
 /// The `UniFFI` bridge reads role state directly from the `ContextManager`
-/// (unlike PyO3/NAPI which cache `role_state` locally). This function
+/// (unlike `PyO3`/NAPI which cache `role_state` locally). This function
 /// validates the `ContextManager` state is consistent and logs the sync
 /// for traceability, matching the pattern of the other bridges.
 ///
@@ -373,7 +407,7 @@ pub fn remove_ucan_state(context_id: &str) {
 ///
 /// Returns `ScpError` if the context is not registered in the manager.
 pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate::ScpError> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     let _role_state =
         manager
             .get_role_state(context_id)

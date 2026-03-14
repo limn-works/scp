@@ -176,7 +176,7 @@ impl NapiContextHandle {
     /// The `Result` return type is required by napi-rs. This getter is infallible.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u32> {
-        let manager = context_manager();
+        let manager = context_manager()?;
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))
             .unwrap_or(0);
@@ -415,8 +415,11 @@ pub async fn context_create(
         ..ContextParams::default()
     };
 
+    // Initialize the ContextManager if not already done (first context_create call).
+    crate::runtime::init_context_manager();
+
     // Delegate to ContextManager.
-    let manager = context_manager();
+    let manager = context_manager()?;
     let core_handle = manager
         .create_context(context_id.clone(), context_params, DID(creator_did.clone()))
         .await
@@ -477,7 +480,7 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
         mls_key_package_bytes: None,
     };
 
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .join_context(core_handle, key_package)
         .await
@@ -511,7 +514,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .leave_context(core_handle, &did, &did)
         .await
@@ -550,7 +553,7 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .close_context(core_handle, &did)
         .await
@@ -633,7 +636,7 @@ pub async fn context_send(
             })?;
     }
 
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .send_message(core_handle, &did, &payload, None)
         .await
@@ -697,7 +700,7 @@ pub fn context_subscribe(
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
@@ -712,7 +715,7 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     Ok(manager.is_member(&handle.context_id, &did).await)
 }
 
@@ -725,7 +728,7 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     Ok(manager.member_dids(&handle.context_id).await)
 }
 
@@ -743,7 +746,7 @@ pub async fn context_member_role(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     Ok(manager
         .member_role(&handle.context_id, &did)
         .await
@@ -764,7 +767,7 @@ pub async fn context_member_role(
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextDrainEvents")]
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     let events = manager.drain_events(&handle.context_id).await;
     Ok(events.into_iter().map(|e| format!("{e:?}")).collect())
 }
@@ -784,7 +787,7 @@ pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Ve
 pub async fn context_broadcast_subscriber_count(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<u32>> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(manager
         .broadcast_subscriber_count(&handle.context_id)
@@ -805,7 +808,7 @@ pub async fn context_is_broadcast_subscriber(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
         .await)
@@ -822,7 +825,7 @@ pub async fn context_is_broadcast_subscriber(
 pub async fn context_broadcast_admission(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     Ok(manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -910,7 +913,7 @@ pub async fn broadcast_subscribe(
     subscriber_did: String,
 ) -> napi::Result<()> {
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
     let timestamp = std::time::SystemTime::now()
@@ -949,7 +952,7 @@ pub async fn broadcast_unsubscribe(
     rotate_keys: Option<bool>,
 ) -> napi::Result<()> {
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
 
@@ -979,7 +982,7 @@ pub async fn broadcast_publish(
     payload: Vec<u8>,
 ) -> napi::Result<()> {
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let author_did = DID(author_did);
 
@@ -1042,7 +1045,7 @@ pub async fn broadcast_block_subscriber(
 ) -> napi::Result<()> {
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let subscriber: DID = DID(subscriber_did);
     let blocker: DID = DID(blocker_did);
@@ -1073,7 +1076,7 @@ pub async fn broadcast_unblock_subscriber(
 ) -> napi::Result<()> {
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let subscriber: DID = DID(subscriber_did);
     let unblocker: DID = DID(unblocker_did);
@@ -1108,7 +1111,7 @@ pub async fn broadcast_handle_key_request(
 ) -> napi::Result<String> {
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let author: DID = DID(author_did);
     let requester: DID = DID(requester_did);
@@ -1189,7 +1192,7 @@ pub async fn context_execute_governance_action(
         created_at_epoch: None,
     };
 
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
     let result = manager
         .execute_governance_action(&context_id, &proposal)
@@ -1309,7 +1312,7 @@ pub async fn context_governance_propose(
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(proposer_did);
-        let manager = context_manager();
+        let manager = context_manager()?;
         let context_id = handle.context_id.clone();
 
         let outcome = manager
@@ -1378,7 +1381,7 @@ pub async fn context_governance_approve(
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager();
+        let manager = context_manager()?;
         let context_id = handle.context_id.clone();
 
         let status = manager
@@ -1438,7 +1441,7 @@ pub async fn context_governance_reject(
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager();
+        let manager = context_manager()?;
         let context_id = handle.context_id.clone();
 
         let status = manager
@@ -1494,7 +1497,7 @@ pub async fn context_governance_withdraw(
 ) -> napi::Result<String> {
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let did = DID(voter_did);
-    let manager = context_manager();
+    let manager = context_manager()?;
     let context_id = handle.context_id.clone();
 
     let status = manager
@@ -1537,7 +1540,7 @@ pub async fn context_governance_get_proposal(
 ) -> napi::Result<String> {
     let context_id = handle.context_id.clone();
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let manager = context_manager();
+    let manager = context_manager()?;
 
     let proposal = manager
         .get_proposal(&context_id, &proposal_id)
@@ -1568,7 +1571,7 @@ pub async fn context_governance_get_proposal(
 #[napi(js_name = "contextGovernanceListProposals")]
 pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
     let context_id = handle.context_id.clone();
-    let manager = context_manager();
+    let manager = context_manager()?;
 
     let proposals = manager.list_proposals(&context_id).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -1599,7 +1602,7 @@ pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> na
 #[napi(js_name = "contextHandleTtlExpiry")]
 pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Result<()> {
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .handle_ttl_expiry(core_handle)
         .await
@@ -1625,7 +1628,7 @@ pub async fn context_propose_ttl_extension(
 ) -> napi::Result<bool> {
     let did = DID(proposer_did.clone());
     let duration = std::time::Duration::from_secs(u64::from(extension_secs));
-    let manager = context_manager();
+    let manager = context_manager()?;
     let unanimous = manager
         .propose_ttl_extension(&handle.context_id, &did, duration)
         .await
@@ -1648,7 +1651,7 @@ pub async fn context_reset_ttl_timer(
 ) -> napi::Result<()> {
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .reset_ttl_timer(&handle.context_id, duration, core_handle.clone())
         .await;
@@ -1671,7 +1674,7 @@ pub async fn context_reset_ttl_timer(
 #[napi(js_name = "contextExport")]
 pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
-    let manager = context_manager();
+    let manager = context_manager()?;
     let export = manager
         .export_context(&handle.context_id, exporter_did)
         .await
@@ -1703,7 +1706,7 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
         })
     })?;
     let context_id = export.snapshot.context_id.clone();
-    let manager = context_manager();
+    let manager = context_manager()?;
     manager
         .import_context(export)
         .await
@@ -1866,7 +1869,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager();
+        let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
 
@@ -1975,7 +1978,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager();
+        let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
         let params = ContextParams {
@@ -2036,7 +2039,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager();
+        let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
         let params = ContextParams {
@@ -2088,7 +2091,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager();
+        let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";
         let target = "did:key:z6MkNapiRemTarget";
