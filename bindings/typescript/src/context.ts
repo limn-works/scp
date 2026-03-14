@@ -1021,7 +1021,7 @@ export class Context implements AsyncDisposable {
 /** Result of validating a capability declaration. */
 export interface DeclarationValidationResult {
   valid: boolean;
-  grantedCapabilities: string[];
+  grantedCapabilities: readonly string[];
   error: string | null;
   appDid: string;
 }
@@ -1038,16 +1038,17 @@ export interface DeclarationValidationResult {
  */
 export class ScopedHandle {
   readonly context: Context;
-  readonly grantedCapabilities: string[];
+  readonly grantedCapabilities: readonly string[];
   readonly appDid: string;
 
   constructor(
     context: Context,
-    grantedCapabilities: string[],
+    grantedCapabilities: readonly string[],
     appDid: string,
   ) {
     this.context = context;
-    this.grantedCapabilities = grantedCapabilities;
+    // Freeze to prevent mutation via Object.defineProperty or prototype tricks.
+    this.grantedCapabilities = Object.freeze([...grantedCapabilities]);
     this.appDid = appDid;
   }
 
@@ -1062,7 +1063,7 @@ export class ScopedHandle {
     if (!this.hasCapability(capability)) {
       throw new ContextError(
         `capability denied: ${capability} not granted to app ${this.appDid}`,
-        "SCP-STORAGE-8001",
+        "SCP-CTX-2050",
       );
     }
   }
@@ -1072,12 +1073,13 @@ export class ScopedHandle {
  * Validates a capability declaration against a context ceiling and role capabilities.
  *
  * Returns a result object with validation outcome. See spec §8.4.1.
+ * This is a synchronous operation -- no I/O is involved.
  */
-export async function validateCapabilityDeclaration(
+export function validateCapabilityDeclaration(
   declarationJson: string,
   ceilingCapabilities: string[],
   roleCapabilities: string[],
-): Promise<DeclarationValidationResult> {
+): DeclarationValidationResult {
   const bridge = getBridge();
   const resultJson = bridge.validateCapabilityDeclaration(
     declarationJson,

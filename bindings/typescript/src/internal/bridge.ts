@@ -339,7 +339,7 @@ export interface Bridge {
     ceilingCapabilities: string[],
     roleCapabilities: string[],
   ): string;
-  checkScopedCapability(grantedCapabilities: string[], requiredCapability: string): boolean;
+  checkScopedCapability(grantedCapabilities: readonly string[], requiredCapability: string): boolean;
 
   // Lifecycle
   version(): string;

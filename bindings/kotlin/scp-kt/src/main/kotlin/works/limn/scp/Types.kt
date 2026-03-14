@@ -8,6 +8,8 @@
 
 package works.limn.scp
 
+import works.limn.scp.bridge.BridgeException
+
 /**
  * Key custody method for identity key management (spec section 3.2).
  *
@@ -132,15 +134,20 @@ data class DeclarationValidationResult(
  * Once created, a [ScopedHandle] cannot gain additional capabilities
  * (no escalation guarantee, spec 8.4.2 rule 4).
  *
- * @property contextId The context ID this handle is scoped to.
- * @property grantedCapabilities The capabilities granted to this app binding.
- * @property appDid The DID of the app.
+ * This is intentionally NOT a data class: the auto-generated `copy()` method
+ * on data classes would allow callers to create a new handle with escalated
+ * capabilities, bypassing the no-escalation guarantee.
  */
-data class ScopedHandle(
+class ScopedHandle internal constructor(
+    /** The context ID this handle is scoped to. */
     val contextId: String,
-    val grantedCapabilities: List<String>,
+    grantedCapabilities: List<String>,
+    /** The DID of the app. */
     val appDid: String,
 ) {
+    /** The capabilities granted to this app binding (immutable). */
+    val grantedCapabilities: List<String> = grantedCapabilities.toList()
+
     /**
      * Check whether a given capability is allowed.
      */
@@ -157,11 +164,32 @@ data class ScopedHandle(
     }
 
     /**
-     * Throws [IllegalStateException] if the capability is not granted.
+     * Throws [BridgeException] if the capability is not granted.
      */
     fun checkCapability(capability: String) {
-        check(hasCapability(capability)) {
-            "capability denied: $capability not granted to app $appDid"
+        if (!hasCapability(capability)) {
+            throw BridgeException(
+                "capability denied: $capability not granted to app $appDid",
+                "SCP-CTX-2050",
+            )
         }
     }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ScopedHandle) return false
+        return contextId == other.contextId &&
+            grantedCapabilities == other.grantedCapabilities &&
+            appDid == other.appDid
+    }
+
+    override fun hashCode(): Int {
+        var result = contextId.hashCode()
+        result = 31 * result + grantedCapabilities.hashCode()
+        result = 31 * result + appDid.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "ScopedHandle(contextId=$contextId, appDid=$appDid, capabilities=${grantedCapabilities.size})"
 }

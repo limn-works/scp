@@ -1140,14 +1140,67 @@ pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u3
 // App Sandboxing (#595, spec §8.4.1, §8.4.2)
 // ---------------------------------------------------------------------------
 
+/// Maps a resource category + action to the canonical capability name string
+/// matching all 19 variants of `scp-core`'s `Capability` enum (see
+/// `crates/scp-core/src/context/roles.rs` `Capability::new()`).
+///
+/// The `is_tool` flag indicates the resource path ends with `tools/{name}`,
+/// meaning the action targets a specific tool (not the tools category itself).
+fn map_capability_name(category: &str, action: &str, is_tool: bool) -> String {
+    match (category, action, is_tool) {
+        // ToolInvoke(specific) -- resource ends with tools/{tool_name}
+        (_, "invoke", true) => format!("tool:invoke:{category}"),
+        // ToolInvokeAll
+        ("tools", "invoke", _) => "tool:invoke:*".to_owned(),
+        // ToolRegister
+        ("tools", "register", _) => "tool:register".to_owned(),
+        // ToolInterface (cross-context tool exposure, spec section 6.2)
+        ("tools", "interface", _) => "tool:interface".to_owned(),
+        // MessagesRead (messaging, messages, or members read)
+        ("messaging" | "messages" | "members", "read", _) => "messages:read".to_owned(),
+        // MessagesWrite
+        ("messaging" | "messages", "write", _) => "messages:write".to_owned(),
+        // MemberInvite
+        ("members", "invite", _) => "member:invite".to_owned(),
+        // MemberRemove
+        ("members", "remove", _) => "member:remove".to_owned(),
+        // MemberBan (spec section 5.3)
+        ("members", "ban", _) => "member:ban".to_owned(),
+        // RoleAssign
+        ("roles", "assign", _) => "role:assign".to_owned(),
+        // GovernancePropose
+        ("governance", "propose" | "write", _) => "governance:propose".to_owned(),
+        // GovernanceVote
+        ("governance", "vote", _) => "governance:vote".to_owned(),
+        // ContextClose
+        ("context", "close", _) => "context:close".to_owned(),
+        // ChildContextCreate (spec section 5.13)
+        ("context", "child:create" | "create_child", _) => "context:child:create".to_owned(),
+        // Bridging (spec section 12)
+        ("bridging", _, _) => "bridging".to_owned(),
+        // MediaVoice (spec section 10.9.1)
+        ("media", "voice", _) => "media:voice".to_owned(),
+        // MediaVideo (spec section 10.9.1)
+        ("media", "video", _) => "media:video".to_owned(),
+        // MediaScreenShare (spec section 10.9.1)
+        ("media", "screen_share", _) => "media:screen_share".to_owned(),
+        // MetadataEdit (spec section 5.7, section 5.3.1)
+        ("metadata", "edit", _) => "metadata:edit".to_owned(),
+        // Custom capabilities -- anything not matching a known pattern
+        _ => format!("custom:{category}:{action}"),
+    }
+}
+
 /// Validates a capability declaration JSON string against a context ceiling and
 /// role capabilities. Returns a JSON string with validation result.
 ///
 /// The declaration JSON must be a valid `CapabilityDeclaration` per spec §8.4.1.
-/// WASM bridge performs structural + capability validation but delegates
-/// signature verification to the caller (Ed25519 verification via `WebCrypto`).
+/// WASM bridge performs structural + capability validation but does NOT perform
+/// Ed25519 signature verification. The `signatureVerified` field in the result
+/// is always `false` -- callers MUST verify the signature themselves (e.g. via
+/// `WebCrypto`) before trusting the result.
 ///
-/// Result JSON: `{ valid, grantedCapabilities, error, appDid }`.
+/// Result JSON: `{ valid, signatureVerified, grantedCapabilities, error, appDid }`.
 ///
 /// # Errors
 ///
@@ -1174,6 +1227,7 @@ pub fn sandbox_validate_declaration(
     if app_name.is_empty() || app_name.len() > 128 {
         let result = serde_json::json!({
             "valid": false,
+            "signatureVerified": false,
             "grantedCapabilities": [],
             "error": "invalid app_name: must be 1-128 UTF-8 bytes",
             "appDid": app_did
@@ -1190,6 +1244,7 @@ pub fn sandbox_validate_declaration(
     if capabilities.is_empty() || capabilities.len() > 64 {
         let result = serde_json::json!({
             "valid": false,
+            "signatureVerified": false,
             "grantedCapabilities": [],
             "error": "capabilities must have 1-64 entries",
             "appDid": app_did
@@ -1217,15 +1272,7 @@ pub fn sandbox_validate_declaration(
 
         for action_val in &actions {
             let action = action_val.as_str().unwrap_or("");
-            let cap_name = match (category, action, is_tool) {
-                (_, "invoke", true) => format!("tool:invoke:{category}"),
-                ("messaging" | "members", "read", _) => "messages:read".to_owned(),
-                ("messaging", "write", _) => "messages:write".to_owned(),
-                ("tools", "invoke", _) => "tool:invoke:*".to_owned(),
-                ("governance", "write", _) => "governance:propose".to_owned(),
-                _ => format!("{category}:{action}"),
-            };
-            requested.push(cap_name);
+            requested.push(map_capability_name(category, action, is_tool));
         }
     }
 
@@ -1242,6 +1289,7 @@ pub fn sandbox_validate_declaration(
         if !in_ceiling || !in_role {
             let result = serde_json::json!({
                 "valid": false,
+                "signatureVerified": false,
                 "grantedCapabilities": [],
                 "error": format!("capability denied: {cap}"),
                 "appDid": app_did
@@ -1253,6 +1301,7 @@ pub fn sandbox_validate_declaration(
 
     let result = serde_json::json!({
         "valid": true,
+        "signatureVerified": false,
         "grantedCapabilities": requested,
         "error": null,
         "appDid": app_did

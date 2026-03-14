@@ -41,7 +41,7 @@ use scp_identity::DID;
 
 /// Errors produced by app sandboxing operations.
 ///
-/// Error codes follow the `SCP-SANDBOX-` prefix (range 8000-8999).
+/// Error codes follow the `SCP-CTX-` prefix (range 2050-2059).
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     /// An API call was attempted that exceeds the app's declared capabilities.
@@ -71,15 +71,21 @@ pub enum SandboxError {
     #[error("signature verification failed")]
     SignatureVerificationFailed,
 
-    /// A requested capability exceeds the context's capability ceiling.
+    /// One or more requested capabilities exceed the context's capability
+    /// ceiling or the agent's role.
     ///
-    /// Returned during bind-time validation when a capability in the
+    /// Returned during bind-time validation when any capability in the
     /// declaration is not present in the context's ceiling or the agent's
-    /// role capabilities.
-    #[error("ceiling exceeded: {requested} not available in context")]
+    /// role capabilities. The rejection is all-or-nothing per spec 8.4.1
+    /// step 4, and includes the full `denied_capabilities` array listing
+    /// every capability that failed and why.
+    #[error(
+        "ceiling exceeded: {}",
+        DeniedCapability::format_list(denied_capabilities)
+    )]
     CeilingExceeded {
-        /// The capability that exceeded the ceiling.
-        requested: Capability,
+        /// All capabilities that were denied, with per-capability reasons.
+        denied_capabilities: Vec<DeniedCapability>,
     },
 
     /// Serialization or deserialization failed.
@@ -688,6 +694,18 @@ pub struct DeniedCapability {
     pub reason: DenialReason,
 }
 
+impl DeniedCapability {
+    /// Formats a list of denied capabilities for error messages.
+    #[must_use]
+    pub fn format_list(denied: &[Self]) -> String {
+        denied
+            .iter()
+            .map(|d| format!("{} ({})", d.capability, d.reason))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// The reason a capability was denied during validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenialReason {
@@ -783,10 +801,12 @@ pub fn validate_declaration(
         }
     }
 
-    // All-or-nothing: if ANY capability is denied, reject ALL.
-    if let Some(first_denied) = denied.first() {
+    // All-or-nothing: if ANY capability is denied, reject ALL (spec 8.4.1 step 4).
+    // The full denied list is returned so callers can report which capabilities
+    // failed and why.
+    if !denied.is_empty() {
         return Err(SandboxError::CeilingExceeded {
-            requested: first_denied.capability.clone(),
+            denied_capabilities: denied,
         });
     }
 
@@ -871,13 +891,19 @@ fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, SandboxErr
 }
 
 /// Recursively sorts all object keys in a JSON value.
+///
+/// Uses an intermediate `BTreeMap` to guarantee lexicographic key ordering
+/// regardless of whether `serde_json` is compiled with the `preserve_order`
+/// feature (which backs `Map` with `IndexMap` instead of `BTreeMap`).
 fn sort_json_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            let sorted: serde_json::Map<String, serde_json::Value> = map
+            let sorted_btree: std::collections::BTreeMap<String, serde_json::Value> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), sort_json_value(v)))
                 .collect();
+            let sorted: serde_json::Map<String, serde_json::Value> =
+                sorted_btree.into_iter().collect();
             serde_json::Value::Object(sorted)
         }
         serde_json::Value::Array(arr) => {
@@ -1998,7 +2024,10 @@ mod tests {
         assert!(err.to_string().contains("signature"));
 
         let err = SandboxError::CeilingExceeded {
-            requested: Capability::Bridging,
+            denied_capabilities: vec![DeniedCapability {
+                capability: Capability::Bridging,
+                reason: DenialReason::NotInCeiling,
+            }],
         };
         assert!(err.to_string().contains("bridging"));
     }
