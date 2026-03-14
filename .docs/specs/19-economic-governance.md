@@ -319,7 +319,7 @@ pub struct CostSchedule {
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 
-**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `toolInvocation` in its ceiling and `per_tool_invoke: $0.01` in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
+**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `tool:invoke:*` in its ceiling and `per_tool_invoke: $0.01` in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
 
 **Child context independence:** Child contexts (§5.13) do NOT inherit parent economic policy — each child's pricing is independent. A free parent can have paid children and vice versa.
 
@@ -408,7 +408,7 @@ pub struct SpendingCapability {
 
 **Enforcement location.** `max_total` is enforced by the **payer's SDK** as a self-imposed spending limit. The payer SDK maintains a local spending ledger: a list of `(receipt_id, amount, timestamp)` tuples stored under `identity/{did}/spending_ledger/{ucan_token_id}/` in `ProtocolRepository`. Before each `authorize()` call, the SDK sums receipts within `time_window` and rejects if `running_total + new_amount > max_total` with a `SpendingLimitExceeded` error. Payees do NOT enforce `max_total` — they cannot know the payer's total spending across all payees. This is a deliberate design choice: `SpendingCapability` is a self-governance mechanism for the human delegating spending authority to their agent, not a protocol-enforced global limit. The human trusts their own SDK to enforce the limit honestly. A compromised SDK that ignores the limit can overspend, but the blast radius is bounded by the UCAN's 24-hour expiry (§9.5) and the adapter's balance.
 
-**AND composition:** Action UCAN + spending UCAN both required for paid actions. Agent with `messagesWrite` but no spending UCAN cannot send paid messages. Agent with spending UCAN but no `messagesWrite` cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.
+**AND composition:** Action UCAN + spending UCAN both required for paid actions. Agent with `messages:write` but no spending UCAN cannot send paid messages. Agent with spending UCAN but no `messages:write` cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.
 
 **Delegation chain:** Human DID (`#active`) → spending UCAN (self-delegation with `fct.scp_key_scope: "#agent"`) → same DID (`#agent` scoped). Attenuation applies: sub-delegation must narrow, never widen. An agent granted $100/day can delegate $10/day to a sub-agent. UCAN standard attenuation rules (§7.2) apply unchanged.
 
@@ -555,20 +555,20 @@ Two new well-known templates:
 **`scp:template/paid-service`:** Tool invocation context with per-invoke cost. `economic_policy.cost_schedule.per_tool_invoke` required at creation. Single-admin governance. Extends `scp:template/tool-interface`.
 
 Properties:
-- Ceiling: `messagesRead`, `messagesWrite`, `toolRegister`, `toolInvokeAll`
+- Ceiling: `messages:read`, `messages:write`, `tool:register`, `tool:invoke:*`
 - Ceiling policy: `immutable`
 - Economic policy: required, `per_tool_invoke` must be set
 - Governance: single-admin
 - Memory scope: `full` (receipts are provenance)
 
-**`scp:template/paid-broadcast`:** Subscription-based broadcast context. `economic_policy.cost_schedule.per_period` required at creation. Gated subscriber registration — admin grants `messagesRead` UCAN after payment verification. Extends `scp:template/gated-broadcast` (§5.14.4).
+**`scp:template/paid-broadcast`:** Subscription-based broadcast context. `economic_policy.cost_schedule.per_period` required at creation. Gated subscriber registration — admin grants `messages:read` UCAN after payment verification. Extends `scp:template/gated-broadcast` (§5.14.4).
 
 Properties:
 - Mode: `Broadcast`
-- Ceiling: `messagesRead`, `messagesWrite`
+- Ceiling: `messages:read`, `messages:write`
 - Ceiling policy: `immutable`
 - Economic policy: required, `per_period` must be set
-- Subscriber admission: gated (admin-issued `messagesRead` UCAN post-payment)
+- Subscriber admission: gated (admin-issued `messages:read` UCAN post-payment)
 - Memory scope: `full`
 
 ## 19.11 SDK Surface

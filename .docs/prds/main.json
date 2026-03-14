@@ -5057,11 +5057,11 @@
         "crates/scp-media/Cargo.toml",
         "crates/scp-media/src/lib.rs"
       ],
-      "description": "Create the `scp-media/` crate with all media session types from ADR-024. Delegated model: context provides identity + trust + governance + MLS-derived key material. Media flows over WebRTC/DTLS-SRTP. Signaling (SDP offers/answers, ICE candidates) goes through SCP as standard encrypted governed messages. No media data touches SCP relays.\n\nKey types:\n\n```rust\npub struct MediaSession {\n    pub session_id: String,\n    pub context_id: ContextId,\n    pub participants: Vec<DID>,\n    pub capabilities: Vec<MediaCapability>,\n    pub state: MediaSessionState,\n    pub started_at: u64,\n}\n\npub enum MediaCapability {\n    Voice,        // maps to ceiling entry media.voice\n    Video,        // maps to ceiling entry media.video\n    ScreenShare,  // maps to ceiling entry media.screenShare\n}\n\npub enum MediaSessionState {\n    Initiating,\n    Active,\n    Ended,\n}\n\npub enum SignalingMessage {\n    Offer(SessionDescription),\n    Answer(SessionDescription),\n    IceCandidate(Candidate),\n    SessionEnd,\n}\n\npub struct SessionDescription {\n    pub sdp: String,\n    pub sender_did: DID,\n}\n\npub struct Candidate {\n    pub candidate: String,\n    pub sdp_mid: Option<String>,\n    pub sdp_mline_index: Option<u16>,\n    pub sender_did: DID,\n}\n\npub struct MediaKeyMaterial {\n    pub dtls_srtp_keys: Vec<u8>,\n    pub epoch: u64,\n    pub context_id: ContextId,\n}\n```\n\nModule declares `pub mod keys; pub mod session; pub mod signaling;` and re-exports all public types.",
+      "description": "Create the `scp-media/` crate with all media session types from ADR-024. Delegated model: context provides identity + trust + governance + MLS-derived key material. Media flows over WebRTC/DTLS-SRTP. Signaling (SDP offers/answers, ICE candidates) goes through SCP as standard encrypted governed messages. No media data touches SCP relays.\n\nKey types:\n\n```rust\npub struct MediaSession {\n    pub session_id: String,\n    pub context_id: ContextId,\n    pub participants: Vec<DID>,\n    pub capabilities: Vec<MediaCapability>,\n    pub state: MediaSessionState,\n    pub started_at: u64,\n}\n\npub enum MediaCapability {\n    Voice,        // maps to ceiling entry media:voice\n    Video,        // maps to ceiling entry media:video\n    ScreenShare,  // maps to ceiling entry media:screen_share\n}\n\npub enum MediaSessionState {\n    Initiating,\n    Active,\n    Ended,\n}\n\npub enum SignalingMessage {\n    Offer(SessionDescription),\n    Answer(SessionDescription),\n    IceCandidate(Candidate),\n    SessionEnd,\n}\n\npub struct SessionDescription {\n    pub sdp: String,\n    pub sender_did: DID,\n}\n\npub struct Candidate {\n    pub candidate: String,\n    pub sdp_mid: Option<String>,\n    pub sdp_mline_index: Option<u16>,\n    pub sender_did: DID,\n}\n\npub struct MediaKeyMaterial {\n    pub dtls_srtp_keys: Vec<u8>,\n    pub epoch: u64,\n    pub context_id: ContextId,\n}\n```\n\nModule declares `pub mod keys; pub mod session; pub mod signaling;` and re-exports all public types.",
       "acceptanceCriteria": [
         "`cargo build -p scp-media` succeeds with zero warnings",
         "MediaSession struct has fields: session_id (String), context_id (ContextId), participants (Vec<DID>), capabilities (Vec<MediaCapability>), state (MediaSessionState), started_at (u64)",
-        "MediaCapability enum has variants: Voice, Video, ScreenShare — mapping to ceiling entries media.voice, media.video, media.screenShare",
+        "MediaCapability enum has variants: Voice, Video, ScreenShare — mapping to ceiling entries media:voice, media:video, media:screen_share",
         "MediaSessionState enum has variants: Initiating, Active, Ended",
         "SignalingMessage enum has variants: Offer(SessionDescription), Answer(SessionDescription), IceCandidate(Candidate), SessionEnd",
         "SessionDescription struct has fields: sdp (String), sender_did (DID)",
@@ -8593,7 +8593,7 @@
         "crates/scp-core/src/crypto/ucan/validate.rs",
         "crates/scp-core/src/crypto/ucan/mod.rs"
       ],
-      "description": "Implement SpendingCapability UCAN type (§19.5) with AND-composition, delegation chain attenuation, revocation, and 24h max expiry.\n\n§19.5 Spending Capability (UCAN Extension):\n```rust\n/// UCAN capability for spending authorization.\n/// Resource URI: \"scp:spending:{context_id}\" or \"scp:spending:*\"\npub struct SpendingCapability {\n    pub max_per_action: Amount,        // max single-action spend\n    pub max_total: Amount,             // max total spend within time_window\n    pub currency: CurrencyCode,        // ISO 4217 or protocol-defined\n    pub time_window: Duration,         // rolling window for max_total\n    pub allowed_adapters: Vec<String>, // empty = any configured adapter\n}\n```\n\nAND composition: Action UCAN + spending UCAN both required for paid actions. Agent with messagesWrite but no spending UCAN cannot send paid messages. Agent with spending UCAN but no messagesWrite cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.\n\nDelegation chain: Human root DID -> spending UCAN -> agent DID. Attenuation applies: sub-delegation must narrow, never widen. An agent granted $100/day can delegate $10/day to a sub-agent. UCAN standard attenuation rules (§7.2) apply unchanged.\n\nNo implicit spending: Protocol NEVER authorizes expenditure without explicit spending UCAN. Missing UCAN -> SpendingCapabilityRequired error. Agent can still perform free actions in the context.\n\n24-hour maximum expiry (§9.5): Spending UCANs follow existing UCAN expiry rules. Short-lived by design — limits blast radius of compromised agents.\n\nRevocation: Independent of other UCANs (§7.4.4). Human discovers overspending -> revoke spending UCAN -> agent retains other capabilities but cannot authorize payments.",
+      "description": "Implement SpendingCapability UCAN type (§19.5) with AND-composition, delegation chain attenuation, revocation, and 24h max expiry.\n\n§19.5 Spending Capability (UCAN Extension):\n```rust\n/// UCAN capability for spending authorization.\n/// Resource URI: \"scp:spending:{context_id}\" or \"scp:spending:*\"\npub struct SpendingCapability {\n    pub max_per_action: Amount,        // max single-action spend\n    pub max_total: Amount,             // max total spend within time_window\n    pub currency: CurrencyCode,        // ISO 4217 or protocol-defined\n    pub time_window: Duration,         // rolling window for max_total\n    pub allowed_adapters: Vec<String>, // empty = any configured adapter\n}\n```\n\nAND composition: Action UCAN + spending UCAN both required for paid actions. Agent with messages:write but no spending UCAN cannot send paid messages. Agent with spending UCAN but no messages:write cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.\n\nDelegation chain: Human root DID -> spending UCAN -> agent DID. Attenuation applies: sub-delegation must narrow, never widen. An agent granted $100/day can delegate $10/day to a sub-agent. UCAN standard attenuation rules (§7.2) apply unchanged.\n\nNo implicit spending: Protocol NEVER authorizes expenditure without explicit spending UCAN. Missing UCAN -> SpendingCapabilityRequired error. Agent can still perform free actions in the context.\n\n24-hour maximum expiry (§9.5): Spending UCANs follow existing UCAN expiry rules. Short-lived by design — limits blast radius of compromised agents.\n\nRevocation: Independent of other UCANs (§7.4.4). Human discovers overspending -> revoke spending UCAN -> agent retains other capabilities but cannot authorize payments.",
       "acceptanceCriteria": [
         "SpendingCapability struct defined with field: max_per_action (Amount) — max single-action spend",
         "SpendingCapability struct defined with field: max_total (Amount) — max total spend within time_window",
@@ -8602,9 +8602,9 @@
         "SpendingCapability struct defined with field: allowed_adapters (Vec<String>) — empty = any configured adapter",
         "SpendingCapability is a valid UCAN capability type registered in the capability type system",
         "Resource URI format: \"scp:spending:{context_id}\" or \"scp:spending:*\" for global spending",
-        "AND-composition enforced: paid action requires BOTH action UCAN (e.g., messagesWrite) AND SpendingCapability — fails if either missing",
-        "AND-composition test: agent with messagesWrite but no SpendingCapability cannot send paid messages",
-        "AND-composition test: agent with SpendingCapability but no messagesWrite cannot spend on messages",
+        "AND-composition enforced: paid action requires BOTH action UCAN (e.g., messages:write) AND SpendingCapability — fails if either missing",
+        "AND-composition test: agent with messages:write but no SpendingCapability cannot send paid messages",
+        "AND-composition test: agent with SpendingCapability but no messages:write cannot spend on messages",
         "Attenuation validation: sub-delegated SpendingCapability must have max_per_action <= parent's max_per_action",
         "Attenuation validation: sub-delegated SpendingCapability must have max_total <= parent's max_total",
         "Attenuation validation: sub-delegated SpendingCapability must have time_window <= parent's time_window",
@@ -8657,7 +8657,7 @@
         }
       ],
       "details": {
-        "ADR-033 criterion 5": "SpendingCapability is a valid UCAN capability type. AND-composition enforced: action requiring both messagesWrite and SpendingCapability fails if either is missing.",
+        "ADR-033 criterion 5": "SpendingCapability is a valid UCAN capability type. AND-composition enforced: action requiring both messages:write and SpendingCapability fails if either is missing.",
         "ADR-033 criterion 6": "UCAN attenuation: sub-delegated SpendingCapability must narrow (lower max_per_action, max_total) — widening is rejected.",
         "Novel contribution": "No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both."
       },
@@ -8742,7 +8742,7 @@
         "ADR-033 criterion 8": "PricingFormula evaluation uses Amount(u64) and Coefficient(i64) exclusively — no f64 in any economic calculation path.",
         "ADR-033 criterion 9": "CostInsufficient error includes receiver's metric_snapshot so payer can see why costs diverged.",
         "ADR-033 criterion 10": "Auto-accept guard: ContextInvitation with EconomicPolicy requiring payment is never auto-accepted regardless of auto-accept policy configuration.",
-        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with toolInvocation in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
+        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with tool:invoke:* in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
       },
       "result": "EconomicPolicy evaluation, CostSchedule lookup, ObservableMetrics, CostInsufficient error, estimate_cost SDK function, policy lock, auto-accept guard all implemented with comprehensive tests."
     },
@@ -9201,11 +9201,11 @@
       "files": [
         "crates/scp-core/src/context/templates.rs"
       ],
-      "description": "Register two new well-known context templates for economic governance (§19.10) and add TemplateId variants.\n\n§19.10 Context Templates:\n\npaid-service (scp:template/paid-service): Tool invocation context with per-invoke cost. economic_policy.cost_schedule.per_tool_invoke required at creation. Single-admin governance. Extends scp:template/tool-interface.\n\nProperties:\n- Ceiling: messagesRead, messagesWrite, toolRegister, toolInvokeAll\n- Ceiling policy: immutable\n- Economic policy: required, per_tool_invoke must be set\n- Governance: single-admin\n- Memory scope: full (receipts are provenance)\n\npaid-broadcast (scp:template/paid-broadcast): Subscription-based broadcast context. economic_policy.cost_schedule.per_period required at creation. Gated subscriber registration — admin grants messagesRead UCAN after payment verification. Extends scp:template/gated-broadcast (§5.14.4).\n\nProperties:\n- Mode: Broadcast\n- Ceiling: messagesRead, messagesWrite\n- Ceiling policy: immutable\n- Economic policy: required, per_period must be set\n- Subscriber admission: gated (admin-issued messagesRead UCAN post-payment)\n- Memory scope: full",
+      "description": "Register two new well-known context templates for economic governance (§19.10) and add TemplateId variants.\n\n§19.10 Context Templates:\n\npaid-service (scp:template/paid-service): Tool invocation context with per-invoke cost. economic_policy.cost_schedule.per_tool_invoke required at creation. Single-admin governance. Extends scp:template/tool-interface.\n\nProperties:\n- Ceiling: messages:read, messages:write, tool:register, tool:invoke:*\n- Ceiling policy: immutable\n- Economic policy: required, per_tool_invoke must be set\n- Governance: single-admin\n- Memory scope: full (receipts are provenance)\n\npaid-broadcast (scp:template/paid-broadcast): Subscription-based broadcast context. economic_policy.cost_schedule.per_period required at creation. Gated subscriber registration — admin grants messages:read UCAN after payment verification. Extends scp:template/gated-broadcast (§5.14.4).\n\nProperties:\n- Mode: Broadcast\n- Ceiling: messages:read, messages:write\n- Ceiling policy: immutable\n- Economic policy: required, per_period must be set\n- Subscriber admission: gated (admin-issued messages:read UCAN post-payment)\n- Memory scope: full",
       "acceptanceCriteria": [
         "TemplateId enum extended with PaidService variant — maps to \"scp:template/paid-service\"",
         "TemplateId enum extended with PaidBroadcast variant — maps to \"scp:template/paid-broadcast\"",
-        "paid-service template registered with ceiling: [messagesRead, messagesWrite, toolRegister, toolInvokeAll]",
+        "paid-service template registered with ceiling: [messages:read, messages:write, tool:register, tool:invoke:*]",
         "paid-service template registered with ceiling_policy: immutable",
         "paid-service template registered with governance: single-admin",
         "paid-service template registered with memory_scope: full",
@@ -9213,13 +9213,13 @@
         "paid-service template requires economic_policy.cost_schedule.per_tool_invoke to be set (validation error if None)",
         "paid-service template extends scp:template/tool-interface — inherits tool-interface base properties",
         "paid-broadcast template registered with mode: Broadcast",
-        "paid-broadcast template registered with ceiling: [messagesRead, messagesWrite]",
+        "paid-broadcast template registered with ceiling: [messages:read, messages:write]",
         "paid-broadcast template registered with ceiling_policy: immutable",
         "paid-broadcast template registered with memory_scope: full",
         "paid-broadcast template requires economic_policy at creation (validation error if absent)",
         "paid-broadcast template requires economic_policy.cost_schedule.per_period to be set (validation error if None)",
         "paid-broadcast template extends scp:template/gated-broadcast (§5.14.4) — inherits gated-broadcast base properties",
-        "paid-broadcast subscriber admission: gated (admin-issued messagesRead UCAN post-payment verification)",
+        "paid-broadcast subscriber admission: gated (admin-issued messages:read UCAN post-payment verification)",
         "Unit test: create context with paid-service template — valid when per_tool_invoke is set",
         "Unit test: create context with paid-service template — rejected when economic_policy is absent",
         "Unit test: create context with paid-service template — rejected when per_tool_invoke is None",
@@ -9231,8 +9231,8 @@
       ],
       "actionItems": [
         "Add PaidService and PaidBroadcast variants to TemplateId enum in crates/scp-core/src/context/templates.rs",
-        "Register paid-service template with properties: ceiling [messaging, toolInvocation], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
-        "Register paid-broadcast template with properties: mode Broadcast, ceiling [messaging], ceiling_policy immutable, memory_scope full, economic_policy required, subscriber admission gated",
+        "Register paid-service template with properties: ceiling [messages:read, messages:write, tool:invoke:*], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
+        "Register paid-broadcast template with properties: mode Broadcast, ceiling [messages:read, messages:write], ceiling_policy immutable, memory_scope full, economic_policy required, subscriber admission gated",
         "Implement validation for paid-service: reject creation when economic_policy is absent or per_tool_invoke is None",
         "Implement validation for paid-broadcast: reject creation when economic_policy is absent or per_period is None",
         "Wire template inheritance: paid-service extends tool-interface, paid-broadcast extends gated-broadcast",

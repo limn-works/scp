@@ -603,7 +603,7 @@ class Context:
         """Subscribe a DID to this broadcast context.
 
         For open broadcast contexts, any DID can subscribe. For gated
-        contexts, a valid ``messagesRead`` UCAN is required.
+        contexts, a valid ``messages:read`` UCAN is required.
 
         Args:
             subscriber_did: The DID subscribing to broadcasts.

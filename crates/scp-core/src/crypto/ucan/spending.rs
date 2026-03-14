@@ -7,7 +7,7 @@
 //! # Key concepts
 //!
 //! - **AND-composition**: Paid actions require BOTH an action UCAN (e.g.,
-//!   `messagesWrite`) AND a `SpendingCapability` UCAN. Neither alone suffices.
+//!   `messages:write`) AND a `SpendingCapability` UCAN. Neither alone suffices.
 //! - **Attenuation**: Sub-delegated spending capabilities must narrow (lower
 //!   `max_per_action`, `max_total`, `time_window`; subset `allowed_adapters`).
 //! - **24-hour maximum expiry**: Spending UCANs follow the existing UCAN expiry
@@ -104,7 +104,7 @@ impl std::fmt::Display for CurrencyCode {
 /// Resource URI: `scp:spending:{context_id}` or `scp:spending:*` for global.
 ///
 /// AND-composed with action UCANs: agent needs both the action capability
-/// (e.g., `messagesWrite`) AND a valid `SpendingCapability` to perform paid
+/// (e.g., `messages:write`) AND a valid `SpendingCapability` to perform paid
 /// actions. Free actions in paid contexts do not require this capability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendingCapability {
@@ -347,7 +347,7 @@ impl SpendingCapability {
 /// Checks that a paid action has both an action UCAN and a spending UCAN.
 ///
 /// This enforces AND-composition (spec section 19.5): a paid action requires
-/// BOTH the action capability (e.g., `messagesWrite`) AND a valid
+/// BOTH the action capability (e.g., `messages:write`) AND a valid
 /// `SpendingCapability`. An agent with one but not the other cannot perform
 /// the paid action.
 ///
@@ -356,7 +356,7 @@ impl SpendingCapability {
 ///
 /// # Arguments
 ///
-/// * `action_ucan` — The action UCAN (e.g., for `messagesWrite`). `None` if
+/// * `action_ucan` — The action UCAN (e.g., for `messages:write`). `None` if
 ///   the agent has no action UCAN.
 /// * `spending_ucan` — The spending UCAN. `None` if the agent has no spending
 ///   capability.

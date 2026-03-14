@@ -60,7 +60,7 @@ export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom
  * Admission policy for a broadcast context.
  *
  * - `"Open"` — any DID can subscribe without authorization.
- * - `"Gated"` — subscription requires a valid `messagesRead` UCAN.
+ * - `"Gated"` — subscription requires a valid `messages:read` UCAN.
  */
 export type BroadcastAdmissionPolicy = "Open" | "Gated";
 

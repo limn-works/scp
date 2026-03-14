@@ -44,7 +44,7 @@ pub type ContextId = String;
 ///
 /// Media sessions are governed by the context's capability ceiling: the
 /// requested [`MediaCapability`] variants must be present in the ceiling
-/// (e.g., `media.voice`, `media.video`, `media.screenShare`) before a
+/// (e.g., `media:voice`, `media:video`, `media:screen_share`) before a
 /// session can be initiated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaSession {
@@ -69,33 +69,33 @@ pub struct MediaSession {
 
 /// A media capability that maps to a context capability-ceiling entry.
 ///
-/// Each variant corresponds to a ceiling key under the `media.*` namespace:
-/// - [`Voice`](MediaCapability::Voice) -- `media.voice`
-/// - [`Video`](MediaCapability::Video) -- `media.video`
-/// - [`ScreenShare`](MediaCapability::ScreenShare) -- `media.screenShare`
+/// Each variant corresponds to a ceiling key under the `media:*` namespace:
+/// - [`Voice`](MediaCapability::Voice) -- `media:voice`
+/// - [`Video`](MediaCapability::Video) -- `media:video`
+/// - [`ScreenShare`](MediaCapability::ScreenShare) -- `media:screen_share`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaCapability {
-    /// Voice-only media. Maps to ceiling entry `media.voice`.
+    /// Voice-only media. Maps to ceiling entry `media:voice`.
     Voice,
 
-    /// Video media. Maps to ceiling entry `media.video`.
+    /// Video media. Maps to ceiling entry `media:video`.
     Video,
 
-    /// Screen sharing. Maps to ceiling entry `media.screenShare`.
+    /// Screen sharing. Maps to ceiling entry `media:screen_share`.
     ScreenShare,
 }
 
 impl MediaCapability {
     /// Returns the capability ceiling name for this media capability.
     ///
-    /// This maps to the `media.*` namespace used in context capability
+    /// This maps to the `media:*` namespace used in context capability
     /// ceilings (see spec §10.9.1).
     #[must_use]
     pub const fn ceiling_name(&self) -> &'static str {
         match self {
-            Self::Voice => "media.voice",
-            Self::Video => "media.video",
-            Self::ScreenShare => "media.screenShare",
+            Self::Voice => "media:voice",
+            Self::Video => "media:video",
+            Self::ScreenShare => "media:screen_share",
         }
     }
 }
@@ -167,9 +167,9 @@ impl SessionMetadata {
 /// Checks that a media capability is present in the context's capability
 /// ceiling.
 ///
-/// Media session initiation requires the corresponding `media.*` capability
+/// Media session initiation requires the corresponding `media:*` capability
 /// in the context ceiling. For example, a voice session requires
-/// `media.voice` in the ceiling.
+/// `media:voice` in the ceiling.
 ///
 /// # Arguments
 ///
@@ -380,15 +380,15 @@ mod tests {
         vec![
             ParamCapability::new("messages:read"),
             ParamCapability::new("messages:write"),
-            ParamCapability::new("media.voice"),
+            ParamCapability::new("media:voice"),
         ]
     }
 
     fn video_ceiling() -> Vec<ParamCapability> {
         vec![
             ParamCapability::new("messages:read"),
-            ParamCapability::new("media.voice"),
-            ParamCapability::new("media.video"),
+            ParamCapability::new("media:voice"),
+            ParamCapability::new("media:video"),
         ]
     }
 
@@ -396,9 +396,9 @@ mod tests {
         vec![
             ParamCapability::new("messages:read"),
             ParamCapability::new("messages:write"),
-            ParamCapability::new("media.voice"),
-            ParamCapability::new("media.video"),
-            ParamCapability::new("media.screenShare"),
+            ParamCapability::new("media:voice"),
+            ParamCapability::new("media:video"),
+            ParamCapability::new("media:screen_share"),
         ]
     }
 
@@ -420,19 +420,19 @@ mod tests {
 
     #[test]
     fn ceiling_name_voice() {
-        assert_eq!(MediaCapability::Voice.ceiling_name(), "media.voice");
+        assert_eq!(MediaCapability::Voice.ceiling_name(), "media:voice");
     }
 
     #[test]
     fn ceiling_name_video() {
-        assert_eq!(MediaCapability::Video.ceiling_name(), "media.video");
+        assert_eq!(MediaCapability::Video.ceiling_name(), "media:video");
     }
 
     #[test]
     fn ceiling_name_screen_share() {
         assert_eq!(
             MediaCapability::ScreenShare.ceiling_name(),
-            "media.screenShare"
+            "media:screen_share"
         );
     }
 
@@ -461,8 +461,8 @@ mod tests {
         let ceiling = no_media_ceiling();
         let err = check_media_capability(&ceiling, &MediaCapability::Voice).unwrap_err();
         assert!(
-            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.voice"),
-            "expected CapabilityNotInCeiling(media.voice), got: {err}"
+            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media:voice"),
+            "expected CapabilityNotInCeiling(media:voice), got: {err}"
         );
     }
 
@@ -471,7 +471,7 @@ mod tests {
         let ceiling = voice_ceiling();
         let err = check_media_capability(&ceiling, &MediaCapability::Video).unwrap_err();
         assert!(
-            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.video")
+            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media:video")
         );
     }
 
@@ -532,7 +532,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media.video")
+            matches!(err, MediaError::CapabilityNotInCeiling(ref name) if name == "media:video")
         );
     }
 

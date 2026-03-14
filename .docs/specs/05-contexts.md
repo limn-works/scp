@@ -51,18 +51,18 @@ Context creation is a multi-step operation that can fail at any point. The proto
 Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what tools can do, what roles can grant, and what agents can exercise. Standard capability categories include:
 
 - **`messaging`** — text and structured data exchange
-- **`toolInvocation`** — executing context-registered tools
-- **`media.voice`** — real-time voice communication (§10.9.1)
-- **`media.video`** — real-time video communication (§10.9.1)
-- **`media.screenShare`** — screen sharing (§10.9.1)
+- **`tool invocation`** — executing context-registered tools
+- **`media:voice`** — real-time voice communication (§10.9.1)
+- **`media:video`** — real-time video communication (§10.9.1)
+- **`media:screen_share`** — screen sharing (§10.9.1)
 - **`bridging`** — bridge connector participation (§12)
-- **`toolInterface`** — cross-context tool interface exposure (§6.2)
-- **`childContext`** — creating child contexts (§5.13)
-- **`memberBan`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeReadAccess` / `RestoreReadAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
+- **`tool:interface`** — cross-context tool interface exposure (§6.2)
+- **`context:child:create`** — creating child contexts (§5.13)
+- **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeReadAccess` / `RestoreReadAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
-Media capabilities (`media.*`) enable the delegated media transport model (§10.9.1) where the context establishes identity, trust, and governance while media flows over WebRTC/DTLS-SRTP. A context without media capabilities in its ceiling cannot initiate voice or video sessions regardless of participant roles.
+Media capabilities (`media:*`) enable the delegated media transport model (§10.9.1) where the context establishes identity, trust, and governance while media flows over WebRTC/DTLS-SRTP. A context without media capabilities in its ceiling cannot initiate voice or video sessions regardless of participant roles.
 
-Capability categories apply uniformly across context modes. `messagesRead` and `messagesWrite` retain the same abstract meaning in both Encrypted and Broadcast modes — the `ContextMode` determines the encryption pipeline, not the capability semantics. A `messagesWrite` UCAN in an Encrypted context authorizes MLS-encrypted message sending; the same capability in a Broadcast context authorizes broadcast-key-encrypted publishing.
+Capability categories apply uniformly across context modes. `messages:read` and `messages:write` retain the same abstract meaning in both Encrypted and Broadcast modes — the `ContextMode` determines the encryption pipeline, not the capability semantics. A `messages:write` UCAN in an Encrypted context authorizes MLS-encrypted message sending; the same capability in a Broadcast context authorizes broadcast-key-encrypted publishing.
 
 Every context also declares a **ceiling policy** at creation — whether the ceiling can change and how. The ceiling policy itself is immutable (locked at creation, cannot be changed). Two policies are available:
 
@@ -79,27 +79,27 @@ The following is the complete enumeration of capability categories available for
 
 | Category | Description | Gated by |
 |----------|-------------|----------|
-| `messagesRead` | Read messages in the context | Role permission |
-| `messagesWrite` | Send messages to the context | Role permission |
-| `toolRegister` | Register new tools in the context | Role permission |
-| `toolInvokeAll` | Invoke any registered tool | Role permission |
-| `toolInvoke:{tool_id}` | Invoke a specific tool (parameterized) | Role permission |
-| `memberInvite` | Invite new members to the context | Role permission |
-| `memberRemove` | Remove members from the context | Role permission + governance |
-| `memberBan` | Ban members (revoke read access) | Role permission + governance |
-| `roleAssign` | Assign or change member roles | Role permission + governance |
-| `media.voice` | Real-time voice communication (§10.9.1) | Role permission |
-| `media.video` | Real-time video communication (§10.9.1) | Role permission |
-| `media.screenShare` | Screen sharing (§10.9.1) | Role permission |
+| `messages:read` | Read messages in the context | Role permission |
+| `messages:write` | Send messages to the context | Role permission |
+| `tool:register` | Register new tools in the context | Role permission |
+| `tool:invoke:*` | Invoke any registered tool | Role permission |
+| `tool:invoke:{tool_id}` | Invoke a specific tool (parameterized) | Role permission |
+| `member:invite` | Invite new members to the context | Role permission |
+| `member:remove` | Remove members from the context | Role permission + governance |
+| `member:ban` | Ban members (revoke read access) | Role permission + governance |
+| `role:assign` | Assign or change member roles | Role permission + governance |
+| `media:voice` | Real-time voice communication (§10.9.1) | Role permission |
+| `media:video` | Real-time video communication (§10.9.1) | Role permission |
+| `media:screen_share` | Screen sharing (§10.9.1) | Role permission |
 | `bridging` | Bridge connector participation (§12) | Role permission + governance |
-| `toolInterface` | Cross-context tool interface exposure (§6.2) | Role permission |
-| `childContext` | Create child contexts (§5.13) | Role permission |
-| `governancePropose` | Submit governance proposals (§5.9) | Role permission |
-| `governanceVote` | Vote on governance proposals (§5.9) | Role permission |
-| `contextClose` | Close context permanently (§5.4) | Role permission + governance |
-| `metadataEdit` | Edit context operational metadata (§5.7) | Role permission + governance |
+| `tool:interface` | Cross-context tool interface exposure (§6.2) | Role permission |
+| `context:child:create` | Create child contexts (§5.13) | Role permission |
+| `governance:propose` | Submit governance proposals (§5.9) | Role permission |
+| `governance:vote` | Vote on governance proposals (§5.9) | Role permission |
+| `context:close` | Close context permanently (§5.4) | Role permission + governance |
+| `metadata:edit` | Edit context operational metadata (§5.7) | Role permission + governance |
 
-**Parameterized categories.** `toolInvoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `toolInvokeAll` grants invocation of all registered tools. A ceiling containing `toolInvokeAll` implicitly includes all `toolInvoke:{tool_id}` capabilities.
+**Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A ceiling containing `tool:invoke:*` implicitly includes all `tool:invoke:{tool_id}` capabilities.
 
 **Category validation.** At context creation, the SDK validates that every entry in the ceiling array is a recognized category string (exact match, case-sensitive). Unrecognized categories cause creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with categories it cannot enforce.
 
@@ -190,8 +190,8 @@ Properties of roles:
 
 **Broadcast context roles.** Broadcast contexts (§5.14) extend the role system with two mode-specific roles that reuse existing primitives:
 
-- **Author** — holds `messagesWrite` UCAN. Can publish broadcast-key-encrypted content. Authors are bounded (added via `roleAssigned` events with role `author`). Each author maintains their own broadcast key with an independent epoch counter.
-- **Subscriber** — holds `messagesRead` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
+- **Author** — holds `messages:write` UCAN. Can publish broadcast-key-encrypted content. Authors are bounded (added via `role:assigned` events with role `author`). Each author maintains their own broadcast key with an independent epoch counter.
+- **Subscriber** — holds `messages:read` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
 
 The author/subscriber distinction mirrors the writer/reader two-tier model from discovery contexts (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as discovery context reader-tier access.
 
@@ -201,10 +201,10 @@ Every context has a minimum set of built-in roles. Context creators MAY define a
 
 | Role | Permissions | Description |
 |------|------------|-------------|
-| `admin` | All capabilities in ceiling + `memberInvite` + `memberRemove` + `roleAssign` + `governancePropose` + `governanceVote` + `metadataEdit` | Full control. The context creator is always assigned this role at creation. |
-| `moderator` | `messagesRead` + `messagesWrite` + `toolInvokeAll` + `memberRemove` + `governancePropose` | Can moderate content and members but cannot change roles or governance structure. |
-| `member` | `messagesRead` + `messagesWrite` + `toolInvokeAll` | Standard participant. Can read, write, and use tools. |
-| `observer` | `messagesRead` | Read-only access. Cannot send messages, invoke tools, or participate in governance. Observers can see all content and membership but cannot create state. |
+| `admin` | All capabilities in ceiling + `member:invite` + `member:remove` + `role:assign` + `governance:propose` + `governance:vote` + `metadata:edit` | Full control. The context creator is always assigned this role at creation. |
+| `moderator` | `messages:read` + `messages:write` + `tool:invoke:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
+| `member` | `messages:read` + `messages:write` + `tool:invoke:*` | Standard participant. Can read, write, and use tools. |
+| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke tools, or participate in governance. Observers can see all content and membership but cannot create state. |
 
 **Observer role permissions (detailed):**
 
@@ -217,7 +217,7 @@ Observers can:
 
 Observers cannot:
 - Send messages or reactions.
-- Invoke tools (no `toolInvokeAll` or `toolInvoke:{id}`).
+- Invoke tools (no `tool:invoke:*` or `tool:invoke:{id}`).
 - Invite members.
 - Propose or vote on governance actions.
 - Modify context metadata.
@@ -399,7 +399,7 @@ The governance model is declared at creation and visible to all. Governance impl
 | Presence-only member (read + write revoked) | Yes | No | No | No |
 | Non-member (removed) | No | No | No | No |
 
-Presence-only members lose `GovernanceVote` and `GovernancePropose` capabilities alongside content access. A member who can neither read nor write content should not influence governance decisions about content they cannot see. Read-only members retain governance capabilities — they can still observe content and participate meaningfully in governance.
+Presence-only members lose `governance:vote` and `governance:propose` capabilities alongside content access. A member who can neither read nor write content should not influence governance decisions about content they cannot see. Read-only members retain governance capabilities — they can still observe content and participate meaningfully in governance.
 
 **Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `FutureOnly` scope when a `Full` revocation is already active is a no-op (Full subsumes FutureOnly). Revoking with `Full` scope when `FutureOnly` is active upgrades to Full.
 
@@ -593,7 +593,7 @@ The protocol defines a set of well-known templates — named parameter bundles w
 
 ```
 Template: "scp:template/bilateral-ephemeral"
-  ceiling:     [messagesRead, messagesWrite, memberBan]
+  ceiling:     [messages:read, messages:write, member:ban]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: ephemeral
@@ -602,7 +602,7 @@ Template: "scp:template/bilateral-ephemeral"
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/bilateral-persistent"
-  ceiling:     [messagesRead, messagesWrite, memberBan]
+  ceiling:     [messages:read, messages:write, member:ban]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: full
@@ -611,7 +611,7 @@ Template: "scp:template/bilateral-persistent"
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
-  ceiling:     [messagesRead, messagesWrite, toolInvokeAll, memberBan]
+  ceiling:     [messages:read, messages:write, tool:invoke:*, member:ban]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: summary
@@ -620,7 +620,7 @@ Template: "scp:template/coordination"
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
-  ceiling:     [messagesRead, messagesWrite, memberInvite, memberBan]
+  ceiling:     [messages:read, messages:write, member:invite, member:ban]
   roles:       [admin, member, observer]
   governance:  single-admin
   memory_scope: full
@@ -630,11 +630,11 @@ Template: "scp:template/group-discussion"
 
 Template: "scp:template/public-broadcast"
   mode:          Broadcast
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
   roles:
-    owner:       all capabilities in ceiling + memberInvite, roleAssign, contextClose
-    author:      messagesWrite, messagesRead, toolInvokeAll
-    subscriber:  messagesRead (auto-granted on DID-authenticated registration)
+    owner:       all capabilities in ceiling + member:invite, role:assign, context:close
+    author:      messages:write, messages:read, tool:invoke:*
+    subscriber:  messages:read (auto-granted on DID-authenticated registration)
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
@@ -643,11 +643,11 @@ Template: "scp:template/public-broadcast"
 
 Template: "scp:template/gated-broadcast"
   mode:          Broadcast
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
   roles:
-    owner:       all capabilities in ceiling + memberInvite, roleAssign, contextClose
-    author:      messagesWrite, messagesRead, toolInvokeAll
-    subscriber:  messagesRead (requires admin-issued UCAN)
+    owner:       all capabilities in ceiling + member:invite, role:assign, context:close
+    author:      messages:write, messages:read, tool:invoke:*
+    subscriber:  messages:read (requires admin-issued UCAN)
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
@@ -655,7 +655,7 @@ Template: "scp:template/gated-broadcast"
   projection_policy: { default_rule: Gated, overrides: [] }
 
 Template: "scp:template/tool-interface"
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll, memberBan]
+  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full
@@ -664,7 +664,7 @@ Template: "scp:template/tool-interface"
   metadata_visibility: all PreJoin
 
 Template: "scp:template/paid-service"
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll, memberBan]
+  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
   ceiling_policy: immutable
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
@@ -676,12 +676,12 @@ Template: "scp:template/paid-service"
 
 Template: "scp:template/paid-broadcast"
   mode:          Broadcast
-  ceiling:       [messagesRead, messagesWrite]
+  ceiling:       [messages:read, messages:write]
   ceiling_policy: immutable
   roles:
-    owner:       all capabilities in ceiling + memberInvite, roleAssign, contextClose
-    author:      messagesWrite, messagesRead
-    subscriber:  messagesRead (requires admin-issued UCAN, granted after payment verification)
+    owner:       all capabilities in ceiling + member:invite, role:assign, context:close
+    author:      messages:write, messages:read
+    subscriber:  messages:read (requires admin-issued UCAN, granted after payment verification)
   governance:    single-admin
   memory_scope:  full
   economic_policy: required — per_period must be set at creation
@@ -691,7 +691,7 @@ Template: "scp:template/paid-broadcast"
   projection_policy: { default_rule: Gated, overrides: [] }
 ```
 
-The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messagesRead` is auto-granted (DID-authenticated, following the discovery context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
+The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messages:read` is auto-granted (DID-authenticated, following the discovery context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
 
 Templates are not extensible by users — they are protocol constants. A template ID is a commitment: "this context has exactly these properties." If you need something a template doesn't cover, use explicit `ContextParams`. Templates and explicit params are equally valid; templates are just the fast path for common cases.
 
@@ -720,12 +720,12 @@ TrustRequirement:
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID I share at least one context with, if TTL ≤ 10 minutes, at most 5 per hour."
 
 **Security properties:**
-- Policies never auto-accept contexts with tool capabilities (ceiling containing `toolInvoke*`). Tool access always requires explicit confirmation. This is non-overridable.
+- Policies never auto-accept contexts with tool capabilities (ceiling containing `tool:invoke:*`). Tool access always requires explicit confirmation. This is non-overridable.
 - Rate limiting prevents a compromised contact from flooding auto-accepts.
 - The `shared_context` trust requirement means strangers can never trigger auto-accept — the existing shared context provides the trust baseline.
 - Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
 
-**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `toolInvokeAll`, `toolInvokeSpecific`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `tool:invoke:*`, `tool:invoke:{tool_id}`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
 
 **No auto-accept for paid contexts.** This is a hard rule, not a default. Any context with an `EconomicPolicy` requiring payment (non-empty `CostSchedule`) requires explicit confirmation regardless of auto-accept policies. Agents never silently incur costs. See §19.3.
 
@@ -743,7 +743,7 @@ sdk.create_context(
 
 // Equivalent explicit path (same result, more configuration)
 sdk.create_context(params: ContextParams {
-  ceiling: [messagesRead, messagesWrite],
+  ceiling: [messages:read, messages:write],
   roles: [admin, member],
   governance: SingleAdmin,
   memory_scope: Ephemeral,
@@ -1007,13 +1007,13 @@ Multi-parent chain:
 A child's capability ceiling is the intersection of all parent ceilings. This is enforced at creation time and is the hard security boundary that prevents capability escalation through nesting.
 
 ```
-Parent A ceiling: [messagesRead, messagesWrite, toolInvokeAll, media]
-Parent B ceiling: [messagesRead, messagesWrite, toolInvokeAll]
+Parent A ceiling: [messages:read, messages:write, tool:invoke:*, media]
+Parent B ceiling: [messages:read, messages:write, tool:invoke:*]
 
-Child ceiling ≤ intersection = [messagesRead, messagesWrite, toolInvokeAll]
+Child ceiling ≤ intersection = [messages:read, messages:write, tool:invoke:*]
 ```
 
-The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messagesRead, messagesWrite]` even if the intersection would allow tools.
+The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow tools.
 
 If a parent has a `governed` ceiling policy (§5.3) and its ceiling is *reduced*, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If this makes the child's ceiling empty (no capabilities remain), the child closes automatically. This cascade is logged in both the parent's and child's event logs. If a parent's ceiling is *expanded*, the child's ceiling does not automatically expand — the child's own ceiling policy governs.
 
@@ -1092,7 +1092,7 @@ Child context creation requires governance approval from every parent context. T
 ```
 Alice (in A + B) → sdk.create_child_context(
   parents: [context_a, context_b],
-  ceiling: [messagesRead, messagesWrite],
+  ceiling: [messages:read, messages:write],
   ttl: .hours(2)
 )
 → A's governance approves (Alice has contextCreate capability in A)
@@ -1153,7 +1153,7 @@ SDK observes matching proposals from all parents
 → Both Alice and Bob are initial members
 ```
 
-This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `childContextCreate` capability in their ceiling.
+This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `context:child:createCreate` capability in their ceiling.
 
 **C. Member proposal without creation rights.** Alice is in A but her role doesn't include creation rights. She proposes the child through A's governance (§5.9). A's governance evaluates and either approves or rejects the proposal. If approved, the governance itself authorizes the creation on A's behalf. Same process on B's side.
 
@@ -1333,7 +1333,7 @@ A context might use both: tool interfaces for structured service queries and a m
 
 **Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via tool interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
 
-**Auto-accept policies.** Auto-accept policies (§5.12.2) can be extended to cover child context invitations. A policy might specify: "auto-accept invitations to children of contexts I'm already in, with ceiling ≤ [messagesRead, messagesWrite], TTL ≤ 10 minutes." The parent lineage provides a stronger trust signal than a standalone context invitation — the member knows the child is governed by contexts they already participate in.
+**Auto-accept policies.** Auto-accept policies (§5.12.2) can be extended to cover child context invitations. A policy might specify: "auto-accept invitations to children of contexts I'm already in, with ceiling ≤ [messages:read, messages:write], TTL ≤ 10 minutes." The parent lineage provides a stronger trust signal than a standalone context invitation — the member knows the child is governed by contexts they already participate in.
 
 **Mixed-mode nesting.** A child context may have a different `ContextMode` than its parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance (§5.13.1) and eligibility enforcement (§5.13.2) operate identically regardless of mode — they are structural properties, not encryption properties. The child's mode is declared at creation and visible in metadata.
 
@@ -1390,7 +1390,7 @@ Where `context_id` and `author_did` are UTF-8 bytes and `epoch_bytes` is the 8-b
 
 Broadcast contexts reuse the two-tier membership model from discovery contexts (§6.2.2B):
 
-- **Writer tier (authors):** Hold `messagesWrite` UCAN. Bounded. Manage content and key distribution.
+- **Writer tier (authors):** Hold `messages:write` UCAN. Bounded. Manage content and key distribution.
 - **Reader tier (subscribers):** DID-authenticated (open) or UCAN-authenticated (gated). Unbounded. Receive author broadcast keys on request.
 
 Subscribers register via DID-signed requests — the same pattern discovery context readers use:
@@ -1399,7 +1399,7 @@ Subscribers register via DID-signed requests — the same pattern discovery cont
 pub struct SubscriberRegistration {
     pub subscriber_did: DID,
     pub wrapping_pubkey: X25519PublicKey,
-    pub ucan: Option<UcanToken>,   // Required for gated contexts (messagesRead UCAN)
+    pub ucan: Option<UcanToken>,   // Required for gated contexts (messages:read UCAN)
     pub timestamp: u64,
     pub signature: Ed25519Signature,
 }
@@ -1413,15 +1413,15 @@ pub struct SubscriberRegistration {
 
 The distinction between open and gated broadcast is expressed through the existing role/UCAN system at the template level, not through a new enum:
 
-**Open broadcast** (`public-broadcast` template): The subscriber role's `messagesRead` capability is granted on DID-authenticated registration — no admin-issued UCAN required. This mirrors discovery context readers who query via DID-signed requests without UCAN.
+**Open broadcast** (`public-broadcast` template): The subscriber role's `messages:read` capability is granted on DID-authenticated registration — no admin-issued UCAN required. This mirrors discovery context readers who query via DID-signed requests without UCAN.
 
-**Gated broadcast** (`gated-broadcast` template): The subscriber role requires an explicit `messagesRead` UCAN from the context admin. Same as encrypted context membership — capabilities require admin-issued tokens.
+**Gated broadcast** (`gated-broadcast` template): The subscriber role requires an explicit `messages:read` UCAN from the context admin. Same as encrypted context membership — capabilities require admin-issued tokens.
 
 **Key request validation:**
 - Open: author checks block list only. Not blocked → respond with key.
-- Gated: author checks (1) valid `messagesRead` UCAN, (2) block list. Both pass → respond with key.
+- Gated: author checks (1) valid `messages:read` UCAN, (2) block list. Both pass → respond with key.
 
-Gated contexts enable: paid subscriptions (admin grants `messagesRead` after payment verification — see §19.10 `paid-broadcast` template), invite-only communities (admin grants `messagesRead` to approved members), and tiered access (scoped UCANs for different content levels).
+Gated contexts enable: paid subscriptions (admin grants `messages:read` after payment verification — see §19.10 `paid-broadcast` template), invite-only communities (admin grants `messages:read` to approved members), and tiered access (scoped UCANs for different content levels).
 
 The open/gated distinction governs all access paths to context content, not just key distribution. This includes HTTP broadcast projection (§18.11) — gated contexts require UCAN authentication on projection endpoints; open contexts serve publicly. The `ProjectionPolicy` on `ContextParams` provides per-author granularity within the bounds set by the admission mode. See §18.11.2.1 for the full projection policy specification.
 
@@ -1471,7 +1471,7 @@ Where:
 
 The domain separator `"SCP-BROADCAST-ENVELOPE-V1:"` prevents cross-protocol payload confusion. The nonce MUST be included in the signature to bind it to the specific encryption operation — without it, any broadcast key holder could re-encrypt different content under a new nonce while reusing the original author's valid signature.
 
-**Send path:** validate UCAN (`messagesWrite`) → assign sequence number → generate random 12-byte nonce → hash provenance → sign (domain-separated hash of version, context_id, author_did, sequence, key_epoch, timestamp, nonce, provenance_hash) → AES-256-GCM encrypt plaintext with author broadcast key using nonce and AAD → serialize BroadcastEnvelope (cleartext metadata + encrypted payload) → wrap in OuterEnvelope → relay PUBLISH.
+**Send path:** validate UCAN (`messages:write`) → assign sequence number → generate random 12-byte nonce → hash provenance → sign (domain-separated hash of version, context_id, author_did, sequence, key_epoch, timestamp, nonce, provenance_hash) → AES-256-GCM encrypt plaintext with author broadcast key using nonce and AAD → serialize BroadcastEnvelope (cleartext metadata + encrypted payload) → wrap in OuterEnvelope → relay PUBLISH.
 
 **Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document (pre-decryption rejection of forgeries) → decrypt with cached author broadcast key for this epoch using envelope nonce and reconstructed AAD → verify author UCAN → replay check (sequence number) → deliver to application layer.
 
@@ -1486,9 +1486,9 @@ The domain separator `"SCP-BROADCAST-ENVELOPE-V1:"` prevents cross-protocol payl
 | Role | UCAN | Registered | Write | Read |
 |---|---|---|---|---|
 | Owner | Yes (full) | Yes | Yes | Yes |
-| Author | Yes (`messagesWrite`) | Yes | Yes | Yes |
+| Author | Yes (`messages:write`) | Yes | Yes | Yes |
 | Subscriber (open) | No (DID-auth only) | Yes (DID + wrapping key) | No | Yes |
-| Subscriber (gated) | Yes (`messagesRead`) | Yes (DID + wrapping key + UCAN) | No | Yes |
+| Subscriber (gated) | Yes (`messages:read`) | Yes (DID + wrapping key + UCAN) | No | Yes |
 
 ### 5.14.8 Blocking
 
@@ -1501,12 +1501,12 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
-**Governance-level subscriber ban.** When the context's capability ceiling includes `memberBan` (§5.3), governance can execute `RevokeReadAccess` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeReadAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
+**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeReadAccess` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeReadAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
 
 Governance ban lifecycle:
 
 1. Governance proposal: `RevokeReadAccess { did, scope }` — proposed via the standard governance flow (§5.9).
-2. Context manager verifies `MemberBan` capability in ceiling — rejects with `PermissionDenied` if absent.
+2. Context manager verifies `member:ban` capability in ceiling — rejects with `PermissionDenied` if absent.
 3. On approval: subscriber removed from registry, added to all authors' block lists.
 4. All authors rotate keys — mandatory `KeyEpochAdvance` per author.
 5. `ReadAccessRevoked` event emitted to event log.
@@ -1514,7 +1514,7 @@ Governance ban lifecycle:
 
 `RestoreReadAccess { did }` reverses the ban: subscriber removed from all authors' block lists, but NOT re-registered (they must re-register manually). No key rotation on restore (forward-only — unban grants future access, the registration gap is permanent). `ReadAccessRestored` event emitted.
 
-Default template configuration: encrypted templates include `memberBan` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `memberBan` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
+Default template configuration: encrypted templates include `member:ban` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `member:ban` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
 
 **Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::RevokeWriteAccess { did, scope }` — the general content access revocation mechanism (§5.9, ADR-031). `RevokeWriteAccess` with `scope: Full` stops publishing AND suppresses historical content; `scope: FutureOnly` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `scope: Full` was used, in which case access keys are also destroyed per §9.17).
 
@@ -1522,7 +1522,7 @@ Default template configuration: encrypted templates include `memberBan` in their
 
 ### 5.14.9 Capabilities
 
-No new capability variants. `messagesWrite` and `messagesRead` apply to both Encrypted and Broadcast modes — the abstract capability to write/read in a context. `ContextMode` determines the processing pipeline.
+No new capability variants. `messages:write` and `messages:read` apply to both Encrypted and Broadcast modes — the abstract capability to write/read in a context. `ContextMode` determines the processing pipeline.
 
 ### 5.14.9.1 Economic Policy in Broadcast Contexts
 
@@ -1533,7 +1533,7 @@ No new capability variants. `messagesWrite` and `messagesRead` apply to both Enc
 Reuses existing event types wherever possible. Only one genuinely new type:
 
 - `MessageSent` — reused for broadcast (same event, mode determines semantics)
-- `roleAssigned` — reused for author grant (role: `author`) and subscriber registration (role: `subscriber`)
+- `role:assigned` — reused for author grant (role: `author`) and subscriber registration (role: `subscriber`)
 - `MemberJoined` — reused for subscriber registration
 - `TokenRevoked` — reused for gated subscriber revocation
 - **`WriteAccessRevoked { did, scope }`** — emitted when a governance-approved write access revocation executes (replaces the former AuthorBlocked event). The author's sender key is destroyed. scope indicates Full (retroactive) or FutureOnly. Distinct from `TokenRevoked` (which has different semantics: UCAN revocation).

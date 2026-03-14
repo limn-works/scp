@@ -478,23 +478,23 @@ fn media_session_lifecycle_with_ceiling_check_and_signaling() {
     let ts_start: u64 = 1_700_000_000;
     let ts_end: u64 = 1_700_003_600;
 
-    // -- Step 1: Build a capability ceiling that includes media.voice --
+    // -- Step 1: Build a capability ceiling that includes media:voice --
     let ceiling = vec![
         ParamCapability::new("messages:read"),
         ParamCapability::new("messages:write"),
-        ParamCapability::new("media.voice"),
+        ParamCapability::new("media:voice"),
     ];
 
-    // Verify that the ceiling contains media.voice.
+    // Verify that the ceiling contains media:voice.
     assert!(
         check_media_capability(&ceiling, &MediaCapability::Voice).is_ok(),
-        "media.voice must be in ceiling"
+        "media:voice must be in ceiling"
     );
 
-    // Verify that media.video is NOT in the ceiling (negative check).
+    // Verify that media:video is NOT in the ceiling (negative check).
     assert!(
         check_media_capability(&ceiling, &MediaCapability::Video).is_err(),
-        "media.video should not be in ceiling"
+        "media:video should not be in ceiling"
     );
 
     // -- Step 2: Initiate a media session with voice capability --

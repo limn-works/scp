@@ -53,7 +53,7 @@ Tool interface creation requires explicit consent from both the exposing context
    ```
    This proposal follows Context A's governance model (§5.9).
 
-2. **Outbound policy validation.** Context A validates that `toolInterface` is in its ceiling (§5.3) and the proposer holds the `toolInterface` capability.
+2. **Outbound policy validation.** Context A validates that `tool:interface` is in its ceiling (§5.3) and the proposer holds the `tool:interface` capability.
 
 3. **Interface offer.** On governance approval, Context A publishes an `InterfaceOffer` to its event log:
    ```
@@ -83,7 +83,7 @@ Tool interface creation requires explicit consent from both the exposing context
 ```
 OutboundPolicy {
   allowed_callers:      Vec<DID>,   // DIDs in Context A authorized to use this interface.
-                                    // Empty = any member with toolInterface capability.
+                                    // Empty = any member with tool:interface capability.
   max_calls_per_minute: u32,        // Rate limit from Context A's perspective.
   max_payload_bytes:    u32,        // Maximum request payload size. Default: 65536 (64 KiB).
   require_provenance:   bool,       // Whether responses must carry provenance. Default: true.
