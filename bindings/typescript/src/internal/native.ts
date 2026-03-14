@@ -172,8 +172,8 @@ export function createNativeBridge(): Bridge {
 
     async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
       const result = await (
-        addon.rotateKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { rotateKey(): Promise<BridgeIdentityHandle> }
+      ).rotateKey();
       return result;
     },
 
@@ -214,9 +214,11 @@ export function createNativeBridge(): Bridge {
       identityDid: string,
       payload: Uint8Array,
     ): Promise<void> {
+      // NAPI Vec<u8> maps to number[] in JS, not Uint8Array.
+      const payloadArray = Array.from(payload) as unknown as number[];
       await (
-        addon.contextSend as (h: BridgeContextHandle, d: string, p: Uint8Array) => Promise<void>
-      )(handle, identityDid, payload);
+        addon.contextSend as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
+      )(handle, identityDid, payloadArray);
     },
 
     contextSubscribe(
@@ -292,13 +294,11 @@ export function createNativeBridge(): Bridge {
       authorDid: string,
       payload: Uint8Array,
     ): Promise<void> {
+      // NAPI Vec<u8> maps to number[] in JS, not Uint8Array.
+      const payloadArray = Array.from(payload) as unknown as number[];
       await (
-        addon.broadcastPublish as (
-          h: BridgeContextHandle,
-          d: string,
-          p: Uint8Array,
-        ) => Promise<void>
-      )(handle, authorDid, payload);
+        addon.broadcastPublish as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
+      )(handle, authorDid, payloadArray);
     },
 
     async broadcastBlockSubscriber(
@@ -529,7 +529,9 @@ export function createNativeBridge(): Bridge {
     },
 
     async contextImport(data: Uint8Array): Promise<string> {
-      return await (addon.contextImport as (d: Uint8Array) => Promise<string>)(data);
+      // NAPI Vec<u8> maps to number[] in JS, not Uint8Array.
+      const dataArray = Array.from(data) as unknown as number[];
+      return await (addon.contextImport as (d: number[]) => Promise<string>)(dataArray);
     },
 
     // Drain events
@@ -541,9 +543,23 @@ export function createNativeBridge(): Bridge {
 
     // Tools
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
+      // NapiToolDefinition has different field names from the Bridge ToolDefinition.
+      const napiDef = {
+        name: definition.name,
+        description: definition.description,
+        inputSchemaJson: JSON.stringify(definition.inputSchema),
+        outputSchemaJson: JSON.stringify(definition.outputSchema),
+        operatorDid: definition.operator,
+        testVectorsJson: definition.testVectors
+          ? JSON.stringify(definition.testVectors)
+          : undefined,
+        implementationHash: definition.implementationHash
+          ? Array.from(definition.implementationHash)
+          : undefined,
+      };
       const toolId = await (
-        addon.toolRegister as (h: BridgeContextHandle, d: ToolDefinition) => Promise<string>
-      )(handle, definition);
+        addon.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
+      )(handle, napiDef);
       return toolId;
     },
 
@@ -743,15 +759,31 @@ export function createNativeBridge(): Bridge {
       platform: string,
       mode: BridgeMode,
     ) {
-      return (
+      // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
+      const raw = (
         addon.bridgeRegister as (
           c: string,
           o: string,
           g: string,
           p: string,
           m: BridgeMode,
-        ) => ReturnType<Bridge["bridgeRegister"]>
+        ) => {
+          bridgeId: string;
+          operatorDid: string;
+          platform: string;
+          mode: string;
+          status: string;
+          contextId: string;
+        }
       )(contextId, operatorDid, governanceDid, platform, mode);
+      return {
+        bridge_id: raw.bridgeId,
+        operator_did: raw.operatorDid,
+        platform: raw.platform,
+        mode: raw.mode as BridgeMode,
+        status: raw.status,
+        context_id: raw.contextId,
+      };
     },
 
     bridgeEvaluateTrust(
@@ -772,14 +804,28 @@ export function createNativeBridge(): Bridge {
       bridgeMode: BridgeMode,
       contextId: string | undefined,
     ) {
-      return (
+      // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
+      const raw = (
         addon.bridgeCreateShadow as (
           b: string,
           p: string,
           m: BridgeMode,
           c: string | undefined,
-        ) => ReturnType<Bridge["bridgeCreateShadow"]>
+        ) => {
+          shadowId: string;
+          platformHandle: string;
+          bridgeId: string;
+          attributedRole: string;
+          provenanceStatus: string;
+        }
       )(bridgeId, platformHandle, bridgeMode, contextId);
+      return {
+        shadow_id: raw.shadowId,
+        platform_handle: raw.platformHandle,
+        bridge_id: raw.bridgeId,
+        attributed_role: raw.attributedRole,
+        provenance_status: raw.provenanceStatus as ShadowStatus,
+      };
     },
 
     // Discovery
@@ -981,7 +1027,28 @@ export function createNativeBridge(): Bridge {
     },
 
     syncGetPolicy() {
-      return (addon.syncGetPolicy as () => ReturnType<Bridge["syncGetPolicy"]>)();
+      const raw = (
+        addon.syncGetPolicy as () => {
+          tier1ThresholdSecs: number;
+          tier2ThresholdSecs: number;
+          gapTimeoutSecs: number;
+          reorderBufferCapacity: number;
+          maxSequentialCommits: number;
+          commitProcessTimeoutSecs: number;
+          senderKeyTimeoutSecs: number;
+          reconnectionDedupWindowSecs: number;
+        }
+      )();
+      return {
+        tier_1_threshold_secs: raw.tier1ThresholdSecs,
+        tier_2_threshold_secs: raw.tier2ThresholdSecs,
+        gap_timeout_secs: raw.gapTimeoutSecs,
+        reorder_buffer_capacity: raw.reorderBufferCapacity,
+        max_sequential_commits: raw.maxSequentialCommits,
+        commit_process_timeout_secs: raw.commitProcessTimeoutSecs,
+        sender_key_timeout_secs: raw.senderKeyTimeoutSecs,
+        reconnection_dedup_window_secs: raw.reconnectionDedupWindowSecs,
+      };
     },
 
     // Identity Advanced
@@ -993,26 +1060,24 @@ export function createNativeBridge(): Bridge {
 
     async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
       return await (
-        addon.identityAddAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { addAgentKey(): Promise<BridgeIdentityHandle> }
+      ).addAgentKey();
     },
 
     async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
       return await (
-        addon.identityRotateAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { rotateAgentKey(): Promise<BridgeIdentityHandle> }
+      ).rotateAgentKey();
     },
 
     async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
       return await (
-        addon.identityRemoveAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { removeAgentKey(): Promise<BridgeIdentityHandle> }
+      ).removeAgentKey();
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return await (
-        addon.identityMigrate as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+      return await (handle as unknown as { migrate(): Promise<BridgeIdentityHandle> }).migrate();
     },
 
     async identityAttestDevice(did: string): Promise<string> {
