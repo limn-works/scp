@@ -40,9 +40,9 @@ use scp_core::store::ProtocolRepository;
 use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
+use scp_platform::Storage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::error::PlatformError;
-use scp_platform::Storage;
 use zeroize::Zeroizing;
 
 /// Global shared `ContextManager` instance.
