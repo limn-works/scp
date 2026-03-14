@@ -8102,6 +8102,60 @@ pub fn scpid_sign(
     })
 }
 
+/// Verifies a signed SCPID response against the original challenge (§3.11.4).
+///
+/// Resolves the signer's DID document via `DualLayerResolver` (parallel
+/// relay + DHT resolution), then runs the 11-step verification pipeline
+/// from `scp-core`. Returns the `ScpIdAuthentication` result as a JSON
+/// string on success.
+///
+/// # Arguments
+///
+/// * `response_json` — JSON string of the signed response (from `scpid_sign`).
+/// * `challenge_json` — JSON string of the original challenge (from `scpid_challenge`).
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if either JSON string is malformed.
+/// Returns `ScpError::Identity` if DID resolution fails, the signature is
+/// invalid, the challenge has expired, or any other verification step fails.
+#[uniffi::export]
+pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<String, ScpError> {
+    use scp_core::identity::scpid_verify as core_verify;
+
+    let response: scp_core::identity::ScpIdResponse = serde_json::from_str(&response_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid response JSON: {e}"),
+            code: "SCP-IDENT-1038".to_owned(),
+        })?;
+
+    let challenge: scp_core::identity::ScpIdChallenge = serde_json::from_str(&challenge_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid challenge JSON: {e}"),
+            code: "SCP-IDENT-1038".to_owned(),
+        })?;
+
+    let resolver = DualLayerResolver::new(
+        Arc::new(NoOpRelayQuerier),
+        Arc::new(InMemoryDhtClient::new()),
+        Arc::new(DidCache::new()),
+        Vec::new(),
+    );
+
+    let rt = crate::runtime();
+    let auth = rt
+        .block_on(core_verify(&resolver, &response, &challenge))
+        .map_err(|e| ScpError::Identity {
+            msg: e.to_string(),
+            code: scpid_error_code(&e).to_owned(),
+        })?;
+
+    serde_json::to_string(&auth).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize SCPID authentication: {e}"),
+        code: "SCP-IDENT-1037".to_owned(),
+    })
+}
+
 /// Parses an SCPID signing key ID string (`"#active"` or `"#agent"`).
 fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, ScpError> {
     match s {
@@ -8113,6 +8167,23 @@ fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, Scp
         }),
     }
 }
+
+/// Maps an [`ScpIdError`] variant to its canonical SCP error code.
+const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
+    use scp_core::identity::ScpIdError;
+    match e {
+        ScpIdError::ChallengeExpired => "SCP-IDENT-1030",
+        ScpIdError::AudienceMismatch => "SCP-IDENT-1031",
+        ScpIdError::TimestampInvalid => "SCP-IDENT-1032",
+        ScpIdError::DidResolutionFailed(_) => "SCP-IDENT-1033",
+        ScpIdError::KeyNotAuthorized => "SCP-IDENT-1034",
+        ScpIdError::SignatureInvalid => "SCP-IDENT-1035",
+        ScpIdError::DidDocumentStale => "SCP-IDENT-1036",
+        ScpIdError::SigningFailed(_) => "SCP-IDENT-1037",
+        ScpIdError::InvalidInput(_) => "SCP-IDENT-1038",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -8883,5 +8954,103 @@ mod tests {
         assert!(parse_scpid_signing_key_id("active").is_err());
         assert!(parse_scpid_signing_key_id("#owner").is_err());
         assert!(parse_scpid_signing_key_id("").is_err());
+    }
+
+    #[test]
+    fn scpid_error_code_maps_all_variants() {
+        use scp_core::identity::ScpIdError;
+
+        assert_eq!(
+            scpid_error_code(&ScpIdError::ChallengeExpired),
+            "SCP-IDENT-1030"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::AudienceMismatch),
+            "SCP-IDENT-1031"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::TimestampInvalid),
+            "SCP-IDENT-1032"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::DidResolutionFailed("test".to_owned())),
+            "SCP-IDENT-1033"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::KeyNotAuthorized),
+            "SCP-IDENT-1034"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::SignatureInvalid),
+            "SCP-IDENT-1035"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::DidDocumentStale),
+            "SCP-IDENT-1036"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::SigningFailed("test".to_owned())),
+            "SCP-IDENT-1037"
+        );
+        assert_eq!(
+            scpid_error_code(&ScpIdError::InvalidInput("test".to_owned())),
+            "SCP-IDENT-1038"
+        );
+    }
+
+    /// Sign→verify roundtrip using scp-core directly. Uses a shared
+    /// `InMemoryDhtClient` so the DID published during identity creation
+    /// is visible to the verify resolver.
+    #[tokio::test]
+    async fn scpid_sign_verify_roundtrip() {
+        use scp_core::identity::{
+            scpid_challenge as core_challenge, scpid_sign as core_sign, scpid_verify as core_verify,
+        };
+        use scp_identity::DidMethod;
+        use std::time::Duration;
+
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+
+        // Create a DidDht with a signer so we can publish the DID document.
+        let sign_fn =
+            scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                Arc::clone(&custody),
+            );
+        let dht = scp_identity::DidDht::with_client_and_signer(
+            Arc::clone(&dht_client),
+            Arc::new(DidCache::new()),
+            sign_fn,
+        );
+        let (identity, doc) = dht.create(custody.as_ref()).await.unwrap();
+
+        // Publish the document to the shared DHT so the resolver can find it.
+        dht.publish(&identity, &doc).await.unwrap();
+
+        // Challenge.
+        let challenge = core_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+
+        // Sign.
+        let response = core_sign(
+            custody.as_ref(),
+            &identity.active_signing_key,
+            &identity.did,
+            scp_identity::SigningKeyId::Active,
+            &challenge,
+        )
+        .await
+        .unwrap();
+
+        // Verify — uses same dht_client so it can find the DID.
+        let resolver = DualLayerResolver::new(
+            Arc::new(NoOpRelayQuerier),
+            dht_client,
+            Arc::new(DidCache::new()),
+            Vec::new(),
+        );
+        let auth = core_verify(&resolver, &response, &challenge).await.unwrap();
+
+        assert_eq!(auth.did, identity.did);
+        assert_eq!(auth.signing_key_id, scp_identity::SigningKeyId::Active);
     }
 }
