@@ -33,8 +33,8 @@ static INIT: Once = Once::new();
 /// Ensures the Python interpreter, tokio runtime, and `ContextManager` are initialized.
 ///
 /// Uses `init_context_manager_for_test()` which wires `LocalTransportProvider`
-/// instead of the production `NotConfiguredTransportProvider`, so that
-/// `create_context` does not fail on the `is_connected()` check.
+/// so that `publish_context` succeeds without warning noise
+/// (`NotConfiguredTransportProvider` would log warnings on best-effort publish).
 fn setup() {
     INIT.call_once(|| {
         pyo3::prepare_freethreaded_python();
@@ -42,8 +42,8 @@ fn setup() {
         // like py_event_log_query when storage is available.
         _scp_core::init_runtime().unwrap();
     });
-    // Uses LocalTransportProvider — production init_context_manager()
-    // uses NotConfiguredTransportProvider which rejects create_context (#501).
+    // Uses LocalTransportProvider so publish_context succeeds without warning
+    // noise (NotConfiguredTransportProvider logs warnings on best-effort publish).
     runtime::init_context_manager_for_test();
 }
 
