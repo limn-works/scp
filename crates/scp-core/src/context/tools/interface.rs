@@ -389,6 +389,13 @@ impl RateLimit {
             // burst_window of the FIRST burst call. Once burst_allowance is
             // consumed OR burst_window expires, no more burst calls until the
             // base window resets (handled above at the window-expiry check).
+
+            // Lazily anchor the burst window to the first actual burst call,
+            // not construction/base-window-reset time (#588 R2-01).
+            if self.burst_count == 0 {
+                self.burst_window_start = now;
+            }
+
             let burst_window_ms = self.burst_window.as_millis() as u64;
 
             // If the burst window has expired, burst is dead until base resets.
@@ -566,6 +573,13 @@ impl PerCallerRateLimit {
             // burst_window of the FIRST burst call. Once burst_allowance is
             // consumed OR burst_window expires, no more burst calls until the
             // base window resets (handled above at the window-expiry check).
+
+            // Lazily anchor the burst window to the first actual burst call,
+            // not construction/base-window-reset time (#588 R2-01).
+            if state.burst_count == 0 {
+                state.burst_window_start = now;
+            }
+
             let burst_window_ms = self.burst_window.as_millis() as u64;
 
             // If the burst window has expired, burst is dead until base resets.
@@ -2511,6 +2525,73 @@ mod tests {
     // -----------------------------------------------------------------------
     // Burst window expiry within base window (F-06, #588)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn rate_limit_burst_works_when_base_exhausted_after_burst_window_would_expire() {
+        // Regression test for #588 R2-01: burst_window_start must be anchored
+        // to the first burst call, not construction time. Without the lazy
+        // initialization fix, exhausting base calls >1s after construction
+        // causes the burst window to appear already expired.
+        //
+        // Setup: 2 base calls, 1-hour window, 5 burst calls, 1s burst window.
+        let mut rl =
+            RateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1)).unwrap();
+
+        // Consume the 2 base calls.
+        assert!(rl.check_and_increment().unwrap(), "base call 1");
+        assert!(rl.check_and_increment().unwrap(), "base call 2");
+
+        // Simulate being 30 seconds into the base window: push burst_window_start
+        // 30s into the past to mimic the scenario where construction happened
+        // 30s ago. Without the fix, the 1s burst window is long expired.
+        rl.burst_window_start = rl.burst_window_start.saturating_sub(30_000);
+
+        // With lazy initialization, the first burst call re-anchors
+        // burst_window_start to now, so all burst calls should succeed.
+        for i in 1..=5 {
+            assert!(
+                rl.check_and_increment().unwrap(),
+                "burst call {i} should succeed — burst window lazily initialized"
+            );
+        }
+
+        // 6th burst call should fail (burst allowance exhausted).
+        assert!(
+            !rl.check_and_increment().unwrap(),
+            "burst call 6 should fail — burst allowance exhausted"
+        );
+    }
+
+    #[test]
+    fn per_caller_burst_works_when_base_exhausted_after_burst_window_would_expire() {
+        // Same regression test for PerCallerRateLimit (#588 R2-01).
+        let mut rl =
+            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1));
+        let alice: DID = "did:dht:z6MkAlice".into();
+
+        // Consume the 2 base calls.
+        assert!(rl.check_and_increment(&alice).unwrap(), "base call 1");
+        assert!(rl.check_and_increment(&alice).unwrap(), "base call 2");
+
+        // Simulate being 30 seconds into the base window.
+        if let Some(state) = rl.callers.get_mut(&alice) {
+            state.burst_window_start = state.burst_window_start.saturating_sub(30_000);
+        }
+
+        // With lazy initialization, all burst calls should succeed.
+        for i in 1..=5 {
+            assert!(
+                rl.check_and_increment(&alice).unwrap(),
+                "burst call {i} should succeed — burst window lazily initialized"
+            );
+        }
+
+        // 6th burst call should fail.
+        assert!(
+            !rl.check_and_increment(&alice).unwrap(),
+            "burst call 6 should fail — burst allowance exhausted"
+        );
+    }
 
     #[test]
     fn rate_limit_burst_not_renewed_after_burst_window_expires() {
