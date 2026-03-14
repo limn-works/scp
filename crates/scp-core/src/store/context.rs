@@ -1729,6 +1729,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: std::collections::HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,

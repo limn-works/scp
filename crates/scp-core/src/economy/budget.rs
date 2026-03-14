@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use scp_identity::DID;
+use serde::{Deserialize, Serialize};
 
 use super::types::Amount;
 
@@ -28,7 +29,7 @@ use super::types::Amount;
 /// Not `Sync` -- callers must hold the context lock before mutating.
 ///
 /// See spec section 19.5, ADR-033.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberBudgetTracker {
     /// Per-member spending limits (governance-approved).
     limits: HashMap<DID, Amount>,
