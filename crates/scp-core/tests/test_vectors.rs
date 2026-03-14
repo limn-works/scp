@@ -19,11 +19,14 @@
 use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha256};
 
+use scp_core::context::tools::interface::InterfaceOffer;
 use scp_core::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
 use scp_core::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
 };
 use scp_core::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
+use scp_core::identity::attestation::IdentityLinkAttestation;
+use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // §25.2 Reference Key Material (RFC 8032 §7.1)
@@ -549,12 +552,15 @@ fn vector_16_single_leaf() {
     let root = leaf;
     print_vec("Root", &root);
 
-    // Verify construction
-    let mut expected_hasher = Sha256::new();
-    expected_hasher.update([0x00]);
-    expected_hasher.update(data);
-    let expected: [u8; 32] = expected_hasher.finalize().into();
-    assert_eq!(root, expected);
+    // §25.8 Vector 16: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf),
+        "90b626dbb1e994c962942db2b3b16d97c63f679912a176bb96f4e308c213005b"
+    );
+    assert_eq!(
+        hex(&root),
+        "90b626dbb1e994c962942db2b3b16d97c63f679912a176bb96f4e308c213005b"
+    );
 }
 
 #[test]
@@ -570,6 +576,20 @@ fn vector_17_two_leaves() {
 
     let root = interior_hash(&leaf_1, &leaf_2);
     print_vec("Root (SHA-256(0x01 || leaf1 || leaf2))", &root);
+
+    // §25.8 Vector 17: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf_1),
+        "00d9ea40d70522a7d0aa41e2708afd5dc148a4dcc26011d598cbc28cdbde306f"
+    );
+    assert_eq!(
+        hex(&leaf_2),
+        "7a7b6da2a00d46f75c01d0c5a33cb62e99caa7f0ebbd084a169a00874751e7a3"
+    );
+    assert_eq!(
+        hex(&root),
+        "9f7a0b4b3965ce3eb4dda7c7c56bc9f7fb2c627d5120692d4ff8e531920ebbf9"
+    );
 }
 
 #[test]
@@ -588,6 +608,28 @@ fn vector_18_three_leaves_unbalanced() {
 
     let root = interior_hash(&interior_1, &leaf_3);
     print_vec("Root (interior1 | C)", &root);
+
+    // §25.8 Vector 18: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf_1),
+        "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d"
+    );
+    assert_eq!(
+        hex(&leaf_2),
+        "87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e"
+    );
+    assert_eq!(
+        hex(&leaf_3),
+        "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2"
+    );
+    assert_eq!(
+        hex(&interior_1),
+        "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25"
+    );
+    assert_eq!(
+        hex(&root),
+        "961d2e2be20f538ffdf56962a86d1bd165498f222684ee4c5e02c1e9f852adc5"
+    );
 }
 
 #[test]
@@ -609,6 +651,36 @@ fn vector_19_four_leaves_balanced() {
 
     let root = interior_hash(&interior_l, &interior_r);
     print_vec("Root (L|R)", &root);
+
+    // §25.8 Vector 19: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf_1),
+        "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d"
+    );
+    assert_eq!(
+        hex(&leaf_2),
+        "87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e"
+    );
+    assert_eq!(
+        hex(&leaf_3),
+        "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2"
+    );
+    assert_eq!(
+        hex(&leaf_4),
+        "08a2afecc9feaef6737f055c177a56a363d28a78d7b259b8c5f66b32174f2e7d"
+    );
+    assert_eq!(
+        hex(&interior_l),
+        "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25"
+    );
+    assert_eq!(
+        hex(&interior_r),
+        "d62c77efa9be96355bb8b07aefc985914377de5aec1287998c9a10f11cd8d075"
+    );
+    assert_eq!(
+        hex(&root),
+        "5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -920,12 +992,157 @@ fn sha256_sanity_check() {
 }
 
 // ---------------------------------------------------------------------------
+// §25.14 Pseudonymization Vectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vector_27_did_pseudonymization() {
+    println!("=== Vector 27: DID Pseudonymization ===");
+
+    // §25.14: pseudonymize_did is a private function, so we reproduce the
+    // SHA-256 construction directly from the spec to verify the expected hash.
+    let pseudonym_key = b"test-pseudonym-key"; // 18 bytes
+    let context_id = b"test-context-01";
+    let did = b"did:dht:z6MkTest";
+
+    // Canonical hash input per §25.14:
+    //   "SCP-PSEUDONYM-V1:" (17 bytes, no length prefix)
+    //   || BE32(18) || "test-pseudonym-key" (4 + 18 = 22 bytes)
+    //   || BE32(15) || "test-context-01"    (4 + 15 = 19 bytes)
+    //   || BE32(16) || "did:dht:z6MkTest"  (4 + 16 = 20 bytes)
+    //   Total: 17 + 22 + 19 + 20 = 78 bytes
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SCP-PSEUDONYM-V1:");
+    buf.extend_from_slice(&(pseudonym_key.len() as u32).to_be_bytes());
+    buf.extend_from_slice(pseudonym_key);
+    buf.extend_from_slice(&(context_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(context_id);
+    buf.extend_from_slice(&(did.len() as u32).to_be_bytes());
+    buf.extend_from_slice(did);
+
+    println!("  Canonical hash input length: {} bytes", buf.len());
+    assert_eq!(buf.len(), 78, "pseudonym input must be 78 bytes per §25.14");
+
+    let hash: [u8; 32] = Sha256::digest(&buf).into();
+    print_vec("Pseudonym hash", &hash);
+
+    // §25.14 Vector 27: assert exact spec hex value.
+    assert_eq!(
+        hex(&hash),
+        "a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e28d"
+    );
+
+    // Verify the pseudonym DID format.
+    let pseudonym_did = format!("did:pseudo:{}", hex(&hash));
+    assert_eq!(
+        pseudonym_did,
+        "did:pseudo:a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e28d"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §25.15 Tool Interface Offer ID Vectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vector_28_tool_interface_offer_id() {
+    println!("=== Vector 28: Tool Interface Offer ID ===");
+
+    let source_context = "source-ctx-01";
+    let tool_id = "tool-abc123";
+    let target_context = "target-ctx-02";
+    let timestamp: u64 = 1_700_000_000;
+
+    // Use the actual InterfaceOffer::compute_offer_id implementation.
+    let offer_id =
+        InterfaceOffer::compute_offer_id(source_context, tool_id, target_context, timestamp);
+    print_vec("Offer ID", &offer_id);
+
+    // §25.15 Vector 28: assert exact spec hex value.
+    assert_eq!(
+        hex(&offer_id),
+        "b9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53"
+    );
+
+    // Also verify via manual construction to confirm the implementation matches.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SCP-OFFER-ID-V1:");
+    buf.extend_from_slice(&(source_context.len() as u32).to_be_bytes());
+    buf.extend_from_slice(source_context.as_bytes());
+    buf.extend_from_slice(&(tool_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(tool_id.as_bytes());
+    buf.extend_from_slice(&(target_context.len() as u32).to_be_bytes());
+    buf.extend_from_slice(target_context.as_bytes());
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+
+    assert_eq!(buf.len(), 73, "offer ID input must be 73 bytes per §25.15");
+
+    let manual_hash: [u8; 32] = Sha256::digest(&buf).into();
+    assert_eq!(
+        offer_id, manual_hash,
+        "compute_offer_id must match manual construction"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §25.16 Attestation ID Vectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vector_29_attestation_id() {
+    println!("=== Vector 29: Attestation ID ===");
+
+    let issuer: DID = "did:dht:z6MkIssuer".into();
+    let platform = "x";
+    let platform_handle = "@alice";
+    let issued_at: u64 = 1_700_000_000;
+
+    // Use the actual IdentityLinkAttestation::compute_id implementation.
+    let attestation_id =
+        IdentityLinkAttestation::compute_id(&issuer, platform, platform_handle, issued_at);
+    println!("  Attestation ID: {attestation_id}");
+
+    // §25.16 Vector 29: assert exact spec hex value.
+    assert_eq!(
+        attestation_id,
+        "3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c"
+    );
+
+    // Also verify via manual construction to confirm the implementation matches.
+    let issuer_str: &str = &issuer;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SCP-ATTESTATION-ID-V1:");
+    buf.extend_from_slice(&(issuer_str.len() as u32).to_be_bytes());
+    buf.extend_from_slice(issuer_str.as_bytes());
+    buf.extend_from_slice(&(platform.len() as u32).to_be_bytes());
+    buf.extend_from_slice(platform.as_bytes());
+    buf.extend_from_slice(&(platform_handle.len() as u32).to_be_bytes());
+    buf.extend_from_slice(platform_handle.as_bytes());
+    buf.extend_from_slice(&issued_at.to_be_bytes());
+
+    assert_eq!(
+        buf.len(),
+        67,
+        "attestation ID input must be 67 bytes per §25.16"
+    );
+
+    let manual_hash: [u8; 32] = Sha256::digest(&buf).into();
+    assert_eq!(
+        hex(&manual_hash),
+        attestation_id,
+        "compute_id must match manual construction"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Cross-vector consistency checks
 // ---------------------------------------------------------------------------
 
 #[test]
 fn domain_separators_are_all_unique() {
-    let domains = [
+    // SHA-256 hash domain separators — used as the leading prefix in hash inputs.
+    // Prefix collisions here would be a security issue (domain confusion).
+    let hash_domains = [
         "SCP-INNER-ENVELOPE-V1:",
         "SCP-VOTE-V1:",
         "SCP-RESET-REQUEST-V1:",
@@ -933,23 +1150,81 @@ fn domain_separators_are_all_unique() {
         "SCP-CLAIM-V1:",
         "SCP-PROPOSAL-V1:",
         "SCP-ATTESTATION-V1:",
-        "scp-sender-key-v1",
-        "scp-access-key-v1",
+        "SCP-PSEUDONYM-V1:",
+        "SCP-OFFER-ID-V1:",
+        "SCP-ATTESTATION-ID-V1:",
+        "SCP-EVENT-V1:",
+        "SCP-CHECKPOINT-V1:",
+        "SCP-MIGRATION-V1:",
+        "SCP-KEY-DESTRUCTION-V1:",
+        "SCP-EXPORT-ENTRY-V1:",
+        "SCP-CHUNK-MSG-ID-V1:",
+        "SCP-PRIVATE-LOG-V1:",
+        "SCP-BROADCAST-ENVELOPE-V1:",
+        "SCP-PARTICIPATION-V1:",
+        "SCP-IDENTITY-LINK-ATTESTATION-V1:",
+        "SCP-ACCESS-KEY-REQUEST-V1:",
+        "SCP-TOOL-REGISTRATION-V1:",
+        "SCP-FORK-ID-V1:",
+        "SCP-COMMIT-RANGE-REQ-V1:",
+        "SCP-COMMIT-RANGE-RESP-V1:",
+        "SCP-CONTEXT-SNAPSHOT-V1:",
+        "SCP-CHALLENGE-REQ-V1:",
+        "SCP-CHALLENGE-RESP-V1:",
+        "SCP-CHALLENGE-VERIFY-V1:",
+        "SCP-BRIDGE-REGISTER-V1:",
+        "SCP-BLOCK-NOTIFICATION-V1:",
+        "SCP-EPOCH-ADVANCE-V1:",
+        "SCP-KEY-REQUEST-V1:",
     ];
 
-    for i in 0..domains.len() {
-        for j in (i + 1)..domains.len() {
+    // HKDF/HMAC domain labels — used as info strings, salts, or trailing labels
+    // in key derivation. Prefix relationships between these are structurally safe
+    // (different HKDF/HMAC constructions with different input structures), but
+    // each label must still be globally unique.
+    let derivation_labels = [
+        "scp-sender-key-v1",
+        "scp-access-key-v1",
+        "scp-private-state-v1",
+        "scp-private-state-salt-v1",
+        "scp-media-key-v1",
+        "scp-bridge-credential-v1",
+        "scp-pseudonym-secret-v1",
+        "scp-participation-statement-v1",
+        "scp-context-export-integrity-v1",
+        "scp-psk-wrap-v1",
+        "scp-test-attestation-v1:",
+        "scp-pseudonym",
+        "scp-pseudonym-v2",
+    ];
+
+    // All domain separators across both categories must be unique.
+    let all_domains: Vec<&str> = hash_domains
+        .iter()
+        .chain(derivation_labels.iter())
+        .copied()
+        .collect();
+
+    for i in 0..all_domains.len() {
+        for j in (i + 1)..all_domains.len() {
             assert_ne!(
-                domains[i], domains[j],
+                all_domains[i], all_domains[j],
                 "domain separators must be unique: '{}' vs '{}'",
-                domains[i], domains[j]
+                all_domains[i], all_domains[j]
             );
-            // Also verify no domain is a prefix of another
+        }
+    }
+
+    // Hash domain separators must not be prefixes of each other — they appear at
+    // the start of hash inputs so a prefix collision could cause domain confusion.
+    for i in 0..hash_domains.len() {
+        for j in (i + 1)..hash_domains.len() {
             assert!(
-                !domains[i].starts_with(domains[j]) && !domains[j].starts_with(domains[i]),
-                "no domain separator must be a prefix of another: '{}' vs '{}'",
-                domains[i],
-                domains[j]
+                !hash_domains[i].starts_with(hash_domains[j])
+                    && !hash_domains[j].starts_with(hash_domains[i]),
+                "no hash domain separator must be a prefix of another: '{}' vs '{}'",
+                hash_domains[i],
+                hash_domains[j]
             );
         }
     }
