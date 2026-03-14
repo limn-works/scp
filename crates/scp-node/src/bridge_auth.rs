@@ -18,6 +18,7 @@
 //!
 //! See ADR-023 in `.docs/adrs/phase-5.md` and spec section 12.10.3.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,8 +32,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use scp_core::bridge::{BridgeConnector, BridgeStatus};
+use scp_core::store::ProtocolRepository;
 use scp_identity::dht::decode_multibase_key;
 use scp_identity::document::DidDocument;
+use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -180,6 +183,315 @@ pub trait BridgeLookup: Send + Sync + 'static {
 
     /// Returns the expected audience (node URL) for JWT validation.
     fn expected_audience(&self) -> &str;
+}
+
+// ---------------------------------------------------------------------------
+// StorageBridgeLookup — production implementation
+// ---------------------------------------------------------------------------
+
+/// Key prefix for bridge connector records in storage.
+const BRIDGE_REGISTRY_PREFIX: &str = "bridge/registry/";
+
+/// Key prefix for cached DID documents in storage.
+const BRIDGE_DID_DOC_PREFIX: &str = "bridge/did_doc/";
+
+/// Key prefix for webhook signing keys in storage.
+const BRIDGE_WEBHOOK_KEY_PREFIX: &str = "bridge/webhook_key/";
+
+/// Storage key for the node's audience URL.
+const BRIDGE_AUDIENCE_KEY: &str = "bridge/config/audience";
+
+/// Production [`BridgeLookup`] backed by a [`ProtocolRepository`] (and its
+/// underlying [`Storage`] implementation).
+///
+/// Uses an in-memory cache (protected by `std::sync::RwLock`) for synchronous
+/// lookups required by the `BridgeLookup` trait. All mutations write through
+/// to the underlying storage backend AND update the cache atomically, so the
+/// cache always reflects persistent state.
+///
+/// At node startup, call [`StorageBridgeLookup::load_from_storage`] to hydrate
+/// the cache from persisted data. Subsequent registrations via
+/// [`register_bridge`](Self::register_bridge),
+/// [`register_did_document`](Self::register_did_document), and
+/// [`register_webhook_key`](Self::register_webhook_key) keep both the cache
+/// and storage in sync.
+///
+/// See spec section 12.10.2 (bridge authentication).
+pub struct StorageBridgeLookup<S: Storage> {
+    /// The protocol repository wrapping the storage backend.
+    repo: Arc<ProtocolRepository<S>>,
+    /// In-memory cache of bridge connectors keyed by bridge ID.
+    bridges: std::sync::RwLock<HashMap<String, BridgeConnector>>,
+    /// In-memory cache of DID documents keyed by DID string.
+    did_docs: std::sync::RwLock<HashMap<String, DidDocument>>,
+    /// In-memory cache of webhook signing keys keyed by key ID.
+    webhook_keys: std::sync::RwLock<HashMap<String, [u8; 32]>>,
+    /// The expected JWT audience (node URL).
+    audience: String,
+}
+
+impl<S: Storage> StorageBridgeLookup<S> {
+    /// Creates a new `StorageBridgeLookup` with an empty cache.
+    ///
+    /// Call [`load_from_storage`](Self::load_from_storage) after construction
+    /// to hydrate the cache from persisted data.
+    #[must_use]
+    pub fn new(repo: Arc<ProtocolRepository<S>>, audience: String) -> Self {
+        Self {
+            repo,
+            bridges: std::sync::RwLock::new(HashMap::new()),
+            did_docs: std::sync::RwLock::new(HashMap::new()),
+            webhook_keys: std::sync::RwLock::new(HashMap::new()),
+            audience,
+        }
+    }
+
+    /// Hydrates the in-memory cache from the storage backend.
+    ///
+    /// Scans all `bridge/registry/*`, `bridge/did_doc/*`, and
+    /// `bridge/webhook_key/*` keys, deserializing their values into
+    /// the appropriate caches. Also persists the audience URL if it
+    /// is not yet stored.
+    ///
+    /// Should be called once at node startup before serving requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if a storage operation fails.
+    pub async fn load_from_storage(&self) -> Result<(), scp_platform::PlatformError> {
+        let storage = self.repo.storage();
+
+        // Load bridges — collect from storage first, then insert into cache.
+        let bridge_keys = storage.list_keys(BRIDGE_REGISTRY_PREFIX).await?;
+        let mut loaded_bridges = Vec::new();
+        for key in &bridge_keys {
+            if let Some(data) = storage.retrieve(key).await? {
+                if let Ok(connector) = serde_json::from_slice::<BridgeConnector>(&data) {
+                    loaded_bridges.push(connector);
+                } else {
+                    tracing::warn!(key = %key, "skipping bridge record with invalid JSON");
+                }
+            }
+        }
+        {
+            let mut cache = self
+                .bridges
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for connector in loaded_bridges {
+                cache.insert(connector.bridge_id.clone(), connector);
+            }
+        }
+
+        // Load DID documents — collect from storage first, then insert into cache.
+        let doc_keys = storage.list_keys(BRIDGE_DID_DOC_PREFIX).await?;
+        let mut loaded_docs = Vec::new();
+        for key in &doc_keys {
+            if let Some(data) = storage.retrieve(key).await? {
+                if let Ok(doc) = serde_json::from_slice::<DidDocument>(&data) {
+                    loaded_docs.push(doc);
+                } else {
+                    tracing::warn!(key = %key, "skipping DID document with invalid JSON");
+                }
+            }
+        }
+        {
+            let mut cache = self
+                .did_docs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for doc in loaded_docs {
+                cache.insert(doc.id.clone(), doc);
+            }
+        }
+
+        // Load webhook keys — collect from storage first, then insert into cache.
+        let wh_keys = storage.list_keys(BRIDGE_WEBHOOK_KEY_PREFIX).await?;
+        let mut loaded_wh_keys = Vec::new();
+        for key in &wh_keys {
+            if let Some(data) = storage.retrieve(key).await? {
+                if data.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&data);
+                    let key_id = key.strip_prefix(BRIDGE_WEBHOOK_KEY_PREFIX).unwrap_or(key);
+                    loaded_wh_keys.push((key_id.to_owned(), arr));
+                } else {
+                    tracing::warn!(
+                        key = %key,
+                        len = data.len(),
+                        "skipping webhook key with invalid length (expected 32)"
+                    );
+                }
+            }
+        }
+        {
+            let mut cache = self
+                .webhook_keys
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (key_id, arr) in loaded_wh_keys {
+                cache.insert(key_id, arr);
+            }
+        }
+
+        // Persist the audience URL if not already stored.
+        if storage.retrieve(BRIDGE_AUDIENCE_KEY).await?.is_none() {
+            storage
+                .store(BRIDGE_AUDIENCE_KEY, self.audience.as_bytes())
+                .await?;
+        }
+
+        let bridge_count = self
+            .bridges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let doc_count = self
+            .did_docs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let wh_count = self
+            .webhook_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        tracing::info!(
+            bridges = bridge_count,
+            did_docs = doc_count,
+            webhook_keys = wh_count,
+            "bridge auth cache loaded from storage"
+        );
+
+        Ok(())
+    }
+
+    /// Registers a bridge connector, persisting to storage and updating the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the storage write fails.
+    pub async fn register_bridge(
+        &self,
+        connector: BridgeConnector,
+    ) -> Result<(), scp_platform::PlatformError> {
+        let key = format!("{BRIDGE_REGISTRY_PREFIX}{}", connector.bridge_id);
+        let data = serde_json::to_vec(&connector)
+            .map_err(|e| scp_platform::PlatformError::StorageError(e.to_string()))?;
+        self.repo.storage().store(&key, &data).await?;
+        self.bridges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(connector.bridge_id.clone(), connector);
+        Ok(())
+    }
+
+    /// Removes a bridge connector by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the storage delete fails.
+    pub async fn deregister_bridge(
+        &self,
+        bridge_id: &str,
+    ) -> Result<(), scp_platform::PlatformError> {
+        let key = format!("{BRIDGE_REGISTRY_PREFIX}{bridge_id}");
+        self.repo.storage().delete(&key).await?;
+        self.bridges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
+        Ok(())
+    }
+
+    /// Registers (or updates) a DID document, persisting to storage and
+    /// updating the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the storage write fails.
+    pub async fn register_did_document(
+        &self,
+        doc: DidDocument,
+    ) -> Result<(), scp_platform::PlatformError> {
+        let key = format!("{BRIDGE_DID_DOC_PREFIX}{}", doc.id);
+        let data = serde_json::to_vec(&doc)
+            .map_err(|e| scp_platform::PlatformError::StorageError(e.to_string()))?;
+        self.repo.storage().store(&key, &data).await?;
+        self.did_docs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(doc.id.clone(), doc);
+        Ok(())
+    }
+
+    /// Registers a webhook signing key, persisting to storage and updating
+    /// the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the storage write fails.
+    pub async fn register_webhook_key(
+        &self,
+        key_id: &str,
+        public_key: [u8; 32],
+    ) -> Result<(), scp_platform::PlatformError> {
+        let key = format!("{BRIDGE_WEBHOOK_KEY_PREFIX}{key_id}");
+        self.repo.storage().store(&key, &public_key).await?;
+        self.webhook_keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key_id.to_owned(), public_key);
+        Ok(())
+    }
+
+    /// Removes a webhook signing key by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the storage delete fails.
+    pub async fn deregister_webhook_key(
+        &self,
+        key_id: &str,
+    ) -> Result<(), scp_platform::PlatformError> {
+        let key = format!("{BRIDGE_WEBHOOK_KEY_PREFIX}{key_id}");
+        self.repo.storage().delete(&key).await?;
+        self.webhook_keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key_id);
+        Ok(())
+    }
+}
+
+impl<S: Storage + 'static> BridgeLookup for StorageBridgeLookup<S> {
+    fn find_bridge(&self, bridge_id: &str) -> Option<BridgeConnector> {
+        self.bridges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(bridge_id)
+            .cloned()
+    }
+
+    fn resolve_did_document(&self, did: &str) -> Option<DidDocument> {
+        self.did_docs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(did)
+            .cloned()
+    }
+
+    fn find_webhook_key(&self, key_id: &str) -> Option<[u8; 32]> {
+        self.webhook_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key_id)
+            .copied()
+    }
+
+    fn expected_audience(&self) -> &str {
+        &self.audience
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +674,81 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
 /// See spec sections 12.10.2 and 12.10.3.
 pub async fn bridge_auth_middleware<L: BridgeLookup>(
     State(lookup): State<Arc<L>>,
+    mut req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Extract the Authorization header.
+    let auth_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let token = match auth_header {
+        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => &value[7..],
+        _ => {
+            return bridge_not_authorized("missing or invalid Authorization header")
+                .into_response();
+        }
+    };
+
+    // Verify the JWT.
+    let claims = match verify_bridge_jwt(token, lookup.as_ref()) {
+        Ok(claims) => claims,
+        Err(msg) => {
+            return bridge_not_authorized(msg).into_response();
+        }
+    };
+
+    // Look up the bridge in the registry.
+    let Some(bridge) = lookup.find_bridge(&claims.scp_bridge_id) else {
+        return bridge_not_authorized(format!("bridge not found: {}", claims.scp_bridge_id))
+            .into_response();
+    };
+
+    // Validate that the JWT issuer matches the bridge operator.
+    if bridge.operator_did != claims.iss {
+        return bridge_not_authorized("JWT issuer does not match bridge operator DID")
+            .into_response();
+    }
+
+    // Validate that the context ID matches.
+    if claims.scp_context_id != bridge.registration_context {
+        return bridge_not_authorized("JWT context ID does not match bridge registration context")
+            .into_response();
+    }
+
+    // Check bridge status.
+    match bridge.status {
+        BridgeStatus::Active => {}
+        BridgeStatus::Suspended => {
+            return bridge_suspended(format!(
+                "bridge {} is suspended by context governance",
+                bridge.bridge_id
+            ))
+            .into_response();
+        }
+        BridgeStatus::Revoked => {
+            return bridge_not_authorized(format!("bridge {} has been revoked", bridge.bridge_id))
+                .into_response();
+        }
+    }
+
+    // Insert the auth context for downstream handlers.
+    let auth_ctx = BridgeAuthContext { claims, bridge };
+    req.extensions_mut().insert(auth_ctx);
+
+    next.run(req).await.into_response()
+}
+
+/// Type-erased variant of [`bridge_auth_middleware`] for use with
+/// `Arc<dyn BridgeLookup>`.
+///
+/// This enables the production router to apply the bridge auth middleware
+/// without knowing the concrete `StorageBridgeLookup<S>` type at the
+/// router construction site (since [`NodeState`](crate::http::NodeState) is
+/// not generic over `S`).
+pub async fn bridge_auth_middleware_dyn(
+    State(lookup): State<Arc<dyn BridgeLookup>>,
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
@@ -1192,5 +1579,169 @@ mod tests {
 
         let result = verify_webhook_signature(&sig_b64, "platform-key-1", tampered_body, &lookup);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // StorageBridgeLookup tests
+    // -------------------------------------------------------------------
+
+    use scp_core::store::ProtocolRepository;
+    use scp_platform::testing::InMemoryStorage;
+
+    fn make_storage_lookup() -> StorageBridgeLookup<InMemoryStorage> {
+        let storage = InMemoryStorage::new();
+        let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
+        StorageBridgeLookup::new(repo, "https://node.example.com".to_owned())
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_register_and_find_bridge() {
+        let lookup = make_storage_lookup();
+
+        let bridge = test_bridge(
+            "bridge-1",
+            "did:dht:operator1",
+            "ctx-1",
+            BridgeStatus::Active,
+        );
+        lookup.register_bridge(bridge.clone()).await.unwrap();
+
+        let found = lookup.find_bridge("bridge-1");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().bridge_id, "bridge-1");
+
+        assert!(lookup.find_bridge("bridge-nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_register_and_find_did_document() {
+        let lookup = make_storage_lookup();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&signing_key);
+        let doc = test_did_document(&did, &signing_key);
+
+        lookup.register_did_document(doc.clone()).await.unwrap();
+
+        let found = lookup.resolve_did_document(&did);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, did);
+
+        assert!(lookup.resolve_did_document("did:dht:nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_register_and_find_webhook_key() {
+        let lookup = make_storage_lookup();
+        let pub_key = [42u8; 32];
+
+        lookup
+            .register_webhook_key("platform-key-1", pub_key)
+            .await
+            .unwrap();
+
+        let found = lookup.find_webhook_key("platform-key-1");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), pub_key);
+
+        assert!(lookup.find_webhook_key("nonexistent-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_expected_audience() {
+        let lookup = make_storage_lookup();
+        assert_eq!(lookup.expected_audience(), "https://node.example.com");
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_deregister_bridge() {
+        let lookup = make_storage_lookup();
+        let bridge = test_bridge(
+            "bridge-1",
+            "did:dht:operator1",
+            "ctx-1",
+            BridgeStatus::Active,
+        );
+        lookup.register_bridge(bridge).await.unwrap();
+
+        assert!(lookup.find_bridge("bridge-1").is_some());
+
+        lookup.deregister_bridge("bridge-1").await.unwrap();
+        assert!(lookup.find_bridge("bridge-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_deregister_webhook_key() {
+        let lookup = make_storage_lookup();
+        lookup
+            .register_webhook_key("key-1", [1u8; 32])
+            .await
+            .unwrap();
+
+        assert!(lookup.find_webhook_key("key-1").is_some());
+
+        lookup.deregister_webhook_key("key-1").await.unwrap();
+        assert!(lookup.find_webhook_key("key-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_load_from_storage_roundtrip() {
+        // Register data via one lookup instance, then create a fresh instance
+        // and load from the same storage — it should find everything.
+        let storage = InMemoryStorage::new();
+        let repo = Arc::new(ProtocolRepository::new_for_testing(storage));
+
+        let lookup1 =
+            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        let bridge = test_bridge("bridge-rt", "did:dht:op", "ctx-rt", BridgeStatus::Active);
+        lookup1.register_bridge(bridge).await.unwrap();
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&signing_key);
+        let doc = test_did_document(&did, &signing_key);
+        lookup1.register_did_document(doc).await.unwrap();
+
+        lookup1
+            .register_webhook_key("wh-key-rt", [99u8; 32])
+            .await
+            .unwrap();
+
+        // Create a fresh instance that shares the same storage and load.
+        let lookup2 =
+            StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
+        lookup2.load_from_storage().await.unwrap();
+
+        assert!(lookup2.find_bridge("bridge-rt").is_some());
+        assert!(lookup2.resolve_did_document(&did).is_some());
+        assert_eq!(lookup2.find_webhook_key("wh-key-rt"), Some([99u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn storage_lookup_jwt_roundtrip() {
+        // Full round-trip: register bridge + DID doc via StorageBridgeLookup,
+        // then use it to verify a JWT.
+        let lookup = make_storage_lookup();
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&signing_key);
+        let doc = test_did_document(&did, &signing_key);
+        lookup.register_did_document(doc).await.unwrap();
+
+        let bridge = test_bridge("bridge-jwt", &did, "ctx-jwt", BridgeStatus::Active);
+        lookup.register_bridge(bridge).await.unwrap();
+
+        let now = current_time();
+        let claims = BridgeJwtClaims {
+            iss: did.clone(),
+            aud: "https://node.example.com".to_owned(),
+            iat: now,
+            exp: now + 1800,
+            scp_bridge_id: "bridge-jwt".to_owned(),
+            scp_context_id: "ctx-jwt".to_owned(),
+        };
+
+        let token = create_bridge_jwt(&claims, &signing_key).unwrap();
+        let verified = verify_bridge_jwt(&token, &lookup).unwrap();
+        assert_eq!(verified.iss, did);
+        assert_eq!(verified.scp_bridge_id, "bridge-jwt");
     }
 }
