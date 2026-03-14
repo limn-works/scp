@@ -7359,6 +7359,11 @@ impl ContextManager {
     /// encrypts and sends a payload without the full `send_message` validation
     /// pipeline (since recovery may be happening in a degraded state).
     ///
+    /// Each recovery step uses a distinct `sequence` number to avoid
+    /// collisions when multiple notifications are sent for the same
+    /// context and epoch: 0 = MLS epoch-advance, 1 = UCAN revocation,
+    /// 2 = key-package rotation, 3 = PSK rotation, 4 = contact notification.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if the message cannot be sent.
@@ -7367,6 +7372,7 @@ impl ContextManager {
         context_id: &str,
         sender_did: &str,
         payload: &[u8],
+        sequence: u64,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -7384,7 +7390,7 @@ impl ContextManager {
             sender_did,
             payload,
             current_epoch,
-            0, // Sequence 0 — single notification per recovery.
+            sequence,
         )?;
 
         // Send via transport.
@@ -7426,7 +7432,8 @@ impl ContextManager {
 
         match shared_context_id {
             Some(context_id) => {
-                self.recovery_send_notification(&context_id, recovering_did, payload)
+                // Contact notifications use sequence=4 (step 5 in recovery).
+                self.recovery_send_notification(&context_id, recovering_did, payload, 4)
                     .await
             }
             None => Err(ContextError::TransportFailed(format!(
