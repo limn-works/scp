@@ -195,7 +195,7 @@ class ConformanceRunnerTest {
         fun `dispatcher handles all tool operations`() =
             runTest(testDispatcher) {
                 assertDispatchSucceeds("tool_register", mapOf("context_handle" to "10"))
-                assertDispatchSucceeds("tool_invoke", mapOf("context_handle" to "10"))
+                assertDispatchSucceeds("tool_invoke", mapOf("context_handle" to "10", "identity_handle" to "1"))
                 assertDispatchSucceeds("tool_verify", mapOf("tool_id" to "t"))
             }
 
