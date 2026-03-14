@@ -24,6 +24,7 @@
 //! (deleted as part of issue #387).
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -40,7 +41,8 @@ use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::error::PlatformError;
+use scp_platform::Storage;
 use zeroize::Zeroizing;
 
 /// Global shared `ContextManager` instance.
@@ -133,17 +135,125 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///
-/// Creates an `EncryptingAdapter<InMemoryStorage>` with a random AES-256-GCM
-/// key, wraps it in a `ProtocolRepository`, then builds a
+/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
+/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
 /// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
 /// The resulting `MerkleEventLogProvider` persists entries on each append.
+///
+/// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
+/// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
+/// feature (which also exposes `InMemoryKeyCustody`) is not required in
+/// production mobile builds. See issue #484.
 fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-    let encrypted = EncryptingAdapter::new(InMemoryStorage::new(), key);
+    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
     let store = Arc::new(ProtocolRepository::new(encrypted));
     let bridge = ProtocolRepositoryEventLogBridge::new(store);
     Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+}
+
+// ---------------------------------------------------------------------------
+// BridgeInMemoryStorage — bridge-local Storage implementation
+//
+// This avoids pulling in `scp-platform/testing` (which also exposes
+// `InMemoryKeyCustody`) just for event log persistence. Production mobile
+// builds (iOS/Android) must not compile `InMemoryKeyCustody`.
+// ---------------------------------------------------------------------------
+
+/// In-memory `Storage` implementation for the `UniFFI` bridge event log.
+///
+/// Identical in behavior to `scp_platform::testing::InMemoryStorage` but
+/// defined locally so the `testing` feature is not required in production
+/// dependencies. Only used as the backing store for the
+/// `EncryptingAdapter`-wrapped `ProtocolRepository` that feeds the
+/// `MerkleEventLogProvider`.
+struct BridgeInMemoryStorage {
+    data: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl BridgeInMemoryStorage {
+    fn new() -> Self {
+        Self {
+            data: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl Storage for BridgeInMemoryStorage {
+    fn store(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        let key = key.to_owned();
+        let data = data.to_vec();
+        async move {
+            self.data.lock().await.insert(key, data);
+            Ok(())
+        }
+    }
+
+    fn retrieve(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
+        let key = key.to_owned();
+        async move { Ok(self.data.lock().await.get(&key).cloned()) }
+    }
+
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        let key = key.to_owned();
+        async move {
+            self.data.lock().await.remove(&key);
+            Ok(())
+        }
+    }
+
+    fn list_keys(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
+        let prefix = prefix.to_owned();
+        async move {
+            let store = self.data.lock().await;
+            let mut keys: Vec<String> = store
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            drop(store);
+            keys.sort();
+            Ok(keys)
+        }
+    }
+
+    fn delete_prefix(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
+        let prefix = prefix.to_owned();
+        async move {
+            let mut store = self.data.lock().await;
+            let keys_to_delete: Vec<String> = store
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            let count = keys_to_delete.len() as u64;
+            for key in keys_to_delete {
+                store.remove(&key);
+            }
+            drop(store);
+            Ok(count)
+        }
+    }
+
+    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
+        let key = key.to_owned();
+        async move { Ok(self.data.lock().await.contains_key(&key)) }
+    }
 }
 
 /// Global stub crypto provider shared with the `CloseOrchestrator`.

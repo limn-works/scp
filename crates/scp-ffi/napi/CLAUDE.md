@@ -15,7 +15,8 @@ delegate to a shared `Arc<ContextManager>` initialized once via `OnceLock` in `r
 The `ContextManager` is constructed with bridge-local provider implementations:
 - `NapiBridgeCryptoProvider` — no-op MLS/sender-key operations
 - `NapiBridgeTransportProvider` — reports connected, no-op send
-- `NapiBridgeEventLogProvider` — no-op event log
+- `MerkleEventLogProvider` — persistent Merkle-chained event log backed by
+  `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484)
 - `NapiBridgePersistence` — in-memory `DashMap`-backed persistence
 
 ### UCAN State Registry
@@ -88,7 +89,9 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
   NOT in the `ContextManager`. The `ensure_registered` / `with_context` pattern accesses this state.
 - `context_close` does NOT perform bridge-layer authorization — it delegates to `ContextManager::close_context` which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
 - `context_create` maps all user-specified fields from params JSON to `ContextParams` (mode, ceiling, ceiling_policy, promotion_policy, memory_scope, governance, ttl). Previously only mode and ttl were passed.
-- The bridge event log provider is no-op. Real Merkle proofs use the UCAN registry's `EventLog`.
+- The bridge event log provider uses `MerkleEventLogProvider::with_persistence` backed by
+  `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The UCAN
+  registry's `EventLog` is used separately for per-context Merkle proofs.
 - `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` currently returns a stub
   error. When revocation is wired to the runtime, the bridge will parse the full JWT `token`
   parameter to compute the revocation CID.
