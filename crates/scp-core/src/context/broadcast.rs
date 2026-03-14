@@ -705,7 +705,7 @@ impl BroadcastContext {
             BroadcastAdmission::Gated => {
                 let token = ucan.ok_or_else(|| {
                     ContextError::PermissionDenied(
-                        "gated broadcast requires messagesRead UCAN".to_owned(),
+                        "gated broadcast requires messages:read UCAN".to_owned(),
                     )
                 })?;
                 let ctx = validation_ctx.ok_or_else(|| {
@@ -4322,9 +4322,9 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("gated broadcast requires messagesRead UCAN")
-                || err_msg.contains("messagesRead UCAN required"),
-            "must specify messagesRead UCAN required, got: {err_msg}"
+            err_msg.contains("gated broadcast requires messages:read UCAN")
+                || err_msg.contains("messages:read UCAN required"),
+            "must specify messages:read UCAN required, got: {err_msg}"
         );
         assert!(!ctx.is_subscriber(sub_did));
     }
