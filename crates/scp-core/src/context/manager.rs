@@ -33,7 +33,9 @@ use super::governance::{
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
     SingleAdminEngine,
     majority::MajorityVoteEngine,
-    mls_integration::{MlsImpact, classify_action},
+    mls_integration::{
+        CoordinationRecord, EpochCoordinator, MlsImpact, classify_action, generate_mls_operations,
+    },
     multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
@@ -354,6 +356,10 @@ pub struct ContextSnapshot {
     /// `RevokeReadAccess`, `ResetMember`).
     #[serde(default)]
     pub mls_epoch: u64,
+    /// Epoch coordination records linking governance proposals to MLS epoch
+    /// transitions (ADR-031 §8, issue #630). Persisted for auditability.
+    #[serde(default)]
+    pub epoch_coordination_records: Vec<CoordinationRecord>,
     /// Persisted epoch grace window entries (§23.11).
     ///
     /// Captured from [`EpochGraceStore::to_grace_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::to_grace_entries)
@@ -549,6 +555,12 @@ struct PerContextState {
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.
     mls_epoch: u64,
+    /// MLS-governance epoch coordinator (ADR-031 §8, issue #630).
+    ///
+    /// Records the auditable link between governance proposal approvals and
+    /// resulting MLS epoch advances. Instantiated per context and updated
+    /// after each membership-affecting governance action execution.
+    epoch_coordinator: EpochCoordinator,
     /// Epoch grace window store (§23.11).
     ///
     /// Tracks which old epochs are still within their grace window after
@@ -1437,6 +1449,7 @@ impl ContextManager {
             governance_freeze: ctx.governance_freeze,
             pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
             mls_epoch: ctx.mls_epoch,
+            epoch_coordination_records: ctx.epoch_coordinator.records().to_vec(),
             grace_entries,
             needs_reconnect: ctx.needs_reconnect,
             // MLS crypto state is populated in `persist_context_snapshot`
@@ -1582,6 +1595,10 @@ impl ContextManager {
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             mls_epoch: ctx_snapshot.mls_epoch,
+            epoch_coordinator: EpochCoordinator::from_records(
+                ctx_snapshot.epoch_coordination_records,
+                context_id,
+            ),
             grace_store,
             needs_reconnect,
         };
@@ -2002,6 +2019,10 @@ impl ContextManager {
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
             mls_epoch: export.snapshot.mls_epoch,
+            epoch_coordinator: EpochCoordinator::from_records(
+                export.snapshot.epoch_coordination_records,
+                &context_id,
+            ),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
         };
@@ -2141,6 +2162,7 @@ impl ContextManager {
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordinator: EpochCoordinator::new(),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
         };
@@ -2397,6 +2419,7 @@ impl ContextManager {
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordinator: EpochCoordinator::new(),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
         })
@@ -3368,11 +3391,38 @@ impl ContextManager {
             }
         };
 
+        // Post-dispatch: MLS coordination, event emission, checkpoint
+        // triggering, and cleanup are in a helper to stay within line limits.
+        self.finalize_governance_action(context_id, proposal)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Post-dispatch finalization for an executed governance action.
+    ///
+    /// Handles MLS epoch coordination (ADR-031 §8), event emission
+    /// (PRD SCP-269/SCP-270), checkpoint cosignature triggering (ADR-031 §9),
+    /// and cleanup of approved proposals (ADR-031 §7).
+    ///
+    /// Extracted from [`execute_governance_action`] to keep that method
+    /// focused on validation and dispatch.
+    async fn finalize_governance_action(
+        &self,
+        context_id: &str,
+        proposal: &GovernanceProposal,
+    ) -> Result<(), ContextError> {
         // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
         // ResetMember), increment the epoch counter, place the old epoch into
-        // the grace store (§23.11), and report the new epoch. Non-MLS actions
-        // leave the epoch unchanged and report None.
+        // the grace store (§23.11), record the coordination in the
+        // EpochCoordinator (ADR-031 §8, issue #630), and report the new epoch.
+        // Non-MLS actions leave the epoch unchanged and report None.
         let resulting_epoch = if classify_action(&proposal.action) == MlsImpact::MembershipChange {
+            // Generate the MLS operation from the approved proposal to link
+            // governance approval to the concrete MLS mutation (issue #630).
+            let mls_op = generate_mls_operations(proposal)
+                .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 let old_epoch = ctx.mls_epoch;
@@ -3381,6 +3431,27 @@ impl ContextManager {
                 // messages encrypted under it can still be decrypted for
                 // up to 30 seconds (ADR-001 criterion 6, §23.11).
                 let _expired = ctx.grace_store.add_epoch(old_epoch);
+
+                // Record the governance-MLS coordination for audit trail
+                // (ADR-031 §8, issue #630). The EpochCoordinator creates an
+                // auditable link between the governance proposal and the MLS
+                // epoch transition.
+                if let Some(operation) = mls_op {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Best-effort: log but do not fail if recording fails
+                    // (epoch_after > epoch_before is guaranteed by saturating_add).
+                    let _ = ctx.epoch_coordinator.record_coordination(
+                        proposal.proposal_id,
+                        old_epoch,
+                        ctx.mls_epoch,
+                        operation,
+                        timestamp,
+                    );
+                }
+
                 Some(ctx.mls_epoch)
             } else {
                 None
@@ -3423,6 +3494,26 @@ impl ContextManager {
             }
         }
 
+        // Trigger checkpoint cosignature collection for multi-admin contexts
+        // (ADR-031 §9, issue #630). SingleAdmin contexts emit no event because
+        // they require no cosignatures (quorum is 0).
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                let (required_signers, minimum_count) =
+                    ctx.governance_engine.checkpoint_cosignature_requirements();
+                if minimum_count > 0 {
+                    ctx.receive_buffer
+                        .push(ContextEvent::CheckpointCosignatureRequired {
+                            proposal_id: proposal.proposal_id,
+                            required_signers,
+                            minimum_count,
+                            at_epoch: ctx.mls_epoch,
+                        });
+                }
+            }
+        }
+
         // Remove the executed proposal from approved_proposals so it no
         // longer participates in conflict detection (ADR-031 §7).  Replay
         // prevention is already handled by `executed_proposals`.
@@ -3439,7 +3530,7 @@ impl ContextManager {
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 
     /// Dispatches an approved governance action to its implementation method.
@@ -5565,6 +5656,59 @@ impl ContextManager {
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Gate: context must be in governance freeze state to resolve
+            // a conflict (ADR-031 §7). The freeze was triggered by
+            // detect_and_handle_conflicts when simultaneous proposals landed.
+            // Validate that the proposals being resolved match the ones that
+            // caused the freeze — otherwise an admin could clear a freeze by
+            // referencing arbitrary proposal IDs.
+            let (freeze_a, freeze_b, _) = ctx.governance_freeze.ok_or_else(|| {
+                ContextError::PermissionDenied(
+                    "context is not in governance freeze state — no conflict to resolve".into(),
+                )
+            })?;
+            let proposals_match = (*proposal_a == freeze_a && *proposal_b == freeze_b)
+                || (*proposal_a == freeze_b && *proposal_b == freeze_a);
+            if !proposals_match {
+                return Err(ContextError::PermissionDenied(
+                    "ResolveConflict proposals do not match the governance freeze".into(),
+                ));
+            }
+
+            // Validate that the two proposals actually conflict using the
+            // sync::conflict_resolution module (issue #630). Look up the
+            // proposals from the approved set or executed set to obtain
+            // their actions for conflict verification.
+            let action_a = ctx
+                .approved_proposals
+                .get(proposal_a)
+                .map(|(p, _, _)| &p.action);
+            let action_b = ctx
+                .approved_proposals
+                .get(proposal_b)
+                .map(|(p, _, _)| &p.action);
+
+            let (Some(act_a), Some(act_b)) = (action_a, action_b) else {
+                return Err(ContextError::PermissionDenied(
+                    "one or both conflict proposals are not in the approved set — \
+                     cannot verify conflict"
+                        .into(),
+                ));
+            };
+
+            // Retrieve proposer DIDs for conflict validation.
+            let proposer_a = &ctx.approved_proposals[proposal_a].0.proposer_did;
+            let proposer_b = &ctx.approved_proposals[proposal_b].0.proposer_did;
+            if !crate::sync::conflict_resolution::actions_conflict(
+                act_a, proposer_a, act_b, proposer_b,
+            ) {
+                return Err(ContextError::PermissionDenied(
+                    "the specified proposals do not conflict per \
+                     sync::conflict_resolution::actions_conflict"
+                        .into(),
+                ));
+            }
 
             // Mark the conflicting proposal(s) as executed (invalidated) so
             // they cannot be replayed. For AcceptProposal the loser is
@@ -11326,6 +11470,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
@@ -11428,6 +11573,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
@@ -11518,6 +11664,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
@@ -11587,6 +11734,7 @@ mod tests {
                 governance_freeze: None,
                 pending_ceiling_modification: None,
                 mls_epoch: 0,
+                epoch_coordination_records: Vec::new(),
                 grace_entries: Vec::new(),
                 needs_reconnect: false,
                 mls_crypto_state: Vec::new(),
@@ -11655,6 +11803,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
@@ -11742,6 +11891,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 3,
+            epoch_coordination_records: Vec::new(),
             grace_entries: vec![GraceEntry {
                 epoch: 5,                       // epoch 5 > mls_epoch 3 → inconsistency
                 expires_at_unix_secs: u64::MAX, // far-future expiry
@@ -11839,6 +11989,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 3,
+            epoch_coordination_records: Vec::new(),
             grace_entries: vec![GraceEntry {
                 epoch: 2, // epoch 2 <= mls_epoch 3 → consistent
                 expires_at_unix_secs: future_expiry,
@@ -11928,6 +12079,7 @@ mod tests {
             grace_entries: grace,
             needs_reconnect: false,
             budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            epoch_coordination_records: Vec::new(),
             mls_crypto_state: Vec::new(),
         }
     }
@@ -13152,6 +13304,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
@@ -17067,5 +17220,381 @@ mod tests {
             restored.budget_tracker.remaining(&spender),
             crate::economy::types::Amount::new(2500)
         );
+    }
+
+    // ===================================================================
+    // MLS governance integration (issue #630)
+    // ===================================================================
+
+    /// Helper: creates an approved governance proposal for a given action
+    /// using `SingleAdminEngine` with a mock key resolver that uses
+    /// deterministic keys from `signing_key_for_did`. Returns the approved
+    /// proposal ready for `execute_governance_action()`.
+    fn make_approved_proposal(
+        admin_did: &DID,
+        context_id: &str,
+        action: super::GovernanceAction,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{GovernanceContext, GovernanceEngine, SingleAdminEngine};
+
+        let signing_key = signing_key_for_did(admin_did);
+        let resolver = mock_key_resolver();
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
+        let gov_ctx = GovernanceContext {
+            context_id: context_id.to_owned(),
+            members: vec![(admin_did.clone(), "admin".to_owned())],
+            admin_dids: vec![admin_did.clone()],
+            current_epoch: Some(0),
+            now: 1000,
+        };
+
+        let (proposal, _events) = engine
+            .propose(admin_did, action, &gov_ctx, &signing_key)
+            .unwrap();
+        assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+        proposal
+    }
+
+    /// Issue #630 AC1: `dispatch_governance_action` calls `classify_action()`
+    /// after membership-affecting actions. Verifying that `AddMember`
+    /// increments `mls_epoch` (which requires `classify_action` returning
+    /// `MembershipChange`).
+    #[tokio::test]
+    async fn mls_integration_add_member_increments_epoch() {
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        let action = super::GovernanceAction::AddMember {
+            did: "did:key:new-member".into(),
+            role: "member".to_owned(),
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(result.is_ok(), "AddMember should succeed");
+
+        // Verify epoch was incremented (from 0 to 1).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        assert_eq!(ctx.mls_epoch, 1, "MLS epoch should advance after AddMember");
+    }
+
+    /// Issue #630 AC2: MLS commits generated and applied for `AddMember`.
+    /// Verified by checking that `generate_mls_operations` is invoked
+    /// (the `EpochCoordinator` records the generated MLS operation) and
+    /// the new member appears in the membership state.
+    #[tokio::test]
+    async fn mls_integration_add_member_generates_mls_operation() {
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        let action = super::GovernanceAction::AddMember {
+            did: "did:key:new-member".into(),
+            role: "member".to_owned(),
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await
+            .unwrap();
+
+        // Verify: the EpochCoordinator recorded an AddMember MLS operation,
+        // proving that generate_mls_operations was called.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        let records = ctx.epoch_coordinator.records();
+        assert_eq!(records.len(), 1);
+        if let crate::context::governance::mls_integration::MlsOperation::AddMember {
+            ref did,
+            ref role,
+        } = records[0].operation
+        {
+            assert_eq!(did.as_ref(), "did:key:new-member");
+            assert_eq!(role, "member");
+        } else {
+            panic!("expected AddMember MLS operation");
+        }
+
+        // Verify: the member is in the membership state.
+        let target_did: DID = "did:key:new-member".into();
+        assert!(ctx.membership.contains(&target_did));
+    }
+
+    /// Issue #630 AC3: `EpochCoordinator` instantiated per context and
+    /// records coordination after membership-affecting governance actions.
+    #[tokio::test]
+    async fn mls_integration_epoch_coordinator_records_coordination() {
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        // Execute AddMember — should record coordination.
+        let action = super::GovernanceAction::AddMember {
+            did: "did:key:member-a".into(),
+            role: "member".to_owned(),
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await
+            .unwrap();
+
+        // Execute RemoveMember — should record second coordination.
+        let action2 = super::GovernanceAction::RemoveMember {
+            did: "did:key:member-a".into(),
+            reason: Some("done".to_owned()),
+        };
+        let proposal2 = make_approved_proposal(&admin_did, "test-ctx", action2);
+        manager
+            .execute_governance_action("test-ctx", &proposal2)
+            .await
+            .unwrap();
+
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        assert_eq!(
+            ctx.epoch_coordinator.record_count(),
+            2,
+            "should have 2 coordination records after 2 MLS-affecting actions"
+        );
+
+        // Verify first record: epoch 0 → 1 for AddMember.
+        let records = ctx.epoch_coordinator.records();
+        assert_eq!(records[0].epoch_before, 0);
+        assert_eq!(records[0].epoch_after, 1);
+        assert!(matches!(
+            records[0].operation,
+            crate::context::governance::mls_integration::MlsOperation::AddMember { .. }
+        ));
+
+        // Verify second record: epoch 1 → 2 for RemoveMember.
+        assert_eq!(records[1].epoch_before, 1);
+        assert_eq!(records[1].epoch_after, 2);
+        assert!(matches!(
+            records[1].operation,
+            crate::context::governance::mls_integration::MlsOperation::RemoveMember { .. }
+        ));
+    }
+
+    /// Issue #630 AC3: Non-membership actions do NOT create coordination
+    /// records in the `EpochCoordinator`.
+    #[tokio::test]
+    async fn mls_integration_non_membership_action_no_coordination() {
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        // ChangeRole is a non-membership action — should not coordinate.
+        // First add the member so we have someone to change role for.
+        let add_action = super::GovernanceAction::AddMember {
+            did: "did:key:target".into(),
+            role: "member".to_owned(),
+        };
+        let add_proposal = make_approved_proposal(&admin_did, "test-ctx", add_action);
+        manager
+            .execute_governance_action("test-ctx", &add_proposal)
+            .await
+            .unwrap();
+
+        let action = super::GovernanceAction::ChangeRole {
+            did: "did:key:target".into(),
+            new_role: "observer".to_owned(),
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await
+            .unwrap();
+
+        // Should have exactly 1 coordination record (from AddMember only).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        assert_eq!(
+            ctx.epoch_coordinator.record_count(),
+            1,
+            "ChangeRole should not create a coordination record"
+        );
+        // Epoch should still be 1 (AddMember advanced 0→1, ChangeRole doesn't).
+        assert_eq!(ctx.mls_epoch, 1);
+    }
+
+    /// Issue #630 AC3: `EpochCoordinator` records survive snapshot roundtrip.
+    #[tokio::test]
+    async fn mls_integration_epoch_coordinator_snapshot_roundtrip() {
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        let action = super::GovernanceAction::AddMember {
+            did: "did:key:snap-member".into(),
+            role: "member".to_owned(),
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await
+            .unwrap();
+
+        // Take snapshot and verify records are captured.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        let snapshot = ContextManager::snapshot_context(ctx);
+        assert_eq!(
+            snapshot.epoch_coordination_records.len(),
+            1,
+            "snapshot should capture coordination records"
+        );
+
+        // Serde roundtrip.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: ContextSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.epoch_coordination_records.len(),
+            1,
+            "records should survive serde roundtrip"
+        );
+        assert_eq!(restored.epoch_coordination_records[0].epoch_before, 0);
+        assert_eq!(restored.epoch_coordination_records[0].epoch_after, 1);
+    }
+
+    /// Issue #630 AC4: Checkpoint cosignature collection is NOT triggered
+    /// for `SingleAdmin` contexts (quorum is 0).
+    #[tokio::test]
+    async fn mls_integration_no_checkpoint_event_for_single_admin() {
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        let action = super::GovernanceAction::AddMember {
+            did: "did:key:member-cp".into(),
+            role: "member".to_owned(),
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await
+            .unwrap();
+
+        // Drain the receive buffer and check that no
+        // CheckpointCosignatureRequired event was emitted.
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let events = ctx.receive_buffer.drain();
+        let has_checkpoint_event = events
+            .iter()
+            .any(|e| matches!(e, ContextEvent::CheckpointCosignatureRequired { .. }));
+        assert!(
+            !has_checkpoint_event,
+            "SingleAdmin contexts should not emit CheckpointCosignatureRequired"
+        );
+    }
+
+    /// Issue #630 AC5: `ResolveConflict` requires governance freeze state.
+    #[tokio::test]
+    async fn mls_integration_resolve_conflict_requires_freeze() {
+        use crate::context::governance::ConflictResolution;
+
+        let admin_did: DID = "did:key:creator".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        // Try to resolve a conflict without a freeze state.
+        let action = super::GovernanceAction::ResolveConflict {
+            proposal_a: [1u8; 32],
+            proposal_b: [2u8; 32],
+            resolution: ConflictResolution::InvalidateBoth,
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+
+        assert!(result.is_err(), "should fail without governance freeze");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("freeze")),
+            "error should mention freeze state: {err:?}"
+        );
+    }
+
+    /// Issue #630 AC5: `ResolveConflict` with governance freeze lifts freeze.
+    #[tokio::test]
+    async fn mls_integration_resolve_conflict_lifts_freeze() {
+        use crate::context::governance::ConflictResolution;
+
+        let admin_did: DID = "did:key:creator".into();
+        let other_did: DID = "did:key:other-admin".into();
+        let (manager, _handle) = setup_active_context().await;
+
+        // Build two conflicting proposals (mutual RemoveMember — each
+        // proposer removes the other, which is a canonical conflict per
+        // ADR-031 §7).
+        let proposal_a_id = [10u8; 32];
+        let proposal_b_id = [20u8; 32];
+
+        let conflict_proposal_a = super::GovernanceProposal {
+            proposal_id: proposal_a_id,
+            context_id: "test-ctx".to_owned(),
+            proposer_did: admin_did.clone(),
+            action: super::GovernanceAction::RemoveMember {
+                did: other_did.clone(),
+                reason: None,
+            },
+            status: super::ProposalStatus::Approved,
+            created_at: 900,
+            voting_deadline: 2000,
+            approvals: vec![],
+            rejections: vec![],
+            created_at_epoch: Some(0),
+        };
+        let conflict_proposal_b = super::GovernanceProposal {
+            proposal_id: proposal_b_id,
+            context_id: "test-ctx".to_owned(),
+            proposer_did: other_did.clone(),
+            action: super::GovernanceAction::RemoveMember {
+                did: admin_did.clone(),
+                reason: None,
+            },
+            status: super::ProposalStatus::Approved,
+            created_at: 900,
+            voting_deadline: 2000,
+            approvals: vec![],
+            rejections: vec![],
+            created_at_epoch: Some(0),
+        };
+
+        // Manually set governance freeze and insert the conflicting
+        // proposals into approved_proposals.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            ctx.governance_freeze = Some((proposal_a_id, proposal_b_id, 1000));
+            ctx.approved_proposals
+                .insert(proposal_a_id, (conflict_proposal_a, 900, 2000));
+            ctx.approved_proposals
+                .insert(proposal_b_id, (conflict_proposal_b, 900, 2000));
+        }
+
+        let action = super::GovernanceAction::ResolveConflict {
+            proposal_a: proposal_a_id,
+            proposal_b: proposal_b_id,
+            resolution: ConflictResolution::InvalidateBoth,
+        };
+        let proposal = make_approved_proposal(&admin_did, "test-ctx", action);
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(
+            result.is_ok(),
+            "resolve conflict with freeze should succeed: {result:?}"
+        );
+
+        // Verify freeze is cleared.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        assert!(
+            ctx.governance_freeze.is_none(),
+            "governance freeze should be cleared after conflict resolution"
+        );
+
+        // Both proposals should be in executed_proposals (invalidated).
+        assert!(ctx.executed_proposals.contains(&proposal_a_id));
+        assert!(ctx.executed_proposals.contains(&proposal_b_id));
     }
 }
