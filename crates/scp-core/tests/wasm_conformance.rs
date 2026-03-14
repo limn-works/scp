@@ -1806,6 +1806,13 @@ mod wasm_ucan_mirror {
     /// the conformance mirror) and are rejected fail-closed.
     ///
     /// Must match `scp-core::crypto::ucan::validate::DidResolver::resolve_public_key_by_kid`.
+    ///
+    /// **Behavioral divergence from WASM FFI:** The WASM FFI's version
+    /// (ucan.rs:278-292) checks the identity registry first, supporting both
+    /// `#active` and `#agent` kid values. This conformance mirror skips the
+    /// registry entirely and only supports `#active` — an intentional
+    /// simplification for testing, not a bug. Tests that need `#agent`
+    /// resolution must use the full WASM FFI path.
     fn resolve_public_key_by_kid(did: &str, kid: &str) -> Result<[u8; 32], String> {
         if kid == "#active" {
             resolve_public_key(did)
@@ -5819,5 +5826,42 @@ fn wasm_chain_rejects_intermediary_key_scope_kid_mismatch() {
     assert!(
         err.contains("key scope mismatch"),
         "error must mention key scope mismatch, got: {err}"
+    );
+}
+
+/// Test: `verify_signature` rejects tokens with `kid="#agent"` because the
+/// conformance mirror only supports `#active`. This exercises the non-`#active`
+/// kid dispatch branch in `resolve_public_key_by_kid`, confirming fail-closed
+/// behavior for kid values that require an identity registry.
+#[test]
+fn wasm_verify_signature_rejects_agent_kid() {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let issuer_did = wasm_ucan_mirror::did_from_key(&signing_key);
+
+    let payload = wasm_ucan_mirror::UcanPayload {
+        iss: issuer_did,
+        aud: "did:dht:z6MkReceiver".to_owned(),
+        exp: 9_999_999_999,
+        nbf: None,
+        nnc: "nonce-agent-kid-test".to_owned(),
+        att: vec![],
+        prf: vec![],
+        fct: None,
+    };
+
+    // Sign with kid="#agent" — the conformance mirror cannot resolve this.
+    let jwt = make_signed_ucan_with_kid(&payload, &signing_key, Some("#agent".to_owned()));
+    let token = wasm_ucan_mirror::parse_ucan(&jwt).unwrap();
+
+    let result = wasm_ucan_mirror::verify_signature(&token);
+    assert!(
+        result.is_err(),
+        "verify_signature must reject #agent kid in conformance mirror: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("conformance mirror only supports #active")
+            || err.contains("verification method"),
+        "error must mention conformance mirror limitation, got: {err}"
     );
 }
