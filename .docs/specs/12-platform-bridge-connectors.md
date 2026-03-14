@@ -64,7 +64,7 @@ RegisterBridge {
 
 1. The bridge operator submits a `RegisterBridge` proposal to the context via the standard governance mechanism (§5.9). The operator MUST be a context member or hold a valid UCAN granting `bridging` capability in the context.
 2. The context's governance model processes the proposal (SingleAdmin: admin approves; Threshold/MajorityVote/Unanimity: members vote).
-3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id` (SHA-256 of `context_id || operator_did || platform || timestamp`).
+3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id` (lowercase hex-encoded SHA-256 of `context_id || operator_did || platform || timestamp`). The result is a 64-character hex string carried as `String` on the wire (see §12.12).
 4. The context metadata is republished with the new bridge in the `bridges` structural field (§5.7).
 5. For cooperative mode: the bridge node stores the `platform_key` for webhook signature verification (§12.10.2).
 
@@ -749,10 +749,12 @@ Bridge credentials pass through five phases:
    ```
    ikm  = bridge_credential_key                       // 32 bytes, per-bridge random secret
    salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")          // fixed salt, 32 bytes
-   info = "scp-bridge-credential:" || bridge_id        // bridge_id as hex-encoded bytes
+   info = "scp-bridge-credential:" || bridge_id        // bridge_id as UTF-8 string bytes
    prk  = HKDF-Extract(salt, ikm)                      // 32 bytes
    okm  = HKDF-Expand(prk, info, 32)                   // 32 bytes — AES-256-GCM key
    ```
+
+   **Encoding note:** `bridge_id` is a `String` (§12.12) — specifically, the lowercase hex-encoded SHA-256 hash assigned at registration (§12.2.1). In the `info` parameter, `bridge_id` is concatenated as its UTF-8 string bytes (i.e., the hex characters themselves, not the raw hash bytes). For example, if `bridge_id` is `"a1b2c3..."`, the info bytes are `b"scp-bridge-credential:a1b2c3..."`. Implementations MUST NOT decode the hex string back to raw bytes before concatenation.
 
    Encryption algorithm: AES-256-GCM. Nonce: 12 bytes, randomly generated per encryption operation via CSPRNG. The nonce is prepended to the ciphertext. Authentication tag: 16 bytes, appended to the ciphertext. Stored format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 
@@ -870,7 +872,7 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `bridge_id` | `String` | Yes | Unique bridge identifier. |
+| `bridge_id` | `String` | Yes | Unique bridge identifier — lowercase hex-encoded SHA-256 hash (64 characters, see §12.2.1). |
 | `operator_did` | `String` (DID) | Yes | DID of the human operator. |
 | `platform` | `String` | Yes | Target platform name (e.g., `"slack"`, `"discord"`). |
 | `mode` | `BridgeMode` | Yes | Operating mode. |
