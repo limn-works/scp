@@ -34,6 +34,19 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
 
+// Exclude RealFFITest from compilation when UniFFI bindings are not generated.
+// The test references `uniffi.scp.*` classes that only exist after running
+// `./scripts/generate-uniffi-kotlin.sh`. CI generates bindings before tests;
+// local dev can skip these tests safely.
+val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
+val hasUniffiBindings = uniffiBindingsDir.exists() && uniffiBindingsDir.listFiles()?.any { it.extension == "kt" } == true
+
+if (!hasUniffiBindings) {
+    sourceSets.test {
+        kotlin.exclude("**/RealFFITest.kt")
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
 }
