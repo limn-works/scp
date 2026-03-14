@@ -1595,19 +1595,10 @@ impl ContextManager {
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             mls_epoch: ctx_snapshot.mls_epoch,
-            epoch_coordinator: {
-                let mut ec = EpochCoordinator::new();
-                for record in ctx_snapshot.epoch_coordination_records {
-                    let _ = ec.record_coordination(
-                        record.proposal_id,
-                        record.epoch_before,
-                        record.epoch_after,
-                        record.operation,
-                        record.coordinated_at,
-                    );
-                }
-                ec
-            },
+            epoch_coordinator: EpochCoordinator::from_records(
+                ctx_snapshot.epoch_coordination_records,
+                context_id,
+            ),
             grace_store,
             needs_reconnect,
         };
@@ -2028,19 +2019,10 @@ impl ContextManager {
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
             mls_epoch: export.snapshot.mls_epoch,
-            epoch_coordinator: {
-                let mut ec = EpochCoordinator::new();
-                for record in export.snapshot.epoch_coordination_records {
-                    let _ = ec.record_coordination(
-                        record.proposal_id,
-                        record.epoch_before,
-                        record.epoch_after,
-                        record.operation,
-                        record.coordinated_at,
-                    );
-                }
-                ec
-            },
+            epoch_coordinator: EpochCoordinator::from_records(
+                export.snapshot.epoch_coordination_records,
+                &context_id,
+            ),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
         };
@@ -3411,7 +3393,7 @@ impl ContextManager {
 
         // Post-dispatch: MLS coordination, event emission, checkpoint
         // triggering, and cleanup are in a helper to stay within line limits.
-        self.finalize_governance_action(context_id, proposal, &result)
+        self.finalize_governance_action(context_id, proposal)
             .await?;
 
         Ok(result)
@@ -3429,7 +3411,6 @@ impl ContextManager {
         &self,
         context_id: &str,
         proposal: &GovernanceProposal,
-        _result: &GovernanceActionResult,
     ) -> Result<(), ContextError> {
         // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
         // ResetMember), increment the epoch counter, place the old epoch into
@@ -5679,9 +5660,19 @@ impl ContextManager {
             // Gate: context must be in governance freeze state to resolve
             // a conflict (ADR-031 §7). The freeze was triggered by
             // detect_and_handle_conflicts when simultaneous proposals landed.
-            if ctx.governance_freeze.is_none() {
-                return Err(ContextError::PermissionDenied(
+            // Validate that the proposals being resolved match the ones that
+            // caused the freeze — otherwise an admin could clear a freeze by
+            // referencing arbitrary proposal IDs.
+            let (freeze_a, freeze_b, _) = ctx.governance_freeze.ok_or_else(|| {
+                ContextError::PermissionDenied(
                     "context is not in governance freeze state — no conflict to resolve".into(),
+                )
+            })?;
+            let proposals_match = (*proposal_a == freeze_a && *proposal_b == freeze_b)
+                || (*proposal_a == freeze_b && *proposal_b == freeze_a);
+            if !proposals_match {
+                return Err(ContextError::PermissionDenied(
+                    "ResolveConflict proposals do not match the governance freeze".into(),
                 ));
             }
 
@@ -5698,23 +5689,26 @@ impl ContextManager {
                 .get(proposal_b)
                 .map(|(p, _, _)| &p.action);
 
-            if let (Some(act_a), Some(act_b)) = (action_a, action_b) {
-                // Retrieve proposer DIDs for conflict validation.
-                let proposer_a = &ctx.approved_proposals[proposal_a].0.proposer_did;
-                let proposer_b = &ctx.approved_proposals[proposal_b].0.proposer_did;
-                if !crate::sync::conflict_resolution::actions_conflict(
-                    act_a, proposer_a, act_b, proposer_b,
-                ) {
-                    return Err(ContextError::PermissionDenied(
-                        "the specified proposals do not conflict per \
-                         sync::conflict_resolution::actions_conflict"
-                            .into(),
-                    ));
-                }
+            let (Some(act_a), Some(act_b)) = (action_a, action_b) else {
+                return Err(ContextError::PermissionDenied(
+                    "one or both conflict proposals are not in the approved set — \
+                     cannot verify conflict"
+                        .into(),
+                ));
+            };
+
+            // Retrieve proposer DIDs for conflict validation.
+            let proposer_a = &ctx.approved_proposals[proposal_a].0.proposer_did;
+            let proposer_b = &ctx.approved_proposals[proposal_b].0.proposer_did;
+            if !crate::sync::conflict_resolution::actions_conflict(
+                act_a, proposer_a, act_b, proposer_b,
+            ) {
+                return Err(ContextError::PermissionDenied(
+                    "the specified proposals do not conflict per \
+                     sync::conflict_resolution::actions_conflict"
+                        .into(),
+                ));
             }
-            // If proposals are not in the approved set (already executed or
-            // absent), we still proceed — the governance engine already
-            // validated the ResolveConflict action.
 
             // Mark the conflicting proposal(s) as executed (invalidated) so
             // they cannot be replayed. For AcceptProposal the loser is
@@ -17525,15 +17519,56 @@ mod tests {
         use crate::context::governance::ConflictResolution;
 
         let admin_did: DID = "did:key:creator".into();
+        let other_did: DID = "did:key:other-admin".into();
         let (manager, _handle) = setup_active_context().await;
 
-        // Manually set governance freeze.
+        // Build two conflicting proposals (mutual RemoveMember — each
+        // proposer removes the other, which is a canonical conflict per
+        // ADR-031 §7).
         let proposal_a_id = [10u8; 32];
         let proposal_b_id = [20u8; 32];
+
+        let conflict_proposal_a = super::GovernanceProposal {
+            proposal_id: proposal_a_id,
+            context_id: "test-ctx".to_owned(),
+            proposer_did: admin_did.clone(),
+            action: super::GovernanceAction::RemoveMember {
+                did: other_did.clone(),
+                reason: None,
+            },
+            status: super::ProposalStatus::Approved,
+            created_at: 900,
+            voting_deadline: 2000,
+            approvals: vec![],
+            rejections: vec![],
+            created_at_epoch: Some(0),
+        };
+        let conflict_proposal_b = super::GovernanceProposal {
+            proposal_id: proposal_b_id,
+            context_id: "test-ctx".to_owned(),
+            proposer_did: other_did.clone(),
+            action: super::GovernanceAction::RemoveMember {
+                did: admin_did.clone(),
+                reason: None,
+            },
+            status: super::ProposalStatus::Approved,
+            created_at: 900,
+            voting_deadline: 2000,
+            approvals: vec![],
+            rejections: vec![],
+            created_at_epoch: Some(0),
+        };
+
+        // Manually set governance freeze and insert the conflicting
+        // proposals into approved_proposals.
         {
             let mut contexts = manager.contexts.lock().await;
             let ctx = contexts.get_mut("test-ctx").unwrap();
             ctx.governance_freeze = Some((proposal_a_id, proposal_b_id, 1000));
+            ctx.approved_proposals
+                .insert(proposal_a_id, (conflict_proposal_a, 900, 2000));
+            ctx.approved_proposals
+                .insert(proposal_b_id, (conflict_proposal_b, 900, 2000));
         }
 
         let action = super::GovernanceAction::ResolveConflict {
@@ -17547,7 +17582,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "resolve conflict with freeze should succeed"
+            "resolve conflict with freeze should succeed: {result:?}"
         );
 
         // Verify freeze is cleared.

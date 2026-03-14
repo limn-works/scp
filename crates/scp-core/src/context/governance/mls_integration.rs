@@ -303,6 +303,32 @@ impl EpochCoordinator {
     pub const fn record_count(&self) -> usize {
         self.records.len()
     }
+
+    /// Restores an `EpochCoordinator` from persisted records, logging a
+    /// warning for any record with invalid epoch ordering (data corruption
+    /// or format migration).
+    #[must_use]
+    pub fn from_records(records: Vec<CoordinationRecord>, context_id: &str) -> Self {
+        let mut ec = Self::new();
+        for record in records {
+            if let Err(e) = ec.record_coordination(
+                record.proposal_id,
+                record.epoch_before,
+                record.epoch_after,
+                record.operation.clone(),
+                record.coordinated_at,
+            ) {
+                tracing::warn!(
+                    context_id,
+                    epoch_before = record.epoch_before,
+                    epoch_after = record.epoch_after,
+                    error = %e,
+                    "skipping coordination record with invalid epoch ordering during restore"
+                );
+            }
+        }
+        ec
+    }
 }
 
 impl Default for EpochCoordinator {
