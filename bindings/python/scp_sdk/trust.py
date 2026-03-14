@@ -443,7 +443,7 @@ async def evaluate_trust(
     bridge = _bridge()
 
     # Layer 1: Validate capability tokens if provided.
-    # Each of the four CapabilityValidation fields is set independently
+    # Each of the six CapabilityValidation fields is set independently
     # based on which specific check failed (ADR-017, spec section 9.3).
     # The bridge's ucan_validate runs an 11-step pipeline that returns
     # on the first failure. We classify the error to determine which
