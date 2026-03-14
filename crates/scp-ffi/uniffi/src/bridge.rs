@@ -7976,6 +7976,144 @@ pub fn identity_execute_custody_migration(
 }
 
 // ---------------------------------------------------------------------------
+// SCPID authentication (§3.11)
+// ---------------------------------------------------------------------------
+
+/// Generates an SCPID challenge for the given audience (§3.11.8).
+///
+/// Returns the challenge as a JSON string containing `protocol`, `nonce`,
+/// `audience`, `issued_at`, and `expires_at` fields.
+///
+/// # Arguments
+///
+/// * `audience` — URI identifying the relying party.
+/// * `ttl_seconds` — Challenge validity window in seconds (1–300).
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if `audience` is empty, exceeds 2048 bytes,
+/// or `ttl_seconds` is 0 or exceeds 300.
+#[uniffi::export]
+// ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
+// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
+pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, ScpError> {
+    use scp_core::identity::scpid_challenge as core_challenge;
+    use std::time::Duration;
+
+    let challenge = core_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
+        ScpError::Validation {
+            msg: e.to_string(),
+            code: "SCP-IDENT-1038".to_owned(),
+        }
+    })?;
+
+    serde_json::to_string(&challenge).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize SCPID challenge: {e}"),
+        code: "SCP-IDENT-1037".to_owned(),
+    })
+}
+
+/// Signs an SCPID challenge with the identity's key (§3.11.3).
+///
+/// Selects the appropriate signing key (`#active` or `#agent`) from the
+/// identity handle, and produces a signed SCPID response as a JSON string.
+///
+/// # Arguments
+///
+/// * `identity` — The identity handle (from `identity_create`).
+/// * `signing_key_id` — `"#active"` or `"#agent"`.
+/// * `challenge_json` — JSON string of the challenge (from [`scpid_challenge`]).
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if `signing_key_id` is invalid or the
+/// challenge JSON is malformed.
+/// Returns `ScpError::Identity` if the identity has no agent key when
+/// `#agent` is requested, or if signing fails.
+#[uniffi::export]
+#[cfg(feature = "allow_in_memory_custody")]
+pub fn scpid_sign(
+    identity: Arc<Identity>,
+    signing_key_id: String,
+    challenge_json: String,
+) -> Result<String, ScpError> {
+    use scp_core::identity::scpid_sign as core_sign;
+
+    let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
+
+    let challenge: scp_core::identity::ScpIdChallenge = serde_json::from_str(&challenge_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid challenge JSON: {e}"),
+            code: "SCP-IDENT-1038".to_owned(),
+        })?;
+
+    let core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity has no core identity handle — was it created with identity_create?"
+                .to_owned(),
+            code: "SCP-IDENT-1010".to_owned(),
+        })?;
+
+    let key_handle = match key_id {
+        scp_identity::SigningKeyId::Active => core_id.active_signing_key,
+        scp_identity::SigningKeyId::Agent => {
+            core_id
+                .agent_signing_key
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has no agent signing key — \
+                         add one with identity_add_agent_key first",
+                        identity.did
+                    ),
+                    code: "SCP-IDENT-1034".to_owned(),
+                })?
+        }
+    };
+
+    let custody = identity
+        .in_memory_custody
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "scpid_sign requires in-memory custody (only supported with \
+                  allow_in_memory_custody feature)"
+                .to_owned(),
+            code: "SCP-IDENT-1008".to_owned(),
+        })?;
+
+    let rt = crate::runtime();
+    let response = rt.block_on(core_sign(
+        &custody.0,
+        &key_handle,
+        &identity.did,
+        key_id,
+        &challenge,
+    ));
+
+    let response = response.map_err(|e| ScpError::Identity {
+        msg: e.to_string(),
+        code: "SCP-IDENT-1037".to_owned(),
+    })?;
+
+    serde_json::to_string(&response).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize SCPID response: {e}"),
+        code: "SCP-IDENT-1037".to_owned(),
+    })
+}
+
+/// Parses an SCPID signing key ID string (`"#active"` or `"#agent"`).
+fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, ScpError> {
+    match s {
+        "#active" => Ok(scp_identity::SigningKeyId::Active),
+        "#agent" => Ok(scp_identity::SigningKeyId::Agent),
+        other => Err(ScpError::Validation {
+            msg: format!("invalid signing_key_id '{other}': expected '#active' or '#agent'"),
+            code: "SCP-IDENT-1034".to_owned(),
+        }),
+    }
+}
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -8692,5 +8830,58 @@ mod tests {
              milliseconds would be ~1.7 trillion, hardcoded 0 would fail lower bound",
             reg.registered_at
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCPID authentication (§3.11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scpid_challenge_returns_valid_json() {
+        let json = scpid_challenge("https://example.com".to_owned(), 60)
+            .expect("scpid_challenge should succeed");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
+        assert_eq!(v["protocol"], "scpid/1.0");
+        assert_eq!(v["audience"], "https://example.com");
+        assert!(v["nonce"].is_string());
+        assert!(v["issued_at"].is_u64());
+        assert!(v["expires_at"].is_u64());
+    }
+
+    #[test]
+    fn scpid_challenge_rejects_zero_ttl() {
+        let result = scpid_challenge("https://example.com".to_owned(), 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scpid_challenge_rejects_excessive_ttl() {
+        let result = scpid_challenge("https://example.com".to_owned(), 301);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scpid_challenge_rejects_empty_audience() {
+        let result = scpid_challenge(String::new(), 60);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_scpid_signing_key_id_valid() {
+        assert_eq!(
+            parse_scpid_signing_key_id("#active").unwrap(),
+            scp_identity::SigningKeyId::Active
+        );
+        assert_eq!(
+            parse_scpid_signing_key_id("#agent").unwrap(),
+            scp_identity::SigningKeyId::Agent
+        );
+    }
+
+    #[test]
+    fn parse_scpid_signing_key_id_invalid() {
+        assert!(parse_scpid_signing_key_id("active").is_err());
+        assert!(parse_scpid_signing_key_id("#owner").is_err());
+        assert!(parse_scpid_signing_key_id("").is_err());
     }
 }

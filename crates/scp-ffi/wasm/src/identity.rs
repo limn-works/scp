@@ -1605,6 +1605,63 @@ pub fn identity_execute_recovery(
 }
 
 // ---------------------------------------------------------------------------
+// SCPID signing helper (used by crate::scpid)
+// ---------------------------------------------------------------------------
+
+/// Signs arbitrary data with a registered identity's Ed25519 key.
+///
+/// Looks up the identity by DID and returns the 64-byte Ed25519 signature.
+/// `signing_key_id` must be `"#active"` or `"#agent"`.
+///
+/// This is `pub(crate)` so the `scpid` module can reuse identity key lookup
+/// without exposing the `IdentityEntry` struct or `IDENTITY_REGISTRY`.
+pub(crate) fn sign_with_identity(
+    did: &str,
+    signing_key_id: &str,
+    data: &[u8],
+) -> Result<[u8; 64], crate::error::ScpWasmError> {
+    use ed25519_dalek::Signer;
+
+    IDENTITY_REGISTRY.with(|reg| {
+        let registry = reg.borrow();
+        let entry = registry
+            .get(did)
+            .ok_or_else(|| crate::error::ScpWasmError::Identity {
+                message: format!(
+                    "identity '{did}' not found in registry — \
+                 was it created with identity_create?"
+                ),
+                code: "SCP-IDENT-1010".to_owned(),
+            })?;
+
+        let key_bytes: &[u8; 32] = match signing_key_id {
+            "#active" => &entry.signing_key_bytes,
+            "#agent" => entry.agent_signing_key_bytes.as_deref().ok_or_else(|| {
+                crate::error::ScpWasmError::Identity {
+                    message: format!(
+                        "identity '{did}' has no agent signing key — \
+                         add one with identity_add_agent_key first"
+                    ),
+                    code: "SCP-IDENT-1034".to_owned(),
+                }
+            })?,
+            _ => {
+                return Err(crate::error::ScpWasmError::Validation {
+                    message: format!(
+                        "invalid signing_key_id '{signing_key_id}': expected '#active' or '#agent'"
+                    ),
+                    code: "SCP-IDENT-1034".to_owned(),
+                });
+            }
+        };
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(key_bytes);
+        let signature = signing_key.sign(data);
+        Ok(signature.to_bytes())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Custody migration — WASM local implementation (#632)
 // ---------------------------------------------------------------------------
 

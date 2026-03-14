@@ -153,6 +153,8 @@ pub use bridge::{
     // Free functions — app sandboxing (#595)
     sandbox_check_capability,
     sandbox_validate_declaration,
+    // Free functions — SCPID authentication (#1056)
+    scpid_challenge,
     // Free functions — sync (#370)
     sync_classify_offline,
     sync_classify_offline_custom,
@@ -173,6 +175,9 @@ pub use bridge::{
     ucan_revoke,
     ucan_validate,
 };
+// Feature-gated re-exports — only available with allow_in_memory_custody.
+#[cfg(feature = "allow_in_memory_custody")]
+pub use bridge::scpid_sign;
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 
