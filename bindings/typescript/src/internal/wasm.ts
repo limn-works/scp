@@ -231,6 +231,9 @@ interface WasmModule {
   }) => Promise<{ did: string; custodyType: string }>;
   identity_attest_device: (did: string) => Promise<string>;
   identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
+  // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+  identity_execute_recovery: (did: string, tier: string, contextIds: string[]) => string;
+  identity_execute_custody_migration: (did: string, target: string, contextIds: string[]) => string;
   // Membership queries
   context_member_count: (handle: BridgeContextHandle) => number | null;
   context_is_member: (handle: BridgeContextHandle, did: string) => boolean;
@@ -1271,6 +1274,25 @@ export function createWasmBridge(): Bridge {
     async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
       const wasm = getWasm();
       return await wasm.identity_verify_device_attestation(did, tokenBase64);
+    },
+
+    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    async identityExecuteRecovery(
+      did: string,
+      tier: string,
+      contextIds: string[],
+    ): Promise<string> {
+      const wasm = getWasm();
+      return wasm.identity_execute_recovery(did, tier, contextIds);
+    },
+
+    async identityExecuteCustodyMigration(
+      did: string,
+      target: string,
+      contextIds: string[],
+    ): Promise<string> {
+      const wasm = getWasm();
+      return wasm.identity_execute_custody_migration(did, target, contextIds);
     },
 
     // App Sandboxing (#595, spec §8.4.1, §8.4.2)
