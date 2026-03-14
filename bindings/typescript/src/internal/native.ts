@@ -171,10 +171,9 @@ export function createNativeBridge(): Bridge {
     },
 
     async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      // rotateKey is an instance method on NapiIdentity, not a free function.
       const result = await (
-        handle as unknown as { rotateKey(): Promise<BridgeIdentityHandle> }
-      ).rotateKey();
+        addon.rotateKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
       return result;
     },
 
@@ -215,11 +214,9 @@ export function createNativeBridge(): Bridge {
       identityDid: string,
       payload: Uint8Array,
     ): Promise<void> {
-      // napi-rs maps Rust Vec<u8> to a JS number array, not Uint8Array.
-      // Convert the Uint8Array to Array<number> for the bridge call.
       await (
-        addon.contextSend as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
-      )(handle, identityDid, Array.from(payload));
+        addon.contextSend as (h: BridgeContextHandle, d: string, p: Uint8Array) => Promise<void>
+      )(handle, identityDid, payload);
     },
 
     contextSubscribe(
@@ -295,10 +292,13 @@ export function createNativeBridge(): Bridge {
       authorDid: string,
       payload: Uint8Array,
     ): Promise<void> {
-      // napi-rs maps Rust Vec<u8> to a JS number array, not Uint8Array.
       await (
-        addon.broadcastPublish as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
-      )(handle, authorDid, Array.from(payload));
+        addon.broadcastPublish as (
+          h: BridgeContextHandle,
+          d: string,
+          p: Uint8Array,
+        ) => Promise<void>
+      )(handle, authorDid, payload);
     },
 
     async broadcastBlockSubscriber(
@@ -529,8 +529,7 @@ export function createNativeBridge(): Bridge {
     },
 
     async contextImport(data: Uint8Array): Promise<string> {
-      // napi-rs maps Rust Vec<u8> to a JS number array, not Uint8Array.
-      return await (addon.contextImport as (d: number[]) => Promise<string>)(Array.from(data));
+      return await (addon.contextImport as (d: Uint8Array) => Promise<string>)(data);
     },
 
     // Drain events
@@ -542,22 +541,9 @@ export function createNativeBridge(): Bridge {
 
     // Tools
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
-      // Transform SDK ToolDefinition to NapiToolDefinition shape (camelCase
-      // field names matching napi-rs #[napi(object)] output).
-      const napiDef = {
-        name: definition.name,
-        description: definition.description,
-        inputSchemaJson: JSON.stringify(definition.inputSchema),
-        outputSchemaJson: JSON.stringify(definition.outputSchema),
-        operatorDid: definition.operator,
-        testVectorsJson: definition.testVectors ? JSON.stringify(definition.testVectors) : null,
-        implementationHash: definition.implementationHash
-          ? Array.from(definition.implementationHash)
-          : null,
-      };
       const toolId = await (
-        addon.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
-      )(handle, napiDef);
+        addon.toolRegister as (h: BridgeContextHandle, d: ToolDefinition) => Promise<string>
+      )(handle, definition);
       return toolId;
     },
 
@@ -995,31 +981,7 @@ export function createNativeBridge(): Bridge {
     },
 
     syncGetPolicy() {
-      // napi-rs #[napi(object)] converts Rust snake_case to JS camelCase,
-      // but the Bridge interface uses snake_case to match the WASM bridge.
-      // Map camelCase NAPI output to snake_case Bridge interface.
-      const raw = (
-        addon.syncGetPolicy as () => {
-          tier1ThresholdSecs: number;
-          tier2ThresholdSecs: number;
-          gapTimeoutSecs: number;
-          reorderBufferCapacity: number;
-          maxSequentialCommits: number;
-          commitProcessTimeoutSecs: number;
-          senderKeyTimeoutSecs: number;
-          reconnectionDedupWindowSecs: number;
-        }
-      )();
-      return {
-        tier_1_threshold_secs: raw.tier1ThresholdSecs,
-        tier_2_threshold_secs: raw.tier2ThresholdSecs,
-        gap_timeout_secs: raw.gapTimeoutSecs,
-        reorder_buffer_capacity: raw.reorderBufferCapacity,
-        max_sequential_commits: raw.maxSequentialCommits,
-        commit_process_timeout_secs: raw.commitProcessTimeoutSecs,
-        sender_key_timeout_secs: raw.senderKeyTimeoutSecs,
-        reconnection_dedup_window_secs: raw.reconnectionDedupWindowSecs,
-      };
+      return (addon.syncGetPolicy as () => ReturnType<Bridge["syncGetPolicy"]>)();
     },
 
     // Identity Advanced
@@ -1030,29 +992,27 @@ export function createNativeBridge(): Bridge {
     },
 
     async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      // addAgentKey is an instance method on NapiIdentity, not a free function.
       return await (
-        handle as unknown as { addAgentKey(): Promise<BridgeIdentityHandle> }
-      ).addAgentKey();
+        addon.identityAddAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
     },
 
     async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      // rotateAgentKey is an instance method on NapiIdentity, not a free function.
       return await (
-        handle as unknown as { rotateAgentKey(): Promise<BridgeIdentityHandle> }
-      ).rotateAgentKey();
+        addon.identityRotateAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
     },
 
     async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      // removeAgentKey is an instance method on NapiIdentity, not a free function.
       return await (
-        handle as unknown as { removeAgentKey(): Promise<BridgeIdentityHandle> }
-      ).removeAgentKey();
+        addon.identityRemoveAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      // migrate is an instance method on NapiIdentity, not a free function.
-      return await (handle as unknown as { migrate(): Promise<BridgeIdentityHandle> }).migrate();
+      return await (
+        addon.identityMigrate as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
     },
 
     async identityAttestDevice(did: string): Promise<string> {
