@@ -13,6 +13,7 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
+use scp_core::context::manager::GovernanceActionResult;
 use scp_core::context::params::ContextMode;
 use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
@@ -88,6 +89,8 @@ const fn state_str(state: &ContextState) -> &'static str {
         ContextState::Closing => "closing",
         ContextState::Closed => "closed",
         ContextState::Expired => "expired",
+        ContextState::MigratingOut => "migrating_out",
+        ContextState::Tombstoned => "tombstoned",
     }
 }
 
@@ -1216,6 +1219,26 @@ pub async fn context_execute_governance_action(
         );
     }
 
+    // Sync FFI handle state for migration transitions (§5.11A).
+    match &result {
+        GovernanceActionResult::MigrationProposed(_) => {
+            if let Ok(mut s) = handle.state.lock() {
+                *s = ContextState::MigratingOut;
+            }
+        }
+        GovernanceActionResult::MigrationCancelled => {
+            if let Ok(mut s) = handle.state.lock() {
+                *s = ContextState::Active;
+            }
+        }
+        GovernanceActionResult::ContextTombstoned => {
+            if let Ok(mut s) = handle.state.lock() {
+                *s = ContextState::Tombstoned;
+            }
+        }
+        _ => {}
+    }
+
     Ok(format!("{result:?}"))
 }
 
@@ -1591,6 +1614,66 @@ pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> na
             code: "SCP-CTX-2046".to_owned(),
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — context migration (§5.11A, #580)
+// ---------------------------------------------------------------------------
+
+/// Tombstones a migrated context after its grace period has expired (§5.11A.5).
+///
+/// Transitions the context from `MigratingOut` to `Tombstoned`.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2050` if the context is not migrating or the
+///   grace period has not expired.
+#[napi(js_name = "contextTombstoneMigrated")]
+pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    manager
+        .tombstone_migrated_context(&context_id)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("tombstone_migrated_context failed: {e}"),
+                code: "SCP-CTX-2050".to_owned(),
+            })
+        })?;
+
+    // Sync FFI handle state to Tombstoned (§5.11A.5).
+    if let Ok(mut s) = handle.state.lock() {
+        *s = ContextState::Tombstoned;
+    }
+
+    Ok(())
+}
+
+/// Returns the migration state for a context, if any (§5.11A).
+///
+/// Returns a JSON string with migration state fields, or `null` if the
+/// context is not migrating.
+#[napi(js_name = "contextMigrationState")]
+pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    let state = manager.migration_state(&context_id).await;
+    match state {
+        Some(ms) => {
+            let json = serde_json::json!({
+                "destination_context_id": ms.destination_context_id,
+                "reason": ms.reason,
+                "grace_period_end": ms.grace_period_end,
+                "auto_invite": ms.auto_invite,
+                "proposal_id": hex::encode(ms.proposal_id),
+            });
+            Ok(Some(json.to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------

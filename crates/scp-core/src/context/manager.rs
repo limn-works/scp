@@ -159,6 +159,38 @@ pub struct GovernanceReconfiguredResult {
     pub changes_applied: usize,
 }
 
+// ---------------------------------------------------------------------------
+// MigrationState (§5.11A)
+// ---------------------------------------------------------------------------
+
+/// Tracks an in-progress context migration (§5.11A).
+///
+/// Stored in `PerContextState` and persisted via `ContextSnapshot` while the
+/// source context is in `MigratingOut` state. Cleared on cancellation or
+/// tombstoning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationState {
+    /// The destination context ID.
+    pub destination_context_id: String,
+    /// Human-readable migration rationale.
+    pub reason: String,
+    /// Unix timestamp (seconds) when the grace period ends.
+    pub grace_period_end: u64,
+    /// Whether bulk auto-invites should be sent.
+    pub auto_invite: bool,
+    /// The governance proposal ID that authorized this migration.
+    pub proposal_id: ProposalId,
+}
+
+/// Result of a context migration proposal (§5.11A).
+#[derive(Debug, Clone)]
+pub struct MigrationProposedResult {
+    /// The destination context ID.
+    pub destination_context_id: String,
+    /// Unix timestamp when the grace period ends.
+    pub grace_period_end: u64,
+}
+
 /// Result of executing an approved governance action via
 /// [`ContextManager::execute_governance_action`].
 ///
@@ -234,6 +266,12 @@ pub enum GovernanceActionResult {
     /// result payload. Maps to: `SetEconomicPolicy`, `ApproveSpend`,
     /// `LockEconomicPolicy`.
     Executed,
+    /// A context migration was proposed and approved (§5.11A).
+    MigrationProposed(MigrationProposedResult),
+    /// A context migration was cancelled (§5.11A).
+    MigrationCancelled,
+    /// A context was tombstoned after migration (§5.11A.5).
+    ContextTombstoned,
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +423,11 @@ pub struct ContextSnapshot {
     /// or mock providers). See issue #645.
     #[serde(default, with = "serde_bytes")]
     pub mls_crypto_state: Vec<u8>,
+    /// Active migration state (§5.11A). `Some` when the context is in
+    /// `MigratingOut` state, `None` otherwise. Persisted so migration
+    /// can survive process restarts during the grace period.
+    #[serde(default)]
+    pub migration_state: Option<MigrationState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +619,9 @@ struct PerContextState {
     /// processing begins for this context and initiate the reconnection
     /// protocol if set.
     needs_reconnect: bool,
+    /// Active migration state (§5.11A). `Some` when the context is in
+    /// `MigratingOut` state. `None` otherwise.
+    migration_state: Option<MigrationState>,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -849,6 +895,20 @@ fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
         .ok_or(ContextError::ContextNotActive)?;
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
+    }
+    Ok(())
+}
+
+/// Requires the context to be in `MigratingOut` state (§5.11A).
+/// Used for `CancelContextMigration` which is only valid during migration.
+fn require_migrating_out(handle: &ContextHandle) -> Result<(), ContextError> {
+    let state = handle
+        .try_read_state()
+        .ok_or(ContextError::ContextNotActive)?;
+    if state != ContextState::MigratingOut {
+        return Err(ContextError::PermissionDenied(
+            "action requires MigratingOut state".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1455,6 +1515,7 @@ impl ContextManager {
             // MLS crypto state is populated in `persist_context_snapshot`
             // where the crypto provider is available. Initialized empty here.
             mls_crypto_state: Vec::new(),
+            migration_state: ctx.migration_state.clone(),
         }
     }
 
@@ -1601,6 +1662,7 @@ impl ContextManager {
             ),
             grace_store,
             needs_reconnect,
+            migration_state: ctx_snapshot.migration_state,
         };
 
         {
@@ -2025,6 +2087,7 @@ impl ContextManager {
             ),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
+            migration_state: None,
         };
 
         // 6. Register the context.
@@ -2165,6 +2228,7 @@ impl ContextManager {
             epoch_coordinator: EpochCoordinator::new(),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
+            migration_state: None,
         };
 
         {
@@ -2422,6 +2486,7 @@ impl ContextManager {
             epoch_coordinator: EpochCoordinator::new(),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
             needs_reconnect: false,
+            migration_state: None,
         })
     }
 
@@ -3628,7 +3693,9 @@ impl ContextManager {
             | GovernanceAction::RevokeWriteAccess { .. }
             | GovernanceAction::RestoreWriteAccess { .. }
             | GovernanceAction::RotateContentKeys { .. }
-            | GovernanceAction::ReconfigureGovernance { .. } => {
+            | GovernanceAction::ReconfigureGovernance { .. }
+            | GovernanceAction::ProposeContextMigration { .. }
+            | GovernanceAction::CancelContextMigration => {
                 self.dispatch_context_governance_action(context_id, &proposal.action, pid)
                     .await
             }
@@ -3696,6 +3763,29 @@ impl ContextManager {
                 self.execute_modify_pruning_policy(context_id, new_policy, pid)
                     .await?;
                 Ok(GovernanceActionResult::PruningPolicyModified)
+            }
+            GovernanceAction::ProposeContextMigration {
+                new_context_params,
+                reason,
+                grace_period_secs,
+                auto_invite,
+            } => {
+                let result = self
+                    .execute_propose_context_migration(
+                        context_id,
+                        new_context_params,
+                        reason,
+                        *grace_period_secs,
+                        *auto_invite,
+                        pid,
+                    )
+                    .await?;
+                Ok(GovernanceActionResult::MigrationProposed(result))
+            }
+            GovernanceAction::CancelContextMigration => {
+                self.execute_cancel_context_migration(context_id, pid)
+                    .await?;
+                Ok(GovernanceActionResult::MigrationCancelled)
             }
             // Content access, structural, and reconfiguration actions
             // are dispatched by the companion method.
@@ -3827,7 +3917,9 @@ impl ContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::TransferAdmin { .. }
             | GovernanceAction::CreateChildContext { .. }
-            | GovernanceAction::ModifyPruningPolicy { .. } => {
+            | GovernanceAction::ModifyPruningPolicy { .. }
+            | GovernanceAction::ProposeContextMigration { .. }
+            | GovernanceAction::CancelContextMigration => {
                 unreachable!(
                     "action variant handled by dispatch_governance_action \
                      or dispatch_context_governance_action"
@@ -3947,7 +4039,13 @@ impl ContextManager {
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
-            require_active(&ctx.handle)?;
+            // CancelContextMigration is allowed during MigratingOut (§5.11A);
+            // all other actions require Active state.
+            if matches!(action, GovernanceAction::CancelContextMigration) {
+                require_migrating_out(&ctx.handle)?;
+            } else {
+                require_active(&ctx.handle)?;
+            }
 
             // Presence-only members (read + write revoked) lose
             // GovernancePropose capability (§5.9, ADR-038).
@@ -6310,6 +6408,360 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "EconomicPolicyLocked")?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Context migration (§5.11A)
+    // -----------------------------------------------------------------------
+
+    /// Executes a `ProposeContextMigration` governance action (§5.11A).
+    ///
+    /// On approval, creates the destination context with `migration_source`
+    /// metadata (§5.11A.2), transitions the source context to `MigratingOut`,
+    /// stores migration state, and emits migration events.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    /// - [`ContextError::InvalidTransition`] if the state transition fails.
+    async fn execute_propose_context_migration(
+        &self,
+        context_id: &str,
+        new_context_params: &super::params::ContextParams,
+        reason: &str,
+        grace_period_secs: u64,
+        auto_invite: bool,
+        proposal_id: ProposalId,
+    ) -> Result<MigrationProposedResult, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Generate a deterministic destination context ID from the source
+        // context ID and proposal ID.
+        let destination_context_id = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"SCP-MIGRATION-DEST:");
+            hasher.update(context_id.as_bytes());
+            hasher.update(proposal_id);
+            hex::encode(hasher.finalize())
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let grace_period_end = now.saturating_add(grace_period_secs);
+
+        // Prepare destination params with migration_source metadata
+        // (§5.11A.2). The destination is a fully independent context with
+        // its own ID, MLS group, event log, and key material.
+        let mut dest_params = new_context_params.clone();
+        dest_params.migration_source = Some(super::params::MigrationSource {
+            source_context_id: context_id.to_owned(),
+            proposal_id,
+        });
+
+        // Validate source state, transition to MigratingOut, and set
+        // migration state — all under ONE lock acquisition to prevent a
+        // race where another task observes the source as Active between
+        // destination creation and the state transition (F4).
+        let (creator_did, snapshot, buffer_len_before_migration) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Check no migration is already in progress.
+            if ctx.migration_state.is_some() {
+                return Err(ContextError::PermissionDenied(
+                    "context migration is already in progress".to_owned(),
+                ));
+            }
+
+            // Resolve the creator DID from the source context's membership.
+            let creator = ctx
+                .membership
+                .members()
+                .find(|m| m.role_name == "admin")
+                .map(|m| m.did.clone())
+                .ok_or_else(|| {
+                    ContextError::PermissionDenied(
+                        "no admin found in source context for destination creation".to_owned(),
+                    )
+                })?;
+
+            // Transition to MigratingOut inside the lock so that
+            // migration_state and handle state are always consistent.
+            ctx.handle
+                .transition_to(&ContextState::MigratingOut)
+                .await
+                .map_err(|_| {
+                    ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
+                })?;
+
+            ctx.migration_state = Some(MigrationState {
+                destination_context_id: destination_context_id.clone(),
+                reason: reason.to_owned(),
+                grace_period_end,
+                auto_invite,
+                proposal_id,
+            });
+
+            // Record buffer length before pushing migration events so
+            // rollback can truncate back to this point without destroying
+            // events pushed by concurrent operations.
+            let buffer_len_before_migration = ctx.receive_buffer.len();
+
+            // Emit ContextMigrationProposed event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::ContextMigrationProposed {
+                    destination_context_id: destination_context_id.clone(),
+                    reason: reason.to_owned(),
+                    grace_period_secs,
+                    auto_invite,
+                    proposal_id,
+                });
+
+            // Emit ContextMigrationStarted event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::ContextMigrationStarted {
+                    destination_context_id: destination_context_id.clone(),
+                    grace_period_end,
+                });
+
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+
+            (creator, snap, buffer_len_before_migration)
+        };
+
+        // Create the destination context AFTER the source has been
+        // transitioned to MigratingOut. If creation fails, roll back.
+        if let Err(e) = self
+            .create_context(destination_context_id.clone(), dest_params, creator_did)
+            .await
+        {
+            // Roll back: revert source to Active and clear migration state.
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                let _ = ctx.handle.transition_to(&ContextState::Active).await;
+                ctx.migration_state = None;
+                // Remove only the migration events we pushed, preserving
+                // any events added by concurrent operations.
+                ctx.receive_buffer.truncate(buffer_len_before_migration);
+            }
+            return Err(ContextError::PermissionDenied(format!(
+                "failed to create destination context: {e}"
+            )));
+        }
+
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log
+            .append_context_event(&context_id_bytes, "ContextMigrationStarted")?;
+
+        Ok(MigrationProposedResult {
+            destination_context_id,
+            grace_period_end,
+        })
+    }
+
+    /// Cancels an in-progress context migration (§5.11A).
+    ///
+    /// Returns the context from `MigratingOut` to `Active` state, clears
+    /// migration state, and emits a cancellation event.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the context is not migrating.
+    /// - [`ContextError::InvalidTransition`] if the state transition fails.
+    async fn execute_cancel_context_migration(
+        &self,
+        context_id: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Transition and state mutation happen under the same lock to prevent
+        // a race where migration_state is cleared but the state transition
+        // back to Active fails (F4).
+        let (original_proposal_id, snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            // Must be in MigratingOut state.
+            let state = ctx
+                .handle
+                .try_read_state()
+                .ok_or(ContextError::ContextNotActive)?;
+            if state != ContextState::MigratingOut {
+                return Err(ContextError::PermissionDenied(
+                    "context is not in MigratingOut state — cannot cancel migration".to_owned(),
+                ));
+            }
+
+            // Transition back to Active inside the lock.
+            ctx.handle
+                .transition_to(&ContextState::Active)
+                .await
+                .map_err(|_| {
+                    ContextError::PermissionDenied(
+                        "cannot transition from MigratingOut to Active".to_owned(),
+                    )
+                })?;
+
+            let migration = ctx.migration_state.take().ok_or_else(|| {
+                ContextError::PermissionDenied(
+                    "no migration state found despite MigratingOut state".to_owned(),
+                )
+            })?;
+            let original_pid = migration.proposal_id;
+
+            ctx.receive_buffer
+                .push(ContextEvent::ContextMigrationCancelled {
+                    original_proposal_id: original_pid,
+                });
+
+            let snapshot = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (original_pid, snapshot)
+        };
+
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            &format!(
+                "ContextMigrationCancelled:{}",
+                hex::encode(original_proposal_id)
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Tombstones a context after migration grace period expiry (§5.11A.5).
+    ///
+    /// Transitions the context from `MigratingOut` to `Tombstoned`,
+    /// cancels timers, drops broadcast state, and emits the tombstone event.
+    /// This is called by the application layer when it detects the grace
+    /// period has expired.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the context is not migrating
+    ///   or the grace period has not expired.
+    pub async fn tombstone_migrated_context(&self, context_id: &str) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // State transition and mutation happen under the same lock to prevent
+        // a race where migration_state is cleared but the transition to
+        // Tombstoned fails.
+        let (destination_id, migration_pid, snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            let state = ctx
+                .handle
+                .try_read_state()
+                .ok_or(ContextError::ContextNotActive)?;
+            if state != ContextState::MigratingOut {
+                return Err(ContextError::PermissionDenied(
+                    "context is not in MigratingOut state — cannot tombstone".to_owned(),
+                ));
+            }
+
+            let migration = ctx.migration_state.as_ref().ok_or_else(|| {
+                ContextError::PermissionDenied(
+                    "no migration state found despite MigratingOut state".to_owned(),
+                )
+            })?;
+
+            // Check grace period has expired.
+            if now < migration.grace_period_end {
+                return Err(ContextError::PermissionDenied(format!(
+                    "migration grace period has not expired (ends at {}, now {})",
+                    migration.grace_period_end, now
+                )));
+            }
+
+            let dest_id = migration.destination_context_id.clone();
+            let m_pid = migration.proposal_id;
+
+            // Transition to Tombstoned inside the lock.
+            ctx.handle
+                .transition_to(&ContextState::Tombstoned)
+                .await
+                .map_err(|_| {
+                    ContextError::PermissionDenied(
+                        "cannot transition from MigratingOut to Tombstoned".to_owned(),
+                    )
+                })?;
+
+            // Emit tombstone event.
+            ctx.receive_buffer.push(ContextEvent::ContextTombstoned {
+                destination_context_id: dest_id.clone(),
+                migration_proposal_id: m_pid,
+            });
+
+            // Cancel TTL timer and governance timeout task.
+            ctx.ttl_timer.cancel();
+            ctx.governance_timeout_task.cancel();
+            // Drop broadcast context state.
+            ctx.broadcast_context = None;
+            // Clear migration state.
+            ctx.migration_state = None;
+
+            let snapshot = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (dest_id, m_pid, snapshot)
+        };
+
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            &format!(
+                "ContextTombstoned:{}:{}",
+                destination_id,
+                hex::encode(migration_pid)
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Returns the migration state for a context, if any.
+    ///
+    /// Returns `None` if the context is not registered or not migrating.
+    pub async fn migration_state(&self, context_id: &str) -> Option<MigrationState> {
+        let contexts = self.contexts.lock().await;
+        contexts
+            .get(context_id)
+            .and_then(|ctx| ctx.migration_state.clone())
     }
 
     /// Evaluates whether a subscriber's broadcast key request should be
@@ -11480,6 +11932,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -11583,6 +12036,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -11674,6 +12128,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -11744,6 +12199,7 @@ mod tests {
                 epoch_coordination_records: Vec::new(),
                 grace_entries: Vec::new(),
                 needs_reconnect: false,
+                migration_state: None,
                 mls_crypto_state: Vec::new(),
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
@@ -11813,6 +12269,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -11904,6 +12361,7 @@ mod tests {
                 expires_at_unix_secs: u64::MAX, // far-future expiry
             }],
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -12002,6 +12460,7 @@ mod tests {
                 expires_at_unix_secs: future_expiry,
             }],
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -12088,6 +12547,7 @@ mod tests {
             budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             epoch_coordination_records: Vec::new(),
             mls_crypto_state: Vec::new(),
+            migration_state: None,
         }
     }
 
@@ -13314,6 +13774,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            migration_state: None,
             mls_crypto_state: Vec::new(),
         };
 
@@ -17262,6 +17723,54 @@ mod tests {
         proposal
     }
 
+    // -----------------------------------------------------------------------
+    // Context migration tests (§5.11A, #580)
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates an approved `ProposeContextMigration` governance
+    /// proposal using a `SingleAdminEngine`. The admin DID's signing key
+    /// is derived from a fixed seed so governance vote verification passes.
+    fn approved_migration_proposal(
+        admin_did: &DID,
+        context_id: &str,
+        new_params: ContextParams,
+        reason: &str,
+        grace_period_secs: u64,
+        auto_invite: bool,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{
+            GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
+        };
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let vk = signing_key.verifying_key();
+        #[allow(clippy::type_complexity)]
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(vk));
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
+        let gov_ctx = GovernanceContext {
+            context_id: context_id.to_owned(),
+            members: vec![(admin_did.clone(), "admin".to_owned())],
+            admin_dids: vec![admin_did.clone()],
+            current_epoch: None,
+            now: 1000,
+        };
+
+        let action = GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(new_params),
+            reason: reason.to_owned(),
+            grace_period_secs,
+            auto_invite,
+        };
+
+        let (proposal, _events) = engine
+            .propose(admin_did, action, &gov_ctx, &signing_key)
+            .unwrap();
+        assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+        proposal
+    }
+
     /// Issue #630 AC1: `dispatch_governance_action` calls `classify_action()`
     /// after membership-affecting actions. Verifying that `AddMember`
     /// increments `mls_epoch` (which requires `classify_action` returning
@@ -17603,5 +18112,279 @@ mod tests {
         // Both proposals should be in executed_proposals (invalidated).
         assert!(ctx.executed_proposals.contains(&proposal_a_id));
         assert!(ctx.executed_proposals.contains(&proposal_b_id));
+    }
+
+    /// Helper: creates an approved `CancelContextMigration` governance
+    /// proposal using a `SingleAdminEngine`.
+    fn approved_cancel_migration_proposal(
+        admin_did: &DID,
+        context_id: &str,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{
+            GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
+        };
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let vk = signing_key.verifying_key();
+        #[allow(clippy::type_complexity)]
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(vk));
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
+        let gov_ctx = GovernanceContext {
+            context_id: context_id.to_owned(),
+            members: vec![(admin_did.clone(), "admin".to_owned())],
+            admin_dids: vec![admin_did.clone()],
+            current_epoch: None,
+            now: 1000,
+        };
+
+        let action = GovernanceAction::CancelContextMigration;
+
+        let (proposal, _events) = engine
+            .propose(admin_did, action, &gov_ctx, &signing_key)
+            .unwrap();
+        assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+        proposal
+    }
+
+    /// Section 5.11A lifecycle: propose -> approve -> tombstone.
+    ///
+    /// Verifies that:
+    /// 1. The source context transitions to `MigratingOut`.
+    /// 2. A destination context is created with `migration_source` metadata.
+    /// 3. `send_message` is blocked during the grace period.
+    /// 4. Tombstoning transitions the source to `Tombstoned`.
+    #[tokio::test]
+    async fn migration_propose_approve_tombstone_lifecycle() {
+        let (manager, handle) = setup_active_context().await;
+        let admin_did: DID = "did:key:creator".into();
+
+        // Propose migration with a zero-second grace period so we can
+        // tombstone immediately.
+        let dest_params = ContextParams::default();
+        let proposal = approved_migration_proposal(
+            &admin_did,
+            "test-ctx",
+            dest_params,
+            "expanding ceiling",
+            0, // zero-second grace period
+            false,
+        );
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(result.is_ok(), "migration proposal should succeed");
+
+        // Source context should be MigratingOut.
+        assert_eq!(handle.state().await, ContextState::MigratingOut);
+
+        // migration_state should be set.
+        let ms = manager.migration_state("test-ctx").await;
+        assert!(ms.is_some(), "migration state should be set");
+        let ms = ms.unwrap();
+        assert_eq!(ms.reason, "expanding ceiling");
+
+        // Destination context should exist.
+        let dest_id = &ms.destination_context_id;
+        let dest_ms = manager.migration_state(dest_id).await;
+        // Destination should NOT have migration state (it's not migrating).
+        assert!(dest_ms.is_none());
+
+        // send_message should be blocked (grace period = read-only).
+        let send_result = manager
+            .send_message(&handle, &admin_did, b"hello", None)
+            .await;
+        assert!(
+            send_result.is_err(),
+            "send_message should fail during MigratingOut"
+        );
+
+        // Tombstone should succeed (grace period is 0 seconds).
+        let tombstone_result = manager.tombstone_migrated_context("test-ctx").await;
+        assert!(tombstone_result.is_ok(), "tombstone should succeed");
+        assert_eq!(handle.state().await, ContextState::Tombstoned);
+
+        // migration_state should be cleared after tombstoning.
+        let ms_after = manager.migration_state("test-ctx").await;
+        assert!(ms_after.is_none(), "migration state should be cleared");
+    }
+
+    /// §5.11A lifecycle: propose -> cancel.
+    ///
+    /// Verifies that cancelling a migration returns the context to Active
+    /// and clears migration state.
+    #[tokio::test]
+    async fn migration_propose_cancel_lifecycle() {
+        let (manager, handle) = setup_active_context().await;
+        let admin_did: DID = "did:key:creator".into();
+
+        let dest_params = ContextParams::default();
+        let proposal = approved_migration_proposal(
+            &admin_did,
+            "test-ctx",
+            dest_params,
+            "test cancel",
+            604_800, // 7 days
+            false,
+        );
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(result.is_ok(), "migration proposal should succeed");
+        assert_eq!(handle.state().await, ContextState::MigratingOut);
+
+        // Cancel.
+        let cancel_proposal = approved_cancel_migration_proposal(&admin_did, "test-ctx");
+        let cancel_result = manager
+            .execute_governance_action("test-ctx", &cancel_proposal)
+            .await;
+        assert!(cancel_result.is_ok(), "cancel should succeed");
+
+        // Context should be Active again.
+        assert_eq!(handle.state().await, ContextState::Active);
+
+        // Migration state should be cleared.
+        let ms = manager.migration_state("test-ctx").await;
+        assert!(
+            ms.is_none(),
+            "migration state should be cleared after cancel"
+        );
+
+        // send_message should work again.
+        let send_result = manager
+            .send_message(&handle, &admin_did, b"hello", None)
+            .await;
+        assert!(
+            send_result.is_ok(),
+            "send_message should succeed after cancel"
+        );
+    }
+
+    /// §5.11A: duplicate migration should be rejected.
+    ///
+    /// A second `ProposeContextMigration` while one is already in progress
+    /// must fail.
+    #[tokio::test]
+    async fn migration_duplicate_proposal_rejected() {
+        let (manager, handle) = setup_active_context().await;
+        let admin_did: DID = "did:key:creator".into();
+
+        let dest_params = ContextParams::default();
+        let proposal = approved_migration_proposal(
+            &admin_did,
+            "test-ctx",
+            dest_params.clone(),
+            "first migration",
+            604_800,
+            false,
+        );
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(handle.state().await, ContextState::MigratingOut);
+
+        // Second proposal should be rejected because context is in
+        // MigratingOut state (require_active fails).
+        let proposal2 = approved_migration_proposal(
+            &admin_did,
+            "test-ctx",
+            dest_params,
+            "second migration",
+            604_800,
+            false,
+        );
+
+        let result2 = manager
+            .execute_governance_action("test-ctx", &proposal2)
+            .await;
+        assert!(result2.is_err(), "duplicate migration proposal should fail");
+    }
+
+    /// §5.11A.4: grace period enforcement.
+    ///
+    /// Tombstoning should fail if the grace period has not expired.
+    #[tokio::test]
+    async fn migration_grace_period_prevents_early_tombstone() {
+        let (manager, _handle) = setup_active_context().await;
+        let admin_did: DID = "did:key:creator".into();
+
+        let dest_params = ContextParams::default();
+        let proposal = approved_migration_proposal(
+            &admin_did,
+            "test-ctx",
+            dest_params,
+            "grace period test",
+            999_999_999, // very long grace period
+            false,
+        );
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(result.is_ok());
+
+        // Tombstone should fail — grace period hasn't expired.
+        let tombstone_result = manager.tombstone_migrated_context("test-ctx").await;
+        assert!(
+            tombstone_result.is_err(),
+            "tombstone should fail before grace period expires"
+        );
+        let err_msg = tombstone_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("grace period has not expired"),
+            "error should mention grace period, got: {err_msg}"
+        );
+    }
+
+    /// Section 5.11A.2: destination context has `migration_source` metadata.
+    #[tokio::test]
+    async fn migration_destination_has_migration_source_metadata() {
+        let (manager, _handle) = setup_active_context().await;
+        let admin_did: DID = "did:key:creator".into();
+
+        let dest_params = ContextParams::default();
+        let proposal = approved_migration_proposal(
+            &admin_did,
+            "test-ctx",
+            dest_params,
+            "metadata test",
+            0,
+            true,
+        );
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+        assert!(result.is_ok());
+
+        let ms = manager.migration_state("test-ctx").await.unwrap();
+        let dest_id = &ms.destination_context_id;
+
+        // The destination context should have migration_source set.
+        let contexts = manager.contexts.lock().await;
+        let dest_ctx = contexts.get(dest_id);
+        assert!(
+            dest_ctx.is_some(),
+            "destination context should be registered"
+        );
+        let dest_params = dest_ctx.unwrap().handle.params();
+        assert!(
+            dest_params.migration_source.is_some(),
+            "destination should have migration_source metadata"
+        );
+        let source = dest_params.migration_source.as_ref().unwrap();
+        assert_eq!(
+            source.source_context_id, "test-ctx",
+            "migration_source should reference the source context"
+        );
+        assert_eq!(
+            source.proposal_id, ms.proposal_id,
+            "migration_source proposal_id should match"
+        );
     }
 }

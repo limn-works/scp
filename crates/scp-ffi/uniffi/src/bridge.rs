@@ -682,6 +682,10 @@ pub enum ContextState {
     Closed,
     /// Context TTL has expired.
     Expired,
+    /// Context migration approved — source is in read-only grace period (§5.11A.4).
+    MigratingOut,
+    /// Context permanently tombstoned after migration (§5.11A.5). Terminal state.
+    Tombstoned,
 }
 
 /// Memory scope for a context — governs key destruction and data retention on close.
@@ -1618,7 +1622,8 @@ impl ContextHandle {
 
     /// Returns the context's current lifecycle state as a string.
     ///
-    /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`.
+    /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
+    /// `"migrating_out"`, `"tombstoned"`.
     ///
     /// # Errors
     ///
@@ -1634,6 +1639,8 @@ impl ContextHandle {
             ContextState::Closing => "closing".to_owned(),
             ContextState::Closed => "closed".to_owned(),
             ContextState::Expired => "expired".to_owned(),
+            ContextState::MigratingOut => "migrating_out".to_owned(),
+            ContextState::Tombstoned => "tombstoned".to_owned(),
         })
     }
 
@@ -4818,6 +4825,9 @@ pub async fn governance_execute(
                 GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
                 GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
                 GovernanceActionResult::Executed => "Executed",
+                GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
+                GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
+                GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
             };
             Ok::<_, ScpError>((result_str.to_owned(), action_name))
         })
@@ -4837,6 +4847,20 @@ pub async fn governance_execute(
             error = %e,
             "failed to sync role state after governance execution"
         );
+    }
+
+    // Sync FFI handle state for migration transitions (§5.11A).
+    match result.as_str() {
+        "MigrationProposed" => {
+            *handle.state.lock().await = ContextState::MigratingOut;
+        }
+        "MigrationCancelled" => {
+            *handle.state.lock().await = ContextState::Active;
+        }
+        "ContextTombstoned" => {
+            *handle.state.lock().await = ContextState::Tombstoned;
+        }
+        _ => {}
     }
 
     Ok(result)
@@ -5167,6 +5191,76 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during list proposals: {e}"),
             code: "SCP-CTX-2046".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — context migration (§5.11A, #580)
+// ---------------------------------------------------------------------------
+
+/// Tombstones a migrated context after its grace period has expired (§5.11A.5).
+///
+/// Transitions the context from `MigratingOut` to `Tombstoned`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2050) if the context is not migrating
+/// or the grace period has not expired.
+#[uniffi::export]
+pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    let context_id = handle.context_id.clone();
+    let handle_ref = handle.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            manager
+                .tombstone_migrated_context(&context_id)
+                .await
+                .map_err(ScpError::from)?;
+
+            // Sync FFI handle state to Tombstoned (§5.11A.5).
+            *handle_ref.state.lock().await = ContextState::Tombstoned;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during tombstone: {e}"),
+            code: "SCP-CTX-2050".to_owned(),
+        })?
+}
+
+/// Returns the migration state for a context, if any (§5.11A).
+///
+/// Returns a JSON string with migration state fields, or `None` if the
+/// context is not migrating.
+#[uniffi::export]
+pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    let context_id = handle.context_id.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let state = manager.migration_state(&context_id).await;
+            match state {
+                Some(ms) => {
+                    let json = serde_json::json!({
+                        "destination_context_id": ms.destination_context_id,
+                        "reason": ms.reason,
+                        "grace_period_end": ms.grace_period_end,
+                        "auto_invite": ms.auto_invite,
+                        "proposal_id": hex::encode(ms.proposal_id),
+                    });
+                    Ok(Some(json.to_string()))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during migration_state: {e}"),
+            code: "SCP-CTX-2050".to_owned(),
         })?
 }
 

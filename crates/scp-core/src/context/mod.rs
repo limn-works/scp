@@ -1,13 +1,14 @@
 //! Context lifecycle types for SCP.
 //!
-//! This module implements the context lifecycle as a five-state finite state
+//! This module implements the context lifecycle as a seven-state finite state
 //! machine: `Creating -> Active -> Closing -> Closed`, with `Expired` as a
-//! terminal state reachable from `Active` when TTL elapses. See ADR-008 in
-//! `.docs/adrs/phase-2.md`.
+//! terminal state reachable from `Active` when TTL elapses, and
+//! `MigratingOut -> Tombstoned` as the migration path from `Active`.
+//! See ADR-008 in `.docs/adrs/phase-2.md` and spec §5.11A.
 //!
 //! # Types
 //!
-//! - [`ContextState`] -- The five lifecycle states.
+//! - [`ContextState`] -- The seven lifecycle states.
 //! - [`ContextHandle`] -- Thread-safe handle to a context, holding state and
 //!   parameters. `Send + Sync` via interior `Arc<RwLock<_>>`.
 //! - [`ContextError`] -- Error type for context operations.
@@ -85,9 +86,9 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
-    ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy, PublicMetadata,
-    RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration, decode_protocol_version,
-    encode_protocol_version,
+    MigrationSource, ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy,
+    PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    decode_protocol_version, encode_protocol_version,
 };
 pub use state_machine::transition;
 
@@ -192,16 +193,20 @@ pub use app_sandbox::{
 // ContextState
 // ---------------------------------------------------------------------------
 
-/// The five lifecycle states of an SCP context.
+/// The seven lifecycle states of an SCP context.
 ///
 /// Valid transitions:
 /// - `Creating -> Active` -- MLS group formed, initial parameters committed.
 /// - `Active -> Closing` -- Close initiated by admin or governance.
 /// - `Active -> Expired` -- TTL elapsed (automatic, no governance override).
+/// - `Active -> MigratingOut` -- Migration approved, grace period active (§5.11A).
 /// - `Closing -> Closed` -- All members processed final events, keys destroyed.
+/// - `MigratingOut -> Tombstoned` -- Grace period expired, context permanently
+///   points to destination (§5.11A.5).
+/// - `MigratingOut -> Active` -- Migration cancelled before grace period ends.
 ///
-/// `Closed` and `Expired` are terminal states -- no further transitions are
-/// permitted. See ADR-008 for the full state machine specification.
+/// `Closed`, `Expired`, and `Tombstoned` are terminal states -- no further
+/// transitions are permitted. See ADR-008 and spec §5.11A.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextState {
     /// Context is being created. MLS group formation and parameter validation
@@ -221,6 +226,14 @@ pub enum ContextState {
     /// distinct from `Closed` -- TTL expiry skips the cooperative closing
     /// window. See spec section 5.10.
     Expired,
+    /// Context migration has been approved and the source context is in a
+    /// read-only grace period (§5.11A.4). No new messages, tool invocations,
+    /// or governance actions (except migration cancellation) are accepted.
+    /// Members can still read existing content.
+    MigratingOut,
+    /// Context has been permanently tombstoned after migration (§5.11A.5).
+    /// Carries a pointer to the destination context. Terminal state.
+    Tombstoned,
 }
 
 impl std::fmt::Display for ContextState {
@@ -231,6 +244,8 @@ impl std::fmt::Display for ContextState {
             Self::Closing => write!(f, "Closing"),
             Self::Closed => write!(f, "Closed"),
             Self::Expired => write!(f, "Expired"),
+            Self::MigratingOut => write!(f, "MigratingOut"),
+            Self::Tombstoned => write!(f, "Tombstoned"),
         }
     }
 }
