@@ -1671,6 +1671,131 @@ impl ContextManager {
         }
     }
 
+    /// Returns the IDs of all contexts that need to re-enter the
+    /// reconnection protocol (§23.3) before processing new messages.
+    ///
+    /// The SDK SHOULD call this on startup after
+    /// [`restore_all_contexts`](Self::restore_all_contexts) and whenever
+    /// a relay WebSocket connection is re-established. For each returned
+    /// context ID, the SDK initiates the reconnection protocol via
+    /// [`execute_reconnection`](Self::execute_reconnection).
+    pub async fn contexts_needing_reconnect(&self) -> Vec<String> {
+        self.contexts
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, ctx)| ctx.needs_reconnect)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Builds a [`ReconnectionCoordinator`](crate::sync::hours_offline::ReconnectionCoordinator)
+    /// for contexts that have the `needs_reconnect` flag set.
+    ///
+    /// This wires the `needs_reconnect` detection (§23.11 step 3) to the
+    /// reconnection protocol execution (§23.3). The spec requires that
+    /// "when message processing begins for the affected context, the SDK
+    /// MUST detect the `needs_reconnect` flag and initiate the reconnection
+    /// protocol before processing any new messages."
+    ///
+    /// The returned coordinator provides:
+    /// - [`plan(now)`](crate::sync::hours_offline::ReconnectionCoordinator::plan) —
+    ///   classify each context by offline tier.
+    /// - [`execute(now, driver)`](crate::sync::hours_offline::ReconnectionCoordinator::execute) —
+    ///   run the full six-phase reconnection protocol using the caller's
+    ///   [`SyncPhaseDriver`](crate::sync::hours_offline::SyncPhaseDriver)
+    ///   implementation.
+    ///
+    /// After the coordinator completes successfully, call
+    /// [`clear_needs_reconnect`](Self::clear_needs_reconnect) for each
+    /// context that achieved a terminal outcome (`FullyCaughtUp`,
+    /// `FastForwarded`, `Reset`, `ContextGone`).
+    ///
+    /// # Arguments
+    ///
+    /// * `member_did` — The DID of the reconnecting member.
+    /// * `last_relay_contacts` — Per-context last relay contact timestamps
+    ///   (persisted in `ProtocolRepository` under
+    ///   `sync/{context_id}/last_relay_contact`).
+    ///
+    /// # Returns
+    ///
+    /// `None` if no contexts need reconnection. Otherwise returns the
+    /// coordinator and the list of context IDs that will be reconnected.
+    pub async fn prepare_reconnection(
+        &self,
+        member_did: scp_identity::DID,
+        last_relay_contacts: std::collections::HashMap<String, u64>,
+    ) -> Option<(
+        crate::sync::hours_offline::ReconnectionCoordinator,
+        Vec<String>,
+    )> {
+        let needing = self.contexts_needing_reconnect().await;
+        if needing.is_empty() {
+            return None;
+        }
+
+        let coordinator = crate::sync::hours_offline::ReconnectionCoordinator::new(
+            member_did,
+            needing.clone(),
+            last_relay_contacts,
+        );
+        Some((coordinator, needing))
+    }
+
+    /// Executes the reconnection protocol for all contexts with
+    /// `needs_reconnect = true`, using the provided
+    /// [`SyncPhaseDriver`](crate::sync::hours_offline::SyncPhaseDriver).
+    ///
+    /// This is the one-call convenience method that wires detection to
+    /// execution: it calls [`prepare_reconnection`](Self::prepare_reconnection)
+    /// to build a coordinator, then runs
+    /// [`execute(now, driver)`](crate::sync::hours_offline::ReconnectionCoordinator::execute)
+    /// to perform the six-phase protocol, and finally clears the
+    /// `needs_reconnect` flag for each successfully reconnected context.
+    ///
+    /// # Arguments
+    ///
+    /// * `member_did` — The DID of the reconnecting member.
+    /// * `now` — Current Unix timestamp (seconds) for tier classification.
+    /// * `last_relay_contacts` — Per-context last relay contact timestamps.
+    /// * `driver` — The SDK's [`SyncPhaseDriver`](crate::sync::hours_offline::SyncPhaseDriver)
+    ///   implementation providing transport and MLS operations.
+    ///
+    /// # Returns
+    ///
+    /// `None` if no contexts need reconnection. Otherwise returns the
+    /// [`ReconnectionReport`](crate::sync::hours_offline::ReconnectionReport).
+    pub async fn execute_reconnection<D: crate::sync::hours_offline::SyncPhaseDriver>(
+        &self,
+        member_did: scp_identity::DID,
+        now: u64,
+        last_relay_contacts: std::collections::HashMap<String, u64>,
+        driver: &D,
+    ) -> Option<crate::sync::hours_offline::ReconnectionReport> {
+        let (coordinator, _context_ids) = self
+            .prepare_reconnection(member_did, last_relay_contacts)
+            .await?;
+
+        let report = coordinator.execute(now, driver).await;
+
+        // Clear needs_reconnect for contexts that completed successfully.
+        for result in &report.contexts_synced {
+            let cleared = matches!(
+                result.outcome,
+                crate::sync::SyncOutcome::FullyCaughtUp
+                    | crate::sync::SyncOutcome::FastForwarded { .. }
+                    | crate::sync::SyncOutcome::Reset
+                    | crate::sync::SyncOutcome::ContextGone
+            );
+            if cleared {
+                self.clear_needs_reconnect(&result.context_id).await;
+            }
+        }
+
+        Some(report)
+    }
+
     /// Restores all persisted contexts.
     ///
     /// Lists all context IDs from the persistence provider, creates a
@@ -11752,6 +11877,313 @@ mod tests {
         assert!(
             !manager.context_needs_reconnect("grace-ok-ctx").await,
             "consistent grace entries should not set needs_reconnect"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // contexts_needing_reconnect / execute_reconnection tests (#853)
+    // -----------------------------------------------------------------------
+
+    /// Builds a test `ContextSnapshot` with optional grace inconsistency.
+    /// When `bad_grace_epoch` is `Some(epoch)` and `epoch > mls_epoch`,
+    /// restoring triggers `needs_reconnect = true`.
+    fn reconnect_test_snapshot(
+        ctx_id: &str,
+        mls_epoch: u64,
+        bad_grace_epoch: Option<u64>,
+    ) -> super::ContextSnapshot {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+        let ceiling = default_ceiling();
+        let role_state = ContextRoleState::new(ctx_id, "did:key:a1", ceiling, vec![]).unwrap();
+        let grace = bad_grace_epoch
+            .map(|e| {
+                vec![crate::crypto::mls::epoch_grace::GraceEntry {
+                    epoch: e,
+                    expires_at_unix_secs: u64::MAX,
+                }]
+            })
+            .unwrap_or_default();
+        super::ContextSnapshot {
+            context_id: ctx_id.to_owned(),
+            state: ContextState::Active,
+            context_params: ContextParams::default(),
+            membership: MembershipState::new(),
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
+            mls_epoch,
+            grace_entries: grace,
+            needs_reconnect: false,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            mls_crypto_state: Vec::new(),
+        }
+    }
+
+    /// Creates a manager with persistence pre-loaded, then restores all contexts.
+    async fn manager_with_reconnect_snapshots(
+        snapshots: &[(&str, super::ContextSnapshot)],
+    ) -> ContextManager {
+        let persistence = MockContextPersistence::default();
+        for (ctx_id, snap) in snapshots {
+            let bc = test_broadcast_snapshot(ctx_id);
+            persistence.persist_context(ctx_id, snap).unwrap();
+            persistence.persist_broadcast(ctx_id, &bc).unwrap();
+        }
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(persistence),
+            noop_key_resolver(),
+        );
+        for (ctx_id, _) in snapshots {
+            let handle = ContextHandle::new((*ctx_id).to_owned(), ContextParams::default());
+            handle.transition_to(&ContextState::Active).await.unwrap();
+            manager.restore_context(ctx_id, &handle).await.unwrap();
+        }
+        manager
+    }
+
+    /// §23.11/§23.3: `contexts_needing_reconnect` returns IDs of contexts
+    /// with `needs_reconnect = true`.
+    #[tokio::test]
+    async fn contexts_needing_reconnect_returns_flagged_contexts() {
+        let snap1 = reconnect_test_snapshot("ctx-r1", 3, Some(5)); // inconsistent
+        let snap2 = reconnect_test_snapshot("ctx-r2", 3, None); // consistent
+        let manager =
+            manager_with_reconnect_snapshots(&[("ctx-r1", snap1), ("ctx-r2", snap2)]).await;
+
+        let needing = manager.contexts_needing_reconnect().await;
+        assert_eq!(needing.len(), 1);
+        assert_eq!(needing[0], "ctx-r1");
+        assert!(!manager.context_needs_reconnect("ctx-r2").await);
+    }
+
+    /// §23.3: `prepare_reconnection` returns None when no contexts need
+    /// reconnection.
+    #[tokio::test]
+    async fn prepare_reconnection_returns_none_when_no_reconnect_needed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let result = manager
+            .prepare_reconnection(
+                scp_identity::DID::from("did:dht:z6MkAlice"),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        assert!(result.is_none());
+    }
+
+    /// §23.3: `execute_reconnection` runs the full reconnection protocol
+    /// for contexts with `needs_reconnect = true`, and clears the flag
+    /// after successful completion.
+    #[tokio::test]
+    async fn execute_reconnection_wires_flag_to_protocol() {
+        use crate::sync::hours_offline::{BufferedMessage, EpochCatchUpState, SyncPhaseDriver};
+        use crate::sync::{SyncError, SyncEvent, SyncPolicy};
+
+        // Minimal SyncPhaseDriver that succeeds on all phases.
+        struct NoOpDriver;
+        impl SyncPhaseDriver for NoOpDriver {
+            async fn relay_catch_up(
+                &self,
+                _: &str,
+                _: u64,
+            ) -> Result<Vec<BufferedMessage>, SyncError> {
+                Ok(vec![])
+            }
+            async fn epoch_reconciliation(
+                &self,
+                id: &str,
+                l: u64,
+                t: u64,
+                _: &SyncPolicy,
+            ) -> Result<EpochCatchUpState, SyncError> {
+                let mut s = EpochCatchUpState::new(id.to_owned(), l, t);
+                s.status = crate::sync::CatchUpStatus::Complete;
+                Ok(s)
+            }
+            async fn event_log_sync(&self, _: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
+                Ok((0, vec![]))
+            }
+            async fn sender_key_reacquire(
+                &self,
+                _: &str,
+                _: &SyncPolicy,
+            ) -> Result<u64, SyncError> {
+                Ok(0)
+            }
+            async fn mls_update(&self, _: &str) -> Result<bool, SyncError> {
+                Ok(true)
+            }
+            async fn queue_drain(
+                &self,
+                _: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<(u64, u64), SyncError> {
+                Ok((0, 0))
+            }
+            async fn local_epoch(&self, _: &str) -> Result<Option<u64>, SyncError> {
+                Ok(Some(3))
+            }
+            async fn observed_target_epoch(
+                &self,
+                _: &str,
+                _: &[BufferedMessage],
+            ) -> Result<Option<u64>, SyncError> {
+                Ok(Some(3))
+            }
+            async fn blob_ttl_secs(&self, _: &str) -> Result<Option<u64>, SyncError> {
+                Ok(None)
+            }
+        }
+
+        let snap = reconnect_test_snapshot("ctx-ex", 3, Some(10));
+        let manager = manager_with_reconnect_snapshots(&[("ctx-ex", snap)]).await;
+
+        assert!(manager.context_needs_reconnect("ctx-ex").await);
+
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-ex".to_owned(), 990_000u64);
+        let driver = NoOpDriver;
+
+        let report = manager
+            .execute_reconnection("did:dht:z6MkAlice".into(), 1_000_000, contacts, &driver)
+            .await
+            .expect("should return a report");
+
+        assert_eq!(report.contexts_synced.len(), 1);
+        assert_eq!(
+            report.contexts_synced[0].outcome,
+            crate::sync::SyncOutcome::FullyCaughtUp
+        );
+        assert!(report.contexts_synced[0].mls_update_issued);
+        assert!(
+            !manager.context_needs_reconnect("ctx-ex").await,
+            "flag should be auto-cleared"
+        );
+
+        // No more flagged contexts.
+        let none = manager
+            .execute_reconnection(
+                "did:dht:z6MkAlice".into(),
+                1_000_000,
+                std::collections::HashMap::new(),
+                &driver,
+            )
+            .await;
+        assert!(none.is_none());
+    }
+
+    /// §23.3: `execute_reconnection` clears `needs_reconnect` when the
+    /// driver signals `ContextGone` (context closed/expired while offline).
+    /// This prevents infinite retry loops for contexts that no longer exist.
+    #[tokio::test]
+    async fn execute_reconnection_clears_flag_on_context_gone() {
+        use crate::sync::hours_offline::{BufferedMessage, EpochCatchUpState, SyncPhaseDriver};
+        use crate::sync::{SyncError, SyncEvent, SyncPolicy};
+
+        /// Driver whose `relay_catch_up` returns `SyncError::ContextGone`,
+        /// causing the coordinator to produce `SyncOutcome::ContextGone`.
+        struct ContextGoneDriver;
+        impl SyncPhaseDriver for ContextGoneDriver {
+            async fn relay_catch_up(
+                &self,
+                ctx_id: &str,
+                _: u64,
+            ) -> Result<Vec<BufferedMessage>, SyncError> {
+                Err(SyncError::ContextGone {
+                    context_id: ctx_id.to_owned(),
+                })
+            }
+            async fn epoch_reconciliation(
+                &self,
+                id: &str,
+                l: u64,
+                t: u64,
+                _: &SyncPolicy,
+            ) -> Result<EpochCatchUpState, SyncError> {
+                let mut s = EpochCatchUpState::new(id.to_owned(), l, t);
+                s.status = crate::sync::CatchUpStatus::Complete;
+                Ok(s)
+            }
+            async fn event_log_sync(&self, _: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
+                Ok((0, vec![]))
+            }
+            async fn sender_key_reacquire(
+                &self,
+                _: &str,
+                _: &SyncPolicy,
+            ) -> Result<u64, SyncError> {
+                Ok(0)
+            }
+            async fn mls_update(&self, _: &str) -> Result<bool, SyncError> {
+                Ok(false)
+            }
+            async fn queue_drain(
+                &self,
+                _: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<(u64, u64), SyncError> {
+                Ok((0, 0))
+            }
+            async fn local_epoch(&self, _: &str) -> Result<Option<u64>, SyncError> {
+                Ok(Some(3))
+            }
+            async fn observed_target_epoch(
+                &self,
+                _: &str,
+                _: &[BufferedMessage],
+            ) -> Result<Option<u64>, SyncError> {
+                Ok(Some(3))
+            }
+            async fn blob_ttl_secs(&self, _: &str) -> Result<Option<u64>, SyncError> {
+                Ok(None)
+            }
+        }
+
+        let snap = reconnect_test_snapshot("ctx-gone", 3, Some(10));
+        let manager = manager_with_reconnect_snapshots(&[("ctx-gone", snap)]).await;
+
+        assert!(manager.context_needs_reconnect("ctx-gone").await);
+
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-gone".to_owned(), 990_000u64);
+        let driver = ContextGoneDriver;
+
+        let report = manager
+            .execute_reconnection("did:dht:z6MkAlice".into(), 1_000_000, contacts, &driver)
+            .await
+            .expect("should return a report");
+
+        assert_eq!(report.contexts_synced.len(), 1);
+        assert_eq!(
+            report.contexts_synced[0].outcome,
+            crate::sync::SyncOutcome::ContextGone,
+        );
+        assert!(
+            !manager.context_needs_reconnect("ctx-gone").await,
+            "needs_reconnect must be cleared for ContextGone — not left as infinite retry"
         );
     }
 
