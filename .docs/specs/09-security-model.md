@@ -280,7 +280,7 @@ All signed structures in the protocol use a single canonical hash construction. 
 
 **Reference implementation:** the migration proof (§9.12) uses this exact construction: `SHA-256("SCP-MIGRATION-V1:" || len(old_did) || old_did || len(new_did) || new_did || rotated_at)`.
 
-**Additional signed structures** using this canonical hash construction are defined in their respective spec sections: `ResetRequest` (domain: `"SCP-RESET-REQUEST-V1:"`) is defined in §23.5.2.
+**Additional signed structures** using this canonical hash construction are defined in their respective spec sections: `ResetRequest` (domain: `"SCP-RESET-REQUEST-V1:"`) is defined in §23.5.2. `ScpIdResponse` (domain: `"SCP-DID-AUTH-V1:"`) is defined in §3.11.3.
 
 ### 9.5.2 Signed Structure Definitions
 
@@ -1483,7 +1483,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-COMMIT-RANGE-REQ-V1:"` | Commit range request signing | §23.16.2 |
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
 | `"SCP-CONTEXT-SNAPSHOT-V1:"` | Context snapshot signing | §23.16.4 |
-| `"SCP-DID-AUTH-V1:"` | SCPID challenge-response signing | §3.11 |
+| `"SCP-DID-AUTH-V1:"` | SCPID authentication signing (§3.11.3 canonical hash) | §3.11 |
 
 ### 9.18.3 Key Derivation and HPKE Labels
 

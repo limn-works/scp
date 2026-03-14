@@ -837,7 +837,7 @@ Client (DID holder)                    Relying Party (service)
        │  3. Sign challenge with #active/#agent │
        │                                       │
        │  4. POST /auth/verify                  │
-       │     { did, key_id, signature, ts }     │
+       │     { did, signing_key_id, signature, ts }     │
        │ ────────────────────────────────────►   │
        │                                       │
        │  5. Resolve DID → verify signature     │
@@ -869,7 +869,7 @@ ScpIdChallenge {
 | `nonce` | 32 bytes, CSPRNG | Replay prevention. Must be unique per challenge. |
 | `audience` | URI, max 2048 bytes UTF-8 | Audience binding. Prevents signature reuse across services. |
 | `issued_at` | Unix ms, must be ≤ current time | Prevents pre-dated challenges. |
-| `expires_at` | Unix ms, must be > `issued_at`, recommended max lifetime 300 seconds (5 minutes) | Short-lived to minimize replay window. |
+| `expires_at` | Unix ms, must be > `issued_at`, MUST NOT exceed 300 seconds (5 minutes) | Short-lived to minimize replay window. |
 
 **Wire format.** Challenges are serialized as JSON for transport. The relying party chooses the transport (HTTP, WebSocket, QR code, etc.) — the protocol does not mandate a specific transport.
 
@@ -880,7 +880,7 @@ The client constructs and signs the response:
 ```
 ScpIdResponse {
     did:            DID,      // The signer's DID
-    key_id:         String,   // Verification method ID: "#active" or "#agent"
+    signing_key_id: String,   // Verification method ID: "#active" or "#agent"
     nonce:          [u8; 32], // Echo of the challenge nonce
     audience:       String,   // Echo of the challenge audience
     signed_at:      u64,      // Unix timestamp (ms) when the client signed
@@ -890,20 +890,36 @@ ScpIdResponse {
 
 **Signed content construction:**
 
+The signed content follows the §9.5.1 canonical hash construction: SHA-256 of domain-separated, length-prefixed fields. The Ed25519 signature is over the 32-byte hash, not the raw concatenation.
+
 ```
-signed_bytes = "SCP-DID-AUTH-V1:"
-    || nonce                           // 32 bytes, raw
-    || len(audience) as u32 BE         // 4 bytes, big-endian length prefix
-    || audience                        // UTF-8 bytes
-    || signed_at as u64 BE             // 8 bytes, big-endian timestamp
+signed_bytes = SHA-256(
+    "SCP-DID-AUTH-V1:"
+    || BE32(len(did))              || did              // signer's DID, UTF-8
+    || BE32(len(signing_key_id))   || signing_key_id   // "#active" or "#agent", UTF-8
+    || nonce                                            // 32 bytes, fixed (no length prefix per §9.5.1)
+    || BE32(len(audience))         || audience          // audience URI, UTF-8
+    || signed_at as u64 BE                              // 8 bytes, big-endian
+)
+signature = Ed25519_sign(private_key, signed_bytes)
 ```
 
-The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The `||` operator denotes byte concatenation. The length prefix on `audience` prevents ambiguity when concatenating variable-length fields.
+**SCPID signed content field order:**
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `did` | 4-byte BE length prefix + UTF-8 bytes |
+| 2 | `signing_key_id` | 4-byte BE length prefix + UTF-8 bytes |
+| 3 | `nonce` | 32 bytes raw (fixed-length, no prefix per §9.5.1) |
+| 4 | `audience` | 4-byte BE length prefix + UTF-8 bytes |
+| 5 | `signed_at` | 8-byte big-endian u64 |
+
+The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identity and key role, preventing signature transplant across DIDs and key confusion between `#active` and `#agent`.
 
 **Signing key selection:**
 
 - `#active` — human-initiated authentication. Biometric-protected, appropriate for sensitive actions.
-- `#agent` — agent-initiated authentication. Software-held, no biometric gate. Appropriate for autonomous background operations. The relying party MAY distinguish between `#active` and `#agent` signatures for authorization decisions (e.g., requiring `#active` for account-level changes).
+- `#agent` — agent-initiated authentication. Software-held, no biometric gate. Appropriate for autonomous background operations. The relying party MAY distinguish between `#active` and `#agent` values of `signing_key_id` for authorization decisions (e.g., requiring `#active` for account-level changes). Because `signing_key_id` is included in the signed content (§3.11.3), this distinction is cryptographically authenticated — a signature produced with `#agent` cannot be presented as `#active`.
 
 ### 3.11.4 Verification Procedure
 
@@ -911,38 +927,46 @@ The relying party verifies a response:
 
 ```
 1. Parse the ScpIdResponse.
-2. Check nonce matches a previously issued, unexpired challenge.
+2. Check nonce matches the issued challenge's nonce. Reject if mismatched.
    Consume the nonce (single-use). Reject replays.
-3. Check audience matches the relying party's own audience URI.
-4. Check signed_at is within the challenge's [issued_at, expires_at] window.
+3. Check audience matches the issued challenge's audience URI.
+   Audience comparison MUST be exact byte-for-byte string comparison,
+   not URI normalization.
+4. Check the challenge has not expired: current_time <= expires_at.
+   Check signed_at is within the challenge's [issued_at, expires_at] window.
 5. Resolve the DID document:
    a. Resolve did via DHT (BEP44 lookup) or SCP relay QUERY (§3.10.4).
    b. Verify the BEP44 signature on the DID document (§9.6.1).
    c. Cache policy: the DID document MUST be fresh — fetched within the last
       300 seconds or cached with valid TTL. Stale documents MUST trigger
       a fresh resolution.
-6. Extract the public key for key_id from the DID document's
+6. Extract the public key for signing_key_id from the DID document's
    verificationMethod array.
-7. Confirm key_id is listed in the DID document's "authentication"
+7. Confirm signing_key_id is one of "#active" or "#agent". Reject any
+   other value with KEY_NOT_AUTHORIZED.
+8. Confirm signing_key_id is listed in the DID document's "authentication"
    relationship. Reject if not.
-8. Reconstruct signed_bytes from nonce, audience, signed_at (§3.11.3).
-9. Verify the Ed25519 signature over signed_bytes using the extracted
-   public key.
-10. If all checks pass: the request is authenticated as originating from
-    the holder of the DID's key_id verification method.
+9. Reconstruct signed_bytes from did, signing_key_id, nonce, audience,
+   signed_at per §3.11.3 (SHA-256 of canonical concatenation).
+10. Verify the Ed25519 (PureEdDSA, RFC 8032 §5.1.6) signature over
+    signed_bytes using the extracted public key.
+11. If all checks pass: the request is authenticated as originating from
+    the holder of the DID's signing_key_id verification method.
 ```
 
 **Error responses.** The relying party SHOULD return structured errors:
 
 | Condition | Error | Code |
 |-----------|-------|------|
-| Nonce unknown or expired | `CHALLENGE_EXPIRED` | `SCP-AUTH-8001` |
-| Audience mismatch | `AUDIENCE_MISMATCH` | `SCP-AUTH-8002` |
-| `signed_at` outside challenge window | `TIMESTAMP_INVALID` | `SCP-AUTH-8003` |
-| DID resolution failed | `DID_RESOLUTION_FAILED` | `SCP-AUTH-8004` |
-| `key_id` not in `authentication` relationship | `KEY_NOT_AUTHORIZED` | `SCP-AUTH-8005` |
-| Signature verification failed | `SIGNATURE_INVALID` | `SCP-AUTH-8006` |
-| DID document stale (> 300s, refresh failed) | `DID_DOCUMENT_STALE` | `SCP-AUTH-8007` |
+| Nonce unknown, mismatched, or expired | `CHALLENGE_EXPIRED` | `SCP-IDENT-1030` |
+| Audience mismatch | `AUDIENCE_MISMATCH` | `SCP-IDENT-1031` |
+| `signed_at` outside challenge window or challenge expired | `TIMESTAMP_INVALID` | `SCP-IDENT-1032` |
+| DID resolution failed | `DID_RESOLUTION_FAILED` | `SCP-IDENT-1033` |
+| `signing_key_id` not `#active`/`#agent` or not in `authentication` | `KEY_NOT_AUTHORIZED` | `SCP-IDENT-1034` |
+| Signature verification failed | `SIGNATURE_INVALID` | `SCP-IDENT-1035` |
+| DID document stale (> 300s, refresh failed) | `DID_DOCUMENT_STALE` | `SCP-IDENT-1036` |
+
+**Error response guidance.** Relying parties SHOULD NOT return specific error codes to untrusted clients. Return a generic failure (e.g., HTTP 401 with `"authentication_failed"`) for all verification failures. Specific `SCP-IDENT-103x` codes are for server-side logging and debugging only. Exposing which step failed provides a verification oracle that helps attackers enumerate valid DIDs and probe key configurations.
 
 ### 3.11.5 Wire Format
 
@@ -964,7 +988,7 @@ The relying party verifies a response:
 {
   "protocol": "scpid/1.0",
   "did": "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-  "key_id": "#active",
+  "signing_key_id": "#active",
   "nonce": "<64 hex chars>",
   "audience": "https://app.example.com",
   "signed_at": 1741910405000,
@@ -974,11 +998,13 @@ The relying party verifies a response:
 
 The `protocol` field identifies the authentication scheme and version. Relying parties MUST reject responses with unrecognized protocol versions. Version negotiation is outside scope — clients and relying parties agree on protocol version out-of-band (e.g., the challenge's `protocol` field declares what the relying party accepts).
 
+**Protocol version binding.** The `V1` suffix in the domain separator `SCP-DID-AUTH-V1:` is the cryptographic binding for the protocol version. A new protocol version MUST use a new domain separator (e.g., `SCP-DID-AUTH-V2:`). The `protocol` field in the wire format is for human readability and version negotiation; it is not a security control — it is not included in the signed content.
+
 ### 3.11.6 Security Properties
 
-**Replay prevention.** The nonce is single-use. The relying party MUST track issued nonces and reject any nonce presented more than once. Nonce storage can be pruned after `expires_at` — expired challenges are rejected regardless of nonce state.
+**Replay prevention.** The nonce is single-use. The relying party MUST track issued nonces and reject any nonce presented more than once. Nonce storage can be pruned after `expires_at` — expired challenges are rejected regardless of nonce state. For distributed relying parties (multiple server instances behind a load balancer), nonce storage MUST use a strongly-consistent data store (e.g., Redis with NX-SET, database with unique constraint). Eventually-consistent stores risk double-acceptance. Alternatively, bind the challenge to a specific server instance using HMAC: `nonce = HMAC-SHA-256(server_secret, random_bytes || issued_at)`, verified without shared state. In this case, the relying party reconstructs the `ScpIdChallenge` from the HMAC nonce and stored parameters before passing it to `scpid_verify`.
 
-**Audience binding.** The `audience` field is included in the signed content. A signature produced for `https://app-a.example.com` does not verify for `https://app-b.example.com`. This prevents cross-service signature relay attacks where an attacker presents a legitimate signature obtained from one service to another.
+**Audience binding.** The `audience` field is included in the signed content. A signature produced for `https://app-a.example.com` does not verify for `https://app-b.example.com`. This prevents cross-service signature relay attacks where an attacker presents a legitimate signature obtained from one service to another. Audience comparison MUST be exact byte-for-byte string comparison, not URI normalization. The relying party MUST publish its canonical audience URI and the client MUST use it verbatim. This matches the OIDC `aud` claim comparison model.
 
 **Timestamp freshness.** The `signed_at` timestamp must fall within the challenge's validity window (`issued_at` ≤ `signed_at` ≤ `expires_at`). This bounds the useful lifetime of a stolen challenge to the challenge's expiry window.
 
@@ -988,7 +1014,7 @@ The `protocol` field identifies the authentication scheme and version. Relying p
 
 **MITM resistance.** SCPID does not provide channel binding. If the transport between client and relying party is compromised (no TLS), an attacker can intercept and replay the challenge-response in real time. Relying parties MUST serve challenges and accept responses over TLS. The audience field mitigates relay attacks across services but does not replace transport-layer encryption.
 
-**Agent vs. human distinction.** The `key_id` field tells the relying party whether a human (`#active`, biometric-gated) or an agent (`#agent`, software-held) signed the challenge. The relying party can enforce authorization policies based on this distinction — e.g., requiring `#active` for destructive operations and accepting `#agent` for routine API access.
+**Agent vs. human distinction.** The `signing_key_id` field tells the relying party whether a human (`#active`, biometric-gated) or an agent (`#agent`, software-held) signed the challenge. Because `signing_key_id` is included in the signed content (§3.11.3), this distinction is cryptographically authenticated. The relying party can enforce authorization policies based on this distinction — e.g., requiring `#active` for destructive operations and accepting `#agent` for routine API access.
 
 ### 3.11.7 Relationship to Context Membership
 
@@ -1006,51 +1032,67 @@ An SCP-native app will typically use **context membership** for protocol operati
 
 ### 3.11.8 SDK API Surface
 
-The SDK provides functions for both sides of the protocol:
+The SDK provides functions for all three protocol roles:
 
-**Client side (challenge signing):**
+**Challenge generation (relying party):**
+
+```rust
+/// Generate an SCPID challenge for the given audience.
+///
+/// Generates a 32-byte CSPRNG nonce, sets issued_at to the current time,
+/// and computes expires_at from the TTL. TTL MUST NOT exceed 300 seconds.
+pub fn scpid_challenge(
+    audience: &str,
+    ttl: Duration,
+) -> Result<ScpIdChallenge, IdentityError>;
+```
+
+**Challenge signing (client):**
 
 ```rust
 /// Sign an SCPID challenge using the specified verification method.
 ///
-/// Returns a ScpIdResponse ready for transmission to the relying party.
-/// The caller is responsible for transporting the response (HTTP POST, etc.).
+/// Constructs signed_bytes per §3.11.3 (SHA-256 of canonical concatenation
+/// including did and signing_key_id), signs with Ed25519, returns the response.
 pub async fn scpid_sign(
     custody: &dyn KeyCustody,
     did: &str,
-    key_id: &str,          // "#active" or "#agent"
+    signing_key_id: SigningKeyId,  // Active or Agent (from scp-identity)
     challenge: &ScpIdChallenge,
-) -> Result<ScpIdResponse, AuthError>;
+) -> Result<ScpIdResponse, IdentityError>;
 ```
 
-**Relying party side (response verification):**
+**Response verification (relying party):**
 
 ```rust
-/// Verify an SCPID response against a previously issued challenge.
+/// Verify an SCPID response against the original challenge.
 ///
-/// Resolves the DID document, extracts the public key, and verifies the
-/// Ed25519 signature. Returns the authenticated DID and key_id on success.
+/// Performs the full 11-step verification procedure (§3.11.4): nonce match,
+/// audience match, timestamp window, DID resolution, key extraction,
+/// signing_key_id constraint, authentication relationship check,
+/// signed_bytes reconstruction, Ed25519 signature verification.
 ///
-/// The caller MUST ensure the nonce has not been previously consumed
-/// (single-use enforcement is the caller's responsibility).
+/// The caller MUST ensure the challenge has not been previously consumed
+/// (single-use enforcement). The function checks the response against the
+/// challenge but does not track cross-request nonce state.
 pub async fn scpid_verify(
     resolver: &dyn DidResolver,
     response: &ScpIdResponse,
-    expected_audience: &str,
-    challenge_window: (u64, u64),  // (issued_at, expires_at)
-) -> Result<ScpIdAuthentication, AuthError>;
+    challenge: &ScpIdChallenge,
+) -> Result<ScpIdAuthentication, IdentityError>;
 
 pub struct ScpIdAuthentication {
     pub did: String,
-    pub key_id: String,        // "#active" or "#agent"
+    pub signing_key_id: SigningKeyId,
     pub signed_at: u64,
 }
 ```
 
 **Non-SCP relying parties** can implement verification without the SCP SDK. The only dependencies are:
 1. A `did:dht` resolver (BEP44 lookup — libraries exist for most languages).
-2. An Ed25519 signature verifier (standard, available everywhere).
-3. JSON parsing.
+2. SHA-256 (standard, available everywhere).
+3. An Ed25519 signature verifier (PureEdDSA per RFC 8032 §5.1.6).
+4. JSON parsing.
 
 This is intentional. SCPID is designed to be implementable by services that have no other relationship with SCP.
 
@@ -1058,12 +1100,12 @@ This is intentional. SCPID is designed to be implementable by services that have
 
 A service that wants to accept SCP DID authentication without running SCP software:
 
-1. **DID resolution.** Use any `did:dht` resolver library. The DID document is a BEP44 signed mutable item on Mainline DHT. Libraries: `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. Cache documents per §3.10.4 (24h for active, 7d for inactive).
+1. **DID resolution.** Use any `did:dht` resolver library. The DID document is a BEP44 signed mutable item on Mainline DHT. Libraries: `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. For SCPID verification, DID documents MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
 
-2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and `authentication` relationship. Match `key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase` (z-base-32 encoded Ed25519 public key).
+2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and `authentication` relationship. Match `signing_key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase`. Decoding: strip the `z` prefix (multibase indicator for base58btc), base58btc-decode the remainder to get the raw 32-byte Ed25519 public key.
 
-3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3. Verify with Ed25519. Standard libraries: `ring`, `ed25519-dalek` (Rust), `tweetnacl` (JS), `pynacl` (Python), `Crypto.Sign` (Swift).
+3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed `did`, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the Ed25519 signature (PureEdDSA, RFC 8032 §5.1.6) over the resulting 32-byte hash. Standard libraries: `ring`, `ed25519-dalek` (Rust), `tweetnacl` (JS), `pynacl` (Python), `Crypto.Sign` (Swift).
 
-4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries.
+4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, no context management, no relay connections. The entire verification path is: one DHT lookup + one JSON parse + one Ed25519 verify.
+No SCP SDK, no MLS, no context management, no relay connections. The entire verification path is: one DHT lookup + one JSON parse + one SHA-256 + one Ed25519 verify.

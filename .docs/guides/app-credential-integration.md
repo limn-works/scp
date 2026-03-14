@@ -24,8 +24,8 @@ Your app has three credential domains. Keep them strictly separated.
 ├─────────────────────────────────────────────────────────┤
 │  3. Connected Service Credentials (Linear, GitHub)      │
 │     Tokens: OAuth access + refresh tokens, API keys     │
-│     Storage: Encrypted, per-connection, isolated        │
-│     Keys: Standalone per-connection secrets (NOT from   │
+│     Storage: Encrypted, per-bridge, isolated        │
+│     Keys: Standalone per-bridge secrets (NOT from   │
 │           identity material)                            │
 │     THIS IS WHAT YOU BUILD                              │
 └─────────────────────────────────────────────────────────┘
@@ -41,40 +41,51 @@ Users don't "sign in" to your app — they join a context. Your app IS a context
 
 For any HTTP API endpoints your app serves (REST, webhooks, callbacks), authenticate requests using DID-signed challenges:
 
-### Pattern (from §22.3 / §6.2.2B discovery context readers)
+### Pattern (SCPID, §3.11)
 
 ```
-1. Client requests a nonce from your server
-   GET /auth/challenge → { nonce: "<32 random bytes, hex>", expires: <unix_ts> }
+1. Client requests a challenge from your server
+   GET /auth/challenge → {
+     protocol: "scpid/1.0", nonce: "<64 hex chars>",
+     audience: "https://app.example.com",
+     issued_at: <unix_timestamp>, expires_at: <unix_timestamp>
+   }
 
 2. Client signs the challenge with #active or #agent
-   signed_content = SHA-256("SCP-DID-AUTH-V1:" || nonce || your_app_audience_uri || timestamp)
-   signature = Ed25519.sign(signing_key, signed_content)
+   signed_bytes = SHA-256(
+       "SCP-DID-AUTH-V1:"
+       || BE32(len(did)) || did
+       || BE32(len(signing_key_id)) || signing_key_id
+       || nonce (32 bytes)
+       || BE32(len(audience)) || audience
+       || signed_at as u64 BE
+   )
+   signature = Ed25519.sign(signing_key, signed_bytes)
 
 3. Client sends back:
    POST /auth/verify → {
+     protocol: "scpid/1.0",
      did: "did:dht:...",
-     key_id: "#active",  // or "#agent"
-     signature: "<hex>",
-     timestamp: <unix_ts>
+     signing_key_id: "#active",  // or "#agent"
+     nonce: "<64 hex chars>",
+     audience: "https://app.example.com",
+     signed_at: <unix_timestamp>,
+     signature: "<128 hex chars>"
    }
 
 4. Server verifies:
-   a. Resolve DID document via DHT
-   b. Extract public key for key_id
-   c. Confirm key_id is in the "authentication" relationship
-   d. Verify Ed25519 signature over reconstructed signed_content
-   e. Check nonce freshness + audience match
+   a. Resolve DID document via DHT (cache ≤ 300s for SCPID)
+   b. Extract public key for signing_key_id
+   c. Confirm signing_key_id is "#active" or "#agent"
+   d. Confirm signing_key_id is in the "authentication" relationship
+   e. Reconstruct signed_bytes per §3.11.3, compute SHA-256
+   f. Verify Ed25519 signature over the 32-byte hash
+   g. Check nonce freshness + audience match
 ```
 
 ### Implementation note
 
-This pattern is NOT yet a formalized SDK function. The primitives exist:
-- DID resolution: `scp-identity` crate, exposed through all SDKs
-- Ed25519 signing: via `KeyCustody` trait, exposed through all SDKs
-- Signature verification: `scp-identity` crate
-
-The full protocol is specified in §3.11 (DID Authentication for External Services). SDK functions `scpid_sign()` and `scpid_verify()` are defined in §3.11.8.
+The full protocol is specified in §3.11 (DID Authentication for External Services). SDK functions `scpid_challenge()`, `scpid_sign()`, and `scpid_verify()` are defined in §3.11.8. Note: these functions are spec-defined but not yet implemented in the SDK — implementation is tracked in #1053–#1055.
 
 ---
 
@@ -107,19 +118,19 @@ Since the Rust credential APIs aren't available through SDK bindings yet, implem
 #### 2a. Credential Storage
 
 ```
-Storage layout (per connection):
-  connections/{connection_id}/credential/oauth_access_token
-  connections/{connection_id}/credential/oauth_refresh_token
+Storage layout (per bridge):
+  bridge/{bridge_id}/credential/oauth_access_token
+  bridge/{bridge_id}/credential/oauth_refresh_token
 
 Encryption:
-  - Generate a random 32-byte connection_credential_key per connection
-  - Store the connection_credential_key in platform keychain
+  - Generate a random 32-byte bridge_credential_key per bridge
+  - Store the bridge_credential_key in platform keychain
     (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly on iOS,
      or equivalent — no biometric gate, available to background processes)
   - Derive per-credential encryption keys via HKDF-SHA256:
       salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")
-      info = "scp-bridge-credential:" || connection_id
-      key  = HKDF-Expand(HKDF-Extract(salt, connection_credential_key), info, 32)
+      info = "scp-bridge-credential:" || bridge_id
+      key  = HKDF-Expand(HKDF-Extract(salt, bridge_credential_key), info, 32)
   - Encrypt tokens with AES-256-GCM
   - Store as: nonce (12 bytes) || ciphertext || tag (16 bytes)
 ```
@@ -175,7 +186,7 @@ When user disconnects a service:
      GitHub:  DELETE https://api.github.com/applications/{client_id}/token
   2. Overwrite local token material with zeros
   3. Delete the credential record
-  4. Overwrite and delete the connection_credential_key from keychain
+  4. Overwrite and delete the bridge_credential_key from keychain
 ```
 
 ---
@@ -186,7 +197,7 @@ An autonomous agent running on behalf of the user needs access to connected serv
 
 **This is supported by the access pattern:**
 
-1. The `connection_credential_key` is stored in platform keychain with `AfterFirstUnlockThisDeviceOnly` access class — same as the `#agent` signing key (ADR-025). Available to background processes after first device unlock.
+1. The `bridge_credential_key` is stored in platform keychain with `AfterFirstUnlockThisDeviceOnly` access class — same as the `#agent` signing key (ADR-025). Available to background processes after first device unlock.
 
 2. At session dispatch (foreground, user present), the agent reads and decrypts the needed credentials. Holding decrypted tokens in memory for the duration of the agent run is fine.
 
@@ -195,7 +206,7 @@ An autonomous agent running on behalf of the user needs access to connected serv
 **If the agent run outlives the token lifetime:**
 - The agent must handle token refresh autonomously (using the stored refresh token)
 - This is a normal OAuth flow, no biometric needed
-- The refresh token itself is encrypted with the `connection_credential_key` which is accessible without biometrics
+- The refresh token itself is encrypted with the `bridge_credential_key` which is accessible without biometrics
 
 ---
 
@@ -205,8 +216,8 @@ An autonomous agent running on behalf of the user needs access to connected serv
 |---|---|---|
 | Store API keys in identity attestations (§3.5) | Attestations are public/verifiable claims. API keys are secrets. Publishing a secret in a verifiable claim defeats its purpose. | Use encrypted credential storage (§2a) |
 | Encode service tokens in UCANs (§7.2) | UCANs are SCP-context-scoped capability tokens. They don't model external service access. | Use encrypted credential storage (§2a) |
-| Derive credential encryption keys from `#active` or `#0` | Couples credential lifecycle to key rotation. If `#active` rotates, all credentials need re-encryption. Also violates key isolation (§12.11.2). | Use standalone random keys per connection |
-| Share credentials across connections | A GitHub token for Project A must not be accessible to the Linear connection for Project B, even under the same user. Per §12.11.2: cross-bridge credential sharing is prohibited. | Scope all storage by connection_id |
+| Derive credential encryption keys from `#active` or `#0` | Couples credential lifecycle to key rotation. If `#active` rotates, all credentials need re-encryption. Also violates key isolation (§12.11.2). | Use standalone random keys per bridge |
+| Share credentials across connections | A GitHub token for Project A must not be accessible to the Linear connection for Project B, even under the same user. Per §12.11.2: cross-bridge credential sharing is prohibited. | Scope all storage by bridge_id |
 | Store tokens in the SCP context (as messages or metadata) | Context data is visible to all context members via MLS. Service credentials are user-private. | Store in local encrypted credential store, never in context |
 | Use `ProtocolRepository` for credential storage | `ProtocolRepository` is context-scoped protocol state. Service credentials are operator-scoped private state. Different trust domain. | Use a separate credential store (the Rust core does this — `BridgeCredentialStore` is a separate trait) |
 
