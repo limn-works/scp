@@ -37,6 +37,92 @@ use crate::store::queue::DEFAULT_QUEUE_TTL_SECS;
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
+// SyncPhaseDriver (trait)
+// ---------------------------------------------------------------------------
+
+/// Async interface for executing the six-phase reconnection protocol.
+///
+/// Each phase corresponds to one step of the reconnection protocol defined in
+/// ADR-029 section 2. Implementations bridge the protocol logic to the
+/// transport layer (`TransportAdapter`), MLS group operations, and storage.
+///
+/// The trait is parameterized on `async fn in trait` and is NOT object-safe.
+/// SDK-level code provides a concrete implementation.
+///
+/// See ADR-029 section 2 (Reconnection Protocol).
+#[allow(async_fn_in_trait)]
+pub trait SyncPhaseDriver: Send + Sync {
+    /// Phase 1 — Relay catch-up: re-subscribe with `since` overlap, retrieve
+    /// and deduplicate buffered messages for a context.
+    ///
+    /// Returns the retrieved messages sorted by `stored_at`.
+    async fn relay_catch_up(
+        &self,
+        context_id: &str,
+        last_stored_at: u64,
+    ) -> Result<Vec<BufferedMessage>, SyncError>;
+
+    /// Phase 2 — MLS epoch reconciliation: compare local epoch against the
+    /// target epoch observed from relay messages and process Commits
+    /// sequentially or fall back to Welcome-based fast-forward.
+    ///
+    /// Returns the catch-up state after reconciliation completes.
+    async fn epoch_reconciliation(
+        &self,
+        context_id: &str,
+        local_epoch: u64,
+        target_epoch: u64,
+        policy: &SyncPolicy,
+    ) -> Result<EpochCatchUpState, SyncError>;
+
+    /// Phase 3 — Event log sync: exchange consistency checkpoints with online
+    /// members, compare Merkle roots, and request missing events.
+    ///
+    /// Returns the number of events recovered and any sync events (alerts).
+    async fn event_log_sync(&self, context_id: &str) -> Result<(u64, Vec<SyncEvent>), SyncError>;
+
+    /// Phase 4 — Sender key re-acquisition: request current sender keys for
+    /// any senders whose keys advanced during the offline period.
+    ///
+    /// Returns the number of unrecoverable messages (sender key timeout).
+    async fn sender_key_reacquire(
+        &self,
+        context_id: &str,
+        policy: &SyncPolicy,
+    ) -> Result<u64, SyncError>;
+
+    /// Phase 5 — MLS Update: issue an MLS Update proposal for post-compromise
+    /// security (§9.12).
+    ///
+    /// Returns `true` if the Update was successfully issued.
+    async fn mls_update(&self, context_id: &str) -> Result<bool, SyncError>;
+
+    /// Phase 6 — Queue drain: MLS-encrypt and send queued outbound messages.
+    ///
+    /// Returns `(drained, discarded)` counts.
+    async fn queue_drain(
+        &self,
+        context_id: &str,
+        now: u64,
+        blob_ttl_secs: Option<u64>,
+    ) -> Result<(u64, u64), SyncError>;
+
+    /// Returns the local MLS epoch for a context. `None` for Broadcast contexts.
+    async fn local_epoch(&self, context_id: &str) -> Result<Option<u64>, SyncError>;
+
+    /// Returns the target (current group) MLS epoch observed from relay
+    /// messages. `None` if no messages were received.
+    async fn observed_target_epoch(
+        &self,
+        context_id: &str,
+        messages: &[BufferedMessage],
+    ) -> Result<Option<u64>, SyncError>;
+
+    /// Returns the blob TTL for a context, if configured.
+    async fn blob_ttl_secs(&self, context_id: &str) -> Result<Option<u64>, SyncError>;
+}
+
+// ---------------------------------------------------------------------------
 // RelayMessageBuffer
 // ---------------------------------------------------------------------------
 
@@ -833,11 +919,217 @@ impl ReconnectionCoordinator {
                     events_recovered: 0,
                     messages_unrecoverable: 0,
                     mls_update_issued: false,
-                    outcome: SyncOutcome::FullyCaughtUp, // Placeholder until sync runs.
+                    outcome: SyncOutcome::Pending,
                     sync_events: Vec::new(),
                 }
             })
             .collect()
+    }
+
+    /// Executes the six-phase reconnection protocol for all active contexts.
+    ///
+    /// Runs each phase sequentially per context, using the provided
+    /// [`SyncPhaseDriver`] to bridge to transport and MLS operations.
+    /// Contexts classified as Tier 1 (Short) run the full 6-phase protocol.
+    /// Contexts classified as Tier 2 (Extended) or Tier 3 (Long) are included
+    /// in the report but their execution is delegated to the caller via the
+    /// appropriate tier-specific mechanisms (`DeltaSyncEngine`, `ReJoinExecutor`).
+    ///
+    /// The six phases per Tier 1 context (ADR-029 section 2):
+    /// 1. Relay catch-up
+    /// 2. MLS epoch reconciliation
+    /// 3. Event log sync
+    /// 4. Sender key re-acquisition
+    /// 5. MLS Update
+    /// 6. Queue drain
+    ///
+    /// # Arguments
+    ///
+    /// * `now` — Current Unix timestamp (seconds).
+    /// * `driver` — Phase driver providing transport and MLS operations.
+    ///
+    /// # Returns
+    ///
+    /// A [`ReconnectionReport`] with per-context results and aggregate stats.
+    pub async fn execute<D: SyncPhaseDriver>(&self, now: u64, driver: &D) -> ReconnectionReport {
+        let start = std::time::Instant::now();
+        let mut results = Vec::with_capacity(self.context_ids.len());
+        let mut total_drained: u64 = 0;
+        let mut total_discarded: u64 = 0;
+
+        for ctx_id in &self.context_ids {
+            let tier = self.classify_context(ctx_id, now);
+            let result = match tier {
+                OfflineTier::Short => self.execute_tier1(ctx_id, now, tier, driver).await,
+                OfflineTier::Extended | OfflineTier::Long => {
+                    // Tier 2 and Tier 3 contexts are reported with their
+                    // classification but not executed here — the caller
+                    // drives them via DeltaSyncEngine / ReJoinExecutor.
+                    ContextSyncResult {
+                        context_id: ctx_id.clone(),
+                        tier,
+                        epochs_caught_up: 0,
+                        events_recovered: 0,
+                        messages_unrecoverable: 0,
+                        mls_update_issued: false,
+                        outcome: match tier {
+                            OfflineTier::Extended => SyncOutcome::Failed {
+                                reason: "requires DeltaSyncEngine (Tier 2)".to_owned(),
+                            },
+                            OfflineTier::Long => SyncOutcome::Reset,
+                            OfflineTier::Short => SyncOutcome::FullyCaughtUp,
+                        },
+                        sync_events: Vec::new(),
+                    }
+                }
+            };
+
+            // Accumulate queue drain stats from Tier 1 contexts.
+            if let SyncOutcome::FullyCaughtUp | SyncOutcome::FastForwarded { .. } = &result.outcome
+                && let Ok((drained, discarded)) = driver
+                    .queue_drain(
+                        ctx_id,
+                        now,
+                        driver.blob_ttl_secs(ctx_id).await.ok().flatten(),
+                    )
+                    .await
+            {
+                total_drained = total_drained.saturating_add(drained);
+                total_discarded = total_discarded.saturating_add(discarded);
+            }
+
+            results.push(result);
+        }
+
+        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        ReconnectionReport {
+            contexts_synced: results,
+            messages_drained: total_drained,
+            messages_discarded: total_discarded,
+            total_duration_ms: elapsed_ms,
+        }
+    }
+
+    /// Executes the Tier 1 (Short offline) six-phase protocol for a single
+    /// context.
+    async fn execute_tier1<D: SyncPhaseDriver>(
+        &self,
+        context_id: &str,
+        _now: u64,
+        tier: OfflineTier,
+        driver: &D,
+    ) -> ContextSyncResult {
+        let last_contact = self
+            .last_relay_contacts
+            .get(context_id)
+            .copied()
+            .unwrap_or(0);
+
+        // Phase 1: Relay catch-up.
+        let messages = match driver.relay_catch_up(context_id, last_contact).await {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                return ContextSyncResult {
+                    context_id: context_id.to_owned(),
+                    tier,
+                    epochs_caught_up: 0,
+                    events_recovered: 0,
+                    messages_unrecoverable: 0,
+                    mls_update_issued: false,
+                    outcome: SyncOutcome::Failed {
+                        reason: format!("relay catch-up failed: {e}"),
+                    },
+                    sync_events: Vec::new(),
+                };
+            }
+        };
+
+        // Phase 2: MLS epoch reconciliation.
+        let local_epoch = driver.local_epoch(context_id).await.ok().flatten();
+        let target_epoch = driver
+            .observed_target_epoch(context_id, &messages)
+            .await
+            .ok()
+            .flatten();
+
+        let (epochs_caught_up, catch_up_outcome) = match (local_epoch, target_epoch) {
+            (Some(local), Some(target)) if target > local => {
+                match driver
+                    .epoch_reconciliation(context_id, local, target, &self.policy)
+                    .await
+                {
+                    Ok(state) => {
+                        let caught = state.commits_processed;
+                        let outcome = match &state.status {
+                            CatchUpStatus::Complete => SyncOutcome::FullyCaughtUp,
+                            CatchUpStatus::FastForwarded {
+                                skipped_from,
+                                skipped_to,
+                            } => SyncOutcome::FastForwarded {
+                                skipped_epochs: skipped_to.saturating_sub(*skipped_from),
+                            },
+                            CatchUpStatus::Failed { reason } => SyncOutcome::Failed {
+                                reason: reason.clone(),
+                            },
+                            CatchUpStatus::Processing => SyncOutcome::Failed {
+                                reason: "epoch reconciliation did not complete".to_owned(),
+                            },
+                        };
+                        (caught, outcome)
+                    }
+                    Err(e) => (
+                        0,
+                        SyncOutcome::Failed {
+                            reason: format!("epoch reconciliation failed: {e}"),
+                        },
+                    ),
+                }
+            }
+            _ => (0, SyncOutcome::FullyCaughtUp),
+        };
+
+        // If epoch reconciliation failed, return early.
+        if let SyncOutcome::Failed { .. } = &catch_up_outcome {
+            return ContextSyncResult {
+                context_id: context_id.to_owned(),
+                tier,
+                epochs_caught_up,
+                events_recovered: 0,
+                messages_unrecoverable: 0,
+                mls_update_issued: false,
+                outcome: catch_up_outcome,
+                sync_events: Vec::new(),
+            };
+        }
+
+        // Phase 3: Event log sync.
+        let (events_recovered, sync_events) = driver
+            .event_log_sync(context_id)
+            .await
+            .unwrap_or((0, Vec::new()));
+
+        // Phase 4: Sender key re-acquisition.
+        let messages_unrecoverable = driver
+            .sender_key_reacquire(context_id, &self.policy)
+            .await
+            .unwrap_or(0);
+
+        // Phase 5: MLS Update.
+        let mls_update_issued = driver.mls_update(context_id).await.unwrap_or(false);
+
+        // Phase 6 is handled at the aggregate level in execute().
+
+        ContextSyncResult {
+            context_id: context_id.to_owned(),
+            tier,
+            epochs_caught_up,
+            events_recovered,
+            messages_unrecoverable,
+            mls_update_issued,
+            outcome: catch_up_outcome,
+            sync_events,
+        }
     }
 
     /// Records that the MLS Update was issued for a context after catch-up.
@@ -2054,5 +2346,269 @@ mod tests {
 
         assert!(result.entries.is_empty());
         assert_eq!(result.expired_pruned, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncPhaseDriver + ReconnectionCoordinator::execute() tests
+    // -----------------------------------------------------------------------
+
+    /// A mock `SyncPhaseDriver` for testing `execute()`.
+    struct MockSyncDriver {
+        /// Messages to return from `relay_catch_up`.
+        relay_messages: Vec<BufferedMessage>,
+        /// Local epoch to return.
+        local_epoch_val: Option<u64>,
+        /// Whether MLS update should succeed.
+        mls_update_success: bool,
+        /// Events recovered from event log sync.
+        events_recovered_val: u64,
+        /// Whether to simulate a relay catch-up failure.
+        fail_relay: bool,
+    }
+
+    impl MockSyncDriver {
+        fn new() -> Self {
+            Self {
+                relay_messages: Vec::new(),
+                local_epoch_val: Some(1),
+                mls_update_success: true,
+                events_recovered_val: 5,
+                fail_relay: false,
+            }
+        }
+
+        fn with_relay_failure() -> Self {
+            Self {
+                fail_relay: true,
+                ..Self::new()
+            }
+        }
+    }
+
+    impl SyncPhaseDriver for MockSyncDriver {
+        async fn relay_catch_up(
+            &self,
+            context_id: &str,
+            _last_stored_at: u64,
+        ) -> Result<Vec<BufferedMessage>, SyncError> {
+            if self.fail_relay {
+                return Err(SyncError::RelayCatchUpFailed {
+                    context_id: context_id.to_owned(),
+                    reason: "relay unreachable".to_owned(),
+                });
+            }
+            Ok(self.relay_messages.clone())
+        }
+
+        async fn epoch_reconciliation(
+            &self,
+            context_id: &str,
+            local_epoch: u64,
+            target_epoch: u64,
+            _policy: &SyncPolicy,
+        ) -> Result<EpochCatchUpState, SyncError> {
+            let mut state =
+                EpochCatchUpState::new(context_id.to_owned(), local_epoch, target_epoch);
+            let gap = target_epoch.saturating_sub(local_epoch);
+            for _ in 0..gap {
+                state.record_commit_processed();
+            }
+            Ok(state)
+        }
+
+        async fn event_log_sync(
+            &self,
+            _context_id: &str,
+        ) -> Result<(u64, Vec<SyncEvent>), SyncError> {
+            Ok((self.events_recovered_val, Vec::new()))
+        }
+
+        async fn sender_key_reacquire(
+            &self,
+            _context_id: &str,
+            _policy: &SyncPolicy,
+        ) -> Result<u64, SyncError> {
+            Ok(0)
+        }
+
+        async fn mls_update(&self, _context_id: &str) -> Result<bool, SyncError> {
+            Ok(self.mls_update_success)
+        }
+
+        async fn queue_drain(
+            &self,
+            _context_id: &str,
+            _now: u64,
+            _blob_ttl_secs: Option<u64>,
+        ) -> Result<(u64, u64), SyncError> {
+            Ok((3, 1))
+        }
+
+        async fn local_epoch(&self, _context_id: &str) -> Result<Option<u64>, SyncError> {
+            Ok(self.local_epoch_val)
+        }
+
+        async fn observed_target_epoch(
+            &self,
+            _context_id: &str,
+            messages: &[BufferedMessage],
+        ) -> Result<Option<u64>, SyncError> {
+            Ok(messages.iter().filter_map(|m| m.epoch).max())
+        }
+
+        async fn blob_ttl_secs(&self, _context_id: &str) -> Result<Option<u64>, SyncError> {
+            Ok(Some(86_400))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_tier1_fully_caught_up() {
+        let now = 1_010_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-1".to_owned(), now - 3600); // 1 hour ago → Short
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-1".to_owned()],
+            contacts,
+        );
+
+        let mut driver = MockSyncDriver::new();
+        // No messages → epoch matches → FullyCaughtUp.
+        driver.relay_messages = Vec::new();
+        driver.local_epoch_val = Some(5);
+
+        let report = coord.execute(now, &driver).await;
+        assert_eq!(report.contexts_synced.len(), 1);
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.context_id, "ctx-1");
+        assert_eq!(result.tier, OfflineTier::Short);
+        assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
+        assert!(result.mls_update_issued);
+        assert_eq!(result.events_recovered, 5);
+    }
+
+    #[tokio::test]
+    async fn execute_tier1_with_epoch_catch_up() {
+        let now = 1_010_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-1".to_owned(), now - 3600);
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-1".to_owned()],
+            contacts,
+        );
+
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = Some(5);
+        driver.relay_messages = vec![BufferedMessage {
+            blob_id: "b1".to_owned(),
+            context_id: "ctx-1".to_owned(),
+            payload: vec![1],
+            stored_at: now - 1000,
+            epoch: Some(10),
+        }];
+
+        let report = coord.execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
+        assert_eq!(result.epochs_caught_up, 5); // 10 - 5
+    }
+
+    #[tokio::test]
+    async fn execute_tier1_relay_failure() {
+        let now = 1_010_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-1".to_owned(), now - 3600);
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-1".to_owned()],
+            contacts,
+        );
+
+        let driver = MockSyncDriver::with_relay_failure();
+
+        let report = coord.execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(reason.contains("relay catch-up failed"));
+    }
+
+    #[tokio::test]
+    async fn execute_extended_context_not_executed_as_tier1() {
+        let now = 1_010_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        // 5 days ago → Extended (Tier 2)
+        contacts.insert("ctx-ext".to_owned(), now - 5 * 86_400);
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-ext".to_owned()],
+            contacts,
+        );
+
+        let driver = MockSyncDriver::new();
+        let report = coord.execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.tier, OfflineTier::Extended);
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!(
+                "expected Failed for Tier 2 delegation, got {:?}",
+                result.outcome
+            );
+        };
+        assert!(reason.contains("Tier 2"));
+    }
+
+    #[tokio::test]
+    async fn execute_long_context_returns_reset() {
+        let now = 2_000_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        // 14 days ago → Long (Tier 3)
+        contacts.insert("ctx-long".to_owned(), now - 14 * 86_400);
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-long".to_owned()],
+            contacts,
+        );
+
+        let driver = MockSyncDriver::new();
+        let report = coord.execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.tier, OfflineTier::Long);
+        assert_eq!(result.outcome, SyncOutcome::Reset);
+    }
+
+    #[tokio::test]
+    async fn execute_multiple_contexts_mixed_tiers() {
+        let now = 2_000_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-short".to_owned(), now - 3600); // Short
+        contacts.insert("ctx-ext".to_owned(), now - 5 * 86_400); // Extended
+        contacts.insert("ctx-long".to_owned(), now - 14 * 86_400); // Long
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec![
+                "ctx-short".to_owned(),
+                "ctx-ext".to_owned(),
+                "ctx-long".to_owned(),
+            ],
+            contacts,
+        );
+
+        let driver = MockSyncDriver::new();
+        let report = coord.execute(now, &driver).await;
+        assert_eq!(report.contexts_synced.len(), 3);
+        assert_eq!(report.contexts_synced[0].tier, OfflineTier::Short);
+        assert_eq!(report.contexts_synced[1].tier, OfflineTier::Extended);
+        assert_eq!(report.contexts_synced[2].tier, OfflineTier::Long);
+        // Queue drain only runs for successful Tier 1 contexts.
+        assert!(report.messages_drained > 0);
     }
 }

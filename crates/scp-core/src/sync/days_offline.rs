@@ -731,7 +731,7 @@ pub fn apply_delta(
     local_state.tool_names.sort();
 
     // Advance event log state
-    local_state.event_count += delta.events_added;
+    local_state.event_count = local_state.event_count.saturating_add(delta.events_added);
     local_state.event_log_merkle_root = delta.new_merkle_root;
 
     // Advance epoch and snapshot sequence
@@ -756,10 +756,7 @@ pub fn apply_delta(
 ///
 /// See ADR-029 section 3 (MLS Epoch Catch-Up).
 #[must_use]
-pub const fn determine_mls_recovery(
-    delta: &SnapshotDelta,
-    policy: &SyncPolicy,
-) -> MlsRecoveryAction {
+pub fn determine_mls_recovery(delta: &SnapshotDelta, policy: &SyncPolicy) -> MlsRecoveryAction {
     match (delta.from_epoch, delta.to_epoch) {
         (Some(from), Some(to)) if from == to => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) => {
@@ -776,9 +773,20 @@ pub const fn determine_mls_recovery(
                 }
             }
         }
-        // (None, None) = broadcast context, or mismatched None/Some —
-        // anomalous state; treat as no action (caller handles).
-        _ => MlsRecoveryAction::NoAction,
+        // (None, None) = broadcast context — no MLS epoch to reconcile.
+        (None, None) => MlsRecoveryAction::NoAction,
+        // Mismatched None/Some — anomalous state (one snapshot has an MLS
+        // epoch and the other does not). Log a warning and fall through to
+        // NoAction; the caller is responsible for handling the mismatch.
+        (from, to) => {
+            tracing::warn!(
+                context_id = %delta.context_id,
+                from_epoch = ?from,
+                to_epoch = ?to,
+                "anomalous MLS epoch state in delta: mismatched None/Some pair"
+            );
+            MlsRecoveryAction::NoAction
+        }
     }
 }
 
@@ -868,6 +876,150 @@ pub fn equivocation_alert_from_divergence(
             Some(SyncEvent::EquivocationDetected(Box::new(alert)))
         }
         DeviceDivergence::Consistent | DeviceDivergence::Behind { .. } => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SnapshotTransport (trait)
+// ---------------------------------------------------------------------------
+
+/// Low-level async transport for snapshot data.
+///
+/// Abstracts the raw transport operations needed by [`RelayBackedDeltaSyncEngine`].
+/// Implementations bridge to the relay's `query` and `send` operations. The trait
+/// deals in raw bytes — serialization is handled by the engine.
+///
+/// Note: uses `async fn in trait` which is NOT object-safe. This matches the
+/// pattern of [`DeltaSyncEngine`] and [`super::weeks_offline::ReJoinExecutor`].
+///
+/// See ADR-029 section 1 (Tier 2 strategy).
+#[allow(async_fn_in_trait)]
+pub trait SnapshotTransport: Send + Sync {
+    /// Queries the relay for the latest snapshot bytes for a context.
+    ///
+    /// The snapshot is stored at a well-known routing key derived from the
+    /// context ID. Returns `None` if no snapshot exists on the relay.
+    async fn query_snapshot(&self, context_id: &str) -> Result<Option<Vec<u8>>, DaysOfflineError>;
+
+    /// Publishes snapshot bytes to the relay for a context.
+    ///
+    /// Overwrites any existing snapshot at the well-known routing key.
+    async fn publish_snapshot_bytes(
+        &self,
+        context_id: &str,
+        data: &[u8],
+    ) -> Result<(), DaysOfflineError>;
+}
+
+// ---------------------------------------------------------------------------
+// RelayBackedDeltaSyncEngine
+// ---------------------------------------------------------------------------
+
+/// A [`DeltaSyncEngine`] implementation backed by relay transport.
+///
+/// Uses a [`SnapshotTransport`] to fetch and publish snapshots. Delta
+/// computation is performed locally by comparing the fetched snapshot against
+/// the local checkpoint using [`compute_delta`].
+///
+/// # Snapshot serialization
+///
+/// Snapshots are serialized as `MessagePack` (wire format) for compact relay
+/// storage. JSON canonical hashing is used only for signature computation
+/// (per the project-wide canonical hashing rule).
+///
+/// See ADR-029 section 1 (Tier 2 strategy).
+pub struct RelayBackedDeltaSyncEngine<T: SnapshotTransport> {
+    /// The transport used to fetch/publish snapshot data.
+    transport: T,
+    /// Local snapshot checkpoint for delta computation.
+    /// When set, `fetch_delta` compares the remote snapshot against this.
+    local_checkpoint: Option<ContextSnapshot>,
+}
+
+impl<T: SnapshotTransport> RelayBackedDeltaSyncEngine<T> {
+    /// Creates a new engine with the given transport.
+    #[must_use]
+    pub const fn new(transport: T) -> Self {
+        Self {
+            transport,
+            local_checkpoint: None,
+        }
+    }
+
+    /// Creates a new engine with a local checkpoint for delta computation.
+    #[must_use]
+    pub const fn with_checkpoint(transport: T, local_checkpoint: ContextSnapshot) -> Self {
+        Self {
+            transport,
+            local_checkpoint: Some(local_checkpoint),
+        }
+    }
+
+    /// Sets the local checkpoint used for delta computation.
+    pub fn set_checkpoint(&mut self, snapshot: ContextSnapshot) {
+        self.local_checkpoint = Some(snapshot);
+    }
+}
+
+impl<T: SnapshotTransport> DeltaSyncEngine for RelayBackedDeltaSyncEngine<T> {
+    async fn fetch_snapshot(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<ContextSnapshot>, DaysOfflineError> {
+        let Some(data) = self.transport.query_snapshot(context_id).await? else {
+            return Ok(None);
+        };
+
+        let snapshot: ContextSnapshot =
+            rmp_serde::from_slice(&data).map_err(|_| DaysOfflineError::NoSnapshotAvailable {
+                context_id: context_id.to_owned(),
+            })?;
+
+        // Verify context ID matches.
+        if snapshot.context_id != context_id {
+            return Err(DaysOfflineError::ContextMismatch {
+                expected: context_id.to_owned(),
+                actual: snapshot.context_id,
+            });
+        }
+
+        Ok(Some(snapshot))
+    }
+
+    async fn fetch_delta(
+        &self,
+        context_id: &str,
+        from_sequence: u64,
+    ) -> Result<Option<SnapshotDelta>, DaysOfflineError> {
+        // Fetch the current snapshot from the relay.
+        let Some(current) = self.fetch_snapshot(context_id).await? else {
+            return Ok(None);
+        };
+
+        // Use the local checkpoint if available.
+        let local = match &self.local_checkpoint {
+            Some(cp) if cp.context_id == context_id && cp.sequence == from_sequence => cp,
+            _ => {
+                // Cannot compute delta without a matching local checkpoint.
+                return Ok(None);
+            }
+        };
+
+        // Compute the delta locally.
+        let delta = compute_delta(local, &current)?;
+        Ok(Some(delta))
+    }
+
+    async fn publish_snapshot(&self, snapshot: &ContextSnapshot) -> Result<(), DaysOfflineError> {
+        let data = rmp_serde::to_vec_named(snapshot).map_err(|_| {
+            DaysOfflineError::NoSnapshotAvailable {
+                context_id: snapshot.context_id.clone(),
+            }
+        })?;
+
+        self.transport
+            .publish_snapshot_bytes(&snapshot.context_id, &data)
+            .await
     }
 }
 

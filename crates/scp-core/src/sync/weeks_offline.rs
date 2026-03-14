@@ -790,6 +790,10 @@ pub struct BilateralRecoveryParams<'a> {
     pub local_epoch: u64,
     /// Current group epoch.
     pub current_epoch: u64,
+    /// Number of messages queued by the online member during the offline
+    /// period. The caller obtains this from the outbound queue length for
+    /// this context in the online member's `ProtocolRepository`.
+    pub online_member_queued_messages: u64,
 }
 
 /// Assesses recovery for a bilateral (2-person) context.
@@ -815,7 +819,7 @@ pub fn assess_bilateral_recovery(params: &BilateralRecoveryParams<'_>) -> Bilate
         online_member_can_reset: params.online_can_reset,
         last_known_epoch: params.local_epoch,
         current_epoch: params.current_epoch,
-        online_member_queued_messages: 0,
+        online_member_queued_messages: params.online_member_queued_messages,
         assessment,
     }
 }
@@ -1138,6 +1142,151 @@ pub fn determine_inflight_handling(
     InFlightMessageHandling::QueueAndResend {
         queued_count,
         max_queue_size: queue_max,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResetTransport (trait)
+// ---------------------------------------------------------------------------
+
+/// Low-level async transport for reset request operations.
+///
+/// Abstracts the raw transport operations needed by [`RelayBackedReJoinExecutor`].
+/// Implementations bridge to the relay's `send` and `subscribe` operations.
+///
+/// Note: uses `async fn in trait` which is NOT object-safe. This matches the
+/// pattern of [`ReJoinExecutor`] and [`super::days_offline::SnapshotTransport`].
+///
+/// See ADR-029 section 4 (Reset Protocol).
+#[allow(async_fn_in_trait)]
+pub trait ResetTransport: Send + Sync {
+    /// Publishes a serialized reset request to the relay as plaintext.
+    ///
+    /// The request is NOT MLS-encrypted — the member may not be able to
+    /// encrypt at the current epoch. It IS signed for authentication.
+    async fn publish_plaintext(
+        &self,
+        context_id: &str,
+        data: &[u8],
+    ) -> Result<(), WeeksOfflineError>;
+
+    /// Removes a member's stale MLS leaf node and re-adds them with a fresh
+    /// `KeyPackage`. This is the admin-side MLS operation.
+    ///
+    /// Returns the new MLS epoch after the re-add Commit.
+    async fn remove_and_readd_member(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        role_to_restore: &str,
+    ) -> Result<u64, WeeksOfflineError>;
+
+    /// Subscribes to Welcome messages for the given context and waits for one
+    /// to arrive within the timeout.
+    ///
+    /// Returns the new MLS epoch after processing the Welcome.
+    async fn subscribe_and_await_welcome(
+        &self,
+        context_id: &str,
+        timeout_secs: u64,
+    ) -> Result<u64, WeeksOfflineError>;
+}
+
+// ---------------------------------------------------------------------------
+// RelayBackedReJoinExecutor
+// ---------------------------------------------------------------------------
+
+/// A [`ReJoinExecutor`] implementation backed by relay transport.
+///
+/// Uses a [`ResetTransport`] to publish reset requests, execute admin-side
+/// MLS operations, and await Welcome messages. Anti-replay validation
+/// (signature, freshness, nonce dedup) is performed by
+/// [`validate_reset_request`] before the reset is processed.
+///
+/// See ADR-029 section 4 (Tier 3 reset protocol).
+pub struct RelayBackedReJoinExecutor<T: ResetTransport> {
+    /// The transport used for reset operations.
+    transport: T,
+    /// Nonce tracker for anti-replay on inbound reset requests.
+    nonce_tracker: ResetRequestNonceTracker,
+}
+
+impl<T: ResetTransport> RelayBackedReJoinExecutor<T> {
+    /// Creates a new executor with the given transport.
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport,
+            nonce_tracker: ResetRequestNonceTracker::with_default_ttl(),
+        }
+    }
+
+    /// Creates a new executor with a custom nonce tracker.
+    pub const fn with_nonce_tracker(transport: T, nonce_tracker: ResetRequestNonceTracker) -> Self {
+        Self {
+            transport,
+            nonce_tracker,
+        }
+    }
+
+    /// Returns a reference to the nonce tracker for external validation.
+    #[must_use]
+    pub const fn nonce_tracker(&self) -> &ResetRequestNonceTracker {
+        &self.nonce_tracker
+    }
+
+    /// Validates an inbound reset request for anti-replay before processing.
+    ///
+    /// Performs freshness check and nonce dedup via [`validate_reset_request`].
+    /// The caller must verify the Ed25519 signature on the returned canonical
+    /// hash and call [`NonceGuard::commit`] if signature verification succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeeksOfflineError::StaleResetRequest`] or
+    /// [`WeeksOfflineError::ReplayedResetRequest`] on validation failure.
+    pub fn validate_inbound_request<'a>(
+        &'a self,
+        request: &ResetRequest,
+        now: u64,
+    ) -> Result<ValidatedResetRequest<'a>, WeeksOfflineError> {
+        validate_reset_request(request, now, &self.nonce_tracker)
+    }
+}
+
+impl<T: ResetTransport> ReJoinExecutor for RelayBackedReJoinExecutor<T> {
+    async fn publish_reset_request(&self, request: &ResetRequest) -> Result<(), WeeksOfflineError> {
+        // Serialize the reset request as MessagePack for wire transport.
+        let data = rmp_serde::to_vec_named(request).map_err(|e| {
+            WeeksOfflineError::ResetRequestFailed {
+                context_id: request.context_id.clone(),
+                reason: format!("serialization failed: {e}"),
+            }
+        })?;
+
+        self.transport
+            .publish_plaintext(&request.context_id, &data)
+            .await
+    }
+
+    async fn process_reset(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        role_to_restore: &str,
+    ) -> Result<u64, WeeksOfflineError> {
+        self.transport
+            .remove_and_readd_member(context_id, member_did, role_to_restore)
+            .await
+    }
+
+    async fn await_welcome(
+        &self,
+        context_id: &str,
+        timeout_secs: u64,
+    ) -> Result<u64, WeeksOfflineError> {
+        self.transport
+            .subscribe_and_await_welcome(context_id, timeout_secs)
+            .await
     }
 }
 
@@ -1526,6 +1675,7 @@ mod tests {
             now: BASE_TIMESTAMP + FOURTEEN_DAYS_SECS,
             local_epoch: 50,
             current_epoch: 200,
+            online_member_queued_messages: 5,
         });
 
         assert_eq!(recovery.context_id, "ctx-bilateral");
@@ -1534,6 +1684,7 @@ mod tests {
         assert!(recovery.online_member_can_reset);
         assert_eq!(recovery.last_known_epoch, 50);
         assert_eq!(recovery.current_epoch, 200);
+        assert_eq!(recovery.online_member_queued_messages, 5);
         assert!(matches!(
             recovery.assessment,
             OfflineAssessment::ForceReJoinRequired { .. }
@@ -1551,6 +1702,7 @@ mod tests {
             now: BASE_TIMESTAMP + THREE_DAYS_SECS,
             local_epoch: 50,
             current_epoch: 60,
+            online_member_queued_messages: 0,
         });
 
         assert!(matches!(
@@ -1570,6 +1722,7 @@ mod tests {
             now: BASE_TIMESTAMP + FOURTEEN_DAYS_SECS,
             local_epoch: 50,
             current_epoch: 200,
+            online_member_queued_messages: 0,
         });
 
         assert!(!recovery.online_member_can_reset);
@@ -1810,6 +1963,7 @@ mod tests {
             now: BASE_TIMESTAMP + THIRTY_DAYS_SECS,
             local_epoch: 10,
             current_epoch: 3_000,
+            online_member_queued_messages: 42,
         });
         assert!(matches!(
             recovery.assessment,
