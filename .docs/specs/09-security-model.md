@@ -1483,6 +1483,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-COMMIT-RANGE-REQ-V1:"` | Commit range request signing | §23.16.2 |
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
 | `"SCP-CONTEXT-SNAPSHOT-V1:"` | Context snapshot signing | §23.16.4 |
+| `"SCP-DID-AUTH-V1:"` | SCPID challenge-response signing | §3.11 |
 
 ### 9.18.3 Key Derivation and HPKE Labels
 
