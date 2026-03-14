@@ -475,32 +475,22 @@ pub fn enforce_inner_envelope_category_a(
 
 /// Validates that an inner envelope's version field is compatible (§13.5).
 ///
-/// Accepts envelopes with the same major version. When minor versions differ,
-/// the implementation operates in degraded mode (§13.6) and a `tracing::warn!`
-/// is emitted.
+/// Accepts envelopes with the same major version. Returns
+/// [`VersionCompatibility`] so the caller can decide whether and how to log
+/// degraded-mode situations. This function intentionally does **not** emit
+/// `tracing::warn!` itself, because [`verify_inner_signature`] also calls
+/// [`check_version_compatibility`](super::check_version_compatibility) and
+/// logs on mismatch — callers that invoke both would otherwise get duplicate
+/// warnings.
 ///
 /// # Errors
 ///
 /// Returns [`EnvelopeError::UnsupportedVersion`] if the major version differs
 /// from this implementation's major version.
-pub fn validate_inner_version(
+pub const fn validate_inner_version(
     inner: &InnerEnvelope,
 ) -> Result<super::VersionCompatibility, EnvelopeError> {
-    let compat = super::check_version_compatibility(inner.version)?;
-    if let super::VersionCompatibility::DegradedMode {
-        local_minor,
-        remote_minor,
-    } = compat
-    {
-        tracing::warn!(
-            wire_version = format_args!("{:#06x}", inner.version),
-            local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
-            local_minor,
-            remote_minor,
-            "inner envelope minor version mismatch — operating in degraded mode (§13.6)"
-        );
-    }
-    Ok(compat)
+    super::check_version_compatibility(inner.version)
 }
 
 // ---------------------------------------------------------------------------
