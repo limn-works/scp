@@ -923,6 +923,13 @@ pub fn remove_identity(did: &str) {
 /// functions use [`get_storage`] to access the provider for storing and
 /// loading identity state.
 ///
+/// **Default is `InMemoryStorage`:** Data does NOT survive process restarts.
+/// SDK consumers requiring durable persistence should provide a file-backed
+/// `Storage` implementation (e.g., `SqliteStorage`) at the application layer.
+/// The in-memory default is suitable for testing and ephemeral workloads; the
+/// architecture supports real persistence — it is an SDK integration concern
+/// to wire a durable backend.
+///
 /// The storage backend is `InMemoryStorage` wrapped in
 /// [`EncryptingAdapter`] with a random AES-256-GCM key. This satisfies
 /// the sealed `EncryptedStorage` bound required by

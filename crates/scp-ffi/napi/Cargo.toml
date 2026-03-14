@@ -25,6 +25,7 @@ tracing = { workspace = true }
 base64 = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
+zeroize = { workspace = true }
 z-base-32 = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -32,7 +33,7 @@ scp-core = { path = "../../scp-core" }
 scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
-scp-platform = { path = "../../scp-platform", features = ["testing"] }
+scp-platform = { path = "../../scp-platform", features = ["testing", "encrypting"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 
