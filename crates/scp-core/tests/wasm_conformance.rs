@@ -5367,6 +5367,18 @@ fn wasm_core_category_a_resources_match() {
 }
 
 #[test]
+fn core_wasm_category_a_resources_match() {
+    // Reverse direction: verify every core CATEGORY_A_RESOURCE exists in WASM's list
+    use scp_core::trust::custody_violation::category_a_resources;
+    for resource in category_a_resources() {
+        assert!(
+            wasm_ucan_mirror::CATEGORY_A_RESOURCES.contains(resource),
+            "Core CATEGORY_A_RESOURCES entry '{resource}' missing from WASM mirror"
+        );
+    }
+}
+
+#[test]
 fn wasm_core_category_a_agent_rejected() {
     let token = wasm_ucan_mirror::ParsedUcanToken {
         header: wasm_ucan_mirror::UcanHeader {
