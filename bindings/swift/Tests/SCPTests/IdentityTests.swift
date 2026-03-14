@@ -153,7 +153,7 @@ struct IdentityTests {
 
         let mockAttest: IdentityBridge.AttestDeviceFn = { _ in
             throw ScpError.Identity(
-                message: "device attestation requires retained identity state",
+                msg: "device attestation requires retained identity state",
                 code: "SCP-IDENT-1007"
             )
         }
@@ -211,7 +211,7 @@ struct IdentityTests {
     func identityVerifyDeviceAttestationPropagatesBridgeErrors() async throws {
         let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { _, _ in
             throw ScpError.Identity(
-                message: "invalid base64 attestation token",
+                msg: "invalid base64 attestation token",
                 code: "SCP-IDENT-1011"
             )
         }
@@ -255,7 +255,7 @@ struct IdentityTests {
     func createIdentityPropagatesErrors() async throws {
         let mockCreate: IdentityBridge.CreateFn = { _ in
             throw ScpError.Identity(
-                message: "in_memory custody not available",
+                msg: "in_memory custody not available",
                 code: "SCP-IDENT-1008"
             )
         }
@@ -295,7 +295,7 @@ struct IdentityTests {
     func loadIdentityPropagatesErrors() async throws {
         let mockLoad: IdentityBridge.LoadFn = { _ in
             throw ScpError.Identity(
-                message: "unsupported DID method",
+                msg: "unsupported DID method",
                 code: "SCP-IDENT-1004"
             )
         }
@@ -342,7 +342,7 @@ struct IdentityTests {
     func resolveIdentityPropagatesErrors() async throws {
         let mockResolve: IdentityBridge.ResolveFn = { _ in
             throw ScpError.Identity(
-                message: "DID not found on DHT",
+                msg: "DID not found on DHT",
                 code: "SCP-IDENT-1006"
             )
         }
@@ -385,7 +385,7 @@ struct IdentityTests {
     func createIdentityWithAgentKeyPropagatesErrors() async throws {
         let mockCreate: IdentityBridge.CreateWithAgentKeyFn = { _ in
             throw ScpError.Identity(
-                message: "agent key creation failed",
+                msg: "agent key creation failed",
                 code: "SCP-IDENT-1020"
             )
         }
@@ -432,7 +432,7 @@ struct IdentityTests {
 
         let mockMigrate: IdentityBridge.MigrateFn = { _ in
             throw ScpError.Identity(
-                message: "identity not in registry",
+                msg: "identity not in registry",
                 code: "SCP-IDENT-1021"
             )
         }

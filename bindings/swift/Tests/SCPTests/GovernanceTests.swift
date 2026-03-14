@@ -271,7 +271,7 @@ struct GovernanceTests {
 
         let mockExecute: GovernanceBridge.ExecuteFn = { _, _ in
             throw ScpError.Permission(
-                message: "Not authorized to execute governance action",
+                msg: "Not authorized to execute governance action",
                 code: "SCP-PERM-3001"
             )
         }
@@ -879,7 +879,7 @@ struct GovernanceTests {
         let context = makeActiveContext()
 
         let mockMemberCount: MembershipBridge.MemberCountFn = { _ in
-            throw ScpError.Context(message: "Internal error", code: "SCP-CTX-2099")
+            throw ScpError.Context(msg: "Internal error", code: "SCP-CTX-2099")
         }
 
         do {
@@ -902,7 +902,7 @@ struct GovernanceTests {
 
         let mockPublish: BroadcastBridge.PublishFn = { _, _, _ in
             throw ScpError.Permission(
-                message: "Not authorized to publish",
+                msg: "Not authorized to publish",
                 code: "SCP-PERM-3002"
             )
         }

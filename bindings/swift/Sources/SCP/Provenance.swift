@@ -78,7 +78,7 @@ public enum ProvenanceBridge {
 ///   - counterparties: Optional list of counterparty DIDs.
 ///   - evaluateQualityFn: Bridge function override for testing.
 /// - Returns: Quality tier integer (0-3).
-/// - Throws: ``ScpError/Validation(message:code:)`` if source type or
+/// - Throws: ``ScpError/Validation(msg:code:)`` if source type or
 ///   context state is not recognized.
 ///
 /// ## Provenance
@@ -108,7 +108,7 @@ public func evaluateProvenanceQuality(
 ///   - existingChainDepth: Optional existing chain depth to extend.
 ///   - attachFn: Bridge function override for testing.
 /// - Returns: A JSON string with the attached provenance record.
-/// - Throws: ``ScpError/Validation(message:code:)`` if source type or
+/// - Throws: ``ScpError/Validation(msg:code:)`` if source type or
 ///   memory scope is not recognized.
 ///
 /// ## Provenance

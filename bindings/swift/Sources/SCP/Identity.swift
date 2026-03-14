@@ -341,7 +341,7 @@ public func identityVerifyDeviceAttestation(
 ///   - custody: The custody method string (`"in_memory"` or `"platform"`).
 ///   - createFn: Bridge function override for testing.
 /// - Returns: A new ``Identity`` instance.
-/// - Throws: ``ScpError/Identity(message:code:)`` if creation fails.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if creation fails.
 ///
 /// ## Provenance
 ///
@@ -364,7 +364,7 @@ public func createIdentity(
 ///   - did: The DID string to load (e.g., `"did:dht:z6Mk..."`).
 ///   - loadFn: Bridge function override for testing.
 /// - Returns: An ``Identity`` handle for the loaded DID.
-/// - Throws: ``ScpError/Identity(message:code:)`` if the DID format is
+/// - Throws: ``ScpError/Identity(msg:code:)`` if the DID format is
 ///   unsupported or the identity cannot be loaded.
 ///
 /// ## Provenance
@@ -387,7 +387,7 @@ public func loadIdentity(
 ///   - did: The DID string to resolve (e.g., `"did:dht:z6Mk..."`).
 ///   - resolveFn: Bridge function override for testing.
 /// - Returns: A ``DidDocument`` with the resolved document fields.
-/// - Throws: ``ScpError/Identity(message:code:)`` if the DID cannot be
+/// - Throws: ``ScpError/Identity(msg:code:)`` if the DID cannot be
 ///   resolved (not found on DHT, invalid format, verification failure).
 ///
 /// ## Provenance
@@ -411,7 +411,7 @@ public func resolveIdentity(
 ///   - custody: The custody method string (`"in_memory"` or `"platform"`).
 ///   - createWithAgentKeyFn: Bridge function override for testing.
 /// - Returns: A new ``Identity`` instance with an agent key.
-/// - Throws: ``ScpError/Identity(message:code:)`` if creation fails.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if creation fails.
 ///
 /// ## Provenance
 ///
@@ -434,7 +434,7 @@ public func createIdentityWithAgentKey(
 ///   - identity: The identity to migrate.
 ///   - migrateFn: Bridge function override for testing.
 /// - Returns: A new ``Identity`` with the migrated DID.
-/// - Throws: ``ScpError/Identity(message:code:)`` if the identity is
+/// - Throws: ``ScpError/Identity(msg:code:)`` if the identity is
 ///   not in the registry or migration fails.
 ///
 /// ## Provenance
@@ -458,7 +458,7 @@ public func migrateIdentity(
 ///   - tier: Compromise tier: `"agent"`, `"active_signing"`, or `"identity_key"`.
 ///   - contextIds: Context IDs where this DID is a member.
 /// - Returns: JSON string with the recovery result.
-/// - Throws: ``ScpError/Identity(message:code:)`` if recovery fails.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if recovery fails.
 ///
 /// ## Provenance
 ///
@@ -481,7 +481,7 @@ public func executeRecovery(
 ///     `"software"`, or `"in_memory"`.
 ///   - contextIds: Context IDs where this DID is a member.
 /// - Returns: JSON string with the migration result.
-/// - Throws: ``ScpError/Identity(message:code:)`` if migration fails.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if migration fails.
 ///
 /// ## Provenance
 ///

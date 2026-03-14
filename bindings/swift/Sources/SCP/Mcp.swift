@@ -173,7 +173,7 @@ public enum McpBridge {
     /// Default serve function. Will delegate to UniFFI when MCP exports land.
     public static let defaultServe: ServeFn = { _ in
         throw ScpError.Tool(
-            message: "MCP server bridge not yet wired to UniFFI — awaiting mcp_serve export",
+            msg: "MCP server bridge not yet wired to UniFFI — awaiting mcp_serve export",
             code: "SCP-MCP-10001"
         )
     }
@@ -181,7 +181,7 @@ public enum McpBridge {
     /// Default client create function. Will delegate to UniFFI when MCP exports land.
     public static let defaultClientCreate: ClientCreateFn = { _ in
         throw ScpError.Tool(
-            message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_create export",
+            msg: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_create export",
             code: "SCP-MCP-10002"
         )
     }
@@ -189,7 +189,7 @@ public enum McpBridge {
     /// Default client list tools function.
     public static let defaultClientListTools: ClientListToolsFn = { _ in
         throw ScpError.Tool(
-            message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_list_tools export",
+            msg: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_list_tools export",
             code: "SCP-MCP-10003"
         )
     }
@@ -197,7 +197,7 @@ public enum McpBridge {
     /// Default client invoke function.
     public static let defaultClientInvoke: ClientInvokeFn = { _, _, _, _, _ in
         throw ScpError.Tool(
-            message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_invoke export",
+            msg: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_invoke export",
             code: "SCP-MCP-10004"
         )
     }
@@ -241,7 +241,7 @@ public final class McpClientHandle: Sendable {
 ///   - config: The ``McpServerConfig`` specifying which contexts to expose
 ///     and the transport type.
 ///   - serveFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Tool(message:code:)`` if the server fails to start.
+/// - Throws: ``ScpError/Tool(msg:code:)`` if the server fails to start.
 ///
 /// ## Provenance
 ///
@@ -326,7 +326,7 @@ public actor McpClient {
     ///   - config: The ``McpClientConfig`` specifying the connection transport.
     ///   - createFn: Bridge function override for testing.
     /// - Returns: A connected ``McpClient`` ready to list and invoke tools.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the connection or
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the connection or
     ///   handshake fails.
     ///
     /// ## Provenance
@@ -350,7 +350,7 @@ public actor McpClient {
     ///
     /// - Returns: An array of ``McpToolDefinition`` values describing available
     ///   tools.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the listing fails.
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the listing fails.
     public func listTools() async throws -> [McpToolDefinition] {
         try await listToolsFn(handle)
     }
@@ -369,7 +369,7 @@ public actor McpClient {
     ///   - contextId: The SCP context ID for provenance tracking.
     ///   - invokerDid: The DID of the agent invoking the tool.
     /// - Returns: An ``McpToolResult`` containing the output and provenance.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if invocation fails.
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if invocation fails.
     public func invoke(
         tool: String,
         input: Data,

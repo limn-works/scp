@@ -1494,13 +1494,13 @@ struct RealFFITypeShapeTests {
     func ffiScpErrorVariants() {
         // Verify all error variants can be constructed
         let errors: [ScpError] = [
-            .Identity(message: "test", code: "SCP-IDENT-1000"),
-            .Context(message: "test", code: "SCP-CTX-2000"),
-            .Permission(message: "test", code: "SCP-PERM-3000"),
-            .Crypto(message: "test", code: "SCP-CRYPTO-4000"),
-            .Transport(message: "test", code: "SCP-TRANS-5000"),
-            .Tool(message: "test", code: "SCP-TOOL-6000"),
-            .Validation(message: "test", code: "SCP-VALID-7000")
+            .Identity(msg: "test", code: "SCP-IDENT-1000"),
+            .Context(msg: "test", code: "SCP-CTX-2000"),
+            .Permission(msg: "test", code: "SCP-PERM-3000"),
+            .Crypto(msg: "test", code: "SCP-CRYPTO-4000"),
+            .Transport(msg: "test", code: "SCP-TRANS-5000"),
+            .Tool(msg: "test", code: "SCP-TOOL-6000"),
+            .Validation(msg: "test", code: "SCP-VALID-7000")
         ]
         #expect(errors.count == 7)
     }

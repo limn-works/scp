@@ -34,7 +34,7 @@ struct DiscoveryTests {
     func parseAddressError() throws {
         let mockParse: DiscoveryBridge.ParseAddressFn = { _ in
             throw ScpError.Validation(
-                message: "malformed address",
+                msg: "malformed address",
                 code: "SCP-VALID-7100"
             )
         }
@@ -136,7 +136,7 @@ struct DiscoveryTests {
     func discoverError() async {
         let mockDiscover: DiscoveryBridge.DiscoverFn = { _ in
             throw ScpError.Context(
-                message: "DID resolution failed",
+                msg: "DID resolution failed",
                 code: "SCP-CTX-2050"
             )
         }

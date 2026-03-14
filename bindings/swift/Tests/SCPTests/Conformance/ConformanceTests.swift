@@ -67,7 +67,7 @@ struct ConformanceTests {
             // (which would crash on the nil-pointer handle).
             let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in
                 throw ScpError.Validation(
-                    message: "Conformance stub: no real Rust runtime",
+                    msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-VALID-7999"
                 )
             }
@@ -96,7 +96,7 @@ struct ConformanceTests {
             let handle = ContextHandle(noPointer: .init())
             let mockMint: UcanBridge.MintFn = { _, _, _ in
                 throw ScpError.Validation(
-                    message: "Conformance stub: no real Rust runtime",
+                    msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-VALID-7999"
                 )
             }
@@ -124,7 +124,7 @@ struct ConformanceTests {
             let handle = ContextHandle(noPointer: .init())
             let mockRevoke: UcanBridge.RevokeFn = { _, _ in
                 throw ScpError.Validation(
-                    message: "Conformance stub: no real Rust runtime",
+                    msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-VALID-7999"
                 )
             }
@@ -147,7 +147,7 @@ struct ConformanceTests {
             let config = TransportConfig(relayUrls: relayUrl.isEmpty ? [] : [relayUrl])
             let mockConnect: TransportBridge.ConnectFn = { _ in
                 throw ScpError.Transport(
-                    message: "Conformance stub: no real Rust runtime",
+                    msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-TRANS-5999"
                 )
             }
@@ -163,7 +163,7 @@ struct ConformanceTests {
         case "transport_status":
             let mockStatus: TransportBridge.StatusFn = { _ in
                 throw ScpError.Transport(
-                    message: "Conformance stub: no real Rust runtime",
+                    msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-TRANS-5999"
                 )
             }

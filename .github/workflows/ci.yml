@@ -299,6 +299,7 @@ jobs:
         working-directory: bindings/kotlin
     steps:
       - name: Free disk space
+        working-directory: /
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v5

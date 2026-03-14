@@ -204,7 +204,7 @@ public enum DiscoveryBridge {
 ///   - address: The address string to parse.
 ///   - parseAddressFn: Bridge function override for testing.
 /// - Returns: A JSON string with the parsed address components.
-/// - Throws: ``ScpError/Validation(message:code:)`` if the address
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the address
 ///   format is invalid.
 ///
 /// ## Provenance
@@ -229,7 +229,7 @@ public func parseAddress(
 ///   - minHistorySecs: Optional minimum history duration in seconds.
 ///   - createQueryFn: Bridge function override for testing.
 /// - Returns: A JSON string containing the discovery query.
-/// - Throws: ``ScpError/Validation(message:code:)`` if serialization fails.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if serialization fails.
 ///
 /// ## Provenance
 ///
@@ -298,7 +298,7 @@ public func discover(
 ///   - targetDid: DID to assign the petname to.
 ///   - name: The petname string.
 ///   - petnameSetFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func setPetname(
     ownerDid: String,
     targetDid: String,
@@ -314,7 +314,7 @@ public func setPetname(
 ///   - ownerDid: DID of the identity that owns this petname map.
 ///   - targetDid: DID to remove the petname from.
 ///   - petnameRemoveFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func removePetname(
     ownerDid: String,
     targetDid: String,
@@ -330,7 +330,7 @@ public func removePetname(
 ///   - contextId: Context ID to assign the petname to.
 ///   - name: The petname string.
 ///   - petnameSetContextFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func setContextPetname(
     ownerDid: String,
     contextId: String,
@@ -346,7 +346,7 @@ public func setContextPetname(
 ///   - ownerDid: DID of the identity that owns this petname map.
 ///   - contextId: Context ID to remove the petname from.
 ///   - petnameRemoveContextFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func removeContextPetname(
     ownerDid: String,
     contextId: String,
@@ -362,7 +362,7 @@ public func removeContextPetname(
 ///   - name: The petname to resolve.
 ///   - petnameResolveDidFn: Bridge function override for testing.
 /// - Returns: An array of DID strings.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func resolvePetnameDid(
     ownerDid: String,
     name: String,
@@ -379,7 +379,7 @@ public func resolvePetnameDid(
 ///   - name: The petname to resolve.
 ///   - petnameResolveContextFn: Bridge function override for testing.
 /// - Returns: An array of context ID strings.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func resolvePetnameContext(
     ownerDid: String,
     name: String,
@@ -396,7 +396,7 @@ public func resolvePetnameContext(
 ///   - targetDid: DID to look up.
 ///   - petnameGetForDidFn: Bridge function override for testing.
 /// - Returns: The petname string, or `nil` if no petname is assigned.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func getPetnameForDid(
     ownerDid: String,
     targetDid: String,
@@ -412,7 +412,7 @@ public func getPetnameForDid(
 ///   - contextId: Context ID to look up.
 ///   - petnameGetForContextFn: Bridge function override for testing.
 /// - Returns: The petname string, or `nil` if no petname is assigned.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``ownerDid`` is empty.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
 public func getPetnameForContext(
     ownerDid: String,
     contextId: String,
@@ -434,7 +434,7 @@ public func getPetnameForContext(
 ///   - tags: Optional list of tag strings.
 ///   - handleRegisterFn: Bridge function override for testing.
 /// - Returns: A JSON string with the registration result.
-/// - Throws: ``ScpError/Validation(message:code:)`` if ``targetJson`` is malformed.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if ``targetJson`` is malformed.
 public func registerHandle(
     discoveryContextId: String,
     handle: String,
@@ -494,7 +494,7 @@ public func deregisterHandle(
 ///   - knownContextsJson: Optional JSON object mapping context IDs to names.
 ///   - addressResolveFn: Bridge function override for testing.
 /// - Returns: An array of ``AddressResolution`` dictionaries.
-/// - Throws: ``ScpError/Validation(message:code:)`` if resolution fails.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if resolution fails.
 public func resolveDiscoveryAddress(
     ownerDid: String,
     address: String,
@@ -504,14 +504,14 @@ public func resolveDiscoveryAddress(
     let json = try addressResolveFn(ownerDid, address, knownContextsJson)
     guard let data = json.data(using: .utf8) else {
         throw ScpError.Validation(
-            message: "Invalid UTF-8 in bridge response",
+            msg: "Invalid UTF-8 in bridge response",
             code: "SCP-VALID-7200"
         )
     }
     let parsed = try JSONSerialization.jsonObject(with: data, options: [])
     guard let array = parsed as? [[String: Any]] else {
         throw ScpError.Validation(
-            message: "Expected JSON array of objects from bridge",
+            msg: "Expected JSON array of objects from bridge",
             code: "SCP-VALID-7200"
         )
     }
@@ -522,19 +522,19 @@ public func resolveDiscoveryAddress(
 
 /// Parses a JSON string containing an array of strings into `[String]`.
 ///
-/// - Throws: ``ScpError/Validation(message:code:)`` if the JSON is
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the JSON is
 ///   not valid UTF-8 or does not decode as an array of strings.
 private func parseJsonStringArray(_ json: String) throws -> [String] {
     guard let data = json.data(using: .utf8) else {
         throw ScpError.Validation(
-            message: "Invalid UTF-8 in bridge response",
+            msg: "Invalid UTF-8 in bridge response",
             code: "SCP-VALID-7200"
         )
     }
     let parsed = try JSONSerialization.jsonObject(with: data, options: [])
     guard let array = parsed as? [String] else {
         throw ScpError.Validation(
-            message: "Expected JSON array of strings from bridge",
+            msg: "Expected JSON array of strings from bridge",
             code: "SCP-VALID-7200"
         )
     }

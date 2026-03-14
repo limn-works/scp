@@ -69,7 +69,7 @@ public enum ContextBridge {
     public static let defaultSend: SendFn = { handle, identity, payload in
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "invalid handle type for contextSend",
+                msg: "invalid handle type for contextSend",
                 code: "SCP-CTX-2002"
             )
         }
@@ -80,7 +80,7 @@ public enum ContextBridge {
     public static let defaultLeave: LeaveFn = { handle, identity in
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "invalid handle type for contextLeave",
+                msg: "invalid handle type for contextLeave",
                 code: "SCP-CTX-2002"
             )
         }
@@ -91,7 +91,7 @@ public enum ContextBridge {
     public static let defaultClose: CloseFn = { handle, identity in
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "invalid handle type for contextClose",
+                msg: "invalid handle type for contextClose",
                 code: "SCP-CTX-2002"
             )
         }
@@ -113,7 +113,7 @@ public enum ContextBridge {
     public static let defaultSetEconomicPolicy: SetEconomicPolicyFn = { handle, policyJson in
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "invalid handle type for setEconomicPolicy",
+                msg: "invalid handle type for setEconomicPolicy",
                 code: "SCP-CTX-2002"
             )
         }
@@ -124,7 +124,7 @@ public enum ContextBridge {
     public static let defaultGetEconomicPolicy: GetEconomicPolicyFn = { handle in
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "invalid handle type for getEconomicPolicy",
+                msg: "invalid handle type for getEconomicPolicy",
                 code: "SCP-CTX-2002"
             )
         }
@@ -356,7 +356,7 @@ public actor Context {
     ///   - leaveFn: Bridge function for leaving the context.
     ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
-    /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if context creation fails.
     static func create(
         identity: Identity,
         params: ContextParams,
@@ -392,12 +392,12 @@ public actor Context {
     /// sequencing, and transport.
     ///
     /// - Parameter payload: The raw message data to send.
-    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2001"`
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2001"`
     ///   if the context is not active, or if the bridge send operation fails.
     public func send(_ payload: Data) async throws {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
@@ -409,12 +409,12 @@ public actor Context {
     /// Validates the JSON against the `EconomicPolicy` schema before storing.
     ///
     /// - Parameter policyJson: The economic policy as a JSON string.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active,
-    ///   or ``ScpError/Validation(message:code:)`` if the JSON is invalid.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active,
+    ///   or ``ScpError/Validation(msg:code:)`` if the JSON is invalid.
     public func setEconomicPolicy(_ policyJson: String) throws {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
@@ -424,11 +424,11 @@ public actor Context {
     /// Returns the economic policy for this context as a JSON string, or `nil`.
     ///
     /// - Returns: The economic policy JSON string, or `nil` if no policy is set.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     public func getEconomicPolicy() throws -> String? {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
@@ -443,7 +443,7 @@ public actor Context {
     ///
     /// Only one active message stream per context is supported. Accessing this
     /// property while a previous stream is still active throws
-    /// ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2003"`.
+    /// ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2003"`.
     /// To create a new stream, first ``close()`` or ``leave()`` the context
     /// (which finishes the existing stream), or consume the existing stream
     /// to completion.
@@ -456,20 +456,20 @@ public actor Context {
     /// }
     /// ```
     ///
-    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2001"`
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2001"`
     ///   if the context is not active, or `"SCP-CTX-2003"` if a message stream
     ///   is already active on this context.
     public var messages: AsyncStream<Message> {
         get throws {
             guard state == .active else {
                 throw ScpError.Context(
-                    message: "Context is not active",
+                    msg: "Context is not active",
                     code: "SCP-CTX-2001"
                 )
             }
             guard streamContinuation == nil else {
                 throw ScpError.Context(
-                    message: "A message stream is already active on this context. "
+                    msg: "A message stream is already active on this context. "
                         + "Consume or close the existing stream before creating a new one.",
                     code: "SCP-CTX-2003"
                 )
@@ -501,12 +501,12 @@ public actor Context {
     /// notified. After leaving, the context transitions to ``ContextState/closed``
     /// and the message stream finishes.
     ///
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or the bridge leave operation fails.
     public func leave() async throws {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
@@ -527,7 +527,7 @@ public actor Context {
     /// Always call `close()` when done with a context. `deinit` provides a
     /// safety net but should not be relied upon for timely cleanup.
     ///
-    /// - Throws: ``ScpError/Context(message:code:)`` if the bridge close
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.
     public func close() async throws {
         guard state == .active else {
@@ -553,7 +553,7 @@ public actor Context {
 ///   - handle: The ``ContextHandle`` for the context to join.
 ///   - identity: The ``Identity`` joining the context.
 ///   - joinFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+/// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
 ///   in active state or the join operation fails.
 ///
 /// ## Provenance
@@ -608,7 +608,7 @@ public struct ScopedHandle: Sendable {
     public func checkCapability(_ capability: String) throws {
         guard hasCapability(capability) else {
             throw ScpError.Context(
-                message: "capability denied: \(capability) not granted to app \(appDid)",
+                msg: "capability denied: \(capability) not granted to app \(appDid)",
                 code: "SCP-CTX-2050"
             )
         }
@@ -617,7 +617,7 @@ public struct ScopedHandle: Sendable {
 
 /// Returns a context-scoped validation error with the standard code.
 private func validationError(_ message: String) -> ScpError {
-    ScpError.Context(message: message, code: "SCP-CTX-2051")
+    ScpError.Context(msg: message, code: "SCP-CTX-2051")
 }
 
 /// Extracts a nullable ``String`` from a JSON value (accepts ``String`` or ``NSNull``).

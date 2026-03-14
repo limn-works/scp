@@ -194,7 +194,7 @@ struct ContextTests {
     @Test("Context.create propagates bridge errors")
     func createPropagatesBridgeErrors() async {
         let createFn: ContextBridge.CreateFn = { _, _ in
-            throw ScpError.Context(message: "creation failed", code: "SCP-CTX-2100")
+            throw ScpError.Context(msg: "creation failed", code: "SCP-CTX-2100")
         }
         let noOpSend: ContextBridge.SendFn = { _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
@@ -363,7 +363,7 @@ struct ContextTests {
             payload: "before-error"
         ))
         resolvedListener.onError(error: ScpError.Transport(
-            message: "connection lost",
+            msg: "connection lost",
             code: "SCP-TRANS-5001"
         ))
 
@@ -630,7 +630,7 @@ struct ContextTests {
 
         let mockJoin: ContextBridge.JoinFn = { _, _ in
             throw ScpError.Context(
-                message: "cannot join context in Closed state",
+                msg: "cannot join context in Closed state",
                 code: "SCP-CTX-2013"
             )
         }

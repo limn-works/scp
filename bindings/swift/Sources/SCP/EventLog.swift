@@ -139,11 +139,11 @@ public nonisolated struct EventLog: Sendable {
     ///   - fromSequence: Start sequence number for the query range.
     ///   - limit: Maximum number of events to return.
     /// - Returns: An array of ``Event`` records matching the criteria.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the query fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the query fails.
     public func query(fromSequence: UInt64, limit: UInt64) async throws -> [Event] {
         guard let contextHandle = handle.contextHandle else {
             throw ScpError.Context(
-                message: "EventLog not backed by a UniFFI ContextHandle",
+                msg: "EventLog not backed by a UniFFI ContextHandle",
                 code: "SCP-CTX-2030"
             )
         }
@@ -155,11 +155,11 @@ public nonisolated struct EventLog: Sendable {
     ///
     /// - Parameter leafIndex: The index of the event to prove inclusion for.
     /// - Returns: A ``Proof`` with the Merkle path and verification status.
-    /// - Throws: ``ScpError/Context(message:code:)`` if proof generation fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if proof generation fails.
     public func proveInclusion(leafIndex: UInt64) async throws -> Proof {
         guard let contextHandle = handle.contextHandle else {
             throw ScpError.Context(
-                message: "EventLog not backed by a UniFFI ContextHandle",
+                msg: "EventLog not backed by a UniFFI ContextHandle",
                 code: "SCP-CTX-2031"
             )
         }
@@ -193,8 +193,8 @@ public nonisolated struct EventLog: Sendable {
 ///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
 ///   - checkpointFn: Bridge function override for testing.
 /// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
-/// - Throws: ``ScpError/Context(message:code:)`` if the context is not found.
-///   ``ScpError/Permission(message:code:)`` if key custody is not available.
+/// - Throws: ``ScpError/Context(msg:code:)`` if the context is not found.
+///   ``ScpError/Permission(msg:code:)`` if key custody is not available.
 ///
 /// ## Provenance
 ///
