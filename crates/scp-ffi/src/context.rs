@@ -1442,6 +1442,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         incomplete_verification_policy:
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: py_params.min_protocol_version,
+        migration_source: None,
     }
 }
 
@@ -1755,6 +1756,81 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
         };
         Ok(result_str.to_owned())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Context migration lifecycle (§5.11A, #580)
+// ---------------------------------------------------------------------------
+
+/// Tombstones a migrated context after its grace period has expired (§5.11A.5).
+///
+/// Transitions the context from `MigratingOut` to `Tombstoned`, emits
+/// the tombstone event, and cleans up timers/broadcast state. The
+/// application layer calls this when it detects the grace period has elapsed.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle (must be in `MigratingOut` state).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not migrating or the grace
+/// period has not expired.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+
+    rt.block_on(async move {
+        mgr.tombstone_migrated_context(&context_id)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("tombstone_migrated_context failed: {e}")))
+    })
+}
+
+/// Returns the migration state for a context, if any (§5.11A).
+///
+/// Returns a JSON string with the migration state fields, or `None` if
+/// the context is not migrating.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+///
+/// # Returns
+///
+/// `Optional[str]` -- JSON string with `{ "destination_context_id": str,
+/// "reason": str, "grace_period_end": int, "auto_invite": bool,
+/// "proposal_id": hex }`, or `None`.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_migration_state(handle: &PyContextHandle) -> PyResult<Option<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+
+    rt.block_on(async move {
+        let state = mgr.migration_state(&context_id).await;
+        match state {
+            Some(ms) => {
+                let json = serde_json::json!({
+                    "destination_context_id": ms.destination_context_id,
+                    "reason": ms.reason,
+                    "grace_period_end": ms.grace_period_end,
+                    "auto_invite": ms.auto_invite,
+                    "proposal_id": hex::encode(ms.proposal_id),
+                });
+                Ok(Some(json.to_string()))
+            }
+            None => Ok(None),
+        }
     })
 }
 
@@ -2659,6 +2735,9 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_governance_withdraw, m)?)?;
     m.add_function(wrap_pyfunction!(py_governance_get_proposal, m)?)?;
     m.add_function(wrap_pyfunction!(py_governance_list_proposals, m)?)?;
+    // Context migration (§5.11A, #580)
+    m.add_function(wrap_pyfunction!(py_tombstone_migrated_context, m)?)?;
+    m.add_function(wrap_pyfunction!(py_migration_state, m)?)?;
     // Broadcast (#369)
     m.add_function(wrap_pyfunction!(py_broadcast_subscribe, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;

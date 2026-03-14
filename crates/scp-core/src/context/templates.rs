@@ -286,6 +286,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -307,6 +308,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -328,6 +330,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -349,6 +352,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -373,6 +377,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -397,6 +402,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -418,6 +424,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -441,6 +448,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -467,6 +475,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
         // Discovery context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
@@ -491,6 +500,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         },
     }
 }

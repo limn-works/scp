@@ -5174,6 +5174,70 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
 }
 
 // ---------------------------------------------------------------------------
+// Free functions — context migration (§5.11A, #580)
+// ---------------------------------------------------------------------------
+
+/// Tombstones a migrated context after its grace period has expired (§5.11A.5).
+///
+/// Transitions the context from `MigratingOut` to `Tombstoned`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2050) if the context is not migrating
+/// or the grace period has not expired.
+#[uniffi::export]
+pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    let context_id = handle.context_id.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            manager
+                .tombstone_migrated_context(&context_id)
+                .await
+                .map_err(ScpError::from)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during tombstone: {e}"),
+            code: "SCP-CTX-2050".to_owned(),
+        })?
+}
+
+/// Returns the migration state for a context, if any (§5.11A).
+///
+/// Returns a JSON string with migration state fields, or `None` if the
+/// context is not migrating.
+#[uniffi::export]
+pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    let context_id = handle.context_id.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let state = manager.migration_state(&context_id).await;
+            match state {
+                Some(ms) => {
+                    let json = serde_json::json!({
+                        "destination_context_id": ms.destination_context_id,
+                        "reason": ms.reason,
+                        "grace_period_end": ms.grace_period_end,
+                        "auto_invite": ms.auto_invite,
+                        "proposal_id": hex::encode(ms.proposal_id),
+                    });
+                    Ok(Some(json.to_string()))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during migration_state: {e}"),
+            code: "SCP-CTX-2050".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
 // Free functions — broadcast operations (#387)
 // ---------------------------------------------------------------------------
 

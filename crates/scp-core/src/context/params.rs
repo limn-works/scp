@@ -444,6 +444,24 @@ pub struct BridgeInfo {
 }
 
 // ---------------------------------------------------------------------------
+// MigrationSource (§5.11A.2)
+// ---------------------------------------------------------------------------
+
+/// Records the provenance of a context created via migration (§5.11A.2).
+///
+/// When a context is created as the destination of a migration, this struct
+/// records the source context ID and the governance proposal ID that
+/// authorized the migration. This provides provenance for why the destination
+/// exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationSource {
+    /// The source context ID that this context was migrated from.
+    pub source_context_id: String,
+    /// The governance proposal ID (hex-encoded) that authorized the migration.
+    pub proposal_id: [u8; 32],
+}
+
+// ---------------------------------------------------------------------------
 // PublicMetadata
 // ---------------------------------------------------------------------------
 
@@ -721,6 +739,14 @@ pub struct ContextParams {
     /// capability ceiling and governance model (§5.7, §13.4).
     #[serde(default)]
     pub min_protocol_version: Option<(u8, u8)>,
+
+    /// Migration provenance (§5.11A.2).
+    ///
+    /// When this context was created as the destination of a migration, this
+    /// field records the source context ID and the governance proposal ID
+    /// that authorized the migration. `None` for non-migration contexts.
+    #[serde(default)]
+    pub migration_source: Option<MigrationSource>,
 }
 
 impl Default for ContextParams {
@@ -745,6 +771,7 @@ impl Default for ContextParams {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         }
     }
 }
@@ -959,6 +986,7 @@ mod tests {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1077,6 +1105,7 @@ mod tests {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1134,6 +1163,7 @@ mod tests {
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
+            migration_source: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();

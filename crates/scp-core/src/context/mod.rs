@@ -86,9 +86,9 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
-    ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy, PublicMetadata,
-    RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration, decode_protocol_version,
-    encode_protocol_version,
+    MigrationSource, ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy,
+    PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    decode_protocol_version, encode_protocol_version,
 };
 pub use state_machine::transition;
 

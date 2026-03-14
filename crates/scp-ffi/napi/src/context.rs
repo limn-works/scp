@@ -1596,6 +1596,59 @@ pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> na
 }
 
 // ---------------------------------------------------------------------------
+// Bridge functions — context migration (§5.11A, #580)
+// ---------------------------------------------------------------------------
+
+/// Tombstones a migrated context after its grace period has expired (§5.11A.5).
+///
+/// Transitions the context from `MigratingOut` to `Tombstoned`.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2050` if the context is not migrating or the
+///   grace period has not expired.
+#[napi(js_name = "contextTombstoneMigrated")]
+pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    manager
+        .tombstone_migrated_context(&context_id)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("tombstone_migrated_context failed: {e}"),
+                code: "SCP-CTX-2050".to_owned(),
+            })
+        })
+}
+
+/// Returns the migration state for a context, if any (§5.11A).
+///
+/// Returns a JSON string with migration state fields, or `null` if the
+/// context is not migrating.
+#[napi(js_name = "contextMigrationState")]
+pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    let state = manager.migration_state(&context_id).await;
+    match state {
+        Some(ms) => {
+            let json = serde_json::json!({
+                "destination_context_id": ms.destination_context_id,
+                "reason": ms.reason,
+                "grace_period_end": ms.grace_period_end,
+                "auto_invite": ms.auto_invite,
+                "proposal_id": hex::encode(ms.proposal_id),
+            });
+            Ok(Some(json.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions — TTL (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
