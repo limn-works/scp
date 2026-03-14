@@ -47,7 +47,7 @@ where
 
 /// Errors from SCPID authentication operations.
 ///
-/// Error codes follow the `SCP-IDENT-103x` range defined in §3.11.4.
+/// Error codes follow the `SCP-IDENT-1030` through `SCP-IDENT-1038` range defined in §3.11.4.
 #[derive(Debug, thiserror::Error)]
 pub enum ScpIdError {
     /// Nonce unknown, mismatched, or expired.
@@ -442,7 +442,10 @@ mod tests {
             "expires_at": 1709654700000
         }"#;
         let result = serde_json::from_str::<ScpIdChallenge>(json);
-        assert!(result.is_err(), "should reject wrong protocol on deserialization");
+        assert!(
+            result.is_err(),
+            "should reject wrong protocol on deserialization"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("unsupported SCPID protocol version"),
@@ -463,7 +466,10 @@ mod tests {
             "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         }"##;
         let result = serde_json::from_str::<ScpIdResponse>(json);
-        assert!(result.is_err(), "should reject wrong protocol on response deser");
+        assert!(
+            result.is_err(),
+            "should reject wrong protocol on response deser"
+        );
     }
 
     #[test]
