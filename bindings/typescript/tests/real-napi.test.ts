@@ -870,6 +870,7 @@ if (bridge === null) {
       const events = await napi.eventLogQuery(ctx, undefined);
       expect(events.length).toBeGreaterThanOrEqual(1);
 
+      // Checkpoint the event log.
       const checkpoint = await napi.eventLogCheckpoint(ctx, alice.did, 0);
       expect(checkpoint.eventCount).toBeGreaterThanOrEqual(1);
 
