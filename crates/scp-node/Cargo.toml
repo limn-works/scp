@@ -28,6 +28,7 @@ axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }
 instant-acme = "0.8"
 rcgen = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 rustls-pemfile = "2"
 base64 = { workspace = true }

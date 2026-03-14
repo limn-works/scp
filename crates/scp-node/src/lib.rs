@@ -14,6 +14,7 @@
 pub mod bridge_auth;
 pub mod bridge_handlers;
 pub mod dev_api;
+pub mod dns_provider;
 pub(crate) mod error;
 pub mod http;
 pub mod projection;
@@ -1260,6 +1261,10 @@ pub struct ApplicationNodeBuilder<
     /// before generating a new one, and persist newly created identities.
     /// Set by [`identity_with_storage`](Self::identity_with_storage).
     persist_identity: bool,
+    /// Optional DNS provider configuration for zero-config TLS via DNS
+    /// subdomain (issue #642). When set, `build()` overrides the domain
+    /// and TLS provider with DNS-derived values after identity resolution.
+    dns_provider_config: Option<dns_provider::DnsProviderConfig>,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -1292,6 +1297,7 @@ impl ApplicationNodeBuilder {
             #[cfg(feature = "http3")]
             http3_config: None,
             persist_identity: false,
+            dns_provider_config: None,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1337,6 +1343,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
+            dns_provider_config: self.dns_provider_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1374,6 +1381,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
+            dns_provider_config: self.dns_provider_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1471,6 +1479,26 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
     #[must_use]
     pub fn tls_provider(mut self, provider: Arc<dyn TlsProvider>) -> Self {
         self.tls_provider = Some(provider);
+        self
+    }
+
+    /// Configures zero-config TLS via the SCP DNS subdomain service (#642).
+    ///
+    /// When set, `build()` derives a deterministic subdomain from the node's
+    /// DID (after identity resolution) and creates an [`ScpDnsProvider`] that
+    /// registers with the Limn DNS API for automatic Let's Encrypt
+    /// certificate provisioning.
+    ///
+    /// The domain set via `.domain()` is **overridden** during `build()` with
+    /// the DNS-derived subdomain (e.g., `a3f8b2c1.scp.ctx.network`).
+    ///
+    /// Falls back to self-signed if the DNS API is unreachable — the protocol
+    /// still works because MLS provides real confidentiality.
+    ///
+    /// [`ScpDnsProvider`]: dns_provider::ScpDnsProvider
+    #[must_use]
+    pub fn dns_provider(mut self, config: dns_provider::DnsProviderConfig) -> Self {
+        self.dns_provider_config = Some(config);
         self
     }
 
@@ -1621,6 +1649,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
+            dns_provider_config: self.dns_provider_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1679,6 +1708,7 @@ impl<S: Storage + 'static, Dom>
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
+            dns_provider_config: self.dns_provider_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1716,6 +1746,7 @@ impl<S: Storage + 'static, Dom>
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
+            dns_provider_config: self.dns_provider_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1801,6 +1832,7 @@ impl<S: Storage + 'static, Dom>
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             persist_identity: true,
+            dns_provider_config: self.dns_provider_config,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1862,7 +1894,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         self,
         protocol_repository: Arc<ProtocolRepository<S>>,
     ) -> Result<ApplicationNode<S>, NodeError> {
-        let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
+        let mut domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
@@ -1871,6 +1903,23 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let (identity, document, did_method) =
             resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
                 .await?;
+
+        // If DNS provider config is set, derive the subdomain from the DID
+        // and create the ScpDnsProvider as the TLS provider (#642).
+        let tls_provider_override = if let Some(dns_config) = self.dns_provider_config {
+            let (provider, dns_domain) = dns_config.build(&identity.did);
+            tracing::info!(
+                did = %identity.did,
+                dns_domain = %dns_domain,
+                node_id = %provider.node_id(),
+                "using DNS subdomain provider for zero-config TLS"
+            );
+            domain = dns_domain;
+            Some(Arc::new(provider) as Arc<dyn TlsProvider>)
+        } else {
+            None
+        };
+
         let bridge_secret = generate_bridge_secret();
         let bind_addr = self
             .bind_addr
@@ -1893,7 +1942,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
         let tls_provider = resolve_tls(
-            self.tls_provider,
+            tls_provider_override.or(self.tls_provider),
             &domain,
             &protocol_repository,
             self.acme_email.as_ref(),
