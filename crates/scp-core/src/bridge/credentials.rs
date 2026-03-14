@@ -193,6 +193,17 @@ pub enum CredentialError {
         credential_type: CredentialType,
     },
 
+    /// The bridge credential key was not found for the given bridge.
+    ///
+    /// Returned when [`BridgeCredentialStore::get_bridge_credential_key`]
+    /// is called for a bridge that was never provisioned or whose key was
+    /// deleted.
+    #[error("bridge credential key not found for bridge {bridge_id}")]
+    KeyNotFound {
+        /// The bridge ID that was queried.
+        bridge_id: String,
+    },
+
     /// Storage backend error.
     #[error("storage error: {reason}")]
     StorageError {
@@ -324,7 +335,7 @@ pub trait BridgeCredentialStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`CredentialError::NotFound`] if no key is stored for
+    /// Returns [`CredentialError::KeyNotFound`] if no key is stored for
     /// the given bridge (bridge was never provisioned, or key was deleted
     /// via [`delete_bridge_credential_key`](Self::delete_bridge_credential_key)).
     fn get_bridge_credential_key(
@@ -401,9 +412,9 @@ pub fn derive_credential_key(
 /// consistent with every other key-returning function in this module.
 #[must_use]
 pub fn generate_bridge_credential_key() -> Zeroizing<[u8; 32]> {
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    Zeroizing::new(key)
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    key
 }
 
 /// Encrypts plaintext credential data with AES-256-GCM.
@@ -707,9 +718,8 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
             .await
             .get(bridge_id)
             .cloned()
-            .ok_or_else(|| CredentialError::NotFound {
+            .ok_or_else(|| CredentialError::KeyNotFound {
                 bridge_id: bridge_id.to_owned(),
-                credential_type: CredentialType::Custom("bridge_credential_key".to_owned()),
             })
     }
 
@@ -1315,8 +1325,8 @@ mod tests {
         let result = store.get_bridge_credential_key("bridge-nonexistent").await;
 
         assert!(
-            matches!(result, Err(CredentialError::NotFound { .. })),
-            "missing bridge credential key must return NotFound"
+            matches!(result, Err(CredentialError::KeyNotFound { .. })),
+            "missing bridge credential key must return KeyNotFound"
         );
     }
 
@@ -1347,7 +1357,7 @@ mod tests {
         // Bridge credential key must be gone.
         let result = store.get_bridge_credential_key("bridge-001").await;
         assert!(
-            matches!(result, Err(CredentialError::NotFound { .. })),
+            matches!(result, Err(CredentialError::KeyNotFound { .. })),
             "bridge credential key must be destroyed after revoke"
         );
     }
