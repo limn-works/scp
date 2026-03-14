@@ -24,24 +24,31 @@ import kotlinx.coroutines.launch
 /**
  * Holder for an SCP context's observable state within a Composable.
  *
- * Wraps the raw context handle and coroutine scope needed to collect SCP
- * streams as Compose [State]. Created by [rememberScpContext] and cleaned
- * up via [DisposableEffect] when the Composable leaves composition.
+ * Wraps the raw context handle, identity handle, and coroutine scope needed
+ * to collect SCP streams as Compose [State]. Created by [rememberScpContext]
+ * and cleaned up via [DisposableEffect] when the Composable leaves composition.
+ *
+ * Mirrors the [works.limn.scp.android.TrackedContext] pattern from
+ * [works.limn.scp.android.ScpViewModel] — both context and identity handles
+ * are required for leave/close operations on the FFI bridge.
  *
  * @property contextHandle Opaque context handle from create/join.
+ * @property identityHandle Opaque identity handle for the member in this context.
  * @property scope Coroutine scope for converting Flows to StateFlows.
  *   Cancelled on disposal.
  * @property onDispose Cleanup callback invoked when the Composable
- *   leaves composition. Typically calls leave/close on the context.
+ *   leaves composition. Receives both the context handle and identity handle.
+ *   Typically calls leave/close on the context.
  */
 class ScpContextHolder(
     val contextHandle: Long,
+    val identityHandle: Long,
     internal val scope: CoroutineScope,
-    private val onDispose: (Long) -> Unit,
+    private val onDispose: (Long, Long) -> Unit,
 ) {
     internal fun dispose() {
         scope.cancel()
-        onDispose(contextHandle)
+        onDispose(contextHandle, identityHandle)
     }
 }
 
@@ -51,8 +58,8 @@ class ScpContextHolder(
  * Creates a [ScpContextHolder] that persists across recompositions for the
  * same [contextHandle]. When the Composable leaves composition, the
  * [onDispose] callback is invoked to clean up the context (e.g., call
- * `contextBridge.leave(handle)`), and the internal coroutine scope is
- * cancelled.
+ * `contextBridge.leave(handle, identityHandle)`), and the internal coroutine
+ * scope is cancelled.
  *
  * Per ADR-028: `DisposableEffect(contextId) { onDispose { context.close() } }`
  * ensures the context is closed when the composable leaves composition.
@@ -60,28 +67,31 @@ class ScpContextHolder(
  * Usage:
  * ```kotlin
  * @Composable
- * fun ChatScreen(contextHandle: Long, bridge: CoroutineBridge) {
- *     val holder = rememberScpContext(contextHandle) { handle ->
- *         runBlocking(Dispatchers.IO) { bridge.context.leave(handle) }
+ * fun ChatScreen(contextHandle: Long, identityHandle: Long, bridge: CoroutineBridge) {
+ *     val holder = rememberScpContext(contextHandle, identityHandle) { ctxH, idH ->
+ *         runBlocking(Dispatchers.IO) { bridge.context.leave(ctxH, idH) }
  *     }
  *     // Use holder to collect SCP streams
  * }
  * ```
  *
  * @param contextHandle Opaque context handle from create/join.
+ * @param identityHandle Opaque identity handle for the member in this context.
  * @param onDispose Callback invoked when the Composable leaves composition.
- *   Receives the context handle for cleanup. Runs on the composition thread;
- *   launch a coroutine for suspending cleanup operations.
+ *   Receives the context handle and identity handle for cleanup. Runs on the
+ *   composition thread; launch a coroutine for suspending cleanup operations.
  * @return A [ScpContextHolder] scoped to this Composable.
  */
 @Composable
 fun rememberScpContext(
     contextHandle: Long,
-    onDispose: (Long) -> Unit,
+    identityHandle: Long,
+    onDispose: (Long, Long) -> Unit,
 ): ScpContextHolder {
     val holder = remember(contextHandle) {
         ScpContextHolder(
             contextHandle = contextHandle,
+            identityHandle = identityHandle,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
             onDispose = onDispose,
         )
