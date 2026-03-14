@@ -105,7 +105,7 @@ public enum TransportBridge {
 ///   - config: Transport configuration with relay URLs and/or bootstrap domain.
 ///   - connectFn: Bridge function override for testing.
 /// - Returns: A ``TransportManager`` handle for the established connection.
-/// - Throws: ``ScpError/Transport(message:code:)`` if all connections fail.
+/// - Throws: ``ScpError/Transport(msg:code:)`` if all connections fail.
 ///
 /// ## Provenance
 ///
@@ -118,7 +118,7 @@ public func connectTransport(
 ) async throws -> TransportManager {
     guard let firstUrl = config.relayUrls.first else {
         throw ScpError.Transport(
-            message: "No relay URLs provided in transport configuration",
+            msg: "No relay URLs provided in transport configuration",
             code: "SCP-TRANS-5001"
         )
     }
@@ -133,7 +133,7 @@ public func connectTransport(
 ///   - manager: The transport manager to query.
 ///   - statusFn: Bridge function override for testing.
 /// - Returns: The current ``TransportStatus``.
-/// - Throws: ``ScpError/Transport(message:code:)`` if the status query fails.
+/// - Throws: ``ScpError/Transport(msg:code:)`` if the status query fails.
 ///
 /// ## Provenance
 ///
@@ -158,7 +158,7 @@ public func queryTransportStatus(
 /// - Parameters:
 ///   - manager: The transport manager to disconnect.
 ///   - disconnectFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Transport(message:code:)`` if the disconnect fails.
+/// - Throws: ``ScpError/Transport(msg:code:)`` if the disconnect fails.
 ///
 /// ## Provenance
 ///

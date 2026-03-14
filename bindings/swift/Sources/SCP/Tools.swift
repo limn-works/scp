@@ -203,9 +203,9 @@ public extension Context {
     ///   - invokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output and
     ///   provenance metadata.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the tool is not found,
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the tool is not found,
     ///   the input fails schema validation, or the invocation is unauthorized.
-    ///   ``ScpError/Context(message:code:)`` if the context is not active.
+    ///   ``ScpError/Context(msg:code:)`` if the context is not active.
     ///
     /// ## Provenance
     ///
@@ -223,19 +223,19 @@ public extension Context {
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
-                message: "Tool input is not valid UTF-8",
+                msg: "Tool input is not valid UTF-8",
                 code: "SCP-TOOL-6001"
             )
         }
@@ -256,8 +256,8 @@ public extension Context {
     ///   - definition: The ``ToolDefinition`` describing the tool.
     ///   - registerFn: Bridge function override for testing.
     /// - Returns: The assigned tool identifier.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if registration fails.
-    ///   ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if registration fails.
+    ///   ``ScpError/Context(msg:code:)`` if the context is not active.
     ///
     /// ## Provenance
     ///
@@ -269,13 +269,13 @@ public extension Context {
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -290,8 +290,8 @@ public extension Context {
     ///   - tool: The name of the tool to verify.
     ///   - verifyFn: Bridge function override for testing.
     /// - Returns: A ``ToolVerificationResult`` describing the outcome.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the tool is not found
-    ///   or verification fails. ``ScpError/Context(message:code:)`` if the
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the tool is not found
+    ///   or verification fails. ``ScpError/Context(msg:code:)`` if the
     ///   context is not active.
     ///
     /// ## Provenance
@@ -304,13 +304,13 @@ public extension Context {
     ) async throws -> ToolVerificationResult {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -333,9 +333,9 @@ public extension Context {
     ///   - invokeCrossContextFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output
     ///   and provenance metadata.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the tool is not found,
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the tool is not found,
     ///   chain depth exceeds the limit, or consent is denied.
-    ///   ``ScpError/Context(message:code:)`` if either context is not active.
+    ///   ``ScpError/Context(msg:code:)`` if either context is not active.
     ///
     /// ## Provenance
     ///
@@ -354,25 +354,25 @@ public extension Context {
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Source context is not active",
+                msg: "Source context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let sourceHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Source context handle is not a UniFFI ContextHandle",
+                msg: "Source context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
         guard let targetHandle = targetContext.handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Target context handle is not a UniFFI ContextHandle",
+                msg: "Target context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
-                message: "Tool input is not valid UTF-8",
+                msg: "Tool input is not valid UTF-8",
                 code: "SCP-TOOL-6001"
             )
         }
@@ -399,8 +399,8 @@ public extension Context {
     ///     a session that persists for the lifetime of the context (spec section 6.2.1).
     ///   - sessionCreateFn: Bridge function override for testing.
     /// - Returns: A ``ToolSessionResult`` containing the session ID.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if session creation fails.
-    ///   ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if session creation fails.
+    ///   ``ScpError/Context(msg:code:)`` if the context is not active.
     ///
     /// ## Provenance
     ///
@@ -414,13 +414,13 @@ public extension Context {
     ) async throws -> ToolSessionResult {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -442,8 +442,8 @@ public extension Context {
     ///   - identity: The ``Identity`` of the invoking agent.
     ///   - sessionInvokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the session is expired
-    ///   or not found. ``ScpError/Context(message:code:)`` if the context
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the session is expired
+    ///   or not found. ``ScpError/Context(msg:code:)`` if the context
     ///   is not active.
     ///
     /// ## Provenance
@@ -461,19 +461,19 @@ public extension Context {
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
-                message: "Tool input is not valid UTF-8",
+                msg: "Tool input is not valid UTF-8",
                 code: "SCP-TOOL-6001"
             )
         }
@@ -496,8 +496,8 @@ public extension Context {
     /// - Parameters:
     ///   - sessionId: The session ID to close.
     ///   - sessionCloseFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Tool(message:code:)`` if the session is not
-    ///   found. ``ScpError/Context(message:code:)`` if the context is
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the session is not
+    ///   found. ``ScpError/Context(msg:code:)`` if the context is
     ///   not active.
     ///
     /// ## Provenance
@@ -510,13 +510,13 @@ public extension Context {
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }

@@ -129,7 +129,7 @@ public enum UcanBridge {
 ///   - presentingAgentDid: Optional DID of the agent presenting the token.
 ///   - proofTokens: Optional proof delegation chain tokens.
 ///   - validateFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Permission(message:code:)`` if validation fails.
+/// - Throws: ``ScpError/Permission(msg:code:)`` if validation fails.
 ///
 /// ## Provenance
 ///
@@ -157,7 +157,7 @@ public func validateUcanToken(
 ///   - capabilities: An array of capability strings.
 ///   - mintFn: Bridge function override for testing.
 /// - Returns: The minted ``UcanToken``.
-/// - Throws: ``ScpError/Permission(message:code:)`` if minting fails.
+/// - Throws: ``ScpError/Permission(msg:code:)`` if minting fails.
 ///
 /// ## Provenance
 ///
@@ -181,7 +181,7 @@ public func mintUcanToken(
 ///   - handle: The ``ContextHandle`` for the context.
 ///   - token: The full encoded JWT string of the token to revoke.
 ///   - revokeFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Permission(message:code:)`` if revocation fails.
+/// - Throws: ``ScpError/Permission(msg:code:)`` if revocation fails.
 ///
 /// ## Provenance
 ///
@@ -211,7 +211,7 @@ public func revokeUcanToken(
 ///   - capabilities: Capability URI strings to delegate (subset of parent's).
 ///   - delegateFn: Bridge function override for testing.
 /// - Returns: A ``UcanToken`` with the delegated token's metadata.
-/// - Throws: ``ScpError/Permission(message:code:)`` if delegation fails.
+/// - Throws: ``ScpError/Permission(msg:code:)`` if delegation fails.
 ///
 /// ## Provenance
 ///

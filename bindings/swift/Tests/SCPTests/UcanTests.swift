@@ -344,7 +344,7 @@ struct UcanTests {
 
         let mockDelegate: UcanBridge.DelegateFn = { _, _, _, _, _ in
             throw ScpError.Permission(
-                message: "capabilities wider than parent",
+                msg: "capabilities wider than parent",
                 code: "SCP-PERM-3004"
             )
         }

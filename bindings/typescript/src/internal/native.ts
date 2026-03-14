@@ -171,9 +171,10 @@ export function createNativeBridge(): Bridge {
     },
 
     async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      // rotateKey is an instance method on NapiIdentity, not a free function.
       const result = await (
-        addon.rotateKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { rotateKey(): Promise<BridgeIdentityHandle> }
+      ).rotateKey();
       return result;
     },
 
@@ -541,9 +542,22 @@ export function createNativeBridge(): Bridge {
 
     // Tools
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
+      // Transform SDK ToolDefinition to NapiToolDefinition shape (camelCase
+      // field names matching napi-rs #[napi(object)] output).
+      const napiDef = {
+        name: definition.name,
+        description: definition.description,
+        inputSchemaJson: JSON.stringify(definition.inputSchema),
+        outputSchemaJson: JSON.stringify(definition.outputSchema),
+        operatorDid: definition.operator,
+        testVectorsJson: definition.testVectors ? JSON.stringify(definition.testVectors) : null,
+        implementationHash: definition.implementationHash
+          ? Array.from(definition.implementationHash)
+          : null,
+      };
       const toolId = await (
-        addon.toolRegister as (h: BridgeContextHandle, d: ToolDefinition) => Promise<string>
-      )(handle, definition);
+        addon.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
+      )(handle, napiDef);
       return toolId;
     },
 
@@ -992,27 +1006,29 @@ export function createNativeBridge(): Bridge {
     },
 
     async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      // addAgentKey is an instance method on NapiIdentity, not a free function.
       return await (
-        addon.identityAddAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { addAgentKey(): Promise<BridgeIdentityHandle> }
+      ).addAgentKey();
     },
 
     async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      // rotateAgentKey is an instance method on NapiIdentity, not a free function.
       return await (
-        addon.identityRotateAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { rotateAgentKey(): Promise<BridgeIdentityHandle> }
+      ).rotateAgentKey();
     },
 
     async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      // removeAgentKey is an instance method on NapiIdentity, not a free function.
       return await (
-        addon.identityRemoveAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+        handle as unknown as { removeAgentKey(): Promise<BridgeIdentityHandle> }
+      ).removeAgentKey();
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return await (
-        addon.identityMigrate as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
-      )(handle);
+      // migrate is an instance method on NapiIdentity, not a free function.
+      return await (handle as unknown as { migrate(): Promise<BridgeIdentityHandle> }).migrate();
     },
 
     async identityAttestDevice(did: string): Promise<string> {

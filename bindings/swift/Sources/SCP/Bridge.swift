@@ -87,7 +87,7 @@ public enum BridgeConnectorBridge {
 ///   - shadowStatus: Shadow provenance status: "shadow" or "claimed".
 ///   - evaluateTrustFn: Bridge function override for testing.
 /// - Returns: Trust tier integer (0-3).
-/// - Throws: ``ScpError/Validation(message:code:)`` if the shadow status
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the shadow status
 ///   is not recognized.
 ///
 /// ## Provenance
@@ -180,7 +180,7 @@ public func bridgeCreateShadow(
 ///   - shadowStatus: Shadow provenance status.
 ///   - evaluateTrustFn: Bridge function override for testing.
 /// - Returns: Trust tier integer (0-3).
-/// - Throws: ``ScpError/Validation(message:code:)`` if evaluation fails.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if evaluation fails.
 public func evaluateBridgeTrust(
     isBridged: Bool,
     isNativeTransport: Bool,

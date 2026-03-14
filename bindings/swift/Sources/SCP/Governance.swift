@@ -416,7 +416,7 @@ public extension Context {
     ///   - proposalJson: JSON-serialized ``GovernanceProposal``.
     ///   - executeFn: Bridge function override for testing.
     /// - Returns: A ``GovernanceActionResult`` describing the outcome.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or governance execution fails.
     func executeGovernanceAction(
         proposalJson: String,
@@ -424,13 +424,13 @@ public extension Context {
     ) async throws -> GovernanceActionResult {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -453,7 +453,7 @@ public extension Context {
     ///   - proposerDid: DID of the proposer.
     ///   - proposeFn: Bridge function override for testing.
     /// - Returns: JSON string with `proposal_id`, `status`, and `execution_result`.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or the proposal fails.
     func proposeGovernanceAction(
         actionJson: String,
@@ -462,13 +462,13 @@ public extension Context {
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2041"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -484,7 +484,7 @@ public extension Context {
     ///   - voterDid: DID of the voter.
     ///   - approveFn: Bridge function override for testing.
     /// - Returns: JSON string with `status`.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the vote fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the vote fails.
     func approveGovernanceProposal(
         proposalIdHex: String,
         voterDid: String,
@@ -492,13 +492,13 @@ public extension Context {
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2042"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -512,7 +512,7 @@ public extension Context {
     ///   - voterDid: DID of the voter.
     ///   - rejectFn: Bridge function override for testing.
     /// - Returns: JSON string with `status`.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the vote fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the vote fails.
     func rejectGovernanceProposal(
         proposalIdHex: String,
         voterDid: String,
@@ -520,13 +520,13 @@ public extension Context {
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2043"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -540,7 +540,7 @@ public extension Context {
     ///   - voterDid: DID of the voter.
     ///   - withdrawFn: Bridge function override for testing.
     /// - Returns: JSON string with `status`.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the withdrawal fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the withdrawal fails.
     func withdrawGovernanceVote(
         proposalIdHex: String,
         voterDid: String,
@@ -548,13 +548,13 @@ public extension Context {
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2044"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -567,20 +567,20 @@ public extension Context {
     ///   - proposalIdHex: Hex-encoded 32-byte proposal ID.
     ///   - getProposalFn: Bridge function override for testing.
     /// - Returns: JSON string with proposal details.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the proposal is not found.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the proposal is not found.
     func getGovernanceProposal(
         proposalIdHex: String,
         getProposalFn: GovernanceBridge.GetProposalFn = GovernanceBridge.defaultGetProposal
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2045"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -591,19 +591,19 @@ public extension Context {
     ///
     /// - Parameter listProposalsFn: Bridge function override for testing.
     /// - Returns: JSON array of proposals.
-    /// - Throws: ``ScpError/Context(message:code:)`` if listing fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if listing fails.
     func listGovernanceProposals(
         listProposalsFn: GovernanceBridge.ListProposalsFn = GovernanceBridge.defaultListProposals
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
-                message: "Context is not active",
+                msg: "Context is not active",
                 code: "SCP-CTX-2046"
             )
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -618,16 +618,16 @@ public extension Context {
     ///
     /// - Parameter memberCountFn: Bridge function override for testing.
     /// - Returns: The member count, or `nil` if the context is not registered.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func memberCount(
         memberCountFn: MembershipBridge.MemberCountFn = MembershipBridge.defaultMemberCount
     ) async throws -> UInt64? {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -640,17 +640,17 @@ public extension Context {
     ///   - did: The DID to check.
     ///   - isMemberFn: Bridge function override for testing.
     /// - Returns: `true` if the DID is a member.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func isMember(
         did: String,
         isMemberFn: MembershipBridge.IsMemberFn = MembershipBridge.defaultIsMember
     ) async throws -> Bool {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -661,16 +661,16 @@ public extension Context {
     ///
     /// - Parameter memberDidsFn: Bridge function override for testing.
     /// - Returns: An array of DID strings.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func memberDids(
         memberDidsFn: MembershipBridge.MemberDidsFn = MembershipBridge.defaultMemberDids
     ) async throws -> [String] {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -683,17 +683,17 @@ public extension Context {
     ///   - did: The DID of the member.
     ///   - memberRoleFn: Bridge function override for testing.
     /// - Returns: A ``MemberRole``, or `nil` if the member is not found.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func memberRole(
         did: String,
         memberRoleFn: MembershipBridge.MemberRoleFn = MembershipBridge.defaultMemberRole
     ) async throws -> MemberRole? {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -712,18 +712,18 @@ public extension Context {
     /// - Parameters:
     ///   - subscriberDid: The DID subscribing to broadcasts.
     ///   - subscribeFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or not a broadcast context.
     func broadcastSubscribe(
         subscriberDid: String,
         subscribeFn: BroadcastBridge.SubscribeFn = BroadcastBridge.defaultSubscribe
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -736,7 +736,7 @@ public extension Context {
     ///   - subscriberDid: The DID to unsubscribe.
     ///   - rotateKeys: When `true`, all authors rotate their broadcast keys.
     ///   - unsubscribeFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or not a broadcast context.
     func broadcastUnsubscribe(
         subscriberDid: String,
@@ -744,11 +744,11 @@ public extension Context {
         unsubscribeFn: BroadcastBridge.UnsubscribeFn = BroadcastBridge.defaultUnsubscribe
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -761,7 +761,7 @@ public extension Context {
     ///   - identity: The identity of the author publishing the message.
     ///   - payload: The raw message payload.
     ///   - publishFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or not a broadcast context.
     func broadcastPublish(
         identity: Identity,
@@ -769,11 +769,11 @@ public extension Context {
         publishFn: BroadcastBridge.PublishFn = BroadcastBridge.defaultPublish
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -786,7 +786,7 @@ public extension Context {
     ///   - subscriberDid: The DID of the subscriber to block.
     ///   - blockerDid: The DID of the blocker.
     ///   - blockSubscriberFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the operation fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastBlockSubscriber(
         subscriberDid: String,
         blockerDid: String,
@@ -794,11 +794,11 @@ public extension Context {
             BroadcastBridge.defaultBlockSubscriber
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -814,7 +814,7 @@ public extension Context {
     ///   - subscriberDid: The DID of the subscriber to unblock.
     ///   - unblockerDid: The DID of the author performing the unblock.
     ///   - unblockSubscriberFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the operation fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastUnblockSubscriber(
         subscriberDid: String,
         unblockerDid: String,
@@ -822,11 +822,11 @@ public extension Context {
             BroadcastBridge.defaultUnblockSubscriber
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -840,7 +840,7 @@ public extension Context {
     ///   - requesterDid: The DID of the requester.
     ///   - handleKeyRequestFn: Bridge function override for testing.
     /// - Returns: A string describing the key request decision.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the operation fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastHandleKeyRequest(
         authorDid: String,
         requesterDid: String,
@@ -848,11 +848,11 @@ public extension Context {
             BroadcastBridge.defaultHandleKeyRequest
     ) async throws -> String {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -863,17 +863,17 @@ public extension Context {
     ///
     /// - Parameter subscriberCountFn: Bridge function override for testing.
     /// - Returns: The subscriber count, or `nil` if not a broadcast context.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func broadcastSubscriberCount(
         subscriberCountFn: BroadcastBridge.SubscriberCountFn =
             BroadcastBridge.defaultSubscriberCount
     ) async throws -> UInt64? {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -886,17 +886,17 @@ public extension Context {
     ///   - did: The DID to check.
     ///   - isSubscriberFn: Bridge function override for testing.
     /// - Returns: `true` if the DID is a subscriber.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func broadcastIsSubscriber(
         did: String,
         isSubscriberFn: BroadcastBridge.IsSubscriberFn = BroadcastBridge.defaultIsSubscriber
     ) async throws -> Bool {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -907,16 +907,16 @@ public extension Context {
     ///
     /// - Parameter admissionFn: Bridge function override for testing.
     /// - Returns: The policy (`"Open"` or `"Gated"`), or `nil` if not broadcast.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func broadcastAdmission(
         admissionFn: BroadcastBridge.AdmissionFn = BroadcastBridge.defaultAdmission
     ) async throws -> String? {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -934,17 +934,17 @@ public extension Context {
     ///
     /// - Parameter drainEventsFn: Bridge function override for testing.
     /// - Returns: An array of event description strings.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func drainEvents(
         drainEventsFn: ContextLifecycleBridge.DrainEventsFn =
             ContextLifecycleBridge.defaultDrainEvents
     ) async throws -> [String] {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -957,17 +957,17 @@ public extension Context {
     /// the context's memory scope policy.
     ///
     /// - Parameter handleTtlExpiryFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func handleTtlExpiry(
         handleTtlExpiryFn: ContextLifecycleBridge.HandleTtlExpiryFn =
             ContextLifecycleBridge.defaultHandleTtlExpiry
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -986,7 +986,7 @@ public extension Context {
     ///   - proposedSeconds: The proposed TTL extension duration in seconds.
     ///   - proposeTtlExtensionFn: Bridge function override for testing.
     /// - Returns: `true` if all members have consented, `false` otherwise.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or the member is not found.
     func proposeTtlExtension(
         memberDid: String,
@@ -995,11 +995,11 @@ public extension Context {
             ContextLifecycleBridge.defaultProposeTtlExtension
     ) async throws -> Bool {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -1015,18 +1015,18 @@ public extension Context {
     /// - Parameters:
     ///   - newSeconds: The new TTL duration in seconds.
     ///   - resetTtlTimerFn: Bridge function override for testing.
-    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func resetTtlTimer(
         newSeconds: UInt64,
         resetTtlTimerFn: ContextLifecycleBridge.ResetTtlTimerFn =
             ContextLifecycleBridge.defaultResetTtlTimer
     ) async throws {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -1041,16 +1041,16 @@ public extension Context {
     ///
     /// - Parameter exportFn: Bridge function override for testing.
     /// - Returns: The serialized context state as `Data`.
-    /// - Throws: ``ScpError/Context(message:code:)`` if export fails.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if export fails.
     func exportContext(
         exportFn: ContextLifecycleBridge.ExportFn = ContextLifecycleBridge.defaultExport
     ) async throws -> Data {
         guard state == .active else {
-            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
         guard let contextHandle = handle as? ContextHandle else {
             throw ScpError.Context(
-                message: "Context handle is not a UniFFI ContextHandle",
+                msg: "Context handle is not a UniFFI ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
@@ -1069,7 +1069,7 @@ public extension Context {
 ///   - data: The serialized context state.
 ///   - importFn: Bridge function override for testing.
 /// - Returns: The context ID of the imported context.
-/// - Throws: ``ScpError/Context(message:code:)`` if deserialization,
+/// - Throws: ``ScpError/Context(msg:code:)`` if deserialization,
 ///   validation, or import fails.
 ///
 /// ## Provenance
@@ -1142,7 +1142,7 @@ public func isLocalDid(
 ///   - requirementsJson: JSON string of participation requirements.
 ///   - verifyFn: Bridge function override for testing.
 /// - Returns: `true` if all requirements are satisfied.
-/// - Throws: ``ScpError/Validation(message:code:)`` if JSON parsing fails
+/// - Throws: ``ScpError/Validation(msg:code:)`` if JSON parsing fails
 ///   or a requirement is not met.
 ///
 /// ## Provenance

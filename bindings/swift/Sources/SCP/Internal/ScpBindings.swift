@@ -4556,37 +4556,37 @@ public enum ScpError: Swift.Error {
     /**
      * An identity operation failed (DID creation, resolution, key rotation).
      */
-    case Identity(message: String, code: String
+    case Identity(msg: String, code: String
     )
     /**
      * A context lifecycle operation failed (create, join, leave, close, send).
      */
-    case Context(message: String, code: String
+    case Context(msg: String, code: String
     )
     /**
      * A capability or governance permission check failed.
      */
-    case Permission(message: String, code: String
+    case Permission(msg: String, code: String
     )
     /**
      * A cryptographic operation failed (MLS, sender keys, encryption).
      */
-    case Crypto(message: String, code: String
+    case Crypto(msg: String, code: String
     )
     /**
      * A transport operation failed (connection, send, subscription).
      */
-    case Transport(message: String, code: String
+    case Transport(msg: String, code: String
     )
     /**
      * A tool operation failed (registration, invocation, verification).
      */
-    case Tool(message: String, code: String
+    case Tool(msg: String, code: String
     )
     /**
      * Input validation failed (malformed data, schema mismatch, constraint violation).
      */
-    case Validation(message: String, code: String
+    case Validation(msg: String, code: String
     )
 }
 
@@ -4605,31 +4605,31 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
 
         
         case 1: return .Identity(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
         case 2: return .Context(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
         case 3: return .Permission(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
         case 4: return .Crypto(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
         case 5: return .Transport(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
         case 6: return .Tool(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
         case 7: return .Validation(
-            message: try FfiConverterString.read(from: &buf), 
+            msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
 
@@ -4644,45 +4644,45 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
 
         
         
-        case let .Identity(message,code):
+        case let .Identity(msg,code):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Context(message,code):
+        case let .Context(msg,code):
             writeInt(&buf, Int32(2))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Permission(message,code):
+        case let .Permission(msg,code):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Crypto(message,code):
+        case let .Crypto(msg,code):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Transport(message,code):
+        case let .Transport(msg,code):
             writeInt(&buf, Int32(5))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Tool(message,code):
+        case let .Tool(msg,code):
             writeInt(&buf, Int32(6))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Validation(message,code):
+        case let .Validation(msg,code):
             writeInt(&buf, Int32(7))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         }

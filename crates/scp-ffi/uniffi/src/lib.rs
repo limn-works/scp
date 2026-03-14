@@ -434,8 +434,7 @@ pub trait KeyCustodyProvider: Send + Sync {
     async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
         let _ = key_id;
         Err(ScpError::Context {
-            message: "export_signing_key_bytes not implemented by this KeyCustodyProvider"
-                .to_owned(),
+            msg: "export_signing_key_bytes not implemented by this KeyCustodyProvider".to_owned(),
             code: "SCP-CTX-2050".to_owned(),
         })
     }
@@ -637,11 +636,11 @@ mod tests {
     #[test]
     fn scp_error_display_is_descriptive() {
         let identity = ScpError::Identity {
-            message: "test".to_owned(),
+            msg: "test".to_owned(),
             code: "SCP-IDENT-1001".to_owned(),
         };
         let context = ScpError::Context {
-            message: "test".to_owned(),
+            msg: "test".to_owned(),
             code: "SCP-CTX-2001".to_owned(),
         };
         assert!(identity.to_string().contains("identity error"));

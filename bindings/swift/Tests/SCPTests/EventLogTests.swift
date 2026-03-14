@@ -313,7 +313,7 @@ struct EventLogTests {
 
         let mockCheckpoint: EventLogBridge.CheckpointFn = { _, _, _ in
             throw ScpError.Permission(
-                message: "event log checkpoint requires key custody",
+                msg: "event log checkpoint requires key custody",
                 code: "SCP-PERM-3008"
             )
         }
