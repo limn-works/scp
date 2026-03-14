@@ -1287,6 +1287,40 @@ describe("Broadcast mutation operations (mock bridge)", () => {
     expect(await ctx.broadcastSubscriberCount()).toBe(0);
   });
 
+  it("broadcastUnsubscribe with rotateKeys=false does not trigger key rotation", async () => {
+    const { ctx, handle } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    await ctx.broadcastUnsubscribe(subscriber.did, false);
+
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(false);
+    // No BroadcastKeyRotated event should be emitted when rotateKeys is false.
+    const mockCtx = mockBridge._contexts.get(handle.contextId);
+    expect(mockCtx).toBeDefined();
+    const rotateEvents =
+      mockCtx?.eventLog.filter((e) => e.eventType === "BroadcastKeyRotated") ?? [];
+    expect(rotateEvents.length).toBe(0);
+  });
+
+  it("broadcastUnsubscribe with rotateKeys=true triggers key rotation", async () => {
+    const { ctx, handle } = await createBroadcastContext();
+    const subscriber = await mockBridge.identityCreate("in_memory");
+
+    await ctx.broadcastSubscribe(subscriber.did);
+    await ctx.broadcastUnsubscribe(subscriber.did, true);
+
+    expect(await ctx.broadcastIsSubscriber(subscriber.did)).toBe(false);
+    // A BroadcastKeyRotated event should be emitted when rotateKeys is true.
+    const mockCtx = mockBridge._contexts.get(handle.contextId);
+    expect(mockCtx).toBeDefined();
+    const rotateEvents =
+      mockCtx?.eventLog.filter((e) => e.eventType === "BroadcastKeyRotated") ?? [];
+    expect(rotateEvents.length).toBe(1);
+    expect(rotateEvents[0].payload.reason).toBe("subscriber_removed");
+    expect(rotateEvents[0].payload.subscriberDid).toBe(subscriber.did);
+  });
+
   it("broadcastPublish succeeds for context member", async () => {
     const { ctx, identity } = await createBroadcastContext();
     const payload = new Uint8Array([1, 2, 3]);

@@ -800,13 +800,25 @@ export function createMockBridge(): Bridge & {
     async broadcastUnsubscribe(
       handle: BridgeContextHandle,
       subscriberDid: string,
-      _rotateKeys?: boolean,
+      rotateKeys?: boolean,
     ): Promise<void> {
       const ctx = getContext(handle);
       if (ctx.mode !== "Broadcast") {
         throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
       }
       ctx.broadcastSubscribers.delete(subscriberDid);
+      if (rotateKeys === true) {
+        // Record a key rotation event so tests can verify the parameter was observed.
+        const rotateEvent: Event = {
+          eventType: "BroadcastKeyRotated",
+          actorDid: handle.creatorDid,
+          timestamp: Math.floor(Date.now() / 1000),
+          payload: { reason: "subscriber_removed", subscriberDid },
+          sequence: ctx.eventLog.length,
+        };
+        ctx.receiveBuffer.push(rotateEvent);
+        ctx.eventLog.push(rotateEvent);
+      }
     },
 
     async broadcastPublish(
