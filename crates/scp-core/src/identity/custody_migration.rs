@@ -51,6 +51,7 @@ use crate::time;
 /// - Self-managed keys — user controls raw key material
 /// - Software — encrypted file on disk (e.g., `SQLCipher`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CustodyMigrationTarget {
     /// Platform-managed custody (Apple Keychain, Google Keystore).
     PlatformManaged,
@@ -426,26 +427,29 @@ impl CustodyMigrationOrchestrator {
         // Step 4: Revoke old UCANs and reissue under new key, re-sign
         // attestations. Failure here is recorded but does not abort — the
         // DID document already points to the new key.
+        let mut failure_reason: Option<String> = None;
         let ucans_reissued = match backend.reissue_credentials(&self.did, &request) {
             Ok(()) => true,
-            Err(_) => false,
+            Err(reason) => {
+                failure_reason = Some(format!("UCAN reissuance failed (step 4): {reason}"));
+                false
+            }
         };
 
         // Step 5: Destroy old key material. Non-fatal per spec §3.2.1.
-        let old_key_destroyed = backend.destroy_old_key(&self.did).is_ok();
+        let old_key_destroyed = match backend.destroy_old_key(&self.did) {
+            Ok(()) => true,
+            Err(reason) => {
+                let step5_msg = format!("old key destruction failed (step 5, non-fatal): {reason}");
+                failure_reason = Some(match failure_reason {
+                    Some(existing) => format!("{existing}; {step5_msg}"),
+                    None => step5_msg,
+                });
+                false
+            }
+        };
 
         let completed_at = time::now_millis()?;
-
-        // Determine overall failure reason from non-fatal step failures.
-        let failure_reason = if !ucans_reissued && !old_key_destroyed {
-            Some("UCAN reissuance and old key destruction both failed".to_owned())
-        } else if !ucans_reissued {
-            Some("UCAN reissuance failed (step 4)".to_owned())
-        } else if !old_key_destroyed {
-            Some("old key destruction failed (step 5, non-fatal)".to_owned())
-        } else {
-            None
-        };
 
         Ok(CustodyMigrationResult {
             did: self.did.clone(),
@@ -769,7 +773,7 @@ mod tests {
             failed_contexts: vec!["ctx-2".to_owned()],
             initiated_at: 1000,
             completed_at: 2000,
-            failure_reason: Some("UCAN reissuance and old key destruction both failed".to_owned()),
+            failure_reason: Some("UCAN reissuance failed (step 4): store error; old key destruction failed (step 5, non-fatal): HSM error".to_owned()),
         };
 
         let bytes = rmp_serde::to_vec(&result).unwrap();
@@ -954,12 +958,10 @@ mod tests {
         assert!(result.did_document_rotated);
         assert!(result.old_key_destroyed);
         assert!(result.failure_reason.is_some());
+        let reason = result.failure_reason.as_ref().unwrap();
         assert!(
-            result
-                .failure_reason
-                .as_ref()
-                .unwrap()
-                .contains("UCAN reissuance failed")
+            reason.contains("UCAN reissuance failed (step 4): UCAN store error"),
+            "expected backend error in failure_reason, got: {reason}"
         );
     }
 
@@ -982,12 +984,10 @@ mod tests {
         assert!(result.ucans_reissued);
         assert!(result.did_document_rotated);
         assert!(result.failure_reason.is_some());
+        let reason = result.failure_reason.as_ref().unwrap();
         assert!(
-            result
-                .failure_reason
-                .as_ref()
-                .unwrap()
-                .contains("old key destruction failed")
+            reason.contains("old key destruction failed (step 5, non-fatal): HSM does not support explicit deletion"),
+            "expected backend error in failure_reason, got: {reason}"
         );
     }
 
@@ -1009,12 +1009,14 @@ mod tests {
         assert!(!result.ucans_reissued);
         assert!(!result.old_key_destroyed);
         assert!(result.failure_reason.is_some());
+        let reason = result.failure_reason.as_ref().unwrap();
         assert!(
-            result
-                .failure_reason
-                .as_ref()
-                .unwrap()
-                .contains("both failed")
+            reason.contains("UCAN reissuance failed (step 4): UCAN error"),
+            "expected step 4 backend error in failure_reason, got: {reason}"
+        );
+        assert!(
+            reason.contains("old key destruction failed (step 5, non-fatal): HSM error"),
+            "expected step 5 backend error in failure_reason, got: {reason}"
         );
     }
 

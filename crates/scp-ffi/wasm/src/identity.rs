@@ -1610,13 +1610,15 @@ pub fn identity_execute_recovery(
 
 /// Executes the custody migration protocol for the given DID.
 ///
-/// WASM-local implementation (no scp-core dependency). Returns a JSON
-/// string with the migration result.
+/// WASM cannot depend on scp-core (tokio multi-thread), and no real
+/// custody migration backend is available at the bridge layer. This
+/// function validates the target parameter and returns an error indicating
+/// that a real backend must be provided via the SDK layer.
 ///
 /// # Errors
 ///
 /// Returns `SCP-IDENT-1024` if `target` is not a recognized value.
-/// Returns `SCP-IDENT-1026` if JSON serialization fails.
+/// Returns `SCP-IDENT-1025` because no custody migration backend is configured.
 ///
 /// See spec §3.2.1.
 #[wasm_bindgen]
@@ -1625,9 +1627,14 @@ pub fn identity_execute_custody_migration(
     target: String,
     context_ids: Vec<String>,
 ) -> Result<String, JsValue> {
-    // Validate target parameter.
-    let target_label = match target.as_str() {
-        "platform_managed" | "hardware" | "software" | "in_memory" => target.clone(),
+    // Suppress unused-variable warnings — parameters are validated but the
+    // operation cannot proceed without a real backend.
+    let _ = &did;
+    let _ = &context_ids;
+
+    // Validate target parameter to give a clear error for invalid inputs.
+    match target.as_str() {
+        "platform_managed" | "hardware" | "software" | "in_memory" => {}
         other => {
             return Err(ScpWasmError::Identity {
                 message: format!(
@@ -1638,35 +1645,15 @@ pub fn identity_execute_custody_migration(
             .into_js()
             .into());
         }
-    };
+    }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let now_ms = js_sys::Date::now() as u64;
-
-    // Build result JSON matching the scp-core CustodyMigrationResult structure.
-    let result = serde_json::json!({
-        "did": did,
-        "target": target_label,
-        "key_generated": true,
-        "authorized": true,
-        "did_document_rotated": true,
-        "ucans_reissued": true,
-        "old_key_destroyed": true,
-        "updated_contexts": context_ids,
-        "failed_contexts": [],
-        "initiated_at": now_ms,
-        "completed_at": now_ms,
-        "failure_reason": null,
-    });
-
-    serde_json::to_string(&result).map_err(|e| -> JsValue {
-        ScpWasmError::Identity {
-            message: format!("failed to serialize custody migration result: {e}"),
-            code: "SCP-IDENT-1026".to_owned(),
-        }
-        .into_js()
-        .into()
-    })
+    Err(ScpWasmError::Identity {
+        message: "custody migration backend not configured — provide a real backend via SDK layer"
+            .to_owned(),
+        code: "SCP-IDENT-1025".to_owned(),
+    }
+    .into_js()
+    .into())
 }
 
 // ---------------------------------------------------------------------------

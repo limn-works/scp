@@ -7855,36 +7855,54 @@ pub fn identity_execute_custody_migration(
         }
     };
 
-    struct UniffiMigrationBackend;
-    impl CustodyMigrationBackend for UniffiMigrationBackend {
+    // Error-returning backend — custody migration requires a real backend
+    // provided via the SDK layer. This placeholder ensures callers get an
+    // actionable error instead of silently succeeding with fake keys.
+    struct NotConfiguredMigrationBackend;
+    impl CustodyMigrationBackend for NotConfiguredMigrationBackend {
         fn generate_key(&self, _target: CustodyMigrationTarget) -> Result<Vec<u8>, String> {
-            Ok(vec![0xAA; 32])
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
         }
         fn authorize(&self, _request: &CustodyMigrationRequest) -> Result<(), String> {
-            Ok(())
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
         }
         fn rotate_did_document(
             &self,
             _did: &DID,
             _request: &CustodyMigrationRequest,
-            context_ids: &[String],
+            _context_ids: &[String],
         ) -> Result<(Vec<String>, Vec<String>), String> {
-            Ok((context_ids.to_vec(), Vec::new()))
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
         }
         fn reissue_credentials(
             &self,
             _did: &DID,
             _request: &CustodyMigrationRequest,
         ) -> Result<(), String> {
-            Ok(())
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
         }
         fn destroy_old_key(&self, _did: &DID) -> Result<(), String> {
-            Ok(())
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
         }
     }
 
     let orchestrator = CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
-    let backend = UniffiMigrationBackend;
+    let backend = NotConfiguredMigrationBackend;
 
     let rt = crate::runtime();
 
