@@ -143,9 +143,9 @@ jobs:
             For each story in scope, check ALL of these (from `.docs/standards/prd.md`):
 
             ### Structure
-            - All 14 required fields present (`id`, `title`, `gate`, `priority`,
+            - All 13 required fields present (`id`, `title`, `gate`, `priority`,
               `severity`, `status`, `files`, `description`, `acceptanceCriteria`,
-              `actionItems`, `blockedBy`, `tools`, `sources`, `details`)
+              `actionItems`, `blockedBy`, `sources`, `details`)
             - `priority` is P0/P1/P2; `severity` is critical/major/moderate/minor;
               `status` is pending/in-progress/done
             - `id` follows PREFIX-NNN format (zero-padded 3 digits)
@@ -190,7 +190,25 @@ jobs:
             - Source sections haven't been updated since the story was written
               (check for content that the story doesn't reflect)
 
-            ## Step 4: Report
+            ## Step 4: Self-Validation (MANDATORY before reporting)
+
+            Before writing the report, re-examine every finding:
+
+            1. **Is it factually true?** Re-read the actual source file and heading.
+               Verify the heading text matches exactly. If the finding is about
+               acceptance criteria quality, re-read the criterion — is it truly
+               vague, or did you misread it?
+            2. **Can I prove it — and can I disprove it?** Each finding must:
+               - **Prove it:** cite the specific story field, source section, or
+                 criterion that's wrong and explain exactly what the fix should be.
+               - **Try to disprove it:** if you claim a source heading doesn't exist,
+                 re-read the file looking for close variants (different heading level,
+                 slightly different wording). If you claim an AC is vague, try to
+                 write a concrete test for it — if you can, it's not vague.
+
+            Drop any finding that fails either check.
+
+            ## Step 5: Report
 
             ### When to post
 

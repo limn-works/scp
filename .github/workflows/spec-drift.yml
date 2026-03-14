@@ -183,7 +183,25 @@ jobs:
             classify it as **Planned** (non-actionable). If no pending story covers it, classify
             it as **Action Required**.
 
-            ## Step 3: Report
+            ## Step 3: Self-Validation (MANDATORY before reporting)
+
+            Before writing the report, re-examine every finding:
+
+            1. **Is it factually true?** Re-read the actual code and spec section. Verify
+               type names, field names, method signatures, and behavioral contracts. If
+               you cannot point to a specific line in both the spec and the code, drop it.
+            2. **Can I prove it — and can I disprove it?** Each finding must:
+               - **Prove it:** cite the spec section AND the code location (file:line).
+                 Vague findings ("might not match") are not findings.
+               - **Try to disprove it:** if you claim the code diverges from the spec,
+                 search for other code paths, helper functions, or trait impls that
+                 might implement the spec requirement elsewhere. Grep for the type or
+                 function name across the codebase. If you find it implemented in a
+                 different location, drop the finding.
+
+            Drop any finding that fails either check.
+
+            ## Step 4: Report
 
             ## When to post
 

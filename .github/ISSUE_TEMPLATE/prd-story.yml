@@ -1,0 +1,86 @@
+name: PRD Story
+description: Propose a new PRD story or request changes to an existing one
+title: "[PRD] "
+labels: ["prd-story"]
+body:
+  - type: dropdown
+    id: prd-file
+    attributes:
+      label: PRD File
+      description: Which PRD does this story belong to?
+      options:
+        - agent-binding
+        - bridge-cooperative
+        - capability-registry
+        - content-access
+        - governance-gaps
+        - governance-integration
+        - http-features
+        - main
+        - participation-admission
+        - persistence
+        - reachability
+        - transport-expansion
+        - (new PRD)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: action
+    attributes:
+      label: Action
+      description: What do you want to do?
+      options:
+        - Add new story
+        - Modify existing story
+        - Remove story
+        - Split story
+    validations:
+      required: true
+
+  - type: textarea
+    id: story-json
+    attributes:
+      label: Story JSON
+      description: |
+        Full story object conforming to `.docs/standards/prd.md`.
+        For modifications, include the complete updated story.
+        For removals, include just `{"id": "PREFIX-NNN"}`.
+      placeholder: |
+        {
+          "id": "SCP-042",
+          "title": "Implement widget validation",
+          "gate": "gate-4a",
+          "priority": "P1",
+          "severity": "major",
+          "status": "pending",
+          "files": ["crates/scp-core/src/widget.rs"],
+          "description": "Implement validation logic for widgets per spec section 7.3.",
+          "acceptanceCriteria": [
+            "validate() returns Ok for well-formed widgets",
+            "validate() returns WidgetError::MalformedField for missing required fields"
+          ],
+          "actionItems": [
+            "Add validate() method to Widget",
+            "Add WidgetError::MalformedField variant"
+          ],
+          "blockedBy": [],
+          "sources": [
+            {"file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3 Widget Validation"}
+          ],
+          "details": {}
+        }
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: |
+        Why is this story needed? Reference spec sections, ADRs, or upstream
+        artifacts. For modifications, explain what changed and why.
+      placeholder: "Spec section 7.3 was updated to add widget validation requirements that aren't covered by any existing story."
+    validations:
+      required: false
