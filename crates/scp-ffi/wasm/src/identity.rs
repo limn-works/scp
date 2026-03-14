@@ -1657,6 +1657,49 @@ pub fn identity_execute_custody_migration(
 }
 
 // ---------------------------------------------------------------------------
+// Test helpers (pub(crate) for cross-module integration tests)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+
+    /// Register an Ed25519 identity with a separate agent key in
+    /// `IDENTITY_REGISTRY`. Returns `(did, agent_signing_key)` so callers can
+    /// produce real Ed25519 signatures under the agent VM (`kid: "#agent"`).
+    ///
+    /// Used by `ucan::tests` for E2E integration tests that exercise the full
+    /// `validate_ucan_full` pipeline with real cryptography (issue #1012).
+    pub fn register_identity_with_agent_key()
+    -> (String, ed25519_dalek::SigningKey, ed25519_dalek::SigningKey) {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    public_key_bytes: pub_bytes,
+                    custody_type: "in_memory".to_owned(),
+                    agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                },
+            );
+        });
+        (did, signing_key, agent_key)
+    }
+
+    /// Clean up the identity registry (prevents cross-test pollution from
+    /// thread-local state persisting across tests in the same thread).
+    pub fn cleanup_identity_registry() {
+        IDENTITY_REGISTRY.with(|reg| reg.borrow_mut().clear());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -1289,7 +1289,7 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1830,5 +1830,356 @@ mod tests {
         let parsed = parse_ucan(&jwt)?;
         assert_eq!(parsed.header.kid, None);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E integration tests: real Ed25519 signatures through validate_ucan_full
+    //
+    // These tests exercise the full validate_ucan_full pipeline with real
+    // cryptographic operations (no empty signatures). They register identities
+    // with agent keys in the WASM identity registry and produce properly
+    // signed JWTs.
+    //
+    // Category A rejection fires at step 6b, before the time-dependent steps
+    // (9: nonce, 11: time bounds), so these tests run on native targets
+    // without requiring the WASM time module.
+    //
+    // See issue #1012.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a signed UCAN JWT from header/payload using the given
+    /// signing key. Returns the encoded JWT string.
+    fn build_signed_ucan(
+        header: &UcanHeader,
+        payload: &UcanPayload,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> String {
+        use ed25519_dalek::Signer;
+
+        let header_json = serde_json::to_vec(header).expect("header serialization");
+        let payload_json = serde_json::to_vec(payload).expect("payload serialization");
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    #[test]
+    fn e2e_agent_signed_category_a_rejected_after_real_signature_verification() {
+        // Setup: register an identity with a separate agent key.
+        crate::identity::test_helpers::cleanup_identity_registry();
+
+        let (did, _identity_key, agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        // Build a UCAN signed by the agent key (#agent) granting a Category A
+        // capability (did_document:update). This is a self-delegation scenario
+        // (iss == aud) with scp_key_scope to satisfy step 5a.
+        let context_id = "test-ctx-e2e-catA";
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some("#agent".to_owned()),
+        };
+        let payload = UcanPayload {
+            iss: did.clone(),
+            aud: did.clone(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "unused-nonce".to_owned(),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{context_id}/did_document:update"),
+                can: "update".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+        };
+
+        let jwt = build_signed_ucan(&header, &payload, &agent_key);
+
+        // Verify the signature is valid independently (step 2 must pass).
+        let parsed = parse_ucan(&jwt).expect("JWT should parse");
+        verify_signature(&parsed).expect("real Ed25519 signature must verify");
+
+        // Now run the full pipeline — expect Category A rejection at step 6b.
+        let result = validate_ucan_full(&UcanValidationParams {
+            token: &parsed,
+            capability: &format!("scp:ctx:{context_id}/did_document:update"),
+            context_id,
+            expected_aud_did: &did,
+            proof_tokens: None,
+            ceiling: &HashSet::new(),
+            creator_did: &did,
+            revoked_cids: &HashSet::new(),
+        });
+
+        assert!(
+            result.is_err(),
+            "Category A capability from #agent must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Category A violation"),
+            "expected Category A violation error, got: {err}"
+        );
+        assert!(
+            err.contains("did_document:update"),
+            "error should name the offending capability, got: {err}"
+        );
+    }
+
+    #[test]
+    fn e2e_agent_signed_category_b_passes_signature_and_category_a_check() {
+        // Setup: register an identity with a separate agent key.
+        crate::identity::test_helpers::cleanup_identity_registry();
+
+        let (did, _identity_key, agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        // Build a UCAN signed by the agent key granting a Category B
+        // (non-identity) capability. This should pass steps 1-6b.
+        let context_id = "test-ctx-e2e-catB";
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some("#agent".to_owned()),
+        };
+        let payload = UcanPayload {
+            iss: did.clone(),
+            aud: did.clone(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "unused-nonce".to_owned(),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{context_id}/messages:write"),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+        };
+
+        let jwt = build_signed_ucan(&header, &payload, &agent_key);
+
+        // Verify the signature independently.
+        let parsed = parse_ucan(&jwt).expect("JWT should parse");
+        verify_signature(&parsed).expect("real Ed25519 signature must verify");
+
+        // Run the pipeline — it should pass steps 1-6b (signature + Category A)
+        // then fail at step 9 (nonce validation) because the nonce format is
+        // intentionally invalid. This proves the pipeline reached past step 6b
+        // (Category A check passed for a Category B capability).
+        let result = validate_ucan_full(&UcanValidationParams {
+            token: &parsed,
+            capability: &format!("scp:ctx:{context_id}/messages:write"),
+            context_id,
+            expected_aud_did: &did,
+            proof_tokens: None,
+            ceiling: &HashSet::new(),
+            creator_did: &did,
+            revoked_cids: &HashSet::new(),
+        });
+
+        // The pipeline should fail at step 9 (nonce format), NOT at step 6b.
+        assert!(
+            result.is_err(),
+            "pipeline should fail at nonce validation (step 9)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("Category A"),
+            "Category B capability should pass Category A check, but got: {err}"
+        );
+        assert!(
+            err.contains("nonce"),
+            "expected nonce validation error (step 9), got: {err}"
+        );
+    }
+
+    #[test]
+    fn e2e_active_key_signed_category_a_passes_category_a_check() {
+        // Setup: register identity. The #active key (identity key) should be
+        // allowed to grant Category A capabilities.
+        crate::identity::test_helpers::cleanup_identity_registry();
+
+        let (did, identity_key, _agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let context_id = "test-ctx-e2e-active";
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some("#active".to_owned()),
+        };
+        let payload = UcanPayload {
+            iss: did.clone(),
+            aud: did.clone(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "unused-nonce".to_owned(),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{context_id}/did_document:update"),
+                can: "update".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
+        };
+
+        let jwt = build_signed_ucan(&header, &payload, &identity_key);
+
+        let parsed = parse_ucan(&jwt).expect("JWT should parse");
+        verify_signature(&parsed).expect("real Ed25519 signature must verify");
+
+        // Pipeline should pass Category A (step 6b) because #active is allowed.
+        // It will fail later at nonce validation (step 9).
+        let result = validate_ucan_full(&UcanValidationParams {
+            token: &parsed,
+            capability: &format!("scp:ctx:{context_id}/did_document:update"),
+            context_id,
+            expected_aud_did: &did,
+            proof_tokens: None,
+            ceiling: &HashSet::new(),
+            creator_did: &did,
+            revoked_cids: &HashSet::new(),
+        });
+
+        assert!(result.is_err(), "pipeline should fail at nonce validation");
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("Category A"),
+            "#active key should pass Category A check, but got: {err}"
+        );
+        assert!(
+            err.contains("nonce"),
+            "expected nonce validation error (step 9), got: {err}"
+        );
+    }
+
+    #[test]
+    fn e2e_invalid_signature_rejected_before_category_a() {
+        // Verify that a tampered signature is caught at step 2 (before
+        // Category A at step 6b). This proves the pipeline does real crypto.
+        crate::identity::test_helpers::cleanup_identity_registry();
+
+        let (did, _identity_key, agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let context_id = "test-ctx-e2e-badsig";
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some("#agent".to_owned()),
+        };
+        let payload = UcanPayload {
+            iss: did.clone(),
+            aud: did.clone(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "unused-nonce".to_owned(),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{context_id}/did_document:update"),
+                can: "update".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+        };
+
+        // Sign with the agent key, then corrupt the signature.
+        let jwt = build_signed_ucan(&header, &payload, &agent_key);
+        let parts: Vec<&str> = jwt.split('.').collect();
+        // Replace last byte of signature with a different value.
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        sig_bytes[63] ^= 0xff; // flip all bits of last byte
+        let corrupted_sig = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        let tampered_jwt = format!("{}.{}.{}", parts[0], parts[1], corrupted_sig);
+
+        let parsed = parse_ucan(&tampered_jwt).expect("JWT should parse (format is valid)");
+
+        let result = validate_ucan_full(&UcanValidationParams {
+            token: &parsed,
+            capability: &format!("scp:ctx:{context_id}/did_document:update"),
+            context_id,
+            expected_aud_did: &did,
+            proof_tokens: None,
+            ceiling: &HashSet::new(),
+            creator_did: &did,
+            revoked_cids: &HashSet::new(),
+        });
+
+        assert!(result.is_err(), "tampered signature must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("signature verification failed"),
+            "expected signature error at step 2, got: {err}"
+        );
+    }
+
+    #[test]
+    fn e2e_all_category_a_resources_rejected_for_agent_key() {
+        // Exhaustively verify every Category A resource type is rejected
+        // when the token is signed by #agent with real cryptography.
+        crate::identity::test_helpers::cleanup_identity_registry();
+
+        let (did, _identity_key, agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let context_id = "test-ctx-e2e-allcatA";
+
+        for resource in CATEGORY_A_RESOURCES {
+            let capability = format!("scp:ctx:{context_id}/{resource}:update");
+            let header = UcanHeader {
+                alg: "EdDSA".to_owned(),
+                typ: "JWT".to_owned(),
+                ucv: "0.10.0".to_owned(),
+                kid: Some("#agent".to_owned()),
+            };
+            let payload = UcanPayload {
+                iss: did.clone(),
+                aud: did.clone(),
+                exp: 9_999_999_999,
+                nbf: None,
+                nnc: "unused-nonce".to_owned(),
+                att: vec![Attenuation {
+                    with: capability.clone(),
+                    can: "update".to_owned(),
+                }],
+                prf: vec![],
+                fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            };
+
+            let jwt = build_signed_ucan(&header, &payload, &agent_key);
+            let parsed = parse_ucan(&jwt).unwrap();
+
+            // Real signature must verify (step 2).
+            verify_signature(&parsed)
+                .unwrap_or_else(|e| panic!("signature must verify for resource '{resource}': {e}"));
+
+            // Full pipeline must reject at step 6b.
+            let result = validate_ucan_full(&UcanValidationParams {
+                token: &parsed,
+                capability: &capability,
+                context_id,
+                expected_aud_did: &did,
+                proof_tokens: None,
+                ceiling: &HashSet::new(),
+                creator_did: &did,
+                revoked_cids: &HashSet::new(),
+            });
+
+            assert!(
+                result.is_err(),
+                "Category A resource '{resource}' must be rejected for #agent"
+            );
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("Category A violation"),
+                "expected Category A violation for '{resource}', got: {err}"
+            );
+        }
     }
 }
