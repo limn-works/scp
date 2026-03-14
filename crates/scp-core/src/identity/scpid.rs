@@ -241,6 +241,7 @@ const MAX_AUDIENCE_BYTES: usize = 2048;
 /// Returns [`ScpIdError::InvalidInput`] if:
 /// - `ttl` is zero
 /// - `ttl` exceeds 300 seconds (§3.11.2 constraint)
+/// - `audience` is empty (not a valid URI per RFC 3986)
 /// - `audience` exceeds 2048 bytes
 pub fn scpid_challenge(audience: &str, ttl: Duration) -> Result<ScpIdChallenge, ScpIdError> {
     // TTL is bounded to 300 000 ms, so u128→u64 truncation cannot occur,
@@ -256,6 +257,12 @@ pub fn scpid_challenge(audience: &str, ttl: Duration) -> Result<ScpIdChallenge, 
     if ttl_ms > MAX_TTL_MS {
         return Err(ScpIdError::InvalidInput(
             "TTL exceeds 300 seconds".to_owned(),
+        ));
+    }
+
+    if audience.is_empty() {
+        return Err(ScpIdError::InvalidInput(
+            "audience must not be empty".to_owned(),
         ));
     }
 
@@ -469,6 +476,17 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject wrong protocol on response deser"
+        );
+    }
+
+    #[test]
+    fn test_empty_audience_rejection() {
+        let result = scpid_challenge("", Duration::from_secs(60));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ScpIdError::InvalidInput(ref msg) if msg.contains("audience must not be empty")),
+            "expected InvalidInput with empty audience message, got: {err}"
         );
     }
 
