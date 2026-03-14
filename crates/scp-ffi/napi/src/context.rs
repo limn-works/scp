@@ -13,6 +13,7 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
+use scp_core::context::manager::GovernanceActionResult;
 use scp_core::context::params::ContextMode;
 use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
@@ -1218,6 +1219,26 @@ pub async fn context_execute_governance_action(
         );
     }
 
+    // Sync FFI handle state for migration transitions (§5.11A).
+    match &result {
+        GovernanceActionResult::MigrationProposed(_) => {
+            if let Ok(mut s) = handle.state.lock() {
+                *s = ContextState::MigratingOut;
+            }
+        }
+        GovernanceActionResult::MigrationCancelled => {
+            if let Ok(mut s) = handle.state.lock() {
+                *s = ContextState::Active;
+            }
+        }
+        GovernanceActionResult::ContextTombstoned => {
+            if let Ok(mut s) = handle.state.lock() {
+                *s = ContextState::Tombstoned;
+            }
+        }
+        _ => {}
+    }
+
     Ok(format!("{result:?}"))
 }
 
@@ -1620,7 +1641,14 @@ pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Res
                 message: format!("tombstone_migrated_context failed: {e}"),
                 code: "SCP-CTX-2050".to_owned(),
             })
-        })
+        })?;
+
+    // Sync FFI handle state to Tombstoned (§5.11A.5).
+    if let Ok(mut s) = handle.state.lock() {
+        *s = ContextState::Tombstoned;
+    }
+
+    Ok(())
 }
 
 /// Returns the migration state for a context, if any (§5.11A).

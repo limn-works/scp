@@ -682,6 +682,10 @@ pub enum ContextState {
     Closed,
     /// Context TTL has expired.
     Expired,
+    /// Context migration approved — source is in read-only grace period (§5.11A.4).
+    MigratingOut,
+    /// Context permanently tombstoned after migration (§5.11A.5). Terminal state.
+    Tombstoned,
 }
 
 /// Memory scope for a context — governs key destruction and data retention on close.
@@ -1618,7 +1622,8 @@ impl ContextHandle {
 
     /// Returns the context's current lifecycle state as a string.
     ///
-    /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`.
+    /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
+    /// `"migrating_out"`, `"tombstoned"`.
     ///
     /// # Errors
     ///
@@ -1634,6 +1639,8 @@ impl ContextHandle {
             ContextState::Closing => "closing".to_owned(),
             ContextState::Closed => "closed".to_owned(),
             ContextState::Expired => "expired".to_owned(),
+            ContextState::MigratingOut => "migrating_out".to_owned(),
+            ContextState::Tombstoned => "tombstoned".to_owned(),
         })
     }
 
@@ -4842,6 +4849,20 @@ pub async fn governance_execute(
         );
     }
 
+    // Sync FFI handle state for migration transitions (§5.11A).
+    match result.as_str() {
+        "MigrationProposed" => {
+            *handle.state.lock().await = ContextState::MigratingOut;
+        }
+        "MigrationCancelled" => {
+            *handle.state.lock().await = ContextState::Active;
+        }
+        "ContextTombstoned" => {
+            *handle.state.lock().await = ContextState::Tombstoned;
+        }
+        _ => {}
+    }
+
     Ok(result)
 }
 
@@ -5188,6 +5209,7 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
 #[uniffi::export]
 pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
     let context_id = handle.context_id.clone();
+    let handle_ref = handle.clone();
 
     runtime()
         .spawn(async move {
@@ -5195,7 +5217,12 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
             manager
                 .tombstone_migrated_context(&context_id)
                 .await
-                .map_err(ScpError::from)
+                .map_err(ScpError::from)?;
+
+            // Sync FFI handle state to Tombstoned (§5.11A.5).
+            *handle_ref.state.lock().await = ContextState::Tombstoned;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Context {

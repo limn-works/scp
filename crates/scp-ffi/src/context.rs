@@ -55,7 +55,8 @@ use crate::validate;
 pub struct PyContextHandle {
     /// Unique identifier for this context.
     context_id: String,
-    /// Current lifecycle state: "creating", "active", "closing", "closed", "expired".
+    /// Current lifecycle state: `"creating"`, `"active"`, `"closing"`, `"closed"`,
+    /// `"expired"`, `"migrating_out"`, `"tombstoned"`.
     state: Arc<Mutex<String>>,
     /// DID of the context creator.
     creator_did: String,
@@ -73,7 +74,8 @@ impl PyContextHandle {
 
     /// Returns the context's current lifecycle state as a string.
     ///
-    /// One of: "creating", "active", "closing", "closed", "expired".
+    /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
+    /// `"migrating_out"`, `"tombstoned"`.
     #[getter]
     fn state(&self) -> PyResult<String> {
         let guard = self
@@ -1676,6 +1678,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
     let context_id = handle.context_id.clone();
+    let handle_state = handle.state.clone();
     let proposal_json_owned = proposal_json.to_owned();
 
     rt.block_on(async move {
@@ -1755,6 +1758,29 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
             GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
         };
+
+        // Sync FFI handle state for migration transitions (§5.11A).
+        // The core ContextManager has already transitioned; keep the
+        // FFI-side string in lockstep.
+        match result_str {
+            "MigrationProposed" => {
+                if let Ok(mut s) = handle_state.lock() {
+                    "migrating_out".clone_into(&mut s);
+                }
+            }
+            "MigrationCancelled" => {
+                if let Ok(mut s) = handle_state.lock() {
+                    "active".clone_into(&mut s);
+                }
+            }
+            "ContextTombstoned" => {
+                if let Ok(mut s) = handle_state.lock() {
+                    "tombstoned".clone_into(&mut s);
+                }
+            }
+            _ => {}
+        }
+
         Ok(result_str.to_owned())
     })
 }
@@ -1785,11 +1811,21 @@ fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
     let context_id = handle.context_id.clone();
+    let handle_state = handle.state.clone();
 
     rt.block_on(async move {
         mgr.tombstone_migrated_context(&context_id)
             .await
-            .map_err(|e| PyRuntimeError::new_err(format!("tombstone_migrated_context failed: {e}")))
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("tombstone_migrated_context failed: {e}"))
+            })?;
+
+        // Sync FFI handle state to "tombstoned" (§5.11A.5).
+        if let Ok(mut s) = handle_state.lock() {
+            "tombstoned".clone_into(&mut s);
+        }
+
+        Ok(())
     })
 }
 

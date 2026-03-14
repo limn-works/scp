@@ -6453,7 +6453,7 @@ impl ContextManager {
             .as_secs();
         let grace_period_end = now.saturating_add(grace_period_secs);
 
-        // Create the destination context with migration_source metadata
+        // Prepare destination params with migration_source metadata
         // (§5.11A.2). The destination is a fully independent context with
         // its own ID, MLS group, event log, and key material.
         let mut dest_params = new_context_params.clone();
@@ -6462,34 +6462,11 @@ impl ContextManager {
             proposal_id,
         });
 
-        // Resolve the creator DID from the source context's membership.
-        let creator_did = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            // Use the first admin from membership as the destination creator.
-            ctx.membership
-                .members()
-                .find(|m| m.role_name == "admin")
-                .map(|m| m.did.clone())
-                .ok_or_else(|| {
-                    ContextError::PermissionDenied(
-                        "no admin found in source context for destination creation".to_owned(),
-                    )
-                })?
-        };
-
-        self.create_context(destination_context_id.clone(), dest_params, creator_did)
-            .await
-            .map_err(|e| {
-                ContextError::PermissionDenied(format!("failed to create destination context: {e}"))
-            })?;
-
-        // Validate state, set migration state, and transition — all under
-        // lock to prevent a race where migration_state is committed but the
-        // state transition fails (F4).
-        let snapshot = {
+        // Validate source state, transition to MigratingOut, and set
+        // migration state — all under ONE lock acquisition to prevent a
+        // race where another task observes the source as Active between
+        // destination creation and the state transition (F4).
+        let (creator_did, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -6502,6 +6479,18 @@ impl ContextManager {
                     "context migration is already in progress".to_owned(),
                 ));
             }
+
+            // Resolve the creator DID from the source context's membership.
+            let creator = ctx
+                .membership
+                .members()
+                .find(|m| m.role_name == "admin")
+                .map(|m| m.did.clone())
+                .ok_or_else(|| {
+                    ContextError::PermissionDenied(
+                        "no admin found in source context for destination creation".to_owned(),
+                    )
+                })?;
 
             // Transition to MigratingOut inside the lock so that
             // migration_state and handle state are always consistent.
@@ -6537,12 +6526,33 @@ impl ContextManager {
                     grace_period_end,
                 });
 
-            if self.has_persistence() {
+            let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
                 None
-            }
+            };
+
+            (creator, snap)
         };
+
+        // Create the destination context AFTER the source has been
+        // transitioned to MigratingOut. If creation fails, roll back.
+        if let Err(e) = self
+            .create_context(destination_context_id.clone(), dest_params, creator_did)
+            .await
+        {
+            // Roll back: revert source to Active and clear migration state.
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                let _ = ctx.handle.transition_to(&ContextState::Active).await;
+                ctx.migration_state = None;
+                // Drain the migration events we pushed.
+                let _ = ctx.receive_buffer.drain();
+            }
+            return Err(ContextError::PermissionDenied(format!(
+                "failed to create destination context: {e}"
+            )));
+        }
 
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
