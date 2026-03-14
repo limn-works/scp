@@ -436,6 +436,23 @@ impl DidPublicKeyResolver for IdentityBackedDidResolver {
     }
 }
 
+/// Implements `scp_identity::resolver::DidResolver` so that the global
+/// production resolver can be used directly with `scp_core::identity::scpid_verify`
+/// (which requires the async identity-layer resolver trait, not the sync UCAN
+/// validation trait).
+///
+/// Delegates to the type-erased [`AsyncResolveFn`] stored during construction.
+impl scp_identity::resolver::DidResolver for IdentityBackedDidResolver {
+    fn resolve(
+        &self,
+        did: &str,
+    ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send {
+        let resolve_fn = Arc::clone(&self.resolve_fn);
+        let did_owned = did.to_owned();
+        async move { (resolve_fn)(did_owned).await }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DispatchDidResolver (#311)
 // ---------------------------------------------------------------------------

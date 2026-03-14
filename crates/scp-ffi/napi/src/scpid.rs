@@ -8,7 +8,6 @@
 //!
 //! See spec §3.11 and the `scp-core` `scpid` module.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use napi_derive::napi;
@@ -17,8 +16,7 @@ use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_challenge, scpid_sign as core_sign,
     scpid_verify as core_verify,
 };
-use scp_identity::resolver::DualLayerResolver;
-use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier, SigningKeyId};
+use scp_identity::SigningKeyId;
 
 use crate::error::ScpNapiError;
 
@@ -120,10 +118,10 @@ pub fn scpid_sign(
 
 /// Verifies a signed SCPID response against the original challenge (§3.11.4).
 ///
-/// Resolves the signer's DID document via `DualLayerResolver` (parallel
-/// relay + DHT resolution), then runs the 11-step verification pipeline
-/// from `scp-core`. Returns the `ScpIdAuthentication` result as a JSON
-/// string on success.
+/// Resolves the signer's DID document via the global production DID resolver
+/// (initialized during `identityCreate`), then runs the 11-step verification
+/// pipeline from `scp-core`. Returns the `ScpIdAuthentication` result as a
+/// JSON string on success.
 ///
 /// # JS usage
 ///
@@ -144,16 +142,16 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> napi::Resu
             code: "SCP-IDENT-1038".to_owned(),
         })?;
 
-    let resolver = DualLayerResolver::new(
-        Arc::new(NoOpRelayQuerier),
-        Arc::new(InMemoryDhtClient::new()),
-        Arc::new(DidCache::new()),
-        Vec::new(),
-    );
+    let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpNapiError::Identity {
+        message: "DID resolver not initialized — create an identity with \
+                      identityCreate before calling scpidVerify"
+            .to_owned(),
+        code: "SCP-IDENT-1033".to_owned(),
+    })?;
 
     let rt = crate::runtime();
     let auth = rt
-        .block_on(core_verify(&resolver, &response, &challenge))
+        .block_on(core_verify(resolver.as_ref(), &response, &challenge))
         .map_err(|e| ScpNapiError::Identity {
             message: e.to_string(),
             code: scpid_error_code(&e).to_owned(),
@@ -208,6 +206,10 @@ const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use scp_identity::resolver::DualLayerResolver;
+    use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
 
     #[test]
     fn challenge_returns_valid_json() {
@@ -296,11 +298,50 @@ mod tests {
         );
     }
 
-    /// Sign→verify roundtrip using scp-core directly (bypasses NAPI JS runtime
-    /// requirements). Uses a shared `InMemoryDhtClient` so the DID published
-    /// during identity creation is visible to the verify resolver.
+    /// Bridge `scpid_verify` rejects malformed response JSON with the
+    /// correct error code before attempting DID resolution.
+    #[test]
+    fn scpid_verify_rejects_malformed_response_json() {
+        let result = scpid_verify("not valid json".to_owned(), "{}".to_owned());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("SCP-IDENT-1038"),
+            "expected SCP-IDENT-1038, got: {err_str}"
+        );
+    }
+
+    /// Bridge `scpid_verify` rejects malformed challenge JSON with the
+    /// correct error code (response JSON parses, challenge does not).
+    #[test]
+    fn scpid_verify_rejects_malformed_challenge_json() {
+        let response_json = serde_json::json!({
+            "protocol": "scpid/1.0",
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "audience": "https://example.com",
+            "did": "did:dht:ztest",
+            "signing_key_id": "Active",
+            "signature": "AAAA",
+            "issued_at": 1_000_000_000_u64,
+            "expires_at": 2_000_000_000_u64,
+        });
+        let result = scpid_verify(
+            serde_json::to_string(&response_json).unwrap(),
+            "not valid json".to_owned(),
+        );
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("SCP-IDENT-1038"),
+            "expected SCP-IDENT-1038, got: {err_str}"
+        );
+    }
+
+    /// Sign→verify roundtrip using the `IdentityBackedDidResolver` (the same
+    /// type used by the bridge function). Proves that the resolver impl
+    /// works end-to-end for SCPID verification.
     #[tokio::test]
-    async fn sign_verify_roundtrip() {
+    async fn sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_identity::DidMethod;
 
         let dht_client = Arc::new(InMemoryDhtClient::new());
@@ -334,12 +375,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify — uses same dht_client so it can find the DID.
-        let resolver = DualLayerResolver::new(
+        // Verify using IdentityBackedDidResolver — the same type the bridge
+        // function uses via the global DID_RESOLVER.
+        let dual = DualLayerResolver::new(
             Arc::new(NoOpRelayQuerier),
             dht_client,
             Arc::new(DidCache::new()),
             Vec::new(),
+        );
+        let resolver = scp_ffi_common::IdentityBackedDidResolver::new(
+            Arc::new(dual),
+            tokio::runtime::Handle::current(),
         );
         let auth = core_verify(&resolver, &response, &challenge).await.unwrap();
 

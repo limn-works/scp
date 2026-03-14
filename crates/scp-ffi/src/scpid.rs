@@ -8,7 +8,6 @@
 //!
 //! See spec §3.11 and the `scp-core` `scpid` module.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -16,8 +15,7 @@ use pyo3::prelude::*;
 use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge, scpid_sign, scpid_verify,
 };
-use scp_identity::resolver::DualLayerResolver;
-use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier, SigningKeyId};
+use scp_identity::SigningKeyId;
 
 use crate::error::ScpPyError;
 use crate::runtime::with_identity;
@@ -136,10 +134,10 @@ pub fn py_scpid_sign(
 
 /// Verifies a signed SCPID response against the original challenge (§3.11.4).
 ///
-/// Resolves the signer's DID document via `DualLayerResolver` (parallel
-/// relay + DHT resolution), then runs the 11-step verification pipeline
-/// from `scp-core`. Returns the `ScpIdAuthentication` result as a JSON
-/// string on success.
+/// Resolves the signer's DID document via the global production DID resolver
+/// (initialized during `py_identity_create`), then runs the 11-step
+/// verification pipeline from `scp-core`. Returns the `ScpIdAuthentication`
+/// result as a JSON string on success.
 ///
 /// # Arguments
 ///
@@ -148,6 +146,8 @@ pub fn py_scpid_sign(
 ///
 /// # Errors
 ///
+/// Raises `IdentityError` if the DID resolver is not initialized (no identity
+/// created yet).
 /// Raises `ValidationError` if either JSON string is malformed.
 /// Raises `IdentityError` if DID resolution fails, the signature is invalid,
 /// the challenge has expired, or any other verification step fails.
@@ -173,15 +173,15 @@ pub fn py_scpid_verify(
     let rt = crate::runtime()?;
 
     py.allow_threads(|| {
-        let resolver = DualLayerResolver::new(
-            Arc::new(NoOpRelayQuerier),
-            Arc::new(InMemoryDhtClient::new()),
-            Arc::new(DidCache::new()),
-            Vec::new(),
-        );
+        let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpPyError::IdentityError {
+            message: "DID resolver not initialized — create an identity with \
+                      py_identity_create before calling scpid_verify"
+                .to_string(),
+            code: "SCP-IDENT-1033".to_string(),
+        })?;
 
         let auth = rt
-            .block_on(scpid_verify(&resolver, &response, &challenge))
+            .block_on(scpid_verify(resolver.as_ref(), &response, &challenge))
             .map_err(|e| ScpPyError::IdentityError {
                 message: e.to_string(),
                 code: scpid_error_code(&e).to_string(),
@@ -255,6 +255,10 @@ pub fn register_scpid(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use scp_identity::resolver::DualLayerResolver;
+    use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
 
     #[test]
     fn challenge_returns_valid_json() {
@@ -343,11 +347,12 @@ mod tests {
         );
     }
 
-    /// Sign→verify roundtrip using scp-core directly (bypasses `PyO3` GIL
-    /// requirements). Uses a shared `InMemoryDhtClient` so the DID published
-    /// during identity creation is visible to the verify resolver.
+    /// Sign→verify roundtrip using the `IdentityBackedDidResolver` (the same
+    /// type used by the bridge function). Proves that the resolver impl
+    /// added for SCPID verification correctly delegates to the underlying
+    /// async resolve function.
     #[tokio::test]
-    async fn sign_verify_roundtrip() {
+    async fn sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_identity::DidMethod;
 
         let dht_client = Arc::new(InMemoryDhtClient::new());
@@ -381,12 +386,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify — uses same dht_client so it can find the DID.
-        let resolver = DualLayerResolver::new(
+        // Verify using IdentityBackedDidResolver — the same type the bridge
+        // function uses via the global DID_RESOLVER. This validates that the
+        // `scp_identity::resolver::DidResolver` impl on
+        // `IdentityBackedDidResolver` works end-to-end.
+        let dual = DualLayerResolver::new(
             Arc::new(NoOpRelayQuerier),
             dht_client,
             Arc::new(DidCache::new()),
             Vec::new(),
+        );
+        let resolver = scp_ffi_common::IdentityBackedDidResolver::new(
+            Arc::new(dual),
+            tokio::runtime::Handle::current(),
         );
         let auth = scpid_verify(&resolver, &response, &challenge)
             .await
@@ -394,5 +406,54 @@ mod tests {
 
         assert_eq!(auth.did, identity.did);
         assert_eq!(auth.signing_key_id, SigningKeyId::Active);
+    }
+
+    /// Exercises the bridge `py_scpid_verify` error path with malformed JSON.
+    /// The bridge function cannot be called with valid data in unit tests
+    /// (requires `PyO3` GIL + global DID resolver initialization), but we can
+    /// verify it returns the correct error code for invalid input.
+    #[test]
+    fn py_scpid_verify_rejects_malformed_response_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            py_scpid_verify(py, "not valid json".to_owned(), "{}".to_owned())
+        });
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("SCP-IDENT-1038"),
+            "expected SCP-IDENT-1038 in error, got: {err_str}"
+        );
+    }
+
+    /// Exercises the bridge `py_scpid_verify` error path with malformed
+    /// challenge JSON (valid response JSON, invalid challenge).
+    #[test]
+    fn py_scpid_verify_rejects_malformed_challenge_json() {
+        pyo3::prepare_freethreaded_python();
+        // Provide valid ScpIdResponse JSON structure but invalid challenge.
+        let response_json = serde_json::json!({
+            "protocol": "scpid/1.0",
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "audience": "https://example.com",
+            "did": "did:dht:ztest",
+            "signing_key_id": "Active",
+            "signature": "AAAA",
+            "issued_at": 1_000_000_000_u64,
+            "expires_at": 2_000_000_000_u64,
+        });
+        let result = Python::with_gil(|py| {
+            py_scpid_verify(
+                py,
+                serde_json::to_string(&response_json).unwrap(),
+                "not valid json".to_owned(),
+            )
+        });
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("SCP-IDENT-1038"),
+            "expected SCP-IDENT-1038 in error, got: {err_str}"
+        );
     }
 }
