@@ -506,8 +506,7 @@ pub async fn scpid_verify(
 
     // Step 8: Confirm signing_key_id is in the authentication relationship.
     // Authentication entries are full DID URI + fragment: "did:dht:z...#active".
-    let full_ref = format!("{}{fragment}", response.did);
-    if !doc.authentication.contains(&full_ref) {
+    if !doc.authentication.contains(&expected_vm_id) {
         return Err(ScpIdError::KeyNotAuthorized);
     }
 
