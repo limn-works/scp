@@ -139,7 +139,7 @@ struct ClientInner {
 /// Internal state is protected by `RwLock` and `Mutex`.
 /// # Cloning
 ///
-/// `NativeRelayClient` is cheaply cloneable -- all fields are `Arc`-wrapped.
+/// `NativeRelayClient` is cheaply cloneable -- most fields are `Arc`-wrapped.
 /// Clones share the same underlying WebSocket connection, state, and
 /// background tasks. This is used internally by
 /// [`NativeRelayAdapter::start_cover_traffic`] to give the background cover
