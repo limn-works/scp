@@ -8293,10 +8293,7 @@ mod tests {
             .await
             .expect_err("invalid input_schema_json must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7035");
                 assert!(
                     msg.contains("invalid input_schema_json"),
@@ -8324,10 +8321,7 @@ mod tests {
             .await
             .expect_err("invalid output_schema_json must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7036");
                 assert!(
                     msg.contains("invalid output_schema_json"),
@@ -8357,10 +8351,7 @@ mod tests {
             .await
             .expect_err("non-object input_schema must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7035");
                 assert!(
                     msg.contains("expected a JSON object"),
@@ -8392,10 +8383,7 @@ mod tests {
             .await
             .expect_err("non-object output_schema must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7036");
                 assert!(
                     msg.contains("expected a JSON object"),
@@ -8429,10 +8417,7 @@ mod tests {
             .await
             .expect_err("non-array test_vectors_json must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7037");
                 assert!(
                     msg.contains("invalid test_vectors_json"),
@@ -8487,10 +8472,7 @@ mod tests {
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7038");
                 assert!(
                     msg.contains("32 bytes"),
@@ -8522,10 +8504,7 @@ mod tests {
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
-            ScpError::Validation {
-                ref code,
-                ref msg,
-            } => {
+            ScpError::Validation { ref code, ref msg } => {
                 assert_eq!(code, "SCP-VALID-7038");
                 assert!(
                     msg.contains("32 bytes"),
