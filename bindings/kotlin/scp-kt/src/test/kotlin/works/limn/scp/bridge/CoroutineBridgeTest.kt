@@ -740,6 +740,40 @@ class StubNativeBindings : NativeBindings {
         toolId: String,
     ): String = toolVerifyResult
 
+    @Suppress("LongParameterList")
+    override fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String = """{"cross_context":"ok","tool":"$toolId"}"""
+
+    override fun toolSessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long?,
+    ): String = "session-stub-001"
+
+    @Suppress("LongParameterList")
+    override fun toolSessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String = """{"session":"ok","session_id":"$sessionId"}"""
+
+    override fun toolSessionClose(
+        contextHandle: Long,
+        sessionId: String,
+    ) = Unit
+
     override fun ucanValidate(
         contextHandle: Long,
         token: String,

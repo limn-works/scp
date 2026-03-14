@@ -233,6 +233,40 @@ export interface ToolVerificationResult {
   readonly failures: readonly string[];
 }
 
+/** Result of invoking a tool, with provenance metadata. */
+export interface ToolInvocationResult {
+  /** The serialized output from the tool invocation (JSON string). */
+  readonly output: string;
+  /** The DID of the agent that invoked the tool. */
+  readonly invokerDid: string;
+  /** The context ID in which the tool was invoked. */
+  readonly contextId: string;
+  /** Unix timestamp (milliseconds since epoch) of the invocation. */
+  readonly timestamp: number;
+}
+
+/** Result of creating a stateful tool session (spec section 6.2.1). */
+export interface ToolSessionResult {
+  /** The unique session ID (UUID). */
+  readonly sessionId: string;
+}
+
+/** Result of a cross-context tool invocation (spec section 6.2). */
+export interface CrossContextInvocationResult {
+  /** The serialized output from the tool invocation (JSON string). */
+  readonly output: string;
+  /** The source context ID. */
+  readonly sourceContextId: string;
+  /** The target context ID. */
+  readonly targetContextId: string;
+  /** The DID of the invoker. */
+  readonly invokerDid: string;
+  /** Chain depth of the cross-context invocation. */
+  readonly chainDepth: number;
+  /** Unix timestamp (milliseconds since epoch) of the invocation. */
+  readonly timestamp: number;
+}
+
 // ---------------------------------------------------------------------------
 // UCAN
 // ---------------------------------------------------------------------------

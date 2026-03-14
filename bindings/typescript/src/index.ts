@@ -53,7 +53,13 @@ export { Context, ScopedHandle, validateCapabilityDeclaration } from "./context"
 // Tools
 // ---------------------------------------------------------------------------
 
-export { defineToolDefinition } from "./tools";
+export {
+  defineToolDefinition,
+  toolInvokeCrossContext,
+  toolSessionClose,
+  toolSessionCreate,
+  toolSessionInvoke,
+} from "./tools";
 
 // ---------------------------------------------------------------------------
 // Trust
@@ -174,6 +180,7 @@ export type {
   Capability,
   Checkpoint,
   ContextParams,
+  CrossContextInvocationResult,
   DIDDocument,
   Event,
   EventClaim,
@@ -193,6 +200,8 @@ export type {
   ResolutionPath,
   TestVector,
   ToolDefinition,
+  ToolInvocationResult,
+  ToolSessionResult,
   ToolVerificationResult,
   TransportConfig,
   TransportStatus,

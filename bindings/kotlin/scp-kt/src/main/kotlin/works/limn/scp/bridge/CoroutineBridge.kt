@@ -682,6 +682,98 @@ interface ToolBindings {
         contextHandle: Long,
         toolId: String,
     ): String
+
+    /**
+     * Invokes a tool across context boundaries (spec section 6.2).
+     *
+     * Validates UCAN authorization against the target context, chain depth,
+     * source context capability, and target context tool existence.
+     *
+     * @param sourceContextHandle Opaque handle for the calling (source) context.
+     * @param targetContextHandle Opaque handle for the context containing the tool.
+     * @param toolId The tool's assigned ID.
+     * @param inputJson JSON-encoded tool input.
+     * @param identityHandle Handle for the invoker's identity.
+     * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
+     * @param chainDepth Current cross-context chain depth (0 for direct invocation, max 3).
+     * @param proofTokens Optional parent UCAN tokens for delegation chain.
+     * @return JSON-encoded tool output.
+     * @throws BridgeException with `SCP-TOOL-6010` if source context not active,
+     *   `SCP-TOOL-6011` if target context not active, `SCP-TOOL-6012` if chain
+     *   depth exceeded, `SCP-TOOL-6002` if tool not found.
+     */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
+    fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String
+
+    /**
+     * Creates a stateful tool session (spec section 6.2.1).
+     *
+     * Sessions enable multi-turn workflows with state preservation across
+     * invocations. Subject to per-caller caps (default: 5 concurrent sessions).
+     *
+     * @param contextHandle Opaque handle for the context containing the tool.
+     * @param toolId The tool to create a session for.
+     * @param sourceContextId The calling context ID (session cap tracked per caller).
+     * @param ttlSeconds Optional time-to-live in seconds, or null for context-lifetime.
+     * @return The session ID (UUID string).
+     * @throws BridgeException with `SCP-TOOL-6014` if context not active,
+     *   `SCP-TOOL-6015` if session cap exceeded.
+     */
+    fun toolSessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long?,
+    ): String
+
+    /**
+     * Invokes a tool within an active session.
+     *
+     * Each call is individually governed: the invoker must present a valid
+     * UCAN token. Session state is carried forward across invocations.
+     *
+     * @param contextHandle Opaque handle for the context containing the session.
+     * @param sessionId The session ID from [toolSessionCreate].
+     * @param inputJson JSON-encoded tool input.
+     * @param identityHandle Handle for the invoker's identity.
+     * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
+     * @param proofTokens Optional parent UCAN tokens for delegation chain.
+     * @return JSON-encoded tool output.
+     * @throws BridgeException with `SCP-TOOL-6017` if context not active,
+     *   `SCP-TOOL-6018` if session not found, `SCP-TOOL-6019` if expired.
+     */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
+    fun toolSessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String
+
+    /**
+     * Closes a stateful tool session.
+     *
+     * Removes the session, releasing the caller's session slot.
+     *
+     * @param contextHandle Opaque handle for the context containing the session.
+     * @param sessionId The session ID to close.
+     * @throws BridgeException with `SCP-TOOL-6021` if session not found.
+     */
+    fun toolSessionClose(
+        contextHandle: Long,
+        sessionId: String,
+    )
 }
 
 /**
@@ -1349,6 +1441,101 @@ class ToolBridge internal constructor(
         contextHandle: Long,
         toolId: String,
     ): String = bridge.ffiCall { bindings.toolVerify(contextHandle, toolId) }
+
+    /**
+     * Invoke a tool across context boundaries (spec section 6.2).
+     *
+     * @param sourceContextHandle Handle for the calling (source) context.
+     * @param targetContextHandle Handle for the context containing the tool.
+     * @param toolId The tool's assigned ID.
+     * @param inputJson JSON-encoded tool input.
+     * @param identityHandle Handle for the invoker's identity.
+     * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
+     * @param chainDepth Current cross-context chain depth (0 for direct, max 3).
+     * @param proofTokens Optional parent UCAN tokens for delegation chain.
+     * @return JSON-encoded tool output.
+     */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
+    suspend fun invokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>? = null,
+    ): String = bridge.ffiCall {
+        bindings.toolInvokeCrossContext(
+            sourceContextHandle,
+            targetContextHandle,
+            toolId,
+            inputJson,
+            identityHandle,
+            ucanToken,
+            chainDepth,
+            proofTokens,
+        )
+    }
+
+    /**
+     * Create a stateful tool session (spec section 6.2.1).
+     *
+     * @param contextHandle Handle for the context containing the tool.
+     * @param toolId The tool to create a session for.
+     * @param sourceContextId The calling context ID (session cap tracked per caller).
+     * @param ttlSeconds Optional time-to-live in seconds, or null for context-lifetime.
+     * @return The session ID (UUID string).
+     */
+    suspend fun sessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long? = null,
+    ): String = bridge.ffiCall {
+        bindings.toolSessionCreate(contextHandle, toolId, sourceContextId, ttlSeconds)
+    }
+
+    /**
+     * Invoke a tool within an active session.
+     *
+     * @param contextHandle Handle for the context containing the session.
+     * @param sessionId The session ID from [sessionCreate].
+     * @param inputJson JSON-encoded tool input.
+     * @param identityHandle Handle for the invoker's identity.
+     * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
+     * @param proofTokens Optional parent UCAN tokens for delegation chain.
+     * @return JSON-encoded tool output.
+     */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
+    suspend fun sessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>? = null,
+    ): String = bridge.ffiCall {
+        bindings.toolSessionInvoke(
+            contextHandle,
+            sessionId,
+            inputJson,
+            identityHandle,
+            ucanToken,
+            proofTokens,
+        )
+    }
+
+    /**
+     * Close a stateful tool session.
+     *
+     * @param contextHandle Handle for the context containing the session.
+     * @param sessionId The session ID to close.
+     */
+    suspend fun sessionClose(
+        contextHandle: Long,
+        sessionId: String,
+    ): Unit = bridge.ffiCall { bindings.toolSessionClose(contextHandle, sessionId) }
 }
 
 /**

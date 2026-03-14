@@ -39,6 +39,15 @@ interface MockIdentity {
   custodyType: string;
 }
 
+interface MockSession {
+  sessionId: string;
+  toolId: string;
+  sourceContextId: string;
+  callCount: number;
+  ttlSeconds?: number;
+  createdAt: number;
+}
+
 interface MockContext {
   contextId: string;
   state: string;
@@ -56,6 +65,7 @@ interface MockContext {
   broadcastSubscribers: Set<string>;
   broadcastBlockedSubscribers: Set<string>;
   broadcastAdmission: BroadcastAdmissionPolicy | null;
+  sessions: Map<string, MockSession>;
 }
 
 interface MockTransport {
@@ -237,6 +247,7 @@ export function createMockBridge(): Bridge & {
         broadcastSubscribers: new Set(),
         broadcastBlockedSubscribers: new Set(),
         broadcastAdmission: mode === "Broadcast" ? "Open" : null,
+        sessions: new Map(),
       };
 
       // Record ContextCreated event
@@ -440,6 +451,157 @@ export function createMockBridge(): Bridge & {
         passed: failures.length === 0,
         failures,
       };
+    },
+
+    // Cross-context tool invocation (spec section 6.2)
+    async toolInvokeCrossContext(
+      sourceHandle: BridgeContextHandle,
+      targetHandle: BridgeContextHandle,
+      toolId: string,
+      inputJson: string,
+      invokerDid: string,
+      _ucanToken: string,
+      chainDepth: number,
+      _proofTokens?: readonly string[],
+    ): Promise<string> {
+      const sourceCtx = getContext(sourceHandle);
+      const targetCtx = getContext(targetHandle);
+
+      if (sourceCtx.state !== "active") {
+        throw new Error(
+          `[SCP-TOOL-6010] Source context in "${sourceCtx.state}" state`,
+        );
+      }
+      if (targetCtx.state !== "active") {
+        throw new Error(
+          `[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`,
+        );
+      }
+      if (chainDepth > 3) {
+        throw new Error(
+          `[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds maximum 3`,
+        );
+      }
+
+      const tool = targetCtx.tools.get(toolId);
+      if (tool === undefined) {
+        throw new Error(
+          `[SCP-TOOL-6002] Tool '${toolId}' not found in target context`,
+        );
+      }
+
+      const input = JSON.parse(inputJson);
+      if (tool.handler !== undefined) {
+        const output = tool.handler(input);
+        return JSON.stringify(output);
+      }
+
+      return JSON.stringify({
+        tool: toolId,
+        source_context: sourceCtx.contextId,
+        target_context: targetCtx.contextId,
+        status: "validated",
+        chain_depth: chainDepth,
+        invoker_did: invokerDid,
+        validated_input: input,
+      });
+    },
+
+    // Stateful tool sessions (spec section 6.2.1)
+    async toolSessionCreate(
+      handle: BridgeContextHandle,
+      toolId: string,
+      sourceContextId: string,
+      ttlSeconds?: number,
+    ): Promise<string> {
+      const ctx = getContext(handle);
+      if (ctx.state !== "active") {
+        throw new Error(
+          `[SCP-TOOL-6014] Cannot create session in context in "${ctx.state}" state`,
+        );
+      }
+
+      if (!ctx.tools.has(toolId)) {
+        throw new Error(`[SCP-TOOL-6002] Tool '${toolId}' not found`);
+      }
+
+      // Per-caller session cap (5 per spec section 6.2.1)
+      let callerSessions = 0;
+      for (const session of ctx.sessions.values()) {
+        if (session.sourceContextId === sourceContextId) callerSessions++;
+      }
+      if (callerSessions >= 5) {
+        throw new Error(
+          `[SCP-TOOL-6015] Session cap exceeded for caller '${sourceContextId}'`,
+        );
+      }
+
+      const sessionId = `session-${nextId++}`;
+      ctx.sessions.set(sessionId, {
+        sessionId,
+        toolId,
+        sourceContextId,
+        callCount: 0,
+        ttlSeconds,
+        createdAt: Date.now(),
+      });
+      return sessionId;
+    },
+
+    async toolSessionInvoke(
+      handle: BridgeContextHandle,
+      sessionId: string,
+      inputJson: string,
+      invokerDid: string,
+      _ucanToken: string,
+      _proofTokens?: readonly string[],
+    ): Promise<string> {
+      const ctx = getContext(handle);
+      if (ctx.state !== "active") {
+        throw new Error(
+          `[SCP-TOOL-6017] Cannot invoke session in context in "${ctx.state}" state`,
+        );
+      }
+
+      const session = ctx.sessions.get(sessionId);
+      if (session === undefined) {
+        throw new Error(`[SCP-TOOL-6018] Session '${sessionId}' not found`);
+      }
+
+      // Check TTL expiry
+      if (session.ttlSeconds !== undefined) {
+        const elapsed = (Date.now() - session.createdAt) / 1000;
+        if (elapsed > session.ttlSeconds) {
+          ctx.sessions.delete(sessionId);
+          throw new Error(`[SCP-TOOL-6019] Session '${sessionId}' has expired`);
+        }
+      }
+
+      const tool = ctx.tools.get(session.toolId);
+      const input = JSON.parse(inputJson);
+      session.callCount++;
+
+      if (tool?.handler !== undefined) {
+        const output = tool.handler(input);
+        return JSON.stringify(output);
+      }
+
+      return JSON.stringify({
+        tool: session.toolId,
+        session_id: sessionId,
+        status: "validated",
+        call_count: session.callCount,
+        invoker_did: invokerDid,
+        validated_input: input,
+      });
+    },
+
+    async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
+      const ctx = getContext(handle);
+      if (!ctx.sessions.has(sessionId)) {
+        throw new Error(`[SCP-TOOL-6021] Session '${sessionId}' not found`);
+      }
+      ctx.sessions.delete(sessionId);
     },
 
     // Transport
@@ -772,6 +934,7 @@ export function createMockBridge(): Bridge & {
         broadcastSubscribers: new Set(snapshot.broadcast_subscribers ?? []),
         broadcastBlockedSubscribers: new Set(snapshot.broadcast_blocked_subscribers ?? []),
         broadcastAdmission: snapshot.broadcast_admission ?? (mode === "Broadcast" ? "Open" : null),
+        sessions: new Map(),
       };
       const importedEvent: Event = {
         eventType: "ContextImported",
