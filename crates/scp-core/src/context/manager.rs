@@ -8206,6 +8206,83 @@ mod tests {
         assert!(matches!(decision, super::KeyRequestDecision::Deny { .. }));
     }
 
+    /// Regression test for #1003: `block_broadcast_subscriber` must record the
+    /// blocker as the author — not the subscriber. Verifies:
+    /// 1. `BlockResult::author_did` matches the blocker DID.
+    /// 2. `BlockResult::block_list` contains the target subscriber DID.
+    /// 3. The `MemberBlocked` event carries `author_did = blocker` and
+    ///    `blocked_did = subscriber`.
+    #[tokio::test]
+    async fn block_broadcast_subscriber_records_blocker_as_author() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+
+        let blocker_did: DID = "did:key:author1".into();
+        let target_did: DID = "did:key:target_sub".into();
+
+        // Subscribe the target.
+        manager
+            .subscribe_broadcast::<
+                crate::crypto::ucan::validate::InMemoryDidResolver,
+                crate::crypto::ucan::validate::InMemoryNonceTracker,
+                crate::crypto::ucan::validate::InMemoryRevocationChecker,
+                crate::crypto::ucan::validate::InMemoryProofResolver,
+                std::hash::RandomState,
+            >(
+                &ctx_id,
+                &target_did,
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Block the target subscriber.
+        let result = manager
+            .block_broadcast_subscriber(&ctx_id, &blocker_did, &target_did)
+            .await
+            .unwrap();
+
+        // AC: blocker_did appears as author_did in the block result.
+        assert_eq!(
+            result.author_did,
+            blocker_did.to_string(),
+            "BlockResult::author_did must be the blocker, not the subscriber"
+        );
+
+        // AC: target_did appears in the block list.
+        assert!(
+            result.block_list.contains(&target_did.to_string()),
+            "BlockResult::block_list must contain the target subscriber DID"
+        );
+
+        // AC: MemberBlocked event carries the correct author and blocked DIDs.
+        let events = manager.drain_events(&ctx_id).await;
+        let blocked_event = events
+            .iter()
+            .find(|e| matches!(e, super::ContextEvent::MemberBlocked { .. }));
+        assert!(
+            blocked_event.is_some(),
+            "MemberBlocked event must be emitted"
+        );
+        match blocked_event.unwrap() {
+            super::ContextEvent::MemberBlocked {
+                blocked_did,
+                author_did,
+            } => {
+                assert_eq!(
+                    author_did, &blocker_did,
+                    "MemberBlocked::author_did must be the blocker"
+                );
+                assert_eq!(
+                    blocked_did, &target_did,
+                    "MemberBlocked::blocked_did must be the target subscriber"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// §9.16.8: `unblock_broadcast_subscriber` removes from block list
     /// without key rotation, emits `MemberUnblocked` event, and allows
     /// subsequent key requests.

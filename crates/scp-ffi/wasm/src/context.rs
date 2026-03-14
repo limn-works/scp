@@ -857,7 +857,7 @@ pub fn broadcast_block(
 
     future_to_promise(async move {
         with_manager(|mgr| {
-            mgr.block_broadcast_subscriber(&context_id, &subscriber_did, &blocker_did)
+            mgr.block_broadcast_subscriber(&context_id, &blocker_did, &subscriber_did)
         })
         .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
@@ -886,7 +886,7 @@ pub fn broadcast_unblock(
 
     future_to_promise(async move {
         with_manager(|mgr| {
-            mgr.unblock_broadcast_subscriber(&context_id, &subscriber_did, &unblocker_did)
+            mgr.unblock_broadcast_subscriber(&context_id, &unblocker_did, &subscriber_did)
         })
         .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
