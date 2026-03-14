@@ -76,6 +76,7 @@ interface WasmModule {
         payloadBase64: string;
         timestamp: number;
         contextId: string;
+        sequence: number;
       }) => void;
       onComplete: () => void;
     },
@@ -591,7 +592,7 @@ export function createWasmBridge(): Bridge {
             senderDid: msg.senderDid,
             content: base64ToUint8(msg.payloadBase64),
             timestamp: msg.timestamp,
-            sequence: 0,
+            sequence: msg.sequence,
             contextId: msg.contextId,
           });
         },
