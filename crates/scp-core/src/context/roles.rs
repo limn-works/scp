@@ -118,6 +118,7 @@ impl Capability {
     /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
     /// `"media:screen_share"`, `"member:ban"`, `"metadata:edit"`.
     /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
+    /// Names starting with `"custom:"` are parsed as `Custom(remainder)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
     pub fn new(name: impl AsRef<str>) -> Self {
@@ -141,16 +142,26 @@ impl Capability {
             "member:ban" => Self::MemberBan,
             "metadata:edit" => Self::MetadataEdit,
             other => other.strip_prefix("tool:invoke:").map_or_else(
-                || Self::Custom(other.to_owned()),
+                || {
+                    other.strip_prefix("custom:").map_or_else(
+                        || Self::Custom(other.to_owned()),
+                        |custom_name| Self::Custom(custom_name.to_owned()),
+                    )
+                },
                 |tool_id| Self::ToolInvoke(tool_id.to_owned()),
             ),
         }
     }
 
-    /// Returns the canonical string name of this capability.
+    /// Returns the canonical input name of this capability.
     ///
     /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
-    /// (e.g. `"tool:invoke:my_tool"`), matching the `Display` impl.
+    /// (e.g. `"tool:invoke:my_tool"`). For [`Custom`](Self::Custom) variants,
+    /// returns the raw name without prefix (e.g. `"foo"`, not `"custom:foo"`).
+    ///
+    /// **Note:** This differs from [`Display`](std::fmt::Display) for Custom
+    /// variants — Display prefixes `"custom:"` for disambiguation in logs.
+    /// Both `new(name())` and `new(to_string())` roundtrip correctly.
     #[must_use]
     pub fn name(&self) -> std::borrow::Cow<'_, str> {
         match self {
@@ -1088,6 +1099,74 @@ mod tests {
             format!("{}", Capability::Custom("x".to_owned())),
             "custom:x"
         );
+    }
+
+    #[test]
+    fn capability_display_new_roundtrip() {
+        // All standard variants must roundtrip through Display → new.
+        let standard_caps = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvoke("my-tool".to_owned()),
+            Capability::ToolInvokeAll,
+            Capability::ToolRegister,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::RoleAssign,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::ChildContextCreate,
+            Capability::ToolInterface,
+            Capability::Bridging,
+            Capability::MediaVoice,
+            Capability::MediaVideo,
+            Capability::MediaScreenShare,
+            Capability::MemberBan,
+            Capability::MetadataEdit,
+        ];
+        for cap in &standard_caps {
+            let displayed = cap.to_string();
+            let roundtripped = Capability::new(&displayed);
+            assert_eq!(
+                *cap, roundtripped,
+                "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
+            );
+        }
+
+        // Custom variants must also roundtrip through Display → new.
+        // This was a bug: Display output "custom:my-cap" but new() didn't
+        // strip the "custom:" prefix, creating Custom("custom:my-cap").
+        //
+        // Note: Custom names starting with "custom:" are ambiguous through
+        // new() — the prefix is always stripped. Avoid such names.
+        let custom_caps = vec![
+            Capability::Custom("my-cap".to_owned()),
+            Capability::Custom("x".to_owned()),
+            Capability::Custom("some:nested:name".to_owned()),
+            Capability::Custom(String::new()),
+        ];
+        for cap in &custom_caps {
+            let displayed = cap.to_string();
+            let roundtripped = Capability::new(&displayed);
+            assert_eq!(
+                *cap, roundtripped,
+                "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
+            );
+        }
+
+        // name() → new() roundtrip: name() returns the raw name (no prefix
+        // for Custom), and new() falls through to Custom(...) for unrecognized
+        // names, so the roundtrip holds.
+        for cap in standard_caps.iter().chain(&custom_caps) {
+            let via_name = Capability::new(cap.name());
+            assert_eq!(
+                *cap,
+                via_name,
+                "name()→new() roundtrip failed for {cap:?} (name = {:?})",
+                cap.name()
+            );
+        }
     }
 
     #[test]
