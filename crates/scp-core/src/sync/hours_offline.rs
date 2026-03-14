@@ -1029,19 +1029,17 @@ impl ReconnectionCoordinator {
         // Phase 1: Relay catch-up.
         let messages = match driver.relay_catch_up(context_id, last_contact).await {
             Ok(msgs) => msgs,
+            Err(SyncError::ContextGone { .. }) => {
+                return Self::early_result(context_id, tier, SyncOutcome::ContextGone);
+            }
             Err(e) => {
-                return ContextSyncResult {
-                    context_id: context_id.to_owned(),
+                return Self::early_result(
+                    context_id,
                     tier,
-                    epochs_caught_up: 0,
-                    events_recovered: 0,
-                    messages_unrecoverable: 0,
-                    mls_update_issued: false,
-                    outcome: SyncOutcome::Failed {
+                    SyncOutcome::Failed {
                         reason: format!("relay catch-up failed: {e}"),
                     },
-                    sync_events: Vec::new(),
-                };
+                );
             }
         };
 
@@ -1129,6 +1127,25 @@ impl ReconnectionCoordinator {
             mls_update_issued,
             outcome: catch_up_outcome,
             sync_events,
+        }
+    }
+
+    /// Builds a zero-progress [`ContextSyncResult`] for early returns
+    /// (e.g., relay catch-up failure or context-gone detection).
+    fn early_result(
+        context_id: &str,
+        tier: OfflineTier,
+        outcome: SyncOutcome,
+    ) -> ContextSyncResult {
+        ContextSyncResult {
+            context_id: context_id.to_owned(),
+            tier,
+            epochs_caught_up: 0,
+            events_recovered: 0,
+            messages_unrecoverable: 0,
+            mls_update_issued: false,
+            outcome,
+            sync_events: Vec::new(),
         }
     }
 

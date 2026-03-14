@@ -1709,7 +1709,7 @@ impl ContextManager {
     /// After the coordinator completes successfully, call
     /// [`clear_needs_reconnect`](Self::clear_needs_reconnect) for each
     /// context that achieved a terminal outcome (`FullyCaughtUp`,
-    /// `FastForwarded`, `Reset`).
+    /// `FastForwarded`, `Reset`, `ContextGone`).
     ///
     /// # Arguments
     ///
@@ -12092,6 +12092,99 @@ mod tests {
             )
             .await;
         assert!(none.is_none());
+    }
+
+    /// §23.3: `execute_reconnection` clears `needs_reconnect` when the
+    /// driver signals `ContextGone` (context closed/expired while offline).
+    /// This prevents infinite retry loops for contexts that no longer exist.
+    #[tokio::test]
+    async fn execute_reconnection_clears_flag_on_context_gone() {
+        use crate::sync::hours_offline::{BufferedMessage, EpochCatchUpState, SyncPhaseDriver};
+        use crate::sync::{SyncError, SyncEvent, SyncPolicy};
+
+        /// Driver whose `relay_catch_up` returns `SyncError::ContextGone`,
+        /// causing the coordinator to produce `SyncOutcome::ContextGone`.
+        struct ContextGoneDriver;
+        impl SyncPhaseDriver for ContextGoneDriver {
+            async fn relay_catch_up(
+                &self,
+                ctx_id: &str,
+                _: u64,
+            ) -> Result<Vec<BufferedMessage>, SyncError> {
+                Err(SyncError::ContextGone {
+                    context_id: ctx_id.to_owned(),
+                })
+            }
+            async fn epoch_reconciliation(
+                &self,
+                id: &str,
+                l: u64,
+                t: u64,
+                _: &SyncPolicy,
+            ) -> Result<EpochCatchUpState, SyncError> {
+                let mut s = EpochCatchUpState::new(id.to_owned(), l, t);
+                s.status = crate::sync::CatchUpStatus::Complete;
+                Ok(s)
+            }
+            async fn event_log_sync(&self, _: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
+                Ok((0, vec![]))
+            }
+            async fn sender_key_reacquire(
+                &self,
+                _: &str,
+                _: &SyncPolicy,
+            ) -> Result<u64, SyncError> {
+                Ok(0)
+            }
+            async fn mls_update(&self, _: &str) -> Result<bool, SyncError> {
+                Ok(false)
+            }
+            async fn queue_drain(
+                &self,
+                _: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<(u64, u64), SyncError> {
+                Ok((0, 0))
+            }
+            async fn local_epoch(&self, _: &str) -> Result<Option<u64>, SyncError> {
+                Ok(Some(3))
+            }
+            async fn observed_target_epoch(
+                &self,
+                _: &str,
+                _: &[BufferedMessage],
+            ) -> Result<Option<u64>, SyncError> {
+                Ok(Some(3))
+            }
+            async fn blob_ttl_secs(&self, _: &str) -> Result<Option<u64>, SyncError> {
+                Ok(None)
+            }
+        }
+
+        let snap = reconnect_test_snapshot("ctx-gone", 3, Some(10));
+        let manager = manager_with_reconnect_snapshots(&[("ctx-gone", snap)]).await;
+
+        assert!(manager.context_needs_reconnect("ctx-gone").await);
+
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-gone".to_owned(), 990_000u64);
+        let driver = ContextGoneDriver;
+
+        let report = manager
+            .execute_reconnection("did:dht:z6MkAlice".into(), 1_000_000, contacts, &driver)
+            .await
+            .expect("should return a report");
+
+        assert_eq!(report.contexts_synced.len(), 1);
+        assert_eq!(
+            report.contexts_synced[0].outcome,
+            crate::sync::SyncOutcome::ContextGone,
+        );
+        assert!(
+            !manager.context_needs_reconnect("ctx-gone").await,
+            "needs_reconnect must be cleared for ContextGone — not left as infinite retry"
+        );
     }
 
     // -----------------------------------------------------------------------
