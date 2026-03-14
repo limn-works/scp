@@ -80,20 +80,19 @@ where
 
 /// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Unlike the previous `noop_key_resolver` (which silently returned `None`,
-/// causing governance vote signature verification to be skipped), this
-/// resolver logs a prominent error on every lookup, making it clear that
-/// key resolution is not configured. It still returns `None` (the
-/// `KeyResolver` type signature does not support `Result`), but the error
-/// log ensures the gap is visible rather than silent.
+/// Logs an error once (via `std::sync::Once`) to signal that key resolution
+/// is not configured. Subsequent lookups silently return `None` to avoid
+/// log spam in governance-heavy contexts. The `KeyResolver` type signature
+/// does not support `Result`, so `None` is the only way to signal failure.
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|did| {
-        tracing::error!(
-            did = %did.0,
-            "key resolver not configured — cannot resolve verifying key for DID. \
-             Governance vote signature verification will be skipped for this DID. \
-             Wire a production KeyResolver to enable signature verification."
-        );
+    Arc::new(|_did| {
+        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+        LOG_ONCE.call_once(|| {
+            tracing::error!(
+                "key resolver not configured — governance vote signature verification is disabled. \
+                 Wire a production KeyResolver to enable signature verification."
+            );
+        });
         None
     })
 }
