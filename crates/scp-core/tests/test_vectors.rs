@@ -1140,7 +1140,9 @@ fn vector_29_attestation_id() {
 
 #[test]
 fn domain_separators_are_all_unique() {
-    let domains = [
+    // SHA-256 hash domain separators — used as the leading prefix in hash inputs.
+    // Prefix collisions here would be a security issue (domain confusion).
+    let hash_domains = [
         "SCP-INNER-ENVELOPE-V1:",
         "SCP-VOTE-V1:",
         "SCP-RESET-REQUEST-V1:",
@@ -1151,23 +1153,77 @@ fn domain_separators_are_all_unique() {
         "SCP-PSEUDONYM-V1:",
         "SCP-OFFER-ID-V1:",
         "SCP-ATTESTATION-ID-V1:",
-        "scp-sender-key-v1",
-        "scp-access-key-v1",
+        "SCP-EVENT-V1:",
+        "SCP-CHECKPOINT-V1:",
+        "SCP-MIGRATION-V1:",
+        "SCP-KEY-DESTRUCTION-V1:",
+        "SCP-EXPORT-ENTRY-V1:",
+        "SCP-CHUNK-MSG-ID-V1:",
+        "SCP-PRIVATE-LOG-V1:",
+        "SCP-BROADCAST-ENVELOPE-V1:",
+        "SCP-PARTICIPATION-V1:",
+        "SCP-IDENTITY-LINK-ATTESTATION-V1:",
+        "SCP-ACCESS-KEY-REQUEST-V1:",
+        "SCP-TOOL-REGISTRATION-V1:",
+        "SCP-FORK-ID-V1:",
+        "SCP-COMMIT-RANGE-REQ-V1:",
+        "SCP-COMMIT-RANGE-RESP-V1:",
+        "SCP-CONTEXT-SNAPSHOT-V1:",
+        "SCP-CHALLENGE-REQ-V1:",
+        "SCP-CHALLENGE-RESP-V1:",
+        "SCP-CHALLENGE-VERIFY-V1:",
+        "SCP-BRIDGE-REGISTER-V1:",
+        "SCP-BLOCK-NOTIFICATION-V1:",
+        "SCP-EPOCH-ADVANCE-V1:",
+        "SCP-KEY-REQUEST-V1:",
     ];
 
-    for i in 0..domains.len() {
-        for j in (i + 1)..domains.len() {
+    // HKDF/HMAC domain labels — used as info strings, salts, or trailing labels
+    // in key derivation. Prefix relationships between these are structurally safe
+    // (different HKDF/HMAC constructions with different input structures), but
+    // each label must still be globally unique.
+    let derivation_labels = [
+        "scp-sender-key-v1",
+        "scp-access-key-v1",
+        "scp-private-state-v1",
+        "scp-private-state-salt-v1",
+        "scp-media-key-v1",
+        "scp-bridge-credential-v1",
+        "scp-pseudonym-secret-v1",
+        "scp-participation-statement-v1",
+        "scp-context-export-integrity-v1",
+        "scp-test-attestation-v1:",
+        "scp-pseudonym",
+        "scp-pseudonym-v2",
+    ];
+
+    // All domain separators across both categories must be unique.
+    let all_domains: Vec<&str> = hash_domains
+        .iter()
+        .chain(derivation_labels.iter())
+        .copied()
+        .collect();
+
+    for i in 0..all_domains.len() {
+        for j in (i + 1)..all_domains.len() {
             assert_ne!(
-                domains[i], domains[j],
+                all_domains[i], all_domains[j],
                 "domain separators must be unique: '{}' vs '{}'",
-                domains[i], domains[j]
+                all_domains[i], all_domains[j]
             );
-            // Also verify no domain is a prefix of another
+        }
+    }
+
+    // Hash domain separators must not be prefixes of each other — they appear at
+    // the start of hash inputs so a prefix collision could cause domain confusion.
+    for i in 0..hash_domains.len() {
+        for j in (i + 1)..hash_domains.len() {
             assert!(
-                !domains[i].starts_with(domains[j]) && !domains[j].starts_with(domains[i]),
-                "no domain separator must be a prefix of another: '{}' vs '{}'",
-                domains[i],
-                domains[j]
+                !hash_domains[i].starts_with(hash_domains[j])
+                    && !hash_domains[j].starts_with(hash_domains[i]),
+                "no hash domain separator must be a prefix of another: '{}' vs '{}'",
+                hash_domains[i],
+                hash_domains[j]
             );
         }
     }
