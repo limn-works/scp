@@ -195,7 +195,7 @@ if (bridge === null) {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["messages:read"] }),
+        JSON.stringify({ ceiling: ["messages:read", "context:close"] }),
       );
       await napi.contextClose(ctx, identity.did);
     });

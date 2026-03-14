@@ -215,9 +215,11 @@ export function createNativeBridge(): Bridge {
       identityDid: string,
       payload: Uint8Array,
     ): Promise<void> {
+      // napi-rs maps Rust Vec<u8> to a JS number array, not Uint8Array.
+      // Convert the Uint8Array to Array<number> for the bridge call.
       await (
-        addon.contextSend as (h: BridgeContextHandle, d: string, p: Uint8Array) => Promise<void>
-      )(handle, identityDid, payload);
+        addon.contextSend as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
+      )(handle, identityDid, Array.from(payload));
     },
 
     contextSubscribe(
@@ -293,13 +295,10 @@ export function createNativeBridge(): Bridge {
       authorDid: string,
       payload: Uint8Array,
     ): Promise<void> {
+      // napi-rs maps Rust Vec<u8> to a JS number array, not Uint8Array.
       await (
-        addon.broadcastPublish as (
-          h: BridgeContextHandle,
-          d: string,
-          p: Uint8Array,
-        ) => Promise<void>
-      )(handle, authorDid, payload);
+        addon.broadcastPublish as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
+      )(handle, authorDid, Array.from(payload));
     },
 
     async broadcastBlockSubscriber(
@@ -530,7 +529,8 @@ export function createNativeBridge(): Bridge {
     },
 
     async contextImport(data: Uint8Array): Promise<string> {
-      return await (addon.contextImport as (d: Uint8Array) => Promise<string>)(data);
+      // napi-rs maps Rust Vec<u8> to a JS number array, not Uint8Array.
+      return await (addon.contextImport as (d: number[]) => Promise<string>)(Array.from(data));
     },
 
     // Drain events
@@ -995,7 +995,31 @@ export function createNativeBridge(): Bridge {
     },
 
     syncGetPolicy() {
-      return (addon.syncGetPolicy as () => ReturnType<Bridge["syncGetPolicy"]>)();
+      // napi-rs #[napi(object)] converts Rust snake_case to JS camelCase,
+      // but the Bridge interface uses snake_case to match the WASM bridge.
+      // Map camelCase NAPI output to snake_case Bridge interface.
+      const raw = (
+        addon.syncGetPolicy as () => {
+          tier1ThresholdSecs: number;
+          tier2ThresholdSecs: number;
+          gapTimeoutSecs: number;
+          reorderBufferCapacity: number;
+          maxSequentialCommits: number;
+          commitProcessTimeoutSecs: number;
+          senderKeyTimeoutSecs: number;
+          reconnectionDedupWindowSecs: number;
+        }
+      )();
+      return {
+        tier_1_threshold_secs: raw.tier1ThresholdSecs,
+        tier_2_threshold_secs: raw.tier2ThresholdSecs,
+        gap_timeout_secs: raw.gapTimeoutSecs,
+        reorder_buffer_capacity: raw.reorderBufferCapacity,
+        max_sequential_commits: raw.maxSequentialCommits,
+        commit_process_timeout_secs: raw.commitProcessTimeoutSecs,
+        sender_key_timeout_secs: raw.senderKeyTimeoutSecs,
+        reconnection_dedup_window_secs: raw.reconnectionDedupWindowSecs,
+      };
     },
 
     // Identity Advanced
