@@ -385,12 +385,15 @@ impl RateLimit {
             Ok(true)
         } else if self.burst_allowance > 0 {
             // Base limit exhausted — try burst allowance (spec §6.2.0.2).
+            // The burst window is a deadline: all burst calls must occur within
+            // burst_window of the FIRST burst call. Once burst_allowance is
+            // consumed OR burst_window expires, no more burst calls until the
+            // base window resets (handled above at the window-expiry check).
             let burst_window_ms = self.burst_window.as_millis() as u64;
 
-            // If the burst window has expired, reset burst counter.
+            // If the burst window has expired, burst is dead until base resets.
             if now.saturating_sub(self.burst_window_start) >= burst_window_ms {
-                self.burst_count = 0;
-                self.burst_window_start = now;
+                return Ok(false);
             }
 
             if self.burst_count < self.burst_allowance {
@@ -416,6 +419,21 @@ impl RateLimit {
 /// evicted first; if still at capacity, new callers are rejected.
 const MAX_TRACKED_CALLERS: usize = 10_000;
 
+/// Per-caller rate limit state for a single DID (spec §6.2.0.2).
+///
+/// Tracks the base call count, window start, and burst state for one caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerState {
+    /// Number of calls within the current base window.
+    pub count: u64,
+    /// Start of the current base window as Unix timestamp in milliseconds.
+    pub window_start: u64,
+    /// Number of burst calls consumed in the current burst window.
+    pub burst_count: u32,
+    /// Start of the current burst window as Unix timestamp in milliseconds.
+    pub burst_window_start: u64,
+}
+
 /// Per-caller rate limiter for cross-context tool interfaces (spec §6.2.0.2).
 ///
 /// Tracks per-DID call counts independently of the per-interface limit.
@@ -437,8 +455,8 @@ pub struct PerCallerRateLimit {
     pub burst_allowance: u32,
     /// Duration of the burst window (spec §6.2.0.2). Default: 1 second.
     pub burst_window: Duration,
-    /// Per-caller counters: DID -> (count, `window_start_ms`, `burst_count`, `burst_window_start_ms`).
-    pub callers: HashMap<DID, (u64, u64, u32, u64)>,
+    /// Per-caller state keyed by DID.
+    pub callers: HashMap<DID, CallerState>,
 }
 
 impl PerCallerRateLimit {
@@ -483,7 +501,7 @@ impl PerCallerRateLimit {
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
         self.callers
-            .retain(|_, (_, window_start, _, _)| now.saturating_sub(*window_start) < window_ms);
+            .retain(|_, state| now.saturating_sub(state.window_start) < window_ms);
     }
 
     /// Checks whether a specific caller is within their per-caller rate limit.
@@ -521,34 +539,42 @@ impl PerCallerRateLimit {
             }
         }
 
-        let (count, window_start, burst_count, burst_window_start) = self
+        let state = self
             .callers
             .entry(caller_did.clone())
-            .or_insert((0, now, 0, now));
+            .or_insert(CallerState {
+                count: 0,
+                window_start: now,
+                burst_count: 0,
+                burst_window_start: now,
+            });
 
         // If the window has expired for this caller, reset both base and burst.
-        if now.saturating_sub(*window_start) >= window_ms {
-            *count = 0;
-            *window_start = now;
-            *burst_count = 0;
-            *burst_window_start = now;
+        if now.saturating_sub(state.window_start) >= window_ms {
+            state.count = 0;
+            state.window_start = now;
+            state.burst_count = 0;
+            state.burst_window_start = now;
         }
 
-        if *count < self.max_calls_per_caller {
-            *count += 1;
+        if state.count < self.max_calls_per_caller {
+            state.count += 1;
             Ok(true)
         } else if self.burst_allowance > 0 {
             // Base limit exhausted — try burst allowance (spec §6.2.0.2).
+            // The burst window is a deadline: all burst calls must occur within
+            // burst_window of the FIRST burst call. Once burst_allowance is
+            // consumed OR burst_window expires, no more burst calls until the
+            // base window resets (handled above at the window-expiry check).
             let burst_window_ms = self.burst_window.as_millis() as u64;
 
-            // If the burst window has expired, reset burst counter.
-            if now.saturating_sub(*burst_window_start) >= burst_window_ms {
-                *burst_count = 0;
-                *burst_window_start = now;
+            // If the burst window has expired, burst is dead until base resets.
+            if now.saturating_sub(state.burst_window_start) >= burst_window_ms {
+                return Ok(false);
             }
 
-            if *burst_count < self.burst_allowance {
-                *burst_count += 1;
+            if state.burst_count < self.burst_allowance {
+                state.burst_count += 1;
                 Ok(true)
             } else {
                 Ok(false)
@@ -2113,8 +2139,8 @@ mod tests {
         assert!(!rl.check_and_increment(&alice).unwrap());
 
         // Set the window start far in the past to simulate window expiry.
-        if let Some((_, ws, _, _)) = rl.callers.get_mut(&alice) {
-            *ws = 0;
+        if let Some(state) = rl.callers.get_mut(&alice) {
+            state.window_start = 0;
         }
         assert!(rl.check_and_increment(&alice).unwrap());
     }
@@ -2479,6 +2505,66 @@ mod tests {
         assert!(
             matches!(err, ToolError::InterfaceRateLimited { max_calls: 2, .. }),
             "expected InterfaceRateLimited, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Burst window expiry within base window (F-06, #588)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rate_limit_burst_not_renewed_after_burst_window_expires() {
+        // Base limit: 2 calls within a 1-hour window.
+        // Burst: 3 calls within a 1-second burst window.
+        let mut rl =
+            RateLimit::with_burst(2, Duration::from_secs(3600), 3, Duration::from_secs(1)).unwrap();
+
+        // Consume the 2 base calls.
+        assert!(rl.check_and_increment().unwrap(), "base call 1");
+        assert!(rl.check_and_increment().unwrap(), "base call 2");
+
+        // Use 1 of 3 burst calls (burst window starts now).
+        assert!(rl.check_and_increment().unwrap(), "burst call 1");
+
+        // Simulate burst window expiry by pushing burst_window_start into the
+        // past. The base window is still active (1-hour window).
+        rl.burst_window_start = 0;
+
+        // After burst window expires, NO more burst calls should be allowed
+        // until the base window resets. This verifies the burst window is a
+        // deadline, not a renewable cycle.
+        assert!(
+            !rl.check_and_increment().unwrap(),
+            "burst must NOT renew after burst window expires within base window"
+        );
+    }
+
+    #[test]
+    fn per_caller_burst_not_renewed_after_burst_window_expires() {
+        // Base limit: 2 calls within a 1-hour window.
+        // Burst: 3 calls within a 1-second burst window.
+        let mut rl =
+            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 3, Duration::from_secs(1));
+        let alice: DID = "did:dht:z6MkAlice".into();
+
+        // Consume the 2 base calls.
+        assert!(rl.check_and_increment(&alice).unwrap(), "base call 1");
+        assert!(rl.check_and_increment(&alice).unwrap(), "base call 2");
+
+        // Use 1 of 3 burst calls (burst window starts now).
+        assert!(rl.check_and_increment(&alice).unwrap(), "burst call 1");
+
+        // Simulate burst window expiry by pushing burst_window_start into the
+        // past. The base window is still active (1-hour window).
+        if let Some(state) = rl.callers.get_mut(&alice) {
+            state.burst_window_start = 0;
+        }
+
+        // After burst window expires, NO more burst calls should be allowed
+        // until the base window resets.
+        assert!(
+            !rl.check_and_increment(&alice).unwrap(),
+            "per-caller burst must NOT renew after burst window expires within base window"
         );
     }
 }
