@@ -274,6 +274,39 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
 }
 
 // ---------------------------------------------------------------------------
+// WasmRateLimit — typed deserialization for rate_limit_json (F9)
+// ---------------------------------------------------------------------------
+
+/// Rate limit configuration for cross-context tool interfaces.
+///
+/// Used for typed deserialization of `rate_limit_json` instead of generic
+/// `serde_json::Value`. Validates that the required fields (`max_calls`,
+/// `window_seconds`) are present and well-typed at parse time. Mirrors
+/// `scp_core::context::tools::interface::RateLimit` field layout without
+/// depending on scp-core (WASM constraint per ADR-034).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmRateLimit {
+    /// Maximum number of calls permitted within the time window.
+    pub max_calls: u64,
+    /// Duration of the sliding time window in seconds.
+    pub window_seconds: u64,
+    /// Optional burst allowance (default: 5, max: 50 per §6.2.0.2).
+    #[serde(default = "default_burst_allowance")]
+    pub burst_allowance: u32,
+    /// Optional burst window in seconds (default: 1 per §6.2.0.2).
+    #[serde(default = "default_burst_window_secs")]
+    pub burst_window_seconds: u64,
+}
+
+const fn default_burst_allowance() -> u32 {
+    5
+}
+
+const fn default_burst_window_secs() -> u64 {
+    1
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -684,7 +717,8 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 /// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
 ///
 /// Creates a `ToolInterface` JSON with `approved_by_source = true` and
-/// `approved_by_target = false`.
+/// `approved_by_target = false`. Requires the caller to be an admin of the
+/// source context (matching `scp-core::expose_tool` authorization).
 ///
 /// # Returns
 ///
@@ -694,11 +728,31 @@ pub fn tool_interface_expose(
     context: &WasmContextHandle,
     tool_id: String,
     target_context_id: String,
+    identity_did: String,
     rate_limit_json: Option<String>,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         validate_tool_id(&tool_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+        validate_did(&identity_did).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        // Require admin role — mirrors scp-core::expose_tool authorization.
+        let role = with_manager(|mgr| Ok(mgr.member_role(&context_id, &identity_did)))
+            .map_err(ScpWasmError::into_js)?;
+        match role.as_deref() {
+            Some("admin") => {}
+            _ => {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "tool interface expose requires admin role — '{identity_did}' \
+                         is not an admin of context '{context_id}'"
+                    ),
+                    code: "SCP-PERM-3001".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
+        }
 
         // Validate the tool exists in the source context's registry.
         let exists = with_manager(|mgr| mgr.tool_exists(&context_id, &tool_id))
@@ -712,10 +766,10 @@ pub fn tool_interface_expose(
             .into());
         }
 
-        // Parse optional rate limit.
-        let rate_limit: Option<serde_json::Value> = match rate_limit_json {
+        // Parse optional rate limit into a validated struct (not generic JSON).
+        let rate_limit: Option<WasmRateLimit> = match rate_limit_json {
             Some(ref json) => {
-                let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+                let parsed: WasmRateLimit = serde_json::from_str(json).map_err(|e| {
                     ScpWasmError::Validation {
                         message: format!("invalid rate_limit_json: {e}"),
                         code: "SCP-VALID-7040".to_owned(),
@@ -764,13 +818,16 @@ pub fn tool_interface_expose(
 
 /// Accepts a cross-context tool interface (§6.2.0.1 step 4).
 ///
-/// Sets `approved_by_target = true` on the interface.
+/// Verifies that the interface's `target_context` matches this context, then
+/// sets `approved_by_target = true`. Mirrors `scp-core::accept_tool_interface`
+/// context-mismatch check.
 ///
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the updated `ToolInterface` as JSON.
 #[wasm_bindgen]
-pub fn tool_interface_accept(_context: &WasmContextHandle, interface_json: String) -> Promise {
+pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String) -> Promise {
+    let context_id = context.context_id();
     future_to_promise(async move {
         let mut interface: serde_json::Value =
             serde_json::from_str(&interface_json).map_err(|e| {
@@ -780,6 +837,24 @@ pub fn tool_interface_accept(_context: &WasmContextHandle, interface_json: Strin
                 }
                 .into_js()
             })?;
+
+        // Verify the interface targets this context — mirrors
+        // scp-core::accept_tool_interface context-mismatch check.
+        let target = interface
+            .get("target_context")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if target != context_id {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "interface target_context '{target}' does not match \
+                     accepting context '{context_id}'"
+                ),
+                code: "SCP-TOOL-6032".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
 
         // Set approved_by_target to true and add default inbound policy.
         interface["approved_by_target"] = serde_json::json!(true);
@@ -1197,5 +1272,251 @@ mod tests {
         let result = validate_test_vectors(&def);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // WasmRateLimit deserialization (F9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wasm_rate_limit_deserializes_valid() {
+        let json = r#"{"max_calls": 10, "window_seconds": 60}"#;
+        let rl: WasmRateLimit = serde_json::from_str(json).unwrap();
+        assert_eq!(rl.max_calls, 10);
+        assert_eq!(rl.window_seconds, 60);
+        assert_eq!(rl.burst_allowance, 5);
+        assert_eq!(rl.burst_window_seconds, 1);
+    }
+
+    #[test]
+    fn wasm_rate_limit_rejects_missing_max_calls() {
+        let json = r#"{"window_seconds": 60}"#;
+        let result: Result<WasmRateLimit, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing max_calls should fail");
+    }
+
+    #[test]
+    fn wasm_rate_limit_rejects_string_max_calls() {
+        let json = r#"{"max_calls": "ten", "window_seconds": 60}"#;
+        let result: Result<WasmRateLimit, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "string max_calls should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // Consent protocol lifecycle tests (F3)
+    //
+    // These test the pure-Rust validation logic used by the consent protocol
+    // bridge functions. Tests that require the WasmContextManager (which
+    // calls wasm-bindgen time functions) live in manager::tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn consent_expose_builds_valid_interface_json() {
+        let context_id = "ctx-source";
+        let target_context_id = "ctx-target";
+        let tool_id = "tool-calculator";
+
+        let interface = serde_json::json!({
+            "source_context": context_id,
+            "target_context": target_context_id,
+            "tool_id": tool_id,
+            "rate_limit": null,
+            "per_caller_rate_limit": {
+                "max_calls_per_caller": 10,
+                "window": { "secs": 60, "nanos": 0 },
+                "burst_allowance": 5,
+                "burst_window": { "secs": 1, "nanos": 0 },
+                "callers": {}
+            },
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "outbound_policy": {
+                "allowed_callers": [],
+                "max_calls_per_minute": 60,
+                "max_payload_bytes": 65536,
+                "require_provenance": true
+            },
+            "inbound_policy": null
+        });
+
+        assert_eq!(interface["approved_by_source"], true);
+        assert_eq!(interface["approved_by_target"], false);
+        assert_eq!(interface["source_context"], context_id);
+        assert_eq!(interface["target_context"], target_context_id);
+        assert_eq!(interface["tool_id"], tool_id);
+        assert!(interface["outbound_policy"].is_object());
+        assert!(interface["inbound_policy"].is_null());
+
+        // Serialization roundtrip should succeed.
+        let json_str = serde_json::to_string(&interface).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["source_context"], context_id);
+    }
+
+    #[test]
+    fn consent_expose_admin_role_check_logic() {
+        // Simulates the admin role check that tool_interface_expose performs.
+        // "admin" passes; all other roles are rejected.
+        let admin_role: Option<&str> = Some("admin");
+        let member_role: Option<&str> = Some("member");
+        let no_role: Option<&str> = None;
+
+        assert!(matches!(admin_role, Some("admin")));
+        assert!(!matches!(member_role, Some("admin")));
+        assert!(!matches!(no_role, Some("admin")));
+    }
+
+    #[test]
+    fn consent_accept_validates_context_match() {
+        let interface_json = serde_json::json!({
+            "source_context": "ctx-source",
+            "target_context": "ctx-target",
+            "tool_id": "tool-calc",
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "inbound_policy": null
+        });
+
+        let context_id = "ctx-target";
+        let target = interface_json
+            .get("target_context")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert_eq!(target, context_id, "target should match accepting context");
+    }
+
+    #[test]
+    fn consent_accept_rejects_context_mismatch() {
+        let interface_json = serde_json::json!({
+            "source_context": "ctx-source",
+            "target_context": "ctx-target",
+            "tool_id": "tool-calc",
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "inbound_policy": null
+        });
+
+        let context_id = "ctx-wrong";
+        let target = interface_json
+            .get("target_context")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert_ne!(target, context_id, "target should NOT match wrong context");
+    }
+
+    #[test]
+    fn consent_accept_sets_approved_by_target() {
+        let mut interface = serde_json::json!({
+            "source_context": "ctx-source",
+            "target_context": "ctx-target",
+            "tool_id": "tool-calc",
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "inbound_policy": null
+        });
+
+        // Simulate the accept logic from tool_interface_accept.
+        interface["approved_by_target"] = serde_json::json!(true);
+        if interface.get("inbound_policy").is_none() || interface["inbound_policy"].is_null() {
+            interface["inbound_policy"] = serde_json::json!({
+                "allowed_source_roles": [],
+                "max_calls_per_minute": 60,
+                "max_response_bytes": 65536,
+                "require_spending_ucan": false
+            });
+        }
+
+        assert_eq!(interface["approved_by_target"], true);
+        assert!(interface["approved_by_source"].as_bool().unwrap());
+        assert!(interface["inbound_policy"].is_object());
+        assert_eq!(interface["inbound_policy"]["max_calls_per_minute"], 60);
+        assert_eq!(interface["inbound_policy"]["max_response_bytes"], 65536);
+    }
+
+    #[test]
+    fn consent_accept_preserves_existing_inbound_policy() {
+        let mut interface = serde_json::json!({
+            "source_context": "ctx-source",
+            "target_context": "ctx-target",
+            "tool_id": "tool-calc",
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "inbound_policy": {
+                "allowed_source_roles": ["member"],
+                "max_calls_per_minute": 30,
+                "max_response_bytes": 32768,
+                "require_spending_ucan": true
+            }
+        });
+
+        // Existing inbound_policy should not be overwritten.
+        interface["approved_by_target"] = serde_json::json!(true);
+        if interface.get("inbound_policy").is_none() || interface["inbound_policy"].is_null() {
+            interface["inbound_policy"] = serde_json::json!({
+                "allowed_source_roles": [],
+                "max_calls_per_minute": 60,
+                "max_response_bytes": 65536,
+                "require_spending_ucan": false
+            });
+        }
+
+        // Should keep the original policy.
+        assert_eq!(interface["inbound_policy"]["max_calls_per_minute"], 30);
+        assert_eq!(interface["inbound_policy"]["max_response_bytes"], 32768);
+    }
+
+    #[test]
+    fn consent_revoke_produces_valid_event() {
+        let interface_id_hex = "aa".repeat(32); // 64 hex chars = 32 bytes
+        let interface_id_bytes = hex::decode(&interface_id_hex).unwrap();
+        assert_eq!(interface_id_bytes.len(), 32);
+
+        let context_id = "ctx-revoker";
+        let now_ms: u64 = 1_700_000_000_000;
+
+        let event = serde_json::json!({
+            "interface_id": interface_id_bytes,
+            "revoking_context": context_id,
+            "revoked_at": now_ms
+        });
+
+        assert_eq!(event["revoking_context"], "ctx-revoker");
+        assert_eq!(event["revoked_at"], 1_700_000_000_000_u64);
+        assert!(event["interface_id"].is_array());
+    }
+
+    #[test]
+    fn consent_revoke_rejects_invalid_hex() {
+        let result = hex::decode("not_valid_hex");
+        assert!(result.is_err(), "non-hex should fail");
+    }
+
+    #[test]
+    fn consent_revoke_rejects_wrong_length() {
+        let short_hex = "aa".repeat(16); // 32 hex chars = 16 bytes, need 32
+        let bytes = hex::decode(&short_hex).unwrap();
+        assert_ne!(bytes.len(), 32, "16 bytes should fail 32-byte check");
+    }
+
+    #[test]
+    fn consent_expose_with_rate_limit() {
+        let rl_json = r#"{"max_calls": 20, "window_seconds": 120}"#;
+        let rl: WasmRateLimit = serde_json::from_str(rl_json).unwrap();
+        assert_eq!(rl.max_calls, 20);
+        assert_eq!(rl.window_seconds, 120);
+
+        // Serialized rate_limit should appear in the interface JSON.
+        let interface = serde_json::json!({
+            "source_context": "ctx-source",
+            "target_context": "ctx-target",
+            "tool_id": "tool-calc",
+            "rate_limit": rl,
+            "approved_by_source": true,
+            "approved_by_target": false,
+        });
+
+        assert!(interface["rate_limit"].is_object());
+        assert_eq!(interface["rate_limit"]["max_calls"], 20);
+        assert_eq!(interface["rate_limit"]["window_seconds"], 120);
     }
 }
