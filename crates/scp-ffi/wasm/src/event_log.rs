@@ -237,6 +237,8 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
 
         #[allow(clippy::cast_precision_loss)]
         let timestamp_f64 = crate::time::now_secs() as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let sequence_f64 = count.saturating_sub(1) as f64;
 
         let summary = serde_json::json!({
             "eventType": "LogSummary",
@@ -246,9 +248,9 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
             // Synthetic summary event sequence number for TypeScript adapter
             // compatibility. This is NOT a real event sequence — it represents
             // the last valid index in the log (count - 1). The NAPI bridge
-            // uses the same `count.saturating_sub(1)` pattern. If this
+            // uses the same `count.saturating_sub(1) as f64` pattern. If this
             // semantic needs to change, update both bridges together.
-            "sequence": count.saturating_sub(1),
+            "sequence": sequence_f64,
         });
 
         // Apply `limit` — the only filter field parsed. Both bridges produce
@@ -530,7 +532,7 @@ mod tests {
             "actorDid": "",
             "timestamp": timestamp,
             "payloadJson": serde_json::to_string(&payload).unwrap(),
-            "sequence": count.saturating_sub(1),
+            "sequence": count.saturating_sub(1) as f64,
         })
     }
 
