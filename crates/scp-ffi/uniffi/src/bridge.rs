@@ -5655,6 +5655,7 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 /// Used for defense-in-depth validation in broadcast key request handling.
 #[uniffi::export]
 pub async fn register_local_did(did: String) {
+    crate::runtime::init_context_manager();
     let manager = crate::runtime::context_manager_or_init();
     manager.register_local_did(did.into()).await;
 }
@@ -5662,6 +5663,7 @@ pub async fn register_local_did(did: String) {
 /// Returns `true` if the given DID is registered as locally controlled.
 #[uniffi::export]
 pub async fn is_local_did(did: String) -> bool {
+    crate::runtime::init_context_manager();
     let manager = crate::runtime::context_manager_or_init();
     let did_ref: scp_identity::DID = did.into();
     manager.is_local_did(&did_ref).await
