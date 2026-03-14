@@ -215,6 +215,35 @@ export interface Bridge {
   toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
   toolInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
 
+  // Cross-context tool invocation (spec section 6.2)
+  toolInvokeCrossContext(
+    sourceHandle: BridgeContextHandle,
+    targetHandle: BridgeContextHandle,
+    toolId: string,
+    inputJson: string,
+    invokerDid: string,
+    ucanToken: string,
+    chainDepth: number,
+    proofTokens?: readonly string[],
+  ): Promise<string>;
+
+  // Stateful tool sessions (spec section 6.2.1)
+  toolSessionCreate(
+    handle: BridgeContextHandle,
+    toolId: string,
+    sourceContextId: string,
+    ttlSeconds?: number,
+  ): Promise<string>;
+  toolSessionInvoke(
+    handle: BridgeContextHandle,
+    sessionId: string,
+    inputJson: string,
+    invokerDid: string,
+    ucanToken: string,
+    proofTokens?: readonly string[],
+  ): Promise<string>;
+  toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void>;
+
   // Transport
   transportConnect(relayUrl: string): Promise<BridgeTransportHandle>;
   transportStatus(handle: BridgeTransportHandle): Promise<TransportStatus>;

@@ -704,6 +704,74 @@ export function createNativeBridge(): Bridge {
       )(handle, interfaceIdHex);
     },
 
+    // Cross-context tool invocation (spec section 6.2)
+    async toolInvokeCrossContext(
+      sourceHandle: BridgeContextHandle,
+      targetHandle: BridgeContextHandle,
+      toolId: string,
+      inputJson: string,
+      invokerDid: string,
+      ucanToken: string,
+      chainDepth: number,
+      proofTokens?: readonly string[],
+    ): Promise<string> {
+      return await (
+        addon.toolInvokeCrossContext as (
+          s: BridgeContextHandle,
+          t: BridgeContextHandle,
+          tool: string,
+          input: string,
+          did: string,
+          ucan: string,
+          depth: number,
+          proofs: readonly string[] | undefined,
+        ) => Promise<string>
+      )(sourceHandle, targetHandle, toolId, inputJson, invokerDid, ucanToken, chainDepth, proofTokens);
+    },
+
+    // Stateful tool sessions (spec section 6.2.1)
+    async toolSessionCreate(
+      handle: BridgeContextHandle,
+      toolId: string,
+      sourceContextId: string,
+      ttlSeconds?: number,
+    ): Promise<string> {
+      return await (
+        addon.toolSessionCreate as (
+          h: BridgeContextHandle,
+          t: string,
+          s: string,
+          ttl: number | undefined,
+        ) => Promise<string>
+      )(handle, toolId, sourceContextId, ttlSeconds);
+    },
+
+    async toolSessionInvoke(
+      handle: BridgeContextHandle,
+      sessionId: string,
+      inputJson: string,
+      invokerDid: string,
+      ucanToken: string,
+      proofTokens?: readonly string[],
+    ): Promise<string> {
+      return await (
+        addon.toolSessionInvoke as (
+          h: BridgeContextHandle,
+          sid: string,
+          input: string,
+          did: string,
+          ucan: string,
+          proofs: readonly string[] | undefined,
+        ) => Promise<string>
+      )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
+    },
+
+    async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
+      await (
+        addon.toolSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>
+      )(handle, sessionId);
+    },
+
     // Transport
     async transportConnect(relayUrl: string): Promise<BridgeTransportHandle> {
       const handle = await (

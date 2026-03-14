@@ -1088,6 +1088,61 @@ export function createWasmBridge(): Bridge {
       return await wasm.tool_interface_revoke(handle, interfaceIdHex);
     },
 
+    // Cross-context tool invocation (spec section 6.2) — not available in WASM (ADR-034)
+    async toolInvokeCrossContext(
+      _sourceHandle: BridgeContextHandle,
+      _targetHandle: BridgeContextHandle,
+      _toolId: string,
+      _inputJson: string,
+      _invokerDid: string,
+      _ucanToken: string,
+      _chainDepth: number,
+      _proofTokens?: readonly string[],
+    ): Promise<string> {
+      throw new TransportError(
+        "toolInvokeCrossContext is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for cross-context tool invocation.",
+        "SCP-TRANS-5004",
+      );
+    },
+
+    // Stateful tool sessions (spec section 6.2.1) — not available in WASM (ADR-034)
+    async toolSessionCreate(
+      _handle: BridgeContextHandle,
+      _toolId: string,
+      _sourceContextId: string,
+      _ttlSeconds?: number,
+    ): Promise<string> {
+      throw new TransportError(
+        "toolSessionCreate is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for stateful tool sessions.",
+        "SCP-TRANS-5004",
+      );
+    },
+
+    async toolSessionInvoke(
+      _handle: BridgeContextHandle,
+      _sessionId: string,
+      _inputJson: string,
+      _invokerDid: string,
+      _ucanToken: string,
+      _proofTokens?: readonly string[],
+    ): Promise<string> {
+      throw new TransportError(
+        "toolSessionInvoke is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for stateful tool sessions.",
+        "SCP-TRANS-5004",
+      );
+    },
+
+    async toolSessionClose(_handle: BridgeContextHandle, _sessionId: string): Promise<void> {
+      throw new TransportError(
+        "toolSessionClose is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for stateful tool sessions.",
+        "SCP-TRANS-5004",
+      );
+    },
+
     // Transport
     async transportConnect(relayUrl: string): Promise<BridgeTransportHandle> {
       const wasm = getWasm();
