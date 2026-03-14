@@ -347,6 +347,13 @@ interface WasmModule {
   // Economic policy (§19.3)
   context_set_economic_policy: (handle: BridgeContextHandle, policyJson: string) => void;
   context_get_economic_policy: (handle: BridgeContextHandle) => string | undefined;
+  // App Sandboxing (#595, spec §8.4.1, §8.4.2)
+  sandbox_validate_declaration: (
+    declarationJson: string,
+    ceilingCapabilities: string[],
+    roleCapabilities: string[],
+  ) => string;
+  sandbox_check_capability: (grantedCapabilities: string[], requiredCapability: string) => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,6 +1271,28 @@ export function createWasmBridge(): Bridge {
     async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
       const wasm = getWasm();
       return await wasm.identity_verify_device_attestation(did, tokenBase64);
+    },
+
+    // App Sandboxing (#595, spec §8.4.1, §8.4.2)
+    validateCapabilityDeclaration(
+      declarationJson: string,
+      ceilingCapabilities: string[],
+      roleCapabilities: string[],
+    ): string {
+      const wasm = getWasm();
+      return wasm.sandbox_validate_declaration(
+        declarationJson,
+        ceilingCapabilities,
+        roleCapabilities,
+      );
+    },
+
+    checkScopedCapability(
+      grantedCapabilities: readonly string[],
+      requiredCapability: string,
+    ): boolean {
+      const wasm = getWasm();
+      return wasm.sandbox_check_capability([...grantedCapabilities], requiredCapability);
     },
 
     // Lifecycle

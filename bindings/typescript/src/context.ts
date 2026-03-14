@@ -14,7 +14,7 @@
 import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
-import { getBridge } from "./internal/bridge";
+import { getBridge, getBridgeSync } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
   BroadcastAdmissionPolicy,
@@ -1041,11 +1041,7 @@ export class ScopedHandle {
   readonly grantedCapabilities: readonly string[];
   readonly appDid: string;
 
-  constructor(
-    context: Context,
-    grantedCapabilities: readonly string[],
-    appDid: string,
-  ) {
+  constructor(context: Context, grantedCapabilities: readonly string[], appDid: string) {
     this.context = context;
     // Freeze to prevent mutation via Object.defineProperty or prototype tricks.
     this.grantedCapabilities = Object.freeze([...grantedCapabilities]);
@@ -1054,7 +1050,7 @@ export class ScopedHandle {
 
   /** Check whether a given capability is allowed. */
   hasCapability(capability: string): boolean {
-    const bridge = getBridge();
+    const bridge = getBridgeSync();
     return bridge.checkScopedCapability(this.grantedCapabilities, capability);
   }
 
@@ -1080,7 +1076,7 @@ export function validateCapabilityDeclaration(
   ceilingCapabilities: string[],
   roleCapabilities: string[],
 ): DeclarationValidationResult {
-  const bridge = getBridge();
+  const bridge = getBridgeSync();
   const resultJson = bridge.validateCapabilityDeclaration(
     declarationJson,
     ceilingCapabilities,

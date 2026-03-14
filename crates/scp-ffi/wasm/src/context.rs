@@ -1140,54 +1140,56 @@ pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u3
 // App Sandboxing (#595, spec §8.4.1, §8.4.2)
 // ---------------------------------------------------------------------------
 
-/// Maps a resource category + action to the canonical capability name string
-/// matching all 19 variants of `scp-core`'s `Capability` enum (see
-/// `crates/scp-core/src/context/roles.rs` `Capability::new()`).
+/// Maps a resource category + action to canonical capability name strings,
+/// matching `scp-core`'s `CapabilityEntry::to_capabilities()` exactly.
+///
+/// Returns a `Vec<String>` because some (category, action) pairs produce
+/// multiple capabilities (e.g., `("governance", "admin")` yields both
+/// `governance:propose` and `governance:vote`).
 ///
 /// The `is_tool` flag indicates the resource path ends with `tools/{name}`,
 /// meaning the action targets a specific tool (not the tools category itself).
-fn map_capability_name(category: &str, action: &str, is_tool: bool) -> String {
+///
+/// Core source of truth: `crates/scp-core/src/context/app_sandbox.rs`
+/// `CapabilityEntry::to_capabilities()`.
+fn map_capability_names(category: &str, action: &str, is_tool: bool) -> Vec<String> {
     match (category, action, is_tool) {
         // ToolInvoke(specific) -- resource ends with tools/{tool_name}
-        (_, "invoke", true) => format!("tool:invoke:{category}"),
+        (_, "invoke", true) => vec![format!("tool:invoke:{category}")],
+        // MessagesRead -- core accepts ("messaging"|"members", "read")
+        ("messaging" | "members", "read", _) => vec!["messages:read".to_owned()],
+        // MessagesWrite -- core accepts ("messaging", "write") only
+        ("messaging", "write", _) => vec!["messages:write".to_owned()],
+        // MemberInvite -- core accepts ("members", "write"|"admin")
+        ("members", "write" | "admin", _) => vec!["member:invite".to_owned()],
         // ToolInvokeAll
-        ("tools", "invoke", _) => "tool:invoke:*".to_owned(),
-        // ToolRegister
-        ("tools", "register", _) => "tool:register".to_owned(),
-        // ToolInterface (cross-context tool exposure, spec section 6.2)
-        ("tools", "interface", _) => "tool:interface".to_owned(),
-        // MessagesRead (messaging, messages, or members read)
-        ("messaging" | "messages" | "members", "read", _) => "messages:read".to_owned(),
-        // MessagesWrite
-        ("messaging" | "messages", "write", _) => "messages:write".to_owned(),
-        // MemberInvite
-        ("members", "invite", _) => "member:invite".to_owned(),
-        // MemberRemove
-        ("members", "remove", _) => "member:remove".to_owned(),
-        // MemberBan (spec section 5.3)
-        ("members", "ban", _) => "member:ban".to_owned(),
-        // RoleAssign
-        ("roles", "assign", _) => "role:assign".to_owned(),
-        // GovernancePropose
-        ("governance", "propose" | "write", _) => "governance:propose".to_owned(),
-        // GovernanceVote
-        ("governance", "vote", _) => "governance:vote".to_owned(),
-        // ContextClose
-        ("context", "close", _) => "context:close".to_owned(),
-        // ChildContextCreate (spec section 5.13)
-        ("context", "child:create" | "create_child", _) => "context:child:create".to_owned(),
+        ("tools", "invoke", _) => vec!["tool:invoke:*".to_owned()],
+        // ToolRegister -- core accepts ("tools", "register"|"admin")
+        ("tools", "register" | "admin", _) => vec!["tool:register".to_owned()],
+        // GovernancePropose -- core accepts ("governance", "write")
+        ("governance", "write", _) => vec!["governance:propose".to_owned()],
+        // GovernancePropose + GovernanceVote -- core accepts ("governance", "admin")
+        ("governance", "admin", _) => vec![
+            "governance:propose".to_owned(),
+            "governance:vote".to_owned(),
+        ],
+        // RoleAssign -- core accepts ("roles", "admin")
+        ("roles", "admin", _) => vec!["role:assign".to_owned()],
+        // ContextClose -- core accepts ("context", "admin")
+        ("context", "admin", _) => vec!["context:close".to_owned()],
         // Bridging (spec section 12)
-        ("bridging", _, _) => "bridging".to_owned(),
+        ("bridging", _, _) => vec!["bridging".to_owned()],
         // MediaVoice (spec section 10.9.1)
-        ("media", "voice", _) => "media:voice".to_owned(),
+        ("media", "voice", _) => vec!["media:voice".to_owned()],
         // MediaVideo (spec section 10.9.1)
-        ("media", "video", _) => "media:video".to_owned(),
+        ("media", "video", _) => vec!["media:video".to_owned()],
         // MediaScreenShare (spec section 10.9.1)
-        ("media", "screen_share", _) => "media:screen_share".to_owned(),
-        // MetadataEdit (spec section 5.7, section 5.3.1)
-        ("metadata", "edit", _) => "metadata:edit".to_owned(),
-        // Custom capabilities -- anything not matching a known pattern
-        _ => format!("custom:{category}:{action}"),
+        ("media", "screen_share", _) => vec!["media:screen_share".to_owned()],
+        // MetadataEdit -- core accepts ("metadata", "write"|"admin")
+        ("metadata", "write" | "admin", _) => vec!["metadata:edit".to_owned()],
+        // Custom capabilities -- anything not matching a known pattern.
+        // Uses Capability::name() format (not Display), e.g. "category:action".
+        _ => vec![format!("{category}:{action}")],
     }
 }
 
@@ -1272,7 +1274,7 @@ pub fn sandbox_validate_declaration(
 
         for action_val in &actions {
             let action = action_val.as_str().unwrap_or("");
-            requested.push(map_capability_name(category, action, is_tool));
+            requested.extend(map_capability_names(category, action, is_tool));
         }
     }
 
