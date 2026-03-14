@@ -25,7 +25,7 @@
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::IdentityError;
@@ -7343,6 +7343,29 @@ pub fn sync_get_policy() -> SyncPolicyResult {
 // Bridge connector — register and create shadow (#421)
 // ---------------------------------------------------------------------------
 
+/// Per-context bridge connector state that persists across function calls.
+///
+/// Without this, `bridge_create_shadow` would create ephemeral
+/// `ShadowRegistry` and `SenderKeyStore` instances that are dropped when the
+/// function returns, losing all shadow identity and sender key state.
+///
+/// Keyed by context ID in `BRIDGE_STATE`.
+struct BridgeContextState {
+    shadow_registry: scp_core::bridge::shadow::ShadowRegistry,
+    sender_key_store: scp_core::crypto::sender_keys::SenderKeyStore,
+}
+
+/// Process-global registry of per-context bridge connector state.
+///
+/// Uses `DashMap` for lock-free concurrent reads, matching the pattern
+/// used by `UcanContextState` in `runtime.rs`.
+static BRIDGE_STATE: OnceLock<dashmap::DashMap<String, BridgeContextState>> = OnceLock::new();
+
+/// Returns a reference to the bridge state registry, initializing on first access.
+fn bridge_state_registry() -> &'static dashmap::DashMap<String, BridgeContextState> {
+    BRIDGE_STATE.get_or_init(dashmap::DashMap::new)
+}
+
 /// Bridge registration result record.
 ///
 /// Returned by `bridge_register`. Contains the details of a successfully
@@ -7520,6 +7543,10 @@ pub fn bridge_register(
 /// They carry provenance metadata indicating they are not native SCP
 /// identities.
 ///
+/// Uses the persistent per-context `ShadowRegistry` and `SenderKeyStore`
+/// from the process-global bridge state registry, ensuring that shadow
+/// identity state and sender keys survive across function calls.
+///
 /// # Arguments
 ///
 /// * `bridge_id` — The bridge connector ID that owns this shadow.
@@ -7561,8 +7588,6 @@ pub fn bridge_create_shadow(
     };
 
     let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
-    let mut shadow_registry = scp_core::bridge::shadow::ShadowRegistry::new(context_id);
-    let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
 
     let params = scp_core::bridge::shadow::CreateShadowParams {
         shadow_id: &shadow_id,
@@ -7573,9 +7598,18 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
+    let registry = bridge_state_registry();
+    let mut entry = registry
+        .entry(context_id.clone())
+        .or_insert_with(|| BridgeContextState {
+            shadow_registry: scp_core::bridge::shadow::ShadowRegistry::new(context_id),
+            sender_key_store: scp_core::crypto::sender_keys::SenderKeyStore::new(),
+        });
+    let state = entry.value_mut();
+
     let (shadow, _event) = scp_core::bridge::shadow::create_shadow(
-        &mut shadow_registry,
-        &mut sender_key_store,
+        &mut state.shadow_registry,
+        &mut state.sender_key_store,
         &params,
     )
     .map_err(|e| ScpError::Context {

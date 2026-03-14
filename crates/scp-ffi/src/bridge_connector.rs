@@ -27,6 +27,9 @@
 
 use std::sync::OnceLock;
 
+use std::sync::OnceLock;
+
+use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -50,7 +53,7 @@ use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow
 use scp_core::bridge::{
     BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus,
 };
-use scp_core::crypto::sender_keys::SenderKey;
+use scp_core::crypto::sender_keys::SenderKeyStore;
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::Attestation;
 use zeroize::Zeroizing;
@@ -58,22 +61,30 @@ use zeroize::Zeroizing;
 use crate::error::ScpPyError;
 
 // ---------------------------------------------------------------------------
-// Global credential store (in-memory, per-process)
+// Per-context bridge state — persistent ShadowRegistry + SenderKeyStore
 // ---------------------------------------------------------------------------
 
-/// Global in-memory credential store for bridge credential lifecycle.
+/// Per-context bridge connector state that persists across function calls.
 ///
-/// Uses `OnceLock` for single-initialization, matching the runtime registry
-/// pattern used throughout the `PyO3` bridge. The `InMemoryCredentialStore` is
-/// thread-safe via internal `tokio::sync::RwLock`.
+/// Without this, `bridge_create_shadow` would create ephemeral
+/// `ShadowRegistry` and `SenderKeyStore` instances that are dropped when the
+/// function returns, losing all shadow identity and sender key state.
 ///
-/// Production deployments should replace this with a `Storage`-backed
-/// implementation when it lands (see §12.11.2).
-static CREDENTIAL_STORE: OnceLock<InMemoryCredentialStore> = OnceLock::new();
+/// Keyed by context ID in `BRIDGE_STATE`.
+struct BridgeContextState {
+    shadow_registry: ShadowRegistry,
+    sender_key_store: SenderKeyStore,
+}
 
-/// Returns or initializes the global credential store.
-fn credential_store() -> &'static InMemoryCredentialStore {
-    CREDENTIAL_STORE.get_or_init(InMemoryCredentialStore::new)
+/// Process-global registry of per-context bridge connector state.
+///
+/// Uses `DashMap` for lock-free concurrent reads, matching the pattern
+/// used by `FfiBridgeState` in `runtime.rs`.
+static BRIDGE_STATE: OnceLock<DashMap<String, BridgeContextState>> = OnceLock::new();
+
+/// Returns a reference to the bridge state registry, initializing on first access.
+fn bridge_state_registry() -> &'static DashMap<String, BridgeContextState> {
+    BRIDGE_STATE.get_or_init(DashMap::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,8 +298,9 @@ pub fn py_bridge_evaluate_trust(
 
 /// Creates a shadow identity for an external platform participant.
 ///
-/// Creates a temporary `ShadowRegistry` and calls `create_shadow` with
-/// the correct parameters.
+/// Uses the persistent per-context `ShadowRegistry` and `SenderKeyStore`
+/// from the process-global bridge state registry, ensuring that shadow
+/// identity state and sender keys survive across function calls.
 ///
 /// Returns a dict with the shadow identity details.
 ///
@@ -320,7 +332,6 @@ pub fn py_bridge_create_shadow(
     let mode = parse_bridge_mode(bridge_mode)?;
 
     let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
-    let mut shadow_registry = ShadowRegistry::new(context_id.to_string());
 
     let params = CreateShadowParams {
         shadow_id: &shadow_id,
@@ -330,12 +341,25 @@ pub fn py_bridge_create_shadow(
         context_member_dids: &[], // no existing context member DIDs for collision check
         timestamp: 0,
     };
-    let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
-    let (shadow, _event) = create_shadow(&mut shadow_registry, &mut sender_key_store, &params)
-        .map_err(|e| ScpPyError::ContextError {
-            message: format!("shadow creation failed: {e}"),
-            code: "SCP-CTX-2102".to_string(),
-        })?;
+
+    let registry = bridge_state_registry();
+    let mut entry = registry
+        .entry(context_id.to_owned())
+        .or_insert_with(|| BridgeContextState {
+            shadow_registry: ShadowRegistry::new(context_id.to_string()),
+            sender_key_store: SenderKeyStore::new(),
+        });
+    let state = entry.value_mut();
+
+    let (shadow, _event) = create_shadow(
+        &mut state.shadow_registry,
+        &mut state.sender_key_store,
+        &params,
+    )
+    .map_err(|e| ScpPyError::ContextError {
+        message: format!("shadow creation failed: {e}"),
+        code: "SCP-CTX-2102".to_string(),
+    })?;
 
     let dict = PyDict::new(py);
     dict.set_item("shadow_id", &shadow.shadow_id)?;
