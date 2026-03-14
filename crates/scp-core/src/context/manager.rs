@@ -1773,7 +1773,7 @@ impl ContextManager {
         last_relay_contacts: std::collections::HashMap<String, u64>,
         driver: &D,
     ) -> Option<crate::sync::hours_offline::ReconnectionReport> {
-        let (coordinator, context_ids) = self
+        let (coordinator, _context_ids) = self
             .prepare_reconnection(member_did, last_relay_contacts)
             .await?;
 
@@ -1786,14 +1786,12 @@ impl ContextManager {
                 crate::sync::SyncOutcome::FullyCaughtUp
                     | crate::sync::SyncOutcome::FastForwarded { .. }
                     | crate::sync::SyncOutcome::Reset
+                    | crate::sync::SyncOutcome::ContextGone
             );
             if cleared {
                 self.clear_needs_reconnect(&result.context_id).await;
             }
         }
-
-        // Log context IDs that were attempted (for traceability).
-        let _ = context_ids;
 
         Some(report)
     }
