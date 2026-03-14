@@ -8,6 +8,14 @@
 //! - [`scpid_challenge`] — Generate an SCPID challenge for a relying party.
 //! - [`scpid_sign`] — Sign an SCPID challenge with a registered identity's key.
 //!
+//! **`scpid_verify` is NOT exposed in the WASM bridge.** Verification requires
+//! a network-capable `DidResolver` to resolve the signer's DID document from
+//! the DHT. The WASM environment cannot perform direct DHT queries (no raw UDP
+//! sockets), and the tokio multi-thread runtime required by `DualLayerResolver`
+//! is unavailable per ADR-034. Verification should be performed server-side
+//! via the PyO3 or NAPI bridges, or in a native mobile app via the UniFFI
+//! bridge.
+//!
 //! See spec §3.11 and the `scp-core` `scpid` module for the canonical
 //! implementation.
 
