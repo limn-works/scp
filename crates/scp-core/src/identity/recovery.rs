@@ -914,8 +914,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Serialize the notification. If serialization fails, notification
         // cannot proceed.
-        let Ok(payload) = serde_json::to_vec(&notification) else {
-            return false;
+        let payload = match serde_json::to_vec(&notification) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize contact notification — skipping");
+                return false;
+            }
         };
 
         // Attempt to notify each contact via shared contexts. The manager
@@ -1063,8 +1067,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             "event": "recovery:psk_rotation",
             "wrapped_psks": wrapped_psks.iter().map(hex::encode).collect::<Vec<_>>(),
         });
-        let Ok(payload) = serde_json::to_vec(&psk_event) else {
-            return false;
+        let payload = match serde_json::to_vec(&psk_event) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize PSK rotation event — skipping");
+                return false;
+            }
         };
 
         // Send via recovery notification. We use a synthetic context ID
