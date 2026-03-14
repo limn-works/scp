@@ -1,14 +1,16 @@
 //! Payment receipt verification and history queries.
 //!
 //! Provides the [`PaymentVerifier`] trait for verifying payment receipts
-//! against payment adapters, and the [`payment_history`] function for
-//! retrieving receipts from a context's event log.
+//! against payment adapters, the [`verify_receipts`] function for batch
+//! verification of receipts against registered verifiers, and the
+//! [`payment_history`] function for retrieving receipts from a context's
+//! event log.
 //!
 //! See spec section 19.6 (Payment Receipts and Provenance) and ADR-033.
 
 use serde::{Deserialize, Serialize};
 
-use super::adapter::{PaymentError, PaymentReceipt, VerificationResult};
+use super::adapter::{PaymentAdapter, PaymentError, PaymentReceipt, VerificationResult};
 use scp_event_log::{Event, EventType};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +39,242 @@ pub trait PaymentVerifier: Send + Sync {
         &self,
         receipt: &PaymentReceipt,
     ) -> impl std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// Blanket impl: PaymentAdapter -> PaymentVerifier
+// ---------------------------------------------------------------------------
+
+/// Every [`PaymentAdapter`] automatically implements [`PaymentVerifier`].
+///
+/// The `PaymentVerifier` trait is the verification-only subset of
+/// `PaymentAdapter`, extracted so receipt consumers that do not need
+/// authorize/capture/void/refund can accept a narrower interface. This
+/// blanket impl ensures adapters satisfy both traits without manual wiring.
+impl<T: PaymentAdapter> PaymentVerifier for T {
+    fn adapter_id(&self) -> &str {
+        PaymentAdapter::adapter_id(self)
+    }
+
+    fn verify(
+        &self,
+        receipt: &PaymentReceipt,
+    ) -> impl std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send {
+        PaymentAdapter::verify(self, receipt)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReceiptVerificationError
+// ---------------------------------------------------------------------------
+
+/// Error returned by [`verify_receipts`] when verification of a receipt fails.
+///
+/// Distinguishes between adapter-level verification failures and the absence
+/// of a verifier for a receipt's adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiptVerificationError {
+    /// No verifier registered for this receipt's `adapter_id`.
+    NoVerifierForAdapter {
+        /// The receipt that could not be verified.
+        receipt_id: [u8; 32],
+        /// The adapter identifier from the receipt.
+        adapter_id: String,
+    },
+    /// The verifier returned an error.
+    VerificationFailed {
+        /// The receipt that failed verification.
+        receipt_id: [u8; 32],
+        /// The underlying adapter error.
+        error: PaymentError,
+    },
+}
+
+impl std::fmt::Display for ReceiptVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoVerifierForAdapter {
+                adapter_id,
+                receipt_id,
+            } => write!(
+                f,
+                "no verifier for adapter {adapter_id:?} (receipt {receipt_id:02x?})"
+            ),
+            Self::VerificationFailed { receipt_id, error } => {
+                write!(
+                    f,
+                    "verification failed for receipt {receipt_id:02x?}: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReceiptVerificationError {}
+
+// ---------------------------------------------------------------------------
+// ReceiptVerification
+// ---------------------------------------------------------------------------
+
+/// Result of verifying a single receipt.
+#[derive(Clone, Debug)]
+pub struct ReceiptVerification {
+    /// The receipt that was verified.
+    pub receipt_id: [u8; 32],
+    /// The verification result from the adapter.
+    pub result: VerificationResult,
+}
+
+// ---------------------------------------------------------------------------
+// verify_receipts
+// ---------------------------------------------------------------------------
+
+/// Verifies a batch of payment receipts against registered verifiers.
+///
+/// For each receipt, selects the verifier whose `adapter_id()` matches the
+/// receipt's `adapter_id` field, then calls `verify()`. Receipts without a
+/// matching verifier produce a [`ReceiptVerificationError::NoVerifierForAdapter`]
+/// error. Adapter-level failures produce
+/// [`ReceiptVerificationError::VerificationFailed`].
+///
+/// Returns `Ok` with a [`ReceiptVerification`] for each successfully verified
+/// receipt. On any failure, returns the first error encountered.
+///
+/// This function wires [`PaymentVerifier`] into the receipt verification
+/// flow, enabling receipt consumers to verify receipts from
+/// [`payment_history`] without needing a full [`PaymentAdapter`].
+///
+/// # Errors
+///
+/// Returns [`ReceiptVerificationError::NoVerifierForAdapter`] if a receipt's
+/// `adapter_id` does not match any verifier. Returns
+/// [`ReceiptVerificationError::VerificationFailed`] if a verifier returns an
+/// error.
+///
+/// See spec section 19.6.
+pub async fn verify_receipts<V: PaymentVerifier>(
+    verifiers: &[&V],
+    receipts: &[PaymentReceipt],
+) -> Result<Vec<ReceiptVerification>, ReceiptVerificationError> {
+    let mut results = Vec::with_capacity(receipts.len());
+
+    for receipt in receipts {
+        let verifier = verifiers
+            .iter()
+            .find(|v| v.adapter_id() == receipt.adapter_id);
+
+        match verifier {
+            None => {
+                return Err(ReceiptVerificationError::NoVerifierForAdapter {
+                    receipt_id: receipt.receipt_id,
+                    adapter_id: receipt.adapter_id.clone(),
+                });
+            }
+            Some(v) => {
+                let result = v.verify(receipt).await.map_err(|e| {
+                    ReceiptVerificationError::VerificationFailed {
+                        receipt_id: receipt.receipt_id,
+                        error: e,
+                    }
+                })?;
+                results.push(ReceiptVerification {
+                    receipt_id: receipt.receipt_id,
+                    result,
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Verifies a batch of payment receipts against heterogeneous verifiers.
+///
+/// Like [`verify_receipts`], but accepts verifiers as trait objects
+/// (`&dyn PaymentVerifierDyn`), allowing different verifier types for
+/// different adapters.
+///
+/// # Errors
+///
+/// Returns [`ReceiptVerificationError::NoVerifierForAdapter`] if a receipt's
+/// `adapter_id` does not match any verifier. Returns
+/// [`ReceiptVerificationError::VerificationFailed`] if a verifier returns an
+/// error.
+///
+/// See spec section 19.6.
+pub async fn verify_receipts_dyn(
+    verifiers: &[&dyn PaymentVerifierDyn],
+    receipts: &[PaymentReceipt],
+) -> Result<Vec<ReceiptVerification>, ReceiptVerificationError> {
+    let mut results = Vec::with_capacity(receipts.len());
+
+    for receipt in receipts {
+        let verifier = verifiers
+            .iter()
+            .find(|v| v.adapter_id() == receipt.adapter_id);
+
+        match verifier {
+            None => {
+                return Err(ReceiptVerificationError::NoVerifierForAdapter {
+                    receipt_id: receipt.receipt_id,
+                    adapter_id: receipt.adapter_id.clone(),
+                });
+            }
+            Some(v) => {
+                let result = v.verify_dyn(receipt).await.map_err(|e| {
+                    ReceiptVerificationError::VerificationFailed {
+                        receipt_id: receipt.receipt_id,
+                        error: e,
+                    }
+                })?;
+                results.push(ReceiptVerification {
+                    receipt_id: receipt.receipt_id,
+                    result,
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// PaymentVerifierDyn — object-safe variant
+// ---------------------------------------------------------------------------
+
+/// Object-safe variant of [`PaymentVerifier`] for use with trait objects.
+///
+/// The base [`PaymentVerifier`] trait uses RPITIT (return-position impl
+/// trait in trait), which prevents `dyn PaymentVerifier`. This trait uses
+/// boxed futures instead, enabling `&dyn PaymentVerifierDyn` in
+/// [`verify_receipts_dyn`].
+pub trait PaymentVerifierDyn: Send + Sync {
+    /// Returns the adapter identifier this verifier handles.
+    fn adapter_id(&self) -> &str;
+
+    /// Verifies a payment receipt against the payment rail.
+    fn verify_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send + 'a>,
+    >;
+}
+
+/// Blanket impl: every [`PaymentVerifier`] is also [`PaymentVerifierDyn`].
+impl<T: PaymentVerifier> PaymentVerifierDyn for T {
+    fn adapter_id(&self) -> &str {
+        PaymentVerifier::adapter_id(self)
+    }
+
+    fn verify_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send + 'a>,
+    > {
+        Box::pin(PaymentVerifier::verify(self, receipt))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,5 +725,267 @@ mod tests {
             let deserialized: EventType = serde_json::from_str(&json).unwrap();
             assert_eq!(*event_type, deserialized);
         }
+    }
+
+    // ===================================================================
+    // PaymentVerifier + verify_receipts tests
+    // ===================================================================
+
+    use crate::economy::adapter::{
+        AdapterCapabilities, PaymentAuthorization, PaymentMetadata, RefundConfirmation,
+    };
+
+    /// Minimal test adapter that implements `PaymentAdapter` (and therefore
+    /// `PaymentVerifier` via the blanket impl).
+    struct StubAdapter {
+        id: &'static str,
+        /// When `true`, `verify` returns `valid: true`. When `false`,
+        /// returns an error.
+        succeed: bool,
+    }
+
+    impl PaymentAdapter for StubAdapter {
+        fn adapter_id(&self) -> &str {
+            self.id
+        }
+
+        fn capabilities(&self) -> AdapterCapabilities {
+            AdapterCapabilities {
+                supported_currencies: vec![CurrencyCode::from("USD")],
+                supports_streaming: false,
+                supports_batch_auth: false,
+                supports_single_step: false,
+                min_amount: None,
+                max_amount: None,
+                typical_settlement_ms: 0,
+                requires_facilitator: false,
+            }
+        }
+
+        async fn authorize(
+            &self,
+            _payer: &DID,
+            _payee: &DID,
+            _amount: Amount,
+            _currency: CurrencyCode,
+            _metadata: PaymentMetadata,
+        ) -> Result<PaymentAuthorization, PaymentError> {
+            Err(PaymentError::AdapterError("not implemented".into()))
+        }
+
+        async fn capture(
+            &self,
+            _auth: &PaymentAuthorization,
+        ) -> Result<PaymentReceipt, PaymentError> {
+            Err(PaymentError::AdapterError("not implemented".into()))
+        }
+
+        async fn void(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+            Err(PaymentError::AdapterError("not implemented".into()))
+        }
+
+        async fn verify_authorization(
+            &self,
+            _auth: &PaymentAuthorization,
+        ) -> Result<(), PaymentError> {
+            Err(PaymentError::AdapterError("not implemented".into()))
+        }
+
+        async fn verify(
+            &self,
+            receipt: &PaymentReceipt,
+        ) -> Result<VerificationResult, PaymentError> {
+            if self.succeed {
+                Ok(VerificationResult {
+                    valid: true,
+                    adapter_id: self.id.to_string(),
+                    verified_amount: receipt.amount,
+                    verified_currency: receipt.currency,
+                    verification_timestamp: receipt.timestamp,
+                })
+            } else {
+                Err(PaymentError::InvalidReceipt("stub failure".into()))
+            }
+        }
+
+        async fn refund(
+            &self,
+            _receipt: &PaymentReceipt,
+            _amount: Option<Amount>,
+        ) -> Result<RefundConfirmation, PaymentError> {
+            Err(PaymentError::AdapterError("not implemented".into()))
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // PaymentVerifier blanket impl: adapter_id delegates correctly
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn blanket_payment_verifier_adapter_id() {
+        let adapter = StubAdapter {
+            id: "test-rail",
+            succeed: true,
+        };
+        let verifier: &dyn PaymentVerifierDyn = &adapter;
+        assert_eq!(verifier.adapter_id(), "test-rail");
+    }
+
+    // -------------------------------------------------------------------
+    // verify_receipts: single receipt, single verifier, success
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_receipts_single_success() {
+        let adapter = StubAdapter {
+            id: "test",
+            succeed: true,
+        };
+        let receipt = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 500, 1_000_000);
+
+        let results = verify_receipts(&[&adapter], &[receipt]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].result.valid);
+        assert_eq!(results[0].receipt_id, [0xAA; 32]);
+    }
+
+    // -------------------------------------------------------------------
+    // verify_receipts: no matching verifier → NoVerifierForAdapter
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_receipts_no_matching_verifier() {
+        let adapter = StubAdapter {
+            id: "lightning",
+            succeed: true,
+        };
+        // Receipt has adapter_id "test", but our verifier is "lightning".
+        let receipt = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 500, 1_000_000);
+
+        let err = verify_receipts(&[&adapter], &[receipt]).await.unwrap_err();
+        match err {
+            ReceiptVerificationError::NoVerifierForAdapter { adapter_id, .. } => {
+                assert_eq!(adapter_id, "test");
+            }
+            ReceiptVerificationError::VerificationFailed { .. } => {
+                panic!("expected NoVerifierForAdapter, got VerificationFailed")
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // verify_receipts: adapter verify fails → VerificationFailed
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_receipts_verification_failed() {
+        let adapter = StubAdapter {
+            id: "test",
+            succeed: false,
+        };
+        let receipt = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 500, 1_000_000);
+
+        let err = verify_receipts(&[&adapter], &[receipt]).await.unwrap_err();
+        match err {
+            ReceiptVerificationError::VerificationFailed { receipt_id, .. } => {
+                assert_eq!(receipt_id, [0xAA; 32]);
+            }
+            ReceiptVerificationError::NoVerifierForAdapter { .. } => {
+                panic!("expected VerificationFailed, got NoVerifierForAdapter")
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // verify_receipts: empty receipts → empty results
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_receipts_empty_receipts() {
+        let adapter = StubAdapter {
+            id: "test",
+            succeed: true,
+        };
+        let results = verify_receipts(&[&adapter], &[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // verify_receipts_dyn: heterogeneous verifiers
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_receipts_dyn_heterogeneous() {
+        let adapter_a = StubAdapter {
+            id: "test",
+            succeed: true,
+        };
+        let adapter_b = StubAdapter {
+            id: "lightning",
+            succeed: true,
+        };
+
+        let mut receipt_a = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
+        receipt_a.adapter_id = "test".to_string();
+
+        let mut receipt_b = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 200, 1_000_001);
+        receipt_b.adapter_id = "lightning".to_string();
+
+        let verifiers: Vec<&dyn PaymentVerifierDyn> = vec![&adapter_a, &adapter_b];
+        let results = verify_receipts_dyn(&verifiers, &[receipt_a, receipt_b])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].result.valid);
+        assert!(results[1].result.valid);
+        assert_eq!(results[1].result.adapter_id, "lightning");
+    }
+
+    // -------------------------------------------------------------------
+    // verify_receipts_dyn: no matching verifier → error
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_receipts_dyn_no_verifier() {
+        let adapter = StubAdapter {
+            id: "x402",
+            succeed: true,
+        };
+        let receipt = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 500, 1_000_000);
+
+        let verifiers: Vec<&dyn PaymentVerifierDyn> = vec![&adapter];
+        let err = verify_receipts_dyn(&verifiers, &[receipt])
+            .await
+            .unwrap_err();
+        match err {
+            ReceiptVerificationError::NoVerifierForAdapter { adapter_id, .. } => {
+                assert_eq!(adapter_id, "test");
+            }
+            ReceiptVerificationError::VerificationFailed { .. } => {
+                panic!("expected NoVerifierForAdapter, got VerificationFailed")
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ReceiptVerificationError Display formatting
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn receipt_verification_error_display() {
+        let err = ReceiptVerificationError::NoVerifierForAdapter {
+            receipt_id: [0xAA; 32],
+            adapter_id: "x402".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("x402"));
+        assert!(msg.contains("no verifier"));
+
+        let err2 = ReceiptVerificationError::VerificationFailed {
+            receipt_id: [0xBB; 32],
+            error: PaymentError::InvalidReceipt("bad proof".into()),
+        };
+        let msg2 = err2.to_string();
+        assert!(msg2.contains("verification failed"));
     }
 }

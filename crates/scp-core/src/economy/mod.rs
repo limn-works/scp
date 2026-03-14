@@ -58,7 +58,10 @@ pub use pricing::{
     FormulaChange, FormulaChangeStatus, PriceDirection, RelayPriceAdjustment, RelayPricingConfig,
     adjust_relay_price,
 };
-pub use receipt::{PaymentVerifier, ReceiptFilter, payment_history};
+pub use receipt::{
+    PaymentVerifier, PaymentVerifierDyn, ReceiptFilter, ReceiptVerification,
+    ReceiptVerificationError, payment_history, verify_receipts, verify_receipts_dyn,
+};
 pub use types::{
     Amount, COEFFICIENT_SCALE, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy,
     PaidActionType, PaymentAdapterRef, PricingFormula, PricingMetric, PricingVariable,
