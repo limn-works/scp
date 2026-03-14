@@ -366,11 +366,24 @@ pub fn verify_inner_signature(
     let provenance_hash = compute_provenance_hash(inner.provenance.as_ref())
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
 
-    // Reject unsupported protocol versions before signature verification.
-    if inner.version != SCP_INNER_ENVELOPE_VERSION {
-        return Err(EnvelopeError::UnsupportedVersion {
-            version: inner.version,
-        });
+    // Reject incompatible major versions before signature verification (§13.5).
+    // Same-major envelopes with different minor versions proceed in degraded
+    // mode — the canonical hash uses the wire version, so signature
+    // verification works across minor version differences.
+    let compat = super::check_version_compatibility(inner.version)?;
+    if let super::VersionCompatibility::DegradedMode {
+        local_minor,
+        remote_minor,
+    } = compat
+    {
+        tracing::warn!(
+            wire_version = format_args!("{:#06x}", inner.version),
+            local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
+            local_minor,
+            remote_minor,
+            "inner envelope minor version mismatch during signature verification — \
+             operating in degraded mode (§13.6)"
+        );
     }
 
     // Reconstruct params for canonical hash computation.
@@ -460,22 +473,34 @@ pub fn enforce_inner_envelope_category_a(
     Ok(())
 }
 
-/// Validates that an inner envelope's version field is supported (§13.2.1).
+/// Validates that an inner envelope's version field is compatible (§13.5).
 ///
-/// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
-/// deserialization to reject envelopes from incompatible protocol versions.
+/// Accepts envelopes with the same major version. When minor versions differ,
+/// the implementation operates in degraded mode (§13.6) and a `tracing::warn!`
+/// is emitted.
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::UnsupportedVersion`] if `inner.version` is not
-/// `SCP_INNER_ENVELOPE_VERSION`.
-pub const fn validate_inner_version(inner: &InnerEnvelope) -> Result<(), EnvelopeError> {
-    if inner.version != SCP_INNER_ENVELOPE_VERSION {
-        return Err(EnvelopeError::UnsupportedVersion {
-            version: inner.version,
-        });
+/// Returns [`EnvelopeError::UnsupportedVersion`] if the major version differs
+/// from this implementation's major version.
+pub fn validate_inner_version(
+    inner: &InnerEnvelope,
+) -> Result<super::VersionCompatibility, EnvelopeError> {
+    let compat = super::check_version_compatibility(inner.version)?;
+    if let super::VersionCompatibility::DegradedMode {
+        local_minor,
+        remote_minor,
+    } = compat
+    {
+        tracing::warn!(
+            wire_version = format_args!("{:#06x}", inner.version),
+            local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
+            local_minor,
+            remote_minor,
+            "inner envelope minor version mismatch — operating in degraded mode (§13.6)"
+        );
     }
-    Ok(())
+    Ok(compat)
 }
 
 // ---------------------------------------------------------------------------

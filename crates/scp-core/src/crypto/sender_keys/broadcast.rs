@@ -656,24 +656,46 @@ pub fn open_broadcast_trusted(
     decrypt_envelope(key, envelope)
 }
 
-/// Validates that a broadcast envelope's version field is supported (§13.2.2).
+/// Validates that a broadcast envelope's version field is compatible (§13.5).
 ///
-/// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
-/// deserialization to reject envelopes from incompatible protocol versions.
+/// Accepts envelopes with the same major version. When minor versions differ,
+/// the implementation operates in degraded mode (§13.6) and a `tracing::warn!`
+/// is emitted.
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::UnsupportedVersion`] if `envelope.version` is not
-/// `SCP_PROTOCOL_VERSION`.
-pub const fn validate_broadcast_version(
+/// Returns [`SenderKeyError::UnsupportedVersion`] if the major version differs
+/// from this implementation's major version.
+pub fn validate_broadcast_version(
     envelope: &BroadcastEnvelope,
-) -> Result<(), SenderKeyError> {
-    if envelope.version != crate::envelope::SCP_PROTOCOL_VERSION {
-        return Err(SenderKeyError::UnsupportedVersion {
+) -> Result<crate::envelope::VersionCompatibility, SenderKeyError> {
+    use crate::envelope::{
+        SCP_PROTOCOL_VERSION, VersionCompatibility, check_version_compatibility,
+    };
+
+    let compat = check_version_compatibility(envelope.version).map_err(|_| {
+        SenderKeyError::UnsupportedVersion {
             version: envelope.version,
-        });
+        }
+    })?;
+
+    if let VersionCompatibility::DegradedMode {
+        local_minor,
+        remote_minor,
+    } = compat
+    {
+        tracing::warn!(
+            wire_version = format_args!("{:#06x}", envelope.version),
+            local_version = format_args!("{:#06x}", SCP_PROTOCOL_VERSION),
+            local_minor,
+            remote_minor,
+            context_id = %envelope.context_id,
+            author_did = %envelope.author_did,
+            "broadcast envelope minor version mismatch — operating in degraded mode (§13.6)"
+        );
     }
-    Ok(())
+
+    Ok(compat)
 }
 
 // ---------------------------------------------------------------------------

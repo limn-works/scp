@@ -187,30 +187,52 @@ impl OuterEnvelope {
         }
         let envelope: Self = rmp_serde::from_slice(bytes)
             .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
-        if envelope.version != SCP_OUTER_ENVELOPE_VERSION {
-            return Err(EnvelopeError::UnsupportedVersion {
-                version: envelope.version,
-            });
+
+        // §13.5: accept same-major versions, reject different majors.
+        let compat = super::check_version_compatibility(envelope.version)?;
+        if let super::VersionCompatibility::DegradedMode {
+            local_minor,
+            remote_minor,
+        } = compat
+        {
+            tracing::warn!(
+                wire_version = format_args!("{:#06x}", envelope.version),
+                local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
+                local_minor,
+                remote_minor,
+                "outer envelope minor version mismatch — operating in degraded mode (§13.6)"
+            );
         }
+
         Ok(envelope)
     }
 
-    /// Validates that this outer envelope's version field is supported (§13.2.3).
+    /// Validates that this outer envelope's version field is compatible (§13.5).
     ///
-    /// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
-    /// deserialization to reject envelopes from incompatible protocol versions.
+    /// Accepts envelopes with the same major version. When minor versions
+    /// differ, the implementation operates in degraded mode (§13.6) and a
+    /// `tracing::warn!` is emitted.
     ///
     /// # Errors
     ///
-    /// Returns [`EnvelopeError::UnsupportedVersion`] if `self.version` is not
-    /// `SCP_PROTOCOL_VERSION`.
-    pub const fn validate_version(&self) -> Result<(), EnvelopeError> {
-        if self.version != super::SCP_PROTOCOL_VERSION {
-            return Err(EnvelopeError::UnsupportedVersion {
-                version: self.version,
-            });
+    /// Returns [`EnvelopeError::UnsupportedVersion`] if the major version
+    /// differs from this implementation's major version.
+    pub fn validate_version(&self) -> Result<super::VersionCompatibility, EnvelopeError> {
+        let compat = super::check_version_compatibility(self.version)?;
+        if let super::VersionCompatibility::DegradedMode {
+            local_minor,
+            remote_minor,
+        } = compat
+        {
+            tracing::warn!(
+                wire_version = format_args!("{:#06x}", self.version),
+                local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
+                local_minor,
+                remote_minor,
+                "outer envelope minor version mismatch — operating in degraded mode (§13.6)"
+            );
         }
-        Ok(())
+        Ok(compat)
     }
 }
 
@@ -383,11 +405,24 @@ pub fn open_envelope(
     //    `from_bytes` acts as defense in depth.
     let inner = InnerEnvelope::from_bytes(&plaintext)?;
 
-    // 3a. Reject unsupported protocol versions early (§13.2.1).
-    if inner.version != super::inner::SCP_INNER_ENVELOPE_VERSION {
-        return Err(EnvelopeError::UnsupportedVersion {
-            version: inner.version,
-        });
+    // 3a. Reject incompatible major versions early (§13.5).
+    //     Same-major envelopes with different minor versions proceed in
+    //     degraded mode.
+    let compat = super::check_version_compatibility(inner.version)?;
+    if let super::VersionCompatibility::DegradedMode {
+        local_minor,
+        remote_minor,
+    } = compat
+    {
+        tracing::warn!(
+            wire_version = format_args!("{:#06x}", inner.version),
+            local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
+            local_minor,
+            remote_minor,
+            context_id = %inner.context_id,
+            sender_did = %inner.sender_did,
+            "inner envelope minor version mismatch — operating in degraded mode (§13.6)"
+        );
     }
 
     // 4. Verify sender_did is a member of the MLS group.
