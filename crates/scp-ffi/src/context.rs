@@ -874,6 +874,14 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
     }
     drop(state);
 
+    // Ensure the ContextManager is initialized — context_join is a valid
+    // first operation (e.g. a device joining a context without creating one).
+    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    #[cfg(test)]
+    crate::runtime::init_context_manager_for_test();
+    #[cfg(not(test))]
+    crate::runtime::init_context_manager();
+
     // Delegate join to the shared ContextManager for membership tracking.
     {
         let context_id = handle.context_id.clone();
@@ -1569,6 +1577,14 @@ fn py_context_import(data: &[u8]) -> PyResult<String> {
     })?;
 
     let context_id = export.snapshot.context_id.clone();
+
+    // Ensure the ContextManager is initialized — context_import is a valid
+    // first operation (e.g. a device receiving exported context data).
+    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    #[cfg(test)]
+    crate::runtime::init_context_manager_for_test();
+    #[cfg(not(test))]
+    crate::runtime::init_context_manager();
 
     let rt = crate::runtime()?;
     let mgr =

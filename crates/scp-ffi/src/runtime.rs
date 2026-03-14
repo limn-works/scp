@@ -115,8 +115,8 @@ static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     CONTEXT_MANAGER.get().ok_or_else(|| {
         ScpPyError::context(
-            "ContextManager not initialized — call py_context_create or \
-             init_context_manager first"
+            "ContextManager not initialized — call py_context_create, \
+             py_context_join, py_context_import, or init_context_manager first"
                 .to_owned(),
         )
     })

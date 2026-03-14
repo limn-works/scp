@@ -110,8 +110,8 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
     CONTEXT_MANAGER.get().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
-            message: "ContextManager not initialized — call context_create or \
-                      init_context_manager first"
+            message: "ContextManager not initialized — call context_create, \
+                      context_join, context_import, or init_context_manager first"
                 .to_owned(),
             code: "SCP-CTX-2000".to_owned(),
         })

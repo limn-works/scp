@@ -2416,6 +2416,11 @@ pub async fn context_join(
             }
             drop(state);
 
+            // Ensure the ContextManager is initialized — context_join is a valid
+            // first operation (e.g. a device joining a context without creating
+            // one). init_context_manager is idempotent (OnceLock). #1073
+            crate::runtime::init_context_manager();
+
             // Delegate to the shared ContextManager. Build a core ContextHandle
             // to pass the context_id, then join via the manager.
             //
@@ -6262,6 +6267,12 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
                     }
                 })?;
             let context_id = export.snapshot.context_id.clone();
+
+            // Ensure the ContextManager is initialized — context_import is a
+            // valid first operation (e.g. a device receiving exported context
+            // data). init_context_manager is idempotent (OnceLock). #1073
+            crate::runtime::init_context_manager();
+
             let manager = crate::runtime::context_manager()?;
             manager
                 .import_context(export)
