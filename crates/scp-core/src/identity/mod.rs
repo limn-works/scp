@@ -20,4 +20,7 @@ pub mod scpid;
 // All scp-core consumers should use this re-export via `crate::identity::SigningKeyId`.
 pub use scp_identity::SigningKeyId;
 
-pub use scpid::{ScpIdAuthentication, ScpIdChallenge, ScpIdError, ScpIdResponse, scpid_challenge};
+pub use scpid::{
+    SCPID_DOMAIN_SEPARATOR, ScpIdAuthentication, ScpIdChallenge, ScpIdError, ScpIdResponse,
+    scpid_challenge, scpid_sign,
+};

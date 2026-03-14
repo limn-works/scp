@@ -19,7 +19,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use crate::identity::SigningKeyId;
+use scp_platform::traits::{KeyCustody, KeyHandle};
 
 // ---------------------------------------------------------------------------
 // Protocol-field deserialization validator
@@ -221,6 +223,9 @@ pub struct ScpIdAuthentication {
 /// The protocol version string included in challenge and response wire formats.
 pub const SCPID_PROTOCOL_VERSION: &str = "scpid/1.0";
 
+/// Domain separator for SCPID signed content (§3.11.3, §9.18.2).
+pub const SCPID_DOMAIN_SEPARATOR: &str = "SCP-DID-AUTH-V1:";
+
 /// Maximum TTL for an SCPID challenge in milliseconds (§3.11.2: MUST NOT exceed 300 seconds).
 const MAX_TTL_MS: u64 = 300_000;
 
@@ -290,6 +295,101 @@ pub fn scpid_challenge(audience: &str, ttl: Duration) -> Result<ScpIdChallenge, 
         audience: audience.to_owned(),
         issued_at,
         expires_at,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Client-side signing
+// ---------------------------------------------------------------------------
+
+/// Sign an SCPID challenge, producing an [`ScpIdResponse`] (§3.11.3).
+///
+/// Constructs the canonical hash specified in §3.11.3 and signs it with the
+/// caller's Ed25519 key via [`KeyCustody`]. The `signed_at` timestamp is set
+/// to the current time in milliseconds.
+///
+/// # Errors
+///
+/// Returns [`ScpIdError::ChallengeExpired`] if the challenge has already
+/// expired. Returns [`ScpIdError::InvalidInput`] if the protocol version
+/// is unsupported or the system clock is before the Unix epoch. Returns
+/// [`ScpIdError::SigningFailed`] if the custody operation fails.
+pub async fn scpid_sign(
+    custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
+    did: &str,
+    signing_key_id: SigningKeyId,
+    challenge: &ScpIdChallenge,
+) -> Result<ScpIdResponse, ScpIdError> {
+    // Reject empty DID (consistent with audience validation in scpid_challenge).
+    if did.is_empty() {
+        return Err(ScpIdError::InvalidInput("DID must not be empty".to_owned()));
+    }
+
+    // Reject expired challenges (fail fast).
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| ScpIdError::InvalidInput(format!("system clock error: {e}")))?
+        .as_millis();
+    let now_ms = u64::try_from(now_ms)
+        .map_err(|_| ScpIdError::InvalidInput("system clock overflow".to_owned()))?;
+
+    if now_ms > challenge.expires_at {
+        return Err(ScpIdError::ChallengeExpired);
+    }
+
+    // Validate protocol.
+    if challenge.protocol != SCPID_PROTOCOL_VERSION {
+        return Err(ScpIdError::InvalidInput(format!(
+            "unsupported protocol: {}, expected {SCPID_PROTOCOL_VERSION}",
+            challenge.protocol
+        )));
+    }
+
+    let signed_at = now_ms;
+
+    // Build canonical hash (§3.11.3):
+    //   SHA-256(
+    //       "SCP-DID-AUTH-V1:"
+    //       || BE32(len(did))           || did
+    //       || BE32(len(signing_key_id)) || signing_key_id
+    //       || nonce (32 bytes raw)
+    //       || BE32(len(audience))       || audience
+    //       || signed_at as u64 BE
+    //   )
+    let hash = canonical_hash(
+        SCPID_DOMAIN_SEPARATOR,
+        &[
+            CanonicalField::VarBytes(did.as_bytes()),
+            CanonicalField::VarBytes(signing_key_id.as_fragment().as_bytes()),
+            CanonicalField::Fixed32(&challenge.nonce),
+            CanonicalField::VarBytes(challenge.audience.as_bytes()),
+            CanonicalField::U64(signed_at),
+        ],
+    );
+
+    // Sign via KeyCustody.
+    let signature = custody
+        .sign(signing_key, &hash)
+        .await
+        .map_err(|e| ScpIdError::SigningFailed(e.to_string()))?;
+
+    // Convert to [u8; 64].
+    let sig_bytes: [u8; 64] = signature.into_bytes().try_into().map_err(|v: Vec<u8>| {
+        ScpIdError::SigningFailed(format!(
+            "expected 64-byte Ed25519 signature, got {} bytes",
+            v.len()
+        ))
+    })?;
+
+    Ok(ScpIdResponse {
+        protocol: SCPID_PROTOCOL_VERSION.to_owned(),
+        did: did.to_owned(),
+        signing_key_id,
+        nonce: challenge.nonce,
+        audience: challenge.audience.clone(),
+        signed_at,
+        signature: sig_bytes,
     })
 }
 
@@ -517,7 +617,7 @@ mod tests {
         let signed_at: u64 = 1_709_654_400_000;
 
         let hash = canonical_hash(
-            "SCP-DID-AUTH-V1:",
+            SCPID_DOMAIN_SEPARATOR,
             &[
                 CanonicalField::VarBytes(did.as_bytes()),
                 CanonicalField::VarBytes(signing_key_id.as_fragment().as_bytes()),
@@ -541,6 +641,152 @@ mod tests {
         assert_eq!(
             hex::encode(hash),
             "7552b8e3b0e1654593e956c1429d479eda0524bc6cdc863b142d5909471b57e0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // scpid_sign tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_scpid_sign_roundtrip() {
+        use ed25519_dalek::Verifier;
+        use scp_platform::KeyType;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&handle).await.unwrap();
+
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+
+        let response = scpid_sign(
+            &custody,
+            &handle,
+            "did:dht:z6MkTest",
+            SigningKeyId::Active,
+            &challenge,
+        )
+        .await
+        .unwrap();
+
+        // Verify all fields are populated correctly.
+        assert_eq!(response.protocol, SCPID_PROTOCOL_VERSION);
+        assert_eq!(response.did, "did:dht:z6MkTest");
+        assert_eq!(response.signing_key_id, SigningKeyId::Active);
+        assert_eq!(response.nonce, challenge.nonce);
+        assert_eq!(response.audience, "https://example.com");
+        assert!(response.signed_at >= challenge.issued_at);
+        assert!(response.signed_at <= challenge.expires_at);
+
+        // Manually recompute the canonical hash and verify the signature.
+        let hash = canonical_hash(
+            SCPID_DOMAIN_SEPARATOR,
+            &[
+                CanonicalField::VarBytes(b"did:dht:z6MkTest"),
+                CanonicalField::VarBytes(SigningKeyId::Active.as_fragment().as_bytes()),
+                CanonicalField::Fixed32(&response.nonce),
+                CanonicalField::VarBytes(b"https://example.com"),
+                CanonicalField::U64(response.signed_at),
+            ],
+        );
+
+        let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&response.signature);
+        verifying_key
+            .verify(&hash, &signature)
+            .expect("signature should verify against recomputed canonical hash");
+    }
+
+    #[tokio::test]
+    async fn test_scpid_sign_with_agent_key() {
+        use ed25519_dalek::Verifier;
+        use scp_platform::KeyType;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&handle).await.unwrap();
+
+        let challenge =
+            scpid_challenge("https://agent-service.example.com", Duration::from_secs(60)).unwrap();
+
+        let response = scpid_sign(
+            &custody,
+            &handle,
+            "did:dht:z6MkAgent",
+            SigningKeyId::Agent,
+            &challenge,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.signing_key_id, SigningKeyId::Agent);
+        assert_eq!(response.did, "did:dht:z6MkAgent");
+
+        // Verify the signature with #agent fragment in the hash.
+        let hash = canonical_hash(
+            SCPID_DOMAIN_SEPARATOR,
+            &[
+                CanonicalField::VarBytes(b"did:dht:z6MkAgent"),
+                CanonicalField::VarBytes(SigningKeyId::Agent.as_fragment().as_bytes()),
+                CanonicalField::Fixed32(&response.nonce),
+                CanonicalField::VarBytes(b"https://agent-service.example.com"),
+                CanonicalField::U64(response.signed_at),
+            ],
+        );
+
+        let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&response.signature);
+        verifying_key
+            .verify(&hash, &signature)
+            .expect("agent-signed response should verify");
+    }
+
+    #[tokio::test]
+    async fn test_scpid_sign_expired_challenge() {
+        use scp_platform::KeyType;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Create a challenge with 1ms TTL.
+        let challenge = scpid_challenge("https://example.com", Duration::from_millis(1)).unwrap();
+
+        // Sleep long enough for the challenge to expire.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let result = scpid_sign(
+            &custody,
+            &handle,
+            "did:dht:z6MkTest",
+            SigningKeyId::Active,
+            &challenge,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ScpIdError::ChallengeExpired)),
+            "expected ChallengeExpired, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_sign_empty_did_rejected() {
+        use scp_platform::KeyType;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(60)).unwrap();
+
+        let result = scpid_sign(&custody, &handle, "", SigningKeyId::Active, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("DID must not be empty")),
+            "expected InvalidInput with empty DID message, got: {result:?}"
         );
     }
 }
