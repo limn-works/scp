@@ -498,11 +498,13 @@ class TestBroadcast:
         _scp_core.py_broadcast_subscribe(handle, bob.did)
         assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
 
-        # Block bob.
+        # Block bob from alice's author keys. Per-author blocking does NOT
+        # remove from the context-wide subscriber roster (spec §5.14.8),
+        # so is_subscriber remains True.
         _scp_core.py_broadcast_block_subscriber(handle, bob.did, alice.did)
-        assert not _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
 
-        # Unblock bob — subscriber status should be restored.
+        # Unblock bob — subscriber status unchanged (was never removed).
         _scp_core.py_broadcast_unblock_subscriber(handle, bob.did, alice.did)
         assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
 

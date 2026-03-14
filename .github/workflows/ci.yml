@@ -298,6 +298,9 @@ jobs:
       run:
         working-directory: bindings/kotlin
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
@@ -317,7 +320,7 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v4
         with:
