@@ -999,6 +999,32 @@ export function createWasmBridge(): Bridge {
       return token;
     },
 
+    // Trust Aggregation -- not available in WASM, delegates to WASM (throws)
+    async aggregateTrustInput(
+      contextId: string,
+      subjectDid: string,
+      eventsJson: string,
+      merkleRootJson: string,
+      consequenceRulesJson: string,
+      thresholdRequirementsJson: string,
+      attestorSetsJson: string,
+      cachedAttestationsJson: string,
+      challengeResultsJson: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return wasm.aggregate_trust_input(
+        contextId,
+        subjectDid,
+        eventsJson,
+        merkleRootJson,
+        consequenceRulesJson,
+        thresholdRequirementsJson,
+        attestorSetsJson,
+        cachedAttestationsJson,
+        challengeResultsJson,
+      ) as Promise<string>;
+    },
+
     // Event Log -- delegates to WASM-local Merkle tree
     async eventLogQuery(
       handle: BridgeContextHandle,

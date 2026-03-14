@@ -211,6 +211,19 @@ export interface Bridge {
     capabilities: readonly string[],
   ): Promise<UcanToken>;
 
+  // Trust Aggregation
+  aggregateTrustInput(
+    contextId: string,
+    subjectDid: string,
+    eventsJson: string,
+    merkleRootJson: string,
+    consequenceRulesJson: string,
+    thresholdRequirementsJson: string,
+    attestorSetsJson: string,
+    cachedAttestationsJson: string,
+    challengeResultsJson: string,
+  ): Promise<string>;
+
   // Event Log
   eventLogQuery(
     handle: BridgeContextHandle,

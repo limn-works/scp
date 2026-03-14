@@ -697,6 +697,43 @@ export function createNativeBridge(): Bridge {
       )(handle, delegatorDid, delegateeDid, parentToken, capabilities);
     },
 
+    // Trust Aggregation
+    async aggregateTrustInput(
+      contextId: string,
+      subjectDid: string,
+      eventsJson: string,
+      merkleRootJson: string,
+      consequenceRulesJson: string,
+      thresholdRequirementsJson: string,
+      attestorSetsJson: string,
+      cachedAttestationsJson: string,
+      challengeResultsJson: string,
+    ): Promise<string> {
+      return (
+        addon.aggregateTrustInput as (
+          contextId: string,
+          subjectDid: string,
+          eventsJson: string,
+          merkleRootJson: string,
+          consequenceRulesJson: string,
+          thresholdRequirementsJson: string,
+          attestorSetsJson: string,
+          cachedAttestationsJson: string,
+          challengeResultsJson: string,
+        ) => string
+      )(
+        contextId,
+        subjectDid,
+        eventsJson,
+        merkleRootJson,
+        consequenceRulesJson,
+        thresholdRequirementsJson,
+        attestorSetsJson,
+        cachedAttestationsJson,
+        challengeResultsJson,
+      );
+    },
+
     // Event Log
     async eventLogQuery(
       handle: BridgeContextHandle,

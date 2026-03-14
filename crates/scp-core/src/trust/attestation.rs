@@ -290,7 +290,7 @@ pub struct ThresholdResult {
 /// Callers provide this for each attestor in the set so that
 /// [`check_threshold_attestation`] can evaluate shared context memberships
 /// and mutual endorsements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestorInfo {
     /// The DID of the attestor.
     pub did: DID,

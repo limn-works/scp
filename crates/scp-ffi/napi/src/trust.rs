@@ -7,10 +7,13 @@
 //!   validity.
 //! - [`trust_create_challenge`] — Create a challenge request.
 //! - [`trust_verify_response`] — Verify a challenge response.
+//! - [`aggregate_trust_input`] — Aggregate all trust engine layers into a
+//!   single `TrustInput` for agent-level evaluation.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
+use scp_core::trust::aggregate::TrustProtocolRepository;
 
 use crate::error::ScpNapiError;
 
@@ -229,6 +232,247 @@ pub fn verify_participation_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// aggregate_trust_input (§7.3)
+// ---------------------------------------------------------------------------
+
+/// Aggregates all trust engine layers into a single `TrustInput` for
+/// agent-level evaluation.
+///
+/// Accepts all complex inputs as JSON strings. Returns the aggregated
+/// `TrustInput` as a JSON string.
+///
+/// See ADR-017 acceptance criterion 9, spec §7.3.
+#[napi]
+#[allow(clippy::too_many_arguments)]
+pub fn aggregate_trust_input(
+    context_id: String,
+    subject_did: String,
+    events_json: String,
+    merkle_root_json: String,
+    consequence_rules_json: String,
+    threshold_requirements_json: String,
+    attestor_sets_json: String,
+    cached_attestations_json: String,
+    challenge_results_json: String,
+) -> napi::Result<String> {
+    if context_id.is_empty() {
+        return Err(validation_error("context_id must not be empty"));
+    }
+    if subject_did.is_empty() {
+        return Err(validation_error("subject DID must not be empty"));
+    }
+
+    let events: Vec<scp_event_log::Event> = serde_json::from_str(&events_json)
+        .map_err(|e| validation_error(&format!("failed to parse events JSON: {e}")))?;
+
+    let merkle_root_vec: Vec<u8> = serde_json::from_str(&merkle_root_json)
+        .map_err(|e| validation_error(&format!("failed to parse merkle_root JSON: {e}")))?;
+    let merkle_root: [u8; 32] = merkle_root_vec.try_into().map_err(|v: Vec<u8>| {
+        validation_error(&format!(
+            "merkle_root must be exactly 32 bytes, got {}",
+            v.len()
+        ))
+    })?;
+
+    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
+        serde_json::from_str(&consequence_rules_json).map_err(|e| {
+            validation_error(&format!("failed to parse consequence_rules JSON: {e}"))
+        })?;
+
+    let threshold_requirements: std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    > = serde_json::from_str(&threshold_requirements_json).map_err(|e| {
+        validation_error(&format!("failed to parse threshold_requirements JSON: {e}"))
+    })?;
+
+    let attestor_sets: std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    > = serde_json::from_str(&attestor_sets_json)
+        .map_err(|e| validation_error(&format!("failed to parse attestor_sets JSON: {e}")))?;
+
+    let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+        serde_json::from_str(&cached_attestations_json).map_err(|e| {
+            validation_error(&format!("failed to parse cached_attestations JSON: {e}"))
+        })?;
+
+    let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(&challenge_results_json).map_err(|e| {
+            validation_error(&format!("failed to parse challenge_results JSON: {e}"))
+        })?;
+
+    let store = InMemoryFfiTrustStore::new();
+    for ca in cached_attestations {
+        store
+            .cache_attestation(&context_id, ca)
+            .map_err(|e| validation_error(&format!("failed to cache attestation: {e}")))?;
+    }
+    for cr in &challenge_results {
+        store
+            .store_challenge_result(&context_id, cr)
+            .map_err(|e| validation_error(&format!("failed to store challenge result: {e}")))?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id: &context_id,
+        subject_did: &subject_did,
+        events: &events,
+        merkle_root,
+        consequence_rules: &consequence_rules,
+        threshold_requirements: &threshold_requirements,
+        attestor_sets: &attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx)
+        .map_err(|e| validation_error(&format!("trust aggregation failed: {e}")))?;
+
+    serde_json::to_string(&trust_input)
+        .map_err(|e| validation_error(&format!("failed to serialize TrustInput: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryFfiTrustStore — concrete TrustProtocolRepository for FFI
+// ---------------------------------------------------------------------------
+
+struct InMemoryFfiTrustStore {
+    attestations: std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            Vec<scp_core::trust::aggregate::CachedAttestation>,
+        >,
+    >,
+    revocations: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, bool>>,
+    >,
+    challenges: std::sync::Mutex<
+        std::collections::HashMap<(String, String), Vec<scp_core::trust::ChallengeVerification>>,
+    >,
+}
+
+impl InMemoryFfiTrustStore {
+    fn new() -> Self {
+        Self {
+            attestations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            revocations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl TrustProtocolRepository for InMemoryFfiTrustStore {
+    fn get_cached_attestations(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+    ) -> Result<Vec<scp_core::trust::aggregate::CachedAttestation>, scp_core::trust::TrustError>
+    {
+        let store = self.attestations.lock().map_err(|_| {
+            scp_core::trust::TrustError::InvalidEventData {
+                sequence: 0,
+                reason: "lock poisoned".to_owned(),
+            }
+        })?;
+        let key = (context_id.to_owned(), subject_did.to_owned());
+        Ok(store.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn cache_attestation(
+        &self,
+        context_id: &str,
+        entry: scp_core::trust::aggregate::CachedAttestation,
+    ) -> Result<(), scp_core::trust::TrustError> {
+        let mut store = self.attestations.lock().map_err(|_| {
+            scp_core::trust::TrustError::InvalidEventData {
+                sequence: 0,
+                reason: "lock poisoned".to_owned(),
+            }
+        })?;
+        let key = (context_id.to_owned(), entry.attestation.subject.to_string());
+        let entries = store.entry(key).or_default();
+        if let Some(pos) = entries
+            .iter()
+            .position(|e| e.attestation.id == entry.attestation.id)
+        {
+            entries[pos] = entry;
+        } else {
+            entries.push(entry);
+        }
+        Ok(())
+    }
+
+    fn get_revocation_state(
+        &self,
+        context_id: &str,
+    ) -> Result<std::collections::HashMap<String, bool>, scp_core::trust::TrustError> {
+        let store =
+            self.revocations
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        Ok(store.get(context_id).cloned().unwrap_or_default())
+    }
+
+    fn set_revocation_state(
+        &self,
+        context_id: &str,
+        state: &std::collections::HashMap<String, bool>,
+    ) -> Result<(), scp_core::trust::TrustError> {
+        let mut store =
+            self.revocations
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        store.insert(context_id.to_owned(), state.clone());
+        Ok(())
+    }
+
+    fn get_challenge_results(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+    ) -> Result<Vec<scp_core::trust::ChallengeVerification>, scp_core::trust::TrustError> {
+        let store =
+            self.challenges
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        let key = (context_id.to_owned(), subject_did.to_owned());
+        Ok(store.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn store_challenge_result(
+        &self,
+        context_id: &str,
+        result: &scp_core::trust::ChallengeVerification,
+    ) -> Result<(), scp_core::trust::TrustError> {
+        let mut store =
+            self.challenges
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        let key = (context_id.to_owned(), result.subject_did.to_string());
+        store.entry(key).or_default().push(result.clone());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -302,5 +546,37 @@ mod tests {
         let result = verify_participation_requirements("[]".to_owned(), "[]".to_owned());
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_context() {
+        let result = aggregate_trust_input(
+            String::new(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_events_json() {
+        let result = aggregate_trust_input(
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "not json".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
     }
 }

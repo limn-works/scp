@@ -6454,6 +6454,283 @@ pub fn verify_participation_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// aggregate_trust_input (§7.3)
+// ---------------------------------------------------------------------------
+
+/// Aggregates all trust engine layers into a single `TrustInput` for
+/// agent-level evaluation.
+///
+/// Accepts all complex inputs as JSON strings. Returns the aggregated
+/// `TrustInput` as a JSON string. Uses concrete implementations for the
+/// generic trait bounds: `InMemoryFfiTrustStore` for `TrustProtocolRepository`,
+/// `IdentityDidPublicKeyResolver` for `DidPublicKeyResolver`, and `SystemClock`
+/// for `Clock`.
+///
+/// See ADR-017 acceptance criterion 9, spec §7.3.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn aggregate_trust_input(
+    context_id: String,
+    subject_did: String,
+    events_json: String,
+    merkle_root_json: String,
+    consequence_rules_json: String,
+    threshold_requirements_json: String,
+    attestor_sets_json: String,
+    cached_attestations_json: String,
+    challenge_results_json: String,
+) -> Result<String, ScpError> {
+    use scp_core::trust::aggregate::TrustProtocolRepository;
+
+    if context_id.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "context_id must not be empty".to_owned(),
+            code: "SCP-VALID-7040".to_owned(),
+        });
+    }
+    if subject_did.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "subject DID must not be empty".to_owned(),
+            code: "SCP-VALID-7041".to_owned(),
+        });
+    }
+
+    let events: Vec<scp_event_log::Event> =
+        serde_json::from_str(&events_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse events JSON: {e}"),
+            code: "SCP-VALID-7042".to_owned(),
+        })?;
+
+    let merkle_root_vec: Vec<u8> =
+        serde_json::from_str(&merkle_root_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse merkle_root JSON: {e}"),
+            code: "SCP-VALID-7043".to_owned(),
+        })?;
+    let merkle_root: [u8; 32] =
+        merkle_root_vec
+            .try_into()
+            .map_err(|v: Vec<u8>| ScpError::Validation {
+                msg: format!("merkle_root must be exactly 32 bytes, got {}", v.len()),
+                code: "SCP-VALID-7044".to_owned(),
+            })?;
+
+    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
+        serde_json::from_str(&consequence_rules_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse consequence_rules JSON: {e}"),
+            code: "SCP-VALID-7045".to_owned(),
+        })?;
+
+    let threshold_requirements: std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    > = serde_json::from_str(&threshold_requirements_json).map_err(|e| ScpError::Validation {
+        msg: format!("failed to parse threshold_requirements JSON: {e}"),
+        code: "SCP-VALID-7046".to_owned(),
+    })?;
+
+    let attestor_sets: std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    > = serde_json::from_str(&attestor_sets_json).map_err(|e| ScpError::Validation {
+        msg: format!("failed to parse attestor_sets JSON: {e}"),
+        code: "SCP-VALID-7047".to_owned(),
+    })?;
+
+    let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+        serde_json::from_str(&cached_attestations_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse cached_attestations JSON: {e}"),
+            code: "SCP-VALID-7048".to_owned(),
+        })?;
+
+    let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(&challenge_results_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse challenge_results JSON: {e}"),
+            code: "SCP-VALID-7049".to_owned(),
+        })?;
+
+    let store = InMemoryFfiTrustStore::new();
+    for ca in cached_attestations {
+        store
+            .cache_attestation(&context_id, ca)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to cache attestation: {e}"),
+                code: "SCP-VALID-7050".to_owned(),
+            })?;
+    }
+    for cr in &challenge_results {
+        store
+            .store_challenge_result(&context_id, cr)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to store challenge result: {e}"),
+                code: "SCP-VALID-7051".to_owned(),
+            })?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id: &context_id,
+        subject_did: &subject_did,
+        events: &events,
+        merkle_root,
+        consequence_rules: &consequence_rules,
+        threshold_requirements: &threshold_requirements,
+        attestor_sets: &attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx).map_err(|e| {
+        ScpError::Validation {
+            msg: format!("trust aggregation failed: {e}"),
+            code: "SCP-VALID-7052".to_owned(),
+        }
+    })?;
+
+    serde_json::to_string(&trust_input).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize TrustInput: {e}"),
+        code: "SCP-VALID-7053".to_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryFfiTrustStore — concrete TrustProtocolRepository for UniFFI bridge
+// ---------------------------------------------------------------------------
+
+struct InMemoryFfiTrustStore {
+    attestations: std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            Vec<scp_core::trust::aggregate::CachedAttestation>,
+        >,
+    >,
+    revocations: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, bool>>,
+    >,
+    challenges: std::sync::Mutex<
+        std::collections::HashMap<(String, String), Vec<scp_core::trust::ChallengeVerification>>,
+    >,
+}
+
+impl InMemoryFfiTrustStore {
+    fn new() -> Self {
+        Self {
+            attestations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            revocations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl scp_core::trust::aggregate::TrustProtocolRepository for InMemoryFfiTrustStore {
+    fn get_cached_attestations(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+    ) -> Result<Vec<scp_core::trust::aggregate::CachedAttestation>, scp_core::trust::TrustError>
+    {
+        let store = self.attestations.lock().map_err(|_| {
+            scp_core::trust::TrustError::InvalidEventData {
+                sequence: 0,
+                reason: "lock poisoned".to_owned(),
+            }
+        })?;
+        let key = (context_id.to_owned(), subject_did.to_owned());
+        Ok(store.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn cache_attestation(
+        &self,
+        context_id: &str,
+        entry: scp_core::trust::aggregate::CachedAttestation,
+    ) -> Result<(), scp_core::trust::TrustError> {
+        let mut store = self.attestations.lock().map_err(|_| {
+            scp_core::trust::TrustError::InvalidEventData {
+                sequence: 0,
+                reason: "lock poisoned".to_owned(),
+            }
+        })?;
+        let key = (context_id.to_owned(), entry.attestation.subject.to_string());
+        let entries = store.entry(key).or_default();
+        if let Some(pos) = entries
+            .iter()
+            .position(|e| e.attestation.id == entry.attestation.id)
+        {
+            entries[pos] = entry;
+        } else {
+            entries.push(entry);
+        }
+        Ok(())
+    }
+
+    fn get_revocation_state(
+        &self,
+        context_id: &str,
+    ) -> Result<std::collections::HashMap<String, bool>, scp_core::trust::TrustError> {
+        let store =
+            self.revocations
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        Ok(store.get(context_id).cloned().unwrap_or_default())
+    }
+
+    fn set_revocation_state(
+        &self,
+        context_id: &str,
+        state: &std::collections::HashMap<String, bool>,
+    ) -> Result<(), scp_core::trust::TrustError> {
+        let mut store =
+            self.revocations
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        store.insert(context_id.to_owned(), state.clone());
+        Ok(())
+    }
+
+    fn get_challenge_results(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+    ) -> Result<Vec<scp_core::trust::ChallengeVerification>, scp_core::trust::TrustError> {
+        let store =
+            self.challenges
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        let key = (context_id.to_owned(), subject_did.to_owned());
+        Ok(store.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn store_challenge_result(
+        &self,
+        context_id: &str,
+        result: &scp_core::trust::ChallengeVerification,
+    ) -> Result<(), scp_core::trust::TrustError> {
+        let mut store =
+            self.challenges
+                .lock()
+                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+        let key = (context_id.to_owned(), result.subject_did.to_string());
+        store.entry(key).or_default().push(result.clone());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Economic policy bridge (§19.3, ADR-033)
 // ---------------------------------------------------------------------------
 
