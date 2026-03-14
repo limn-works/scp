@@ -31,6 +31,10 @@ use _scp_core::runtime::{self, IdentityEntry};
 static INIT: Once = Once::new();
 
 /// Ensures the Python interpreter, tokio runtime, and `ContextManager` are initialized.
+///
+/// Uses `init_context_manager_for_test()` which wires `LocalTransportProvider`
+/// so that `publish_context` succeeds without warning noise
+/// (`NotConfiguredTransportProvider` would log warnings on best-effort publish).
 fn setup() {
     INIT.call_once(|| {
         pyo3::prepare_freethreaded_python();
@@ -38,7 +42,9 @@ fn setup() {
         // like py_event_log_query when storage is available.
         _scp_core::init_runtime().unwrap();
     });
-    runtime::init_context_manager();
+    // Uses LocalTransportProvider so publish_context succeeds without warning
+    // noise (NotConfiguredTransportProvider logs warnings on best-effort publish).
+    runtime::init_context_manager_for_test();
 }
 
 /// Creates a tokio runtime for async operations in tests.
@@ -257,6 +263,61 @@ fn multiple_contexts_independent() {
     let ctx1 = create_test_context(&did);
     let ctx2 = create_test_context(&did);
     assert_ne!(ctx1, ctx2);
+}
+
+// ============================================================================
+// Context creation → MLS group verification (issue #501 AC)
+// ============================================================================
+
+/// Verifies that creating a context through the bridge establishes the
+/// context in the `ContextManager` with a valid group (the creator is a
+/// member and crypto provider's `create_mls_group` was called successfully).
+///
+/// This is the acceptance criterion from issue #501: "create context through
+/// bridge → verify MLS group exists." The bridge uses `NoOpCryptoProvider`
+/// whose `create_mls_group` succeeds (real `MlsCryptoProvider` integration
+/// is a separate concern). The test verifies the full bridge path:
+/// identity creation → context creation → `ContextManager` state is populated.
+#[test]
+fn context_create_establishes_mls_group() {
+    let did = create_test_identity();
+    let ctx_id = create_test_context(&did);
+
+    let rt = test_runtime();
+    let mgr = runtime::context_manager().unwrap().clone();
+
+    // The ContextManager should have the context with the creator as a member.
+    // This confirms that the full creation flow ran (including the crypto
+    // provider's create_mls_group call which must succeed for create_context
+    // to return Ok).
+    let member_count = rt.block_on(mgr.member_count(&ctx_id));
+    assert_eq!(
+        member_count,
+        Some(1),
+        "Context should have exactly 1 member (the creator) after creation"
+    );
+
+    // Verify the creator is registered as a member.
+    assert!(
+        rt.block_on(mgr.is_member(&ctx_id, &did)),
+        "Creator DID should be a member of the context"
+    );
+
+    // Verify role state exists (populated during creation).
+    let role_state = rt.block_on(mgr.get_role_state(&ctx_id));
+    assert!(
+        role_state.is_some(),
+        "Context should have role state after creation"
+    );
+
+    // Verify the creator has admin role (context creator gets admin).
+    let role = rt.block_on(mgr.member_role(&ctx_id, &did));
+    assert!(role.is_some(), "Creator should have a role assignment");
+    let role_str = format!("{:?}", role.unwrap());
+    assert!(
+        role_str.to_lowercase().contains("admin"),
+        "Creator should be admin, got: {role_str}"
+    );
 }
 
 // ============================================================================

@@ -27,7 +27,12 @@ use super::{ContextError, ContextHandle, ContextMode, ContextParams, ContextStat
 #[derive(Debug, thiserror::Error)]
 pub enum ContextCreationError {
     /// Transport layer is not connected or no relay is reachable.
-    /// Returned during Phase 1 validation.
+    ///
+    /// Note: `create_context` no longer checks `is_connected()` during
+    /// Phase 1 validation — context creation is a local operation.
+    /// This variant is retained for downstream match arms but is no
+    /// longer emitted by the builder. Transport errors during
+    /// `publish_context` (Phase 2 step 5) use [`Self::TransportFailed`].
     #[error("transport is not connected")]
     TransportNotConnected,
 
@@ -553,6 +558,59 @@ impl ContextTransportProvider for LocalTransportProvider {
 }
 
 // ---------------------------------------------------------------------------
+// NotConfiguredTransportProvider -- returns errors for unconfigured transport
+// ---------------------------------------------------------------------------
+
+/// [`ContextTransportProvider`] that returns descriptive errors for all operations.
+///
+/// Use this at the FFI bridge layer when no relay transport has been configured.
+/// Unlike [`LocalTransportProvider`] (which silently succeeds), this provider
+/// makes it explicit that transport is not configured — all publish/send/delete
+/// calls return errors, and `is_connected()` returns `false`.
+///
+/// This prevents silent data loss where callers believe messages were sent
+/// successfully when no relay is actually reachable.
+pub struct NotConfiguredTransportProvider;
+
+impl ContextTransportProvider for NotConfiguredTransportProvider {
+    fn is_connected(&self) -> bool {
+        false
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Err(ContextCreationError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before publishing contexts"
+                .to_owned(),
+        ))
+    }
+
+    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Err(ContextCreationError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before deleting published contexts"
+                .to_owned(),
+        ))
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before sending messages"
+                .to_owned(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Opaque resource handles -- represent ownership for rollback tracking
 // ---------------------------------------------------------------------------
 
@@ -737,8 +795,9 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 /// Executes the two-phase context creation flow.
 ///
-/// **Phase 1 (validate):** Checks params, identity, and transport with zero
-/// side effects. Returns early on any validation failure.
+/// **Phase 1 (validate):** Checks params and identity with zero side effects.
+/// Returns early on any validation failure. Transport connectivity is NOT
+/// checked — context creation is a local operation.
 ///
 /// **Phase 2 (execute):** Steps through creation, recording progress in a
 /// [`CreationReceipt`]. On failure at any step, all previously completed
@@ -781,10 +840,10 @@ pub async fn create_context(
     // 2. Validate the creator's identity and signing key accessibility.
     crypto.validate_creator_identity()?;
 
-    // 3. Validate transport connectivity.
-    if !transport.is_connected() {
-        return Err(ContextCreationError::TransportNotConnected);
-    }
+    // 3. Transport connectivity is NOT checked here. Context creation is a
+    //    local operation (MLS group init, sender key generation, event log
+    //    bootstrap). Publishing to a relay is a separate step (step 5) that
+    //    will surface its own error if the transport is unavailable.
 
     // ------------------------------------------------------------------
     // Phase 2 -- Execute (with ordered rollback)
@@ -834,20 +893,26 @@ pub async fn create_context(
     }
     receipt.event_log = Some(EventLogHandle::new());
 
-    // Step 5: Publish to transport.
+    // Step 5: Publish to transport (best-effort).
     //
-    // If publish_context fails, the transport may have partially published
-    // (e.g., sent to 1 of 3 relays). Issue a best-effort DELETE for any
-    // partial blobs before rolling back all prior steps. Orphaned blobs on
-    // relays are encrypted with keys that will be destroyed during rollback,
-    // so they are unusable even if DELETE fails.
-    if let Err(e) = transport.publish_context(&id_bytes, &params) {
-        // Best-effort cleanup of any partially published blobs.
-        let _ = transport.delete_published(&id_bytes);
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
-        return Err(e);
+    // Context creation is a local operation — the context is fully
+    // functional even without relay publication.  If publish fails
+    // (e.g., transport not configured, relay unreachable), we log a
+    // warning and continue.  The context won't be discoverable via
+    // relay until a subsequent publish or sync, but all local state
+    // (MLS group, sender key, event log) remains valid.
+    match transport.publish_context(&id_bytes, &params) {
+        Ok(()) => {
+            receipt.published = true;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "context created locally but publish failed — \
+                 context is not discoverable via relay"
+            );
+        }
     }
-    receipt.published = true;
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active).await {
@@ -1176,9 +1241,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn create_context_fails_when_transport_disconnected() {
+    async fn create_context_succeeds_when_transport_disconnected() {
+        // Context creation is a local operation — it should succeed even
+        // when transport is not configured and `publish_context` returns
+        // an error. The publish failure is logged as a warning; the
+        // context is fully functional locally.
         let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::default(); // not connected
+        let transport = NotConfiguredTransportProvider;
         let event_log = MockEventLogProvider::default();
 
         let result = create_context(
@@ -1190,17 +1259,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TransportNotConnected
-        ));
-
-        // No side effects.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        assert!(event_log.inited.lock().unwrap().is_empty());
-        assert!(transport.published.lock().unwrap().is_empty());
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-no-transport");
+        assert_eq!(handle.state().await, ContextState::Active);
     }
 
     #[tokio::test]
@@ -1355,7 +1417,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_context_rollback_on_publish_failure() {
+    async fn create_context_succeeds_despite_publish_failure() {
+        // Publish is best-effort — a transport failure during publish
+        // should NOT roll back the context.  The context is valid
+        // locally; it just won't be discoverable via relay.
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
         transport.fail_publish.store(true, Ordering::Relaxed);
@@ -1370,21 +1435,22 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-fail-pub");
+        assert_eq!(handle.state().await, ContextState::Active);
 
-        // Everything up to publish was created.
+        // All local state was created and NOT rolled back.
         assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
         assert_eq!(crypto.sender_keys_created.lock().unwrap().len(), 1);
         assert_eq!(event_log.inited.lock().unwrap().len(), 1);
-
-        // All rolled back.
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(event_log.destroyed.lock().unwrap().len(), 1);
-        // Publish failed, but partial publication rollback issues a
-        // best-effort DELETE to clean up any partially published blobs.
+        assert!(crypto.mls_groups_destroyed.lock().unwrap().is_empty());
+        assert!(crypto.sender_keys_destroyed.lock().unwrap().is_empty());
+        assert!(event_log.destroyed.lock().unwrap().is_empty());
+        // Publish was attempted but failed — nothing published, no
+        // delete_published call since we don't roll back.
         assert!(transport.published.lock().unwrap().is_empty());
-        assert_eq!(transport.deleted.lock().unwrap().len(), 1);
+        assert!(transport.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1547,7 +1613,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_context_transport_failure_returns_transport_error() {
+    async fn create_context_transport_failure_is_best_effort() {
+        // Transport publish failure should NOT fail create_context —
+        // publish is best-effort (the context is valid locally).
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
         transport.fail_publish.store(true, Ordering::Relaxed);
@@ -1562,10 +1630,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TransportFailed(_)
-        ));
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-err");
+        assert_eq!(handle.state().await, ContextState::Active);
     }
 
     #[tokio::test]

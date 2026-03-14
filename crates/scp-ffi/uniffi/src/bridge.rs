@@ -2294,8 +2294,11 @@ pub async fn context_create(
             // Convert bridge ContextParams to scp-core ContextParams.
             let core_params = bridge_params_to_core(&params);
 
+            // Initialize the ContextManager if not already done (first context_create call).
+            crate::runtime::init_context_manager();
+
             // Delegate to the shared ContextManager.
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let _core_handle = manager
                 .create_context(context_id.clone(), core_params, identity.did.clone().into())
                 .await
@@ -2419,7 +2422,7 @@ pub async fn context_join(
             // This ephemeral ContextHandle carries default params — the
             // ContextManager ignores them, performing version compatibility
             // checks against the stored context's params instead.
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -2480,7 +2483,7 @@ pub async fn context_leave(
             drop(state);
 
             // Delegate to the shared ContextManager.
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -2542,7 +2545,7 @@ pub async fn context_close(
             }
 
             // Delegate to the shared ContextManager.
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -2724,7 +2727,7 @@ pub async fn context_send(
 
             // Delegate to the shared ContextManager for message delivery
             // through the transport provider.
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -4798,7 +4801,7 @@ pub async fn governance_execute(
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
             let action_name = proposal.action.variant_name();
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let result = manager
                 .execute_governance_action(&context_id, &proposal)
                 .await
@@ -4954,7 +4957,7 @@ pub async fn governance_propose(
                 serde_json::from_str(&action_json)?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let outcome = manager
                 .propose_governance_action_checked(&context_id, &did, action, &signing_key)
                 .await
@@ -5007,7 +5010,7 @@ pub async fn governance_approve(
     let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let status = manager
                 .approve_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
                 .await
@@ -5052,7 +5055,7 @@ pub async fn governance_reject(
     let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let status = manager
                 .reject_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
                 .await
@@ -5097,7 +5100,7 @@ pub async fn governance_withdraw(
     let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let status = manager
                 .withdraw_governance_vote(&context_id, &proposal_id, &did)
                 .await
@@ -5137,7 +5140,7 @@ pub async fn governance_get_proposal(
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let proposal = manager
                 .get_proposal(&context_id, &proposal_id)
                 .await
@@ -5168,7 +5171,7 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let proposals = manager
                 .list_proposals(&context_id)
                 .await
@@ -5206,7 +5209,7 @@ pub async fn broadcast_subscribe(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let did: scp_identity::DID = subscriber_did.into();
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5248,7 +5251,7 @@ pub async fn broadcast_unsubscribe(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let did: scp_identity::DID = subscriber_did.into();
             manager
                 .unsubscribe_broadcast(&handle.context_id, &did, rotate_keys)
@@ -5289,7 +5292,7 @@ pub async fn broadcast_publish(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let did: scp_identity::DID = identity.did.clone().into();
 
             let core_id = identity
@@ -5374,7 +5377,7 @@ pub async fn broadcast_block_subscriber(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let subscriber: scp_identity::DID = subscriber_did.into();
             let blocker: scp_identity::DID = blocker_did.into();
             manager
@@ -5408,7 +5411,7 @@ pub async fn broadcast_unblock_subscriber(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let subscriber: scp_identity::DID = subscriber_did.into();
             let unblocker: scp_identity::DID = unblocker_did.into();
             manager
@@ -5440,7 +5443,7 @@ pub async fn broadcast_handle_key_request(
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let author: scp_identity::DID = author_did.into();
             let requester: scp_identity::DID = requester_did.into();
             let decision = manager
@@ -5461,7 +5464,7 @@ pub async fn broadcast_handle_key_request(
 /// Returns `None` if the context is not registered or not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
@@ -5471,7 +5474,7 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
 /// Returns `true` if the given DID is a broadcast subscriber.
 #[uniffi::export]
 pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager
         .is_broadcast_subscriber(&handle.context_id, &did)
         .await
@@ -5483,7 +5486,7 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
 /// Returns `None` if the context is not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -5499,7 +5502,7 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 /// Returns `None` if the context is not registered.
 #[uniffi::export]
 pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager
         .member_count(&handle.context_id)
         .await
@@ -5509,14 +5512,14 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
 /// Returns `true` if the given DID is a member of the context.
 #[uniffi::export]
 pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager.is_member(&handle.context_id, &did).await
 }
 
 /// Returns all member DIDs for a context.
 #[uniffi::export]
 pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager.member_dids(&handle.context_id).await
 }
 
@@ -5525,7 +5528,7 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
 /// Returns `None` if the member is not found or the context is not registered.
 #[uniffi::export]
 pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager
         .member_role(&handle.context_id, &did)
         .await
@@ -5542,7 +5545,7 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
 /// if the context is not registered.
 #[uniffi::export]
 pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager
         .drain_events(&handle.context_id)
         .await
@@ -5567,7 +5570,7 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
 pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -5609,7 +5612,7 @@ pub async fn context_propose_ttl_extension(
 ) -> Result<bool, ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let did: scp_identity::DID = member_did.into();
             let duration = std::time::Duration::from_secs(proposed_seconds);
             manager
@@ -5629,7 +5632,7 @@ pub async fn context_propose_ttl_extension(
 /// Cancels the old timer and spawns a new one with the given duration.
 #[uniffi::export]
 pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     let core_handle = scp_core::context::ContextHandle::new(
         handle.context_id.clone(),
         scp_core::context::ContextParams::default(),
@@ -5652,14 +5655,14 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 /// Used for defense-in-depth validation in broadcast key request handling.
 #[uniffi::export]
 pub async fn register_local_did(did: String) {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     manager.register_local_did(did.into()).await;
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.
 #[uniffi::export]
 pub async fn is_local_did(did: String) -> bool {
-    let manager = crate::runtime::context_manager();
+    let manager = crate::runtime::context_manager_or_init();
     let did_ref: scp_identity::DID = did.into();
     manager.is_local_did(&did_ref).await
 }
@@ -6210,7 +6213,7 @@ pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpEr
     let creator_did = handle.creator_did.clone();
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             let export = manager
                 .export_context(&ctx_id, scp_identity::DID::from(creator_did))
                 .await
@@ -6252,7 +6255,7 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
                     }
                 })?;
             let context_id = export.snapshot.context_id.clone();
-            let manager = crate::runtime::context_manager();
+            let manager = crate::runtime::context_manager()?;
             manager
                 .import_context(export)
                 .await

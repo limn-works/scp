@@ -28,12 +28,12 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use scp_core::context::ContextError;
 use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
 };
 use scp_core::context::manager::ContextManager;
 use scp_core::context::providers::MerkleEventLogProvider;
-use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -83,53 +83,92 @@ where
     )));
 }
 
-/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+/// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Governance vote signature verification is not yet wired at the `UniFFI` layer —
-/// the no-op resolver returns `None` for all DIDs, which causes vote
-/// verification to be skipped (permissive mode). A warning is emitted on
-/// first invocation to alert operators.
-fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|_| {
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-        WARN_ONCE.call_once(|| {
-            tracing::warn!(
-                "noop_key_resolver: returning None for all DIDs — \
-                 governance vote signature verification is skipped. \
-                 Wire a production KeyResolver before deploying."
-            );
-        });
+/// Unlike the previous `noop_key_resolver` (which silently returned `None`,
+/// causing governance vote signature verification to be skipped), this
+/// resolver logs a prominent error on every lookup, making it clear that
+/// key resolution is not configured. It still returns `None` (the
+/// `KeyResolver` type signature does not support `Result`), but the error
+/// log ensures the gap is visible rather than silent.
+fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|did| {
+        tracing::error!(
+            did = %did.0,
+            "key resolver not configured — cannot resolve verifying key for DID. \
+             Governance vote signature verification will be skipped for this DID. \
+             Wire a production KeyResolver to enable signature verification."
+        );
         None
     })
 }
 
-/// Returns (or lazily initializes) the shared `ContextManager`.
+/// Returns a reference to the shared `ContextManager`.
 ///
-/// The manager is created with stub provider implementations that delegate
-/// to no-op operations for crypto and transport. Event log persistence is
-/// wired via `MerkleEventLogProvider::with_persistence` backed by a
-/// `ProtocolRepositoryEventLogBridge` over an encrypted in-memory storage
-/// provider. This ensures event log entries are persisted on each append
-/// (issue #484 AC). Mobile apps (Swift/Kotlin) are killed aggressively by
+/// # Errors
+///
+/// Returns `ScpError::Context` if the manager has not been initialized via
+/// [`init_context_manager`]. Matches the `PyO3` bridge pattern: callers
+/// must explicitly initialize the manager (typically during
+/// `context_create`) rather than silently auto-initializing with
+/// potentially invalid state.
+pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
+    CONTEXT_MANAGER
+        .get()
+        .ok_or_else(|| crate::ScpError::Context {
+            message: "ContextManager not initialized — call context_create or \
+                  init_context_manager first"
+                .to_owned(),
+            code: "SCP-CTX-2000".to_owned(),
+        })
+}
+
+/// Returns a reference to the shared `ContextManager` for infallible contexts.
+///
+/// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
+/// Option, ()), this provides access to the manager without requiring a
+/// `Result` return type. Callers should prefer [`context_manager`] when the
+/// return type supports `Result`.
+///
+/// # Panics
+///
+/// Panics if the `ContextManager` has not been initialized via
+/// [`init_context_manager`] (called during `context_create`). This is
+/// intentional: silently auto-initializing with no-op providers contradicts
+/// issue #501's goal of eliminating silent degradation. The panic produces
+/// a clear error message that guides the caller to initialize first.
+#[allow(clippy::expect_used)]
+pub fn context_manager_or_init() -> &'static Arc<ContextManager> {
+    CONTEXT_MANAGER.get().expect(
+        "ContextManager not initialized — call context_create() first. \
+             The manager must be explicitly initialized before querying \
+             context state (membership, broadcast, events, TTL).",
+    )
+}
+
+/// Initializes the global [`ContextManager`] with bridge-local providers.
+///
+/// Uses `FfiBridgeCrypto` (no-op), `NotConfiguredTransportProvider`,
+/// `MerkleEventLogProvider` (persistent, #484), and a not-configured key
+/// resolver. This is called during `context_create` to ensure the manager
+/// is ready before any context operations.
+///
+/// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
+/// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
+/// storage provider. Mobile apps (Swift/Kotlin) are killed aggressively by
 /// the OS, making persistence critical for data durability.
 ///
-/// SDK consumers requiring durable persistence across app restarts should
-/// provide a file-backed `Storage` implementation at the application layer
-/// (e.g., `SqliteStorage`). The in-memory default provides the persistence
-/// wiring so the `MerkleEventLogProvider` records entries; app-level storage
-/// makes them survive process termination.
-///
-/// Thread-safe: `OnceLock` guarantees initialization happens exactly once.
-pub fn context_manager() -> &'static Arc<ContextManager> {
-    CONTEXT_MANAGER.get_or_init(|| {
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn init_context_manager() {
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
         let event_log = build_event_log_provider();
         Arc::new(ContextManager::new(
             Box::new(FfiBridgeCrypto),
-            Box::new(FfiBridgeTransport),
+            Box::new(scp_core::context::NotConfiguredTransportProvider),
             event_log,
-            noop_key_resolver(),
+            not_configured_key_resolver(),
         ))
-    })
+    });
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
@@ -365,7 +404,7 @@ pub fn remove_ucan_state(context_id: &str) {
 /// Syncs role state from the `ContextManager` after governance operations.
 ///
 /// The `UniFFI` bridge reads role state directly from the `ContextManager`
-/// (unlike PyO3/NAPI which cache `role_state` locally). This function
+/// (unlike `PyO3`/NAPI which cache `role_state` locally). This function
 /// validates the `ContextManager` state is consistent and logs the sync
 /// for traceability, matching the pattern of the other bridges.
 ///
@@ -373,7 +412,7 @@ pub fn remove_ucan_state(context_id: &str) {
 ///
 /// Returns `ScpError` if the context is not registered in the manager.
 pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate::ScpError> {
-    let manager = context_manager();
+    let manager = context_manager()?;
     let _role_state =
         manager
             .get_role_state(context_id)
@@ -488,37 +527,9 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
     }
 }
 
-/// Stub transport provider for the FFI bridge `ContextManager`.
-///
-/// Reports as connected and succeeds on all operations. Real transport
-/// operations are handled by the `TransportManager` and relay adapters.
-struct FfiBridgeTransport;
-
-impl ContextTransportProvider for FfiBridgeTransport {
-    fn is_connected(&self) -> bool {
-        true
-    }
-
-    fn publish_context(
-        &self,
-        _context_id: &[u8; 32],
-        _params: &ContextParams,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn send_message(
-        &self,
-        _context_id: &[u8; 32],
-        _encrypted_payload: &[u8],
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
+// Transport provider: uses `scp_core::context::NotConfiguredTransportProvider`
+// instead of a bridge-local no-op. Returns descriptive errors when transport
+// operations are attempted without configuring a relay. See issue #501.
 
 // FfiBridgeEventLog removed — replaced by MerkleEventLogProvider with
 // ProtocolRepositoryEventLogBridge persistence (issue #484).

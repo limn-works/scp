@@ -7376,7 +7376,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_create_context_transport_disconnected() {
+    async fn manager_create_context_succeeds_when_transport_disconnected() {
+        // Context creation is a local operation — it should succeed even
+        // when `is_connected()` returns false. Transport connectivity is
+        // not a Phase 1 gate.
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::default()), // not connected
@@ -7388,11 +7391,9 @@ mod tests {
             .create_context_bare("mgr-ctx-dc".into(), ContextParams::default())
             .await;
 
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TransportNotConnected
-        ));
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "mgr-ctx-dc");
     }
 
     #[tokio::test]
