@@ -49,6 +49,7 @@ use crate::crypto::ucan::UcanToken;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
+use crate::economy::budget::MemberBudgetTracker;
 use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
 
@@ -326,6 +327,10 @@ pub struct ContextSnapshot {
     /// `None` means free context (no payment required).
     #[serde(default)]
     pub economic_policy: Option<EconomicPolicy>,
+    /// Per-member cumulative budget tracker for governance-approved spending
+    /// (§19.5, ADR-033). Tracks grants from `ApproveSpend` governance actions.
+    #[serde(default)]
+    pub budget_tracker: MemberBudgetTracker,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
     /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
     #[serde(default)]
@@ -520,6 +525,10 @@ struct PerContextState {
     governance_engine: Box<dyn GovernanceEngine>,
     /// Mutable economic policy (§19.3, ADR-033).
     economic_policy: Option<EconomicPolicy>,
+    /// Per-member cumulative budget tracker for governance-approved spending
+    /// (§19.5, ADR-033). Grants are recorded via `ApproveSpend` governance
+    /// actions and tracked here. Persisted in [`ContextSnapshot`].
+    budget_tracker: MemberBudgetTracker,
     /// Governance timeout task (SCP-271, ADR-031 §5).
     governance_timeout_task: GovernanceTimeoutTask,
     /// Per-context deadlock detection tracking (ADR-031 §10).
@@ -1423,6 +1432,7 @@ impl ContextManager {
             pruning_policy: ctx.pruning_policy.clone(),
             governance_model_config: Some(ctx.governance_engine.model_config()),
             economic_policy: ctx.economic_policy.clone(),
+            budget_tracker: ctx.budget_tracker.clone(),
             approved_proposals: ctx.approved_proposals.clone(),
             governance_freeze: ctx.governance_freeze,
             pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
@@ -1565,6 +1575,7 @@ impl ContextManager {
             governance_freeze: ctx_snapshot.governance_freeze,
             governance_engine,
             economic_policy: ctx_snapshot.economic_policy,
+            budget_tracker: ctx_snapshot.budget_tracker,
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
@@ -1859,6 +1870,7 @@ impl ContextManager {
             governance_freeze: export.snapshot.governance_freeze,
             governance_engine,
             economic_policy: export.snapshot.economic_policy,
+            budget_tracker: export.snapshot.budget_tracker,
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
@@ -1997,6 +2009,7 @@ impl ContextManager {
             governance_freeze: None,
             governance_engine,
             economic_policy: params.economic_policy.clone(),
+            budget_tracker: MemberBudgetTracker::new(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
@@ -2252,6 +2265,7 @@ impl ContextManager {
             governance_freeze: None,
             governance_engine,
             economic_policy: params.economic_policy.clone(),
+            budget_tracker: MemberBudgetTracker::new(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
             deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: HashSet::new(),
@@ -5920,9 +5934,10 @@ impl ContextManager {
 
     /// Approves a spending authorization for a member (§19.5, ADR-033).
     ///
-    /// Records the spend approval in the event log. Budget enforcement is
-    /// handled at the tool invocation layer, not here — this action simply
-    /// records governance approval for the spend.
+    /// Grants the approved `amount` to the spender's cumulative budget via
+    /// [`MemberBudgetTracker::grant`] and records the approval in the event
+    /// log. Budget enforcement (checking remaining balance before tool
+    /// invocations) is handled at the tool invocation layer.
     ///
     /// # Errors
     ///
@@ -5933,8 +5948,8 @@ impl ContextManager {
         &self,
         context_id: &str,
         spender: &DID,
-        _amount: crate::economy::types::Amount,
-        _purpose: &str,
+        amount: crate::economy::types::Amount,
+        purpose: &str,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -5951,6 +5966,9 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(spender.to_string()));
             }
 
+            // Grant the approved budget to the member's cumulative tracker.
+            ctx.budget_tracker.grant(spender, amount);
+
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -5961,8 +5979,14 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
+        let payload = serde_json::json!({
+            "event": "SpendApproved",
+            "spender": spender.as_ref(),
+            "amount": amount,
+            "purpose": purpose,
+        });
         self.event_log
-            .append_context_event(&context_id_bytes, "SpendApproved")?;
+            .append_context_event(&context_id_bytes, &payload.to_string())?;
         Ok(())
     }
 
@@ -11172,6 +11196,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -11273,6 +11298,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -11362,6 +11388,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -11430,6 +11457,7 @@ mod tests {
                 pruning_policy: None,
                 governance_model_config: None,
                 economic_policy: None,
+                budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
                 approved_proposals: HashMap::new(),
                 governance_freeze: None,
                 pending_ceiling_modification: None,
@@ -11497,6 +11525,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -11583,6 +11612,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -11679,6 +11709,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -12684,6 +12715,7 @@ mod tests {
                 },
             ),
             economic_policy: None,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -16415,6 +16447,193 @@ mod tests {
         assert!(
             manager.has_persistence(),
             ".storage() should auto-wire persistence"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ApproveSpend → MemberBudgetTracker integration (issue #622)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a `SingleAdmin` context with a spender member added.
+    async fn setup_budget_context(ctx_id: &str) -> (ContextManager, DID, DID) {
+        let admin_did: DID = "did:key:admin".into();
+        let spender_did: DID = "did:key:spender".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            ..ContextParams::default()
+        };
+        manager
+            .create_context(ctx_id.into(), params, admin_did.clone())
+            .await
+            .unwrap();
+        let sk = signing_key_for_did(&admin_did);
+        manager
+            .propose_governance_action(
+                ctx_id,
+                &admin_did,
+                GovernanceAction::AddMember {
+                    did: spender_did.clone(),
+                    role: "member".to_owned(),
+                },
+                &sk,
+            )
+            .await
+            .unwrap();
+        (manager, admin_did, spender_did)
+    }
+
+    /// Verifies that `ApproveSpend` grants budget and additive grants accumulate.
+    #[tokio::test]
+    async fn approve_spend_grants_budget_to_member_tracker() {
+        let (manager, admin, spender) = setup_budget_context("budget-ctx").await;
+        let sk = signing_key_for_did(&admin);
+
+        // No budget initially.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("budget-ctx").unwrap();
+            assert!(!ctx.budget_tracker.has_budget(&spender));
+        }
+
+        // First grant: 5000.
+        manager
+            .propose_governance_action(
+                "budget-ctx",
+                &admin,
+                GovernanceAction::ApproveSpend {
+                    spender: spender.clone(),
+                    amount: crate::economy::types::Amount::new(5000),
+                    purpose: "tool budget".to_owned(),
+                },
+                &sk,
+            )
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("budget-ctx").unwrap();
+            assert!(ctx.budget_tracker.has_budget(&spender));
+            assert_eq!(
+                ctx.budget_tracker.remaining(&spender),
+                crate::economy::types::Amount::new(5000)
+            );
+        }
+
+        // Second grant: 3000 — additive.
+        manager
+            .propose_governance_action(
+                "budget-ctx",
+                &admin,
+                GovernanceAction::ApproveSpend {
+                    spender: spender.clone(),
+                    amount: crate::economy::types::Amount::new(3000),
+                    purpose: "more budget".to_owned(),
+                },
+                &sk,
+            )
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("budget-ctx").unwrap();
+            assert_eq!(
+                ctx.budget_tracker.limit(&spender),
+                crate::economy::types::Amount::new(8000)
+            );
+        }
+    }
+
+    /// Verifies that `ApproveSpend` rejects non-member spenders.
+    #[tokio::test]
+    async fn approve_spend_rejects_non_member_spender() {
+        let admin_did: DID = "did:key:admin".into();
+        let non_member: DID = "did:key:nonmember".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            ..ContextParams::default()
+        };
+        manager
+            .create_context("reject-ctx".into(), params, admin_did.clone())
+            .await
+            .unwrap();
+        let sk = signing_key_for_did(&admin_did);
+        let result = manager
+            .propose_governance_action(
+                "reject-ctx",
+                &admin_did,
+                GovernanceAction::ApproveSpend {
+                    spender: non_member,
+                    amount: crate::economy::types::Amount::new(1000),
+                    purpose: "should fail".to_owned(),
+                },
+                &sk,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::MemberNotFound(_)
+        ));
+    }
+
+    /// Verifies that `budget_tracker` is included in context snapshots
+    /// and survives serde roundtrip.
+    #[tokio::test]
+    async fn budget_tracker_included_in_snapshot() {
+        let (manager, admin, spender) = setup_budget_context("snap-ctx").await;
+        let sk = signing_key_for_did(&admin);
+        manager
+            .propose_governance_action(
+                "snap-ctx",
+                &admin,
+                GovernanceAction::ApproveSpend {
+                    spender: spender.clone(),
+                    amount: crate::economy::types::Amount::new(2500),
+                    purpose: "snapshot test".to_owned(),
+                },
+                &sk,
+            )
+            .await
+            .unwrap();
+
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("snap-ctx").unwrap();
+        let snapshot = ContextManager::snapshot_context(ctx);
+        assert!(snapshot.budget_tracker.has_budget(&spender));
+        assert_eq!(
+            snapshot.budget_tracker.remaining(&spender),
+            crate::economy::types::Amount::new(2500)
+        );
+
+        // Serde roundtrip.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: ContextSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.budget_tracker.remaining(&spender),
+            crate::economy::types::Amount::new(2500)
         );
     }
 }
