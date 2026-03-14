@@ -449,6 +449,28 @@ pub enum ContextEvent {
         /// The DID of the app that was unbound.
         app_did: DID,
     },
+    /// The local implementation is operating in degraded mode (§13.6) because
+    /// a received envelope has a different minor version within the same major
+    /// version.
+    ///
+    /// Constructed by callers who receive
+    /// [`VersionCompatibility::DegradedMode`] from envelope processing
+    /// functions. The envelope layer returns the compatibility result; the
+    /// application/SDK layer emits this event.
+    ///
+    /// [`VersionCompatibility::DegradedMode`]: crate::envelope::VersionCompatibility::DegradedMode
+    DegradedMode {
+        /// The context where the envelope was received.
+        context_id: String,
+        /// The local implementation's protocol version as `(major, minor)`.
+        local_version: (u8, u8),
+        /// The remote (wire) protocol version as `(major, minor)`.
+        remote_version: (u8, u8),
+        /// Features present in the remote version that the local
+        /// implementation does not support. At SCP/1.x there are no
+        /// known feature flags, so callers should pass `vec![]`.
+        unsupported_features: Vec<String>,
+    },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.

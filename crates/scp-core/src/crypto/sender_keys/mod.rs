@@ -175,11 +175,12 @@ pub enum SenderKeyError {
     #[error("stale sender key request: timestamp outside freshness window")]
     StaleSenderKeyRequest,
 
-    /// The envelope's `version` field is not supported by this implementation.
+    /// The envelope's major version is incompatible with this implementation.
     ///
-    /// Currently only version `0x0100` (SCP/1.0) is supported. Returned by
-    /// [`broadcast::validate_broadcast_version`] when the version doesn't
-    /// match (§13.2.2).
+    /// Returned by [`broadcast::validate_broadcast_version`] when the major
+    /// version differs from the local major version (§13.5). Envelopes with
+    /// the same major version but a different minor version are accepted in
+    /// degraded mode (§13.6) and do NOT produce this error.
     #[error("unsupported broadcast envelope version: {version:#06x}")]
     UnsupportedVersion {
         /// The version value from the wire.

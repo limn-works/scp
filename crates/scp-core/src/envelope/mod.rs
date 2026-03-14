@@ -34,12 +34,97 @@ pub mod validation;
 /// All envelope types include this as their first serialized field.
 pub const SCP_PROTOCOL_VERSION: u16 = 0x0100;
 
+// ---------------------------------------------------------------------------
+// Version compatibility (§13.5)
+// ---------------------------------------------------------------------------
+
+/// Extracts the major version component from a `u16` protocol version.
+///
+/// The major version occupies the high byte: `version >> 8`.
+#[inline]
+#[must_use]
+pub const fn version_major(version: u16) -> u8 {
+    (version >> 8) as u8
+}
+
+/// Extracts the minor version component from a `u16` protocol version.
+///
+/// The minor version occupies the low byte: `version & 0xFF`.
+#[inline]
+#[must_use]
+pub const fn version_minor(version: u16) -> u8 {
+    (version & 0xFF) as u8
+}
+
+/// Result of checking version compatibility per spec §13.5.
+///
+/// The SCP forward compatibility model accepts envelopes with the same major
+/// version. When the minor version differs, the implementation operates in
+/// degraded mode (§13.6): full participation in understood features, silent
+/// non-participation in unrecognized features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionCompatibility {
+    /// Exact version match — fully compatible.
+    Exact,
+    /// Same major version, different minor — degraded mode (§13.6).
+    ///
+    /// The implementation can process all known fields but may encounter
+    /// unknown fields from the higher minor version. These should be
+    /// preserved per §13.5.1.
+    DegradedMode {
+        /// The local implementation's minor version.
+        local_minor: u8,
+        /// The remote (wire) minor version.
+        remote_minor: u8,
+    },
+}
+
+/// Checks whether a wire version is compatible with the local protocol version.
+///
+/// Per spec §13.5, same-major envelopes are always accepted:
+/// - Exact match → [`VersionCompatibility::Exact`]
+/// - Same major, different minor → [`VersionCompatibility::DegradedMode`]
+/// - Different major → [`Err(EnvelopeError::UnsupportedVersion)`]
+///
+/// This replaces the previous exact-match-only check that would reject any
+/// version other than `SCP_PROTOCOL_VERSION` (issue #628).
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::UnsupportedVersion`] if the major version of
+/// `wire_version` differs from the local major version.
+pub const fn check_version_compatibility(
+    wire_version: u16,
+) -> Result<VersionCompatibility, EnvelopeError> {
+    let local_major = version_major(SCP_PROTOCOL_VERSION);
+    let local_minor = version_minor(SCP_PROTOCOL_VERSION);
+    let remote_major = version_major(wire_version);
+    let remote_minor = version_minor(wire_version);
+
+    if remote_major != local_major {
+        return Err(EnvelopeError::UnsupportedVersion {
+            version: wire_version,
+        });
+    }
+
+    if remote_minor == local_minor {
+        Ok(VersionCompatibility::Exact)
+    } else {
+        Ok(VersionCompatibility::DegradedMode {
+            local_minor,
+            remote_minor,
+        })
+    }
+}
+
 // Re-export primary types and functions at the envelope module level.
 pub use inner::{
     InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
     enforce_inner_envelope_category_a, validate_inner_version, verify_inner_signature,
 };
-pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
+pub use outer::{
+    OuterEnvelope, SCP_OUTER_ENVELOPE_VERSION, create_outer_envelope, open_envelope, seal_envelope,
+};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 pub use pseudonym::{derive_pseudonym, derive_rotatable_pseudonym};
 pub use validation::{
@@ -126,11 +211,13 @@ pub enum EnvelopeError {
     #[error("content integrity failed: payload_hash mismatch")]
     ContentIntegrityFailed,
 
-    /// The envelope's `version` field is not supported by this implementation.
+    /// The envelope's major version is incompatible with this implementation.
     ///
-    /// Currently only version `0x0100` (SCP/1.0) is supported. This error
-    /// triggers on deserialization or validation to future-proof the wire
-    /// format (§13.2).
+    /// Different major versions have incompatible wire formats (§13.1).
+    /// Same-major envelopes with a different minor version are accepted in
+    /// degraded mode (§13.6) and do NOT produce this error.
+    ///
+    /// See [`check_version_compatibility`] for the full compatibility check.
     #[error("unsupported envelope version: {version:#06x}")]
     UnsupportedVersion {
         /// The version value from the wire.
@@ -247,4 +334,113 @@ pub enum EnvelopeError {
         /// The highest previously seen timestamp from this sender.
         last_seen_timestamp: u64,
     },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // version_major / version_minor extraction
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn version_major_extracts_high_byte() {
+        assert_eq!(version_major(0x0100), 1);
+        assert_eq!(version_major(0x0200), 2);
+        assert_eq!(version_major(0x0000), 0);
+        assert_eq!(version_major(0xFF00), 255);
+    }
+
+    #[test]
+    fn version_minor_extracts_low_byte() {
+        assert_eq!(version_minor(0x0100), 0);
+        assert_eq!(version_minor(0x0101), 1);
+        assert_eq!(version_minor(0x01FF), 255);
+        assert_eq!(version_minor(0x0200), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // check_version_compatibility (§13.5, #628)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn exact_version_match_returns_exact() {
+        let result = check_version_compatibility(SCP_PROTOCOL_VERSION);
+        assert_eq!(result.unwrap(), VersionCompatibility::Exact);
+    }
+
+    #[test]
+    fn same_major_higher_minor_returns_degraded_mode() {
+        // SCP/1.1 from a peer when we are SCP/1.0
+        let result = check_version_compatibility(0x0101);
+        match result.unwrap() {
+            VersionCompatibility::DegradedMode {
+                local_minor,
+                remote_minor,
+            } => {
+                assert_eq!(local_minor, 0);
+                assert_eq!(remote_minor, 1);
+            }
+            VersionCompatibility::Exact => panic!("expected DegradedMode"),
+        }
+    }
+
+    #[test]
+    fn same_major_lower_minor_returns_degraded_mode() {
+        // If we were at SCP/1.2 and receive SCP/1.0, still degraded mode.
+        // Since SCP_PROTOCOL_VERSION is 0x0100, receiving 0x0100 is exact.
+        // But we can test with a version that has the same major but lower
+        // minor than a hypothetical future local version.
+        // With current SCP/1.0, minor 0 is the lowest so let's test 0x0102.
+        let result = check_version_compatibility(0x0102);
+        match result.unwrap() {
+            VersionCompatibility::DegradedMode {
+                local_minor,
+                remote_minor,
+            } => {
+                assert_eq!(local_minor, 0);
+                assert_eq!(remote_minor, 2);
+            }
+            VersionCompatibility::Exact => panic!("expected DegradedMode"),
+        }
+    }
+
+    #[test]
+    fn different_major_version_rejected() {
+        // SCP/2.0
+        let result = check_version_compatibility(0x0200);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("0x0200"),
+            "error must include the rejected version"
+        );
+    }
+
+    #[test]
+    fn different_major_version_zero_rejected() {
+        // Major version 0 when we're at major version 1.
+        let result = check_version_compatibility(0x0000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn different_major_higher_rejected() {
+        let result = check_version_compatibility(0x0300);
+        assert!(result.is_err());
+    }
+
+    /// #628 acceptance criterion: 0x0100 and 0x0101 interoperate.
+    #[test]
+    fn versions_0x0100_and_0x0101_interoperate() {
+        // 0x0100 receiving 0x0101 — degraded mode (accepted).
+        let result = check_version_compatibility(0x0101);
+        assert!(result.is_ok(), "0x0101 should be accepted by 0x0100");
+        assert!(
+            matches!(result.unwrap(), VersionCompatibility::DegradedMode { .. }),
+            "different minor should trigger degraded mode"
+        );
+    }
 }
