@@ -108,7 +108,7 @@ class ToolsConformanceTest {
         @Test
         fun `tool_verify returns result for registered tool`() =
             runTest(testDispatcher) {
-                stubBindings.toolVerifyResult = true
+                stubBindings.toolVerifyResult = """{"tool_id":"tool-calc-001","passed":true,"failures":[]}"""
                 val result = dispatcher.dispatch(
                     "tool_verify",
                     mapOf(
@@ -122,7 +122,9 @@ class ToolsConformanceTest {
         @Test
         fun `tool_verify returns failed result`() =
             runTest(testDispatcher) {
-                stubBindings.toolVerifyResult = false
+                @Suppress("MaxLineLength")
+                stubBindings.toolVerifyResult =
+                    """{"tool_id":"tool-calc-001","passed":false,"failures":["signature mismatch"]}"""
                 val result = dispatcher.dispatch(
                     "tool_verify",
                     mapOf(
