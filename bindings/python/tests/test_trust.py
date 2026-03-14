@@ -1,7 +1,7 @@
 """Tests for SCP Python SDK trust evaluation.
 
 Covers:
-- UCAN error classification into the 4 independent Layer 1 checks
+- UCAN error classification into the 6 independent Layer 1 checks
 - CapabilityValidation field independence
 - evaluate_trust Layer 1 integration (mocked bridge)
 - Dataclass construction for all trust types

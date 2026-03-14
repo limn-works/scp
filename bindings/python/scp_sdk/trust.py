@@ -5,7 +5,7 @@ dataclass for assessing the trustworthiness of a participant within
 an SCP context.  Trust evaluation is a four-layer model:
 
 1. **Protocol Enforcement** -- mechanical pass/fail (UCAN validity,
-   signatures, capability ceiling, revocation).
+   signatures, capability ceiling, nonce, revocation, and expiry).
 2. **Behavioral Validation** -- verified facts from the event log
    (participation history, governance actions, tool usage).
 3. **Attestation Authenticity** -- verified signatures and evidence
@@ -399,7 +399,7 @@ async def evaluate_trust(
     Performs the four-layer trust evaluation model:
 
     1. **Protocol enforcement** -- validates UCAN tokens, signatures,
-       capability ceiling compliance, and revocation status.
+       capability ceiling compliance, nonce, revocation, and expiry.
     2. **Behavioral validation** -- queries the event log for the
        subject's participation history.
     3. **Attestation authenticity** -- verifies signatures and evidence
@@ -443,7 +443,7 @@ async def evaluate_trust(
     bridge = _bridge()
 
     # Layer 1: Validate capability tokens if provided.
-    # Each of the four CapabilityValidation fields is set independently
+    # Each of the six CapabilityValidation fields is set independently
     # based on which specific check failed (ADR-017, spec section 9.3).
     # The bridge's ucan_validate runs an 11-step pipeline that returns
     # on the first failure. We classify the error to determine which
