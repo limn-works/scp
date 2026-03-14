@@ -474,6 +474,11 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
         .into());
     }
 
+    // Ensure the ContextManager is initialized — context_join is a valid
+    // first operation (e.g. a device joining a context without creating one).
+    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    crate::runtime::init_context_manager();
+
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let key_package = scp_core::context::membership::KeyPackage {
         owner_did: DID(identity_did.clone()),
@@ -1706,6 +1711,12 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
         })
     })?;
     let context_id = export.snapshot.context_id.clone();
+
+    // Ensure the ContextManager is initialized — context_import is a valid
+    // first operation (e.g. a device receiving exported context data).
+    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    crate::runtime::init_context_manager();
+
     let manager = context_manager()?;
     manager
         .import_context(export)
