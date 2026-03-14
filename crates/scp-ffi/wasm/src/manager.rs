@@ -1152,6 +1152,16 @@ impl WasmContextManager {
         Ok(tool_id)
     }
 
+    /// Checks whether a tool exists in the context's registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found or not active.
+    pub fn tool_exists(&self, context_id: &str, tool_id: &str) -> Result<bool, ScpWasmError> {
+        let ctx = self.require_active_context(context_id)?;
+        Ok(ctx.tool_registry.get(tool_id).is_some())
+    }
+
     /// Registers a handler function for a tool.
     ///
     /// The handler will be called when the tool is invoked. The tool must

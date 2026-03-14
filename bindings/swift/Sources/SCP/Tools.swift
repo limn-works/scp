@@ -184,6 +184,41 @@ public enum ToolBridge {
     public static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
         try await toolSessionClose(handle: handle, sessionId: sessionId)
     }
+
+    /// Expose a tool interface for cross-context sharing. Maps to ``toolInterfaceExpose`` in ScpBindings.
+    public typealias InterfaceExposeFn = @Sendable (
+        _ handle: ContextHandle,
+        _ toolId: String,
+        _ targetContextId: String,
+        _ rateLimitJson: String?
+    ) async throws -> String
+
+    /// Accept a cross-context tool interface. Maps to ``toolInterfaceAccept`` in ScpBindings.
+    public typealias InterfaceAcceptFn = @Sendable (
+        _ handle: ContextHandle,
+        _ interfaceJson: String
+    ) async throws -> String
+
+    /// Revoke a cross-context tool interface. Maps to ``toolInterfaceRevoke`` in ScpBindings.
+    public typealias InterfaceRevokeFn = @Sendable (
+        _ handle: ContextHandle,
+        _ interfaceIdHex: String
+    ) async throws -> String
+
+    /// Default interface expose function — delegates to UniFFI.
+    public static let defaultInterfaceExpose: InterfaceExposeFn = { handle, toolId, targetContextId, rateLimitJson in
+        try await toolInterfaceExpose(handle: handle, toolId: toolId, targetContextId: targetContextId, rateLimitJson: rateLimitJson)
+    }
+
+    /// Default interface accept function — delegates to UniFFI.
+    public static let defaultInterfaceAccept: InterfaceAcceptFn = { handle, interfaceJson in
+        try await toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
+    }
+
+    /// Default interface revoke function — delegates to UniFFI.
+    public static let defaultInterfaceRevoke: InterfaceRevokeFn = { handle, interfaceIdHex in
+        try await toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
+    }
 }
 
 // MARK: - Context Tool Extensions
@@ -521,5 +556,98 @@ public extension Context {
             )
         }
         try await sessionCloseFn(contextHandle, sessionId)
+    }
+
+    // MARK: - Bidirectional Consent Protocol (§6.2.0.1)
+
+    /// Exposes a tool interface for cross-context sharing (step 1).
+    ///
+    /// The caller (admin of the source context) proposes sharing a specific
+    /// tool with a target context.
+    ///
+    /// - Parameters:
+    ///   - toolId: The ID of the tool to expose.
+    ///   - targetContextId: The target context to expose the tool to.
+    ///   - rateLimitJson: Optional per-interface rate limit as a JSON string.
+    ///   - interfaceExposeFn: Bridge function override for testing.
+    /// - Returns: The ``ToolInterface`` as a JSON string.
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the caller is not an admin
+    ///   or the tool is not found.
+    func exposeToolInterface(
+        toolId: String,
+        targetContextId: String,
+        rateLimitJson: String? = nil,
+        interfaceExposeFn: ToolBridge.InterfaceExposeFn = ToolBridge.defaultInterfaceExpose
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await interfaceExposeFn(contextHandle, toolId, targetContextId, rateLimitJson)
+    }
+
+    /// Accepts a cross-context tool interface (step 4).
+    ///
+    /// Sets `approved_by_target = true` on the interface.
+    ///
+    /// - Parameters:
+    ///   - interfaceJson: The ``ToolInterface`` JSON string to accept.
+    ///   - interfaceAcceptFn: Bridge function override for testing.
+    /// - Returns: The updated ``ToolInterface`` as a JSON string.
+    /// - Throws: ``ScpError/Tool(msg:code:)`` if the caller is not an admin
+    ///   or context mismatch.
+    func acceptToolInterface(
+        interfaceJson: String,
+        interfaceAcceptFn: ToolBridge.InterfaceAcceptFn = ToolBridge.defaultInterfaceAccept
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await interfaceAcceptFn(contextHandle, interfaceJson)
+    }
+
+    /// Revokes a cross-context tool interface (step 5).
+    ///
+    /// Either context may revoke unilaterally.
+    ///
+    /// - Parameters:
+    ///   - interfaceIdHex: The 32-byte interface/offer ID as a hex string.
+    ///   - interfaceRevokeFn: Bridge function override for testing.
+    /// - Returns: The ``InterfaceRevoked`` event as a JSON string.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` if the hex ID is invalid.
+    func revokeToolInterface(
+        interfaceIdHex: String,
+        interfaceRevokeFn: ToolBridge.InterfaceRevokeFn = ToolBridge.defaultInterfaceRevoke
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await interfaceRevokeFn(contextHandle, interfaceIdHex)
     }
 }

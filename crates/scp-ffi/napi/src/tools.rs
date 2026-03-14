@@ -882,6 +882,206 @@ pub async fn tool_session_close(
 }
 
 // ---------------------------------------------------------------------------
+// Bidirectional consent protocol (spec §6.2.0.1)
+// ---------------------------------------------------------------------------
+
+/// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+///
+/// The caller (admin of the source context) proposes sharing a specific tool
+/// with a target context. Returns a JSON string of the `ToolInterface` with
+/// `approved_by_source = true` and `approved_by_target = false`.
+///
+/// # Returns
+///
+/// A `Promise<string>` resolving to the `ToolInterface` as JSON.
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn tool_interface_expose(
+    handle: &NapiContextHandle,
+    tool_id: String,
+    target_context_id: String,
+    rate_limit_json: Option<String>,
+) -> napi::Result<String> {
+    scp_ffi_common::validate::validate_tool_id(&tool_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_context_id(&target_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let state_str = handle.state()?;
+    if state_str != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot expose tool interface in context in {state_str:?} state — context must be active"
+            ),
+            code: "SCP-TOOL-6030".to_owned(),
+        }
+        .into());
+    }
+
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+
+    let rate_limit = match rate_limit_json {
+        Some(ref json) => {
+            let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
+                .map_err(|e| {
+                    napi::Error::from(ScpNapiError::Validation {
+                        message: format!("invalid rate_limit_json: {e}"),
+                        code: "SCP-VALID-7040".to_owned(),
+                    })
+                })?;
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    crate::runtime::with_context(&context_id, |rt| {
+        let context_handle = scp_core::context::ContextHandle::new(
+            context_id.clone(),
+            scp_core::context::ContextParams::default(),
+        );
+
+        let interface = scp_core::context::tools::interface::expose_tool(
+            &context_handle,
+            &tool_id,
+            &target_context_id,
+            &rt.role_state,
+            &rt.creator_did,
+            &rt.tool_registry,
+            rate_limit,
+            None,
+        )
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("expose_tool failed: {e}"),
+            code: "SCP-TOOL-6030".to_owned(),
+        })?;
+
+        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
+            message: format!("failed to serialize ToolInterface: {e}"),
+            code: "SCP-TOOL-6031".to_owned(),
+        })
+    })
+    .map_err(napi::Error::from)
+}
+
+/// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+///
+/// Sets `approved_by_target = true` on the interface.
+///
+/// # Returns
+///
+/// A `Promise<string>` resolving to the updated `ToolInterface` as JSON.
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn tool_interface_accept(
+    handle: &NapiContextHandle,
+    interface_json: String,
+) -> napi::Result<String> {
+    let state_str = handle.state()?;
+    if state_str != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot accept tool interface in context in {state_str:?} state — context must be active"
+            ),
+            code: "SCP-TOOL-6032".to_owned(),
+        }
+        .into());
+    }
+
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+
+    let mut interface: scp_core::context::tools::interface::ToolInterface =
+        serde_json::from_str(&interface_json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid interface_json: {e}"),
+                code: "SCP-VALID-7041".to_owned(),
+            })
+        })?;
+
+    crate::runtime::with_context(&context_id, |rt| {
+        let context_handle = scp_core::context::ContextHandle::new(
+            context_id.clone(),
+            scp_core::context::ContextParams::default(),
+        );
+
+        scp_core::context::tools::interface::accept_tool_interface(
+            &context_handle,
+            &mut interface,
+            &rt.role_state,
+            &rt.creator_did,
+            None,
+        )
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("accept_tool_interface failed: {e}"),
+            code: "SCP-TOOL-6032".to_owned(),
+        })?;
+
+        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
+            message: format!("failed to serialize ToolInterface: {e}"),
+            code: "SCP-TOOL-6033".to_owned(),
+        })
+    })
+    .map_err(napi::Error::from)
+}
+
+/// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+///
+/// Either context may revoke unilaterally.
+///
+/// # Returns
+///
+/// A `Promise<string>` resolving to the `InterfaceRevoked` event as JSON.
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn tool_interface_revoke(
+    handle: &NapiContextHandle,
+    interface_id_hex: String,
+) -> napi::Result<String> {
+    let context_id = handle.context_id();
+
+    let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid interface_id_hex: not valid hex: {e}"),
+            code: "SCP-VALID-7042".to_owned(),
+        })
+    })?;
+    let interface_id: [u8; 32] =
+        <[u8; 32]>::try_from(interface_id_bytes.as_slice()).map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!(
+                    "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
+                    interface_id_bytes.len()
+                ),
+                code: "SCP-VALID-7042".to_owned(),
+            })
+        })?;
+
+    let now_ms = scp_core::time::now_millis().map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("clock error: {e}"),
+            code: "SCP-TOOL-6034".to_owned(),
+        })
+    })?;
+
+    let event = scp_core::context::tools::interface::revoke_tool_interface(
+        interface_id,
+        &context_id,
+        now_ms,
+    );
+
+    serde_json::to_string(&event).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("failed to serialize InterfaceRevoked: {e}"),
+            code: "SCP-TOOL-6035".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

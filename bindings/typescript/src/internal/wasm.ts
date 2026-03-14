@@ -870,6 +870,33 @@ export function createWasmBridge(): Bridge {
       };
     },
 
+    // Bidirectional consent protocol (§6.2.0.1)
+    async toolInterfaceExpose(
+      handle: BridgeContextHandle,
+      toolId: string,
+      targetContextId: string,
+      rateLimitJson?: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.tool_interface_expose(handle, toolId, targetContextId, rateLimitJson);
+    },
+
+    async toolInterfaceAccept(
+      handle: BridgeContextHandle,
+      interfaceJson: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.tool_interface_accept(handle, interfaceJson);
+    },
+
+    async toolInterfaceRevoke(
+      handle: BridgeContextHandle,
+      interfaceIdHex: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.tool_interface_revoke(handle, interfaceIdHex);
+    },
+
     // Transport
     async transportConnect(relayUrl: string): Promise<BridgeTransportHandle> {
       const wasm = getWasm();

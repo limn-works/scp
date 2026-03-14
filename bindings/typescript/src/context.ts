@@ -338,6 +338,81 @@ export class Context implements AsyncDisposable {
   }
 
   // ---------------------------------------------------------------------------
+  // Bidirectional consent protocol (spec section 6.2.0.1)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Exposes a tool interface for cross-context sharing (step 1).
+   *
+   * The caller (admin of the source context) proposes sharing a specific
+   * tool with a target context. The returned JSON interface has
+   * `approved_by_source = true` and `approved_by_target = false`.
+   *
+   * @param toolId - The ID of the tool to expose.
+   * @param targetContextId - The target context to expose the tool to.
+   * @param rateLimitJson - Optional per-interface rate limit as a JSON string.
+   * @returns The ToolInterface as a JSON string.
+   * @throws {ToolError} If the caller is not an admin or the tool is not found.
+   */
+  async exposeToolInterface(
+    toolId: string,
+    targetContextId: string,
+    rateLimitJson?: string,
+  ): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.toolInterfaceExpose(
+        this._handle,
+        toolId,
+        targetContextId,
+        rateLimitJson,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Accepts a cross-context tool interface (step 4).
+   *
+   * Sets `approved_by_target = true`. Both `approved_by_source` and
+   * `approved_by_target` must be `true` before calls are permitted.
+   *
+   * @param interfaceJson - The ToolInterface JSON string to accept.
+   * @returns The updated ToolInterface as a JSON string.
+   * @throws {ToolError} If the caller is not an admin or context mismatch.
+   */
+  async acceptToolInterface(interfaceJson: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.toolInterfaceAccept(this._handle, interfaceJson);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Revokes a cross-context tool interface (step 5).
+   *
+   * Either context may revoke unilaterally.
+   *
+   * @param interfaceIdHex - The 32-byte interface/offer ID as a hex string.
+   * @returns The InterfaceRevoked event as a JSON string.
+   * @throws {ValidationError} If interfaceIdHex is invalid.
+   */
+  async revokeToolInterface(interfaceIdHex: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.toolInterfaceRevoke(this._handle, interfaceIdHex);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Membership queries
   // ---------------------------------------------------------------------------
 

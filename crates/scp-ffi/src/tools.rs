@@ -1099,6 +1099,197 @@ pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()>
 }
 
 // ---------------------------------------------------------------------------
+// Bidirectional consent protocol (spec §6.2.0.1)
+// ---------------------------------------------------------------------------
+
+/// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+///
+/// The caller (admin of the source context) proposes sharing a specific tool
+/// with a target context. The returned JSON contains the `ToolInterface` with
+/// `approved_by_source = true` and `approved_by_target = false`. The target
+/// context must call [`py_tool_interface_accept`] to complete the handshake.
+///
+/// # Arguments
+///
+/// * `context_id` — The source context ID.
+/// * `tool_id` — The ID of the tool to expose.
+/// * `target_context_id` — The target context to expose the tool to.
+/// * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
+///   When provided, must be a JSON object with `max_calls` (u64) and
+///   `window_seconds` (u64) fields.
+///
+/// # Returns
+///
+/// A JSON string representation of the created `ToolInterface`.
+///
+/// # Errors
+///
+/// Raises `ToolError` if the caller is not an admin or the tool is not found.
+#[pyfunction]
+#[pyo3(name = "tool_interface_expose", signature = (context_id, tool_id, target_context_id, rate_limit_json=None))]
+pub fn py_tool_interface_expose(
+    context_id: &str,
+    tool_id: &str,
+    target_context_id: &str,
+    rate_limit_json: Option<&str>,
+) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_id(tool_id)?;
+    validate::validate_context_id(target_context_id)?;
+
+    let rate_limit = match rate_limit_json {
+        Some(json) => {
+            let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("invalid rate_limit_json: {e}"),
+                    code: "SCP-VALID-7040".to_owned(),
+                })?;
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    Ok(crate::runtime::with_context(context_id, |rt| {
+        let context_handle = scp_core::context::ContextHandle::new(
+            context_id.to_string(),
+            scp_core::context::ContextParams::default(),
+        );
+
+        let interface = scp_core::context::tools::interface::expose_tool(
+            &context_handle,
+            &tool_id.to_owned(),
+            &target_context_id.to_owned(),
+            &rt.role_state,
+            &rt.creator_did,
+            &rt.tool_registry,
+            rate_limit,
+            None,
+        )
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("expose_tool failed: {e}"),
+            code: "SCP-TOOL-6030".to_owned(),
+        })?;
+
+        serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
+            message: format!("failed to serialize ToolInterface: {e}"),
+            code: "SCP-TOOL-6031".to_owned(),
+        })
+    })?)
+}
+
+/// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+///
+/// Sets `approved_by_target = true` on the interface. Both `approved_by_source`
+/// and `approved_by_target` must be `true` before calls are permitted.
+///
+/// # Arguments
+///
+/// * `context_id` — The target context ID (the one accepting).
+/// * `interface_json` — The `ToolInterface` JSON string to accept (as received
+///   from the source context's `tool_interface_expose` call).
+///
+/// # Returns
+///
+/// The updated `ToolInterface` JSON string with `approved_by_target = true`.
+///
+/// # Errors
+///
+/// Raises `ToolError` if the caller is not an admin or the interface's target
+/// context does not match `context_id`.
+#[pyfunction]
+#[pyo3(name = "tool_interface_accept")]
+pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+
+    let mut interface: scp_core::context::tools::interface::ToolInterface =
+        serde_json::from_str(interface_json).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid interface_json: {e}"),
+            code: "SCP-VALID-7041".to_owned(),
+        })?;
+
+    Ok(crate::runtime::with_context(context_id, |rt| {
+        let context_handle = scp_core::context::ContextHandle::new(
+            context_id.to_string(),
+            scp_core::context::ContextParams::default(),
+        );
+
+        scp_core::context::tools::interface::accept_tool_interface(
+            &context_handle,
+            &mut interface,
+            &rt.role_state,
+            &rt.creator_did,
+            None,
+        )
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("accept_tool_interface failed: {e}"),
+            code: "SCP-TOOL-6032".to_owned(),
+        })?;
+
+        serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
+            message: format!("failed to serialize ToolInterface: {e}"),
+            code: "SCP-TOOL-6033".to_owned(),
+        })
+    })?)
+}
+
+/// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+///
+/// Either context may revoke unilaterally. Returns an `InterfaceRevoked` event
+/// for recording in the revoking context's event log.
+///
+/// # Arguments
+///
+/// * `context_id` — The revoking context ID.
+/// * `interface_id` — The 32-byte interface/offer ID as a hex string.
+///
+/// # Returns
+///
+/// A JSON string representation of the `InterfaceRevoked` event.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
+#[pyfunction]
+#[pyo3(name = "tool_interface_revoke")]
+pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+
+    let interface_id_bytes =
+        hex::decode(interface_id_hex).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid interface_id_hex: not valid hex: {e}"),
+            code: "SCP-VALID-7042".to_owned(),
+        })?;
+    let interface_id: [u8; 32] =
+        <[u8; 32]>::try_from(interface_id_bytes.as_slice()).map_err(|_| {
+            ScpPyError::ValidationError {
+                message: format!(
+                    "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
+                    interface_id_bytes.len()
+                ),
+                code: "SCP-VALID-7042".to_owned(),
+            }
+        })?;
+
+    let now_ms = scp_core::time::now_millis().map_err(|e| ScpPyError::ContextError {
+        message: format!("clock error: {e}"),
+        code: "SCP-TOOL-6034".to_owned(),
+    })?;
+
+    let event = scp_core::context::tools::interface::revoke_tool_interface(
+        interface_id,
+        &context_id.to_owned(),
+        now_ms,
+    );
+
+    let json = serde_json::to_string(&event).map_err(|e| ScpPyError::ContextError {
+        message: format!("failed to serialize InterfaceRevoked: {e}"),
+        code: "SCP-TOOL-6035".to_owned(),
+    })?;
+
+    Ok(json)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1119,6 +1310,9 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_tool_session_create, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_session_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_session_close, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_interface_expose, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_interface_accept, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_interface_revoke, m)?)?;
     Ok(())
 }
 

@@ -678,6 +678,186 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 }
 
 // ---------------------------------------------------------------------------
+// Bidirectional consent protocol (spec §6.2.0.1)
+// ---------------------------------------------------------------------------
+
+/// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+///
+/// Creates a `ToolInterface` JSON with `approved_by_source = true` and
+/// `approved_by_target = false`.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the `ToolInterface` as a JSON string.
+#[wasm_bindgen]
+pub fn tool_interface_expose(
+    context: &WasmContextHandle,
+    tool_id: String,
+    target_context_id: String,
+    rate_limit_json: Option<String>,
+) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        validate_tool_id(&tool_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        // Validate the tool exists in the source context's registry.
+        let exists = with_manager(|mgr| mgr.tool_exists(&context_id, &tool_id))
+            .map_err(ScpWasmError::into_js)?;
+        if !exists {
+            return Err(ScpWasmError::Tool {
+                message: format!("tool '{tool_id}' not found in context '{context_id}'"),
+                code: "SCP-TOOL-6030".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        // Parse optional rate limit.
+        let rate_limit: Option<serde_json::Value> = match rate_limit_json {
+            Some(ref json) => {
+                let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+                    ScpWasmError::Validation {
+                        message: format!("invalid rate_limit_json: {e}"),
+                        code: "SCP-VALID-7040".to_owned(),
+                    }
+                    .into_js()
+                })?;
+                Some(parsed)
+            }
+            None => None,
+        };
+
+        let interface = serde_json::json!({
+            "source_context": context_id,
+            "target_context": target_context_id,
+            "tool_id": tool_id,
+            "rate_limit": rate_limit,
+            "per_caller_rate_limit": {
+                "max_calls_per_caller": 10,
+                "window": { "secs": 60, "nanos": 0 },
+                "burst_allowance": 5,
+                "burst_window": { "secs": 1, "nanos": 0 },
+                "callers": {}
+            },
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "outbound_policy": {
+                "allowed_callers": [],
+                "max_calls_per_minute": 60,
+                "max_payload_bytes": 65536,
+                "require_provenance": true
+            },
+            "inbound_policy": null
+        });
+
+        let json_str = serde_json::to_string(&interface).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize ToolInterface: {e}"),
+                code: "SCP-TOOL-6031".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+///
+/// Sets `approved_by_target = true` on the interface.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the updated `ToolInterface` as JSON.
+#[wasm_bindgen]
+pub fn tool_interface_accept(_context: &WasmContextHandle, interface_json: String) -> Promise {
+    future_to_promise(async move {
+        let mut interface: serde_json::Value =
+            serde_json::from_str(&interface_json).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid interface_json: {e}"),
+                    code: "SCP-VALID-7041".to_owned(),
+                }
+                .into_js()
+            })?;
+
+        // Set approved_by_target to true and add default inbound policy.
+        interface["approved_by_target"] = serde_json::json!(true);
+        if interface.get("inbound_policy").is_none() || interface["inbound_policy"].is_null() {
+            interface["inbound_policy"] = serde_json::json!({
+                "allowed_source_roles": [],
+                "max_calls_per_minute": 60,
+                "max_response_bytes": 65536,
+                "require_spending_ucan": false
+            });
+        }
+
+        let json_str = serde_json::to_string(&interface).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize ToolInterface: {e}"),
+                code: "SCP-TOOL-6033".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+///
+/// Either context may revoke unilaterally.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the `InterfaceRevoked` event as JSON.
+#[wasm_bindgen]
+pub fn tool_interface_revoke(context: &WasmContextHandle, interface_id_hex: String) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid interface_id_hex: not valid hex: {e}"),
+                code: "SCP-VALID-7042".to_owned(),
+            }
+            .into_js()
+        })?;
+        if interface_id_bytes.len() != 32 {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
+                    interface_id_bytes.len()
+                ),
+                code: "SCP-VALID-7042".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        let now_ms = crate::time::now_ms();
+        // now_ms is always non-negative (milliseconds since epoch) and well within u64 range.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let now_ms_u64 = now_ms as u64;
+
+        let event = serde_json::json!({
+            "interface_id": interface_id_bytes,
+            "revoking_context": context_id,
+            "revoked_at": now_ms_u64
+        });
+
+        let json_str = serde_json::to_string(&event).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize InterfaceRevoked: {e}"),
+                code: "SCP-TOOL-6035".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
