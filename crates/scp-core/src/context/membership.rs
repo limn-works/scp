@@ -453,17 +453,23 @@ pub enum ContextEvent {
     /// a received envelope has a different minor version within the same major
     /// version.
     ///
-    /// Callers can emit this event when [`VersionCompatibility::DegradedMode`]
-    /// is returned from version checks on outer, inner, or broadcast envelopes.
-    /// The `tracing::warn!` calls in those paths remain as supplemental
-    /// diagnostics.
+    /// Constructed by callers who receive
+    /// [`VersionCompatibility::DegradedMode`] from envelope processing
+    /// functions. The envelope layer returns the compatibility result; the
+    /// application/SDK layer emits this event.
     ///
     /// [`VersionCompatibility::DegradedMode`]: crate::envelope::VersionCompatibility::DegradedMode
     DegradedMode {
-        /// The local implementation's protocol version (`SCP_PROTOCOL_VERSION`).
-        local_version: u16,
-        /// The remote (wire) protocol version from the received envelope.
-        remote_version: u16,
+        /// The context where the envelope was received.
+        context_id: String,
+        /// The local implementation's protocol version as `(major, minor)`.
+        local_version: (u8, u8),
+        /// The remote (wire) protocol version as `(major, minor)`.
+        remote_version: (u8, u8),
+        /// Features present in the remote version that the local
+        /// implementation does not support. At SCP/1.x there are no
+        /// known feature flags, so callers should pass `vec![]`.
+        unsupported_features: Vec<String>,
     },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///

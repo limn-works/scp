@@ -422,25 +422,10 @@ pub fn open_envelope(
     //    `from_bytes` acts as defense in depth.
     let inner = InnerEnvelope::from_bytes(&plaintext)?;
 
-    // 3a. Reject incompatible major versions early (§13.5).
-    //     Same-major envelopes with different minor versions proceed in
-    //     degraded mode.
-    let compat = super::check_version_compatibility(inner.version)?;
-    if let super::VersionCompatibility::DegradedMode {
-        local_minor,
-        remote_minor,
-    } = compat
-    {
-        tracing::warn!(
-            wire_version = format_args!("{:#06x}", inner.version),
-            local_version = format_args!("{:#06x}", super::SCP_PROTOCOL_VERSION),
-            local_minor,
-            remote_minor,
-            context_id = %inner.context_id,
-            sender_did = %inner.sender_did,
-            "inner envelope minor version mismatch — operating in degraded mode (§13.6)"
-        );
-    }
+    // 3a. Version compatibility is checked inside `verify_inner_signature`
+    //     (step 7 below), which rejects incompatible major versions and warns
+    //     on minor mismatches. No duplicate check here — standalone callers of
+    //     `verify_inner_signature` still get the check.
 
     // 4. Verify sender_did is a member of the MLS group.
     verify_sender_in_group(group, &inner.sender_did)?;
