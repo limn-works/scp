@@ -1299,7 +1299,11 @@ fn py_identity_execute_recovery(
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn rotate_key_packages(&self, _context_id: &str) -> Result<(), RecoveryStepError> {
+            fn rotate_key_packages(
+                &self,
+                _context_id: &str,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
             fn notify_contacts(

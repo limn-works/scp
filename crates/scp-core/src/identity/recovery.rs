@@ -364,13 +364,19 @@ pub trait RecoveryBackend {
 
     /// Step 4: Delete old `KeyPackages` and publish new ones.
     ///
-    /// Prevents new group additions using old key material.
+    /// Prevents new group additions using old key material. The
+    /// `key_rotation` outcome is used to identify the recovering member's
+    /// DID for the notification payload.
     ///
     /// # Errors
     ///
     /// Returns [`RecoveryStepError`] if old key packages cannot be deleted
     /// or new ones cannot be published.
-    fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError>;
+    fn rotate_key_packages(
+        &self,
+        context_id: &str,
+        key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError>;
 
     /// Step 5: Send key-change notification to contacts.
     ///
@@ -525,7 +531,7 @@ impl CompromiseRecoveryOrchestrator {
             }
 
             // Step 4: KeyPackage rotation (depends on step 3).
-            match backend.rotate_key_packages(context_id) {
+            match backend.rotate_key_packages(context_id, key_rotation) {
                 Ok(()) => {
                     state.key_packages_rotated = true;
                 }
@@ -722,14 +728,42 @@ impl RecoveryBackend for ProductionRecoveryBackend {
     fn mls_update(
         &self,
         context_id: &str,
-        _key_rotation: &KeyRotationOutcome,
+        key_rotation: &KeyRotationOutcome,
     ) -> Result<(), RecoveryStepError> {
         // Step 2: Advance the MLS epoch for post-compromise security.
         // The ContextManager increments the epoch counter, places the old
         // epoch into the grace window, and emits an event log entry.
         let result = Self::block_on_async(self.manager.recovery_advance_epoch(context_id));
         match result {
-            Ok(_epoch) => Ok(()),
+            Ok(_epoch) => {
+                // Send a scoped epoch-advance notification including the
+                // rotated key scopes so recipients know which keys were
+                // compromised and can adjust their local trust state.
+                let scoped_payload = serde_json::json!({
+                    "event": "recovery:epoch_advanced",
+                    "rotated_key_scopes": key_rotation.rotated_key_scopes,
+                    "did_after": key_rotation.did_after.as_ref(),
+                    "did_changed": key_rotation.did_changed,
+                });
+                if let Ok(payload_bytes) = serde_json::to_vec(&scoped_payload) {
+                    let notify_result =
+                        Self::block_on_async(self.manager.recovery_send_notification(
+                            context_id,
+                            key_rotation.did_after.as_ref(),
+                            &payload_bytes,
+                        ));
+                    // Notification failure is non-fatal — the epoch was
+                    // already advanced, which is the critical security step.
+                    if let Err(e) = notify_result {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            error = %e,
+                            "failed to send scoped epoch-advance notification"
+                        );
+                    }
+                }
+                Ok(())
+            }
             Err(mut e) => {
                 e.step = 2;
                 // Detect Tier 3 re-join requirement (ADR-029).
@@ -793,7 +827,11 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         }
     }
 
-    fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError> {
+    fn rotate_key_packages(
+        &self,
+        context_id: &str,
+        key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError> {
         // Step 4: Delete old KeyPackages and publish new ones.
         //
         // Old key packages are implicitly invalidated by the MLS epoch
@@ -801,33 +839,29 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // they should discard cached key packages for this member and
         // records the rotation in the event log.
         //
+        // NOTE: This implementation is notification-only — it does not
+        // interact with the relay to delete/publish actual KeyPackage
+        // objects because the RecoveryBackend trait does not expose relay
+        // transport APIs. The notification informs other members to purge
+        // their cached key packages for the recovering member. Actual
+        // KeyPackage lifecycle management happens at the SDK integration
+        // layer. See issue #1083 finding 6.
+        //
         // We build a key-package-rotation notification and send it via
         // the context manager. The payload tells recipients to purge
         // cached key packages for the recovering member.
         let payload = format!("recovery:key_package_rotation:context={context_id}");
 
-        // Look up the recovering member's DID from the orchestrator context.
-        // The orchestrator always processes contexts where the DID is a
-        // member, so we retrieve member DIDs to find ourselves.
-        let member_dids = Self::block_on_async(async {
-            Ok::<_, crate::context::ContextError>(self.manager.member_dids(context_id).await)
-        })
-        .map_err(|mut e| {
-            e.step = 4;
-            e
-        })?;
-
-        // Use the first member DID as sender (the recovering member is
-        // always a member of the context). If the context has no members
-        // (shouldn't happen during recovery), we still send with a
-        // placeholder — the transport layer handles routing.
-        let sender_did = member_dids.first().cloned().unwrap_or_default();
+        // Use the recovering member's DID from the key rotation outcome
+        // as the sender — this is the authoritative identity performing
+        // recovery, not an arbitrary first member from the context.
+        let sender_did = key_rotation.did_after.as_ref();
 
         // Send the key-package-rotation notification via the recovery
         // notification channel. This records the event and alerts members.
         let result = Self::block_on_async(self.manager.recovery_send_notification(
             context_id,
-            &sender_did,
+            sender_did,
             payload.as_bytes(),
         ));
         match result {
@@ -889,17 +923,13 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             let contact_did_str = contact.as_ref();
             let did_str = did.as_ref();
 
-            // Try sending to any context where both the recovering DID and
-            // the contact DID are members. We use block_on_async to bridge
-            // to the async ContextManager API.
+            // Try sending to a shared context where both the recovering DID
+            // and the contact DID are members. The manager's
+            // `recovery_notify_contact` searches registered contexts to find
+            // a suitable channel, then sends the notification through it.
             let send_result = Self::block_on_async(async {
-                // Use the manager's recovery_send_notification on each
-                // context where the contact is a member. Since we don't
-                // have the context list directly, we send the notification
-                // using the contact DID as the context hint — the transport
-                // layer routes based on membership.
                 self.manager
-                    .recovery_send_notification(contact_did_str, did_str, &payload)
+                    .recovery_notify_contact(did_str, contact_did_str, &payload)
                     .await
             });
 
@@ -994,11 +1024,13 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
             match cipher.encrypt(nonce, new_psk.as_ref()) {
                 Ok(ciphertext) => {
-                    // 5. Prepend ephemeral public key so the recipient can
-                    // perform the reverse ECDH. Format:
-                    // [32 bytes ephemeral_pubkey || ciphertext+tag]
-                    let mut wrapped = Vec::with_capacity(32 + ciphertext.len());
+                    // 5. Prepend ephemeral public key and nonce so the
+                    // recipient can perform the reverse ECDH + decrypt.
+                    // Format:
+                    // [32 bytes ephemeral_pubkey || 12 bytes nonce || ciphertext+tag]
+                    let mut wrapped = Vec::with_capacity(32 + 12 + ciphertext.len());
                     wrapped.extend_from_slice(ephemeral_public.as_bytes());
+                    wrapped.extend_from_slice(&nonce_bytes[..12]);
                     wrapped.extend_from_slice(&ciphertext);
                     wrapped_psks.push(wrapped);
                 }
@@ -1107,7 +1139,11 @@ mod tests {
             Ok(())
         }
 
-        fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError> {
+        fn rotate_key_packages(
+            &self,
+            context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
             if let Some((ref ctx, ref err)) = self.rotate_key_packages_error
                 && ctx == context_id
             {
@@ -1836,20 +1872,47 @@ mod tests {
 
     /// Helper to create a context in the manager for testing.
     async fn setup_context(manager: &ContextManager, context_id: &str, creator_did: &DID) {
+        setup_context_with_members(manager, context_id, creator_did, &[]).await;
+    }
+
+    /// Helper to create a context with the creator and additional members.
+    async fn setup_context_with_members(
+        manager: &ContextManager,
+        context_id: &str,
+        creator_did: &DID,
+        additional_members: &[&DID],
+    ) {
         use crate::context::ContextParams;
+        use crate::context::membership::KeyPackage;
         use crate::context::params::{ContextMode, GovernanceModel};
+        use crate::context::roles::Capability;
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
             governance: GovernanceModel::SingleAdmin,
+            // Include role:assign capability so the admin can add members.
+            ceiling: vec![
+                Capability::new("messages:read"),
+                Capability::new("messages:write"),
+                Capability::new("role:assign"),
+            ],
             ..ContextParams::default()
         };
 
         // Create the context. This registers it in the manager.
-        let _handle = manager
+        let handle = manager
             .create_context(context_id.to_owned(), params, creator_did.clone())
             .await
             .expect("failed to create test context");
+
+        // Add additional members via join_context.
+        for member_did in additional_members {
+            let kp = KeyPackage::mock((*member_did).clone());
+            manager
+                .join_context(&handle, kp)
+                .await
+                .expect("failed to join test member");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1903,8 +1966,9 @@ mod tests {
         setup_context(&manager, context_id, &alice).await;
 
         let backend = ProductionRecoveryBackend::new(manager);
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.rotate_key_packages(context_id);
+        let result = backend.rotate_key_packages(context_id, &key_rotation);
         assert!(
             result.is_ok(),
             "rotate_key_packages should succeed: {result:?}"
@@ -1914,10 +1978,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_notify_contacts_succeeds() {
         let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager);
         let alice = did("did:dht:alice");
+        let bob = did("did:dht:bob");
+        let carol = did("did:dht:carol");
+
+        // Set up a shared context where alice, bob, and carol are all members.
+        // recovery_notify_contact searches for shared contexts between the
+        // recovering DID and each contact.
+        setup_context_with_members(&manager, "ctx-shared", &alice, &[&bob, &carol]).await;
+
+        let backend = ProductionRecoveryBackend::new(manager);
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
-        let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
+        let contacts = HashSet::from([bob, carol]);
 
         let result =
             backend.notify_contacts(&alice, CompromiseTier::Agent, &key_rotation, &contacts);
@@ -1991,14 +2063,17 @@ mod tests {
     async fn production_backend_full_recovery_agent_tier() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
+        let bob = did("did:dht:bob");
         let context_id = "ctx-full-recovery";
 
-        setup_context(&manager, context_id, &alice).await;
+        // Set up a context with alice and bob as members so contact
+        // notification can find a shared context.
+        setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
 
         let backend = ProductionRecoveryBackend::new(manager);
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
-        let contacts = HashSet::from([did("did:dht:bob")]);
+        let contacts = HashSet::from([bob]);
 
         let result = orch
             .execute_recovery(
@@ -2023,14 +2098,17 @@ mod tests {
     async fn production_backend_full_recovery_active_signing_tier() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
+        let bob = did("did:dht:bob");
         let context_id = "ctx-active-recovery";
 
-        setup_context(&manager, context_id, &alice).await;
+        // Set up a context with alice and bob as members so contact
+        // notification can find a shared context.
+        setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
 
         let backend = ProductionRecoveryBackend::new(manager);
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
         let key_rotation = active_key_rotation_outcome(&alice, 2000);
-        let contacts = HashSet::from([did("did:dht:bob")]);
+        let contacts = HashSet::from([bob]);
         let psk_params = PskRotationParams {
             enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
             compromised_device_pubkey: None,
@@ -2057,14 +2135,18 @@ mod tests {
     async fn production_backend_full_recovery_identity_key_tier() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
+        let bob = did("did:dht:bob");
+        let carol = did("did:dht:carol");
         let context_id = "ctx-identity-recovery";
 
-        setup_context(&manager, context_id, &alice).await;
+        // Set up a context with alice, bob, and carol as members so
+        // contact notification can find shared contexts.
+        setup_context_with_members(&manager, context_id, &alice, &[&bob, &carol]).await;
 
         let backend = ProductionRecoveryBackend::new(manager);
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
         let key_rotation = identity_key_rotation_outcome(&alice, did("did:dht:alice-new"), 3000);
-        let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
+        let contacts = HashSet::from([bob, carol]);
         let psk_params = PskRotationParams {
             enrolled_device_pubkeys: vec![vec![1u8; 32]],
             compromised_device_pubkey: None,

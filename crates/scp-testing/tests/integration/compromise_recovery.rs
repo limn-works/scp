@@ -75,7 +75,11 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError> {
+    fn rotate_key_packages(
+        &self,
+        context_id: &str,
+        _key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError> {
         if let Some((ref ctx, ref err)) = self.rotate_key_packages_error
             && ctx == context_id
         {
