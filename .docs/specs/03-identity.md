@@ -855,6 +855,7 @@ The relying party generates a challenge:
 
 ```
 ScpIdChallenge {
+    protocol:   String,      // "scpid/1.0" — MUST reject unrecognized versions
     nonce:      [u8; 32],    // 32 bytes, CSPRNG-generated
     audience:   String,      // URI identifying the relying party (e.g., "https://app.example.com")
     issued_at:  u64,         // Unix timestamp (ms) when the challenge was created
@@ -879,6 +880,7 @@ The client constructs and signs the response:
 
 ```
 ScpIdResponse {
+    protocol:       String,   // "scpid/1.0" — MUST reject unrecognized versions
     did:            DID,      // The signer's DID
     signing_key_id: String,   // Verification method ID: "#active" or "#agent"
     nonce:          [u8; 32], // Echo of the challenge nonce

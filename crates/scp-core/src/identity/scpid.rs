@@ -460,7 +460,7 @@ mod tests {
             "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "audience": "https://example.com",
             "signed_at": 1709654400000,
-            "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         }"##;
         let result = serde_json::from_str::<ScpIdResponse>(json);
         assert!(result.is_err(), "should reject wrong protocol on response deser");
