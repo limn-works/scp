@@ -790,6 +790,10 @@ pub struct BilateralRecoveryParams<'a> {
     pub local_epoch: u64,
     /// Current group epoch.
     pub current_epoch: u64,
+    /// Number of messages queued by the online member during the offline
+    /// period. The caller obtains this from the outbound queue length for
+    /// this context in the online member's `ProtocolRepository`.
+    pub online_member_queued_messages: u64,
 }
 
 /// Assesses recovery for a bilateral (2-person) context.
@@ -815,7 +819,7 @@ pub fn assess_bilateral_recovery(params: &BilateralRecoveryParams<'_>) -> Bilate
         online_member_can_reset: params.online_can_reset,
         last_known_epoch: params.local_epoch,
         current_epoch: params.current_epoch,
-        online_member_queued_messages: 0,
+        online_member_queued_messages: params.online_member_queued_messages,
         assessment,
     }
 }
@@ -1671,6 +1675,7 @@ mod tests {
             now: BASE_TIMESTAMP + FOURTEEN_DAYS_SECS,
             local_epoch: 50,
             current_epoch: 200,
+            online_member_queued_messages: 5,
         });
 
         assert_eq!(recovery.context_id, "ctx-bilateral");
@@ -1679,6 +1684,7 @@ mod tests {
         assert!(recovery.online_member_can_reset);
         assert_eq!(recovery.last_known_epoch, 50);
         assert_eq!(recovery.current_epoch, 200);
+        assert_eq!(recovery.online_member_queued_messages, 5);
         assert!(matches!(
             recovery.assessment,
             OfflineAssessment::ForceReJoinRequired { .. }
@@ -1696,6 +1702,7 @@ mod tests {
             now: BASE_TIMESTAMP + THREE_DAYS_SECS,
             local_epoch: 50,
             current_epoch: 60,
+            online_member_queued_messages: 0,
         });
 
         assert!(matches!(
@@ -1715,6 +1722,7 @@ mod tests {
             now: BASE_TIMESTAMP + FOURTEEN_DAYS_SECS,
             local_epoch: 50,
             current_epoch: 200,
+            online_member_queued_messages: 0,
         });
 
         assert!(!recovery.online_member_can_reset);
@@ -1955,6 +1963,7 @@ mod tests {
             now: BASE_TIMESTAMP + THIRTY_DAYS_SECS,
             local_epoch: 10,
             current_epoch: 3_000,
+            online_member_queued_messages: 42,
         });
         assert!(matches!(
             recovery.assessment,

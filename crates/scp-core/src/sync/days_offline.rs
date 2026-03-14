@@ -731,7 +731,7 @@ pub fn apply_delta(
     local_state.tool_names.sort();
 
     // Advance event log state
-    local_state.event_count += delta.events_added;
+    local_state.event_count = local_state.event_count.saturating_add(delta.events_added);
     local_state.event_log_merkle_root = delta.new_merkle_root;
 
     // Advance epoch and snapshot sequence
@@ -756,10 +756,7 @@ pub fn apply_delta(
 ///
 /// See ADR-029 section 3 (MLS Epoch Catch-Up).
 #[must_use]
-pub const fn determine_mls_recovery(
-    delta: &SnapshotDelta,
-    policy: &SyncPolicy,
-) -> MlsRecoveryAction {
+pub fn determine_mls_recovery(delta: &SnapshotDelta, policy: &SyncPolicy) -> MlsRecoveryAction {
     match (delta.from_epoch, delta.to_epoch) {
         (Some(from), Some(to)) if from == to => MlsRecoveryAction::NoAction,
         (Some(from), Some(to)) => {
@@ -776,9 +773,20 @@ pub const fn determine_mls_recovery(
                 }
             }
         }
-        // (None, None) = broadcast context, or mismatched None/Some —
-        // anomalous state; treat as no action (caller handles).
-        _ => MlsRecoveryAction::NoAction,
+        // (None, None) = broadcast context — no MLS epoch to reconcile.
+        (None, None) => MlsRecoveryAction::NoAction,
+        // Mismatched None/Some — anomalous state (one snapshot has an MLS
+        // epoch and the other does not). Log a warning and fall through to
+        // NoAction; the caller is responsible for handling the mismatch.
+        (from, to) => {
+            tracing::warn!(
+                context_id = %delta.context_id,
+                from_epoch = ?from,
+                to_epoch = ?to,
+                "anomalous MLS epoch state in delta: mismatched None/Some pair"
+            );
+            MlsRecoveryAction::NoAction
+        }
     }
 }
 

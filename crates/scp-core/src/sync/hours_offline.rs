@@ -919,7 +919,7 @@ impl ReconnectionCoordinator {
                     events_recovered: 0,
                     messages_unrecoverable: 0,
                     mls_update_issued: false,
-                    outcome: SyncOutcome::FullyCaughtUp, // Placeholder until sync runs.
+                    outcome: SyncOutcome::Pending,
                     sync_events: Vec::new(),
                 }
             })
