@@ -1449,47 +1449,25 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
 // Economic policy bridge (§19.3, ADR-033)
 // ---------------------------------------------------------------------------
 
-/// Sets the economic policy for a context (§19.3).
+/// Rejects direct economic policy mutation — use governance flow instead
+/// (§19.3, #728).
 ///
-/// Accepts the economic policy as a JSON string. Validates the JSON against
-/// the `EconomicPolicy` schema before storing. If the existing policy has
-/// `locked: true`, the mutation is rejected — matching the
-/// `ContextManager::execute_set_economic_policy` behaviour in scp-core.
-///
-/// # Warning
-///
-/// This is a low-level FFI function that directly overwrites the economic
-/// policy on the context handle. It does **not** go through governance —
-/// there is no event logging, no 24-hour notification period, and no
-/// proposal flow. Governance enforcement is the SDK / application layer's
-/// responsibility. See spec §19.3 and ADR-033 for the full governance
-/// requirements around economic policy changes.
+/// Economic policy changes MUST go through the governance proposal flow
+/// (`SetEconomicPolicy` action) to ensure event logging and the mandatory
+/// 24-hour notification period. Direct setters bypass these controls.
 ///
 /// # Errors
 ///
-/// - `ValueError` if the JSON is invalid or does not parse as `EconomicPolicy`.
-/// - `PermissionError` if the existing economic policy is locked.
-/// - `ScpContextError` if the context handle is not valid.
+/// Always returns `PermissionError` directing the caller to use governance.
 #[pyfunction]
 #[pyo3(signature = (handle, policy_json))]
 fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> PyResult<()> {
-    // Check whether the existing policy is locked (§19.3).
-    if let Some(ref existing_json) = handle.params.economic_policy
-        && let Ok(existing) =
-            serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
-        && existing.locked
-    {
-        return Err(pyo3::exceptions::PyPermissionError::new_err(
-            "economic policy is locked and cannot be changed",
-        ));
-    }
-
-    let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(policy_json)
-        .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid economic policy JSON: {e}"))
-        })?;
-    handle.params.economic_policy = Some(policy_json.to_owned());
-    Ok(())
+    let _ = (handle, policy_json);
+    Err(pyo3::exceptions::PyPermissionError::new_err(
+        "economic policy changes must go through governance \
+         (propose SetEconomicPolicy action). Direct mutation is \
+         not permitted — see spec §19.3",
+    ))
 }
 
 /// Returns the economic policy for a context as a JSON string, or `None`.
@@ -3196,30 +3174,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn set_economic_policy_valid_json() {
+    fn set_economic_policy_always_rejects_requires_governance() {
         let mut handle = PyContextHandle::new(
             "ctx-econ-1".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
         );
-        assert!(handle.params.economic_policy.is_none());
 
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        py_set_economic_policy(&mut handle, json).unwrap();
-        assert_eq!(handle.params.economic_policy.as_deref(), Some(json));
-    }
-
-    #[test]
-    fn set_economic_policy_invalid_json_rejects() {
-        let mut handle = PyContextHandle::new(
-            "ctx-econ-2".to_owned(),
-            "did:test:creator".to_owned(),
-            default_params(),
+        let result = py_set_economic_policy(&mut handle, json);
+        assert!(
+            result.is_err(),
+            "direct set must be rejected — use governance"
         );
-
-        let result = py_set_economic_policy(&mut handle, "not valid json");
-        assert!(result.is_err());
-        // Original value should be unchanged.
         assert!(handle.params.economic_policy.is_none());
     }
 
@@ -3247,42 +3214,6 @@ mod tests {
         );
         let result = py_get_economic_policy(&handle);
         assert_eq!(result.as_deref(), Some(json));
-    }
-
-    #[test]
-    fn set_economic_policy_rejects_when_locked() {
-        let locked_json = r#"{"locked":true,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        let mut handle = PyContextHandle::new(
-            "ctx-econ-locked".to_owned(),
-            "did:test:creator".to_owned(),
-            PyContextParams {
-                economic_policy: Some(locked_json.to_owned()),
-                ..default_params()
-            },
-        );
-
-        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        let result = py_set_economic_policy(&mut handle, new_json);
-        assert!(result.is_err());
-        // Original locked policy should be unchanged.
-        assert_eq!(handle.params.economic_policy.as_deref(), Some(locked_json));
-    }
-
-    #[test]
-    fn set_economic_policy_allows_when_unlocked() {
-        let unlocked_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        let mut handle = PyContextHandle::new(
-            "ctx-econ-unlocked".to_owned(),
-            "did:test:creator".to_owned(),
-            PyContextParams {
-                economic_policy: Some(unlocked_json.to_owned()),
-                ..default_params()
-            },
-        );
-
-        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        py_set_economic_policy(&mut handle, new_json).unwrap();
-        assert_eq!(handle.params.economic_policy.as_deref(), Some(new_json));
     }
 
     // -----------------------------------------------------------------------

@@ -442,6 +442,7 @@ pub fn wasm_event_type_tag(event_type: &str) -> u16 {
         "MediaSessionEnded" => 20,
         "PaymentReceived" => 21,
         "EconomicPolicyChanged" => 22,
+        "EconomicPolicyApplied" => 33,
         "SpendingUcanGranted" => 23,
         "SpendingUcanRevoked" => 24,
         "GovernanceProposalCreated" => 25,

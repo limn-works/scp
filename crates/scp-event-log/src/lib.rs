@@ -146,8 +146,13 @@ pub enum EventType {
     /// A payment was received and captured (spec section 19.6.1).
     PaymentReceived,
     /// The context's economic policy was changed through governance
-    /// (spec section 19.6.1).
+    /// (spec section 19.6.1). This event marks the START of the 24-hour
+    /// notification period (§19.3). The policy is not yet in effect.
     EconomicPolicyChanged,
+    /// A pending economic policy change was applied after the 24-hour
+    /// notification period expired (spec section 19.3). The new policy
+    /// is now in effect.
+    EconomicPolicyApplied,
     /// A spending UCAN was granted to an agent (spec section 19.6.1).
     SpendingUcanGranted,
     /// A spending UCAN was revoked (spec section 19.6.1).
@@ -474,6 +479,7 @@ mod tests {
             EventType::MediaSessionEnded,
             EventType::PaymentReceived,
             EventType::EconomicPolicyChanged,
+            EventType::EconomicPolicyApplied,
             EventType::SpendingUcanGranted,
             EventType::SpendingUcanRevoked,
             // Governance event types (ADR-031 §8)
@@ -487,10 +493,10 @@ mod tests {
             EventType::GovernanceActionExecuted,
         ];
 
-        // Verify all 33 variants are covered.
+        // Verify all 34 variants are covered.
         assert_eq!(
             event_types.len(),
-            33,
+            34,
             "all EventType variants must be tested"
         );
 

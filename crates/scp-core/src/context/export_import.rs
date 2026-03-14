@@ -293,6 +293,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         approved_proposals: HashMap::new(),
         governance_freeze: None,
         pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
         mls_epoch: 0,
         // Epoch coordination records are stripped in public scope —
         // they are auditable but internal governance state.
@@ -399,6 +400,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),

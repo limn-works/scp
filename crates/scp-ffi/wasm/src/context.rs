@@ -960,36 +960,29 @@ pub fn broadcast_handle_key_request(
 // Economic policy bridge (§19.3, ADR-033)
 // ---------------------------------------------------------------------------
 
-/// Sets the economic policy on a context (§19.3).
+/// Rejects direct economic policy mutation — use governance flow instead
+/// (§19.3, #728).
 ///
-/// Validates the JSON string before storing. Does not go through
-/// governance — this is a direct setter for local state matching the
-/// `PyO3` `py_set_economic_policy` pattern.
+/// Economic policy changes MUST go through the governance proposal flow
+/// (`SetEconomicPolicy` action) to ensure event logging and the mandatory
+/// 24-hour notification period.
 ///
 /// # Errors
 ///
-/// Returns a `JsError` if the JSON is invalid.
+/// Always returns a `JsError` directing the caller to use governance.
 #[wasm_bindgen]
 pub fn context_set_economic_policy(
-    handle: &WasmContextHandle,
-    policy_json: String,
+    _handle: &WasmContextHandle,
+    _policy_json: String,
 ) -> Result<(), JsError> {
-    // Validate JSON is well-formed and parses as a generic JSON value.
-    // WASM cannot import scp-core's EconomicPolicy (ADR-034), so we
-    // validate that the JSON is syntactically valid. Schema validation
-    // is the SDK wrapper's responsibility in the WASM path.
-    let _val: serde_json::Value = serde_json::from_str(&policy_json).map_err(|e| {
-        ScpWasmError::Validation {
-            message: format!("invalid economic policy JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
-        }
-        .into_js()
-    })?;
-
-    let context_id = handle.context_id();
-    with_manager(|mgr| mgr.set_economic_policy(&context_id, policy_json))
-        .map_err(ScpWasmError::into_js)?;
-    Ok(())
+    Err(ScpWasmError::Permission {
+        message: "economic policy changes must go through governance \
+                  (propose SetEconomicPolicy action). Direct mutation is \
+                  not permitted — see spec §19.3"
+            .to_owned(),
+        code: "SCP-CTX-2013".to_owned(),
+    }
+    .into_js())
 }
 
 /// Returns the economic policy for a context as a JSON string, or `null`.

@@ -372,6 +372,20 @@ pub enum ContextEvent {
         /// The governance proposal ID that approved this modification.
         proposal_id: [u8; 32],
     },
+    /// An economic policy change notification was emitted (§19.3).
+    ///
+    /// All current members receive this when a `SetEconomicPolicy` governance
+    /// action is approved. The notification period (minimum 24 hours) must
+    /// expire before the new policy takes effect. Members may leave during
+    /// the notification period if they disagree with the proposed pricing.
+    EconomicPolicyChangeNotification {
+        /// Unix timestamp (seconds) when the notification period started.
+        notified_at: u64,
+        /// Unix timestamp (seconds) when the new policy takes effect.
+        effective_at: u64,
+        /// The governance proposal ID that approved this change.
+        proposal_id: [u8; 32],
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.
