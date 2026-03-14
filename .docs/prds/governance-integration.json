@@ -6,7 +6,7 @@
       "id": "gate-gov-wiring",
       "name": "Governance-Manager Wiring",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-267",
         "SCP-268",
@@ -143,7 +143,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/governance/mod.rs",
         "crates/scp-core/src/context/mod.rs",
@@ -213,7 +213,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/mod.rs"
@@ -280,7 +280,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/governance/mod.rs"
@@ -344,7 +344,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/governance/mod.rs"
@@ -395,7 +395,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/store/mod.rs",
         "crates/scp-core/src/context/governance/mod.rs"
@@ -443,7 +443,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/tests/governance_integration.rs"
       ],

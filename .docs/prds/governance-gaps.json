@@ -6,7 +6,7 @@
       "id": "gate-foundation-types",
       "name": "Foundation Types",
       "priority": "P0",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-GG-001",
         "SCP-GG-002"
@@ -16,7 +16,7 @@
       "id": "gate-metadata-visibility",
       "name": "Metadata Visibility",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-GG-003",
         "SCP-GG-004"
@@ -26,7 +26,7 @@
       "id": "gate-governance-bans",
       "name": "Governance Bans",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-GG-005",
         "SCP-GG-006"
@@ -36,7 +36,7 @@
       "id": "gate-projection-auth",
       "name": "Projection Auth",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-GG-007",
         "SCP-GG-008"
@@ -50,7 +50,7 @@
       "gate": "gate-foundation-types",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/roles.rs",
         "crates/scp-core/src/context/params.rs"
@@ -107,7 +107,7 @@
       "gate": "gate-foundation-types",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/governance/mod.rs",
         "crates/scp-core/src/context/governance/mls_integration.rs",
@@ -151,7 +151,7 @@
       "gate": "gate-metadata-visibility",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/templates.rs"
       ],
@@ -199,7 +199,7 @@
       "gate": "gate-metadata-visibility",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/params.rs"
       ],
@@ -239,7 +239,7 @@
       "gate": "gate-governance-bans",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/broadcast.rs"
       ],
@@ -285,7 +285,7 @@
       "gate": "gate-governance-bans",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
@@ -333,7 +333,7 @@
       "gate": "gate-projection-auth",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs",
         "crates/scp-node/src/lib.rs"
@@ -376,7 +376,7 @@
       "gate": "gate-projection-auth",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs"
       ],
