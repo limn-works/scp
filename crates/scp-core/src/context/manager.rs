@@ -3026,6 +3026,54 @@ impl ContextManager {
             .unwrap_or_default()
     }
 
+    /// Reports that a received envelope triggered degraded mode (§13.6) for a
+    /// context.
+    ///
+    /// Called by the SDK/FFI layer after processing a received envelope whose
+    /// [`VersionCompatibility`] is [`DegradedMode`]. This pushes a
+    /// [`ContextEvent::DegradedMode`] to the context's receive buffer so the
+    /// application layer can observe the degraded state via [`drain_events`].
+    ///
+    /// If `compat` is [`VersionCompatibility::Exact`], this is a no-op (no
+    /// event is emitted). If the context is not registered, this is also a
+    /// no-op.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The context where the envelope was received.
+    /// * `compat` — The version compatibility result from envelope processing.
+    /// * `unsupported_features` — Human-readable descriptions of features
+    ///   present in the remote version that the local implementation does not
+    ///   support. At SCP/1.x there are no known feature flags; pass an empty
+    ///   `Vec`.
+    ///
+    /// [`VersionCompatibility`]: crate::envelope::VersionCompatibility
+    /// [`DegradedMode`]: crate::envelope::VersionCompatibility::DegradedMode
+    /// [`drain_events`]: Self::drain_events
+    pub async fn report_degraded_mode(
+        &self,
+        context_id: &str,
+        compat: crate::envelope::VersionCompatibility,
+        unsupported_features: Vec<String>,
+    ) {
+        if let crate::envelope::VersionCompatibility::DegradedMode {
+            local_minor,
+            remote_minor,
+        } = compat
+        {
+            let local_major = crate::envelope::version_major(crate::envelope::SCP_PROTOCOL_VERSION);
+            let remote_major = local_major; // same major guaranteed by VersionCompatibility
+            if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+                ctx.receive_buffer.push(ContextEvent::DegradedMode {
+                    context_id: context_id.to_owned(),
+                    local_version: (local_major, local_minor),
+                    remote_version: (remote_major, remote_minor),
+                    unsupported_features,
+                });
+            }
+        }
+    }
+
     // -------------------------------------------------------------------
     // Broadcast context operations (SCP-227)
     // -------------------------------------------------------------------
@@ -18902,5 +18950,106 @@ mod tests {
             source.proposal_id, ms.proposal_id,
             "migration_source proposal_id should match"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Degraded mode reporting tests (§13.6, #606)
+    // -----------------------------------------------------------------------
+
+    /// `report_degraded_mode` emits a `ContextEvent::DegradedMode` when given
+    /// a `VersionCompatibility::DegradedMode` result.
+    #[tokio::test]
+    async fn report_degraded_mode_emits_event() {
+        let (manager, _handle) = setup_active_context().await;
+
+        let compat = crate::envelope::VersionCompatibility::DegradedMode {
+            local_minor: 0,
+            remote_minor: 3,
+        };
+
+        manager
+            .report_degraded_mode("test-ctx", compat, vec!["hypothetical-feature".to_owned()])
+            .await;
+
+        let events = manager.drain_events("test-ctx").await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ContextEvent::DegradedMode {
+                context_id,
+                local_version,
+                remote_version,
+                unsupported_features,
+            } => {
+                assert_eq!(context_id, "test-ctx");
+                assert_eq!(*local_version, (1, 0));
+                assert_eq!(*remote_version, (1, 3));
+                assert_eq!(unsupported_features, &["hypothetical-feature"]);
+            }
+            other => panic!("expected DegradedMode event, got {other:?}"),
+        }
+    }
+
+    /// `report_degraded_mode` is a no-op when given
+    /// `VersionCompatibility::Exact`.
+    #[tokio::test]
+    async fn report_degraded_mode_noop_for_exact() {
+        let (manager, _handle) = setup_active_context().await;
+
+        manager
+            .report_degraded_mode(
+                "test-ctx",
+                crate::envelope::VersionCompatibility::Exact,
+                vec![],
+            )
+            .await;
+
+        let events = manager.drain_events("test-ctx").await;
+        assert!(
+            events.is_empty(),
+            "Exact compatibility should not emit events"
+        );
+    }
+
+    /// `report_degraded_mode` is a no-op for an unknown context.
+    #[tokio::test]
+    async fn report_degraded_mode_noop_for_unknown_context() {
+        let (manager, _handle) = setup_active_context().await;
+
+        let compat = crate::envelope::VersionCompatibility::DegradedMode {
+            local_minor: 0,
+            remote_minor: 2,
+        };
+
+        // "nonexistent-ctx" is not registered — should not panic.
+        manager
+            .report_degraded_mode("nonexistent-ctx", compat, vec![])
+            .await;
+
+        // No events on the registered context either.
+        let events = manager.drain_events("test-ctx").await;
+        assert!(events.is_empty());
+    }
+
+    /// Multiple degraded mode reports accumulate in the receive buffer.
+    #[tokio::test]
+    async fn report_degraded_mode_accumulates() {
+        let (manager, _handle) = setup_active_context().await;
+
+        for minor in 1..=3u8 {
+            let compat = crate::envelope::VersionCompatibility::DegradedMode {
+                local_minor: 0,
+                remote_minor: minor,
+            };
+            manager
+                .report_degraded_mode("test-ctx", compat, vec![])
+                .await;
+        }
+
+        let events = manager.drain_events("test-ctx").await;
+        let degraded_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::DegradedMode { .. }))
+            .collect();
+        assert_eq!(degraded_events.len(), 3);
     }
 }
