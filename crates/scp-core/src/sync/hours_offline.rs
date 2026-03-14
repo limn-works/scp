@@ -2704,10 +2704,7 @@ mod tests {
             report.contexts_synced[0].outcome,
             SyncOutcome::FullyCaughtUp,
         );
-        assert_eq!(
-            report.contexts_synced[1].outcome,
-            SyncOutcome::ContextGone,
-        );
+        assert_eq!(report.contexts_synced[1].outcome, SyncOutcome::ContextGone,);
         assert_eq!(report.messages_drained, 5);
         assert_eq!(report.messages_discarded, 2);
     }
