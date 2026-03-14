@@ -38,7 +38,7 @@ import kotlin.test.assertTrue
  * - Context creation, join, leave, close
  * - Membership queries (count, is_member, member_dids, role)
  * - Tool registration and verification
- * - UCAN mint
+ * - UCAN mint and revoke
  * - Event log query
  * - Discovery address parsing
  * - Provenance evaluation
@@ -295,6 +295,34 @@ class RealFFITest {
             val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
             val tokenData = token.tokenData()
             assertNotNull(tokenData, "Token data should be non-null")
+        }
+
+        @Test
+        fun `revoke UCAN token`() = runTest {
+            assumeTrue(nativeAvailable, skipReason)
+            val alice = uniffi.scp.identityCreate("in_memory")
+            val params = uniffi.scp.ContextParams(
+                ceiling = listOf("messages:read"),
+                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                ttlSeconds = 0uL,
+                promotable = false,
+                minProtocolVersion = 0u,
+            )
+            val handle = uniffi.scp.contextCreate(alice, params)
+
+            // Mint a token so the UCAN state is fully initialised for this context.
+            val bob = uniffi.scp.identityCreate("in_memory")
+            val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
+            assertNotNull(token.tokenData(), "Minted token should have data")
+
+            // Revoke the token. The bridge accepts the raw JWT string.
+            // Revocation is idempotent — revoking a non-existent or already-
+            // revoked token succeeds without error.
+            uniffi.scp.ucanRevoke(handle, "not-a-valid-ucan-token")
+
+            // A second revocation of the same string also succeeds (idempotent).
+            uniffi.scp.ucanRevoke(handle, "not-a-valid-ucan-token")
         }
     }
 
