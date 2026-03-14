@@ -1,37 +1,33 @@
-name: PR Review
+name: PRD Story Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review]
-    paths:
-      - 'crates/**'
-      - 'bindings/**'
-      - 'tests/**'
-      - 'scripts/**'
-      - '.docs/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+    types: [opened, synchronize, ready_for_review, labeled]
 
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number }}
+  group: pr-story-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  review:
+  story-review:
     if: |
       github.event.pull_request.draft == false &&
-      github.actor != 'dependabot[bot]' &&
-      !contains(github.event.pull_request.labels.*.name, 'prd-story')
+      contains(github.event.pull_request.labels.*.name, 'prd-story')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
+      issues: read
       id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Compute review scope
         id: diff
@@ -55,9 +51,7 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "diff_head=$DIFF_HEAD" >> "$GITHUB_OUTPUT"
 
-          # Write raw file list, then filter to in-scope paths
           if ! git diff --name-only "$DIFF_BASE".."$DIFF_HEAD" > /tmp/all-changed-files.txt 2>/dev/null; then
-            # BEFORE sha is unreachable (force push) — fall back to full PR diff
             MODE="full"
             DIFF_BASE="$PR_BASE"
             DIFF_HEAD="$HEAD"
@@ -65,151 +59,139 @@ jobs:
             gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > /tmp/all-changed-files.txt
           fi
 
-          grep -E '^(crates/|bindings/|tests/|scripts/|\.docs/|Cargo\.(toml|lock)$)' /tmp/all-changed-files.txt > /tmp/changed-files.txt || true
+          cp /tmp/all-changed-files.txt /tmp/changed-files.txt
 
           FILE_COUNT=$(wc -l < /tmp/changed-files.txt | tr -d ' ')
           echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
 
-          if [[ "$FILE_COUNT" -eq 0 ]]; then
-            echo "No in-scope files changed — skipping review."
-            exit 0
-          fi
-
-          # Write diff content (only in-scope files)
-          git diff "$DIFF_BASE".."$DIFF_HEAD" -- $(cat /tmp/changed-files.txt) > /tmp/scope-diff.patch || \
+          git diff "$DIFF_BASE".."$DIFF_HEAD" > /tmp/scope-diff.patch || \
             gh pr diff ${{ github.event.pull_request.number }} > /tmp/scope-diff.patch
-
-          echo "## Review Scope" > /tmp/review-scope.md
-          echo "**Mode:** $MODE" >> /tmp/review-scope.md
-          echo "**Range:** \`${DIFF_BASE:0:8}..${DIFF_HEAD:0:8}\`" >> /tmp/review-scope.md
-          echo "**Files in scope:** $FILE_COUNT" >> /tmp/review-scope.md
-          echo "" >> /tmp/review-scope.md
-          echo "### Changed files" >> /tmp/review-scope.md
-          cat /tmp/changed-files.txt >> /tmp/review-scope.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract PR body and run structural validation
+        id: structural
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get PR body
+          gh pr view ${{ github.event.pull_request.number }} --json body --jq '.body' > /tmp/pr-body.md
+
+          # Run structural validation
+          RESULT=$(python3 scripts/validate-pr-story.py \
+            --body-file /tmp/pr-body.md \
+            --files-file /tmp/changed-files.txt) || true
+
+          echo "$RESULT" > /tmp/structural-result.json
+
+          # Extract story ID for Claude
+          STORY_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('story_id',''))" 2>/dev/null || echo "")
+          echo "story_id=$STORY_ID" >> "$GITHUB_OUTPUT"
+
+          PRD_FILE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('prd_file',''))" 2>/dev/null || echo "")
+          echo "prd_file=$PRD_FILE" >> "$GITHUB_OUTPUT"
+
+          VALID=$(echo "$RESULT" | python3 -c "import sys,json; print(str(json.load(sys.stdin).get('valid',False)).lower())" 2>/dev/null || echo "false")
+          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
+
+          # Extract and save report
+          python3 -c "import sys,json; print(json.load(sys.stdin).get('report','Script error.'))" < /tmp/structural-result.json > /tmp/structural-report.md
+
       - name: Fetch review history
-        if: steps.diff.outputs.file_count != '0'
         run: |
           PR=${{ github.event.pull_request.number }}
           REPO="${{ github.repository }}"
-          OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
 
-          echo "## Previous Review Threads" > /tmp/review-history.md
+          echo "## Previous Story Review Comments" > /tmp/review-history.md
 
-          # Inline review threads with resolution status (GraphQL)
-          gh api graphql -f query='
-          {
-            repository(owner: "'"$OWNER"'", name: "'"$REPO_NAME"'") {
-              pullRequest(number: '"$PR"') {
-                reviewThreads(first: 100) {
-                  nodes {
-                    isResolved
-                    isOutdated
-                    path
-                    line
-                    comments(first: 5) {
-                      nodes {
-                        body
-                        author { login }
-                        createdAt
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }' --jq '.data.repository.pullRequest.reviewThreads.nodes' > /tmp/review-threads.json 2>/dev/null || echo "[]" > /tmp/review-threads.json
+          gh api "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.body | test("PRD Story Review")) | "- \(.user.login) at \(.created_at): \(.body | .[0:500])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
 
-          THREAD_COUNT=$(jq length /tmp/review-threads.json)
-          if [[ "$THREAD_COUNT" -gt 0 ]]; then
-            echo "" >> /tmp/review-history.md
-            echo "**$THREAD_COUNT thread(s) found.**" >> /tmp/review-history.md
-            echo "" >> /tmp/review-history.md
-            jq -r '.[] | "- [\(if .isResolved then "RESOLVED" elif .isOutdated then "OUTDATED" else "OPEN" end)] \(.path):\(.line) — \(.comments.nodes[0].body | .[0:200])"' /tmp/review-threads.json >> /tmp/review-history.md
-          else
-            echo "" >> /tmp/review-history.md
-            echo "No previous review threads." >> /tmp/review-history.md
-          fi
-
-          # Previous review verdicts
           echo "" >> /tmp/review-history.md
           echo "## Previous Review Verdicts" >> /tmp/review-history.md
           gh api "repos/$REPO/pulls/$PR/reviews" \
             --jq '.[] | "- \(.state) by \(.user.login) at \(.submitted_at): \(.body | .[0:300])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
-
-          # PR-level comments
-          echo "" >> /tmp/review-history.md
-          echo "## Previous PR Comments" >> /tmp/review-history.md
-          gh api "repos/$REPO/issues/$PR/comments" \
-            --jq '.[] | "- \(.user.login) at \(.created_at): \(.body | .[0:300])"' >> /tmp/review-history.md 2>/dev/null || echo "None." >> /tmp/review-history.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run Claude PR review
-        if: steps.diff.outputs.file_count != '0'
-        continue-on-error: true
+      - name: Run Claude story-aware review
+        if: steps.structural.outputs.story_id != ''
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           show_full_output: true
-          claude_args: '--model claude-opus-4-20250514 --max-turns 100 --allowedTools "Bash,Read,Glob,Grep,Task"'
+          claude_args: '--model claude-opus-4-20250514 --max-turns 80 --allowedTools "Bash(gh *),Read,Glob,Grep"'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
 
+            This is a **PRD story implementation PR** for story `${{ steps.structural.outputs.story_id }}`.
+
+            IMPORTANT: Be turn-efficient. Use parallel tool calls aggressively.
+
             ## Setup
 
-            Read the review scope and history (pre-computed):
-            1. Read `/tmp/review-scope.md` — the files and diff range in scope
-            2. Read `/tmp/review-history.md` — all previous review threads and verdicts
-            3. Read `/tmp/scope-diff.patch` — the actual diff to review
+            Read these files in parallel:
+            1. `/tmp/structural-report.md` — structural validation results (file coverage, deps, stubs)
+            2. `/tmp/review-history.md` — previous review comments
+            3. `/tmp/changed-files.txt` — files changed in this PR
+            4. `/tmp/scope-diff.patch` — the actual diff
+            5. `.docs/prds/${{ steps.structural.outputs.prd_file }}.json` — the PRD file (find story `${{ steps.structural.outputs.story_id }}`)
+            6. `.docs/standards/prd.md` — the PRD standard
 
             This review is in **${{ steps.diff.outputs.mode }}** mode.
-            - **full**: Review all changes. This is the first review or the PR just left draft.
-            - **incremental**: Review ONLY the latest push. Do not re-review unchanged code.
+            - **full**: Review all changes against the story.
+            - **incremental**: Review only the latest push.
 
             ## History Rules
 
-            - **RESOLVED threads**: Already fixed. Do NOT re-flag.
-            - **OUTDATED threads**: Code changed since comment. Check if new code fixes the concern.
-              If fixed, skip. If same issue persists, re-flag referencing the original.
-            - **OPEN threads**: Still active on unchanged code. Do NOT duplicate. If the file is in
-              your review scope and the issue persists, you may add a follow-up.
-            - **Previous verdicts**: If changes were previously requested, check whether this push
-              addresses them. Note resolved items and flag remaining ones.
+            Review previous comments in /tmp/review-history.md.
+            - Do NOT repeat findings already flagged.
+            - If a previous finding is resolved, note it.
+            - If still open, re-flag only if in scope.
 
-            ## Perspectives
+            ## Phase 1: Story Compliance
 
-            Review the PR from these 5 perspectives. For each, read the agent file first:
+            Extract the story from the PRD file. For each acceptance criterion:
 
-            ### 1. Architecture (read `.claude/agents/architecture-reviewer.md`)
-            - Completeness, scalability, maintainability
-            - ADR compliance — do changes follow existing decisions?
-            - Pattern consistency — does this establish or break patterns?
+            1. **Find the implementation.** Search the changed files for code that satisfies
+               the criterion. Read the relevant source files.
+            2. **Find the test.** Search for a test that verifies the criterion. If the AC says
+               "returns Err for X", there should be a test that asserts exactly that.
+            3. **Grade it:**
+               - **MET** — implementation exists AND test exists
+               - **PARTIAL** — implementation exists but no test, or test exists but
+                 implementation is incomplete
+               - **MISSING** — neither implementation nor test found
+               - **STUB** — stub/TODO/placeholder found instead of implementation
 
-            ### 2. Security (read `.claude/agents/security-reviewer.md`)
-            - Authentication/authorization issues
-            - Input validation, injection risks
-            - Secrets exposure, error message leakage
+            Build a table:
+            | # | Acceptance Criterion | Status | Implementation | Test |
+            |---|---------------------|--------|----------------|------|
 
-            ### 3. Alignment (read `.claude/agents/alignment-reviewer.md`)
-            - Does implementation match the spec/issue it addresses?
-            - Does it serve the product vision from `.docs/architecture.md`?
-            - Will it create problems for future phases?
+            ## Phase 2: Source Verification
 
-            ### 4. API Design (read `.claude/agents/api-design-reviewer.md`)
-            - Discoverability, misuse resistance
-            - Consistency with existing APIs
-            - Developer experience
+            For each source in the story's `sources` array:
+            1. Read the referenced section in the spec/ADR
+            2. Verify the implementation matches what the source says
+            3. Flag any drift between source requirements and implementation
 
-            ### 5. Code Quality (read `.claude/agents/bug-catcher.md`)
-            - Actual bugs: crashes, logic errors, concurrency issues
-            - Incorrect assumptions about data or state
-            - Edge cases and error handling gaps
+            ## Phase 3: Code Quality
 
-            ### 6. Completeness & Gap Detection
+            Review from these perspectives (same as general review but story-focused):
+
+            ### Architecture
+            - Does the implementation follow existing patterns and ADRs?
+            - Is it structured for the right abstraction level?
+
+            ### Security
+            - Authentication/authorization, input validation, secrets handling
+            - Cryptographic correctness (if applicable)
+
+            ### Bugs
+            - Logic errors, edge cases, concurrency issues
+            - Error handling gaps, incorrect assumptions
+
+            ### Completeness & Gap Detection
 
             This is the **highest-priority perspective**. The most common failure mode
             in this codebase is code that compiles and passes tests but is incomplete —
@@ -223,7 +205,7 @@ jobs:
             *Textual (grep these):*
             - `todo!()`, `unimplemented!()`, `// Stub`, `// TODO`, `// FIXME`, `// HACK`
             - `placeholder`, `Default::default()` used where a real value should exist
-            - `None` assignments where the spec defines a real value
+            - `None` assignments where the story/spec defines a real value
 
             *Semantic (trace these — they won't show up in grep):*
             - **Empty implementations**: function body is just `Ok(())`, `Ok(vec![])`,
@@ -272,7 +254,7 @@ jobs:
               `bindings/kotlin/`)
 
             **SDK Divergence**
-            - If changes touch core types or public APIs, check whether ALL SDK bindings
+            - If the story touches core types/APIs, check whether ALL SDK bindings
               reflect the change. Build a matrix:
               | Operation | Core | PyO3 | UniFFI | NAPI | WASM | Python SDK | TS SDK | Swift SDK | Kotlin SDK |
               Missing cells are findings.
@@ -282,9 +264,7 @@ jobs:
               each SDK's error mapping
 
             **Implied & Skipped Requirements**
-            - Identify the spec sections relevant to the changed code (use path-to-spec
-              mapping from the spec-drift workflow). Read those sections.
-            - Look for:
+            - Read the source spec/ADR sections referenced by the story. Look for:
               - Conditional language ("unless", "except when", "only if") that
                 should produce explicit branches or error cases in the code
               - Enumerated lists in the spec (e.g., "supports X, Y, and Z") where
@@ -295,6 +275,14 @@ jobs:
             - Compare the spec's level of detail against the implementation's level
               of detail. If the spec has 5 sub-requirements and the code has 2 branches,
               3 are likely missing.
+
+            ## Phase 4: Cross-reference
+
+            Check for consistency issues:
+            - Files changed in PR vs files listed in story — flag mismatches
+            - Dependencies (`blockedBy`) — verify all are `done`
+            - If the PR modifies the PRD file, verify story status is set to `done`
+              and all ACs are reflected
 
             ## Self-Validation (MANDATORY before reporting)
 
@@ -329,46 +317,60 @@ jobs:
 
             ## Output
 
-            For each NEW issue (not previously flagged), post an inline review comment on the specific line(s) using:
+            ### Inline Comments
+
+            For specific code issues, post inline review comments:
             ```bash
             gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
               -f body="<comment>" -f path="<file>" -f commit_id="${{ steps.diff.outputs.diff_head }}" -F line=<line> -f side=RIGHT
             ```
 
-            ONLY comment on files listed in /tmp/changed-files.txt.
+            Only comment on files in /tmp/changed-files.txt.
 
-            ## When to post a review verdict
+            ### Summary Report
 
-            **In incremental mode**: Only post a verdict if you have new findings (inline comments,
-            newly resolved requested-changes, or status changes worth reporting). If the incremental
-            diff introduces no new issues and there are no previous requested-changes to clear,
-            exit silently — do not post an empty approval or "no issues" comment.
-
-            **In full mode**: Always post a verdict (this is the first review).
-
-            ## Verdict format
-
-            If there are critical issues that must be fixed:
+            Write the full report to /tmp/story-review-report.md, then post as a PR comment:
             ```bash
-            gh pr review ${{ github.event.pull_request.number }} --request-changes --body "<summary>"
+            gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/story-review-report.md
             ```
 
-            If there are only notes/suggestions (no critical or warning):
+            **Report format:**
+
+            Start with:
+            `## PRD Story Review — [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+
+            Then:
+            `**Story:** \`${{ steps.structural.outputs.story_id }}\` | **Mode:** ${{ steps.diff.outputs.mode }} | **Files:** <count>`
+
+            Include these sections:
+
+            **Structural Validation** — summarize /tmp/structural-report.md findings
+
+            **Acceptance Criteria** — the table from Phase 1 with the MET/PARTIAL/MISSING/STUB grades
+
+            **Source Verification** — drift findings from Phase 2 (or "No drift detected")
+
+            **Code Quality** — findings from Phase 3 (Architecture, Security, Bugs)
+
+            **Completeness & Gaps** — findings from Completeness & Gap Detection in
+            Phase 3. Include the SDK matrix if applicable. This is the most important
+            section — reviewers read this first.
+
+            **Cross-reference** — findings from Phase 4
+
+            ### Verdict
+
+            **If any AC is MISSING or STUB, or any gap/wiring/SDK findings exist:**
             ```bash
-            gh pr review ${{ github.event.pull_request.number }} --comment --body "<summary>"
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body "Story review: <N> ACs unmet, <M> errors. See report."
             ```
 
-            If there are no issues and you need to clear a previous request-changes, or this is a full review:
+            **If all ACs are MET but there are warnings/notes:**
             ```bash
-            gh pr review ${{ github.event.pull_request.number }} --approve --body "<summary>"
+            gh pr review ${{ github.event.pull_request.number }} --comment --body "Story review: All ACs met. <N> notes. See report."
             ```
 
-            The summary must include:
-            - **Review mode**: ${{ steps.diff.outputs.mode }}
-            - **Files reviewed**: count from /tmp/changed-files.txt
-            - **History reconciliation**: which previous findings were resolved, which remain
-            - A section per perspective (all 6, including Completeness & Gap Detection)
-              with key findings (or "No issues found")
-            - Total issue count by severity (critical / warning / note)
-
-            If no issues are found across all perspectives, say so clearly — don't invent problems.
+            **If all ACs are MET with no issues:**
+            ```bash
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "Story review: All ACs met. Implementation matches story."
+            ```

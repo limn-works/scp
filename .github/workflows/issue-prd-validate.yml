@@ -1,0 +1,91 @@
+name: PRD Story Issue Validation
+
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  validate:
+    if: contains(github.event.issue.labels.*.name, 'prd-story')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate story from issue body
+        id: validate
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          RESULT=$(echo "$ISSUE_BODY" | python3 scripts/validate-issue-story.py) || true
+          echo "$RESULT" > /tmp/validation-result.json
+
+          # Extract report for the comment
+          REPORT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('report','Validation script error.'))")
+          echo "$REPORT" > /tmp/validation-report.md
+
+          # Set outputs
+          VALID=$(echo "$RESULT" | python3 -c "import sys,json; print(str(json.load(sys.stdin).get('valid',False)).lower())")
+          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
+
+          PARSE_ERR=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('parse_error',''))" 2>/dev/null || echo "")
+          if [[ -n "$PARSE_ERR" ]]; then
+            # Write a parse error report
+            cat > /tmp/validation-report.md <<ENDREPORT
+          ## PRD Story Validation
+
+          **PARSE ERROR:** $PARSE_ERR
+
+          Please ensure the Story JSON field contains valid JSON conforming to the PRD standard.
+
+          ---
+          *Validated against [\`.docs/standards/prd.md\`](.docs/standards/prd.md)*
+          ENDREPORT
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find existing validation comment
+        id: find-comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            --jq '[.[] | select(.body | startswith("## PRD Story Validation")) | .id] | last // empty')
+          echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update validation comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE=${{ github.event.issue.number }}
+          COMMENT_ID="${{ steps.find-comment.outputs.comment_id }}"
+
+          if [[ -n "$COMMENT_ID" ]]; then
+            gh api "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" \
+              -X PATCH \
+              -F body=@/tmp/validation-report.md
+          else
+            gh issue comment "$ISSUE" --body-file /tmp/validation-report.md
+          fi
+
+      - name: Apply validation labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE=${{ github.event.issue.number }}
+          VALID="${{ steps.validate.outputs.valid }}"
+
+          if [[ "$VALID" == "true" ]]; then
+            gh issue edit "$ISSUE" --add-label "prd-valid" --remove-label "prd-invalid" 2>/dev/null || \
+              gh issue edit "$ISSUE" --add-label "prd-valid"
+          else
+            gh issue edit "$ISSUE" --add-label "prd-invalid" --remove-label "prd-valid" 2>/dev/null || \
+              gh issue edit "$ISSUE" --add-label "prd-invalid"
+          fi
