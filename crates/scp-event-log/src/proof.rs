@@ -26,7 +26,7 @@ use crate::tree;
 ///
 /// Indicates whether the sibling hash is to the left or right of the node
 /// on the path being verified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     /// The sibling is to the left (our node is the right child).
     Left,
@@ -38,7 +38,7 @@ pub enum Direction {
 ///
 /// Each step contains the sibling hash at a given tree level and indicates
 /// whether that sibling is to the left or right of the path node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProofStep {
     /// The hash of the sibling node at this tree level.
     pub sibling_hash: [u8; 32],
@@ -52,7 +52,7 @@ pub struct ProofStep {
 /// indicators. Proof size is O(log n) where n is the number of leaves.
 ///
 /// See ADR-011 acceptance criterion 3.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InclusionProof {
     /// The index of the leaf in the append-order log.
     pub leaf_index: u64,

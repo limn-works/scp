@@ -16,6 +16,8 @@
 //! - [`TierConfig`] -- Configurable thresholds for tier migration.
 //! - [`TieredEventLog`] -- Wraps an [`EventLog`] with hot/cold tier separation.
 //! - [`ColdTierProvider`] -- Async trait for fetching cold events from a relay.
+//! - [`RelayBlobColdProvider`] -- Production `ColdTierProvider` backed by relay
+//!   blob storage via a caller-supplied fetch function.
 //! - [`ColdTierEntry`] -- Local metadata retained for a cold-tier event.
 //! - [`TierMigrationResult`] -- Statistics from a migration operation.
 //! - [`TieredStorageError`] -- Error type for tiered storage operations.
@@ -142,6 +144,161 @@ pub trait ColdTierProvider: Send + Sync {
         leaf_index: u64,
         leaf_hash: [u8; 32],
     ) -> Result<InclusionProof, TieredStorageError>;
+}
+
+// ---------------------------------------------------------------------------
+// RelayBlobColdProvider
+// ---------------------------------------------------------------------------
+
+/// Production [`ColdTierProvider`] that fetches cold-tier inclusion proofs from
+/// relay blob storage.
+///
+/// Cold-tier events are stored on the relay as `MessagePack`-serialized
+/// [`InclusionProof`] blobs. Each blob is keyed by `(context_id, leaf_index)`.
+/// When a cold proof is requested, this provider delegates to a caller-supplied
+/// fetch function that queries the relay and returns the raw blob bytes. The
+/// provider deserializes the bytes into an [`InclusionProof`].
+///
+/// # Transport agnosticism
+///
+/// This provider does not depend on any specific transport implementation.
+/// The fetch function abstracts over the transport layer -- callers wire it
+/// to a [`TransportAdapter`] at construction time. This keeps `scp-event-log`
+/// free of transport dependencies.
+///
+/// [`TransportAdapter`]: https://docs.rs/scp-transport/latest/scp_transport/traits/trait.TransportAdapter.html
+///
+/// # Wire format
+///
+/// Cold proof blobs are serialized via [`serialize_cold_proof`] and
+/// deserialized via [`deserialize_cold_proof`]. The format is `MessagePack`
+/// with domain separation: a 4-byte magic prefix (`b"SCP1"`) followed by the
+/// serialized [`InclusionProof`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use scp_event_log::tiered_storage::{RelayBlobColdProvider, TieredStorageError};
+///
+/// // Wire to a transport adapter at a higher layer:
+/// let provider = RelayBlobColdProvider::new(Box::new(move |context_id, leaf_index| {
+///     // Query the relay for the cold proof blob keyed by (context_id, leaf_index).
+///     // Return the raw blob bytes or an error string.
+///     let blob_key = format!("{context_id}:cold:{leaf_index}");
+///     relay.fetch_blob(&blob_key).map_err(|e| e.to_string())
+/// }));
+/// ```
+///
+/// See ADR-030 in `.docs/adrs/phase-6.md`.
+pub struct RelayBlobColdProvider {
+    /// Fetch function that retrieves raw cold proof blob bytes from the relay.
+    ///
+    /// Arguments: `(context_id, leaf_index)`.
+    /// Returns: raw blob bytes on success, or an error description on failure.
+    fetch_fn: ColdBlobFetchFn,
+}
+
+/// A fetch function that retrieves raw cold proof blob bytes from the relay.
+///
+/// Takes `(context_id, leaf_index)` and returns the raw blob bytes or an
+/// error description. Used by [`RelayBlobColdProvider`] to abstract over
+/// the transport layer.
+pub type ColdBlobFetchFn = Box<dyn Fn(&str, u64) -> Result<Vec<u8>, String> + Send + Sync>;
+
+impl std::fmt::Debug for RelayBlobColdProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayBlobColdProvider")
+            .field("fetch_fn", &"<fn>")
+            .finish()
+    }
+}
+
+impl RelayBlobColdProvider {
+    /// Creates a new `RelayBlobColdProvider` with the given fetch function.
+    ///
+    /// The fetch function is called with `(context_id, leaf_index)` and must
+    /// return the raw cold proof blob bytes (as produced by
+    /// [`serialize_cold_proof`]) or an error description string.
+    #[must_use]
+    pub fn new(fetch_fn: ColdBlobFetchFn) -> Self {
+        Self { fetch_fn }
+    }
+}
+
+impl ColdTierProvider for RelayBlobColdProvider {
+    fn fetch_inclusion_proof(
+        &self,
+        context_id: &str,
+        leaf_index: u64,
+        _leaf_hash: [u8; 32],
+    ) -> Result<InclusionProof, TieredStorageError> {
+        let blob_bytes = (self.fetch_fn)(context_id, leaf_index).map_err(|e| {
+            TieredStorageError::ColdFetchFailed(format!(
+                "relay fetch failed for context {context_id}, leaf {leaf_index}: {e}"
+            ))
+        })?;
+
+        deserialize_cold_proof(&blob_bytes).map_err(|e| {
+            TieredStorageError::ColdFetchFailed(format!(
+                "deserialization failed for context {context_id}, leaf {leaf_index}: {e}"
+            ))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cold proof wire format
+// ---------------------------------------------------------------------------
+
+/// Magic prefix for cold proof blobs: `b"SCP1"`.
+///
+/// Provides domain separation to prevent cross-protocol deserialization
+/// confusion. All cold proof blobs start with this prefix.
+const COLD_PROOF_MAGIC: &[u8; 4] = b"SCP1";
+
+/// Serializes an [`InclusionProof`] into the cold proof wire format.
+///
+/// Format: 4-byte magic prefix (`b"SCP1"`) followed by `MessagePack`-encoded
+/// [`InclusionProof`]. The magic prefix enables early rejection of blobs that
+/// are not cold proofs (e.g., event payloads stored under the same routing ID).
+///
+/// # Errors
+///
+/// Returns an error string if `MessagePack` serialization fails (should never
+/// happen for well-formed proofs).
+pub fn serialize_cold_proof(proof: &InclusionProof) -> Result<Vec<u8>, String> {
+    let encoded =
+        rmp_serde::to_vec(proof).map_err(|e| format!("MessagePack encode failed: {e}"))?;
+    let mut buf = Vec::with_capacity(COLD_PROOF_MAGIC.len() + encoded.len());
+    buf.extend_from_slice(COLD_PROOF_MAGIC);
+    buf.extend_from_slice(&encoded);
+    Ok(buf)
+}
+
+/// Deserializes an [`InclusionProof`] from the cold proof wire format.
+///
+/// Validates the 4-byte magic prefix (`b"SCP1"`) before attempting
+/// `MessagePack` deserialization.
+///
+/// # Errors
+///
+/// Returns an error string if the magic prefix is missing or incorrect,
+/// or if `MessagePack` deserialization fails.
+pub fn deserialize_cold_proof(data: &[u8]) -> Result<InclusionProof, String> {
+    if data.len() < COLD_PROOF_MAGIC.len() {
+        return Err(format!(
+            "cold proof blob too short: expected at least {} bytes, got {}",
+            COLD_PROOF_MAGIC.len(),
+            data.len()
+        ));
+    }
+
+    if &data[..COLD_PROOF_MAGIC.len()] != COLD_PROOF_MAGIC {
+        return Err("cold proof blob missing magic prefix (expected b\"SCP1\")".to_owned());
+    }
+
+    rmp_serde::from_slice(&data[COLD_PROOF_MAGIC.len()..])
+        .map_err(|e| format!("MessagePack decode failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,5 +1657,210 @@ mod tests {
         assert!(total > 0);
         // Each event is at least ~100 bytes serialized.
         assert!(total > 500);
+    }
+
+    // -------------------------------------------------------------------
+    // Cold proof serialization roundtrip
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn serialize_deserialize_cold_proof_roundtrip() {
+        let proof = InclusionProof {
+            leaf_index: 42,
+            leaf_hash: [0xAA; 32],
+            path: vec![
+                ProofStep {
+                    sibling_hash: [0xBB; 32],
+                    direction: Direction::Right,
+                },
+                ProofStep {
+                    sibling_hash: [0xCC; 32],
+                    direction: Direction::Left,
+                },
+            ],
+            root: [0xDD; 32],
+        };
+
+        let serialized = serialize_cold_proof(&proof).unwrap();
+
+        // Verify magic prefix.
+        assert_eq!(&serialized[..4], b"SCP1");
+
+        // Roundtrip.
+        let deserialized = deserialize_cold_proof(&serialized).unwrap();
+        assert_eq!(deserialized, proof);
+    }
+
+    #[test]
+    fn deserialize_cold_proof_rejects_short_blob() {
+        let result = deserialize_cold_proof(&[0x01, 0x02]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn deserialize_cold_proof_rejects_bad_magic() {
+        let mut data = vec![b'X', b'Y', b'Z', b'W'];
+        data.extend_from_slice(&[0x00; 20]);
+        let result = deserialize_cold_proof(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("magic prefix"));
+    }
+
+    #[test]
+    fn deserialize_cold_proof_rejects_corrupt_payload() {
+        let mut data = Vec::from(b"SCP1" as &[u8]);
+        data.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // Invalid MessagePack.
+        let result = deserialize_cold_proof(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("decode failed"));
+    }
+
+    #[test]
+    fn serialize_cold_proof_empty_path() {
+        let proof = InclusionProof {
+            leaf_index: 0,
+            leaf_hash: [0x00; 32],
+            path: vec![],
+            root: [0x11; 32],
+        };
+
+        let serialized = serialize_cold_proof(&proof).unwrap();
+        let deserialized = deserialize_cold_proof(&serialized).unwrap();
+        assert_eq!(deserialized, proof);
+    }
+
+    // -------------------------------------------------------------------
+    // RelayBlobColdProvider
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn relay_blob_cold_provider_fetches_and_deserializes() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Build a proof and serialize it.
+        let proof = InclusionProof {
+            leaf_index: 7,
+            leaf_hash: [0xAA; 32],
+            path: vec![ProofStep {
+                sibling_hash: [0xBB; 32],
+                direction: Direction::Right,
+            }],
+            root: [0xCC; 32],
+        };
+        let blob = serialize_cold_proof(&proof).unwrap();
+
+        // Build a "relay" that stores the blob keyed by (context_id, leaf_index).
+        let mut store: HashMap<(String, u64), Vec<u8>> = HashMap::new();
+        store.insert(("ctx-1".to_owned(), 7), blob);
+        let store = Arc::new(store);
+
+        let provider = RelayBlobColdProvider::new(Box::new(move |context_id, leaf_index| {
+            store
+                .get(&(context_id.to_owned(), leaf_index))
+                .cloned()
+                .ok_or_else(|| format!("not found: {context_id}:{leaf_index}"))
+        }));
+
+        let fetched = provider
+            .fetch_inclusion_proof("ctx-1", 7, [0xAA; 32])
+            .unwrap();
+        assert_eq!(fetched, proof);
+    }
+
+    #[test]
+    fn relay_blob_cold_provider_returns_error_on_missing_blob() {
+        let provider = RelayBlobColdProvider::new(Box::new(|_, _| Err("relay timeout".to_owned())));
+
+        let result = provider.fetch_inclusion_proof("ctx-1", 0, [0x00; 32]);
+        assert!(result.is_err());
+        match result {
+            Err(TieredStorageError::ColdFetchFailed(msg)) => {
+                assert!(msg.contains("relay timeout"));
+            }
+            other => panic!("expected ColdFetchFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_blob_cold_provider_returns_error_on_corrupt_blob() {
+        let provider = RelayBlobColdProvider::new(Box::new(|_, _| {
+            // Return valid magic but corrupt payload.
+            let mut data = Vec::from(b"SCP1" as &[u8]);
+            data.extend_from_slice(&[0xFF, 0xFE]);
+            Ok(data)
+        }));
+
+        let result = provider.fetch_inclusion_proof("ctx-1", 0, [0x00; 32]);
+        assert!(result.is_err());
+        match result {
+            Err(TieredStorageError::ColdFetchFailed(msg)) => {
+                assert!(msg.contains("deserialization failed"));
+            }
+            other => panic!("expected ColdFetchFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_blob_cold_provider_debug_impl() {
+        let provider =
+            RelayBlobColdProvider::new(Box::new(|_, _| Err("not implemented".to_owned())));
+        let debug_str = format!("{provider:?}");
+        assert!(debug_str.contains("RelayBlobColdProvider"));
+    }
+
+    /// Integration test: build a tiered log, migrate events to cold, store
+    /// proofs via `serialize_cold_proof`, then fetch and verify them via
+    /// `RelayBlobColdProvider`.
+    #[test]
+    fn relay_blob_cold_provider_end_to_end_with_tiered_log() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let config = TierConfig {
+            age_threshold_secs: None,
+            max_hot_events: Some(3),
+            max_hot_bytes: None,
+        };
+
+        // Build a log with 8 events, max 3 hot -> 5 will migrate.
+        let (mut tiered, leaf_hashes) = build_tiered_log(8, config, 1_000_000, 60);
+
+        // Migrate.
+        let result = tiered.migrate_to_cold(1_000_000).unwrap();
+        assert_eq!(result.events_migrated, 5);
+
+        // Pre-compute inclusion proofs for cold entries using the ghost tree
+        // and store them as serialized blobs (simulating relay upload).
+        let ghost_provider = GhostTreeProvider::new(leaf_hashes);
+        let mut relay_store: HashMap<(String, u64), Vec<u8>> = HashMap::new();
+
+        for entry in tiered.cold_entries() {
+            let proof = ghost_provider
+                .fetch_inclusion_proof("ctx-tiered-test", entry.sequence, entry.leaf_hash)
+                .unwrap();
+            let blob = serialize_cold_proof(&proof).unwrap();
+            relay_store.insert(("ctx-tiered-test".to_owned(), entry.sequence), blob);
+        }
+
+        let relay_store = Arc::new(relay_store);
+
+        // Create the production provider backed by the simulated relay.
+        let relay_provider = RelayBlobColdProvider::new(Box::new(move |context_id, leaf_index| {
+            relay_store
+                .get(&(context_id.to_owned(), leaf_index))
+                .cloned()
+                .ok_or_else(|| format!("not found: {context_id}:{leaf_index}"))
+        }));
+
+        // Fetch and verify each cold proof via the tiered log.
+        for entry in tiered.cold_entries() {
+            let proof = tiered
+                .fetch_cold_proof(entry.sequence, &relay_provider)
+                .unwrap();
+            assert_eq!(proof.leaf_index, entry.sequence);
+            assert_eq!(proof.leaf_hash, entry.leaf_hash);
+        }
     }
 }
