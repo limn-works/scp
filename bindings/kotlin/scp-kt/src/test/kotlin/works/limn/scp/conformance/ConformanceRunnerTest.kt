@@ -185,10 +185,22 @@ class ConformanceRunnerTest {
         fun `dispatcher handles all context operations`() =
             runTest(testDispatcher) {
                 assertDispatchSucceeds("context_create", mapOf("identity_handle" to "1"))
-                assertDispatchSucceeds("context_join", mapOf("identity_handle" to "1"))
-                assertDispatchSucceeds("context_leave", mapOf("context_handle" to "10"))
-                assertDispatchSucceeds("context_close", mapOf("context_handle" to "10"))
-                assertDispatchSucceeds("context_send", mapOf("context_handle" to "10"))
+                assertDispatchSucceeds(
+                    "context_join",
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
+                )
+                assertDispatchSucceeds(
+                    "context_leave",
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
+                )
+                assertDispatchSucceeds(
+                    "context_close",
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
+                )
+                assertDispatchSucceeds(
+                    "context_send",
+                    mapOf("context_handle" to "10", "identity_handle" to "1"),
+                )
             }
 
         @Test
@@ -196,15 +208,21 @@ class ConformanceRunnerTest {
             runTest(testDispatcher) {
                 assertDispatchSucceeds("tool_register", mapOf("context_handle" to "10"))
                 assertDispatchSucceeds("tool_invoke", mapOf("context_handle" to "10", "identity_handle" to "1"))
-                assertDispatchSucceeds("tool_verify", mapOf("tool_id" to "t"))
+                assertDispatchSucceeds(
+                    "tool_verify",
+                    mapOf("context_handle" to "10", "tool_id" to "t"),
+                )
             }
 
         @Test
         fun `dispatcher handles all ucan operations`() =
             runTest(testDispatcher) {
-                assertDispatchSucceeds("ucan_validate", mapOf("encoded" to "t"))
-                assertDispatchSucceeds("ucan_mint", mapOf("identity_handle" to "1"))
-                assertDispatchSucceeds("ucan_revoke", mapOf("identity_handle" to "1"))
+                assertDispatchSucceeds(
+                    "ucan_validate",
+                    mapOf("context_handle" to "10", "encoded" to "t"),
+                )
+                assertDispatchSucceeds("ucan_mint", mapOf("context_handle" to "10"))
+                assertDispatchSucceeds("ucan_revoke", mapOf("context_handle" to "10"))
             }
 
         @Test
@@ -255,7 +273,10 @@ class ConformanceRunnerTest {
                         category = "context",
                         description = "Leave context",
                         operation = "context_leave",
-                        input = mapOf("context_handle" to "10"),
+                        input = mapOf(
+                            "context_handle" to "10",
+                            "identity_handle" to "1",
+                        ),
                         expected = mapOf("status" to "left"),
                     ),
                     ConformanceFixture(
@@ -265,6 +286,7 @@ class ConformanceRunnerTest {
                         operation = "context_send",
                         input = mapOf(
                             "context_handle" to "10",
+                            "identity_handle" to "1",
                             "payload" to "hello",
                         ),
                         expected = mapOf("status" to "sent"),
