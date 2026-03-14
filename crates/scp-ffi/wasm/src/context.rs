@@ -1267,7 +1267,10 @@ pub fn sandbox_validate_declaration(
     // Extract requested capabilities from declaration.
     let mut requested: Vec<String> = Vec::new();
     for cap_entry in &capabilities {
-        let resource = cap_entry.get("resource").and_then(|v| v.as_str()).unwrap_or("");
+        let resource = cap_entry
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let actions = cap_entry
             .get("actions")
             .and_then(|v| v.as_array())

@@ -979,15 +979,13 @@ class ScopedHandle:
     app_did: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, 'granted_capabilities', tuple(self.granted_capabilities))
+        object.__setattr__(self, "granted_capabilities", tuple(self.granted_capabilities))
 
     def has_capability(self, capability: str) -> bool:
         """Check whether a given capability is allowed."""
-        import _scp_core  # noqa: PLC0415
+        import _scp_core
 
-        return _scp_core.py_check_scoped_capability(
-            self.granted_capabilities, capability
-        )
+        return _scp_core.py_check_scoped_capability(self.granted_capabilities, capability)
 
     def check_capability(self, capability: str) -> None:
         """Raise :class:`ContextError` if the capability is not granted."""
@@ -1008,9 +1006,9 @@ def validate_capability_declaration(
 
     See spec sections 8.4.1 and 8.4.2.
     """
-    import json  # noqa: PLC0415
+    import json
 
-    import _scp_core  # noqa: PLC0415
+    import _scp_core
 
     result_json = _scp_core.py_validate_capability_declaration(
         declaration_json, ceiling_capabilities, role_capabilities

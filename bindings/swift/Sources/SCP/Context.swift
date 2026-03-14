@@ -615,6 +615,51 @@ public struct ScopedHandle: Sendable {
     }
 }
 
+/// Returns a context-scoped validation error with the standard code.
+private func validationError(_ message: String) -> ScpError {
+    ScpError.Context(message: message, code: "SCP-CTX-2051")
+}
+
+/// Extracts a nullable ``String`` from a JSON value (accepts ``String`` or ``NSNull``).
+private func extractNullableString(_ value: Any?, field: String) throws -> String? {
+    guard let raw = value else { return nil }
+    if raw is NSNull { return nil }
+    guard let str = raw as? String else {
+        throw validationError("validation result '\(field)' has unexpected type (expected String or null)")
+    }
+    return str
+}
+
+/// Parses a validation result JSON string into a ``DeclarationValidationResult``.
+///
+/// - Parameter resultJson: The JSON string returned by the bridge.
+/// - Throws: ``ScpError`` if the JSON is malformed or missing required fields.
+private func parseValidationResult(_ resultJson: String) throws -> DeclarationValidationResult {
+    guard let data = resultJson.data(using: .utf8) else {
+        throw validationError("failed to encode validation result as UTF-8")
+    }
+    let parsed: Any
+    do { parsed = try JSONSerialization.jsonObject(with: data) } catch {
+        throw validationError("failed to parse validation result JSON: \(error.localizedDescription)")
+    }
+    guard let json = parsed as? [String: Any] else {
+        throw validationError("validation result JSON is not an object")
+    }
+    guard let valid = json["valid"] as? Bool else {
+        throw validationError("validation result missing or invalid 'valid' field (expected Bool)")
+    }
+    guard let capabilities = json["granted_capabilities"] as? [String] else {
+        throw validationError("missing or invalid 'granted_capabilities' field (expected [String])")
+    }
+    guard let appDid = json["app_did"] as? String else {
+        throw validationError("missing or invalid 'app_did' field (expected String)")
+    }
+    let errorValue = try extractNullableString(json["error"], field: "error")
+    return DeclarationValidationResult(
+        valid: valid, grantedCapabilities: capabilities, error: errorValue, appDid: appDid
+    )
+}
+
 /// Validates a capability declaration against a context ceiling and role capabilities.
 ///
 /// Returns a ``DeclarationValidationResult`` with the validation outcome.
@@ -635,65 +680,5 @@ public func validateCapabilityDeclaration(
         ceilingCapabilities: ceilingCapabilities,
         roleCapabilities: roleCapabilities
     )
-    guard let data = resultJson.data(using: .utf8) else {
-        throw ScpError.Context(
-            message: "failed to encode validation result as UTF-8",
-            code: "SCP-CTX-2051"
-        )
-    }
-    let parsed: Any
-    do {
-        parsed = try JSONSerialization.jsonObject(with: data)
-    } catch {
-        throw ScpError.Context(
-            message: "failed to parse validation result JSON: \(error.localizedDescription)",
-            code: "SCP-CTX-2051"
-        )
-    }
-    guard let json = parsed as? [String: Any] else {
-        throw ScpError.Context(
-            message: "validation result JSON is not an object",
-            code: "SCP-CTX-2051"
-        )
-    }
-    guard let valid = json["valid"] as? Bool else {
-        throw ScpError.Context(
-            message: "validation result missing or invalid 'valid' field (expected Bool)",
-            code: "SCP-CTX-2051"
-        )
-    }
-    guard let capabilities = json["granted_capabilities"] as? [String] else {
-        throw ScpError.Context(
-            message: "validation result missing or invalid 'granted_capabilities' field (expected [String])",
-            code: "SCP-CTX-2051"
-        )
-    }
-    guard let appDid = json["app_did"] as? String else {
-        throw ScpError.Context(
-            message: "validation result missing or invalid 'app_did' field (expected String)",
-            code: "SCP-CTX-2051"
-        )
-    }
-    // error is nullable — but when present it must be a String
-    let errorValue: String?
-    if let rawError = json["error"] {
-        if rawError is NSNull {
-            errorValue = nil
-        } else if let errorStr = rawError as? String {
-            errorValue = errorStr
-        } else {
-            throw ScpError.Context(
-                message: "validation result 'error' field has unexpected type (expected String or null)",
-                code: "SCP-CTX-2051"
-            )
-        }
-    } else {
-        errorValue = nil
-    }
-    return DeclarationValidationResult(
-        valid: valid,
-        grantedCapabilities: capabilities,
-        error: errorValue,
-        appDid: appDid
-    )
+    return try parseValidationResult(resultJson)
 }
