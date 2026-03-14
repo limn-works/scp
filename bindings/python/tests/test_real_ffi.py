@@ -116,6 +116,36 @@ class TestIdentity:
         assert identity._handle.has_agent_key
         assert identity._handle.get_agent_public_key() is not None
 
+    async def test_attest_device(self):
+        identity = await Identity.create(CustodyType.IN_MEMORY)
+        token = await identity.attest_device()
+        assert isinstance(token, str)
+        assert len(token) > 0
+
+    async def test_verify_device_attestation(self):
+        identity = await Identity.create(CustodyType.IN_MEMORY)
+        token = await identity.attest_device()
+        is_valid = await identity.verify_device_attestation(token)
+        assert is_valid is True
+
+    async def test_verify_device_attestation_rejects_invalid(self):
+        identity = await Identity.create(CustodyType.IN_MEMORY)
+        # An arbitrary base64 string that is not a valid attestation token
+        is_valid = await identity.verify_device_attestation("aW52YWxpZA==")
+        assert is_valid is False
+
+    async def test_execute_custody_migration(self):
+        identity = await Identity.create(CustodyType.IN_MEMORY)
+        # The FFI uses a NotConfiguredMigrationBackend that returns an error
+        # on step 1 (key generation). Verify the SDK wrapper propagates this.
+        with pytest.raises(Exception, match="custody migration"):
+            await identity.execute_custody_migration("hardware")
+
+    async def test_execute_custody_migration_invalid_target(self):
+        identity = await Identity.create(CustodyType.IN_MEMORY)
+        with pytest.raises(Exception, match="invalid custody migration target"):
+            await identity.execute_custody_migration("nonexistent_target")
+
 
 # ---------------------------------------------------------------------------
 # Context

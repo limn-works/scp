@@ -1176,6 +1176,395 @@ export function createMockBridge(): Bridge & {
         signing_key_id: response.signing_key_id,
         signed_at: response.signed_at,
       });
+
+    // Membership queries
+    async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const ctx = getContext(handle);
+      return ctx.members.size;
+    },
+
+    async contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const ctx = getContext(handle);
+      return ctx.members.has(did);
+    },
+
+    async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
+      const ctx = getContext(handle);
+      return [...ctx.members];
+    },
+
+    async contextMemberRole(
+      handle: BridgeContextHandle,
+      did: string,
+    ): Promise<{ role: string; capabilities: string[] } | null> {
+      const ctx = getContext(handle);
+      if (!ctx.members.has(did)) return null;
+      if (did === ctx.creatorDid) {
+        return { role: "admin", capabilities: ["*"] };
+      }
+      return { role: "member", capabilities: ["messages:read"] };
+    },
+
+    // Governance
+    async contextExecuteGovernanceAction(
+      _handle: BridgeContextHandle,
+      actionJson: string,
+      _proposerDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "executed", action: JSON.parse(actionJson) });
+    },
+
+    async contextGovernancePropose(
+      _handle: BridgeContextHandle,
+      _actionJson: string,
+      _proposerDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ proposal_id: generateId("prop"), status: "pending" });
+    },
+
+    async contextGovernanceApprove(
+      _handle: BridgeContextHandle,
+      proposalIdHex: string,
+      _voterDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ proposal_id: proposalIdHex, status: "approved" });
+    },
+
+    async contextGovernanceReject(
+      _handle: BridgeContextHandle,
+      proposalIdHex: string,
+      _voterDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ proposal_id: proposalIdHex, status: "rejected" });
+    },
+
+    async contextGovernanceWithdraw(
+      _handle: BridgeContextHandle,
+      proposalIdHex: string,
+      _voterDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ proposal_id: proposalIdHex, status: "withdrawn" });
+    },
+
+    async contextGovernanceGetProposal(
+      _handle: BridgeContextHandle,
+      proposalIdHex: string,
+    ): Promise<string> {
+      return JSON.stringify({ proposal_id: proposalIdHex, status: "pending" });
+    },
+
+    async contextGovernanceListProposals(_handle: BridgeContextHandle): Promise<string> {
+      return JSON.stringify([]);
+    },
+
+    // Economic policy
+    async contextSetEconomicPolicy(handle: BridgeContextHandle, policyJson: string): Promise<void> {
+      const ctx = getContext(handle);
+      ctx.economicPolicy = policyJson;
+    },
+
+    async contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null> {
+      const ctx = getContext(handle);
+      return ctx.economicPolicy;
+    },
+
+    // Bridge Connector
+    bridgeRegister(
+      contextId: string,
+      operatorDid: string,
+      _governanceDid: string,
+      platform: string,
+      mode: string,
+    ) {
+      return {
+        bridge_id: generateId("bridge"),
+        operator_did: operatorDid,
+        platform,
+        mode: mode as "relay" | "shadow" | "claimed",
+        status: "active",
+        context_id: contextId,
+      };
+    },
+
+    bridgeEvaluateTrust(
+      isBridged: boolean,
+      _isNativeTransport: boolean,
+      _shadowStatus: string,
+    ): number {
+      return isBridged ? 1 : 3;
+    },
+
+    bridgeCreateShadow(
+      bridgeId: string,
+      platformHandle: string,
+      _bridgeMode: string,
+      _contextId: string | undefined,
+    ) {
+      return {
+        shadow_id: generateId("shadow"),
+        platform_handle: platformHandle,
+        bridge_id: bridgeId,
+        attributed_role: "observer",
+        provenance_status: "shadow" as const,
+      };
+    },
+
+    // Discovery
+    discoveryParseAddress(address: string): string {
+      if (address.includes("@")) {
+        return JSON.stringify({ type: "DiscoveryHandle", address });
+      }
+      return JSON.stringify({ type: "Unscoped", address });
+    },
+
+    discoveryCreateQuery(
+      capabilities: string[] | undefined,
+      keywords: string[] | undefined,
+      _minHistorySecs: number | undefined,
+    ): string {
+      return JSON.stringify({ capabilities: capabilities ?? [], keywords: keywords ?? [] });
+    },
+
+    discoveryNormalizeAddress(address: string): string {
+      return address.trim().toLowerCase();
+    },
+
+    async contextDiscover(_query: string): Promise<string> {
+      return JSON.stringify([]);
+    },
+
+    // Petnames
+    petnameSet(_ownerDid: string, _targetDid: string, _name: string): void {},
+    petnameRemove(_ownerDid: string, _targetDid: string): void {},
+    petnameSetContext(_ownerDid: string, _contextId: string, _name: string): void {},
+    petnameRemoveContext(_ownerDid: string, _contextId: string): void {},
+    petnameResolveDid(_ownerDid: string, _name: string): string {
+      throw new Error("Petname not found");
+    },
+    petnameResolveContext(_ownerDid: string, _name: string): string {
+      throw new Error("Petname not found");
+    },
+    petnameGetForDid(_ownerDid: string, _targetDid: string): string | null {
+      return null;
+    },
+    petnameGetForContext(_ownerDid: string, _contextId: string): string | null {
+      return null;
+    },
+
+    // Handle Registry
+    handleRegister(
+      _discoveryContextId: string,
+      handle: string,
+      _targetJson: string,
+      _registrantDid: string,
+      _description: string | undefined,
+      _tags: string[] | undefined,
+    ): string {
+      return JSON.stringify({ handle, status: "registered" });
+    },
+
+    handleLookup(
+      _discoveryContextId: string,
+      handle: string,
+      _typeFilter: string | undefined,
+    ): string {
+      return JSON.stringify({ handle, results: [] });
+    },
+
+    handleDeregister(_discoveryContextId: string, handle: string, _did: string): string {
+      return JSON.stringify({ handle, status: "deregistered" });
+    },
+
+    // Address Resolution
+    async addressResolve(
+      _ownerDid: string,
+      address: string,
+      _knownContextsJson: string | undefined,
+    ): Promise<string> {
+      return JSON.stringify({ address, resolved: false });
+    },
+
+    // Provenance
+    async evaluateProvenanceQuality(
+      _sourceContext: string | undefined,
+      _sourceType: string,
+      _contextState: string,
+      _counterparties: string[] | undefined,
+    ): Promise<number> {
+      return 2;
+    },
+
+    provenanceAttach(
+      sourceContextId: string,
+      _sourceType: string,
+      _memoryScope: string,
+      _members: string[],
+      targetContextId: string,
+      _existingChainDepth: number | undefined,
+      _discoveryMethod: string | undefined,
+      _purpose: string | undefined,
+      _counterpartyPolicy: string | undefined,
+    ): string {
+      return JSON.stringify({
+        source_context_id: sourceContextId,
+        target_context_id: targetContextId,
+        chain_depth: 1,
+      });
+    },
+
+    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined): boolean {
+      return chainDepth <= (maxDepth ?? 5);
+    },
+
+    // Sync
+    syncClassifyOffline(lastRelayContact: number, now: number): string {
+      const delta = now - lastRelayContact;
+      if (delta < 86400) return "short";
+      if (delta < 604800) return "extended";
+      return "long";
+    },
+
+    syncClassifyOfflineCustom(
+      lastRelayContact: number,
+      now: number,
+      tier1ThresholdSecs: number,
+      tier2ThresholdSecs: number,
+    ): string {
+      const delta = now - lastRelayContact;
+      if (delta < tier1ThresholdSecs) return "short";
+      if (delta < tier2ThresholdSecs) return "extended";
+      return "long";
+    },
+
+    syncGetPolicy() {
+      return {
+        tier_1_threshold_secs: 86400,
+        tier_2_threshold_secs: 604800,
+        gap_timeout_secs: 30,
+        reorder_buffer_capacity: 64,
+        max_sequential_commits: 100,
+        commit_process_timeout_secs: 10,
+        sender_key_timeout_secs: 3600,
+        reconnection_dedup_window_secs: 5,
+      };
+    },
+
+    // Identity Advanced
+    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
+      const did = generateDid();
+      const identity: MockIdentity = { did, custodyType: custody };
+      identities.set(did, identity);
+      return { did, custodyType: custody };
+    },
+
+    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const identity = identities.get(handle.did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1020] Identity not found: ${handle.did}`);
+      }
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const identity = identities.get(handle.did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1021] Identity not found: ${handle.did}`);
+      }
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const identity = identities.get(handle.did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1022] Identity not found: ${handle.did}`);
+      }
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const identity = identities.get(handle.did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1023] Identity not found: ${handle.did}`);
+      }
+      // Migration returns a new DID
+      const newDid = generateDid();
+      const migrated: MockIdentity = { did: newDid, custodyType: handle.custodyType };
+      identities.set(newDid, migrated);
+      return { did: newDid, custodyType: handle.custodyType };
+    },
+
+    async identityAttestDevice(did: string): Promise<string> {
+      const identity = identities.get(did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1007] Identity not found: ${did}`);
+      }
+      // Return a mock base64 attestation token
+      return Buffer.from(`mock-attestation-${did}`).toString("base64");
+    },
+
+    async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
+      // Verify the mock token format
+      const decoded = Buffer.from(tokenBase64, "base64").toString();
+      return decoded === `mock-attestation-${did}`;
+    },
+
+    // Recovery and custody migration
+    async identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string> {
+      const identity = identities.get(did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1030] Identity not found: ${did}`);
+      }
+      return JSON.stringify({
+        did,
+        tier,
+        key_rotation_completed: true,
+        completed_contexts: contextIds,
+        failed_contexts: [],
+      });
+    },
+
+    async identityExecuteCustodyMigration(
+      did: string,
+      target: string,
+      contextIds: string[],
+    ): Promise<string> {
+      const identity = identities.get(did);
+      if (identity === undefined) {
+        throw new Error(`[SCP-IDENT-1024] Identity not found: ${did}`);
+      }
+      const validTargets = ["platform_managed", "hardware", "software", "in_memory"];
+      if (!validTargets.includes(target)) {
+        throw new Error(
+          `[SCP-IDENT-1024] invalid custody migration target: ${target}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'`,
+        );
+      }
+      return JSON.stringify({
+        did,
+        target,
+        key_generated: true,
+        authorized: true,
+        did_document_rotated: true,
+        ucans_reissued: true,
+        old_key_destroyed: true,
+        updated_contexts: contextIds,
+        failed_contexts: [],
+      });
+    },
+
+    // App Sandboxing
+    validateCapabilityDeclaration(
+      declarationJson: string,
+      _ceilingCapabilities: string[],
+      _roleCapabilities: string[],
+    ): string {
+      return JSON.stringify({ valid: true, declaration: JSON.parse(declarationJson) });
+    },
+
+    checkScopedCapability(
+      grantedCapabilities: readonly string[],
+      requiredCapability: string,
+    ): boolean {
+      return grantedCapabilities.includes(requiredCapability) || grantedCapabilities.includes("*");
     },
 
     // Tool interface (§6.2.0.1)

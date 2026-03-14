@@ -164,6 +164,32 @@ public enum IdentityBridge {
     public static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { did, tokenBase64 in
         try await identityVerifyDeviceAttestation(did: did, tokenBase64: tokenBase64)
     }
+
+    /// Execute the compromise recovery protocol for an identity.
+    public typealias ExecuteRecoveryFn = @Sendable (
+        _ did: String,
+        _ tier: String,
+        _ contextIds: [String]
+    ) async throws -> String
+
+    /// Execute the custody migration protocol for an identity.
+    public typealias ExecuteCustodyMigrationFn = @Sendable (
+        _ did: String,
+        _ target: String,
+        _ contextIds: [String]
+    ) async throws -> String
+
+    /// Default execute recovery function — delegates to UniFFI
+    /// ``identityExecuteRecovery(did:tier:contextIds:)``.
+    public static let defaultExecuteRecovery: ExecuteRecoveryFn = { did, tier, contextIds in
+        try await identityExecuteRecovery(did: did, tier: tier, contextIds: contextIds)
+    }
+
+    /// Default execute custody migration function — delegates to UniFFI
+    /// ``identityExecuteCustodyMigration(did:target:contextIds:)``.
+    public static let defaultExecuteCustodyMigration: ExecuteCustodyMigrationFn = { did, target, contextIds in
+        try await identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
+    }
 }
 
 // MARK: - Public API
@@ -457,6 +483,7 @@ public func migrateIdentity(
 ///   - did: The DID string to recover.
 ///   - tier: Compromise tier: `"agent"`, `"active_signing"`, or `"identity_key"`.
 ///   - contextIds: Context IDs where this DID is a member.
+///   - executeRecoveryFn: Bridge function override for testing.
 /// - Returns: JSON string with the recovery result.
 /// - Throws: ``ScpError/Identity(msg:code:)`` if recovery fails.
 ///
@@ -466,9 +493,10 @@ public func migrateIdentity(
 public func executeRecovery(
     did: String,
     tier: String,
-    contextIds: [String] = []
+    contextIds: [String] = [],
+    executeRecoveryFn: IdentityBridge.ExecuteRecoveryFn = IdentityBridge.defaultExecuteRecovery
 ) async throws -> String {
-    try await identityExecuteRecovery(did: did, tier: tier, contextIds: contextIds)
+    try await executeRecoveryFn(did, tier, contextIds)
 }
 
 /// Executes the custody migration protocol for an identity.
@@ -480,6 +508,7 @@ public func executeRecovery(
 ///   - target: Target custody type: `"platform_managed"`, `"hardware"`,
 ///     `"software"`, or `"in_memory"`.
 ///   - contextIds: Context IDs where this DID is a member.
+///   - executeCustodyMigrationFn: Bridge function override for testing.
 /// - Returns: JSON string with the migration result.
 /// - Throws: ``ScpError/Identity(msg:code:)`` if migration fails.
 ///
@@ -489,7 +518,9 @@ public func executeRecovery(
 public func executeCustodyMigration(
     did: String,
     target: String,
-    contextIds: [String] = []
+    contextIds: [String] = [],
+    executeCustodyMigrationFn: IdentityBridge.ExecuteCustodyMigrationFn =
+        IdentityBridge.defaultExecuteCustodyMigration
 ) async throws -> String {
-    try await identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
+    try await executeCustodyMigrationFn(did, target, contextIds)
 }
