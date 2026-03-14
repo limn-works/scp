@@ -1048,7 +1048,7 @@ pub async fn broadcast_block_subscriber(
     let blocker: DID = DID(blocker_did);
 
     manager
-        .block_broadcast_subscriber(&context_id, &subscriber, &blocker)
+        .block_broadcast_subscriber(&context_id, &blocker, &subscriber)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())

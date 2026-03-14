@@ -5378,7 +5378,7 @@ pub async fn broadcast_block_subscriber(
             let subscriber: scp_identity::DID = subscriber_did.into();
             let blocker: scp_identity::DID = blocker_did.into();
             manager
-                .block_broadcast_subscriber(&handle.context_id, &subscriber, &blocker)
+                .block_broadcast_subscriber(&handle.context_id, &blocker, &subscriber)
                 .await
                 .map_err(ScpError::from)?;
             Ok(())

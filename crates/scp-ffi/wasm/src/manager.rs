@@ -3254,8 +3254,8 @@ impl WasmContextManager {
     pub fn block_broadcast_subscriber(
         &mut self,
         context_id: &str,
-        subscriber_did: &str,
         blocker_did: &str,
+        subscriber_did: &str,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -3328,8 +3328,8 @@ impl WasmContextManager {
     pub fn unblock_broadcast_subscriber(
         &mut self,
         context_id: &str,
-        subscriber_did: &str,
         unblocker_did: &str,
+        subscriber_did: &str,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -5170,7 +5170,7 @@ mod tests {
 
         // Subscriber is NOT blocked — unblock should fail.
         let err = mgr
-            .unblock_broadcast_subscriber("ctx-1", subscriber, author)
+            .unblock_broadcast_subscriber("ctx-1", author, subscriber)
             .unwrap_err();
 
         match &err {
@@ -5243,7 +5243,7 @@ mod tests {
         }
 
         // Blocking an already-blocked subscriber when at capacity must succeed.
-        let result = mgr.block_broadcast_subscriber("ctx-1", target_did, "author-a");
+        let result = mgr.block_broadcast_subscriber("ctx-1", "author-a", target_did);
         assert!(
             result.is_ok(),
             "idempotent per-author block at capacity should succeed, got: {result:?}"
@@ -5268,7 +5268,7 @@ mod tests {
 
         // Blocking a NEW DID when at capacity must fail.
         let err = mgr
-            .block_broadcast_subscriber("ctx-1", "sub2", "author-a")
+            .block_broadcast_subscriber("ctx-1", "author-a", "sub2")
             .unwrap_err();
 
         match &err {

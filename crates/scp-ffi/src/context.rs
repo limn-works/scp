@@ -2223,7 +2223,7 @@ fn py_broadcast_block_subscriber(
     let blocker: scp_identity::DID = blocker_did.to_owned().into();
 
     rt.block_on(async move {
-        mgr.block_broadcast_subscriber(&context_id, &subscriber, &blocker)
+        mgr.block_broadcast_subscriber(&context_id, &blocker, &subscriber)
             .await
             .map_err(|e| PyRuntimeError::new_err(format!("broadcast block failed: {e}")))?;
         Ok(())
