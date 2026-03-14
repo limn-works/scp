@@ -192,9 +192,13 @@ impl IdentityHandle {
 
 /// A complete SCP application node composing relay, identity, and storage.
 ///
-/// Created via [`ApplicationNodeBuilder`]. The node starts a relay server,
-/// publishes the identity's DID document with `SCPRelay` service entries,
-/// and provides accessors for each component.
+/// Created via [`ApplicationNodeBuilder`] for production use, or via
+/// [`ApplicationNode::dev`] for quick development/demo setups (requires the
+/// `allow_unencrypted_storage` feature).
+///
+/// The node starts a relay server, publishes the identity's DID document
+/// with `SCPRelay` service entries, and provides accessors for each
+/// component.
 ///
 /// The relay accepts connections from any SCP client, not just the local
 /// identity. DID publication happens once on `.build()`, not continuously
@@ -514,6 +518,73 @@ impl<S: Storage> ApplicationNode<S> {
                 projected.retain_only_epochs(&new_epochs);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dev convenience constructor
+// ---------------------------------------------------------------------------
+
+/// Dev/demo convenience constructor for [`ApplicationNode`].
+///
+/// Requires the `allow_unencrypted_storage` feature flag (or `#[cfg(test)]`).
+/// **Not for production use.**
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
+    /// Creates an `ApplicationNode` with sensible development defaults.
+    ///
+    /// Auto-wires:
+    /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
+    /// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
+    /// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT network)
+    /// - [`SelfSignedTlsProvider`] (self-signed TLS certificate for `localhost`)
+    /// - Relay bound to `127.0.0.1:<port>`
+    /// - Domain set to `localhost`
+    ///
+    /// This is the zero-friction path for demos, prototyping, and integration
+    /// tests. For production deployments, use [`ApplicationNodeBuilder`] with
+    /// real key custody, encrypted storage, and ACME TLS.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), scp_node::NodeError> {
+    /// let node = scp_node::ApplicationNode::dev(4000).await?;
+    /// println!("Relay at {}", node.relay().bound_addr());
+    /// println!("DID: {}", node.identity().did());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] if relay binding, identity generation, or TLS
+    /// provisioning fails.
+    pub async fn dev(port: u16) -> Result<Self, NodeError> {
+        use scp_identity::DidCache;
+        use scp_identity::InMemoryDhtClient;
+        use scp_identity::cache::SystemClock;
+        use scp_identity::dht::DidDht;
+        use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+
+        type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let sign_fn = DevDidDht::make_sign_fn(Arc::clone(&custody));
+        let did_method = Arc::new(DevDidDht::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ));
+
+        ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
+            .domain("localhost")
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
+            .generate_identity_with(custody, did_method)
+            .build_for_testing()
+            .await
     }
 }
 
@@ -968,6 +1039,48 @@ impl<S: Storage + 'static> TlsProvider for tls::AcmeProvider<S> {
 
     fn needs_challenge_listener(&self) -> bool {
         true
+    }
+}
+
+/// TLS provider that generates a self-signed certificate for development.
+///
+/// Uses [`tls::generate_self_signed`] to create a certificate valid for the
+/// given domain. **Not for production use** — browsers and other TLS clients
+/// will reject the certificate unless configured to trust it.
+///
+/// This provider is used internally by [`ApplicationNode::dev`] and is also
+/// available for custom builder configurations during development.
+///
+/// Requires the `allow_unencrypted_storage` feature flag (or `#[cfg(test)]`).
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+pub struct SelfSignedTlsProvider {
+    domain: String,
+}
+
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+impl SelfSignedTlsProvider {
+    /// Creates a new self-signed TLS provider for the given domain.
+    #[must_use]
+    pub fn new(domain: &str) -> Self {
+        Self {
+            domain: domain.to_owned(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+impl TlsProvider for SelfSignedTlsProvider {
+    fn provision(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let domain = self.domain.clone();
+        Box::pin(async move { tls::generate_self_signed(&domain) })
     }
 }
 

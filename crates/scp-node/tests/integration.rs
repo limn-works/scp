@@ -864,3 +864,45 @@ async fn scenario8_projection_endpoints_coexist_with_well_known() {
         "message endpoint should return 404 for unknown routing_id"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ApplicationNode::dev() convenience constructor
+// ---------------------------------------------------------------------------
+
+/// Verifies that `ApplicationNode::dev(port)` creates a fully functional node
+/// with in-memory storage, auto-generated DID identity, self-signed TLS, and
+/// a relay bound to localhost.
+#[tokio::test]
+async fn dev_constructor_creates_working_node() {
+    use scp_node::ApplicationNode;
+
+    // Port 0 lets the OS assign an available port.
+    let node = ApplicationNode::dev(0).await.unwrap();
+
+    // Identity was auto-generated with did:dht method.
+    assert!(
+        node.identity().did().starts_with("did:dht:"),
+        "DID should start with did:dht:, got: {}",
+        node.identity().did()
+    );
+
+    // DID document has an SCPRelay service entry pointing to localhost.
+    let relay_urls = node.identity().document().relay_service_urls();
+    assert_eq!(relay_urls.len(), 1);
+    assert_eq!(relay_urls[0], "wss://localhost/scp/v1");
+
+    // Domain is "localhost".
+    assert_eq!(node.domain(), Some("localhost"));
+    assert_eq!(node.relay_url(), "wss://localhost/scp/v1");
+
+    // Relay is actually bound to a real port on localhost.
+    let addr = node.relay().bound_addr();
+    assert!(addr.ip().is_loopback(), "relay should be bound to loopback");
+    assert_ne!(addr.port(), 0, "relay should be bound to a real port");
+
+    // Storage is accessible.
+    let _storage = node.storage();
+
+    // Clean shutdown.
+    node.shutdown();
+}
