@@ -5,7 +5,7 @@
 //!
 //! - [`MlsCryptoProvider`] — Production `ContextCryptoProvider` backed by
 //!   `OpenMLS` with HPKE sender key distribution, nonce deduplication, and
-//!   per-context crypto state persistence. Lives in `crypto::mls::provider`.
+//!   per-context crypto state persistence.
 //! - [`MerkleEventLogProvider`] — Merkle-chained event log with append-only
 //!   semantics and optional persistence (#636).
 //! - [`ProtocolRepositoryContextBridge`] — Wraps [`ProtocolRepository`](crate::store::ProtocolRepository)
