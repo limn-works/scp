@@ -316,7 +316,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is True
-        assert cv.not_expired is True
+        assert cv.time_bounds_valid is True
 
     def test_revoked_token_has_valid_signature(self) -> None:
         """A revoked token should show signatures_valid=True, not_revoked=False."""
@@ -326,7 +326,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_invalid_signature_does_not_affect_tokens_valid(self) -> None:
         """A bad signature should show tokens_valid=True (parse worked)."""
@@ -336,27 +336,27 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_expired_token_has_valid_everything_else(self) -> None:
-        """An expired token shows all other checks passed but not_expired=False."""
+        """An expired token shows all other checks passed but time_bounds_valid=False."""
         cv = self._run("token expired")
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is True
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
-    def test_token_not_yet_valid_marks_not_expired_false(self) -> None:
-        """A not-yet-valid token shows all checks passed but not_expired=False."""
+    def test_token_not_yet_valid_marks_time_bounds_valid_false(self) -> None:
+        """A not-yet-valid token shows all checks passed but time_bounds_valid=False."""
         cv = self._run("token not yet valid")
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is True
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_capability_outside_ceiling(self) -> None:
         cv = self._run("capability outside ceiling: messages:admin")
@@ -365,7 +365,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_malformed_token_all_false(self) -> None:
         """A malformed token means nothing could be checked."""
@@ -375,7 +375,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_nonce_reused(self) -> None:
         """Nonce reuse: parse, sig, and ceiling passed; nonce_valid=False."""
@@ -385,7 +385,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is True
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_audience_mismatch(self) -> None:
         msg = "audience mismatch: expected did:dht:zMember, got did:dht:zOther"
@@ -395,7 +395,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_no_tokens_all_default_false(self) -> None:
         """When no tokens are provided, all fields stay at default (False)."""
@@ -416,7 +416,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_with_bridge_formatted_error(self) -> None:
         """Full bridge error format is parsed correctly."""
@@ -430,7 +430,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_did_not_found_classified_as_signature(self) -> None:
         """DID resolution failure (step 2) → tokens_valid=True, signatures_valid=False."""
@@ -440,7 +440,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_invalid_did_document_classified_as_signature(self) -> None:
         """Invalid DID document (step 2) → tokens_valid=True, signatures_valid=False."""
@@ -450,7 +450,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_network_unavailable_classified_as_signature(self) -> None:
         """Network unavailable (step 2) → tokens_valid=True, signatures_valid=False."""
@@ -460,7 +460,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_did_revoked_downgraded_classified_as_signature(self) -> None:
         """DID revoked/downgraded (step 2) → tokens_valid=True, signatures_valid=False."""
@@ -470,7 +470,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_unparseable_capability_classified_as_ceiling(self) -> None:
         """Capability URI parse failure (step 6) → tokens+sigs valid, ceiling=False."""
@@ -480,7 +480,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_unknown_error_conservatively_all_false(self) -> None:
         """Unrecognized errors set all fields to False (fail-closed)."""
@@ -490,7 +490,7 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_non_ucan_exception_propagates(self) -> None:
         """Non-UcanError exceptions (e.g. ValidationError) are NOT silently caught."""
@@ -530,7 +530,7 @@ class TestCapabilityValidation:
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
-        assert cv.not_expired is False
+        assert cv.time_bounds_valid is False
 
     def test_individual_fields_settable(self) -> None:
         cv = CapabilityValidation(
@@ -539,14 +539,14 @@ class TestCapabilityValidation:
             within_ceiling=True,
             nonce_valid=True,
             not_revoked=False,
-            not_expired=True,
+            time_bounds_valid=True,
         )
         assert cv.tokens_valid is True
         assert cv.signatures_valid is False
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is False
-        assert cv.not_expired is True
+        assert cv.time_bounds_valid is True
 
 
 class TestBehavioralRecord:

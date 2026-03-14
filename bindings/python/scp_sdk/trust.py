@@ -267,8 +267,8 @@ class CapabilityValidation:
     #: No tokens have been revoked.
     not_revoked: bool = False
 
-    #: Token time bounds are valid (not expired, not pre-dated).
-    not_expired: bool = False
+    #: Token time bounds are valid (not expired, not pre-dated, valid range).
+    time_bounds_valid: bool = False
 
 
 @dataclass
@@ -457,7 +457,7 @@ async def evaluate_trust(
         cap_validation.within_ceiling = True
         cap_validation.nonce_valid = True
         cap_validation.not_revoked = True
-        cap_validation.not_expired = True
+        cap_validation.time_bounds_valid = True
 
         # Multi-token evaluation uses fail-fast semantics: we stop at the
         # first token that fails validation and report that failure.
@@ -480,7 +480,7 @@ async def evaluate_trust(
                 cap_validation.within_ceiling = "within_ceiling" in passed
                 cap_validation.nonce_valid = "nonce_valid" in passed
                 cap_validation.not_revoked = "not_revoked" in passed
-                cap_validation.not_expired = "not_expired" in passed
+                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
                 break
 
     # Layer 2: Query behavioral record from event log.
