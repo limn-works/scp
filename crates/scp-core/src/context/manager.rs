@@ -5949,7 +5949,7 @@ impl ContextManager {
         context_id: &str,
         spender: &DID,
         amount: crate::economy::types::Amount,
-        _purpose: &str,
+        purpose: &str,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -5979,8 +5979,14 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
+        let payload = serde_json::json!({
+            "event": "SpendApproved",
+            "spender": spender.as_ref(),
+            "amount": amount,
+            "purpose": purpose,
+        });
         self.event_log
-            .append_context_event(&context_id_bytes, "SpendApproved")?;
+            .append_context_event(&context_id_bytes, &payload.to_string())?;
         Ok(())
     }
 
