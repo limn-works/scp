@@ -550,10 +550,12 @@ export function createNativeBridge(): Bridge {
         inputSchemaJson: JSON.stringify(definition.inputSchema),
         outputSchemaJson: JSON.stringify(definition.outputSchema),
         operatorDid: definition.operator,
-        testVectorsJson: definition.testVectors ? JSON.stringify(definition.testVectors) : null,
+        testVectorsJson: definition.testVectors
+          ? JSON.stringify(definition.testVectors)
+          : undefined,
         implementationHash: definition.implementationHash
           ? Array.from(definition.implementationHash)
-          : null,
+          : undefined,
       };
       const toolId = await (
         addon.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
@@ -757,15 +759,31 @@ export function createNativeBridge(): Bridge {
       platform: string,
       mode: BridgeMode,
     ) {
-      return (
+      // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
+      const raw = (
         addon.bridgeRegister as (
           c: string,
           o: string,
           g: string,
           p: string,
           m: BridgeMode,
-        ) => ReturnType<Bridge["bridgeRegister"]>
+        ) => {
+          bridgeId: string;
+          operatorDid: string;
+          platform: string;
+          mode: string;
+          status: string;
+          contextId: string;
+        }
       )(contextId, operatorDid, governanceDid, platform, mode);
+      return {
+        bridge_id: raw.bridgeId,
+        operator_did: raw.operatorDid,
+        platform: raw.platform,
+        mode: raw.mode as BridgeMode,
+        status: raw.status,
+        context_id: raw.contextId,
+      };
     },
 
     bridgeEvaluateTrust(
@@ -786,14 +804,28 @@ export function createNativeBridge(): Bridge {
       bridgeMode: BridgeMode,
       contextId: string | undefined,
     ) {
-      return (
+      // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
+      const raw = (
         addon.bridgeCreateShadow as (
           b: string,
           p: string,
           m: BridgeMode,
           c: string | undefined,
-        ) => ReturnType<Bridge["bridgeCreateShadow"]>
+        ) => {
+          shadowId: string;
+          platformHandle: string;
+          bridgeId: string;
+          attributedRole: string;
+          provenanceStatus: string;
+        }
       )(bridgeId, platformHandle, bridgeMode, contextId);
+      return {
+        shadow_id: raw.shadowId,
+        platform_handle: raw.platformHandle,
+        bridge_id: raw.bridgeId,
+        attributed_role: raw.attributedRole,
+        provenance_status: raw.provenanceStatus as ShadowStatus,
+      };
     },
 
     // Discovery
