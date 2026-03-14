@@ -27,7 +27,12 @@ use super::{ContextError, ContextHandle, ContextMode, ContextParams, ContextStat
 #[derive(Debug, thiserror::Error)]
 pub enum ContextCreationError {
     /// Transport layer is not connected or no relay is reachable.
-    /// Returned during Phase 1 validation.
+    ///
+    /// Note: `create_context` no longer checks `is_connected()` during
+    /// Phase 1 validation — context creation is a local operation.
+    /// This variant is retained for downstream match arms but is no
+    /// longer emitted by the builder. Transport errors during
+    /// `publish_context` (Phase 2 step 5) use [`Self::TransportFailed`].
     #[error("transport is not connected")]
     TransportNotConnected,
 
@@ -790,8 +795,9 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 /// Executes the two-phase context creation flow.
 ///
-/// **Phase 1 (validate):** Checks params, identity, and transport with zero
-/// side effects. Returns early on any validation failure.
+/// **Phase 1 (validate):** Checks params and identity with zero side effects.
+/// Returns early on any validation failure. Transport connectivity is NOT
+/// checked — context creation is a local operation.
 ///
 /// **Phase 2 (execute):** Steps through creation, recording progress in a
 /// [`CreationReceipt`]. On failure at any step, all previously completed
@@ -834,10 +840,10 @@ pub async fn create_context(
     // 2. Validate the creator's identity and signing key accessibility.
     crypto.validate_creator_identity()?;
 
-    // 3. Validate transport connectivity.
-    if !transport.is_connected() {
-        return Err(ContextCreationError::TransportNotConnected);
-    }
+    // 3. Transport connectivity is NOT checked here. Context creation is a
+    //    local operation (MLS group init, sender key generation, event log
+    //    bootstrap). Publishing to a relay is a separate step (step 5) that
+    //    will surface its own error if the transport is unavailable.
 
     // ------------------------------------------------------------------
     // Phase 2 -- Execute (with ordered rollback)
@@ -1229,7 +1235,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn create_context_fails_when_transport_disconnected() {
+    async fn create_context_succeeds_when_transport_disconnected() {
+        // Context creation is a local operation — it should succeed even
+        // when `is_connected()` returns false, as long as `publish_context`
+        // succeeds (transport connectivity is not a Phase 1 gate).
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::default(); // not connected
         let event_log = MockEventLogProvider::default();
@@ -1243,17 +1252,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TransportNotConnected
-        ));
-
-        // No side effects.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        assert!(event_log.inited.lock().unwrap().is_empty());
-        assert!(transport.published.lock().unwrap().is_empty());
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-no-transport");
+        assert_eq!(handle.state().await, ContextState::Active);
     }
 
     #[tokio::test]

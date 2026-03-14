@@ -173,7 +173,7 @@ impl NapiContextHandle {
     ///
     /// # Errors
     ///
-    /// The `Result` return type is required by napi-rs. This getter is infallible.
+    /// Returns an error if the `ContextManager` is not initialised.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u32> {
         let manager = context_manager()?;
@@ -697,7 +697,7 @@ pub fn context_subscribe(
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
     let manager = context_manager()?;
@@ -711,7 +711,7 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
@@ -725,7 +725,7 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
     let manager = context_manager()?;
@@ -739,7 +739,7 @@ pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberRole")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_member_role(
@@ -764,7 +764,7 @@ pub async fn context_member_role(
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextDrainEvents")]
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
     let manager = context_manager()?;
@@ -782,7 +782,7 @@ pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Ve
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextBroadcastSubscriberCount")]
 pub async fn context_broadcast_subscriber_count(
     handle: &NapiContextHandle,
@@ -801,7 +801,7 @@ pub async fn context_broadcast_subscriber_count(
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextIsBroadcastSubscriber")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_broadcast_subscriber(
@@ -820,7 +820,7 @@ pub async fn context_is_broadcast_subscriber(
 ///
 /// # Errors
 ///
-/// This function is infallible. The `Result` return type is required by napi-rs.
+/// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextBroadcastAdmission")]
 pub async fn context_broadcast_admission(
     handle: &NapiContextHandle,

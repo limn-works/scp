@@ -175,9 +175,10 @@ pub fn init_context_manager_with(
 /// Test variant of [`init_context_manager`] that uses [`LocalTransportProvider`]
 /// instead of [`NotConfiguredTransportProvider`].
 ///
-/// Production code uses `NotConfiguredTransportProvider` to surface errors when
-/// transport is not configured. Tests need `LocalTransportProvider` because
-/// `create_context` checks `is_connected()` and returns `TransportNotConnected`.
+/// Production code uses `NotConfiguredTransportProvider` to surface descriptive
+/// errors when transport operations (publish, send) are attempted without a
+/// configured relay. Tests use `LocalTransportProvider` so that
+/// `publish_context` succeeds without real relay infrastructure.
 ///
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
