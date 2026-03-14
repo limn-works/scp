@@ -53,6 +53,16 @@ pub const DEFAULT_PER_CALLER_CALLS_PER_MINUTE: u32 = 10;
 /// Default sliding window duration: 60 seconds (spec §6.2.0.2).
 pub const DEFAULT_WINDOW_SECONDS: u64 = 60;
 
+/// Default burst allowance: 5 calls above the per-minute limit within the burst
+/// window (spec §6.2.0.2). Configurable range: 0-50.
+pub const DEFAULT_BURST_ALLOWANCE: u32 = 5;
+
+/// Default burst window duration: 1 second (spec §6.2.0.2).
+pub const DEFAULT_BURST_WINDOW_SECS: u64 = 1;
+
+/// Maximum configurable burst allowance (spec §6.2.0.2).
+pub const MAX_BURST_ALLOWANCE: u32 = 50;
+
 /// Interface offer expiry duration: 7 days (spec §6.2.0.1).
 pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -274,6 +284,10 @@ pub struct InterfaceRevoked {
 /// Tracks the maximum number of calls permitted within a sliding time window.
 /// The `current_count` and `window_start` fields are mutable state that is
 /// updated on each invocation.
+///
+/// Supports burst allowance (spec §6.2.0.2): up to `burst_allowance` calls
+/// above `max_calls` are permitted if they occur within `burst_window` of
+/// the first burst call. Default: 5 extra calls within 1 second.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimit {
     /// Maximum number of calls permitted within the time window.
@@ -284,22 +298,58 @@ pub struct RateLimit {
     pub current_count: u64,
     /// Start of the current window as Unix timestamp in milliseconds.
     pub window_start: u64,
+    /// Number of additional calls allowed above `max_calls` within the burst
+    /// window (spec §6.2.0.2). Default: 5. Range: 0-50.
+    pub burst_allowance: u32,
+    /// Duration of the burst window (spec §6.2.0.2). Default: 1 second.
+    pub burst_window: Duration,
+    /// Number of burst calls consumed in the current burst window.
+    pub burst_count: u32,
+    /// Start of the current burst window as Unix timestamp in milliseconds.
+    pub burst_window_start: u64,
 }
 
 impl RateLimit {
     /// Creates a new rate limit with the given maximum calls and window duration.
     ///
+    /// Uses default burst allowance (5 calls within 1 second, spec §6.2.0.2).
     /// Initializes `current_count` to 0 and `window_start` to the current time.
     ///
     /// # Errors
     ///
     /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     pub fn new(max_calls: u64, window: Duration) -> Result<Self, crate::time::ClockError> {
+        Self::with_burst(
+            max_calls,
+            window,
+            DEFAULT_BURST_ALLOWANCE,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+        )
+    }
+
+    /// Creates a new rate limit with custom burst parameters.
+    ///
+    /// `burst_allowance` is clamped to [`MAX_BURST_ALLOWANCE`] (50).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+    pub fn with_burst(
+        max_calls: u64,
+        window: Duration,
+        burst_allowance: u32,
+        burst_window: Duration,
+    ) -> Result<Self, crate::time::ClockError> {
+        let now = crate::time::now_millis()?;
         Ok(Self {
             max_calls,
             window,
             current_count: 0,
-            window_start: crate::time::now_millis()?,
+            window_start: now,
+            burst_allowance: burst_allowance.min(MAX_BURST_ALLOWANCE),
+            burst_window,
+            burst_count: 0,
+            burst_window_start: now,
         })
     }
 
@@ -308,6 +358,10 @@ impl RateLimit {
     /// If the current window has expired, resets the counter and starts a new
     /// window. Returns `true` if the call is permitted (count < max), `false`
     /// otherwise.
+    ///
+    /// When the base rate limit is exhausted, burst allowance is checked:
+    /// up to `burst_allowance` additional calls are permitted if they occur
+    /// within `burst_window` of the first burst call (spec §6.2.0.2).
     ///
     /// # Errors
     ///
@@ -318,15 +372,33 @@ impl RateLimit {
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
 
-        // If the window has expired, reset.
+        // If the window has expired, reset both base and burst counters.
         if now.saturating_sub(self.window_start) >= window_ms {
             self.current_count = 0;
             self.window_start = now;
+            self.burst_count = 0;
+            self.burst_window_start = now;
         }
 
         if self.current_count < self.max_calls {
             self.current_count += 1;
             Ok(true)
+        } else if self.burst_allowance > 0 {
+            // Base limit exhausted — try burst allowance (spec §6.2.0.2).
+            let burst_window_ms = self.burst_window.as_millis() as u64;
+
+            // If the burst window has expired, reset burst counter.
+            if now.saturating_sub(self.burst_window_start) >= burst_window_ms {
+                self.burst_count = 0;
+                self.burst_window_start = now;
+            }
+
+            if self.burst_count < self.burst_allowance {
+                self.burst_count += 1;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         } else {
             Ok(false)
         }
@@ -351,23 +423,53 @@ const MAX_TRACKED_CALLERS: usize = 10_000;
 /// monopolizing an interface. Expired entries are periodically evicted
 /// and the total number of tracked callers is capped at
 /// `MAX_TRACKED_CALLERS` to prevent unbounded memory growth.
+///
+/// Supports burst allowance: up to `burst_allowance` additional calls
+/// above `max_calls_per_caller` within the burst window (spec §6.2.0.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerCallerRateLimit {
     /// Maximum calls per caller within the window.
     pub max_calls_per_caller: u64,
     /// Sliding window duration.
     pub window: Duration,
-    /// Per-caller counters: DID -> (count, `window_start_ms`).
-    pub callers: HashMap<DID, (u64, u64)>,
+    /// Number of additional calls allowed above `max_calls_per_caller` within
+    /// the burst window (spec §6.2.0.2). Default: 5. Range: 0-50.
+    pub burst_allowance: u32,
+    /// Duration of the burst window (spec §6.2.0.2). Default: 1 second.
+    pub burst_window: Duration,
+    /// Per-caller counters: DID -> (count, `window_start_ms`, `burst_count`, `burst_window_start_ms`).
+    pub callers: HashMap<DID, (u64, u64, u32, u64)>,
 }
 
 impl PerCallerRateLimit {
     /// Creates a new per-caller rate limiter with the given limit and window.
+    ///
+    /// Uses default burst allowance (5 calls within 1 second, spec §6.2.0.2).
     #[must_use]
     pub fn new(max_calls_per_caller: u64, window: Duration) -> Self {
+        Self::with_burst(
+            max_calls_per_caller,
+            window,
+            DEFAULT_BURST_ALLOWANCE,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+        )
+    }
+
+    /// Creates a new per-caller rate limiter with custom burst parameters.
+    ///
+    /// `burst_allowance` is clamped to [`MAX_BURST_ALLOWANCE`] (50).
+    #[must_use]
+    pub fn with_burst(
+        max_calls_per_caller: u64,
+        window: Duration,
+        burst_allowance: u32,
+        burst_window: Duration,
+    ) -> Self {
         Self {
             max_calls_per_caller,
             window,
+            burst_allowance: burst_allowance.min(MAX_BURST_ALLOWANCE),
+            burst_window,
             callers: HashMap::new(),
         }
     }
@@ -381,7 +483,7 @@ impl PerCallerRateLimit {
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
         self.callers
-            .retain(|_, (_, window_start)| now.saturating_sub(*window_start) < window_ms);
+            .retain(|_, (_, window_start, _, _)| now.saturating_sub(*window_start) < window_ms);
     }
 
     /// Checks whether a specific caller is within their per-caller rate limit.
@@ -390,8 +492,13 @@ impl PerCallerRateLimit {
     /// If the caller map is at capacity (`MAX_TRACKED_CALLERS`) after
     /// eviction, new callers are rejected with a rate-limit error.
     ///
+    /// When the base rate limit is exhausted for a caller, burst allowance is
+    /// checked: up to `burst_allowance` additional calls are permitted if they
+    /// occur within `burst_window` of the first burst call (spec §6.2.0.2).
+    ///
     /// Returns `true` if the call is permitted, `false` if the caller has
-    /// exceeded their individual limit or the caller map is at capacity.
+    /// exceeded their individual limit (including burst) or the caller map
+    /// is at capacity.
     ///
     /// # Errors
     ///
@@ -414,17 +521,38 @@ impl PerCallerRateLimit {
             }
         }
 
-        let (count, window_start) = self.callers.entry(caller_did.clone()).or_insert((0, now));
+        let (count, window_start, burst_count, burst_window_start) = self
+            .callers
+            .entry(caller_did.clone())
+            .or_insert((0, now, 0, now));
 
-        // If the window has expired for this caller, reset.
+        // If the window has expired for this caller, reset both base and burst.
         if now.saturating_sub(*window_start) >= window_ms {
             *count = 0;
             *window_start = now;
+            *burst_count = 0;
+            *burst_window_start = now;
         }
 
         if *count < self.max_calls_per_caller {
             *count += 1;
             Ok(true)
+        } else if self.burst_allowance > 0 {
+            // Base limit exhausted — try burst allowance (spec §6.2.0.2).
+            let burst_window_ms = self.burst_window.as_millis() as u64;
+
+            // If the burst window has expired, reset burst counter.
+            if now.saturating_sub(*burst_window_start) >= burst_window_ms {
+                *burst_count = 0;
+                *burst_window_start = now;
+            }
+
+            if *burst_count < self.burst_allowance {
+                *burst_count += 1;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         } else {
             Ok(false)
         }
@@ -1133,6 +1261,11 @@ mod tests {
         let rl = interface.rate_limit.unwrap();
         assert_eq!(rl.max_calls, 10);
         assert_eq!(rl.window, Duration::from_secs(60));
+        assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
+        assert_eq!(
+            rl.burst_window,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1454,7 +1587,11 @@ mod tests {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
             tool_id: "calculator".to_owned(),
-            rate_limit: Some(RateLimit::new(2, Duration::from_secs(3600)).unwrap()),
+            // Zero burst to test base limit rejection.
+            rate_limit: Some(
+                RateLimit::with_burst(2, Duration::from_secs(3600), 0, Duration::from_secs(1))
+                    .unwrap(),
+            ),
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -1669,6 +1806,10 @@ mod tests {
             current_count: 1,
             // Set window_start far in the past so the window is expired.
             window_start: 0,
+            burst_allowance: DEFAULT_BURST_ALLOWANCE,
+            burst_window: Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+            burst_count: 0,
+            burst_window_start: 0,
         };
 
         // Window should have expired, so this should succeed and reset.
@@ -1687,6 +1828,10 @@ mod tests {
             window: Duration::from_secs(60),
             current_count: 5,
             window_start: 1_000_000,
+            burst_allowance: 10,
+            burst_window: Duration::from_secs(2),
+            burst_count: 3,
+            burst_window_start: 999_000,
         };
         let json = serde_json::to_string(&rl).unwrap();
         let deserialized: RateLimit = serde_json::from_str(&json).unwrap();
@@ -1939,7 +2084,9 @@ mod tests {
 
     #[test]
     fn per_caller_rate_limit_tracks_independently() {
-        let mut rl = PerCallerRateLimit::new(2, Duration::from_secs(3600));
+        // Zero burst to test base limit behavior independently.
+        let mut rl =
+            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 0, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
 
@@ -1957,14 +2104,16 @@ mod tests {
     #[test]
     fn per_caller_rate_limit_window_reset() {
         // Use a long window so CI timing can't cause spurious resets.
-        let mut rl = PerCallerRateLimit::new(1, Duration::from_secs(3600));
+        // Zero burst to test base limit behavior independently.
+        let mut rl =
+            PerCallerRateLimit::with_burst(1, Duration::from_secs(3600), 0, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
 
         assert!(rl.check_and_increment(&alice).unwrap());
         assert!(!rl.check_and_increment(&alice).unwrap());
 
         // Set the window start far in the past to simulate window expiry.
-        if let Some((_, ws)) = rl.callers.get_mut(&alice) {
+        if let Some((_, ws, _, _)) = rl.callers.get_mut(&alice) {
             *ws = 0;
         }
         assert!(rl.check_and_increment(&alice).unwrap());
@@ -2097,5 +2246,239 @@ mod tests {
         assert_eq!(event.interface_id, interface_id);
         assert_eq!(event.revoking_context, "ctx-a");
         assert_eq!(event.revoked_at, 5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Burst allowance (§6.2.0.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rate_limit_burst_allows_calls_above_base_limit() {
+        // Base limit: 2 calls, burst allowance: 5 within 1 second.
+        let mut rl =
+            RateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1)).unwrap();
+
+        // First 2 calls: within base limit.
+        assert!(rl.check_and_increment().unwrap());
+        assert!(rl.check_and_increment().unwrap());
+
+        // Next 5 calls: within burst allowance.
+        for i in 0..5 {
+            assert!(
+                rl.check_and_increment().unwrap(),
+                "burst call {i} should succeed"
+            );
+        }
+
+        // 8th call (6th above base): exceeds burst allowance.
+        assert!(
+            !rl.check_and_increment().unwrap(),
+            "call beyond burst allowance should fail"
+        );
+    }
+
+    #[test]
+    fn rate_limit_burst_of_5_rapid_calls_above_limit_succeeds_6th_fails() {
+        // Spec §6.2.0.2: "5 calls above the per-minute limit within a
+        // 1-second window." Exactly 5 burst calls succeed, 6th fails.
+        let mut rl = RateLimit::with_burst(
+            1,
+            Duration::from_secs(3600),
+            DEFAULT_BURST_ALLOWANCE,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+        )
+        .unwrap();
+
+        // Base call.
+        assert!(
+            rl.check_and_increment().unwrap(),
+            "base call should succeed"
+        );
+
+        // 5 burst calls above the limit.
+        for i in 0..5 {
+            assert!(
+                rl.check_and_increment().unwrap(),
+                "burst call {i} should succeed"
+            );
+        }
+
+        // 6th call above the limit: must fail.
+        assert!(
+            !rl.check_and_increment().unwrap(),
+            "6th call above limit should fail"
+        );
+    }
+
+    #[test]
+    fn rate_limit_zero_burst_disables_burst() {
+        let mut rl =
+            RateLimit::with_burst(1, Duration::from_secs(3600), 0, Duration::from_secs(1)).unwrap();
+
+        assert!(rl.check_and_increment().unwrap());
+        // With zero burst, immediately fails after base limit.
+        assert!(!rl.check_and_increment().unwrap());
+    }
+
+    #[test]
+    fn rate_limit_burst_allowance_clamped_to_max() {
+        let rl = RateLimit::with_burst(
+            10,
+            Duration::from_secs(60),
+            100, // Above MAX_BURST_ALLOWANCE (50)
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(rl.burst_allowance, MAX_BURST_ALLOWANCE);
+    }
+
+    #[test]
+    fn rate_limit_new_has_default_burst() {
+        let rl = RateLimit::new(60, Duration::from_secs(60)).unwrap();
+        assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
+        assert_eq!(
+            rl.burst_window,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS)
+        );
+        assert_eq!(rl.burst_count, 0);
+    }
+
+    #[test]
+    fn per_caller_rate_limit_burst_allows_calls_above_base_limit() {
+        let mut rl =
+            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1));
+        let alice: DID = "did:dht:z6MkAlice".into();
+
+        // Base: 2 calls.
+        assert!(rl.check_and_increment(&alice).unwrap());
+        assert!(rl.check_and_increment(&alice).unwrap());
+
+        // Burst: 5 calls.
+        for i in 0..5 {
+            assert!(
+                rl.check_and_increment(&alice).unwrap(),
+                "burst call {i} should succeed"
+            );
+        }
+
+        // 6th above base: fails.
+        assert!(!rl.check_and_increment(&alice).unwrap());
+    }
+
+    #[test]
+    fn per_caller_rate_limit_burst_is_independent_per_caller() {
+        let mut rl =
+            PerCallerRateLimit::with_burst(1, Duration::from_secs(3600), 2, Duration::from_secs(1));
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+
+        // Alice exhausts base + burst.
+        assert!(rl.check_and_increment(&alice).unwrap()); // base
+        assert!(rl.check_and_increment(&alice).unwrap()); // burst 1
+        assert!(rl.check_and_increment(&alice).unwrap()); // burst 2
+        assert!(!rl.check_and_increment(&alice).unwrap()); // over
+
+        // Bob still has full base + burst.
+        assert!(rl.check_and_increment(&bob).unwrap());
+        assert!(rl.check_and_increment(&bob).unwrap());
+        assert!(rl.check_and_increment(&bob).unwrap());
+        assert!(!rl.check_and_increment(&bob).unwrap());
+    }
+
+    #[test]
+    fn per_caller_rate_limit_new_has_default_burst() {
+        let rl = PerCallerRateLimit::new(10, Duration::from_secs(60));
+        assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
+        assert_eq!(
+            rl.burst_window,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS)
+        );
+    }
+
+    #[test]
+    fn per_caller_rate_limit_burst_clamped_to_max() {
+        let rl = PerCallerRateLimit::with_burst(
+            10,
+            Duration::from_secs(60),
+            100,
+            Duration::from_secs(1),
+        );
+        assert_eq!(rl.burst_allowance, MAX_BURST_ALLOWANCE);
+    }
+
+    #[test]
+    fn invoke_cross_context_burst_allows_calls_above_limit() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let source_role_state = test_role_state("ctx-source", admin_did);
+        let source_context = test_context("ctx-source");
+        let target_role_state = test_role_state("ctx-target", admin_did);
+        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+
+        // Base limit: 2 calls, burst allowance: 5.
+        let mut interface = ToolInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            tool_id: "calculator".to_owned(),
+            rate_limit: Some(
+                RateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1))
+                    .unwrap(),
+            ),
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
+        };
+
+        let input = serde_json::json!({"a": 1, "b": 2});
+
+        // First 2 calls: within base limit.
+        for i in 0..2 {
+            let result = invoke_cross_context(
+                &source_context,
+                &mut interface,
+                &input,
+                &DID::from(admin_did),
+                &source_role_state,
+                &target_registry,
+                0,
+                add_executor,
+            );
+            assert!(result.is_ok(), "base call {i} should succeed");
+        }
+
+        // Next 5 calls: within burst allowance.
+        for i in 0..5 {
+            let result = invoke_cross_context(
+                &source_context,
+                &mut interface,
+                &input,
+                &DID::from(admin_did),
+                &source_role_state,
+                &target_registry,
+                0,
+                add_executor,
+            );
+            assert!(result.is_ok(), "burst call {i} should succeed");
+        }
+
+        // 8th call: exceeds burst allowance.
+        let result = invoke_cross_context(
+            &source_context,
+            &mut interface,
+            &input,
+            &DID::from(admin_did),
+            &source_role_state,
+            &target_registry,
+            0,
+            add_executor,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InterfaceRateLimited { max_calls: 2, .. }),
+            "expected InterfaceRateLimited, got {err:?}"
+        );
     }
 }
