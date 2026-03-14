@@ -117,7 +117,7 @@ pub fn init_runtime() -> PyResult<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("scp-tokio-worker")
-        .worker_threads(std::cmp::min(4, std::thread::available_parallelism().map_or(2, |p| p.get())))
+        .worker_threads(std::cmp::min(4, std::thread::available_parallelism().map_or(2, std::num::NonZero::get)))
         .build()
         .or_else(|_| {
             // Fallback to current_thread runtime in constrained environments (CI).
