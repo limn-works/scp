@@ -279,7 +279,7 @@ jobs:
       - uses: android-actions/setup-android@v3
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew test
+      - run: ./gradlew testDebugUnitTest
 
   # ── WASM ───────────────────────────────────────────────────────────
   wasm-clippy:
