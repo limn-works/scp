@@ -22,6 +22,26 @@ use serde::{Deserialize, Serialize};
 use crate::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
+// Protocol-field deserialization validator
+// ---------------------------------------------------------------------------
+
+/// Deserialize the `protocol` field, rejecting values that are not
+/// [`SCPID_PROTOCOL_VERSION`].  Used via `#[serde(deserialize_with)]` on
+/// both [`ScpIdChallenge`] and [`ScpIdResponse`].
+fn deserialize_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s != SCPID_PROTOCOL_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported SCPID protocol version: {s}, expected {SCPID_PROTOCOL_VERSION}"
+        )));
+    }
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -59,11 +79,11 @@ pub enum ScpIdError {
     DidDocumentStale,
 
     /// Key custody or signing operation failed.
-    #[error("signing failed: {0}")]
+    #[error("signing failed (SCP-IDENT-1037): {0}")]
     SigningFailed(String),
 
     /// Input validation failure (TTL too large, audience too long, etc.).
-    #[error("invalid input: {0}")]
+    #[error("invalid input (SCP-IDENT-1038): {0}")]
     InvalidInput(String),
 }
 
@@ -127,6 +147,8 @@ mod hex_serde_64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScpIdChallenge {
     /// Protocol identifier and version: `"scpid/1.0"`.
+    /// Rejected on deserialization if not equal to [`SCPID_PROTOCOL_VERSION`].
+    #[serde(deserialize_with = "deserialize_protocol")]
     pub protocol: String,
 
     /// 32-byte CSPRNG nonce for replay prevention (hex-encoded on wire).
@@ -136,10 +158,10 @@ pub struct ScpIdChallenge {
     /// URI identifying the relying party (e.g., `"https://app.example.com"`).
     pub audience: String,
 
-    /// Unix timestamp (seconds) when the challenge was created.
+    /// Unix timestamp (milliseconds) when the challenge was created (§3.11.2).
     pub issued_at: u64,
 
-    /// Unix timestamp (seconds) when the challenge expires.
+    /// Unix timestamp (milliseconds) when the challenge expires (§3.11.2).
     pub expires_at: u64,
 }
 
@@ -150,6 +172,8 @@ pub struct ScpIdChallenge {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScpIdResponse {
     /// Protocol identifier and version: `"scpid/1.0"`.
+    /// Rejected on deserialization if not equal to [`SCPID_PROTOCOL_VERSION`].
+    #[serde(deserialize_with = "deserialize_protocol")]
     pub protocol: String,
 
     /// The signer's DID (e.g., `"did:dht:z6Mk..."`).
@@ -165,7 +189,7 @@ pub struct ScpIdResponse {
     /// Echo of the challenge audience URI.
     pub audience: String,
 
-    /// Unix timestamp (seconds) when the client signed.
+    /// Unix timestamp (milliseconds) when the client signed (§3.11.3).
     pub signed_at: u64,
 
     /// Ed25519 signature over the canonical hash (hex-encoded on wire).
@@ -186,7 +210,7 @@ pub struct ScpIdAuthentication {
     /// Which verification method produced the signature.
     pub signing_key_id: SigningKeyId,
 
-    /// Unix timestamp (seconds) when the client signed.
+    /// Unix timestamp (milliseconds) when the client signed (§3.11.3).
     pub signed_at: u64,
 }
 
@@ -197,8 +221,8 @@ pub struct ScpIdAuthentication {
 /// The protocol version string included in challenge and response wire formats.
 pub const SCPID_PROTOCOL_VERSION: &str = "scpid/1.0";
 
-/// Maximum TTL for an SCPID challenge (§3.11.2: MUST NOT exceed 300 seconds).
-const MAX_TTL_SECS: u64 = 300;
+/// Maximum TTL for an SCPID challenge in milliseconds (§3.11.2: MUST NOT exceed 300 seconds).
+const MAX_TTL_MS: u64 = 300_000;
 
 /// Maximum audience string length in bytes.
 const MAX_AUDIENCE_BYTES: usize = 2048;
@@ -209,16 +233,27 @@ const MAX_AUDIENCE_BYTES: usize = 2048;
 
 /// Generate an SCPID challenge for the given audience (§3.11.8).
 ///
-/// Generates a 32-byte CSPRNG nonce, sets `issued_at` to the current time,
-/// and computes `expires_at` from the TTL.
+/// Generates a 32-byte CSPRNG nonce, sets `issued_at` to the current time
+/// in milliseconds, and computes `expires_at` from the TTL.
 ///
 /// # Errors
 ///
 /// Returns [`ScpIdError::InvalidInput`] if:
+/// - `ttl` is zero
 /// - `ttl` exceeds 300 seconds (§3.11.2 constraint)
 /// - `audience` exceeds 2048 bytes
 pub fn scpid_challenge(audience: &str, ttl: Duration) -> Result<ScpIdChallenge, ScpIdError> {
-    if ttl.as_secs() > MAX_TTL_SECS || (ttl.as_secs() == MAX_TTL_SECS && ttl.subsec_nanos() > 0) {
+    // TTL is bounded to 300 000 ms, so u128→u64 truncation cannot occur,
+    // but we use saturating conversion to keep clippy happy without #[allow].
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+
+    if ttl_ms == 0 {
+        return Err(ScpIdError::InvalidInput(
+            "TTL must be greater than zero".to_owned(),
+        ));
+    }
+
+    if ttl_ms > MAX_TTL_MS {
         return Err(ScpIdError::InvalidInput(
             "TTL exceeds 300 seconds".to_owned(),
         ));
@@ -233,12 +268,14 @@ pub fn scpid_challenge(audience: &str, ttl: Duration) -> Result<ScpIdChallenge, 
     let mut nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
-    let issued_at = SystemTime::now()
+    let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ScpIdError::InvalidInput(format!("system clock error: {e}")))?
-        .as_secs();
+        .as_millis();
+    let issued_at = u64::try_from(now_ms)
+        .map_err(|_| ScpIdError::InvalidInput("system clock overflow".to_owned()))?;
 
-    let expires_at = issued_at + ttl.as_secs();
+    let expires_at = issued_at + ttl_ms;
 
     Ok(ScpIdChallenge {
         protocol: SCPID_PROTOCOL_VERSION.to_owned(),
@@ -266,7 +303,7 @@ mod tests {
 
         assert_eq!(challenge.protocol, "scpid/1.0");
         assert_eq!(challenge.audience, "https://example.com");
-        assert_eq!(challenge.expires_at, challenge.issued_at + 60);
+        assert_eq!(challenge.expires_at, challenge.issued_at + 60_000);
         // Nonce should not be all zeros (overwhelmingly unlikely from CSPRNG).
         assert_ne!(challenge.nonce, [0u8; 32]);
     }
@@ -309,7 +346,7 @@ mod tests {
             signing_key_id: SigningKeyId::Active,
             nonce,
             audience: "https://example.com".to_owned(),
-            signed_at: 1_709_654_400,
+            signed_at: 1_709_654_400_000,
             signature,
         };
 
@@ -350,13 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn test_ttl_boundary_300_plus_nanos() {
-        // 300 seconds + 1 nanosecond should fail.
-        let result = scpid_challenge(
-            "https://example.com",
-            Duration::from_secs(300) + Duration::from_nanos(1),
-        );
+    fn test_ttl_boundary_300_plus_millis() {
+        // 300.001 seconds (300_001 ms) should fail — exceeds MAX_TTL_MS.
+        let result = scpid_challenge("https://example.com", Duration::from_millis(300_001));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_ttl_rejection() {
+        let result = scpid_challenge("https://example.com", Duration::from_secs(0));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ScpIdError::InvalidInput(ref msg) if msg.contains("TTL must be greater than zero")),
+            "expected InvalidInput with zero TTL message, got: {err}"
+        );
     }
 
     #[test]
@@ -386,20 +431,39 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_protocol_not_validated_at_deser() {
-        // The protocol field is not validated at deserialization time.
-        // Validation happens in scpid_sign / scpid_verify (§3.11.5:
-        // "Relying parties MUST reject responses with unrecognized protocol versions").
+    fn test_invalid_protocol_rejected_on_deser() {
+        // Protocol validation happens at deserialization time —
+        // reject unrecognized protocol versions immediately.
         let json = r#"{
             "protocol": "wrong/2.0",
             "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "audience": "https://example.com",
-            "issued_at": 1709654400,
-            "expires_at": 1709654700
+            "issued_at": 1709654400000,
+            "expires_at": 1709654700000
         }"#;
-        let challenge: ScpIdChallenge =
-            serde_json::from_str(json).expect("should deserialize despite wrong protocol");
-        assert_eq!(challenge.protocol, "wrong/2.0");
+        let result = serde_json::from_str::<ScpIdChallenge>(json);
+        assert!(result.is_err(), "should reject wrong protocol on deserialization");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported SCPID protocol version"),
+            "error should mention unsupported protocol version, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_protocol_rejected_on_response_deser() {
+        // Protocol validation also applies to ScpIdResponse deserialization.
+        let json = r##"{
+            "protocol": "wrong/2.0",
+            "did": "did:dht:z6MkTest",
+            "signing_key_id": "#active",
+            "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "audience": "https://example.com",
+            "signed_at": 1709654400000,
+            "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }"##;
+        let result = serde_json::from_str::<ScpIdResponse>(json);
+        assert!(result.is_err(), "should reject wrong protocol on response deser");
     }
 
     #[test]
@@ -411,7 +475,7 @@ mod tests {
         //   signing_key_id = "#active" (SigningKeyId::Active)
         //   nonce          = 0xAA repeated 32 times
         //   audience       = "https://example.com"
-        //   signed_at      = 1709654400
+        //   signed_at      = 1709654400000 (milliseconds per §3.11.2)
         //
         // Construction per §3.11.3:
         //   SHA-256(
@@ -426,7 +490,7 @@ mod tests {
         let signing_key_id = SigningKeyId::Active;
         let nonce = [0xAAu8; 32];
         let audience = "https://example.com";
-        let signed_at: u64 = 1_709_654_400;
+        let signed_at: u64 = 1_709_654_400_000;
 
         let hash = canonical_hash(
             "SCP-DID-AUTH-V1:",
@@ -448,11 +512,11 @@ mod tests {
         //     + lp(b'#active')
         //     + nonce
         //     + lp(b'https://example.com')
-        //     + struct.pack('>Q', 1709654400))
+        //     + struct.pack('>Q', 1709654400000))
         //   print(hashlib.sha256(data).hexdigest())
         assert_eq!(
             hex::encode(hash),
-            "c6a90aa317513f9c8c683ba5bf1ad8c3296edacc68ec5a6ee6ffffedab46c8b7"
+            "7552b8e3b0e1654593e956c1429d479eda0524bc6cdc863b142d5909471b57e0"
         );
     }
 }
