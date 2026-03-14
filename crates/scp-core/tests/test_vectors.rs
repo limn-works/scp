@@ -1176,6 +1176,7 @@ fn domain_separators_are_all_unique() {
         "SCP-BLOCK-NOTIFICATION-V1:",
         "SCP-EPOCH-ADVANCE-V1:",
         "SCP-KEY-REQUEST-V1:",
+        "SCP-DID-AUTH-V1:",
     ];
 
     // HKDF/HMAC domain labels — used as info strings, salts, or trailing labels
