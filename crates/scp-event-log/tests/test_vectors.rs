@@ -75,8 +75,15 @@ fn vector_16_single_leaf() {
     let root = leaf;
     print_vec("Root (= leaf hash)", &root);
 
-    // The leaf hash is deterministic — print the exact value.
-    println!("  Root hex: 0x{}", hex(&root));
+    // §25.8 Vector 16: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf),
+        "90b626dbb1e994c962942db2b3b16d97c63f679912a176bb96f4e308c213005b"
+    );
+    assert_eq!(
+        hex(&root),
+        "90b626dbb1e994c962942db2b3b16d97c63f679912a176bb96f4e308c213005b"
+    );
 }
 
 #[test]
@@ -92,7 +99,20 @@ fn vector_17_two_leaves() {
 
     let root = interior_hash(&leaf_1, &leaf_2);
     print_vec("Root (SHA-256(0x01 || leaf1 || leaf2))", &root);
-    println!("  Root hex: 0x{}", hex(&root));
+
+    // §25.8 Vector 17: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf_1),
+        "00d9ea40d70522a7d0aa41e2708afd5dc148a4dcc26011d598cbc28cdbde306f"
+    );
+    assert_eq!(
+        hex(&leaf_2),
+        "7a7b6da2a00d46f75c01d0c5a33cb62e99caa7f0ebbd084a169a00874751e7a3"
+    );
+    assert_eq!(
+        hex(&root),
+        "9f7a0b4b3965ce3eb4dda7c7c56bc9f7fb2c627d5120692d4ff8e531920ebbf9"
+    );
 }
 
 #[test]
@@ -111,7 +131,28 @@ fn vector_18_three_leaves_unbalanced() {
 
     let root = interior_hash(&interior_ab, &leaf_c);
     print_vec("Root (AB|C)", &root);
-    println!("  Root hex: 0x{}", hex(&root));
+
+    // §25.8 Vector 18: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf_a),
+        "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d"
+    );
+    assert_eq!(
+        hex(&leaf_b),
+        "87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e"
+    );
+    assert_eq!(
+        hex(&leaf_c),
+        "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2"
+    );
+    assert_eq!(
+        hex(&interior_ab),
+        "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25"
+    );
+    assert_eq!(
+        hex(&root),
+        "961d2e2be20f538ffdf56962a86d1bd165498f222684ee4c5e02c1e9f852adc5"
+    );
 }
 
 #[test]
@@ -133,7 +174,36 @@ fn vector_19_four_leaves_balanced() {
 
     let root = interior_hash(&interior_l, &interior_r);
     print_vec("Root (L|R)", &root);
-    println!("  Root hex: 0x{}", hex(&root));
+
+    // §25.8 Vector 19: assert exact spec hex values.
+    assert_eq!(
+        hex(&leaf_a),
+        "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d"
+    );
+    assert_eq!(
+        hex(&leaf_b),
+        "87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e"
+    );
+    assert_eq!(
+        hex(&leaf_c),
+        "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2"
+    );
+    assert_eq!(
+        hex(&leaf_d),
+        "08a2afecc9feaef6737f055c177a56a363d28a78d7b259b8c5f66b32174f2e7d"
+    );
+    assert_eq!(
+        hex(&interior_l),
+        "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25"
+    );
+    assert_eq!(
+        hex(&interior_r),
+        "d62c77efa9be96355bb8b07aefc985914377de5aec1287998c9a10f11cd8d075"
+    );
+    assert_eq!(
+        hex(&root),
+        "5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca"
+    );
 }
 
 // ---------------------------------------------------------------------------
