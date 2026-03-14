@@ -11927,6 +11927,7 @@ mod tests {
             mls_epoch,
             grace_entries: grace,
             needs_reconnect: false,
+            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             mls_crypto_state: Vec::new(),
         }
     }
