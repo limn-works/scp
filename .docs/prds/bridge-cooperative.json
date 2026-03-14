@@ -393,7 +393,7 @@
         "rotate() replaces existing credential with new value for a given bridge_id and credential_type",
         "revoke() destroys all credentials for a bridge_id: overwrites encrypted_data with zeros before deletion",
         "list() returns all credential types stored for a given bridge_id",
-        "Encryption uses HKDF(operator_key_material, bridge_id || credential_type) as the derived key",
+        "Encryption uses HKDF-SHA256 with IKM=bridge_credential_key (per-bridge CSPRNG random), salt=SHA-256(\"SCP-BRIDGE-CREDENTIAL-V1\"), info=\"scp-bridge-credential:\" || bridge_id",
         "Cross-bridge credential access is rejected: retrieve with wrong bridge_id returns NotFound",
         "All types derive Serialize, Deserialize, Debug, Clone",
         "Unit tests verify provision-retrieve roundtrip, rotate replaces credential, revoke destroys all, suspended bridge blocks retrieve"
