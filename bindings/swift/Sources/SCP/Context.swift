@@ -70,7 +70,7 @@ public enum ContextBridge {
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
                 message: "invalid handle type for contextSend",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-2002"
             )
         }
         try await contextSend(handle: ctxHandle, identity: identity, payload: payload)
@@ -81,7 +81,7 @@ public enum ContextBridge {
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
                 message: "invalid handle type for contextLeave",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-2002"
             )
         }
         try await contextLeave(handle: ctxHandle, identity: identity)
@@ -92,7 +92,7 @@ public enum ContextBridge {
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
                 message: "invalid handle type for contextClose",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-2002"
             )
         }
         try await contextClose(handle: ctxHandle, identity: identity)
@@ -114,7 +114,7 @@ public enum ContextBridge {
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
                 message: "invalid handle type for setEconomicPolicy",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-2002"
             )
         }
         try setEconomicPolicy(handle: ctxHandle, policyJson: policyJson)
@@ -125,7 +125,7 @@ public enum ContextBridge {
         guard let ctxHandle = handle as? ContextHandle else {
             throw ScpError.Context(
                 message: "invalid handle type for getEconomicPolicy",
-                code: "SCP-CTX-2001"
+                code: "SCP-CTX-2002"
             )
         }
         return try getEconomicPolicy(handle: ctxHandle)
