@@ -2611,4 +2611,131 @@ mod tests {
         // Queue drain only runs for successful Tier 1 contexts.
         assert!(report.messages_drained > 0);
     }
+
+    // -----------------------------------------------------------------------
+    // ContextGone and Failed SyncOutcome variant tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn context_sync_result_context_gone_outcome() {
+        let result = ContextSyncResult {
+            context_id: "ctx-gone".to_owned(),
+            tier: OfflineTier::Short,
+            epochs_caught_up: 0,
+            events_recovered: 0,
+            messages_unrecoverable: 0,
+            mls_update_issued: false,
+            outcome: SyncOutcome::ContextGone,
+            sync_events: vec![],
+        };
+        assert_eq!(result.outcome, SyncOutcome::ContextGone);
+        assert_eq!(result.context_id, "ctx-gone");
+        assert!(!result.mls_update_issued);
+
+        // ContextGone results should serialize/deserialize correctly.
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: ContextSyncResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.outcome, SyncOutcome::ContextGone);
+    }
+
+    #[test]
+    fn context_sync_result_failed_outcome() {
+        let reason = "epoch reconciliation timed out".to_owned();
+        let result = ContextSyncResult {
+            context_id: "ctx-fail".to_owned(),
+            tier: OfflineTier::Short,
+            epochs_caught_up: 3,
+            events_recovered: 0,
+            messages_unrecoverable: 0,
+            mls_update_issued: false,
+            outcome: SyncOutcome::Failed {
+                reason: reason.clone(),
+            },
+            sync_events: vec![],
+        };
+        let SyncOutcome::Failed {
+            reason: ref actual_reason,
+        } = result.outcome
+        else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert_eq!(actual_reason, &reason);
+        assert_eq!(result.epochs_caught_up, 3);
+
+        // Failed results should serialize/deserialize correctly.
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: ContextSyncResult = serde_json::from_str(&json).unwrap();
+        let SyncOutcome::Failed {
+            reason: deser_reason,
+        } = deser.outcome
+        else {
+            unreachable!("expected Failed after deserialization");
+        };
+        assert_eq!(deser_reason, reason);
+    }
+
+    #[test]
+    fn build_report_with_context_gone_result() {
+        let results = vec![
+            ContextSyncResult {
+                context_id: "ctx-ok".to_owned(),
+                tier: OfflineTier::Short,
+                epochs_caught_up: 5,
+                events_recovered: 10,
+                messages_unrecoverable: 0,
+                mls_update_issued: true,
+                outcome: SyncOutcome::FullyCaughtUp,
+                sync_events: vec![],
+            },
+            ContextSyncResult {
+                context_id: "ctx-gone".to_owned(),
+                tier: OfflineTier::Short,
+                epochs_caught_up: 0,
+                events_recovered: 0,
+                messages_unrecoverable: 0,
+                mls_update_issued: false,
+                outcome: SyncOutcome::ContextGone,
+                sync_events: vec![],
+            },
+        ];
+        let report = ReconnectionCoordinator::build_report(results, 5, 2, 1000);
+        assert_eq!(report.contexts_synced.len(), 2);
+        assert_eq!(
+            report.contexts_synced[0].outcome,
+            SyncOutcome::FullyCaughtUp,
+        );
+        assert_eq!(
+            report.contexts_synced[1].outcome,
+            SyncOutcome::ContextGone,
+        );
+        assert_eq!(report.messages_drained, 5);
+        assert_eq!(report.messages_discarded, 2);
+    }
+
+    #[test]
+    fn build_report_with_failed_result() {
+        let results = vec![ContextSyncResult {
+            context_id: "ctx-fail".to_owned(),
+            tier: OfflineTier::Extended,
+            epochs_caught_up: 0,
+            events_recovered: 0,
+            messages_unrecoverable: 0,
+            mls_update_issued: false,
+            outcome: SyncOutcome::Failed {
+                reason: "delta sync unavailable".to_owned(),
+            },
+            sync_events: vec![],
+        }];
+        let report = ReconnectionCoordinator::build_report(results, 0, 0, 500);
+        assert_eq!(report.contexts_synced.len(), 1);
+        let SyncOutcome::Failed { reason } = &report.contexts_synced[0].outcome else {
+            unreachable!(
+                "expected Failed, got {:?}",
+                report.contexts_synced[0].outcome
+            );
+        };
+        assert_eq!(reason, "delta sync unavailable");
+        // No queue drain should occur for failed contexts.
+        assert_eq!(report.messages_drained, 0);
+    }
 }
