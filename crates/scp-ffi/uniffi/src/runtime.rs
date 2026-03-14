@@ -143,8 +143,8 @@ fn build_default_context_manager() -> Arc<ContextManager> {
     ))
 }
 
-/// Returns a reference to the shared `ContextManager`, initializing it if
-/// necessary.
+/// Returns a reference to the shared `ContextManager`, initializing it with
+/// defaults if necessary.
 ///
 /// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
 /// Option, ()), this provides access to the manager without requiring a
@@ -157,7 +157,7 @@ fn build_default_context_manager() -> Arc<ContextManager> {
 /// tracking). This is safe because standalone functions like
 /// `register_local_did` / `is_local_did` only access the DID registry, not
 /// transport or crypto, and should not require a prior `context_create` call.
-pub fn context_manager_or_init() -> &'static Arc<ContextManager> {
+pub fn context_manager_expect() -> &'static Arc<ContextManager> {
     CONTEXT_MANAGER.get_or_init(build_default_context_manager)
 }
 
