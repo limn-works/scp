@@ -113,6 +113,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
             blob_ttl: 0,
             encrypted_blob: Vec::new(), // Context announcement: empty blob.
             extensions: std::collections::HashMap::new(),
+            version_compatibility: None,
         };
 
         // Clone the Arc so the mutex lock is acquired inside block_in_place,
@@ -163,6 +164,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
             blob_ttl: 0,
             encrypted_blob: encrypted_payload.to_vec(),
             extensions: std::collections::HashMap::new(),
+            version_compatibility: None,
         };
 
         let adapter = Arc::clone(&self.adapter);

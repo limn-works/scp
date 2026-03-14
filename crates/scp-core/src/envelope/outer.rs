@@ -103,6 +103,18 @@ pub struct OuterEnvelope {
     /// values for security-sensitive decisions.
     #[serde(flatten)]
     pub extensions: HashMap<String, rmpv::Value>,
+
+    /// The result of version compatibility checking, recorded by
+    /// [`OuterEnvelope::from_bytes`] so callers can programmatically detect
+    /// degraded mode without re-checking the version field.
+    ///
+    /// `None` when the envelope was constructed locally (e.g., via
+    /// [`create_outer_envelope`]) rather than deserialized from the wire.
+    ///
+    /// This field is not serialized — it is a local annotation, not part of
+    /// the wire format.
+    #[serde(skip)]
+    pub version_compatibility: Option<super::VersionCompatibility>,
 }
 
 /// Constructs an outer envelope from its components.
@@ -145,6 +157,7 @@ pub fn create_outer_envelope(
         blob_ttl,
         encrypted_blob,
         extensions: HashMap::new(),
+        version_compatibility: None,
     })
 }
 
@@ -185,7 +198,7 @@ impl OuterEnvelope {
                 max: MAX_ENVELOPE_SIZE,
             });
         }
-        let envelope: Self = rmp_serde::from_slice(bytes)
+        let mut envelope: Self = rmp_serde::from_slice(bytes)
             .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
 
         // §13.5: accept same-major versions, reject different majors.
@@ -203,6 +216,10 @@ impl OuterEnvelope {
                 "outer envelope minor version mismatch — operating in degraded mode (§13.6)"
             );
         }
+
+        // Record the compatibility result so callers can detect degraded mode
+        // programmatically without re-checking (#628 F4).
+        envelope.version_compatibility = Some(compat);
 
         Ok(envelope)
     }

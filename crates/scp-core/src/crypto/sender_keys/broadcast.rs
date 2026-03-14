@@ -607,6 +607,9 @@ pub fn open_broadcast(
     envelope: &BroadcastEnvelope,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<Vec<u8>, SenderKeyError> {
+    // Step 0: Reject incompatible major versions early (§13.5, #628).
+    validate_broadcast_version(envelope)?;
+
     // Step 1: Verify signature BEFORE decryption (issue #352).
     // Use the envelope's version (not the constant) so that tampering with
     // the version field causes verification to fail (§13.2.2).
@@ -653,6 +656,9 @@ pub fn open_broadcast_trusted(
     key: &BroadcastKey,
     envelope: &BroadcastEnvelope,
 ) -> Result<Vec<u8>, SenderKeyError> {
+    // Reject incompatible major versions early (§13.5, #628).
+    validate_broadcast_version(envelope)?;
+
     decrypt_envelope(key, envelope)
 }
 
@@ -776,7 +782,8 @@ impl BroadcastReplayDetector {
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::panic
 )]
 mod tests {
     use super::*;
@@ -1469,6 +1476,98 @@ mod tests {
     // -----------------------------------------------------------------------
     // Property-based tests
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // validate_broadcast_version tests (#628 F3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_broadcast_version_exact_match_returns_exact() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let envelope = test_seal(&key, b"version test");
+        // Default version is SCP_PROTOCOL_VERSION (0x0100) — exact match.
+        let result = validate_broadcast_version(&envelope);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            crate::envelope::VersionCompatibility::Exact
+        );
+    }
+
+    #[test]
+    fn validate_broadcast_version_degraded_mode_same_major_different_minor() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut envelope = test_seal(&key, b"degraded test");
+        // SCP/1.3 — same major (1), different minor (3 vs 0).
+        envelope.version = 0x0103;
+        let result = validate_broadcast_version(&envelope);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            crate::envelope::VersionCompatibility::DegradedMode {
+                local_minor,
+                remote_minor,
+            } => {
+                assert_eq!(local_minor, 0);
+                assert_eq!(remote_minor, 3);
+            }
+            crate::envelope::VersionCompatibility::Exact => {
+                panic!("expected DegradedMode, got Exact");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_broadcast_version_different_major_rejected() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut envelope = test_seal(&key, b"reject test");
+        // SCP/2.0 — different major version.
+        envelope.version = 0x0200;
+        let result = validate_broadcast_version(&envelope);
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                SenderKeyError::UnsupportedVersion { version: 0x0200 }
+            ),
+            "major version 2 must be rejected"
+        );
+    }
+
+    #[test]
+    fn open_broadcast_rejects_incompatible_major_version() {
+        // Verify that open_broadcast rejects major version mismatch
+        // via the wired-in validate_broadcast_version call (#628 F0).
+        let key = generate_broadcast_key("did:dht:alice");
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+        let mut envelope = test_seal(&key, b"version gate test");
+        envelope.version = 0x0200;
+        let result = open_broadcast(&key, &envelope, &vk);
+        assert!(
+            matches!(
+                result,
+                Err(SenderKeyError::UnsupportedVersion { version: 0x0200 })
+            ),
+            "open_broadcast must reject major version 2, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn open_broadcast_trusted_rejects_incompatible_major_version() {
+        // Verify that open_broadcast_trusted rejects major version mismatch
+        // via the wired-in validate_broadcast_version call (#628 F0).
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut envelope = test_seal(&key, b"trusted version gate test");
+        envelope.version = 0x0200;
+        let result = open_broadcast_trusted(&key, &envelope);
+        assert!(
+            matches!(
+                result,
+                Err(SenderKeyError::UnsupportedVersion { version: 0x0200 })
+            ),
+            "open_broadcast_trusted must reject major version 2, got {result:?}"
+        );
+    }
 
     proptest! {
         #[test]

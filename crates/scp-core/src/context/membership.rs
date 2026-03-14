@@ -449,6 +449,22 @@ pub enum ContextEvent {
         /// The DID of the app that was unbound.
         app_did: DID,
     },
+    /// The local implementation is operating in degraded mode (§13.6) because
+    /// a received envelope has a different minor version within the same major
+    /// version.
+    ///
+    /// Callers can emit this event when [`VersionCompatibility::DegradedMode`]
+    /// is returned from version checks on outer, inner, or broadcast envelopes.
+    /// The `tracing::warn!` calls in those paths remain as supplemental
+    /// diagnostics.
+    ///
+    /// [`VersionCompatibility::DegradedMode`]: crate::envelope::VersionCompatibility::DegradedMode
+    DegradedMode {
+        /// The local implementation's protocol version (`SCP_PROTOCOL_VERSION`).
+        local_version: u16,
+        /// The remote (wire) protocol version from the received envelope.
+        remote_version: u16,
+    },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.

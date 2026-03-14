@@ -176,6 +176,7 @@ fn test_envelope() -> OuterEnvelope {
         blob_ttl: 7200,
         encrypted_blob: vec![0x10, 0x20, 0x30],
         extensions: std::collections::HashMap::new(),
+        version_compatibility: None,
     }
 }
 
@@ -269,6 +270,7 @@ async fn webrtc_payload_too_large_rejected() {
         blob_ttl: 3600,
         encrypted_blob: vec![0xFF; 300_000], // > 256 KiB default max
         extensions: std::collections::HashMap::new(),
+        version_compatibility: None,
     };
 
     let result = adapter.send(&large_envelope).await;
