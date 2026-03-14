@@ -1192,6 +1192,7 @@ fn domain_separators_are_all_unique() {
         "scp-pseudonym-secret-v1",
         "scp-participation-statement-v1",
         "scp-context-export-integrity-v1",
+        "scp-psk-wrap-v1",
         "scp-test-attestation-v1:",
         "scp-pseudonym",
         "scp-pseudonym-v2",
