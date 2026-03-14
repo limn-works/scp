@@ -8165,11 +8165,11 @@ mod tests {
 
         let err = ffi.to_core().unwrap_err();
         match err {
-            ScpError::Validation { code, message } => {
+            ScpError::Validation { code, msg } => {
                 assert_eq!(code, "SCP-VALID-7080");
                 assert!(
-                    message.contains("32 bytes"),
-                    "expected '32 bytes' in message, got: {message}"
+                    msg.contains("32 bytes"),
+                    "expected '32 bytes' in message, got: {msg}"
                 );
             }
             other => panic!("expected Validation error, got: {other:?}"),
@@ -8583,9 +8583,9 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         match err {
-            ScpError::Context { ref message, .. } => {
+            ScpError::Context { ref msg, .. } => {
                 assert!(
-                    message.contains("approver cannot be the same"),
+                    msg.contains("approver cannot be the same"),
                     "expected self-approval error, got: {err:?}"
                 );
             }
