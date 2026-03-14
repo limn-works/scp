@@ -1193,6 +1193,18 @@ fn map_capability_names(category: &str, action: &str, is_tool: bool) -> Vec<Stri
     }
 }
 
+/// Builds a sandbox validation error result JSON string.
+fn sandbox_err(app_did: &str, error: &str) -> Result<String, JsError> {
+    let result = serde_json::json!({
+        "valid": false,
+        "signatureVerified": false,
+        "grantedCapabilities": [],
+        "error": error,
+        "appDid": app_did
+    });
+    serde_json::to_string(&result).map_err(|e| JsError::new(&format!("serialization failed: {e}")))
+}
+
 /// Validates a capability declaration JSON string against a context ceiling and
 /// role capabilities. Returns a JSON string with validation result.
 ///
@@ -1224,18 +1236,23 @@ pub fn sandbox_validate_declaration(
         .unwrap_or("unknown")
         .to_owned();
 
+    // app_id must start with "did:" (spec §8.4.1).
+    if !app_did.starts_with("did:") {
+        return sandbox_err(&app_did, "invalid app_id: must start with \"did:\"");
+    }
+    // scp_version must be present (spec §8.4.1).
+    if decl.get("scp_version").and_then(|v| v.as_str()).is_none() {
+        return sandbox_err(&app_did, "missing required field: scp_version");
+    }
+    // signature must be present (spec §8.4.1).
+    if decl.get("signature").is_none() {
+        return sandbox_err(&app_did, "missing required field: signature");
+    }
+
     // Structural validation.
     let app_name = decl.get("app_name").and_then(|v| v.as_str()).unwrap_or("");
     if app_name.is_empty() || app_name.len() > 128 {
-        let result = serde_json::json!({
-            "valid": false,
-            "signatureVerified": false,
-            "grantedCapabilities": [],
-            "error": "invalid app_name: must be 1-128 UTF-8 bytes",
-            "appDid": app_did
-        });
-        return serde_json::to_string(&result)
-            .map_err(|e| JsError::new(&format!("serialization failed: {e}")));
+        return sandbox_err(&app_did, "invalid app_name: must be 1-128 UTF-8 bytes");
     }
 
     let capabilities = decl
@@ -1244,24 +1261,13 @@ pub fn sandbox_validate_declaration(
         .cloned()
         .unwrap_or_default();
     if capabilities.is_empty() || capabilities.len() > 64 {
-        let result = serde_json::json!({
-            "valid": false,
-            "signatureVerified": false,
-            "grantedCapabilities": [],
-            "error": "capabilities must have 1-64 entries",
-            "appDid": app_did
-        });
-        return serde_json::to_string(&result)
-            .map_err(|e| JsError::new(&format!("serialization failed: {e}")));
+        return sandbox_err(&app_did, "capabilities must have 1-64 entries");
     }
 
     // Extract requested capabilities from declaration.
     let mut requested: Vec<String> = Vec::new();
     for cap_entry in &capabilities {
-        let resource = cap_entry
-            .get("resource")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let resource = cap_entry.get("resource").and_then(|v| v.as_str()).unwrap_or("");
         let actions = cap_entry
             .get("actions")
             .and_then(|v| v.as_array())
@@ -1287,17 +1293,8 @@ pub fn sandbox_validate_declaration(
             || (cap.starts_with("tool:invoke:") && ceiling_set.contains("tool:invoke:*"));
         let in_role = role_set.contains(cap.as_str())
             || (cap.starts_with("tool:invoke:") && role_set.contains("tool:invoke:*"));
-
         if !in_ceiling || !in_role {
-            let result = serde_json::json!({
-                "valid": false,
-                "signatureVerified": false,
-                "grantedCapabilities": [],
-                "error": format!("capability denied: {cap}"),
-                "appDid": app_did
-            });
-            return serde_json::to_string(&result)
-                .map_err(|e| JsError::new(&format!("serialization failed: {e}")));
+            return sandbox_err(&app_did, &format!("capability denied: {cap}"));
         }
     }
 

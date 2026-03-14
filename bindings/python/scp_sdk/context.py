@@ -975,8 +975,11 @@ class ScopedHandle:
     """
 
     context: Context
-    granted_capabilities: list[str]
+    granted_capabilities: tuple[str, ...]
     app_did: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'granted_capabilities', tuple(self.granted_capabilities))
 
     def has_capability(self, capability: str) -> bool:
         """Check whether a given capability is allowed."""

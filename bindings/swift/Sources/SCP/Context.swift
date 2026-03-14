@@ -662,15 +662,15 @@ public func validateCapabilityDeclaration(
             code: "SCP-CTX-2051"
         )
     }
-    guard let capabilities = json["grantedCapabilities"] as? [String] else {
+    guard let capabilities = json["granted_capabilities"] as? [String] else {
         throw ScpError.Context(
-            message: "validation result missing or invalid 'grantedCapabilities' field (expected [String])",
+            message: "validation result missing or invalid 'granted_capabilities' field (expected [String])",
             code: "SCP-CTX-2051"
         )
     }
-    guard let appDid = json["appDid"] as? String else {
+    guard let appDid = json["app_did"] as? String else {
         throw ScpError.Context(
-            message: "validation result missing or invalid 'appDid' field (expected String)",
+            message: "validation result missing or invalid 'app_did' field (expected String)",
             code: "SCP-CTX-2051"
         )
     }
