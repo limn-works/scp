@@ -48,6 +48,8 @@ pub use upnp::{
     MappingProtocol, NatTierChange, PortMapper, PortMappingError, PortMappingManager,
     PortMappingResult,
 };
+#[cfg(feature = "upnp")]
+pub use upnp::{NatPmpPortMapper, UpnpPortMapper};
 
 use std::future::Future;
 use std::net::SocketAddr;

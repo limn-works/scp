@@ -75,6 +75,7 @@ quic = ["scp-transport/quic"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]
 coap = ["scp-transport/coap"]
+upnp = ["scp-transport/upnp"]
 
 [lints]
 workspace = true

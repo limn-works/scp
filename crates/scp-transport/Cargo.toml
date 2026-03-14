@@ -25,6 +25,7 @@ webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-
 coap = ["dep:coap-lite", "dep:openssl"]
 nostr = ["dep:base64", "dep:k256"]
 webrtc = []
+upnp = ["dep:igd-next", "dep:natpmp"]
 
 [dependencies]
 scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
@@ -72,6 +73,8 @@ getrandom_03 = { package = "getrandom", version = "0.3", optional = true, featur
 coap-lite = { version = "0.13", optional = true }
 base64 = { workspace = true, optional = true }
 k256 = { version = "0.13", optional = true, features = ["schnorr"] }
+igd-next = { version = "0.16", optional = true, features = ["aio_tokio"] }
+natpmp = { version = "0.5", optional = true, features = ["tokio"] }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
