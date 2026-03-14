@@ -333,6 +333,17 @@ export interface Bridge {
   identityAttestDevice(did: string): Promise<string>;
   identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean>;
 
+  // App Sandboxing (#595, spec §8.4.1, §8.4.2)
+  validateCapabilityDeclaration(
+    declarationJson: string,
+    ceilingCapabilities: string[],
+    roleCapabilities: string[],
+  ): string;
+  checkScopedCapability(
+    grantedCapabilities: readonly string[],
+    requiredCapability: string,
+  ): boolean;
+
   // Lifecycle
   version(): string;
   shutdown(timeoutSecs: number): void;
@@ -407,6 +418,26 @@ export const BRIDGE_TARGET: BridgeTarget = detectBridge();
 
 /** Cached bridge instance. `null` until first `getBridge()` call. */
 let _bridge: Bridge | null = null;
+
+/**
+ * Returns the cached bridge instance synchronously.
+ *
+ * This is safe to call only after at least one async SDK method has completed
+ * (which triggers `getBridge()` and caches the bridge). If called before
+ * initialization, throws an error.
+ *
+ * Used by synchronous SDK functions (`ScopedHandle.hasCapability`,
+ * `validateCapabilityDeclaration`) that cannot await.
+ *
+ * @returns The cached `Bridge` instance.
+ * @throws {Error} If the bridge has not been initialized yet.
+ */
+export function getBridgeSync(): Bridge {
+  if (_bridge === null) {
+    throw new Error("Bridge not initialized — call an async SCP function first");
+  }
+  return _bridge;
+}
 
 /**
  * Returns the initialized bridge instance, loading it lazily on first call.

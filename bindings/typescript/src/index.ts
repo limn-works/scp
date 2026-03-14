@@ -39,7 +39,8 @@ export { Identity } from "./identity";
 // Context
 // ---------------------------------------------------------------------------
 
-export { Context } from "./context";
+export type { DeclarationValidationResult } from "./context";
+export { Context, ScopedHandle, validateCapabilityDeclaration } from "./context";
 
 // ---------------------------------------------------------------------------
 // Tools

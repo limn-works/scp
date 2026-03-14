@@ -26,6 +26,7 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod app_sandbox;
 pub mod broadcast;
 pub mod builder;
 pub mod close;
@@ -178,6 +179,13 @@ pub use ttl::{CloseResult, TtlExpiryFailureCallback, TtlExpiryResult, TtlExtensi
 pub use ttl::{
     ExtensionConsentMode, TtlEnforcer, TtlError, TtlExtensionProposal, TtlPolicy, TtlTimerHandle,
     check_ttl, consent_mode_for_member_count, run_ttl_expiry_with_retries, try_ttl_expiry_cleanup,
+};
+
+// Re-export app sandboxing types (spec §8.4.1, §8.4.2, issue #595).
+pub use app_sandbox::{
+    AppBindEvent, AppUnbindEvent, CapabilityConstraint, CapabilityDeclaration, CapabilityEntry,
+    DenialReason, DeniedCapability, SandboxError, ScopedHandle, declaration_content_hash,
+    format_bind_event, format_unbind_event, sign_declaration, validate_declaration,
 };
 
 // ---------------------------------------------------------------------------

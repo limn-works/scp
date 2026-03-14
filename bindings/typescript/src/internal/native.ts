@@ -1025,6 +1025,27 @@ export function createNativeBridge(): Bridge {
       )(did, tokenBase64);
     },
 
+    // App Sandboxing (#595, spec §8.4.1, §8.4.2)
+    validateCapabilityDeclaration(
+      declarationJson: string,
+      ceilingCapabilities: string[],
+      roleCapabilities: string[],
+    ): string {
+      return (
+        addon.validateCapabilityDeclaration as (d: string, c: string[], r: string[]) => string
+      )(declarationJson, ceilingCapabilities, roleCapabilities);
+    },
+
+    checkScopedCapability(
+      grantedCapabilities: readonly string[],
+      requiredCapability: string,
+    ): boolean {
+      return (addon.checkScopedCapability as (g: string[], r: string) => boolean)(
+        [...grantedCapabilities],
+        requiredCapability,
+      );
+    },
+
     // Lifecycle
     version(): string {
       return (addon.scpVersion as () => string)();

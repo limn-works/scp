@@ -148,6 +148,9 @@ pub use bridge::{
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)
     register_local_did,
+    // Free functions — app sandboxing (#595)
+    sandbox_check_capability,
+    sandbox_validate_declaration,
     // Free functions — sync (#370)
     sync_classify_offline,
     sync_classify_offline_custom,

@@ -14,7 +14,7 @@
 import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
-import { getBridge } from "./internal/bridge";
+import { getBridge, getBridgeSync } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
   BroadcastAdmissionPolicy,
@@ -1012,4 +1012,75 @@ export class Context implements AsyncDisposable {
       );
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
+// ---------------------------------------------------------------------------
+
+/** Result of validating a capability declaration. */
+export interface DeclarationValidationResult {
+  valid: boolean;
+  grantedCapabilities: readonly string[];
+  error: string | null;
+  appDid: string;
+}
+
+/**
+ * Capability-restricted context handle (spec §8.4.2).
+ *
+ * Wraps a `Context` with a whitelist of allowed capabilities. All protocol
+ * operations must check the whitelist before proceeding. An app cannot access
+ * protocol operations beyond its declared capabilities.
+ *
+ * Once created, a `ScopedHandle` cannot gain additional capabilities
+ * (no escalation guarantee, spec 8.4.2 rule 4).
+ */
+export class ScopedHandle {
+  readonly context: Context;
+  readonly grantedCapabilities: readonly string[];
+  readonly appDid: string;
+
+  constructor(context: Context, grantedCapabilities: readonly string[], appDid: string) {
+    this.context = context;
+    // Freeze to prevent mutation via Object.defineProperty or prototype tricks.
+    this.grantedCapabilities = Object.freeze([...grantedCapabilities]);
+    this.appDid = appDid;
+  }
+
+  /** Check whether a given capability is allowed. */
+  hasCapability(capability: string): boolean {
+    const bridge = getBridgeSync();
+    return bridge.checkScopedCapability(this.grantedCapabilities, capability);
+  }
+
+  /** Throws `ContextError` if the capability is not granted. */
+  checkCapability(capability: string): void {
+    if (!this.hasCapability(capability)) {
+      throw new ContextError(
+        `capability denied: ${capability} not granted to app ${this.appDid}`,
+        "SCP-CTX-2050",
+      );
+    }
+  }
+}
+
+/**
+ * Validates a capability declaration against a context ceiling and role capabilities.
+ *
+ * Returns a result object with validation outcome. See spec §8.4.1.
+ * This is a synchronous operation -- no I/O is involved.
+ */
+export function validateCapabilityDeclaration(
+  declarationJson: string,
+  ceilingCapabilities: string[],
+  roleCapabilities: string[],
+): DeclarationValidationResult {
+  const bridge = getBridgeSync();
+  const resultJson = bridge.validateCapabilityDeclaration(
+    declarationJson,
+    ceilingCapabilities,
+    roleCapabilities,
+  );
+  return JSON.parse(resultJson) as DeclarationValidationResult;
 }

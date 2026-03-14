@@ -962,7 +962,63 @@ def _validate_buffer_size(size: int) -> None:
         raise ValueError(msg)
 
 
+@dataclass(frozen=True)
+class ScopedHandle:
+    """Capability-restricted context handle (spec section 8.4.2).
+
+    Wraps a context with a whitelist of allowed capabilities. All protocol
+    operations must check the whitelist before proceeding. An app cannot
+    access protocol operations beyond its declared capabilities.
+
+    Once created, a ``ScopedHandle`` cannot gain additional capabilities
+    (no escalation guarantee, spec 8.4.2 rule 4).
+    """
+
+    context: Context
+    granted_capabilities: tuple[str, ...]
+    app_did: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "granted_capabilities", tuple(self.granted_capabilities))
+
+    def has_capability(self, capability: str) -> bool:
+        """Check whether a given capability is allowed."""
+        import _scp_core
+
+        return _scp_core.py_check_scoped_capability(self.granted_capabilities, capability)
+
+    def check_capability(self, capability: str) -> None:
+        """Raise :class:`ContextError` if the capability is not granted."""
+        if not self.has_capability(capability):
+            msg = f"capability denied: {capability} not granted to app {self.app_did}"
+            raise ContextError(msg)
+
+
+def validate_capability_declaration(
+    declaration_json: str,
+    ceiling_capabilities: list[str],
+    role_capabilities: list[str],
+) -> dict[str, Any]:
+    """Validate a capability declaration against a context ceiling and role.
+
+    Returns a dict with ``valid`` (bool), ``granted_capabilities`` (list of str),
+    ``error`` (str or None), and ``app_did`` (str).
+
+    See spec sections 8.4.1 and 8.4.2.
+    """
+    import json
+
+    import _scp_core
+
+    result_json = _scp_core.py_validate_capability_declaration(
+        declaration_json, ceiling_capabilities, role_capabilities
+    )
+    return json.loads(result_json)
+
+
 __all__ = [
     "Context",
     "Membership",
+    "ScopedHandle",
+    "validate_capability_declaration",
 ]

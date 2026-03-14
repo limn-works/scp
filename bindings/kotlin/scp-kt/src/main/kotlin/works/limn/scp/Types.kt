@@ -8,6 +8,8 @@
 
 package works.limn.scp
 
+import works.limn.scp.bridge.BridgeException
+
 /**
  * Key custody method for identity key management (spec section 3.2).
  *
@@ -100,4 +102,94 @@ enum class ShadowStatus(val rawValue: String) {
          */
         fun fromRawValue(value: String): ShadowStatus? = entries.find { it.rawValue == value }
     }
+}
+
+// ---------------------------------------------------------------------------
+// App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of validating a capability declaration.
+ *
+ * See spec sections 8.4.1 and 8.4.2.
+ */
+data class DeclarationValidationResult(
+    /** Whether the validation passed. */
+    val valid: Boolean,
+    /** Capabilities granted to the app (if valid). */
+    val grantedCapabilities: List<String>,
+    /** Error message if validation failed, null otherwise. */
+    val error: String?,
+    /** The DID of the app from the declaration. */
+    val appDid: String,
+)
+
+/**
+ * Capability-restricted context handle (spec §8.4.2).
+ *
+ * Wraps a context with a whitelist of allowed capabilities. All protocol
+ * operations must check the whitelist before proceeding. An app cannot access
+ * protocol operations beyond its declared capabilities.
+ *
+ * Once created, a [ScopedHandle] cannot gain additional capabilities
+ * (no escalation guarantee, spec 8.4.2 rule 4).
+ *
+ * This is intentionally NOT a data class: the auto-generated `copy()` method
+ * on data classes would allow callers to create a new handle with escalated
+ * capabilities, bypassing the no-escalation guarantee.
+ */
+class ScopedHandle internal constructor(
+    /** The context ID this handle is scoped to. */
+    val contextId: String,
+    grantedCapabilities: List<String>,
+    /** The DID of the app. */
+    val appDid: String,
+) {
+    /** The capabilities granted to this app binding (immutable). */
+    val grantedCapabilities: List<String> = grantedCapabilities.toList()
+
+    /**
+     * Check whether a given capability is allowed.
+     */
+    fun hasCapability(capability: String): Boolean {
+        if (grantedCapabilities.contains(capability)) return true
+        // ToolInvokeAll covers any specific ToolInvoke
+        if (capability.startsWith("tool:invoke:") &&
+            capability != "tool:invoke:*" &&
+            grantedCapabilities.contains("tool:invoke:*")
+        ) {
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Throws [BridgeException] if the capability is not granted.
+     */
+    fun checkCapability(capability: String) {
+        if (!hasCapability(capability)) {
+            throw BridgeException(
+                "capability denied: $capability not granted to app $appDid",
+                "SCP-CTX-2050",
+            )
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ScopedHandle) return false
+        return contextId == other.contextId &&
+            grantedCapabilities == other.grantedCapabilities &&
+            appDid == other.appDid
+    }
+
+    override fun hashCode(): Int {
+        var result = contextId.hashCode()
+        result = 31 * result + grantedCapabilities.hashCode()
+        result = 31 * result + appDid.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "ScopedHandle(contextId=$contextId, appDid=$appDid, capabilities=${grantedCapabilities.size})"
 }

@@ -1137,6 +1137,204 @@ pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u3
 }
 
 // ---------------------------------------------------------------------------
+// App Sandboxing (#595, spec §8.4.1, §8.4.2)
+// ---------------------------------------------------------------------------
+
+/// Maps a resource category + action to canonical capability name strings,
+/// matching `scp-core`'s `CapabilityEntry::to_capabilities()` exactly.
+///
+/// Returns a `Vec<String>` because some (category, action) pairs produce
+/// multiple capabilities (e.g., `("governance", "admin")` yields both
+/// `governance:propose` and `governance:vote`).
+///
+/// The `is_tool` flag indicates the resource path ends with `tools/{name}`,
+/// meaning the action targets a specific tool (not the tools category itself).
+///
+/// Core source of truth: `crates/scp-core/src/context/app_sandbox.rs`
+/// `CapabilityEntry::to_capabilities()`.
+fn map_capability_names(category: &str, action: &str, is_tool: bool) -> Vec<String> {
+    match (category, action, is_tool) {
+        // ToolInvoke(specific) -- resource ends with tools/{tool_name}
+        (_, "invoke", true) => vec![format!("tool:invoke:{category}")],
+        // MessagesRead -- core accepts ("messaging"|"members", "read")
+        ("messaging" | "members", "read", _) => vec!["messages:read".to_owned()],
+        // MessagesWrite -- core accepts ("messaging", "write") only
+        ("messaging", "write", _) => vec!["messages:write".to_owned()],
+        // MemberInvite -- core accepts ("members", "write"|"admin")
+        ("members", "write" | "admin", _) => vec!["member:invite".to_owned()],
+        // ToolInvokeAll
+        ("tools", "invoke", _) => vec!["tool:invoke:*".to_owned()],
+        // ToolRegister -- core accepts ("tools", "register"|"admin")
+        ("tools", "register" | "admin", _) => vec!["tool:register".to_owned()],
+        // GovernancePropose -- core accepts ("governance", "write")
+        ("governance", "write", _) => vec!["governance:propose".to_owned()],
+        // GovernancePropose + GovernanceVote -- core accepts ("governance", "admin")
+        ("governance", "admin", _) => vec![
+            "governance:propose".to_owned(),
+            "governance:vote".to_owned(),
+        ],
+        // RoleAssign -- core accepts ("roles", "admin")
+        ("roles", "admin", _) => vec!["role:assign".to_owned()],
+        // ContextClose -- core accepts ("context", "admin")
+        ("context", "admin", _) => vec!["context:close".to_owned()],
+        // Bridging (spec section 12)
+        ("bridging", _, _) => vec!["bridging".to_owned()],
+        // MediaVoice (spec section 10.9.1)
+        ("media", "voice", _) => vec!["media:voice".to_owned()],
+        // MediaVideo (spec section 10.9.1)
+        ("media", "video", _) => vec!["media:video".to_owned()],
+        // MediaScreenShare (spec section 10.9.1)
+        ("media", "screen_share", _) => vec!["media:screen_share".to_owned()],
+        // MetadataEdit -- core accepts ("metadata", "write"|"admin")
+        ("metadata", "write" | "admin", _) => vec!["metadata:edit".to_owned()],
+        // Custom capabilities -- anything not matching a known pattern.
+        // Uses Capability::name() format (not Display), e.g. "category:action".
+        _ => vec![format!("{category}:{action}")],
+    }
+}
+
+/// Builds a sandbox validation error result JSON string.
+fn sandbox_err(app_did: &str, error: &str) -> Result<String, JsError> {
+    let result = serde_json::json!({
+        "valid": false,
+        "signatureVerified": false,
+        "grantedCapabilities": [],
+        "error": error,
+        "appDid": app_did
+    });
+    serde_json::to_string(&result).map_err(|e| JsError::new(&format!("serialization failed: {e}")))
+}
+
+/// Validates a capability declaration JSON string against a context ceiling and
+/// role capabilities. Returns a JSON string with validation result.
+///
+/// The declaration JSON must be a valid `CapabilityDeclaration` per spec §8.4.1.
+/// WASM bridge performs structural + capability validation but does NOT perform
+/// Ed25519 signature verification. The `signatureVerified` field in the result
+/// is always `false` -- callers MUST verify the signature themselves (e.g. via
+/// `WebCrypto`) before trusting the result.
+///
+/// Result JSON: `{ valid, signatureVerified, grantedCapabilities, error, appDid }`.
+///
+/// # Errors
+///
+/// Returns `JsError` if the declaration JSON is malformed or serialization fails.
+#[wasm_bindgen]
+pub fn sandbox_validate_declaration(
+    declaration_json: String,
+    ceiling_capabilities: Vec<String>,
+    role_capabilities: Vec<String>,
+) -> Result<String, JsError> {
+    use std::collections::HashSet;
+
+    let decl: serde_json::Value = serde_json::from_str(&declaration_json)
+        .map_err(|e| JsError::new(&format!("invalid declaration JSON: {e}")))?;
+
+    let app_did = decl
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+
+    // app_id must start with "did:" (spec §8.4.1).
+    if !app_did.starts_with("did:") {
+        return sandbox_err(&app_did, "invalid app_id: must start with \"did:\"");
+    }
+    // scp_version must be present (spec §8.4.1).
+    if decl.get("scp_version").and_then(|v| v.as_str()).is_none() {
+        return sandbox_err(&app_did, "missing required field: scp_version");
+    }
+    // signature must be present (spec §8.4.1).
+    if decl.get("signature").is_none() {
+        return sandbox_err(&app_did, "missing required field: signature");
+    }
+
+    // Structural validation.
+    let app_name = decl.get("app_name").and_then(|v| v.as_str()).unwrap_or("");
+    if app_name.is_empty() || app_name.len() > 128 {
+        return sandbox_err(&app_did, "invalid app_name: must be 1-128 UTF-8 bytes");
+    }
+
+    let capabilities = decl
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if capabilities.is_empty() || capabilities.len() > 64 {
+        return sandbox_err(&app_did, "capabilities must have 1-64 entries");
+    }
+
+    // Extract requested capabilities from declaration.
+    let mut requested: Vec<String> = Vec::new();
+    for cap_entry in &capabilities {
+        let resource = cap_entry
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let actions = cap_entry
+            .get("actions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let category = resource.rsplit('/').next().unwrap_or(resource);
+        let parts: Vec<&str> = resource.split('/').collect();
+        let is_tool = parts.len() >= 2 && parts[parts.len() - 2] == "tools";
+
+        for action_val in &actions {
+            let action = action_val.as_str().unwrap_or("");
+            requested.extend(map_capability_names(category, action, is_tool));
+        }
+    }
+
+    // All-or-nothing ceiling + role check.
+    let ceiling_set: HashSet<&str> = ceiling_capabilities.iter().map(String::as_str).collect();
+    let role_set: HashSet<&str> = role_capabilities.iter().map(String::as_str).collect();
+
+    for cap in &requested {
+        let in_ceiling = ceiling_set.contains(cap.as_str())
+            || (cap.starts_with("tool:invoke:") && ceiling_set.contains("tool:invoke:*"));
+        let in_role = role_set.contains(cap.as_str())
+            || (cap.starts_with("tool:invoke:") && role_set.contains("tool:invoke:*"));
+        if !in_ceiling || !in_role {
+            return sandbox_err(&app_did, &format!("capability denied: {cap}"));
+        }
+    }
+
+    let result = serde_json::json!({
+        "valid": true,
+        "signatureVerified": false,
+        "grantedCapabilities": requested,
+        "error": null,
+        "appDid": app_did
+    });
+    serde_json::to_string(&result).map_err(|e| JsError::new(&format!("serialization failed: {e}")))
+}
+
+/// Checks whether a given capability is allowed for an app binding.
+#[wasm_bindgen]
+pub fn sandbox_check_capability(
+    granted_capabilities: Vec<String>,
+    required_capability: String,
+) -> bool {
+    use std::collections::HashSet;
+
+    let granted: HashSet<&str> = granted_capabilities.iter().map(String::as_str).collect();
+
+    if granted.contains(required_capability.as_str()) {
+        return true;
+    }
+    // ToolInvokeAll covers any specific ToolInvoke.
+    if required_capability.starts_with("tool:invoke:")
+        && required_capability != "tool:invoke:*"
+        && granted.contains("tool:invoke:*")
+    {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Bridge-level validation helpers
 // ---------------------------------------------------------------------------
 
