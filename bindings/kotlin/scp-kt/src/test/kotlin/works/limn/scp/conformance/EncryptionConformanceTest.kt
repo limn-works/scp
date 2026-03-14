@@ -54,6 +54,7 @@ class EncryptionConformanceTest {
                     "context_send",
                     mapOf(
                         "context_handle" to "10",
+                        "identity_handle" to "1",
                         "payload" to "encrypted-content",
                     ),
                 )
@@ -71,7 +72,11 @@ class EncryptionConformanceTest {
                     BridgeException("MLS encryption failed", "SCP-CRYPTO-4001")
                 val result = dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "data"),
+                    mapOf(
+                        "context_handle" to "10",
+                        "identity_handle" to "1",
+                        "payload" to "data",
+                    ),
                 )
                 assertEquals("SCP-CRYPTO-4001", result["error"])
             }
@@ -86,7 +91,11 @@ class EncryptionConformanceTest {
                     BridgeException("Sender key expired", "SCP-CRYPTO-4010")
                 val result = dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "data"),
+                    mapOf(
+                        "context_handle" to "10",
+                        "identity_handle" to "1",
+                        "payload" to "data",
+                    ),
                 )
                 assertEquals("SCP-CRYPTO-4010", result["error"])
             }
@@ -97,7 +106,7 @@ class EncryptionConformanceTest {
                 BridgeException("Key cleanup failed", "SCP-CRYPTO-4011")
             val result = dispatcher.dispatch(
                 "context_leave",
-                mapOf("context_handle" to "10"),
+                mapOf("context_handle" to "10", "identity_handle" to "1"),
             )
             assertEquals("SCP-CRYPTO-4011", result["error"])
         }
@@ -112,7 +121,11 @@ class EncryptionConformanceTest {
                     BridgeException("Decryption failed", "SCP-CRYPTO-4002")
                 val result = dispatcher.dispatch(
                     "context_send",
-                    mapOf("context_handle" to "10", "payload" to "garbled"),
+                    mapOf(
+                        "context_handle" to "10",
+                        "identity_handle" to "1",
+                        "payload" to "garbled",
+                    ),
                 )
                 assertEquals("SCP-CRYPTO-4002", result["error"])
             }
@@ -130,6 +143,7 @@ class EncryptionConformanceTest {
                     operation = "context_send",
                     input = mapOf(
                         "context_handle" to "10",
+                        "identity_handle" to "1",
                         "payload" to "hello-encrypted",
                     ),
                     expected = mapOf("status" to "sent"),
