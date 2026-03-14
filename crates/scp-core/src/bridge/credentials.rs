@@ -315,7 +315,7 @@ pub trait BridgeCredentialStore: Send + Sync {
     fn store_bridge_credential_key(
         &self,
         bridge_id: &str,
-        key: [u8; 32],
+        key: Zeroizing<[u8; 32]>,
     ) -> impl std::future::Future<Output = Result<(), CredentialError>> + Send;
 
     /// Retrieve the bridge credential key from the custody boundary.
@@ -396,11 +396,14 @@ pub fn derive_credential_key(
 ///
 /// Called once at bridge provisioning time. The returned key MUST be
 /// stored in the custody boundary via `ProtocolRepository`.
+///
+/// The key is wrapped in [`Zeroizing`] so it is zeroed on drop,
+/// consistent with every other key-returning function in this module.
 #[must_use]
-pub fn generate_bridge_credential_key() -> [u8; 32] {
+pub fn generate_bridge_credential_key() -> Zeroizing<[u8; 32]> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
-    key
+    Zeroizing::new(key)
 }
 
 /// Encrypts plaintext credential data with AES-256-GCM.
@@ -686,12 +689,12 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
     async fn store_bridge_credential_key(
         &self,
         bridge_id: &str,
-        key: [u8; 32],
+        key: Zeroizing<[u8; 32]>,
     ) -> Result<(), CredentialError> {
         self.bridge_credential_keys
             .write()
             .await
-            .insert(bridge_id.to_owned(), Zeroizing::new(key));
+            .insert(bridge_id.to_owned(), key);
         Ok(())
     }
 
@@ -1290,6 +1293,7 @@ mod tests {
     async fn store_and_retrieve_bridge_credential_key_roundtrip() {
         let store = InMemoryCredentialStore::new();
         let key = generate_bridge_credential_key();
+        let expected = *key;
 
         store
             .store_bridge_credential_key("bridge-001", key)
@@ -1301,7 +1305,7 @@ mod tests {
             .await
             .expect("get key");
 
-        assert_eq!(*retrieved, key, "retrieved key must match stored key");
+        assert_eq!(*retrieved, expected, "retrieved key must match stored key");
     }
 
     #[tokio::test]
@@ -1324,6 +1328,7 @@ mod tests {
     async fn revoke_destroys_bridge_credential_key() {
         let store = InMemoryCredentialStore::new();
         let key = generate_bridge_credential_key();
+        let raw_key = *key;
 
         // Store a key and a credential.
         store
@@ -1332,7 +1337,7 @@ mod tests {
             .expect("store key");
 
         store
-            .provision("bridge-001", CredentialType::ApiKey, b"secret", &key)
+            .provision("bridge-001", CredentialType::ApiKey, b"secret", &raw_key)
             .await
             .expect("provision");
 
