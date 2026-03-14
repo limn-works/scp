@@ -395,8 +395,9 @@ pub fn resolve_metadata_conflict(a: &MetadataOp, b: &MetadataOp) -> ConflictReso
 ///
 /// # Note
 ///
-/// Only resolves the first regular-conflict pair. Callers should re-invoke
-/// after removing the losing proposal if additional conflicts may exist.
+/// Only resolves the first regular-conflict pair. For complete resolution
+/// of all regular conflicts in a single call, use
+/// [`resolve_all_governance_conflicts`].
 ///
 /// # Errors
 ///
@@ -464,6 +465,113 @@ pub fn resolve_governance_conflict(
         winner_proposal_id: winner.proposal_id,
         loser_proposal_id: loser.proposal_id,
     })
+}
+
+/// Resolves **all** conflicting governance proposals in a single call.
+///
+/// This is the complete-resolution counterpart to
+/// [`resolve_governance_conflict`], which resolves only the first
+/// regular-conflict pair. This function iterates until every regular
+/// conflict is resolved, returning one [`ConflictResolutionStrategy`] per
+/// resolved pair.
+///
+/// **Freeze triggers are unchanged:** if ANY pair is a
+/// [`ConflictPairKind::SimultaneousCommit`] or
+/// [`ConflictPairKind::MutualRemoval`], the function returns a single
+/// [`ConflictResolutionStrategy::GovernanceFreeze`] containing all
+/// conflicting proposal IDs (same behavior as
+/// `resolve_governance_conflict`).
+///
+/// **Regular conflict iteration:** when all conflicts are `Regular`, the
+/// function repeatedly classifies the remaining proposals, resolves the
+/// first conflicting pair (lower leaf index wins), removes the loser from
+/// the working set, and repeats until no conflicts remain. The result is a
+/// `Vec` of [`ConflictResolutionStrategy::MerkleOrdered`] entries — one
+/// per eliminated proposal.
+///
+/// No synchronized clock dependency (§9.8.3).
+///
+/// # Errors
+///
+/// Returns [`ConflictResolutionError::EmptyProposals`] if the slice is
+/// empty. Returns [`ConflictResolutionError::NotConflicting`] if no pair
+/// of proposals actually conflicts.
+///
+/// See ADR-029 section 5c and ADR-031 section 7.
+pub fn resolve_all_governance_conflicts(
+    proposals: &[GovernanceProposalSnapshot],
+) -> Result<Vec<ConflictResolutionStrategy>, ConflictResolutionError> {
+    if proposals.is_empty() {
+        return Err(ConflictResolutionError::EmptyProposals);
+    }
+
+    if proposals.len() == 1 {
+        return Err(ConflictResolutionError::NotConflicting {
+            reason: "only one proposal provided".to_owned(),
+        });
+    }
+
+    // Initial classification to check for freeze triggers and validate
+    // that at least one conflict exists.
+    let classified = classify_conflict_pairs(proposals);
+
+    if classified.is_empty() {
+        return Err(ConflictResolutionError::NotConflicting {
+            reason: "no conflicting action pairs found".to_owned(),
+        });
+    }
+
+    // If ANY pair triggers a freeze, delegate to the single-resolution
+    // function — the freeze already collects ALL conflicting proposals.
+    let has_freeze_trigger = classified.iter().any(|p| {
+        matches!(
+            p.kind,
+            ConflictPairKind::SimultaneousCommit | ConflictPairKind::MutualRemoval
+        )
+    });
+
+    if has_freeze_trigger {
+        let mut all_ids: Vec<ProposalId> = classified
+            .iter()
+            .flat_map(|p| [proposals[p.i].proposal_id, proposals[p.j].proposal_id])
+            .collect();
+        all_ids.sort_unstable();
+        all_ids.dedup();
+        return Ok(vec![ConflictResolutionStrategy::GovernanceFreeze {
+            conflicting_proposals: all_ids,
+        }]);
+    }
+
+    // All conflicts are Regular. Iterate: resolve one pair, remove the
+    // loser, re-classify, repeat.
+    let mut remaining: Vec<GovernanceProposalSnapshot> = proposals.to_vec();
+    let mut resolutions = Vec::new();
+
+    loop {
+        let pairs = classify_conflict_pairs(&remaining);
+        if pairs.is_empty() {
+            break;
+        }
+
+        // Resolve the first conflicting pair by Merkle log order.
+        let first = &pairs[0];
+        let (winner_idx, loser_idx) =
+            if remaining[first.i].leaf_index < remaining[first.j].leaf_index {
+                (first.i, first.j)
+            } else {
+                (first.j, first.i)
+            };
+
+        resolutions.push(ConflictResolutionStrategy::MerkleOrdered {
+            winner_proposal_id: remaining[winner_idx].proposal_id,
+            loser_proposal_id: remaining[loser_idx].proposal_id,
+        });
+
+        // Remove the loser from the working set and re-classify.
+        remaining.remove(loser_idx);
+    }
+
+    Ok(resolutions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1487,465 @@ mod tests {
                 loser_proposal_id: proposal_id(3),
             }),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_all_governance_conflicts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_all_empty_proposals_errors() {
+        let result = resolve_all_governance_conflicts(&[]);
+        assert!(matches!(
+            result,
+            Err(ConflictResolutionError::EmptyProposals)
+        ));
+    }
+
+    #[test]
+    fn resolve_all_single_proposal_errors() {
+        let p = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:bob"),
+                new_role: "admin".to_owned(),
+            },
+            5,
+        );
+        let result = resolve_all_governance_conflicts(&[p]);
+        assert!(matches!(
+            result,
+            Err(ConflictResolutionError::NotConflicting { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_all_non_conflicting_proposals_errors() {
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:bob"),
+                new_role: "admin".to_owned(),
+            },
+            5,
+        );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:carol",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:dave"),
+                new_role: "member".to_owned(),
+            },
+            7,
+        );
+        let result = resolve_all_governance_conflicts(&[p1, p2]);
+        assert!(matches!(
+            result,
+            Err(ConflictResolutionError::NotConflicting { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_all_two_proposal_conflict() {
+        // Simple two-proposal conflict — same as resolve_governance_conflict.
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "admin".to_owned(),
+            },
+            3,
+        );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "observer".to_owned(),
+            },
+            7,
+        );
+        let result = resolve_all_governance_conflicts(&[p1, p2]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0],
+            ConflictResolutionStrategy::MerkleOrdered {
+                winner_proposal_id: proposal_id(1),
+                loser_proposal_id: proposal_id(2),
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_all_three_proposals_pairwise_regular_conflicts() {
+        // Three proposals all targeting the same DID with different roles.
+        // A (leaf 2) conflicts with B (leaf 5), B conflicts with C (leaf 8),
+        // A conflicts with C. All pairwise conflicts are Regular.
+        // Expected: A wins over B (first pair), then A wins over C.
+        let p_a = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "admin".to_owned(),
+            },
+            2,
+        );
+        let p_b = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "observer".to_owned(),
+            },
+            5,
+        );
+        let p_c = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "member".to_owned(),
+            },
+            8,
+        );
+        let result = resolve_all_governance_conflicts(&[p_a, p_b, p_c]).unwrap();
+        // A should beat both B and C — two resolutions.
+        assert_eq!(result.len(), 2);
+        // Verify all losers are identified (order may vary based on
+        // classify_conflict_pairs enumeration, but A always wins).
+        let loser_ids: Vec<ProposalId> = result
+            .iter()
+            .map(|r| match r {
+                ConflictResolutionStrategy::MerkleOrdered {
+                    loser_proposal_id, ..
+                } => *loser_proposal_id,
+                other => panic!("expected MerkleOrdered, got {other:?}"),
+            })
+            .collect();
+        assert!(loser_ids.contains(&proposal_id(2)));
+        assert!(loser_ids.contains(&proposal_id(3)));
+        // Winner is always A.
+        for r in &result {
+            match r {
+                ConflictResolutionStrategy::MerkleOrdered {
+                    winner_proposal_id, ..
+                } => assert_eq!(*winner_proposal_id, proposal_id(1)),
+                other => panic!("expected MerkleOrdered, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_all_conflict_with_unrelated_proposal() {
+        // A-B conflict (role change on same target), C is unrelated.
+        // Expected: A beats B. C is untouched. One resolution.
+        let p_a = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "admin".to_owned(),
+            },
+            2,
+        );
+        let p_b = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target"),
+                new_role: "observer".to_owned(),
+            },
+            5,
+        );
+        let p_c = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3600,
+            },
+            8,
+        );
+        let result = resolve_all_governance_conflicts(&[p_a, p_b, p_c]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0],
+            ConflictResolutionStrategy::MerkleOrdered {
+                winner_proposal_id: proposal_id(1),
+                loser_proposal_id: proposal_id(2),
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_all_four_proposals_complete_resolution() {
+        // Four proposals all conflicting (ModifyCeiling — always conflicts).
+        // Leaf indices: A=1, B=3, C=5, D=7.
+        // Expected: A beats B, then A beats C, then A beats D — 3 resolutions.
+        let p_a = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            1,
+        );
+        let p_b = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            3,
+        );
+        let p_c = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            5,
+        );
+        let p_d = gov_proposal(
+            4,
+            "did:dht:dave",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            7,
+        );
+        let result = resolve_all_governance_conflicts(&[p_a, p_b, p_c, p_d]).unwrap();
+        assert_eq!(result.len(), 3);
+
+        // Collect all loser IDs.
+        let loser_ids: Vec<ProposalId> = result
+            .iter()
+            .map(|r| match r {
+                ConflictResolutionStrategy::MerkleOrdered {
+                    loser_proposal_id, ..
+                } => *loser_proposal_id,
+                other => panic!("expected MerkleOrdered, got {other:?}"),
+            })
+            .collect();
+        assert!(loser_ids.contains(&proposal_id(2)));
+        assert!(loser_ids.contains(&proposal_id(3)));
+        assert!(loser_ids.contains(&proposal_id(4)));
+
+        // Winner is always A (lowest leaf index).
+        for r in &result {
+            match r {
+                ConflictResolutionStrategy::MerkleOrdered {
+                    winner_proposal_id, ..
+                } => assert_eq!(*winner_proposal_id, proposal_id(1)),
+                other => panic!("expected MerkleOrdered, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_all_freeze_trigger_returns_single_freeze() {
+        // Mutual removal triggers freeze — same as resolve_governance_conflict.
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:bob"),
+                reason: None,
+            },
+            3,
+        );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:alice"),
+                reason: None,
+            },
+            7,
+        );
+        let result = resolve_all_governance_conflicts(&[p1, p2]).unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            ConflictResolutionStrategy::GovernanceFreeze {
+                conflicting_proposals,
+            } => {
+                assert_eq!(conflicting_proposals.len(), 2);
+                assert!(conflicting_proposals.contains(&proposal_id(1)));
+                assert!(conflicting_proposals.contains(&proposal_id(2)));
+            }
+            other => panic!("expected GovernanceFreeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_all_mixed_freeze_and_regular_returns_freeze() {
+        // Mixed: mutual removal (p1/p2) + regular conflict (p1/p3).
+        // Freeze should include all three.
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:bob"),
+                reason: None,
+            },
+            3,
+        );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:alice"),
+                reason: None,
+            },
+            7,
+        );
+        let p3 = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:bob"),
+                new_role: "observer".to_owned(),
+            },
+            10,
+        );
+        let result = resolve_all_governance_conflicts(&[p1, p2, p3]).unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            ConflictResolutionStrategy::GovernanceFreeze {
+                conflicting_proposals,
+            } => {
+                assert_eq!(conflicting_proposals.len(), 3);
+                assert!(conflicting_proposals.contains(&proposal_id(1)));
+                assert!(conflicting_proposals.contains(&proposal_id(2)));
+                assert!(conflicting_proposals.contains(&proposal_id(3)));
+            }
+            other => panic!("expected GovernanceFreeze with 3 proposals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_all_order_independent_losers() {
+        // Same proposals in different input order produce the same set of
+        // eliminated (loser) proposal IDs. The intermediate resolution
+        // steps may differ (e.g., A beats B then A beats C vs B beats C
+        // then A beats B), but the final outcome — which proposals survive
+        // — is deterministic and order-independent.
+        let p_a = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            1,
+        );
+        let p_b = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            3,
+        );
+        let p_c = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![],
+            },
+            5,
+        );
+        let result_abc =
+            resolve_all_governance_conflicts(&[p_a.clone(), p_b.clone(), p_c.clone()]).unwrap();
+        let result_cba =
+            resolve_all_governance_conflicts(&[p_c.clone(), p_b.clone(), p_a.clone()]).unwrap();
+        let result_bca = resolve_all_governance_conflicts(&[p_b, p_c, p_a]).unwrap();
+
+        // All orderings produce the same number of resolutions.
+        assert_eq!(result_abc.len(), result_cba.len());
+        assert_eq!(result_abc.len(), result_bca.len());
+
+        // Extract and sort loser IDs — they must match across orderings.
+        let losers = |results: &[ConflictResolutionStrategy]| -> Vec<ProposalId> {
+            let mut ids: Vec<_> = results
+                .iter()
+                .map(|r| match r {
+                    ConflictResolutionStrategy::MerkleOrdered {
+                        loser_proposal_id, ..
+                    } => *loser_proposal_id,
+                    other => panic!("expected MerkleOrdered, got {other:?}"),
+                })
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        assert_eq!(losers(&result_abc), losers(&result_cba));
+        assert_eq!(losers(&result_abc), losers(&result_bca));
+        // Both B and C should be losers.
+        assert_eq!(losers(&result_abc), vec![proposal_id(2), proposal_id(3)]);
+    }
+
+    #[test]
+    fn resolve_all_two_independent_conflict_groups() {
+        // Two independent conflicts: A-B conflict (role on target1),
+        // C-D conflict (role on target2). A and C don't conflict.
+        let p_a = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target1"),
+                new_role: "admin".to_owned(),
+            },
+            2,
+        );
+        let p_b = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target1"),
+                new_role: "observer".to_owned(),
+            },
+            5,
+        );
+        let p_c = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target2"),
+                new_role: "admin".to_owned(),
+            },
+            4,
+        );
+        let p_d = gov_proposal(
+            4,
+            "did:dht:dave",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:target2"),
+                new_role: "member".to_owned(),
+            },
+            9,
+        );
+        let result = resolve_all_governance_conflicts(&[p_a, p_b, p_c, p_d]).unwrap();
+        // Two independent conflicts, two resolutions.
+        assert_eq!(result.len(), 2);
+        let mut pairs: Vec<(ProposalId, ProposalId)> = result
+            .iter()
+            .map(|r| match r {
+                ConflictResolutionStrategy::MerkleOrdered {
+                    winner_proposal_id,
+                    loser_proposal_id,
+                } => (*winner_proposal_id, *loser_proposal_id),
+                other => panic!("expected MerkleOrdered, got {other:?}"),
+            })
+            .collect();
+        pairs.sort_unstable();
+        // A (leaf 2) beats B (leaf 5), C (leaf 4) beats D (leaf 9).
+        assert!(pairs.contains(&(proposal_id(1), proposal_id(2))));
+        assert!(pairs.contains(&(proposal_id(3), proposal_id(4))));
     }
 
     // -----------------------------------------------------------------------
