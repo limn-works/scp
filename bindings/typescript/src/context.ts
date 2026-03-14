@@ -1062,7 +1062,7 @@ export class ScopedHandle {
     if (!this.hasCapability(capability)) {
       throw new ContextError(
         `capability denied: ${capability} not granted to app ${this.appDid}`,
-        "SCP-SANDBOX-8001",
+        "SCP-STORAGE-8001",
       );
     }
   }

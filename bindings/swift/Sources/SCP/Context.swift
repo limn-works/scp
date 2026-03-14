@@ -609,7 +609,7 @@ public struct ScopedHandle: Sendable {
         guard hasCapability(capability) else {
             throw ScpError.Context(
                 message: "capability denied: \(capability) not granted to app \(appDid)",
-                code: "SCP-SANDBOX-8001"
+                code: "SCP-STORAGE-8001"
             )
         }
     }
@@ -639,7 +639,7 @@ public func validateCapabilityDeclaration(
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         throw ScpError.Context(
             message: "failed to parse validation result JSON",
-            code: "SCP-SANDBOX-8002"
+            code: "SCP-STORAGE-8002"
         )
     }
     return DeclarationValidationResult(
