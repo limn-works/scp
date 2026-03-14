@@ -8295,12 +8295,12 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7035");
                 assert!(
-                    message.contains("invalid input_schema_json"),
-                    "error should reference field name, got: {message}"
+                    msg.contains("invalid input_schema_json"),
+                    "error should reference field name, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
@@ -8326,12 +8326,12 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7036");
                 assert!(
-                    message.contains("invalid output_schema_json"),
-                    "error should reference field name, got: {message}"
+                    msg.contains("invalid output_schema_json"),
+                    "error should reference field name, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
@@ -8359,16 +8359,16 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7035");
                 assert!(
-                    message.contains("expected a JSON object"),
-                    "error should mention expected type, got: {message}"
+                    msg.contains("expected a JSON object"),
+                    "error should mention expected type, got: {msg}"
                 );
                 assert!(
-                    message.contains("string"),
-                    "error should mention actual type, got: {message}"
+                    msg.contains("string"),
+                    "error should mention actual type, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
@@ -8394,16 +8394,16 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7036");
                 assert!(
-                    message.contains("expected a JSON object"),
-                    "error should mention expected type, got: {message}"
+                    msg.contains("expected a JSON object"),
+                    "error should mention expected type, got: {msg}"
                 );
                 assert!(
-                    message.contains("array"),
-                    "error should mention actual type, got: {message}"
+                    msg.contains("array"),
+                    "error should mention actual type, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
@@ -8431,12 +8431,12 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7037");
                 assert!(
-                    message.contains("invalid test_vectors_json"),
-                    "error should reference field name, got: {message}"
+                    msg.contains("invalid test_vectors_json"),
+                    "error should reference field name, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
@@ -8489,16 +8489,16 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7038");
                 assert!(
-                    message.contains("32 bytes"),
-                    "error should mention expected length, got: {message}"
+                    msg.contains("32 bytes"),
+                    "error should mention expected length, got: {msg}"
                 );
                 assert!(
-                    message.contains("16"),
-                    "error should report actual length, got: {message}"
+                    msg.contains("16"),
+                    "error should report actual length, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
@@ -8524,16 +8524,16 @@ mod tests {
         match err {
             ScpError::Validation {
                 ref code,
-                ref message,
+                ref msg,
             } => {
                 assert_eq!(code, "SCP-VALID-7038");
                 assert!(
-                    message.contains("32 bytes"),
-                    "error should mention expected length, got: {message}"
+                    msg.contains("32 bytes"),
+                    "error should mention expected length, got: {msg}"
                 );
                 assert!(
-                    message.contains("64"),
-                    "error should report actual length, got: {message}"
+                    msg.contains("64"),
+                    "error should report actual length, got: {msg}"
                 );
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
