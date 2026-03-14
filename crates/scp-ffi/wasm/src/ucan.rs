@@ -37,7 +37,7 @@ const MAX_CHAIN_DEPTH: usize = 32;
 
 /// Clock skew tolerance in seconds (spec section 9.14). Accommodates NTP
 /// desynchronization between issuer and validator in distributed deployments.
-/// Must match `scp-core::crypto::ucan::validate::CLOCK_SKEW_TOLERANCE_SECS`.
+/// Must match `scp-core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`.
 const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 
 /// Category A resource types — the closed set of UCAN capability resource

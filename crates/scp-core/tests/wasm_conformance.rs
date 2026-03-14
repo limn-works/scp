@@ -1800,8 +1800,30 @@ mod wasm_ucan_mirror {
         Err(format!("unsupported DID method: {did}"))
     }
 
+    /// Resolves a specific verification method key by `kid` fragment identifier
+    /// (ADR-039, SCP-AB-013). Falls back to `resolve_public_key` for `#active`
+    /// (the default key). Other kid values require a registry (not available in
+    /// the conformance mirror) and are rejected fail-closed.
+    ///
+    /// Must match `scp-core::crypto::ucan::validate::DidResolver::resolve_public_key_by_kid`.
+    fn resolve_public_key_by_kid(did: &str, kid: &str) -> Result<[u8; 32], String> {
+        if kid == "#active" {
+            resolve_public_key(did)
+        } else {
+            Err(format!(
+                "verification method '{kid}' not found on DID '{did}' \
+                 (conformance mirror only supports #active)"
+            ))
+        }
+    }
+
     pub fn verify_signature(token: &ParsedUcanToken) -> Result<(), String> {
-        let pk_bytes = resolve_public_key(&token.payload.iss)?;
+        // When kid is present in the header, resolve the specific verification
+        // method from the DID document (ADR-039, SCP-AB-013).
+        let pk_bytes = match &token.header.kid {
+            Some(kid) => resolve_public_key_by_kid(&token.payload.iss, kid)?,
+            None => resolve_public_key(&token.payload.iss)?,
+        };
         let verifying_key =
             VerifyingKey::from_bytes(&pk_bytes).map_err(|e| format!("invalid public key: {e}"))?;
 
