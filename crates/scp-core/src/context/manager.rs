@@ -12534,6 +12534,7 @@ mod tests {
             budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
             epoch_coordination_records: Vec::new(),
             mls_crypto_state: Vec::new(),
+            migration_state: None,
         }
     }
 
