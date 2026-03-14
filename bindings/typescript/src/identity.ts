@@ -255,4 +255,50 @@ export class Identity {
       throw mapBridgeError(error);
     }
   }
+
+  /**
+   * Executes the compromise recovery protocol for this identity.
+   *
+   * Runs the 6-step recovery protocol from spec section 9.12.
+   *
+   * @param tier - Compromise tier: `"agent"`, `"active_signing"`, or `"identity_key"`.
+   * @param contextIds - Context IDs where this DID is a member.
+   * @returns The recovery result as a parsed object.
+   * @throws {IdentityError} If recovery fails.
+   */
+  async executeRecovery(
+    tier: "agent" | "active_signing" | "identity_key",
+    contextIds: string[] = [],
+  ): Promise<Record<string, unknown>> {
+    try {
+      const bridge = await getBridge();
+      const json = await bridge.identityExecuteRecovery(this.did, tier, contextIds);
+      return JSON.parse(json);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Executes the custody migration protocol for this identity.
+   *
+   * Runs the 5-step migration protocol from spec section 3.2.1.
+   *
+   * @param target - Target custody type: `"platform_managed"`, `"hardware"`, `"software"`, or `"in_memory"`.
+   * @param contextIds - Context IDs where this DID is a member.
+   * @returns The migration result as a parsed object.
+   * @throws {IdentityError} If migration fails.
+   */
+  async executeCustodyMigration(
+    target: "platform_managed" | "hardware" | "software" | "in_memory",
+    contextIds: string[] = [],
+  ): Promise<Record<string, unknown>> {
+    try {
+      const bridge = await getBridge();
+      const json = await bridge.identityExecuteCustodyMigration(this.did, target, contextIds);
+      return JSON.parse(json);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
 }

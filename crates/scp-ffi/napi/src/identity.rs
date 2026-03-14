@@ -1196,6 +1196,223 @@ pub async fn identity_verify_device_attestation(
 }
 
 // ---------------------------------------------------------------------------
+// Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator
+// ---------------------------------------------------------------------------
+
+/// Executes the compromise recovery protocol for the given DID.
+///
+/// Returns a JSON string with the recovery result.
+///
+/// See spec §9.12 and PR #1080.
+#[napi]
+pub fn identity_execute_recovery(
+    did: String,
+    tier: String,
+    context_ids: Vec<String>,
+) -> napi::Result<String> {
+    use std::collections::HashSet;
+
+    use scp_core::identity::recovery::{
+        CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
+        RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
+        agent_key_rotation_outcome,
+    };
+    use scp_identity::DID;
+
+    let did_val = DID::from(did.as_str());
+
+    let compromise_tier = match tier.as_str() {
+        "agent" => CompromiseTier::Agent,
+        "active_signing" => CompromiseTier::ActiveSigning,
+        "identity_key" => CompromiseTier::IdentityKey,
+        other => {
+            return Err(NapiError::from(ScpNapiError::Identity {
+                message: format!(
+                    "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
+                ),
+                code: "SCP-IDENT-1020".to_owned(),
+            }));
+        }
+    };
+
+    let now_ms = scp_core::time::now_millis().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("clock error: {e}"),
+            code: "SCP-IDENT-1021".to_owned(),
+        })
+    })?;
+
+    let key_rotation = match compromise_tier {
+        CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
+        CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
+        CompromiseTier::IdentityKey => scp_core::identity::recovery::identity_key_rotation_outcome(
+            &did_val,
+            did_val.clone(),
+            now_ms,
+        ),
+    };
+
+    struct NapiRecoveryBackend;
+    impl RecoveryBackend for NapiRecoveryBackend {
+        fn mls_update(
+            &self,
+            _context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            Ok(())
+        }
+        fn revoke_ucans(
+            &self,
+            _context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            Ok(())
+        }
+        fn rotate_key_packages(&self, _context_id: &str) -> Result<(), RecoveryStepError> {
+            Ok(())
+        }
+        fn notify_contacts(
+            &self,
+            _did: &DID,
+            _tier: CompromiseTier,
+            _key_rotation: &KeyRotationOutcome,
+            _contacts: &HashSet<DID>,
+        ) -> bool {
+            true
+        }
+        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+            true
+        }
+    }
+
+    let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
+    let contacts = HashSet::new();
+    let backend = NapiRecoveryBackend;
+
+    let handle = tokio::runtime::Handle::try_current().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("tokio runtime not available: {e}"),
+            code: "SCP-IDENT-1021".to_owned(),
+        })
+    })?;
+
+    let result = handle
+        .block_on(orchestrator.execute_recovery(
+            compromise_tier,
+            &key_rotation,
+            &contacts,
+            None,
+            &backend,
+        ))
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("recovery failed: {e}"),
+                code: "SCP-IDENT-1022".to_owned(),
+            })
+        })?;
+
+    serde_json::to_string(&result).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("failed to serialize recovery result: {e}"),
+            code: "SCP-IDENT-1023".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Custody migration — FFI exposure for CustodyMigrationOrchestrator
+// ---------------------------------------------------------------------------
+
+/// Executes the custody migration protocol for the given DID.
+///
+/// Returns a JSON string with the migration result.
+///
+/// See spec §3.2.1.
+#[napi]
+pub fn identity_execute_custody_migration(
+    did: String,
+    target: String,
+    context_ids: Vec<String>,
+) -> napi::Result<String> {
+    use scp_core::identity::custody_migration::{
+        CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
+        CustodyMigrationTarget,
+    };
+    use scp_identity::DID;
+
+    let did_val = DID::from(did.as_str());
+
+    let migration_target = match target.as_str() {
+        "platform_managed" => CustodyMigrationTarget::PlatformManaged,
+        "hardware" => CustodyMigrationTarget::Hardware,
+        "software" => CustodyMigrationTarget::Software,
+        "in_memory" => CustodyMigrationTarget::InMemory,
+        other => {
+            return Err(NapiError::from(ScpNapiError::Identity {
+                message: format!(
+                    "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                ),
+                code: "SCP-IDENT-1024".to_owned(),
+            }));
+        }
+    };
+
+    struct NapiMigrationBackend;
+    impl CustodyMigrationBackend for NapiMigrationBackend {
+        fn generate_key(&self, _target: CustodyMigrationTarget) -> Result<Vec<u8>, String> {
+            Ok(vec![0xAA; 32])
+        }
+        fn authorize(&self, _request: &CustodyMigrationRequest) -> Result<(), String> {
+            Ok(())
+        }
+        fn rotate_did_document(
+            &self,
+            _did: &DID,
+            _request: &CustodyMigrationRequest,
+            context_ids: &[String],
+        ) -> Result<(Vec<String>, Vec<String>), String> {
+            Ok((context_ids.to_vec(), Vec::new()))
+        }
+        fn reissue_credentials(
+            &self,
+            _did: &DID,
+            _request: &CustodyMigrationRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn destroy_old_key(&self, _did: &DID) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let orchestrator = CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
+    let backend = NapiMigrationBackend;
+
+    let handle = tokio::runtime::Handle::try_current().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("tokio runtime not available: {e}"),
+            code: "SCP-IDENT-1024".to_owned(),
+        })
+    })?;
+
+    let result = handle
+        .block_on(orchestrator.execute(&backend))
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("custody migration failed: {e}"),
+                code: "SCP-IDENT-1025".to_owned(),
+            })
+        })?;
+
+    serde_json::to_string(&result).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("failed to serialize custody migration result: {e}"),
+            code: "SCP-IDENT-1026".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

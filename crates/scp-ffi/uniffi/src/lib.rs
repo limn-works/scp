@@ -140,6 +140,8 @@ pub use bridge::{
     // Free functions — identity
     identity_create,
     identity_create_with_custody,
+    identity_execute_custody_migration,
+    identity_execute_recovery,
     identity_load,
     identity_resolve,
     is_local_did,

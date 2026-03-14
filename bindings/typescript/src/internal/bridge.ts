@@ -333,6 +333,10 @@ export interface Bridge {
   identityAttestDevice(did: string): Promise<string>;
   identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean>;
 
+  // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+  identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
+  identityExecuteCustodyMigration(did: string, target: string, contextIds: string[]): Promise<string>;
+
   // App Sandboxing (#595, spec §8.4.1, §8.4.2)
   validateCapabilityDeclaration(
     declarationJson: string,
