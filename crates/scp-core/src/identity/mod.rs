@@ -14,7 +14,10 @@ pub mod custody_migration;
 pub mod private_state;
 pub mod private_state_events;
 pub mod recovery;
+pub mod scpid;
 
 // Re-export SigningKeyId from scp-identity — the single canonical definition.
 // All scp-core consumers should use this re-export via `crate::identity::SigningKeyId`.
 pub use scp_identity::SigningKeyId;
+
+pub use scpid::{ScpIdAuthentication, ScpIdChallenge, ScpIdError, ScpIdResponse, scpid_challenge};
