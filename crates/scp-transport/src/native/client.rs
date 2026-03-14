@@ -31,6 +31,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use futures::{SinkExt, StreamExt};
+use rand::RngCore;
 use scp_core::envelope::OuterEnvelope;
 
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
@@ -136,6 +137,17 @@ struct ClientInner {
 ///
 /// The client is `Send + Sync` and safe to use from multiple tasks.
 /// Internal state is protected by `RwLock` and `Mutex`.
+/// # Cloning
+///
+/// `NativeRelayClient` is cheaply cloneable -- all fields are `Arc`-wrapped.
+/// Clones share the same underlying WebSocket connection, state, and
+/// background tasks. This is used internally by
+/// [`NativeRelayAdapter::start_cover_traffic`] to give the background cover
+/// traffic task a handle to the connection without requiring `Arc<Self>` at
+/// the adapter level.
+///
+/// [`NativeRelayAdapter::start_cover_traffic`]: super::adapter::NativeRelayAdapter::start_cover_traffic
+#[derive(Clone)]
 pub struct NativeRelayClient {
     /// The relay URL (e.g., `ws://127.0.0.1:9000/scp/v1`).
     url: String,
@@ -831,6 +843,36 @@ impl NativeRelayClient {
     #[cfg(test)]
     async fn pending_len(&self) -> usize {
         self.inner.read().await.pending.len()
+    }
+
+    /// Sends a cover traffic payload as a PUBLISH with a random routing ID
+    /// and 60-second TTL (spec §9.10.6).
+    ///
+    /// The random routing ID ensures the dummy is unroutable (no subscriber
+    /// exists for it), so it is silently discarded by the relay after TTL
+    /// expiry. The 60-second TTL minimizes relay-side storage cost while
+    /// keeping the message alive long enough to be indistinguishable from
+    /// short-lived real traffic.
+    pub async fn send_cover_traffic(&self, payload: Vec<u8>) -> Result<(), TransportError> {
+        let mut routing_id = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut routing_id);
+
+        let msg = ClientMessage::Publish {
+            ref_id: None,
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: 60,
+            blob: payload,
+        };
+
+        let response = self.send_request(msg).await?;
+
+        match response {
+            RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
+                "cover traffic relay error {code}: {msg}"
+            ))),
+            _ => Ok(()),
+        }
     }
 }
 

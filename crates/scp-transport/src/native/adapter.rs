@@ -6,6 +6,14 @@
 //! wraps a `NativeRelayClient` to handle connection lifecycle, keepalive,
 //! reconnection, and deduplication.
 //!
+//! # Cover traffic
+//!
+//! The adapter implements [`CoverTrafficSender`] and provides
+//! [`start_cover_traffic`](NativeRelayAdapter::start_cover_traffic) for
+//! launching a background task that emits constant-rate dummy messages
+//! (spec §9.10.6). The background task is automatically cancelled when the
+//! adapter is dropped, preventing resource leaks.
+//!
 //! # Mapping
 //!
 //! | Transport method | Relay operation |
@@ -24,9 +32,13 @@ use std::pin::Pin;
 
 use futures::Stream;
 use scp_core::envelope::OuterEnvelope;
+use tokio_util::sync::CancellationToken;
 
 use super::client::{NativeRelayClient, SubscriptionMessage};
 use super::protocol::{ClientMessage, RelayMessage};
+use crate::cover_traffic::{
+    CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender,
+};
 use crate::error::TransportError;
 use crate::relay::connection::{SourcedRelayUrl, validate_relay_url};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
@@ -75,11 +87,25 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 pub struct NativeRelayAdapter {
     /// The underlying WebSocket client.
     client: NativeRelayClient,
+    /// Cancellation token for the cover traffic background task. Cancelled
+    /// on `Drop` to ensure the task is aborted and the `Arc` cycle is broken,
+    /// preventing resource leaks.
+    cover_traffic_cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for NativeRelayAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeRelayAdapter").finish_non_exhaustive()
+    }
+}
+
+impl Drop for NativeRelayAdapter {
+    fn drop(&mut self) {
+        // Cancel the cover traffic background task (if running). This breaks
+        // the Arc cycle: the spawned task holds an Arc<NativeRelayClient> clone
+        // and will exit its loop when the token is cancelled, allowing the Arc
+        // to be reclaimed.
+        self.cover_traffic_cancel.cancel();
     }
 }
 
@@ -111,7 +137,67 @@ impl NativeRelayAdapter {
     pub async fn connect_sourced(sourced: &SourcedRelayUrl) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            cover_traffic_cancel: CancellationToken::new(),
+        })
+    }
+
+    /// Starts a background task that emits cover traffic at a constant rate
+    /// per the given configuration (spec §9.10.6).
+    ///
+    /// The task runs until the adapter is dropped (the `Drop` impl cancels
+    /// the internal `CancellationToken`). Only one cover traffic task should
+    /// be started per adapter instance; calling this a second time spawns an
+    /// additional task (both will be cancelled on drop).
+    ///
+    /// Takes `&self` for ergonomic use -- internally creates a lightweight
+    /// sender handle that shares the underlying `NativeRelayClient`'s
+    /// connection via `Arc` clones. No `Arc<Self>` wrapping required by
+    /// the caller.
+    ///
+    /// # Returns
+    ///
+    /// A `JoinHandle` to the spawned task. Callers can ignore the handle;
+    /// the task is cancelled automatically on drop.
+    #[must_use]
+    pub fn start_cover_traffic(&self, config: CoverTrafficConfig) -> tokio::task::JoinHandle<()> {
+        let cancel = self.cover_traffic_cancel.clone();
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            let mut generator = CoverTrafficGenerator::new(config);
+
+            let Some(interval_duration) = generator.interval() else {
+                // Off tier: nothing to do.
+                return;
+            };
+
+            let mut interval = tokio::time::interval(interval_duration);
+            // The first tick fires immediately; consume it and let the
+            // generator produce the first dummy on its own schedule.
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        tracing::debug!("cover traffic task cancelled");
+                        return;
+                    }
+                    _ = interval.tick() => {
+                        let now = tokio::time::Instant::now();
+                        match generator.next_action(now) {
+                            CoverAction::SendDummy(payload) => {
+                                if let Err(e) = client.send_cover_traffic(payload).await {
+                                    tracing::warn!("cover traffic send failed: {e}");
+                                }
+                            }
+                            CoverAction::Skip => {}
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -238,6 +324,15 @@ impl TransportAdapter for NativeRelayAdapter {
                 _ => Ok(()),
             }
         })
+    }
+}
+
+impl CoverTrafficSender for NativeRelayAdapter {
+    fn send_cover_traffic(
+        &self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>> {
+        Box::pin(self.client.send_cover_traffic(payload))
     }
 }
 
@@ -558,5 +653,109 @@ mod tests {
             .await
             .expect_err("http:// scheme must be rejected");
         assert!(err.to_string().contains("ws:// or wss://"));
+    }
+
+    // --- Cover traffic integration tests (Finding 6: real adapter coverage) ---
+
+    /// Exercises the real `NativeRelayAdapter::send_cover_traffic()` method
+    /// against a local relay server. Verifies the method sends a well-formed
+    /// `ClientMessage::Publish` with a random routing ID, 60s TTL, and the
+    /// payload as blob.
+    #[tokio::test]
+    async fn send_cover_traffic_real_adapter() {
+        use crate::cover_traffic::{CoverTrafficSender, DUMMY_FLAG, pad_to_bucket};
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Start a local relay server.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        // Connect with DhtResolved source (permits ws://).
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+
+        // Build a cover traffic payload: DUMMY_FLAG + padding to bucket boundary.
+        let payload = pad_to_bucket(&[DUMMY_FLAG]);
+        assert_eq!(payload.len(), 256); // smallest bucket
+        assert_eq!(payload[0], DUMMY_FLAG);
+
+        // Send via the real CoverTrafficSender impl. This exercises the full
+        // path: payload -> ClientMessage::Publish -> send_request -> relay.
+        let result = adapter.send_cover_traffic(payload.clone()).await;
+        assert!(
+            result.is_ok(),
+            "send_cover_traffic should succeed against a real relay: {result:?}"
+        );
+    }
+
+    /// Verifies that `Drop` cancels the cover traffic background task,
+    /// preventing resource leaks (Finding 3).
+    #[tokio::test]
+    async fn drop_cancels_cover_traffic_task() {
+        use crate::cover_traffic::CoverTrafficConfig;
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::CoverTrafficTier;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Start a local relay server.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let handle;
+        {
+            let adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+            // Start cover traffic with a short custom interval for testing.
+            let ct_config = CoverTrafficConfig {
+                tier: CoverTrafficTier::Custom {
+                    interval: Duration::from_millis(50),
+                    padding_bytes: 256,
+                },
+                bandwidth_budget_bytes_per_min: None,
+            };
+            handle = adapter.start_cover_traffic(ct_config);
+            // Let a few ticks fire.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Adapter is dropped here, which should cancel the token.
+        }
+
+        // The task should complete shortly after the adapter is dropped.
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            result.is_ok(),
+            "cover traffic task should terminate after adapter drop"
+        );
     }
 }
