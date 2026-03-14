@@ -112,11 +112,20 @@ pub fn init_runtime() -> PyResult<()> {
         return Ok(());
     }
 
-    // Build the runtime, returning an error instead of panicking.
+    // Build the runtime, with fallback for resource-constrained environments.
+    // First try the preferred multi-threaded runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("scp-tokio-worker")
+        .worker_threads(std::cmp::min(4, std::thread::available_parallelism().map_or(2, |p| p.get())))
         .build()
+        .or_else(|_| {
+            // Fallback to current_thread runtime in constrained environments (CI).
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name("scp-tokio-worker")
+                .build()
+        })
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to create SCP tokio runtime: {e}"
