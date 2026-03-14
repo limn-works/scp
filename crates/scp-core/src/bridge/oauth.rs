@@ -445,7 +445,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
         bridge_id: &str,
         authorization_code: &str,
         code_verifier: &str,
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> Result<OAuthTokenResponse, OAuthError> {
         let response = self
             .http_client
@@ -458,7 +458,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
                 bridge_id,
                 CredentialType::OAuthAccessToken,
                 response.access_token.as_bytes(),
-                operator_key_material,
+                bridge_credential_key,
             )
             .await?;
 
@@ -469,7 +469,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
                     bridge_id,
                     CredentialType::OAuthRefreshToken,
                     refresh_token.as_bytes(),
-                    operator_key_material,
+                    bridge_credential_key,
                 )
                 .await?;
         }
@@ -494,7 +494,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
     pub async fn refresh_access_token(
         &self,
         bridge_id: &str,
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> Result<OAuthTokenResponse, OAuthError> {
         // Retrieve the stored refresh token.
         let refresh_token_bytes = self
@@ -502,7 +502,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
             .retrieve(
                 bridge_id,
                 &CredentialType::OAuthRefreshToken,
-                operator_key_material,
+                bridge_credential_key,
             )
             .await?;
 
@@ -528,7 +528,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
                             bridge_id,
                             &CredentialType::OAuthAccessToken,
                             response.access_token.as_bytes(),
-                            operator_key_material,
+                            bridge_credential_key,
                         )
                         .await?;
 
@@ -539,7 +539,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
                                 bridge_id,
                                 &CredentialType::OAuthRefreshToken,
                                 new_refresh.as_bytes(),
-                                operator_key_material,
+                                bridge_credential_key,
                             )
                             .await?;
                     }
@@ -604,7 +604,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
     pub async fn revoke_tokens(
         &self,
         bridge_id: &str,
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> Result<(), OAuthError> {
         // Call platform revocation endpoint if configured.
         if let Some(ref revocation_endpoint) = self.config.revocation_endpoint {
@@ -614,7 +614,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
                 .retrieve(
                     bridge_id,
                     &CredentialType::OAuthAccessToken,
-                    operator_key_material,
+                    bridge_credential_key,
                 )
                 .await
                 .ok()
@@ -632,7 +632,7 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
                 .retrieve(
                     bridge_id,
                     &CredentialType::OAuthRefreshToken,
-                    operator_key_material,
+                    bridge_credential_key,
                 )
                 .await
                 .ok()
@@ -680,8 +680,8 @@ mod tests {
     use super::*;
     use crate::bridge::credentials::InMemoryCredentialStore;
 
-    /// Shared operator key material for tests.
-    const TEST_OPERATOR_KEY: &[u8; 32] = b"operator-key-material-32-bytes!!";
+    /// Shared bridge credential key for tests.
+    const TEST_BRIDGE_KEY: &[u8; 32] = b"bridge-credential-key-32-bytes!!";
 
     // -------------------------------------------------------------------
     // PKCE tests
@@ -928,7 +928,7 @@ mod tests {
         let manager = OAuthCredentialManager::new(test_config(), mock, store);
 
         let response = manager
-            .exchange_code("bridge-001", "auth-code", "verifier", TEST_OPERATOR_KEY)
+            .exchange_code("bridge-001", "auth-code", "verifier", TEST_BRIDGE_KEY)
             .await
             .expect("exchange_code");
 
@@ -941,7 +941,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve access token");
@@ -952,7 +952,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthRefreshToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve refresh token");
@@ -974,7 +974,7 @@ mod tests {
         let manager = OAuthCredentialManager::new(test_config(), mock, store);
 
         manager
-            .exchange_code("bridge-001", "auth-code", "verifier", TEST_OPERATOR_KEY)
+            .exchange_code("bridge-001", "auth-code", "verifier", TEST_BRIDGE_KEY)
             .await
             .expect("exchange_code");
 
@@ -984,7 +984,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
         assert!(access.is_ok());
@@ -995,7 +995,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthRefreshToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
         assert!(matches!(refresh, Err(CredentialError::NotFound { .. })));
@@ -1028,13 +1028,13 @@ mod tests {
 
         // Exchange code first to populate store.
         manager
-            .exchange_code("bridge-001", "auth-code", "verifier", TEST_OPERATOR_KEY)
+            .exchange_code("bridge-001", "auth-code", "verifier", TEST_BRIDGE_KEY)
             .await
             .expect("exchange_code");
 
         // Refresh.
         let response = manager
-            .refresh_access_token("bridge-001", TEST_OPERATOR_KEY)
+            .refresh_access_token("bridge-001", TEST_BRIDGE_KEY)
             .await
             .expect("refresh");
 
@@ -1046,7 +1046,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve rotated access token");
@@ -1077,12 +1077,12 @@ mod tests {
         let manager = OAuthCredentialManager::new(test_config(), mock, store);
 
         manager
-            .exchange_code("bridge-001", "auth-code", "verifier", TEST_OPERATOR_KEY)
+            .exchange_code("bridge-001", "auth-code", "verifier", TEST_BRIDGE_KEY)
             .await
             .expect("exchange_code");
 
         manager
-            .refresh_access_token("bridge-001", TEST_OPERATOR_KEY)
+            .refresh_access_token("bridge-001", TEST_BRIDGE_KEY)
             .await
             .expect("refresh");
 
@@ -1092,7 +1092,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve");
@@ -1103,7 +1103,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthRefreshToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve");
@@ -1126,12 +1126,12 @@ mod tests {
         let manager = OAuthCredentialManager::new(test_config(), mock, store);
 
         manager
-            .exchange_code("bridge-001", "auth-code", "verifier", TEST_OPERATOR_KEY)
+            .exchange_code("bridge-001", "auth-code", "verifier", TEST_BRIDGE_KEY)
             .await
             .expect("exchange_code");
 
         manager
-            .revoke_tokens("bridge-001", TEST_OPERATOR_KEY)
+            .revoke_tokens("bridge-001", TEST_BRIDGE_KEY)
             .await
             .expect("revoke_tokens");
 
@@ -1151,7 +1151,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
         assert!(matches!(result, Err(CredentialError::NotFound { .. })));
@@ -1176,12 +1176,12 @@ mod tests {
         let manager = OAuthCredentialManager::new(config, mock, store);
 
         manager
-            .exchange_code("bridge-001", "auth-code", "verifier", TEST_OPERATOR_KEY)
+            .exchange_code("bridge-001", "auth-code", "verifier", TEST_BRIDGE_KEY)
             .await
             .expect("exchange_code");
 
         manager
-            .revoke_tokens("bridge-001", TEST_OPERATOR_KEY)
+            .revoke_tokens("bridge-001", TEST_BRIDGE_KEY)
             .await
             .expect("revoke_tokens");
 
@@ -1197,7 +1197,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
         assert!(matches!(result, Err(CredentialError::NotFound { .. })));

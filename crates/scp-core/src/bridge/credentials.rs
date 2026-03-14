@@ -2,8 +2,9 @@
 //!
 //! Implements the `BridgeCredentialStore` trait specified in spec section 12.11.
 //! Bridge credentials (OAuth tokens, API keys, webhook secrets) are encrypted
-//! at rest using AES-256-GCM with keys derived via HKDF-SHA256 from the bridge
-//! operator's identity key material and a bridge-specific salt.
+//! at rest using AES-256-GCM with keys derived via HKDF-SHA256 from a per-bridge
+//! random secret (`bridge_credential_key`) — NOT from the operator's identity
+//! key material.
 //!
 //! # Lifecycle Phases (spec section 12.11.1)
 //!
@@ -15,12 +16,22 @@
 //!    with zeros, then delete).
 //! 5. **List** -- Enumerate credential types stored for a bridge.
 //!
+//! # Key Derivation (spec section 12.11.1 Phase 2)
+//!
+//! ```text
+//! ikm  = bridge_credential_key                       // 32 bytes, per-bridge CSPRNG
+//! salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")          // fixed 32-byte hash
+//! info = "scp-bridge-credential:" || bridge_id        // bridge-specific context
+//! okm  = HKDF-Expand(HKDF-Extract(salt, ikm), info, 32)
+//! ```
+//!
 //! # Security Properties (spec section 12.11.2)
 //!
-//! - Credentials are encrypted at rest using a key derived from the bridge
-//!   operator's identity key material (not the identity key itself).
-//! - Key derivation uses HKDF-SHA256 with `bridge_id || credential_type` as
-//!   the salt, providing per-credential key isolation.
+//! - Credentials are encrypted at rest using a key derived from the bridge's
+//!   `bridge_credential_key` — a per-bridge random secret stored in the
+//!   custody boundary, independent of any identity key.
+//! - Key derivation uses HKDF-SHA256 with a fixed salt and bridge-specific
+//!   info string, providing per-bridge key isolation.
 //! - Credential access is scoped to bridge instance -- cross-bridge credential
 //!   sharing is prohibited even under the same operator DID.
 //! - On `BridgeStatus::Revoked`, `revoke()` overwrites encrypted data with
@@ -36,7 +47,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 // ---------------------------------------------------------------------------
@@ -45,13 +56,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// AES-256-GCM nonce size in bytes.
 const NONCE_SIZE: usize = 12;
-
-/// HKDF info string for bridge credential encryption.
-///
-/// Domain-separated from sender key HPKE (`scp-sender-key-hpke-v1`) and
-/// access key derivation (`scp-access-key-v1`) to prevent cross-protocol
-/// key reuse.
-const CREDENTIAL_HKDF_INFO: &[u8] = b"scp-bridge-credential-v1";
 
 // ---------------------------------------------------------------------------
 // CredentialType
@@ -99,7 +103,7 @@ impl std::fmt::Display for CredentialType {
 /// An encrypted credential stored for a bridge instance.
 ///
 /// The `encrypted_data` field contains AES-256-GCM ciphertext (nonce prepended)
-/// encrypted with a key derived from the operator's identity key material.
+/// encrypted with a key derived from the bridge's `bridge_credential_key`.
 /// The credential is scoped to a single bridge instance via `bridge_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeCredential {
@@ -207,8 +211,8 @@ pub trait BridgeCredentialStore: Send + Sync {
     /// Store a new credential for a bridge instance.
     ///
     /// The `plaintext` credential is encrypted using a key derived from
-    /// `operator_key_material` via HKDF with `bridge_id || credential_type`
-    /// as the salt, then stored.
+    /// the per-bridge `bridge_credential_key` via HKDF-SHA256
+    /// (spec §12.11.1 Phase 2), then stored.
     ///
     /// # Errors
     ///
@@ -222,7 +226,7 @@ pub trait BridgeCredentialStore: Send + Sync {
         bridge_id: &str,
         credential_type: CredentialType,
         plaintext: &[u8],
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> impl std::future::Future<Output = Result<BridgeCredential, CredentialError>> + Send;
 
     /// Retrieve and decrypt a credential for a bridge instance.
@@ -239,7 +243,7 @@ pub trait BridgeCredentialStore: Send + Sync {
         &self,
         bridge_id: &str,
         credential_type: &CredentialType,
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> impl std::future::Future<Output = Result<Zeroizing<Vec<u8>>, CredentialError>> + Send;
 
     /// Replace an existing credential with a new value.
@@ -257,7 +261,7 @@ pub trait BridgeCredentialStore: Send + Sync {
         bridge_id: &str,
         credential_type: &CredentialType,
         new_plaintext: &[u8],
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> impl std::future::Future<Output = Result<BridgeCredential, CredentialError>> + Send;
 
     /// Destroy all credentials for a bridge instance.
@@ -289,13 +293,23 @@ pub trait BridgeCredentialStore: Send + Sync {
 // Key derivation
 // ---------------------------------------------------------------------------
 
-/// Derives a 32-byte AES-256-GCM encryption key from operator key material
-/// using HKDF-SHA256.
+/// Derives a 32-byte AES-256-GCM encryption key from a per-bridge random
+/// secret using HKDF-SHA256 (spec §12.11.1 Phase 2).
 ///
-/// The salt is `bridge_id || credential_type` (Display-formatted), providing
-/// per-bridge, per-credential-type key isolation. This ensures:
-/// - Different bridges under the same operator get different keys.
-/// - Different credential types within the same bridge get different keys.
+/// ```text
+/// ikm  = bridge_credential_key                       // 32 bytes, per-bridge CSPRNG
+/// salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")          // fixed 32-byte hash
+/// info = "scp-bridge-credential:" || bridge_id        // bridge-specific context
+/// okm  = HKDF-Expand(HKDF-Extract(salt, ikm), info, 32)
+/// ```
+///
+/// The `bridge_credential_key` is a standalone random secret generated once
+/// per bridge instance at provisioning time — it is NOT derived from any
+/// identity key (avoiding coupling to key rotation or hardware custody).
+///
+/// Per-bridge isolation is provided by the `bridge_id` in the info string:
+/// different bridges produce different derived keys even if they somehow
+/// shared the same `bridge_credential_key`.
 ///
 /// The returned key is wrapped in [`Zeroizing`] so derived key material is
 /// zeroed on drop.
@@ -305,16 +319,18 @@ pub trait BridgeCredentialStore: Send + Sync {
 /// Returns [`CredentialError::KeyDerivationError`] if HKDF expansion fails
 /// (should not occur with valid inputs and SHA-256).
 pub fn derive_credential_key(
-    operator_key_material: &[u8],
+    bridge_credential_key: &[u8; 32],
     bridge_id: &str,
-    credential_type: &CredentialType,
 ) -> Result<Zeroizing<[u8; 32]>, CredentialError> {
-    // Salt = bridge_id || credential_type (Display-formatted).
-    let salt = format!("{bridge_id}{credential_type}");
+    // Salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1") — fixed 32-byte hash.
+    let salt = Sha256::digest(b"SCP-BRIDGE-CREDENTIAL-V1");
 
-    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), operator_key_material);
+    // Info = "scp-bridge-credential:" || bridge_id.
+    let info = format!("scp-bridge-credential:{bridge_id}");
+
+    let hk = Hkdf::<Sha256>::new(Some(&salt), bridge_credential_key);
     let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(CREDENTIAL_HKDF_INFO, okm.as_mut()).map_err(|e| {
+    hk.expand(info.as_bytes(), okm.as_mut()).map_err(|e| {
         CredentialError::KeyDerivationError {
             reason: e.to_string(),
         }
@@ -457,9 +473,9 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         bridge_id: &str,
         credential_type: CredentialType,
         plaintext: &[u8],
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> Result<BridgeCredential, CredentialError> {
-        let key = derive_credential_key(operator_key_material, bridge_id, &credential_type)?;
+        let key = derive_credential_key(bridge_credential_key, bridge_id)?;
         let encrypted_data = encrypt_credential(&key, plaintext)?;
 
         let credential = BridgeCredential {
@@ -491,7 +507,7 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         &self,
         bridge_id: &str,
         credential_type: &CredentialType,
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
         // Check suspension status before retrieval.
         if self.suspended_bridges.read().await.contains(bridge_id) {
@@ -510,7 +526,7 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
                 credential_type: credential_type.clone(),
             })?;
 
-        let key = derive_credential_key(operator_key_material, bridge_id, credential_type)?;
+        let key = derive_credential_key(bridge_credential_key, bridge_id)?;
         decrypt_credential(&key, &credential.encrypted_data)
     }
 
@@ -519,9 +535,9 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         bridge_id: &str,
         credential_type: &CredentialType,
         new_plaintext: &[u8],
-        operator_key_material: &[u8],
+        bridge_credential_key: &[u8; 32],
     ) -> Result<BridgeCredential, CredentialError> {
-        let key = derive_credential_key(operator_key_material, bridge_id, credential_type)?;
+        let key = derive_credential_key(bridge_credential_key, bridge_id)?;
         let new_encrypted = encrypt_credential(&key, new_plaintext)?;
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
@@ -602,11 +618,11 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
 mod tests {
     use super::*;
 
-    /// Shared operator key material for tests (32 bytes, deterministic).
-    const TEST_OPERATOR_KEY: &[u8; 32] = b"operator-key-material-32-bytes!!";
+    /// Shared bridge credential key for tests (32 bytes, deterministic).
+    const TEST_BRIDGE_KEY: &[u8; 32] = b"bridge-credential-key-32-bytes!!";
 
-    /// A different operator key to verify key isolation.
-    const OTHER_OPERATOR_KEY: &[u8; 32] = b"other-operator-key-material-32b!";
+    /// A different bridge credential key to verify key isolation.
+    const OTHER_BRIDGE_KEY: &[u8; 32] = b"other-bridge-credential-key-32b!";
 
     // -----------------------------------------------------------------------
     // CredentialType tests
@@ -677,20 +693,16 @@ mod tests {
 
     #[test]
     fn derive_credential_key_produces_deterministic_output() {
-        let key1 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
-        let key2 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
+        let key1 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let key2 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
 
         assert_eq!(*key1, *key2, "same inputs must produce same key");
     }
 
     #[test]
     fn derive_credential_key_differs_by_bridge_id() {
-        let key1 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
-        let key2 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-002", &CredentialType::ApiKey)
-            .expect("derive");
+        let key1 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let key2 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-002").expect("derive");
 
         assert_ne!(
             *key1, *key2,
@@ -699,32 +711,38 @@ mod tests {
     }
 
     #[test]
-    fn derive_credential_key_differs_by_credential_type() {
-        let key1 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
-        let key2 = derive_credential_key(
-            TEST_OPERATOR_KEY,
-            "bridge-001",
-            &CredentialType::OAuthAccessToken,
-        )
-        .expect("derive");
+    fn derive_credential_key_differs_by_ikm() {
+        let key1 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let key2 = derive_credential_key(OTHER_BRIDGE_KEY, "bridge-001").expect("derive");
 
         assert_ne!(
             *key1, *key2,
-            "different credential types must produce different keys"
+            "different bridge credential keys must produce different keys"
         );
     }
 
     #[test]
-    fn derive_credential_key_differs_by_operator_key() {
-        let key1 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
-        let key2 = derive_credential_key(OTHER_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
+    fn derive_credential_key_different_bridges_different_ikm_produces_different_keys() {
+        let key1 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let key2 = derive_credential_key(OTHER_BRIDGE_KEY, "bridge-002").expect("derive");
 
         assert_ne!(
             *key1, *key2,
-            "different operator keys must produce different keys"
+            "different bridge_credential_key + different bridge_id must produce different keys"
+        );
+    }
+
+    #[test]
+    fn derive_credential_key_same_bridge_id_different_ikm_key_isolation() {
+        // Verifies that two bridges with the same bridge_id but different
+        // bridge_credential_key values produce completely different derived keys,
+        // confirming that the IKM (not just the info string) drives key isolation.
+        let key1 = derive_credential_key(TEST_BRIDGE_KEY, "shared-bridge-id").expect("derive");
+        let key2 = derive_credential_key(OTHER_BRIDGE_KEY, "shared-bridge-id").expect("derive");
+
+        assert_ne!(
+            *key1, *key2,
+            "same bridge_id with different IKM must produce different keys (key isolation)"
         );
     }
 
@@ -734,8 +752,7 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let key = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
+        let key = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
 
         let plaintext = b"my-secret-api-key-12345";
         let encrypted = encrypt_credential(&key, plaintext).expect("encrypt");
@@ -749,10 +766,8 @@ mod tests {
 
     #[test]
     fn decrypt_with_wrong_key_fails() {
-        let key1 = derive_credential_key(TEST_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
-        let key2 = derive_credential_key(OTHER_OPERATOR_KEY, "bridge-001", &CredentialType::ApiKey)
-            .expect("derive");
+        let key1 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let key2 = derive_credential_key(OTHER_BRIDGE_KEY, "bridge-001").expect("derive");
 
         let encrypted = encrypt_credential(&key1, b"secret").expect("encrypt");
         let result = decrypt_credential(&key2, &encrypted);
@@ -780,7 +795,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::OAuthAccessToken,
                 plaintext,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
@@ -793,7 +808,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve");
@@ -810,7 +825,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::ApiKey,
                 b"key-1",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("first provision");
@@ -820,7 +835,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::ApiKey,
                 b"key-2",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
 
@@ -835,7 +850,7 @@ mod tests {
         let store = InMemoryCredentialStore::new();
 
         let result = store
-            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_OPERATOR_KEY)
+            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
             .await;
 
         assert!(
@@ -853,14 +868,14 @@ mod tests {
                 "bridge-001",
                 CredentialType::ApiKey,
                 b"secret-key",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
 
         // Attempt to retrieve from a different bridge -- must fail.
         let result = store
-            .retrieve("bridge-002", &CredentialType::ApiKey, TEST_OPERATOR_KEY)
+            .retrieve("bridge-002", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
             .await;
 
         assert!(
@@ -878,7 +893,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::OAuthAccessToken,
                 b"old-token",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
@@ -888,7 +903,7 @@ mod tests {
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
                 b"new-token",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("rotate");
@@ -900,7 +915,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("retrieve");
@@ -917,7 +932,7 @@ mod tests {
                 "bridge-001",
                 &CredentialType::ApiKey,
                 b"new-value",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
 
@@ -937,7 +952,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::OAuthAccessToken,
                 b"token",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision access token");
@@ -947,7 +962,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::OAuthRefreshToken,
                 b"refresh",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision refresh token");
@@ -957,7 +972,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::WebhookSecret,
                 b"webhook-secret",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision webhook secret");
@@ -978,7 +993,7 @@ mod tests {
             .retrieve(
                 "bridge-001",
                 &CredentialType::OAuthAccessToken,
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await;
         assert!(
@@ -996,7 +1011,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::ApiKey,
                 b"key-1",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision bridge-001");
@@ -1006,7 +1021,7 @@ mod tests {
                 "bridge-002",
                 CredentialType::ApiKey,
                 b"key-2",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision bridge-002");
@@ -1016,7 +1031,7 @@ mod tests {
 
         // bridge-002 should be unaffected.
         let retrieved = store
-            .retrieve("bridge-002", &CredentialType::ApiKey, TEST_OPERATOR_KEY)
+            .retrieve("bridge-002", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
             .await
             .expect("retrieve bridge-002");
 
@@ -1032,7 +1047,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::ApiKey,
                 b"my-key",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
@@ -1042,7 +1057,7 @@ mod tests {
 
         // Retrieve should fail with BridgeSuspended.
         let result = store
-            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_OPERATOR_KEY)
+            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
             .await;
 
         assert!(
@@ -1055,7 +1070,7 @@ mod tests {
 
         // Retrieve should succeed again.
         let retrieved = store
-            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_OPERATOR_KEY)
+            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
             .await
             .expect("retrieve after reactivation");
 
@@ -1071,7 +1086,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::OAuthAccessToken,
                 b"token",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
@@ -1081,7 +1096,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::ApiKey,
                 b"key",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
@@ -1091,7 +1106,7 @@ mod tests {
                 "bridge-001",
                 CredentialType::Custom("discord-bot-token".to_owned()),
                 b"bot-token",
-                TEST_OPERATOR_KEY,
+                TEST_BRIDGE_KEY,
             )
             .await
             .expect("provision");
@@ -1129,7 +1144,7 @@ mod tests {
 
         for (ct, plaintext) in &types_to_provision {
             store
-                .provision("bridge-001", ct.clone(), plaintext, TEST_OPERATOR_KEY)
+                .provision("bridge-001", ct.clone(), plaintext, TEST_BRIDGE_KEY)
                 .await
                 .expect("provision");
         }
@@ -1137,7 +1152,7 @@ mod tests {
         // Verify each can be independently retrieved.
         for (ct, expected) in &types_to_provision {
             let retrieved = store
-                .retrieve("bridge-001", ct, TEST_OPERATOR_KEY)
+                .retrieve("bridge-001", ct, TEST_BRIDGE_KEY)
                 .await
                 .expect("retrieve");
             assert_eq!(retrieved.as_slice(), *expected);
