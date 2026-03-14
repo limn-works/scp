@@ -1109,9 +1109,10 @@ pub fn clear_relay_connection() -> Result<(), ScpPyError> {
 /// Returns `ScpPyError::ContextError` if registration fails.
 pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
     // Ensure the ContextManager is initialized.
-    // Tests use LocalTransportProvider so create_context doesn't fail on
-    // the is_connected() check. Production uses NotConfiguredTransportProvider
-    // to surface errors when transport is not configured (#501).
+    // Tests use LocalTransportProvider so publish_context succeeds silently.
+    // Production uses NotConfiguredTransportProvider — publish_context
+    // returns an error that create_context logs as a warning (best-effort;
+    // context is valid locally even without relay publication, #501).
     #[cfg(test)]
     init_context_manager_for_test();
     #[cfg(not(test))]

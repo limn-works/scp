@@ -893,20 +893,26 @@ pub async fn create_context(
     }
     receipt.event_log = Some(EventLogHandle::new());
 
-    // Step 5: Publish to transport.
+    // Step 5: Publish to transport (best-effort).
     //
-    // If publish_context fails, the transport may have partially published
-    // (e.g., sent to 1 of 3 relays). Issue a best-effort DELETE for any
-    // partial blobs before rolling back all prior steps. Orphaned blobs on
-    // relays are encrypted with keys that will be destroyed during rollback,
-    // so they are unusable even if DELETE fails.
-    if let Err(e) = transport.publish_context(&id_bytes, &params) {
-        // Best-effort cleanup of any partially published blobs.
-        let _ = transport.delete_published(&id_bytes);
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
-        return Err(e);
+    // Context creation is a local operation — the context is fully
+    // functional even without relay publication.  If publish fails
+    // (e.g., transport not configured, relay unreachable), we log a
+    // warning and continue.  The context won't be discoverable via
+    // relay until a subsequent publish or sync, but all local state
+    // (MLS group, sender key, event log) remains valid.
+    match transport.publish_context(&id_bytes, &params) {
+        Ok(()) => {
+            receipt.published = true;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "context created locally but publish failed — \
+                 context is not discoverable via relay"
+            );
+        }
     }
-    receipt.published = true;
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active).await {
@@ -1237,10 +1243,11 @@ mod tests {
     #[tokio::test]
     async fn create_context_succeeds_when_transport_disconnected() {
         // Context creation is a local operation — it should succeed even
-        // when `is_connected()` returns false, as long as `publish_context`
-        // succeeds (transport connectivity is not a Phase 1 gate).
+        // when transport is not configured and `publish_context` returns
+        // an error. The publish failure is logged as a warning; the
+        // context is fully functional locally.
         let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::default(); // not connected
+        let transport = NotConfiguredTransportProvider;
         let event_log = MockEventLogProvider::default();
 
         let result = create_context(
@@ -1410,7 +1417,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_context_rollback_on_publish_failure() {
+    async fn create_context_succeeds_despite_publish_failure() {
+        // Publish is best-effort — a transport failure during publish
+        // should NOT roll back the context.  The context is valid
+        // locally; it just won't be discoverable via relay.
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
         transport.fail_publish.store(true, Ordering::Relaxed);
@@ -1425,21 +1435,22 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-fail-pub");
+        assert_eq!(handle.state().await, ContextState::Active);
 
-        // Everything up to publish was created.
+        // All local state was created and NOT rolled back.
         assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
         assert_eq!(crypto.sender_keys_created.lock().unwrap().len(), 1);
         assert_eq!(event_log.inited.lock().unwrap().len(), 1);
-
-        // All rolled back.
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(event_log.destroyed.lock().unwrap().len(), 1);
-        // Publish failed, but partial publication rollback issues a
-        // best-effort DELETE to clean up any partially published blobs.
+        assert!(crypto.mls_groups_destroyed.lock().unwrap().is_empty());
+        assert!(crypto.sender_keys_destroyed.lock().unwrap().is_empty());
+        assert!(event_log.destroyed.lock().unwrap().is_empty());
+        // Publish was attempted but failed — nothing published, no
+        // delete_published call since we don't roll back.
         assert!(transport.published.lock().unwrap().is_empty());
-        assert_eq!(transport.deleted.lock().unwrap().len(), 1);
+        assert!(transport.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1602,7 +1613,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_context_transport_failure_returns_transport_error() {
+    async fn create_context_transport_failure_is_best_effort() {
+        // Transport publish failure should NOT fail create_context —
+        // publish is best-effort (the context is valid locally).
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
         transport.fail_publish.store(true, Ordering::Relaxed);
@@ -1617,10 +1630,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TransportFailed(_)
-        ));
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.context_id(), "ctx-err");
+        assert_eq!(handle.state().await, ContextState::Active);
     }
 
     #[tokio::test]
