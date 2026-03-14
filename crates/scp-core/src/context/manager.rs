@@ -6466,7 +6466,7 @@ impl ContextManager {
         // migration state — all under ONE lock acquisition to prevent a
         // race where another task observes the source as Active between
         // destination creation and the state transition (F4).
-        let (creator_did, snapshot) = {
+        let (creator_did, snapshot, buffer_len_before_migration) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -6509,6 +6509,11 @@ impl ContextManager {
                 proposal_id,
             });
 
+            // Record buffer length before pushing migration events so
+            // rollback can truncate back to this point without destroying
+            // events pushed by concurrent operations.
+            let buffer_len_before_migration = ctx.receive_buffer.len();
+
             // Emit ContextMigrationProposed event to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::ContextMigrationProposed {
@@ -6532,7 +6537,7 @@ impl ContextManager {
                 None
             };
 
-            (creator, snap)
+            (creator, snap, buffer_len_before_migration)
         };
 
         // Create the destination context AFTER the source has been
@@ -6546,8 +6551,9 @@ impl ContextManager {
             if let Some(ctx) = contexts.get_mut(context_id) {
                 let _ = ctx.handle.transition_to(&ContextState::Active).await;
                 ctx.migration_state = None;
-                // Drain the migration events we pushed.
-                let _ = ctx.receive_buffer.drain();
+                // Remove only the migration events we pushed, preserving
+                // any events added by concurrent operations.
+                ctx.receive_buffer.truncate(buffer_len_before_migration);
             }
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"

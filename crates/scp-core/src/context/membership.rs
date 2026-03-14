@@ -692,6 +692,16 @@ impl ReceiveBuffer {
         self.dropped_since_last_consume = 0;
         self.events.drain(..).collect()
     }
+
+    /// Truncates the buffer to `len` events, removing from the back.
+    ///
+    /// If `len` is greater than or equal to the current length, this is a
+    /// no-op. Used by rollback paths to remove only the events pushed
+    /// after a recorded checkpoint, without disturbing events that were
+    /// already in the buffer or added by concurrent operations.
+    pub fn truncate(&mut self, len: usize) {
+        self.events.truncate(len);
+    }
 }
 
 impl Default for ReceiveBuffer {
