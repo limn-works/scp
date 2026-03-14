@@ -37,6 +37,8 @@ use crate::runtime::with_identity;
 /// or `ttl_seconds` is 0 or exceeds 300.
 #[pyfunction]
 #[pyo3(name = "scpid_challenge")]
+// ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
+// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
 pub fn py_scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String> {
     let challenge = scpid_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
         ScpPyError::ValidationError {
@@ -46,7 +48,7 @@ pub fn py_scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String
     })?;
 
     serde_json::to_string(&challenge).map_err(|e| {
-        ScpPyError::CryptoError {
+        ScpPyError::IdentityError {
             message: format!("failed to serialize SCPID challenge: {e}"),
             code: "SCP-IDENT-1037".to_string(),
         }
@@ -71,7 +73,7 @@ pub fn py_scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String
 /// Raises `IdentityError` if the DID is not registered.
 /// Raises `ValidationError` if `signing_key_id` is invalid or the challenge
 /// JSON is malformed.
-/// Raises `CryptoError` if the signing operation fails.
+/// Raises `IdentityError` if the signing operation fails.
 #[pyfunction]
 #[pyo3(name = "scpid_sign")]
 pub fn py_scpid_sign(
@@ -114,12 +116,12 @@ pub fn py_scpid_sign(
                 &challenge,
             ));
 
-            let response = response.map_err(|e| ScpPyError::CryptoError {
+            let response = response.map_err(|e| ScpPyError::IdentityError {
                 message: e.to_string(),
                 code: "SCP-IDENT-1037".to_string(),
             })?;
 
-            serde_json::to_string(&response).map_err(|e| ScpPyError::CryptoError {
+            serde_json::to_string(&response).map_err(|e| ScpPyError::IdentityError {
                 message: format!("failed to serialize SCPID response: {e}"),
                 code: "SCP-IDENT-1037".to_string(),
             })

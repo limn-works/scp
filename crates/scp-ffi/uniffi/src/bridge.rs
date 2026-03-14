@@ -7994,6 +7994,8 @@ pub fn identity_execute_custody_migration(
 /// Returns `ScpError::Validation` if `audience` is empty, exceeds 2048 bytes,
 /// or `ttl_seconds` is 0 or exceeds 300.
 #[uniffi::export]
+// ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
+// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
 pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, ScpError> {
     use scp_core::identity::scpid_challenge as core_challenge;
     use std::time::Duration;

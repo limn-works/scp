@@ -79,6 +79,8 @@ struct ScpIdResponse {
 /// const challengeJson = scpid_challenge("https://app.example.com", 120);
 /// ```
 #[wasm_bindgen]
+// ttl_seconds is u32 — idiomatic for WASM platforms (max valid TTL is 300s).
+// PyO3/UniFFI bridges use u64 to match `Duration::from_secs` parameter type.
 pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsError> {
     let ttl_ms = u64::from(ttl_seconds) * 1000;
 
