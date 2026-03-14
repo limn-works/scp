@@ -420,6 +420,12 @@ pub async fn scpid_sign(
 /// DID document freshness (the 300s requirement from §3.11.4 step 5c) is
 /// enforced by the resolver's cache policy, not by this function.
 ///
+/// # Caller Responsibilities
+///
+/// - The relying party **must** track issued nonces and reject duplicates
+///   per §3.11.6.  This function verifies that the response nonce matches
+///   the challenge nonce, but it does not consume or invalidate the nonce.
+///
 /// # Errors
 ///
 /// Returns the appropriate [`ScpIdError`] variant for each verification
@@ -1250,6 +1256,24 @@ mod tests {
         assert!(
             matches!(result, Err(ScpIdError::KeyNotAuthorized)),
             "expected KeyNotAuthorized when VM not found, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_wrong_protocol() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Mutate the protocol field directly (deserialization would reject it,
+        // but the field is pub so we can set it post-construction).
+        response.protocol = "scpid/2.0".to_owned();
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("unsupported protocol")),
+            "expected InvalidInput for wrong protocol version, got: {result:?}"
         );
     }
 }
