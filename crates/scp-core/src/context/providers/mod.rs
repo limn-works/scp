@@ -3,8 +3,9 @@
 //! These providers wrap the real SCP crypto, event log, and persistence
 //! subsystems, allowing [`ContextManager`] to operate outside of tests.
 //!
-//! - [`MlsCryptoProvider`] — Wraps `crypto::mls::group` and `crypto::sender_keys`
-//!   for real MLS group operations, sender key management, and encryption.
+//! - [`MlsCryptoProvider`] — Production `ContextCryptoProvider` backed by
+//!   `OpenMLS` with HPKE sender key distribution, nonce deduplication, and
+//!   per-context crypto state persistence.
 //! - [`MerkleEventLogProvider`] — Merkle-chained event log with append-only
 //!   semantics and optional persistence (#636).
 //! - [`ProtocolRepositoryContextBridge`] — Wraps [`ProtocolRepository`](crate::store::ProtocolRepository)
@@ -17,11 +18,10 @@
 //!
 //! [`ContextManager`]: super::manager::ContextManager
 
-pub mod crypto;
 pub mod event_log;
 pub mod persistence;
 
-pub use crypto::MlsCryptoProvider;
+pub use crate::crypto::mls::provider::MlsCryptoProvider;
 pub use event_log::{EventLogEntry, EventLogPersistence, MerkleEventLogProvider};
 pub use persistence::{InMemoryPersistence, ProtocolRepositoryContextBridge};
 
