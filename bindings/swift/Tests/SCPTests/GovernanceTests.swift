@@ -16,10 +16,10 @@ import Testing
 struct GovernanceTests {
     // MARK: - Helpers
 
-    /// Creates a ``Context`` with a real ``ContextHandle`` for active-state testing.
+    /// Creates a ``Context`` with a concrete ``ContextHandle`` for active-state testing.
     ///
-    /// Uses `ContextHandle(noPointer: .init())` so that `handle as? ContextHandle`
-    /// succeeds inside governance/membership/broadcast methods.
+    /// Uses `ContextHandle(noPointer: .init())` with explicit overrides for
+    /// contextId, creatorDid, and initialState.
     private func makeActiveContext() -> Context {
         let handle = ContextHandle(noPointer: .init())
         let sendFn: ContextBridge.SendFn = { _, _, _ in }

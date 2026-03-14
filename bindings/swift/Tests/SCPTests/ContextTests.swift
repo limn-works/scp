@@ -14,39 +14,6 @@ import Testing
 // See ADR-026 (Swift SDK) and story SCP-102.
 // swiftlint:disable:next type_body_length
 struct ContextTests {
-    // MARK: - Mock ContextHandle
-
-    /// Mock implementation of ``ContextHandleProtocol`` for testing.
-    /// Returns configurable values for contextId, creatorDid, and state.
-    ///
-    /// UniFFI's ContextHandleProtocol requires:
-    ///   - contextId() -> String
-    ///   - creatorDid() -> String
-    ///   - state() throws -> String
-    private final class MockContextHandle: ContextHandleProtocol, @unchecked Sendable {
-        let id: String
-        let creator: String
-        let initialState: String
-
-        init(id: String = "test-context-001", creator: String = "did:dht:z6MkCreator", state: String = "active") {
-            self.id = id
-            self.creator = creator
-            initialState = state
-        }
-
-        func contextId() -> String {
-            id
-        }
-
-        func creatorDid() -> String {
-            creator
-        }
-
-        func state() throws -> String {
-            initialState
-        }
-    }
-
     // MARK: - Thread-safe test state
 
     /// A simple lock-based thread-safe container for test assertions.
@@ -81,15 +48,18 @@ struct ContextTests {
     /// to inspect sent payloads. The `captureListener` closure captures the
     /// ``MessageListener`` registered by ``Context/messages``, enabling
     /// tests to push messages into the stream from the outside.
+    ///
+    /// Uses `ContextHandle(noPointer:)` with explicit overrides for contextId
+    /// and initialState, avoiding protocol-type mock handles.
     private func makeTestContext(
         contextId: String = "test-context-001",
-        state: String = "active",
+        initialState: ContextState = .active,
         onSend: (@Sendable (Data) -> Void)? = nil,
         onLeave: (@Sendable () -> Void)? = nil,
         onClose: (@Sendable () -> Void)? = nil,
         captureListener: (@Sendable (any MessageListener) -> Void)? = nil
     ) -> Context {
-        let handle = MockContextHandle(id: contextId, state: state)
+        let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
         let sendFn: ContextBridge.SendFn = { _, _, payload in
@@ -111,6 +81,8 @@ struct ContextTests {
         return Context(
             handle: handle,
             identity: identity,
+            contextId: contextId,
+            initialState: initialState,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -146,10 +118,7 @@ struct ContextTests {
         let createFn: ContextBridge.CreateFn = { identity, params in
             capturedIdentity.withLock { $0 = identity }
             capturedParams.withLock { $0 = params }
-            return MockContextHandle(
-                id: "ctx-create-test",
-                state: "active"
-            )
+            return ContextHandle(noPointer: .init())
         }
         let noOpSend: ContextBridge.SendFn = { _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
@@ -173,7 +142,9 @@ struct ContextTests {
             sendFn: noOpSend,
             subscribeFn: noOpSubscribe,
             leaveFn: noOpLeave,
-            closeFn: noOpClose
+            closeFn: noOpClose,
+            contextId: "ctx-create-test",
+            initialState: .active
         )
 
         #expect(await context.contextId == "ctx-create-test")
@@ -595,16 +566,16 @@ struct ContextTests {
 
     // MARK: - Context state tests
 
-    @Test("context initializes with active state from handle")
+    @Test("context initializes with active state")
     func contextInitializesWithActiveState() async {
-        let context = makeTestContext(state: "active")
+        let context = makeTestContext(initialState: .active)
         #expect(await context.state == .active)
     }
 
-    @Test("context falls back to active for unknown state strings")
-    func contextFallsBackToActiveForUnknownState() async {
-        let context = makeTestContext(state: "unknown-state")
-        #expect(await context.state == .active)
+    @Test("context initializes with explicit state override")
+    func contextInitializesWithExplicitState() async {
+        let context = makeTestContext(initialState: .closed)
+        #expect(await context.state == .closed)
     }
 
     @Test("contextId matches the handle's context ID")
@@ -739,10 +710,12 @@ struct ContextTests {
             stored.current
         }
 
-        let handle = MockContextHandle()
+        let handle = ContextHandle(noPointer: .init())
         let context = Context(
             handle: handle,
             identity: Identity(noPointer: .init()),
+            contextId: "econ-policy-test",
+            initialState: .active,
             sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
