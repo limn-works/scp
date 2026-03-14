@@ -8002,13 +8002,13 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, Scp
 
     let challenge = core_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
         ScpError::Validation {
-            message: e.to_string(),
+            msg: e.to_string(),
             code: "SCP-IDENT-1038".to_owned(),
         }
     })?;
 
     serde_json::to_string(&challenge).map_err(|e| ScpError::Identity {
-        message: format!("failed to serialize SCPID challenge: {e}"),
+        msg: format!("failed to serialize SCPID challenge: {e}"),
         code: "SCP-IDENT-1037".to_owned(),
     })
 }
@@ -8043,7 +8043,7 @@ pub fn scpid_sign(
 
     let challenge: scp_core::identity::ScpIdChallenge = serde_json::from_str(&challenge_json)
         .map_err(|e| ScpError::Validation {
-            message: format!("invalid challenge JSON: {e}"),
+            msg: format!("invalid challenge JSON: {e}"),
             code: "SCP-IDENT-1038".to_owned(),
         })?;
 
@@ -8051,7 +8051,7 @@ pub fn scpid_sign(
         .core_id
         .as_ref()
         .ok_or_else(|| ScpError::Identity {
-            message: "identity has no core identity handle — was it created with identity_create?"
+            msg: "identity has no core identity handle — was it created with identity_create?"
                 .to_owned(),
             code: "SCP-IDENT-1010".to_owned(),
         })?;
@@ -8062,7 +8062,7 @@ pub fn scpid_sign(
             core_id
                 .agent_signing_key
                 .ok_or_else(|| ScpError::Identity {
-                    message: format!(
+                    msg: format!(
                         "identity '{}' has no agent signing key — \
                          add one with identity_add_agent_key first",
                         identity.did
@@ -8076,8 +8076,8 @@ pub fn scpid_sign(
         .in_memory_custody
         .as_ref()
         .ok_or_else(|| ScpError::Identity {
-            message: "scpid_sign requires in-memory custody (only supported with \
-                      allow_in_memory_custody feature)"
+            msg: "scpid_sign requires in-memory custody (only supported with \
+                  allow_in_memory_custody feature)"
                 .to_owned(),
             code: "SCP-IDENT-1008".to_owned(),
         })?;
@@ -8092,12 +8092,12 @@ pub fn scpid_sign(
     ));
 
     let response = response.map_err(|e| ScpError::Identity {
-        message: e.to_string(),
+        msg: e.to_string(),
         code: "SCP-IDENT-1037".to_owned(),
     })?;
 
     serde_json::to_string(&response).map_err(|e| ScpError::Identity {
-        message: format!("failed to serialize SCPID response: {e}"),
+        msg: format!("failed to serialize SCPID response: {e}"),
         code: "SCP-IDENT-1037".to_owned(),
     })
 }
@@ -8108,7 +8108,7 @@ fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, Scp
         "#active" => Ok(scp_identity::SigningKeyId::Active),
         "#agent" => Ok(scp_identity::SigningKeyId::Agent),
         other => Err(ScpError::Validation {
-            message: format!("invalid signing_key_id '{other}': expected '#active' or '#agent'"),
+            msg: format!("invalid signing_key_id '{other}': expected '#active' or '#agent'"),
             code: "SCP-IDENT-1034".to_owned(),
         }),
     }
