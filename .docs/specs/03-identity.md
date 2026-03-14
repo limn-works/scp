@@ -1059,7 +1059,8 @@ pub fn scpid_challenge(
 /// Constructs signed_bytes per §3.11.3 (SHA-256 of canonical concatenation
 /// including did and signing_key_id), signs with Ed25519, returns the response.
 pub async fn scpid_sign(
-    custody: &dyn KeyCustody,
+    custody: &impl KeyCustody,
+    signing_key: &KeyHandle,
     did: &str,
     signing_key_id: SigningKeyId,  // Active or Agent (from scp-identity)
     challenge: &ScpIdChallenge,

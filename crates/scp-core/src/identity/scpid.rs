@@ -321,6 +321,11 @@ pub async fn scpid_sign(
     signing_key_id: SigningKeyId,
     challenge: &ScpIdChallenge,
 ) -> Result<ScpIdResponse, ScpIdError> {
+    // Reject empty DID (consistent with audience validation in scpid_challenge).
+    if did.is_empty() {
+        return Err(ScpIdError::InvalidInput("DID must not be empty".to_owned()));
+    }
+
     // Reject expired challenges (fail fast).
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -766,6 +771,24 @@ mod tests {
         assert!(
             matches!(result, Err(ScpIdError::ChallengeExpired)),
             "expected ChallengeExpired, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_sign_empty_did_rejected() {
+        use scp_platform::KeyType;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let challenge =
+            scpid_challenge("https://example.com", Duration::from_secs(60)).unwrap();
+
+        let result =
+            scpid_sign(&custody, &handle, "", SigningKeyId::Active, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("DID must not be empty")),
+            "expected InvalidInput with empty DID message, got: {result:?}"
         );
     }
 }
