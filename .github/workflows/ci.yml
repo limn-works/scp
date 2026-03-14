@@ -223,14 +223,19 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Python dependencies
-        run: pip install pytest pytest-asyncio maturin
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install pytest pytest-asyncio maturin
       - name: Build PyO3 native module
         run: |
+          source .venv/bin/activate
           cd bindings/python
           maturin develop --release --features allow_in_memory_custody
       - name: Run tests (including real FFI)
         run: |
+          source .venv/bin/activate
           cd bindings/python
           PYTHONPATH=. pytest tests/ -v
 
