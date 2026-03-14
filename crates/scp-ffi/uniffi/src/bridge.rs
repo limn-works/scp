@@ -5539,7 +5539,7 @@ pub async fn broadcast_handle_key_request(
 /// Returns `None` if the context is not registered or not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
@@ -5549,7 +5549,7 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
 /// Returns `true` if the given DID is a broadcast subscriber.
 #[uniffi::export]
 pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager
         .is_broadcast_subscriber(&handle.context_id, &did)
         .await
@@ -5561,7 +5561,7 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
 /// Returns `None` if the context is not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -5577,7 +5577,7 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 /// Returns `None` if the context is not registered.
 #[uniffi::export]
 pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager
         .member_count(&handle.context_id)
         .await
@@ -5587,14 +5587,14 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
 /// Returns `true` if the given DID is a member of the context.
 #[uniffi::export]
 pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager.is_member(&handle.context_id, &did).await
 }
 
 /// Returns all member DIDs for a context.
 #[uniffi::export]
 pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager.member_dids(&handle.context_id).await
 }
 
@@ -5603,7 +5603,7 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
 /// Returns `None` if the member is not found or the context is not registered.
 #[uniffi::export]
 pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager
         .member_role(&handle.context_id, &did)
         .await
@@ -5620,7 +5620,7 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
 /// if the context is not registered.
 #[uniffi::export]
 pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager
         .drain_events(&handle.context_id)
         .await
@@ -5707,7 +5707,7 @@ pub async fn context_propose_ttl_extension(
 /// Cancels the old timer and spawns a new one with the given duration.
 #[uniffi::export]
 pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     let core_handle = scp_core::context::ContextHandle::new(
         handle.context_id.clone(),
         scp_core::context::ContextParams::default(),
@@ -5733,7 +5733,7 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 #[uniffi::export]
 pub async fn register_local_did(did: String) {
     crate::runtime::init_context_manager();
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     manager.register_local_did(did.into()).await;
 }
 
@@ -5744,7 +5744,7 @@ pub async fn register_local_did(did: String) {
 #[uniffi::export]
 pub async fn is_local_did(did: String) -> bool {
     crate::runtime::init_context_manager();
-    let manager = crate::runtime::context_manager_or_init();
+    let manager = crate::runtime::context_manager_expect();
     let did_ref: scp_identity::DID = did.into();
     manager.is_local_did(&did_ref).await
 }
