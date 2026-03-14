@@ -209,29 +209,19 @@ impl WasmCheckpoint {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Extracts filter fields from a parsed JSON filter object.
+/// Extracts the `limit` field from a parsed JSON filter object.
 ///
 /// The filter JSON uses camelCase keys matching the TypeScript `EventFilter`
-/// interface: `eventType`, `actorDid`, `afterSequence`, `beforeSequence`,
-/// `limit`. This mirrors the NAPI bridge's filter handling (where the
-/// TypeScript wrapper converts camelCase to `snake_case` before sending,
-/// but WASM receives camelCase directly from `JSON.stringify`).
+/// interface. Only `limit` is extracted and applied — both WASM and NAPI
+/// bridges produce a single synthetic `LogSummary` event, so field-level
+/// filters (`eventType`, `actorDid`, `afterSequence`, `beforeSequence`)
+/// are not meaningful and are not parsed.
 fn extract_filter(filter: Option<&serde_json::Value>) -> ParsedFilter {
     let Some(f) = filter else {
         return ParsedFilter::default();
     };
     #[allow(clippy::cast_possible_truncation)]
     ParsedFilter {
-        event_type: f
-            .get("eventType")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
-        actor_did: f
-            .get("actorDid")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
-        after_sequence: f.get("afterSequence").and_then(serde_json::Value::as_u64),
-        before_sequence: f.get("beforeSequence").and_then(serde_json::Value::as_u64),
         limit: f
             .get("limit")
             .and_then(serde_json::Value::as_u64)
@@ -241,20 +231,12 @@ fn extract_filter(filter: Option<&serde_json::Value>) -> ParsedFilter {
 
 /// Parsed filter criteria for event log queries.
 ///
-/// Currently only `limit` is applied (matching NAPI bridge behavior). The
-/// remaining fields are parsed for forward-compatibility — they will be
-/// applied when bridges produce real event streams instead of a single
-/// synthetic `LogSummary`.
+/// Only `limit` is meaningful — both WASM and NAPI bridges produce a
+/// single synthetic `LogSummary` event, so field-level filters
+/// (`eventType`, `actorDid`, `afterSequence`, `beforeSequence`) are not
+/// applicable and are not parsed.
 #[derive(Default)]
 struct ParsedFilter {
-    #[allow(dead_code)] // Parsed for forward-compatibility; not yet applied.
-    event_type: Option<String>,
-    #[allow(dead_code)] // Parsed for forward-compatibility; not yet applied.
-    actor_did: Option<String>,
-    #[allow(dead_code)] // Parsed for forward-compatibility; not yet applied.
-    after_sequence: Option<u64>,
-    #[allow(dead_code)] // Parsed for forward-compatibility; not yet applied.
-    before_sequence: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -265,13 +247,11 @@ struct ParsedFilter {
 /// returns a `LogSummary` event carrying event count and Merkle root in
 /// `payloadJson`, consistent with the NAPI bridge.
 ///
-/// Only the `limit` filter field is applied, matching the NAPI bridge which
-/// also only applies `limit`. The remaining filter fields (`eventType`,
-/// `actorDid`, `afterSequence`, `beforeSequence`) are parsed by
-/// [`extract_filter`] but not applied — both bridges currently produce a
-/// single synthetic `LogSummary` event, so field-level filtering is
-/// meaningless on the current data. Fields use camelCase to match the
-/// TypeScript `EventFilter` interface directly — the WASM bridge receives
+/// Only the `limit` filter field is extracted and applied — both WASM and NAPI
+/// bridges produce a single synthetic `LogSummary` event, so field-level
+/// filters (`eventType`, `actorDid`, `afterSequence`, `beforeSequence`) are
+/// not meaningful and are not parsed. The filter JSON uses camelCase to match
+/// the TypeScript `EventFilter` interface directly — the WASM bridge receives
 /// JSON from `JSON.stringify(filter)` without `snake_case` conversion (unlike
 /// the NAPI bridge where the TypeScript wrapper converts keys).
 #[wasm_bindgen]
@@ -324,10 +304,8 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
             "sequence": count.saturating_sub(1),
         });
 
-        // Only apply `limit`, matching NAPI bridge behavior. Both bridges
-        // currently produce a single synthetic LogSummary event, so
-        // field-level filters (eventType, actorDid, afterSequence,
-        // beforeSequence) are not applied.
+        // Apply `limit` — the only filter field parsed. Both bridges produce
+        // a single synthetic LogSummary event.
         let events = [summary];
         let result: Vec<&serde_json::Value> = events
             .iter()
@@ -647,15 +625,11 @@ mod tests {
     #[test]
     fn extract_filter_none_returns_defaults() {
         let parsed = extract_filter(None);
-        assert!(parsed.event_type.is_none());
-        assert!(parsed.actor_did.is_none());
-        assert!(parsed.after_sequence.is_none());
-        assert!(parsed.before_sequence.is_none());
         assert!(parsed.limit.is_none());
     }
 
     #[test]
-    fn extract_filter_extracts_all_camel_case_fields() {
+    fn extract_filter_extracts_limit() {
         let filter = Some(serde_json::json!({
             "eventType": "MessageSent",
             "actorDid": "did:dht:z1234",
@@ -664,18 +638,13 @@ mod tests {
             "limit": 3,
         }));
         let parsed = extract_filter(filter.as_ref());
-        assert_eq!(parsed.event_type.as_deref(), Some("MessageSent"));
-        assert_eq!(parsed.actor_did.as_deref(), Some("did:dht:z1234"));
-        assert_eq!(parsed.after_sequence, Some(5));
-        assert_eq!(parsed.before_sequence, Some(10));
         assert_eq!(parsed.limit, Some(3));
     }
 
     #[test]
-    fn extract_filter_partial_fields() {
-        let filter = Some(serde_json::json!({ "limit": 1 }));
+    fn extract_filter_ignores_non_limit_fields() {
+        let filter = Some(serde_json::json!({ "eventType": "MessageSent" }));
         let parsed = extract_filter(filter.as_ref());
-        assert!(parsed.event_type.is_none());
-        assert_eq!(parsed.limit, Some(1));
+        assert!(parsed.limit.is_none());
     }
 }
