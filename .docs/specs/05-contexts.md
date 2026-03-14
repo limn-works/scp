@@ -154,7 +154,7 @@ TestVector {
   input:            Value,           // MessagePack value matching the input schema.
   expected_output:  Value,           // MessagePack value. Verification uses structural comparison,
                                      // not byte equality (§7.3.3).
-  description:      Option<String>,  // Optional human-readable description of what this tests.
+  description:      String,          // Human-readable description of what this tests. Max 4096 UTF-8 bytes.
 }
 
 ToolCost {
