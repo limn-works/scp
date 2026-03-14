@@ -1273,6 +1273,23 @@ export function createWasmBridge(): Bridge {
       return await wasm.identity_verify_device_attestation(did, tokenBase64);
     },
 
+    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    async identityExecuteRecovery(
+      _did: string,
+      _tier: string,
+      _contextIds: string[],
+    ): Promise<string> {
+      throw new Error("identityExecuteRecovery not yet implemented in WASM bridge");
+    },
+
+    async identityExecuteCustodyMigration(
+      _did: string,
+      _target: string,
+      _contextIds: string[],
+    ): Promise<string> {
+      throw new Error("identityExecuteCustodyMigration not yet implemented in WASM bridge");
+    },
+
     // App Sandboxing (#595, spec §8.4.1, §8.4.2)
     validateCapabilityDeclaration(
       declarationJson: string,

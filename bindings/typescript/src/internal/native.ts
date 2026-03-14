@@ -1025,6 +1025,37 @@ export function createNativeBridge(): Bridge {
       )(did, tokenBase64);
     },
 
+    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    async identityExecuteRecovery(
+      did: string,
+      tier: string,
+      contextIds: string[],
+    ): Promise<string> {
+      if (typeof addon.identityExecuteRecovery === "function") {
+        return await (
+          addon.identityExecuteRecovery as (d: string, t: string, c: string[]) => Promise<string>
+        )(did, tier, contextIds);
+      }
+      throw new Error("identityExecuteRecovery not yet implemented in NAPI bridge");
+    },
+
+    async identityExecuteCustodyMigration(
+      did: string,
+      target: string,
+      contextIds: string[],
+    ): Promise<string> {
+      if (typeof addon.identityExecuteCustodyMigration === "function") {
+        return await (
+          addon.identityExecuteCustodyMigration as (
+            d: string,
+            t: string,
+            c: string[],
+          ) => Promise<string>
+        )(did, target, contextIds);
+      }
+      throw new Error("identityExecuteCustodyMigration not yet implemented in NAPI bridge");
+    },
+
     // App Sandboxing (#595, spec §8.4.1, §8.4.2)
     validateCapabilityDeclaration(
       declarationJson: string,
