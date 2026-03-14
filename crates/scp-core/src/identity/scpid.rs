@@ -1,26 +1,30 @@
 //! SCPID — DID authentication for external services (§3.11).
 //!
-//! Provides wire types and challenge generation for the SCPID protocol,
-//! which lets DID holders authenticate to relying parties outside of SCP
-//! contexts. Analogous to "Sign in with Ethereum" (EIP-4361) but simpler:
-//! no blockchain state, no gas — the DID document is the identity provider.
+//! Provides wire types, challenge generation, client signing, and relying-party
+//! verification for the SCPID protocol, which lets DID holders authenticate to
+//! external services outside of SCP contexts. Analogous to "Sign in with
+//! Ethereum" (EIP-4361) but simpler: no blockchain state, no gas — the DID
+//! document is the identity provider.
 //!
 //! This module implements:
 //! - [`ScpIdChallenge`] — issued by the relying party
 //! - [`ScpIdResponse`] — signed by the client
 //! - [`ScpIdAuthentication`] — result of successful verification
 //! - [`scpid_challenge`] — challenge generation with CSPRNG nonce
-//!
-//! Signing (`scpid_sign`) and verification (`scpid_verify`) require async
-//! key custody / DID resolution and live in separate modules.
+//! - [`scpid_sign`] — client-side challenge signing via key custody
+//! - [`scpid_verify`] — relying-party 11-step verification (§3.11.4)
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::crypto::canonical::{CanonicalField, canonical_hash};
+use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::identity::SigningKeyId;
+use scp_identity::decode_multibase_key;
+use scp_identity::resolver::DidResolver;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 // ---------------------------------------------------------------------------
@@ -390,6 +394,149 @@ pub async fn scpid_sign(
         audience: challenge.audience.clone(),
         signed_at,
         signature: sig_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Relying-party verification (§3.11.4)
+// ---------------------------------------------------------------------------
+
+/// Verify an SCPID response against the original challenge (§3.11.4).
+///
+/// Implements the full 11-step verification procedure:
+///
+/// 1. Parse (already done — typed inputs).
+/// 2. Constant-time nonce match.
+/// 3. Constant-time audience match.
+/// 4. Timestamp window validation.
+/// 5. DID resolution via dual-layer resolver.
+/// 6. Public key extraction from DID document verification methods.
+/// 7. Signing key ID validation (`#active` or `#agent`).
+/// 8. Authentication relationship check.
+/// 9. Canonical hash reconstruction.
+/// 10. Ed25519 strict signature verification.
+/// 11. Return authenticated identity.
+///
+/// DID document freshness (the 300s requirement from §3.11.4 step 5c) is
+/// enforced by the resolver's cache policy, not by this function.
+///
+/// # Caller Responsibilities
+///
+/// - The relying party **must** track issued nonces and reject duplicates
+///   per §3.11.6.  This function verifies that the response nonce matches
+///   the challenge nonce, but it does not consume or invalidate the nonce.
+///
+/// # Errors
+///
+/// Returns the appropriate [`ScpIdError`] variant for each verification
+/// failure per the error table in §3.11.4.
+pub async fn scpid_verify(
+    resolver: &impl DidResolver,
+    response: &ScpIdResponse,
+    challenge: &ScpIdChallenge,
+) -> Result<ScpIdAuthentication, ScpIdError> {
+    // Step 0: Validate protocol version.
+    if response.protocol != SCPID_PROTOCOL_VERSION {
+        return Err(ScpIdError::InvalidInput(format!(
+            "unsupported protocol: {}, expected {SCPID_PROTOCOL_VERSION}",
+            response.protocol
+        )));
+    }
+
+    // Step 2: Constant-time nonce comparison (replay prevention).
+    if !bool::from(response.nonce.ct_eq(&challenge.nonce)) {
+        return Err(ScpIdError::ChallengeExpired);
+    }
+
+    // Step 3: Constant-time audience comparison (defense in depth).
+    if !bool::from(
+        response
+            .audience
+            .as_bytes()
+            .ct_eq(challenge.audience.as_bytes()),
+    ) {
+        return Err(ScpIdError::AudienceMismatch);
+    }
+
+    // Step 4: Timestamp window validation.
+    //   - signed_at must be within [issued_at, expires_at]
+    //   - current time must be <= expires_at
+    if response.signed_at < challenge.issued_at || response.signed_at > challenge.expires_at {
+        return Err(ScpIdError::TimestampInvalid);
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| ScpIdError::InvalidInput(format!("system clock error: {e}")))?
+        .as_millis();
+    let now_ms = u64::try_from(now_ms)
+        .map_err(|_| ScpIdError::InvalidInput("system clock overflow".to_owned()))?;
+
+    if now_ms > challenge.expires_at {
+        return Err(ScpIdError::TimestampInvalid);
+    }
+
+    // Step 5: Resolve the DID document.
+    let did_result = resolver
+        .resolve(&response.did)
+        .await
+        .map_err(|e| ScpIdError::DidResolutionFailed(e.to_string()))?
+        .ok_or_else(|| {
+            ScpIdError::DidResolutionFailed(format!("DID not found: {}", response.did))
+        })?;
+
+    let doc = &did_result.document;
+
+    // Step 6: Extract public key from verification methods.
+    // The fragment in `signing_key_id` includes the `#` prefix (e.g., "#active").
+    // DID document verification method IDs are full URIs: "did:dht:z...#active".
+    let fragment = response.signing_key_id.as_fragment();
+    let expected_vm_id = format!("{}{fragment}", response.did);
+
+    let vm = doc
+        .verification_method
+        .iter()
+        .find(|vm| vm.id == expected_vm_id)
+        .ok_or(ScpIdError::KeyNotAuthorized)?;
+
+    let public_key_bytes = decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
+        ScpIdError::DidResolutionFailed(format!("failed to decode public key: {e}"))
+    })?;
+
+    // Step 7: Confirm signing_key_id is #active or #agent.
+    // The SigningKeyId enum is already constrained to these two variants at the
+    // type level, but we verify defensively for correctness.
+    match response.signing_key_id {
+        SigningKeyId::Active | SigningKeyId::Agent => {}
+    }
+
+    // Step 8: Confirm signing_key_id is in the authentication relationship.
+    // Authentication entries are full DID URI + fragment: "did:dht:z...#active".
+    if !doc.authentication.contains(&expected_vm_id) {
+        return Err(ScpIdError::KeyNotAuthorized);
+    }
+
+    // Step 9: Reconstruct the canonical hash (same construction as scpid_sign).
+    let hash = canonical_hash(
+        SCPID_DOMAIN_SEPARATOR,
+        &[
+            CanonicalField::VarBytes(response.did.as_bytes()),
+            CanonicalField::VarBytes(response.signing_key_id.as_fragment().as_bytes()),
+            CanonicalField::Fixed32(&response.nonce),
+            CanonicalField::VarBytes(response.audience.as_bytes()),
+            CanonicalField::U64(response.signed_at),
+        ],
+    );
+
+    // Step 10: Verify Ed25519 signature (strict mode — rejects small-order points).
+    verify_ed25519_signature(&public_key_bytes, &hash, &response.signature)
+        .map_err(|_| ScpIdError::SignatureInvalid)?;
+
+    // Step 11: All checks pass — return authenticated identity.
+    Ok(ScpIdAuthentication {
+        did: response.did.clone(),
+        signing_key_id: response.signing_key_id,
+        signed_at: response.signed_at,
     })
 }
 
@@ -787,6 +934,346 @@ mod tests {
         assert!(
             matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("DID must not be empty")),
             "expected InvalidInput with empty DID message, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // scpid_verify tests
+    // -----------------------------------------------------------------------
+
+    /// Test DID resolver that returns a pre-configured `DidDocument` wrapped
+    /// in a `ResolvedDidDocument`. Implements `scp_identity::resolver::DidResolver`.
+    struct TestDidResolver {
+        document: Option<scp_identity::document::DidDocument>,
+        /// When `true`, `resolve()` returns `Err(...)` instead of `Ok(...)`.
+        fail: bool,
+    }
+
+    impl TestDidResolver {
+        fn with_document(doc: scp_identity::document::DidDocument) -> Self {
+            Self {
+                document: Some(doc),
+                fail: false,
+            }
+        }
+
+        fn not_found() -> Self {
+            Self {
+                document: None,
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                document: None,
+                fail: true,
+            }
+        }
+    }
+
+    impl scp_identity::resolver::DidResolver for TestDidResolver {
+        fn resolve(
+            &self,
+            _did: &str,
+        ) -> impl Future<
+            Output = Result<
+                Option<scp_identity::resolver::ResolvedDidDocument>,
+                scp_identity::IdentityError,
+            >,
+        > + Send {
+            let result = if self.fail {
+                Err(scp_identity::IdentityError::DhtResolveFailed(
+                    "test resolver failure".to_owned(),
+                ))
+            } else {
+                Ok(self
+                    .document
+                    .clone()
+                    .map(|doc| scp_identity::resolver::ResolvedDidDocument {
+                        document: doc,
+                        seq: 1,
+                        source: scp_identity::resolver::ResolutionSource::Cache,
+                    }))
+            };
+            async move { result }
+        }
+    }
+
+    /// Helper: generates a keypair, signs an SCPID challenge, and returns the
+    /// response along with the public key bytes and DID document.
+    async fn sign_and_build_doc(
+        did: &str,
+        signing_key_id: SigningKeyId,
+        challenge: &ScpIdChallenge,
+    ) -> (ScpIdResponse, scp_identity::document::DidDocument) {
+        use scp_platform::KeyType;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&handle).await.unwrap();
+        let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+
+        let response = scpid_sign(&custody, &handle, did, signing_key_id, challenge)
+            .await
+            .unwrap();
+
+        // Build a DID document with the signing key in the correct VM slot.
+        let doc = match signing_key_id {
+            SigningKeyId::Active => scp_identity::document::DidDocument::new_with_agent_key(
+                did, &[0u8; 32], // identity key (not used for SCPID)
+                &pk_bytes, &[0u8; 32], // pre-rotation commitment (not used for SCPID)
+                None,
+            ),
+            SigningKeyId::Agent => scp_identity::document::DidDocument::new_with_agent_key(
+                did,
+                &[0u8; 32],
+                &[1u8; 32], // different active key
+                &[0u8; 32],
+                Some(&pk_bytes),
+            ),
+        };
+
+        (response, doc)
+    }
+
+    #[tokio::test]
+    async fn test_scpid_sign_then_verify_roundtrip_active() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let auth = scpid_verify(&resolver, &response, &challenge)
+            .await
+            .expect("verification should succeed");
+
+        assert_eq!(auth.did, did);
+        assert_eq!(auth.signing_key_id, SigningKeyId::Active);
+        assert_eq!(auth.signed_at, response.signed_at);
+    }
+
+    #[tokio::test]
+    async fn test_scpid_sign_then_verify_roundtrip_agent() {
+        let did = "did:dht:z6MkAgent";
+        let challenge =
+            scpid_challenge("https://agent-service.example.com", Duration::from_secs(60)).unwrap();
+        let (response, doc) = sign_and_build_doc(did, SigningKeyId::Agent, &challenge).await;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let auth = scpid_verify(&resolver, &response, &challenge)
+            .await
+            .expect("agent verification should succeed");
+
+        assert_eq!(auth.did, did);
+        assert_eq!(auth.signing_key_id, SigningKeyId::Agent);
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_nonce_mismatch() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Tamper with the nonce in the response.
+        response.nonce[0] ^= 0xFF;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::ChallengeExpired)),
+            "expected ChallengeExpired for nonce mismatch, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_audience_mismatch() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Tamper with the audience in the response.
+        response.audience = "https://evil.com".to_owned();
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::AudienceMismatch)),
+            "expected AudienceMismatch, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_expired_challenge() {
+        let did = "did:dht:z6MkTest";
+        // Use a short but sufficient TTL so sign can succeed before expiry.
+        let challenge = scpid_challenge("https://example.com", Duration::from_millis(50)).unwrap();
+        let (response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Wait for the challenge to expire.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::TimestampInvalid)),
+            "expected TimestampInvalid for expired challenge, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_signed_at_before_issued_at() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Set signed_at before issued_at.
+        response.signed_at = challenge.issued_at - 1;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::TimestampInvalid)),
+            "expected TimestampInvalid for signed_at < issued_at, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_signed_at_after_expires_at() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Set signed_at after expires_at.
+        response.signed_at = challenge.expires_at + 1;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::TimestampInvalid)),
+            "expected TimestampInvalid for signed_at > expires_at, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_did_not_found() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let resolver = TestDidResolver::not_found();
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::DidResolutionFailed(_))),
+            "expected DidResolutionFailed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_did_resolution_error() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let resolver = TestDidResolver::failing();
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::DidResolutionFailed(_))),
+            "expected DidResolutionFailed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_wrong_signing_key() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Build a DID document with a different key in the #active slot.
+        let wrong_doc = scp_identity::document::DidDocument::new_with_agent_key(
+            did,
+            &[0u8; 32],
+            &[99u8; 32], // different key — verification will fail
+            &[0u8; 32],
+            None,
+        );
+
+        let resolver = TestDidResolver::with_document(wrong_doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::SignatureInvalid)),
+            "expected SignatureInvalid for wrong key, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_invalid_signature() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Tamper with the signature.
+        response.signature[0] ^= 0xFF;
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::SignatureInvalid)),
+            "expected SignatureInvalid for tampered signature, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_key_not_in_authentication() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Remove #active from the authentication relationship.
+        doc.authentication.clear();
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::KeyNotAuthorized)),
+            "expected KeyNotAuthorized when key not in authentication, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_vm_not_found() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Remove all verification methods except #0.
+        doc.verification_method
+            .retain(|vm| !vm.id.ends_with("#active"));
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::KeyNotAuthorized)),
+            "expected KeyNotAuthorized when VM not found, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scpid_verify_wrong_protocol() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Mutate the protocol field directly (deserialization would reject it,
+        // but the field is pub so we can set it post-construction).
+        response.protocol = "scpid/2.0".to_owned();
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("unsupported protocol")),
+            "expected InvalidInput for wrong protocol version, got: {result:?}"
         );
     }
 }

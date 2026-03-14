@@ -22,5 +22,5 @@ pub use scp_identity::SigningKeyId;
 
 pub use scpid::{
     SCPID_DOMAIN_SEPARATOR, ScpIdAuthentication, ScpIdChallenge, ScpIdError, ScpIdResponse,
-    scpid_challenge, scpid_sign,
+    scpid_challenge, scpid_sign, scpid_verify,
 };
