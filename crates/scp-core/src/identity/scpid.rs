@@ -781,11 +781,9 @@ mod tests {
 
         let custody = InMemoryKeyCustody::new();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let challenge =
-            scpid_challenge("https://example.com", Duration::from_secs(60)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_secs(60)).unwrap();
 
-        let result =
-            scpid_sign(&custody, &handle, "", SigningKeyId::Active, &challenge).await;
+        let result = scpid_sign(&custody, &handle, "", SigningKeyId::Active, &challenge).await;
         assert!(
             matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("DID must not be empty")),
             "expected InvalidInput with empty DID message, got: {result:?}"
