@@ -113,32 +113,37 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// `context_create`) rather than silently auto-initializing with
 /// potentially invalid state.
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
-    CONTEXT_MANAGER.get().ok_or_else(|| crate::ScpError::Context {
-        message: "ContextManager not initialized — call context_create or \
+    CONTEXT_MANAGER
+        .get()
+        .ok_or_else(|| crate::ScpError::Context {
+            message: "ContextManager not initialized — call context_create or \
                   init_context_manager first"
-            .to_owned(),
-        code: "SCP-CTX-2000".to_owned(),
-    })
+                .to_owned(),
+            code: "SCP-CTX-2000".to_owned(),
+        })
 }
 
 /// Returns a reference to the shared `ContextManager` for infallible contexts.
 ///
 /// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
-/// Option, ()), this provides a fallback that logs an error and returns
-/// a default-initialized manager rather than panicking. Callers should
-/// prefer [`context_manager`] when the return type supports `Result`.
+/// Option, ()), this provides access to the manager without requiring a
+/// `Result` return type. Callers should prefer [`context_manager`] when the
+/// return type supports `Result`.
+///
+/// # Panics
+///
+/// Panics if the `ContextManager` has not been initialized via
+/// [`init_context_manager`] (called during `context_create`). This is
+/// intentional: silently auto-initializing with no-op providers contradicts
+/// issue #501's goal of eliminating silent degradation. The panic produces
+/// a clear error message that guides the caller to initialize first.
+#[allow(clippy::expect_used)]
 pub fn context_manager_or_init() -> &'static Arc<ContextManager> {
-    if let Some(mgr) = CONTEXT_MANAGER.get() {
-        return mgr;
-    }
-    tracing::warn!(
-        "context_manager_or_init: ContextManager not explicitly initialized — \
-         auto-initializing with default providers. Call context_create first."
-    );
-    init_context_manager();
-    CONTEXT_MANAGER
-        .get()
-        .unwrap_or_else(|| unreachable!("init_context_manager just set CONTEXT_MANAGER"))
+    CONTEXT_MANAGER.get().expect(
+        "ContextManager not initialized — call context_create() first. \
+             The manager must be explicitly initialized before querying \
+             context state (membership, broadcast, events, TTL).",
+    )
 }
 
 /// Initializes the global [`ContextManager`] with bridge-local providers.
