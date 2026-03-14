@@ -428,13 +428,8 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        let raw = try await executeFn(contextHandle, proposalJson)
+
+        let raw = try await executeFn(handle, proposalJson)
         return GovernanceActionResult(rawValue: raw) ?? .executed
     }
 }
@@ -466,13 +461,8 @@ public extension Context {
                 code: "SCP-CTX-2041"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await proposeFn(contextHandle, proposerDid, actionJson)
+
+        return try await proposeFn(handle, proposerDid, actionJson)
     }
 
     /// Casts an approval vote on a pending governance proposal.
@@ -496,13 +486,8 @@ public extension Context {
                 code: "SCP-CTX-2042"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await approveFn(contextHandle, voterDid, proposalIdHex)
+
+        return try await approveFn(handle, voterDid, proposalIdHex)
     }
 
     /// Casts a rejection vote on a pending governance proposal.
@@ -524,13 +509,8 @@ public extension Context {
                 code: "SCP-CTX-2043"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await rejectFn(contextHandle, voterDid, proposalIdHex)
+
+        return try await rejectFn(handle, voterDid, proposalIdHex)
     }
 
     /// Withdraws a previously cast vote on a pending governance proposal.
@@ -552,13 +532,8 @@ public extension Context {
                 code: "SCP-CTX-2044"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await withdrawFn(contextHandle, voterDid, proposalIdHex)
+
+        return try await withdrawFn(handle, voterDid, proposalIdHex)
     }
 
     /// Retrieves a governance proposal by hex-encoded ID.
@@ -578,13 +553,8 @@ public extension Context {
                 code: "SCP-CTX-2045"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await getProposalFn(contextHandle, proposalIdHex)
+
+        return try await getProposalFn(handle, proposalIdHex)
     }
 
     /// Lists all governance proposals for this context.
@@ -601,13 +571,8 @@ public extension Context {
                 code: "SCP-CTX-2046"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await listProposalsFn(contextHandle)
+
+        return try await listProposalsFn(handle)
     }
 }
 
@@ -625,13 +590,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await memberCountFn(contextHandle)
+
+        return try await memberCountFn(handle)
     }
 
     /// Checks whether a DID is a member of this context.
@@ -648,13 +608,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await isMemberFn(contextHandle, did)
+
+        return try await isMemberFn(handle, did)
     }
 
     /// Returns all member DIDs in this context.
@@ -668,13 +623,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await memberDidsFn(contextHandle)
+
+        return try await memberDidsFn(handle)
     }
 
     /// Returns the role of a member in this context.
@@ -691,13 +641,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        guard let raw = try await memberRoleFn(contextHandle, did) else {
+
+        guard let raw = try await memberRoleFn(handle, did) else {
             return nil
         }
         return MemberRole.fromBridge(raw)
@@ -721,13 +666,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await subscribeFn(contextHandle, subscriberDid)
+
+        try await subscribeFn(handle, subscriberDid)
     }
 
     /// Unsubscribes a DID from this broadcast context.
@@ -746,13 +686,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await unsubscribeFn(contextHandle, subscriberDid, rotateKeys)
+
+        try await unsubscribeFn(handle, subscriberDid, rotateKeys)
     }
 
     /// Publishes a message to this broadcast context.
@@ -771,13 +706,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await publishFn(contextHandle, identity, payload)
+
+        try await publishFn(handle, identity, payload)
     }
 
     /// Blocks a subscriber's read access in this broadcast context.
@@ -796,13 +726,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await blockSubscriberFn(contextHandle, subscriberDid, blockerDid)
+
+        try await blockSubscriberFn(handle, subscriberDid, blockerDid)
     }
 
     /// Unblocks a previously blocked subscriber in this broadcast context (§9.16.8).
@@ -824,13 +749,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await unblockSubscriberFn(contextHandle, subscriberDid, unblockerDid)
+
+        try await unblockSubscriberFn(handle, subscriberDid, unblockerDid)
     }
 
     /// Handles a broadcast key request from a subscriber.
@@ -850,13 +770,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await handleKeyRequestFn(contextHandle, authorDid, requesterDid)
+
+        return try await handleKeyRequestFn(handle, authorDid, requesterDid)
     }
 
     /// Returns the number of broadcast subscribers for this context.
@@ -871,13 +786,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await subscriberCountFn(contextHandle)
+
+        return try await subscriberCountFn(handle)
     }
 
     /// Checks whether a DID is a broadcast subscriber.
@@ -894,13 +804,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await isSubscriberFn(contextHandle, did)
+
+        return try await isSubscriberFn(handle, did)
     }
 
     /// Returns the broadcast admission policy for this context.
@@ -914,13 +819,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await admissionFn(contextHandle)
+
+        return try await admissionFn(handle)
     }
 }
 
@@ -942,13 +842,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await drainEventsFn(contextHandle)
+
+        return try await drainEventsFn(handle)
     }
 
     /// Handles TTL expiry for this context.
@@ -965,13 +860,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await handleTtlExpiryFn(contextHandle)
+
+        try await handleTtlExpiryFn(handle)
         state = .expired
     }
 
@@ -997,13 +887,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await proposeTtlExtensionFn(contextHandle, memberDid, proposedSeconds)
+
+        return try await proposeTtlExtensionFn(handle, memberDid, proposedSeconds)
     }
 
     /// Resets the TTL timer after a successful unanimous extension.
@@ -1024,13 +909,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await resetTtlTimerFn(contextHandle, newSeconds)
+
+        try await resetTtlTimerFn(handle, newSeconds)
     }
 
     /// Exports this context's full state as serialized bytes.
@@ -1048,13 +928,8 @@ public extension Context {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await exportFn(contextHandle)
+
+        return try await exportFn(handle)
     }
 }
 
