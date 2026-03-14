@@ -139,8 +139,8 @@ public enum ContextBridge {
 /// `MessageListenerAdapter` writes the error from the Rust callback thread;
 /// the `Context` actor reads it from its own isolation domain. `NSLock`
 /// provides the cross-isolation synchronization. This is `@unchecked Sendable`
-/// because access is guarded by the lock — see `.docs/standards/swift.md` for
-/// the UniFFI callback exception.
+/// because access is guarded by the lock — see `.docs/adrs/phase-5.md`
+/// §ADR-026 acceptance criterion 11.
 private final class SharedError: @unchecked Sendable {
     private var error: ScpError?
     private let lock = NSLock()
@@ -156,6 +156,12 @@ private final class SharedError: @unchecked Sendable {
         defer { lock.unlock() }
         return error
     }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        error = nil
+    }
 }
 
 // MARK: - MessageListenerAdapter
@@ -170,8 +176,8 @@ private final class SharedError: @unchecked Sendable {
 /// Note: This class uses `@unchecked Sendable` because it is accessed from the
 /// Rust callback thread (via UniFFI) and the actor-isolated stream consumer.
 /// The `AsyncStream.Continuation` it wraps is itself thread-safe (documented
-/// by Apple as safe to call from any context). See `.docs/standards/swift.md`
-/// for the UniFFI callback exception to the `@unchecked Sendable` prohibition.
+/// by Apple as safe to call from any context). See `.docs/adrs/phase-5.md`
+/// §ADR-026 acceptance criterion 11.
 ///
 /// See ADR-026 §`MessageListenerAdapter` for the design.
 private final class MessageListenerAdapter: MessageListener, @unchecked Sendable {
@@ -535,6 +541,7 @@ public actor Context {
                 )
             }
 
+            streamError.reset()
             let (stream, continuation) = AsyncStream<Message>.makeStream()
             streamContinuation = continuation
             continuation.onTermination = { [weak self] _ in
