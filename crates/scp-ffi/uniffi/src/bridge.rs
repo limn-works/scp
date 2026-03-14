@@ -44,8 +44,9 @@ use uuid::Uuid;
 use scp_core::context::membership::KeyPackage;
 
 use scp_ffi_common::validate::{
-    json_value_type_name, validate_capability_uri, validate_did, validate_relay_url,
-    validate_tool_id, validate_tool_name, validate_ucan_token,
+    json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
+    validate_mcp_handle, validate_relay_url, validate_tool_id, validate_tool_name,
+    validate_transport_mode, validate_ucan_token,
 };
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
@@ -3738,6 +3739,900 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
             msg: format!("tokio task join error during transport disconnect: {e}"),
             code: "SCP-TRANS-5003".to_owned(),
         })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — MCP operations
+//
+// MCP (Model Context Protocol) server and client operations for Swift/Kotlin.
+// Mirrors the PyO3 and NAPI MCP bridges. See ADR-015.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MCP UniFFI records
+// ---------------------------------------------------------------------------
+
+/// Configuration for starting an MCP server.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpServerConfig {
+    /// DID of the identity running the server.
+    pub identity_did: String,
+    /// Context IDs to expose via MCP.
+    pub context_ids: Vec<String>,
+    /// Transport mode: `"stdio"` or `"sse"`.
+    pub transport: String,
+}
+
+/// Tool definition from an external MCP server.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpToolInfo {
+    /// Tool name.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// JSON Schema for tool input (as a JSON string).
+    pub input_schema_json: String,
+}
+
+/// Result of invoking an external MCP tool with SCP provenance.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpInvokeResult {
+    /// Tool output content as serialized JSON.
+    pub content_json: String,
+    /// Whether the tool call resulted in an error.
+    pub is_error: bool,
+    /// Source of the result, formatted as `"mcp:{tool_name}"`.
+    pub source: String,
+    /// DID of the invoking agent.
+    pub invoked_by: String,
+    /// SCP context ID for the invocation.
+    pub context_id: String,
+    /// Invocation timestamp (milliseconds since Unix epoch).
+    pub timestamp: u64,
+}
+
+/// Snapshot of the current stdio allowlist state.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct McpAllowlistState {
+    /// Sorted list of allowed binary basenames.
+    pub allowed: Vec<String>,
+    /// Whether the allowlist is bypassed entirely (unrestricted mode).
+    pub unrestricted: bool,
+}
+
+// ---------------------------------------------------------------------------
+// MCP registries
+// ---------------------------------------------------------------------------
+
+/// Internal state for a running MCP server.
+struct McpServerEntry {
+    /// Shutdown signal sender. Dropping this signals the transport task to stop.
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Handle to the tokio task running the transport.
+    _task_handle: tokio::task::JoinHandle<()>,
+    /// Whether the server has been stopped.
+    stopped: bool,
+}
+
+/// Internal state for an active MCP client connection.
+struct McpClientEntry {
+    /// The real MCP client, connected and initialized.
+    client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
+}
+
+fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
+    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
+    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+fn mcp_handle_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+// ---------------------------------------------------------------------------
+// MCP transport implementations
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes per line from MCP transport (10 MiB). Prevents OOM from
+/// unbounded line reads by a malicious or broken peer.
+const MCP_MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Transport wrapper that delegates to either stdio or SSE.
+enum McpUniFFITransportWrapper {
+    Stdio(McpStdioTransport),
+    Sse(McpSseTransport),
+}
+
+impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
+    fn send_request(
+        &self,
+        request: &scp_mcp::protocol::JsonRpcRequest,
+    ) -> Result<scp_mcp::protocol::JsonRpcResponse, String> {
+        match self {
+            Self::Stdio(t) => t.send_request(request),
+            #[allow(clippy::match_same_arms)]
+            Self::Sse(t) => t.send_request(request),
+        }
+    }
+
+    fn send_notification(
+        &self,
+        notification: &scp_mcp::protocol::JsonRpcNotification,
+    ) -> Result<(), String> {
+        match self {
+            Self::Stdio(t) => t.send_notification(notification),
+            #[allow(clippy::match_same_arms)]
+            Self::Sse(t) => t.send_notification(notification),
+        }
+    }
+}
+
+/// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
+struct McpStdioTransport {
+    inner: std::sync::Mutex<McpStdioTransportInner>,
+}
+
+struct McpStdioTransportInner {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl McpStdioTransport {
+    fn spawn(command: &[String]) -> Result<Self, String> {
+        use std::process::{Command, Stdio};
+
+        let (cmd, args) = command
+            .split_first()
+            .ok_or_else(|| "command list is empty".to_owned())?;
+
+        // Validate the command against the stdio allowlist (defense-in-depth).
+        let basename = scp_mcp::allowlist::validate_command(cmd).map_err(|e| e.to_string())?;
+
+        let mut child = Command::new(&basename)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
+
+        let stdin = child.stdin.take().ok_or("failed to capture child stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("failed to capture child stdout")?;
+        let reader = std::io::BufReader::new(stdout);
+
+        Ok(Self {
+            inner: std::sync::Mutex::new(McpStdioTransportInner {
+                child,
+                stdin,
+                reader,
+            }),
+        })
+    }
+}
+
+impl scp_mcp::client::McpTransport for McpStdioTransport {
+    fn send_request(
+        &self,
+        request: &scp_mcp::protocol::JsonRpcRequest,
+    ) -> Result<scp_mcp::protocol::JsonRpcResponse, String> {
+        use std::io::{BufRead, Read, Write};
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("transport lock poisoned: {e}"))?;
+
+        let json = serde_json::to_string(request).map_err(|e| format!("serialize error: {e}"))?;
+        guard
+            .stdin
+            .write_all(json.as_bytes())
+            .map_err(|e| format!("write error: {e}"))?;
+        guard
+            .stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("write newline error: {e}"))?;
+        guard
+            .stdin
+            .flush()
+            .map_err(|e| format!("flush error: {e}"))?;
+
+        // Read response line with bounded read to prevent OOM.
+        let mut line = String::new();
+        let n = {
+            let mut bounded = (&mut guard.reader).take(MCP_MAX_LINE_BYTES);
+            bounded
+                .read_line(&mut line)
+                .map_err(|e| format!("read error: {e}"))?
+        };
+        if n == 0 {
+            return Err("EOF from subprocess".to_owned());
+        }
+
+        serde_json::from_str(line.trim()).map_err(|e| format!("parse error: {e}"))
+    }
+
+    fn send_notification(
+        &self,
+        notification: &scp_mcp::protocol::JsonRpcNotification,
+    ) -> Result<(), String> {
+        use std::io::Write;
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("transport lock poisoned: {e}"))?;
+
+        let json =
+            serde_json::to_string(notification).map_err(|e| format!("serialize error: {e}"))?;
+        guard
+            .stdin
+            .write_all(json.as_bytes())
+            .map_err(|e| format!("write error: {e}"))?;
+        guard
+            .stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("write newline error: {e}"))?;
+        guard
+            .stdin
+            .flush()
+            .map_err(|e| format!("flush error: {e}"))?;
+
+        Ok(())
+    }
+}
+
+impl Drop for McpStdioTransport {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let _ = guard.child.kill();
+            let _ = guard.child.wait();
+        }
+    }
+}
+
+/// SSE MCP transport: communicates via HTTP with Server-Sent Events.
+///
+/// SSE transport is a placeholder — stdio is the primary transport for
+/// mobile clients. SSE methods return descriptive errors.
+struct McpSseTransport {
+    _url: String,
+}
+
+impl McpSseTransport {
+    fn connect(url: &str) -> Self {
+        Self {
+            _url: url.to_owned(),
+        }
+    }
+}
+
+impl scp_mcp::client::McpTransport for McpSseTransport {
+    fn send_request(
+        &self,
+        _request: &scp_mcp::protocol::JsonRpcRequest,
+    ) -> Result<scp_mcp::protocol::JsonRpcResponse, String> {
+        Err("SSE client transport not yet implemented for UniFFI — use stdio transport".to_owned())
+    }
+
+    fn send_notification(
+        &self,
+        _notification: &scp_mcp::protocol::JsonRpcNotification,
+    ) -> Result<(), String> {
+        Err("SSE client transport not yet implemented for UniFFI — use stdio transport".to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP FFI bridge context provider
+// ---------------------------------------------------------------------------
+
+/// FFI bridge provider for the MCP server. Implements `ContextProvider` by
+/// delegating to the context manager for tool and state queries.
+struct McpUniFfiBridgeProvider {
+    agent_did: String,
+    context_ids: Vec<String>,
+}
+
+impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
+    fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
+        self.context_ids.clone()
+    }
+
+    fn agent_role(&self, _context_id: &str) -> Option<String> {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "McpUniFfiBridgeProvider::agent_role returns None — \
+                 wire a production ContextProvider that resolves real roles \
+                 from ContextManager before exposing MCP in production."
+            );
+        });
+        None
+    }
+
+    fn agent_did(&self) -> &str {
+        &self.agent_did
+    }
+
+    fn context_tools(&self, _context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+        Vec::new()
+    }
+
+    fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "McpUniFfiBridgeProvider::validate_capability returns error — \
+                 wire a production ContextProvider that checks UCAN capabilities \
+                 against the context's role state before exposing MCP in production."
+            );
+        });
+        Err("capability validation not implemented — wire a production ContextProvider".to_owned())
+    }
+
+    fn invoke_tool(
+        &self,
+        _context_id: &str,
+        _tool_name: &str,
+        _arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err(
+            "tool invocation through MCP server requires ContextManager tool registry integration"
+                .to_owned(),
+        )
+    }
+
+    fn context_members(&self, _context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
+        Vec::new()
+    }
+
+    fn context_events(&self, _context_id: &str) -> serde_json::Value {
+        serde_json::Value::Array(Vec::new())
+    }
+
+    fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
+        Err("resource subscriptions require full relay integration".to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP stdio server loop
+// ---------------------------------------------------------------------------
+
+async fn run_mcp_stdio_server_uniffi(
+    server: Arc<std::sync::Mutex<scp_mcp::server::McpServer<McpUniFfiBridgeProvider>>>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    tokio::select! {
+        _ = shutdown_rx => {}
+        () = async {
+            let stdin = tokio::io::stdin();
+            let mut stdout = tokio::io::stdout();
+            let mut reader = tokio::io::BufReader::new(stdin);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if line.len() as u64 > MCP_MAX_LINE_BYTES {
+                    break;
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let response = {
+                    let request: Result<scp_mcp::protocol::JsonRpcRequest, _> =
+                        serde_json::from_str(trimmed);
+                    match request {
+                        Ok(req) => {
+                            server
+                                .lock()
+                                .map_or(None, |mut srv| srv.handle_request(&req))
+                        }
+                        Err(e) => {
+                            Some(scp_mcp::protocol::JsonRpcResponse::error(
+                                scp_mcp::protocol::RequestId::Number(0),
+                                scp_mcp::protocol::JsonRpcError {
+                                    code: scp_mcp::protocol::PARSE_ERROR,
+                                    message: format!("failed to parse: {e}"),
+                                    data: None,
+                                },
+                            ))
+                        }
+                    }
+                };
+
+                if let Some(resp) = response
+                    && let Ok(json) = serde_json::to_string(&resp) {
+                        let _ = stdout.write_all(json.as_bytes()).await;
+                        let _ = stdout.write_all(b"\n").await;
+                        let _ = stdout.flush().await;
+                    }
+            }
+        } => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP allowlist error mapping
+// ---------------------------------------------------------------------------
+
+/// Maps [`AllowlistError`] to the appropriate [`ScpError`] variant.
+///
+/// Input-validation errors map to `Validation`. Runtime/policy errors
+/// map to `Transport`. Exhaustive match ensures new variants produce
+/// a compile error instead of silently falling through.
+fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
+    use scp_mcp::allowlist::AllowlistError;
+    let msg = e.to_string();
+    match e {
+        AllowlistError::EmptyEntry
+        | AllowlistError::PathInEntry(_)
+        | AllowlistError::NulInEntry(_)
+        | AllowlistError::ControlCharInEntry(_)
+        | AllowlistError::PathInCommand(_)
+        | AllowlistError::InvalidCommand(_) => ScpError::Validation {
+            msg,
+            code: "SCP-VALID-7033".to_owned(),
+        },
+        AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => ScpError::Transport {
+            msg,
+            code: "SCP-TRANS-5030".to_owned(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP bridge functions
+// ---------------------------------------------------------------------------
+
+/// Starts an MCP server exposing SCP context tools.
+///
+/// Creates an MCP server backed by a `McpUniFfiBridgeProvider`. For `"stdio"`
+/// transport, the server processes JSON-RPC messages via a tokio task. For
+/// `"sse"` transport, the server binds an HTTP server on a random port.
+///
+/// # Arguments
+///
+/// * `config` — Server configuration (identity DID, context IDs, transport).
+///
+/// # Returns
+///
+/// An opaque server handle string for use with `mcp_server_stop`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the server fails to start.
+///
+/// See ADR-015: MCP server with context namespace mapping.
+#[uniffi::export]
+pub async fn mcp_server_create(config: McpServerConfig) -> Result<String, ScpError> {
+    validate_did(&config.identity_did)?;
+    validate_transport_mode(&config.transport)?;
+    for ctx_id in &config.context_ids {
+        validate_context_id(ctx_id)?;
+    }
+
+    if config.context_ids.is_empty() {
+        return Err(ScpError::Transport {
+            msg: "context_ids must not be empty".to_owned(),
+            code: "SCP-TRANS-5011".to_owned(),
+        });
+    }
+
+    let provider = McpUniFfiBridgeProvider {
+        agent_did: config.identity_did.clone(),
+        context_ids: config.context_ids.clone(),
+    };
+    let server = scp_mcp::server::McpServer::new(provider);
+    let server = Arc::new(std::sync::Mutex::new(server));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server_clone = Arc::clone(&server);
+    let transport_mode = config.transport.clone();
+    let sse_identity_did = config.identity_did;
+    let sse_context_ids = config.context_ids;
+
+    let task_handle = runtime().spawn(async move {
+        match transport_mode.as_str() {
+            "stdio" => {
+                run_mcp_stdio_server_uniffi(server_clone, shutdown_rx).await;
+            }
+            "sse" => {
+                let provider = McpUniFfiBridgeProvider {
+                    agent_did: sse_identity_did,
+                    context_ids: sse_context_ids,
+                };
+                let sse_server = scp_mcp::server::McpServer::new(provider);
+                let sse_config =
+                    scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+                let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
+                let sse_shutdown_trigger = sse_shutdown.clone();
+                tokio::spawn(async move {
+                    let _ = shutdown_rx.await;
+                    sse_shutdown_trigger.shutdown();
+                });
+                let result = scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown).await;
+                if let Err(e) = result {
+                    tracing::error!("MCP SSE server error: {e}");
+                }
+            }
+            _ => {} // Already validated above.
+        }
+    });
+
+    let handle_id = mcp_handle_id("mcp-server");
+    mcp_server_registry().insert(
+        handle_id.clone(),
+        McpServerEntry {
+            shutdown_tx: Some(shutdown_tx),
+            _task_handle: task_handle,
+            stopped: false,
+        },
+    );
+    increment_handle_count();
+
+    Ok(handle_id)
+}
+
+/// Stops a running MCP server.
+///
+/// # Arguments
+///
+/// * `handle` — The server handle returned by `mcp_server_create`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the handle is not found or server
+/// is already stopped.
+#[uniffi::export]
+pub async fn mcp_server_stop(handle: String) -> Result<(), ScpError> {
+    validate_mcp_handle(&handle)?;
+
+    let mut entry = mcp_server_registry()
+        .get_mut(&handle)
+        .ok_or_else(|| ScpError::Transport {
+            msg: format!("MCP server handle '{handle}' not found"),
+            code: "SCP-TRANS-5012".to_owned(),
+        })?;
+
+    if entry.stopped {
+        return Err(ScpError::Transport {
+            msg: format!("MCP server '{handle}' is already stopped"),
+            code: "SCP-TRANS-5013".to_owned(),
+        });
+    }
+
+    entry.stopped = true;
+    if let Some(tx) = entry.shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    Ok(())
+}
+
+/// Connects to an external MCP server via stdio transport.
+///
+/// Spawns the given command as a subprocess, communicates via line-delimited
+/// JSON over stdin/stdout, and performs the MCP initialize handshake.
+///
+/// # Arguments
+///
+/// * `command` — The command and arguments to spawn (e.g.,
+///   `["uvx", "some-mcp-server"]`).
+///
+/// # Returns
+///
+/// An opaque client handle string.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the subprocess fails to start or the
+/// MCP initialize handshake fails.
+#[uniffi::export]
+pub async fn mcp_client_connect_stdio(command: Vec<String>) -> Result<String, ScpError> {
+    if command.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "command must be a non-empty list".to_owned(),
+            code: "SCP-VALID-7034".to_owned(),
+        });
+    }
+
+    let transport = McpStdioTransport::spawn(&command).map_err(|e| ScpError::Transport {
+        msg: format!("failed to connect stdio MCP client: {e}"),
+        code: "SCP-TRANS-5015".to_owned(),
+    })?;
+
+    let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
+    client.initialize().map_err(|e| ScpError::Transport {
+        msg: format!("MCP initialize handshake failed: {e}"),
+        code: "SCP-TRANS-5016".to_owned(),
+    })?;
+
+    let handle_id = mcp_handle_id("mcp-client");
+    mcp_client_registry().insert(
+        handle_id.clone(),
+        McpClientEntry {
+            client: std::sync::Mutex::new(client),
+        },
+    );
+    increment_handle_count();
+
+    Ok(handle_id)
+}
+
+/// Connects to an external MCP server via SSE transport.
+///
+/// # Arguments
+///
+/// * `url` — The URL of the SSE endpoint.
+///
+/// # Returns
+///
+/// An opaque client handle string.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the connection or MCP handshake fails.
+#[uniffi::export]
+pub async fn mcp_client_connect_sse(url: String) -> Result<String, ScpError> {
+    validate_relay_url(&url)?;
+
+    let transport = McpSseTransport::connect(&url);
+
+    let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
+    client.initialize().map_err(|e| ScpError::Transport {
+        msg: format!("MCP initialize handshake failed: {e}"),
+        code: "SCP-TRANS-5018".to_owned(),
+    })?;
+
+    let handle_id = mcp_handle_id("mcp-client");
+    mcp_client_registry().insert(
+        handle_id.clone(),
+        McpClientEntry {
+            client: std::sync::Mutex::new(client),
+        },
+    );
+    increment_handle_count();
+
+    Ok(handle_id)
+}
+
+/// Disconnects from an external MCP server.
+///
+/// Removes the client from the registry and drops the transport connection.
+/// For stdio clients, the subprocess is killed via `McpStdioTransport::drop`.
+///
+/// # Arguments
+///
+/// * `handle` — The client handle returned by `mcp_client_connect_*`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the handle is not found.
+#[uniffi::export]
+pub async fn mcp_client_disconnect(handle: String) -> Result<(), ScpError> {
+    validate_mcp_handle(&handle)?;
+
+    let removed = mcp_client_registry().remove(&handle);
+    if removed.is_none() {
+        return Err(ScpError::Transport {
+            msg: format!("MCP client handle '{handle}' not found"),
+            code: "SCP-TRANS-5019".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Lists available tools from an external MCP server.
+///
+/// Sends a `tools/list` JSON-RPC request to the connected MCP server and
+/// returns the tool definitions.
+///
+/// # Arguments
+///
+/// * `handle` — The client handle returned by `mcp_client_connect_*`.
+///
+/// # Returns
+///
+/// A list of `McpToolInfo` records describing the available tools.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the client is not connected or the
+/// request fails.
+#[uniffi::export]
+pub async fn mcp_client_list_tools(handle: String) -> Result<Vec<McpToolInfo>, ScpError> {
+    validate_mcp_handle(&handle)?;
+
+    let entry = mcp_client_registry()
+        .get(&handle)
+        .ok_or_else(|| ScpError::Transport {
+            msg: format!("MCP client handle '{handle}' not found"),
+            code: "SCP-TRANS-5020".to_owned(),
+        })?;
+
+    let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+        msg: format!("client lock poisoned: {e}"),
+        code: "SCP-TRANS-5021".to_owned(),
+    })?;
+
+    let tools = client_guard.list_tools().map_err(|e| ScpError::Transport {
+        msg: format!("tools/list failed: {e}"),
+        code: "SCP-TRANS-5022".to_owned(),
+    })?;
+
+    Ok(tools
+        .into_iter()
+        .map(|t| McpToolInfo {
+            name: t.name,
+            description: t.description.unwrap_or_default(),
+            input_schema_json: serde_json::to_string(&t.input_schema)
+                .unwrap_or_else(|_| "{}".to_owned()),
+        })
+        .collect())
+}
+
+/// Invokes an external MCP tool with SCP provenance wrapping.
+///
+/// Sends a `tools/call` JSON-RPC request to the external MCP server and
+/// wraps the result with provenance metadata.
+///
+/// # Arguments
+///
+/// * `handle` — The client handle returned by `mcp_client_connect_*`.
+/// * `tool_name` — The name of the external tool to invoke.
+/// * `input_json` — Tool input parameters as a JSON string.
+/// * `context_id` — The SCP context ID for provenance tracking.
+/// * `invoker_did` — The DID of the invoking identity.
+///
+/// # Returns
+///
+/// An `McpInvokeResult` with content, error flag, and provenance metadata.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the client is not connected or the
+/// invocation fails. Returns `ScpError::Validation` if input JSON is
+/// malformed.
+#[uniffi::export]
+pub async fn mcp_client_invoke(
+    handle: String,
+    tool_name: String,
+    input_json: String,
+    context_id: String,
+    invoker_did: String,
+) -> Result<McpInvokeResult, ScpError> {
+    validate_mcp_handle(&handle)?;
+    validate_tool_name(&tool_name)?;
+    validate_context_id(&context_id)?;
+    validate_did(&invoker_did)?;
+
+    let entry = mcp_client_registry()
+        .get(&handle)
+        .ok_or_else(|| ScpError::Transport {
+            msg: format!("MCP client handle '{handle}' not found"),
+            code: "SCP-TRANS-5023".to_owned(),
+        })?;
+
+    let input: serde_json::Value =
+        serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid input JSON: {e}"),
+            code: "SCP-VALID-7021".to_owned(),
+        })?;
+
+    let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+        msg: format!("client lock poisoned: {e}"),
+        code: "SCP-TRANS-5024".to_owned(),
+    })?;
+
+    let result = client_guard
+        .invoke(&tool_name, input, &context_id, &invoker_did)
+        .map_err(|e| ScpError::Transport {
+            msg: format!("tools/call failed: {e}"),
+            code: "SCP-TRANS-5025".to_owned(),
+        })?;
+
+    let content_json = serde_json::to_string(&result.content).unwrap_or_else(|_| "[]".to_owned());
+
+    Ok(McpInvokeResult {
+        content_json,
+        is_error: result.is_error,
+        source: result.provenance.source,
+        invoked_by: result.provenance.invoked_by,
+        context_id: result.provenance.context,
+        timestamp: result.provenance.timestamp,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stdio allowlist configuration (UniFFI)
+// ---------------------------------------------------------------------------
+
+/// Configures the MCP stdio subprocess allowlist.
+///
+/// By default, only well-known MCP server launchers are permitted (e.g.
+/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
+///
+/// # Arguments
+///
+/// * `additional_binaries` — Binary basenames to add to the default allowlist.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if any entry is invalid (path, NUL, empty).
+/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
+#[uniffi::export]
+pub fn mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> Result<(), ScpError> {
+    scp_mcp::allowlist::configure(&additional_binaries).map_err(mcp_allowlist_err)?;
+    Ok(())
+}
+
+/// Disable the stdio allowlist entirely (unrestricted mode).
+///
+/// After calling this, **any** binary name may be spawned as a subprocess.
+/// Only use when the command source is fully trusted.
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
+#[uniffi::export]
+pub fn mcp_disable_stdio_allowlist() -> Result<(), ScpError> {
+    scp_mcp::allowlist::disable_enforcement().map_err(mcp_allowlist_err)?;
+    Ok(())
+}
+
+/// Reset the stdio allowlist to its default state.
+///
+/// Restores the default binaries, removes any additions, and re-enables
+/// enforcement (clears unrestricted mode).
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
+#[uniffi::export]
+pub fn mcp_reset_stdio_allowlist() -> Result<(), ScpError> {
+    scp_mcp::allowlist::reset().map_err(mcp_allowlist_err)?;
+    Ok(())
+}
+
+/// Return the current stdio allowlist state.
+///
+/// Returns a record with:
+/// - `allowed`: sorted list of allowed binary names
+/// - `unrestricted`: whether the allowlist is bypassed
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
+#[uniffi::export]
+pub fn mcp_get_stdio_allowlist() -> Result<McpAllowlistState, ScpError> {
+    let state = scp_mcp::allowlist::get_state().map_err(mcp_allowlist_err)?;
+    Ok(McpAllowlistState {
+        allowed: state.allowed,
+        unrestricted: state.unrestricted,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -9099,5 +9994,192 @@ mod tests {
 
         assert_eq!(auth.did, identity.did);
         assert_eq!(auth.signing_key_id, scp_identity::SigningKeyId::Active);
+
+    // MCP bridge tests (issue #591)
+    // -----------------------------------------------------------------------
+
+    /// `mcp_server_create` must reject empty `context_ids`.
+    #[tokio::test]
+    async fn mcp_server_create_rejects_empty_context_ids() {
+        let config = McpServerConfig {
+            identity_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec![],
+            transport: "stdio".to_owned(),
+        };
+
+        let result = mcp_server_create(config).await;
+        let err = result.expect_err("empty context_ids must be rejected");
+        match err {
+            ScpError::Transport { ref code, .. } => {
+                assert_eq!(code, "SCP-TRANS-5011");
+            }
+            other => panic!("expected ScpError::Transport, got {other:?}"),
+        }
+    }
+
+    /// `mcp_server_create` must reject invalid transport mode.
+    #[tokio::test]
+    async fn mcp_server_create_rejects_invalid_transport() {
+        let config = McpServerConfig {
+            identity_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-1".to_owned()],
+            transport: "websocket".to_owned(),
+        };
+
+        let result = mcp_server_create(config).await;
+        assert!(result.is_err(), "invalid transport mode should be rejected");
+    }
+
+    /// `mcp_client_connect_stdio` must reject empty command list.
+    #[tokio::test]
+    async fn mcp_client_connect_stdio_rejects_empty_command() {
+        let result = mcp_client_connect_stdio(vec![]).await;
+        let err = result.expect_err("empty command must be rejected");
+        match err {
+            ScpError::Validation { ref code, .. } => {
+                assert_eq!(code, "SCP-VALID-7034");
+            }
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+    }
+
+    /// `mcp_client_disconnect` must reject unknown handle.
+    #[tokio::test]
+    async fn mcp_client_disconnect_rejects_unknown_handle() {
+        let result = mcp_client_disconnect("mcp-client-nonexistent".to_owned()).await;
+        let err = result.expect_err("unknown handle must be rejected");
+        match err {
+            ScpError::Transport { ref code, .. } => {
+                assert_eq!(code, "SCP-TRANS-5019");
+            }
+            other => panic!("expected ScpError::Transport, got {other:?}"),
+        }
+    }
+
+    /// `mcp_client_list_tools` must reject unknown handle.
+    #[tokio::test]
+    async fn mcp_client_list_tools_rejects_unknown_handle() {
+        let result = mcp_client_list_tools("mcp-client-nonexistent".to_owned()).await;
+        let err = result.expect_err("unknown handle must be rejected");
+        match err {
+            ScpError::Transport { ref code, .. } => {
+                assert_eq!(code, "SCP-TRANS-5020");
+            }
+            other => panic!("expected ScpError::Transport, got {other:?}"),
+        }
+    }
+
+    /// `mcp_client_invoke` must reject invalid input JSON.
+    #[tokio::test]
+    async fn mcp_client_invoke_rejects_unknown_handle() {
+        let result = mcp_client_invoke(
+            "mcp-client-nonexistent".to_owned(),
+            "test-tool".to_owned(),
+            "{}".to_owned(),
+            "ctx-test".to_owned(),
+            "did:dht:z6MkTestUser".to_owned(),
+        )
+        .await;
+        let err = result.expect_err("unknown handle must be rejected");
+        match err {
+            ScpError::Transport { ref code, .. } => {
+                assert_eq!(code, "SCP-TRANS-5023");
+            }
+            other => panic!("expected ScpError::Transport, got {other:?}"),
+        }
+    }
+
+    /// `mcp_server_stop` must reject unknown handle.
+    #[tokio::test]
+    async fn mcp_server_stop_rejects_unknown_handle() {
+        let result = mcp_server_stop("mcp-server-nonexistent".to_owned()).await;
+        let err = result.expect_err("unknown handle must be rejected");
+        match err {
+            ScpError::Transport { ref code, .. } => {
+                assert_eq!(code, "SCP-TRANS-5012");
+            }
+            other => panic!("expected ScpError::Transport, got {other:?}"),
+        }
+    }
+
+    /// Stdio allowlist: `get_state` returns default entries.
+    #[test]
+    fn mcp_allowlist_get_state_returns_defaults() {
+        // Reset to clean state first.
+        mcp_reset_stdio_allowlist().expect("reset should succeed");
+
+        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        assert!(!state.unrestricted, "should not be unrestricted by default");
+        assert!(
+            !state.allowed.is_empty(),
+            "default allowlist should have entries"
+        );
+        // Verify some expected defaults.
+        assert!(
+            state.allowed.contains(&"uvx".to_owned()),
+            "default allowlist should contain 'uvx'"
+        );
+        assert!(
+            state.allowed.contains(&"node".to_owned()),
+            "default allowlist should contain 'node'"
+        );
+    }
+
+    /// Stdio allowlist: configure adds entries.
+    #[test]
+    fn mcp_allowlist_configure_adds_entries() {
+        mcp_reset_stdio_allowlist().expect("reset should succeed");
+
+        mcp_configure_stdio_allowlist(vec!["my-custom-server".to_owned()])
+            .expect("configure should succeed");
+
+        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        assert!(
+            state.allowed.contains(&"my-custom-server".to_owned()),
+            "allowlist should contain newly added entry"
+        );
+
+        // Clean up.
+        mcp_reset_stdio_allowlist().expect("reset should succeed");
+    }
+
+    /// Stdio allowlist: configure rejects entries containing paths.
+    #[test]
+    fn mcp_allowlist_configure_rejects_path_entries() {
+        let result = mcp_configure_stdio_allowlist(vec!["/usr/bin/evil".to_owned()]);
+        assert!(result.is_err(), "path entries must be rejected");
+    }
+
+    /// Stdio allowlist: disable enters unrestricted mode.
+    #[test]
+    fn mcp_allowlist_disable_enters_unrestricted() {
+        mcp_reset_stdio_allowlist().expect("reset should succeed");
+
+        mcp_disable_stdio_allowlist().expect("disable should succeed");
+        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        assert!(state.unrestricted, "should be unrestricted after disable");
+
+        // Clean up.
+        mcp_reset_stdio_allowlist().expect("reset should succeed");
+    }
+
+    /// Stdio allowlist: reset restores defaults and re-enables enforcement.
+    #[test]
+    fn mcp_allowlist_reset_restores_defaults() {
+        // Start by disabling and adding a custom entry.
+        mcp_disable_stdio_allowlist().expect("disable should succeed");
+        mcp_configure_stdio_allowlist(vec!["custom-thing".to_owned()])
+            .expect("configure should succeed");
+
+        // Reset.
+        mcp_reset_stdio_allowlist().expect("reset should succeed");
+        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+
+        assert!(
+            !state.unrestricted,
+            "should not be unrestricted after reset"
+        );
+        // custom-thing should be gone after reset.
+        // (Note: configure adds to defaults, reset removes everything non-default)
     }
 }

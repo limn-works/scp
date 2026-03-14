@@ -5096,6 +5096,7 @@ dependencies = [
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
+ "scp-mcp",
  "scp-platform",
  "scp-transport",
  "serde_json",
