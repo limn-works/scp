@@ -119,7 +119,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
 
 ```
 IdentityLinkAttestation {
-  id:           String,          // SHA-256(issuer_did || platform || platform_handle || created_at), hex-encoded
+  id:           String,          // Deterministic ID (see below), hex-encoded
   type:         "identity_link",
   issuer:       DID,             // The DID claiming the external identity
   subject:      DID,             // Same as issuer (self-attestation)
@@ -146,6 +146,20 @@ IdentityLinkAttestation {
 ```
 
 **Signature scope:** The signature covers `MessagePack_canonical(id, type, issuer, subject, issued_at, expires_at, claim, evidence, revocation)` where `MessagePack_canonical` uses sorted-key encoding (keys in lexicographic order within each map) per §17.1. The signature is computed using the issuer's Active Signing Key (`#active`) or Agent Signing Key (`#agent`).
+
+**Attestation ID construction:** The `id` field is a deterministic, hex-encoded SHA-256 hash derived from the attestation's identifying fields using the canonical hash construction (§9.5.1). The domain separator `"SCP-ATTESTATION-ID-V1:"` prevents cross-protocol collision, and 4-byte big-endian length prefixes on variable-length fields prevent field boundary ambiguity (e.g., platform `"ab"` + handle `"cd"` vs platform `"a"` + handle `"bcd"`).
+
+```
+id = hex(SHA-256(
+  "SCP-ATTESTATION-ID-V1:"                          (22 bytes, no length prefix)
+  || BE32(len(issuer_did))  || issuer_did            (4 + N bytes)
+  || BE32(len(platform))    || platform              (4 + N bytes)
+  || BE32(len(platform_handle)) || platform_handle   (4 + N bytes)
+  || BE64(issued_at)                                 (8 bytes)
+))
+```
+
+The `issued_at` timestamp is encoded as 8-byte big-endian for deterministic cross-platform computation. See §25.16 (Vector 29) for a test vector.
 
 **Revocation check:** Verifiers check revocation by resolving the issuer's DID document and looking for an `AttestationRevocations` service endpoint (§18.2.2). The endpoint returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked.
 
