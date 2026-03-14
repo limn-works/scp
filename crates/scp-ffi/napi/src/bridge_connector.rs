@@ -163,7 +163,7 @@ pub fn bridge_register(
             <[u8; 32]>::try_from(k.as_slice()).map_err(|_| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                    code: "SCP-VALID-7012".to_owned(),
+                    code: "SCP-VALID-7052".to_owned(),
                 })
             })
         })
@@ -244,9 +244,9 @@ pub fn bridge_create_shadow(
     let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
     let (shadow, _event) = create_shadow(&mut shadow_registry, &mut sender_key_store, &params)
         .map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
+            napi::Error::from(ScpNapiError::Context {
                 message: format!("shadow creation failed: {e}"),
-                code: "SCP-VALID-7014".to_owned(),
+                code: "SCP-CTX-2102".to_owned(),
             })
         })?;
 
@@ -273,7 +273,7 @@ fn parse_bridge_mode(s: &str) -> napi::Result<BridgeMode> {
             message: format!(
                 "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
             ),
-            code: "SCP-VALID-7010".to_owned(),
+            code: "SCP-VALID-7050".to_owned(),
         }
         .into()),
     }
@@ -285,7 +285,7 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
         "claimed" => Ok(ShadowProvenanceStatus::Claimed),
         other => Err(ScpNapiError::Validation {
             message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-            code: "SCP-VALID-7011".to_owned(),
+            code: "SCP-VALID-7051".to_owned(),
         }
         .into()),
     }

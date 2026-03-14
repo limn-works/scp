@@ -173,7 +173,7 @@ impl BridgeMode {
                 message: format!(
                     "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
                 ),
-                code: "SCP-VALID-7010".to_owned(),
+                code: "SCP-VALID-7050".to_owned(),
             }),
         }
     }
@@ -204,7 +204,7 @@ impl ShadowProvenanceStatus {
             "claimed" => Ok(Self::Claimed),
             other => Err(ScpWasmError::Validation {
                 message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-                code: "SCP-VALID-7011".to_owned(),
+                code: "SCP-VALID-7051".to_owned(),
             }),
         }
     }
@@ -338,7 +338,7 @@ pub fn bridge_register(
     if context_id.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7012".to_owned(),
+            code: "SCP-VALID-7053".to_owned(),
         }
         .into_js());
     }
@@ -351,7 +351,7 @@ pub fn bridge_register(
     if platform.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform must not be empty".to_owned(),
-            code: "SCP-VALID-7012".to_owned(),
+            code: "SCP-VALID-7054".to_owned(),
         }
         .into_js());
     }
@@ -444,14 +444,14 @@ pub fn bridge_create_shadow(
     if bridge_id.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "bridge_id must not be empty".to_owned(),
-            code: "SCP-VALID-7014".to_owned(),
+            code: "SCP-VALID-7055".to_owned(),
         }
         .into_js());
     }
     if platform_handle.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform_handle must not be empty".to_owned(),
-            code: "SCP-VALID-7014".to_owned(),
+            code: "SCP-VALID-7056".to_owned(),
         }
         .into_js());
     }
