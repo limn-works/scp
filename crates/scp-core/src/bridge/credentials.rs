@@ -330,11 +330,10 @@ pub fn derive_credential_key(
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), bridge_credential_key);
     let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(info.as_bytes(), okm.as_mut()).map_err(|e| {
-        CredentialError::KeyDerivationError {
+    hk.expand(info.as_bytes(), okm.as_mut())
+        .map_err(|e| CredentialError::KeyDerivationError {
             reason: e.to_string(),
-        }
-    })?;
+        })?;
     Ok(okm)
 }
 
