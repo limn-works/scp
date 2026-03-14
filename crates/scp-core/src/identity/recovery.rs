@@ -745,20 +745,30 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                     "did_after": key_rotation.did_after.as_ref(),
                     "did_changed": key_rotation.did_changed,
                 });
-                if let Ok(payload_bytes) = serde_json::to_vec(&scoped_payload) {
-                    let notify_result =
-                        Self::block_on_async(self.manager.recovery_send_notification(
-                            context_id,
-                            key_rotation.did_after.as_ref(),
-                            &payload_bytes,
-                        ));
-                    // Notification failure is non-fatal — the epoch was
-                    // already advanced, which is the critical security step.
-                    if let Err(e) = notify_result {
+                match serde_json::to_vec(&scoped_payload) {
+                    Ok(payload_bytes) => {
+                        let notify_result =
+                            Self::block_on_async(self.manager.recovery_send_notification(
+                                context_id,
+                                key_rotation.did_after.as_ref(),
+                                &payload_bytes,
+                                0, // sequence 0: MLS epoch-advance notification
+                            ));
+                        // Notification failure is non-fatal — the epoch was
+                        // already advanced, which is the critical security step.
+                        if let Err(e) = notify_result {
+                            tracing::warn!(
+                                context_id = %context_id,
+                                error = %e,
+                                "failed to send scoped epoch-advance notification"
+                            );
+                        }
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             context_id = %context_id,
                             error = %e,
-                            "failed to send scoped epoch-advance notification"
+                            "failed to serialize epoch-advance notification payload, skipping notification"
                         );
                     }
                 }
@@ -817,6 +827,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             context_id,
             key_rotation.did_after.as_ref(),
             &revocation_payload,
+            1, // sequence 1: UCAN revocation notification
         ));
         match result {
             Ok(()) => Ok(()),
@@ -863,6 +874,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             context_id,
             sender_did,
             payload.as_bytes(),
+            2, // sequence 2: key-package rotation notification
         ));
         match result {
             Ok(()) => Ok(()),
@@ -1062,6 +1074,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             "identity-private-state",
             "system",
             &payload,
+            3, // sequence 3: PSK rotation notification
         ));
 
         result.is_ok()
