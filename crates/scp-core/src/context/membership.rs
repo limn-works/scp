@@ -498,6 +498,52 @@ pub enum ContextEvent {
         /// The MLS epoch at which the checkpoint should be taken.
         at_epoch: u64,
     },
+    /// A context migration has been proposed (§5.11A.3).
+    ///
+    /// All source context members receive this notification containing
+    /// the migration details. Members can evaluate the destination
+    /// parameters before accepting.
+    ContextMigrationProposed {
+        /// The destination context ID (created after approval).
+        destination_context_id: String,
+        /// The reason for migration.
+        reason: String,
+        /// Grace period duration in seconds.
+        grace_period_secs: u64,
+        /// Whether bulk auto-invites will be sent.
+        auto_invite: bool,
+        /// The governance proposal ID that authorized this migration.
+        proposal_id: [u8; 32],
+    },
+    /// The context migration grace period has started (§5.11A.4).
+    ///
+    /// The source context is now in read-only mode. Members should
+    /// join the destination context before the grace period expires.
+    ContextMigrationStarted {
+        /// The destination context ID.
+        destination_context_id: String,
+        /// Unix timestamp (seconds) when the grace period ends.
+        grace_period_end: u64,
+    },
+    /// A context migration was cancelled (§5.11A).
+    ///
+    /// The source context has returned to Active state. All migration
+    /// state has been cleared.
+    ContextMigrationCancelled {
+        /// The governance proposal ID of the original migration.
+        original_proposal_id: [u8; 32],
+    },
+    /// The context has been tombstoned after migration (§5.11A.5).
+    ///
+    /// The source context is permanently closed with a pointer to the
+    /// destination. Late-arriving members can discover the migration
+    /// destination from the tombstone record.
+    ContextTombstoned {
+        /// The destination context ID.
+        destination_context_id: String,
+        /// The governance proposal ID that authorized the migration.
+        migration_proposal_id: [u8; 32],
+    },
 }
 
 // ---------------------------------------------------------------------------

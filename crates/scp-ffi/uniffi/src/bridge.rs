@@ -4818,6 +4818,9 @@ pub async fn governance_execute(
                 GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
                 GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
                 GovernanceActionResult::Executed => "Executed",
+                GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
+                GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
+                GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
             };
             Ok::<_, ScpError>((result_str.to_owned(), action_name))
         })

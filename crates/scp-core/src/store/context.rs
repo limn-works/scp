@@ -1738,6 +1738,7 @@ mod tests {
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
+            migration_state: None,
         }
     }
 

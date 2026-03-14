@@ -1750,6 +1750,9 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
             GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
             GovernanceActionResult::Executed => "Executed",
+            GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
+            GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
+            GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
         };
         Ok(result_str.to_owned())
     })

@@ -742,6 +742,26 @@ pub enum GovernanceAction {
     /// The lock is itself immutable: once set, it cannot be reverted.
     /// Requires an economic policy to already be set on the context.
     LockEconomicPolicy,
+    /// Propose migrating this context to a new destination context (§5.11A).
+    ///
+    /// On approval, the source context enters a read-only grace period.
+    /// If `auto_invite` is true, the initiating admin sends bulk invitations
+    /// to all current members. Members accept or decline individually.
+    ProposeContextMigration {
+        /// Parameters for the destination context.
+        new_context_params: Box<ContextParams>,
+        /// Human-readable migration rationale.
+        reason: String,
+        /// Grace period duration in seconds. RECOMMENDED: 604,800 (7 days).
+        grace_period_secs: u64,
+        /// Whether to bulk-invite all current members to the destination.
+        auto_invite: bool,
+    },
+    /// Cancel an in-progress context migration (§5.11A).
+    ///
+    /// Only valid while the source context is in `MigratingOut` state
+    /// (during the grace period). Returns the context to `Active`.
+    CancelContextMigration,
 }
 
 impl GovernanceAction {
@@ -777,6 +797,8 @@ impl GovernanceAction {
             Self::SetEconomicPolicy { .. } => "SetEconomicPolicy",
             Self::ApproveSpend { .. } => "ApproveSpend",
             Self::LockEconomicPolicy => "LockEconomicPolicy",
+            Self::ProposeContextMigration { .. } => "ProposeContextMigration",
+            Self::CancelContextMigration => "CancelContextMigration",
         }
     }
 }

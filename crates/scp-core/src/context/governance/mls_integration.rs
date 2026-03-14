@@ -115,7 +115,9 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::ReconfigureGovernance { .. }
         | GovernanceAction::SetEconomicPolicy { .. }
         | GovernanceAction::ApproveSpend { .. }
-        | GovernanceAction::LockEconomicPolicy => MlsImpact::NoMlsChange,
+        | GovernanceAction::LockEconomicPolicy
+        | GovernanceAction::ProposeContextMigration { .. }
+        | GovernanceAction::CancelContextMigration => MlsImpact::NoMlsChange,
     }
 }
 

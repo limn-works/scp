@@ -88,6 +88,8 @@ const fn state_str(state: &ContextState) -> &'static str {
         ContextState::Closing => "closing",
         ContextState::Closed => "closed",
         ContextState::Expired => "expired",
+        ContextState::MigratingOut => "migrating_out",
+        ContextState::Tombstoned => "tombstoned",
     }
 }
 

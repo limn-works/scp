@@ -153,7 +153,11 @@ impl StandingChannelManager {
                 }
                 // Step 4: Peer has left or context ended -- fall through to
                 // create a new one.
-                ContextState::Closed | ContextState::Expired | ContextState::Closing => {
+                ContextState::Closed
+                | ContextState::Expired
+                | ContextState::Closing
+                | ContextState::MigratingOut
+                | ContextState::Tombstoned => {
                     // Will create a new channel below.
                 }
             }
