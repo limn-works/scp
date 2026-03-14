@@ -6208,59 +6208,30 @@ pub fn verify_participation_requirements(
 
 /// Sets the economic policy for a context (§19.3).
 ///
-/// Accepts the economic policy as a JSON string. Validates the JSON against
-/// the `EconomicPolicy` schema before storing. If the existing policy has
-/// `locked: true`, the mutation is rejected — matching the
-/// `ContextManager::execute_set_economic_policy` behaviour in scp-core.
+/// Rejects direct economic policy mutation — use governance flow instead
+/// (§19.3, #728).
 ///
-/// # Warning
-///
-/// This is a low-level FFI function that directly overwrites the economic
-/// policy. It does **not** go through governance — no event logging, no
-/// 24-hour notification period, no proposal flow. Governance enforcement
-/// is the SDK / application layer's responsibility.
+/// Economic policy changes MUST go through the governance proposal flow
+/// (`SetEconomicPolicy` action) to ensure event logging and the mandatory
+/// 24-hour notification period. Direct setters bypass these controls.
 ///
 /// # Errors
 ///
-/// - `ScpError::Validation` if the JSON is invalid or does not parse as
-///   `EconomicPolicy`.
-/// - `ScpError::Permission` if the existing economic policy is locked.
+/// Always returns `ScpError::Permission` directing the caller to use governance.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
 pub fn set_economic_policy(
     handle: Arc<ContextHandle>,
     policy_json: String,
 ) -> Result<(), ScpError> {
-    // Hold the mutex for the entire check-validate-store sequence to prevent
-    // TOCTOU races (another thread bypassing the lock between check and store).
-    let mut guard = handle
-        .economic_policy
-        .lock()
-        .map_err(|_| ScpError::Context {
-            msg: "economic_policy lock is poisoned".to_owned(),
-            code: "SCP-CTX-2012".to_owned(),
-        })?;
-
-    // Check whether the existing policy is locked (§19.3).
-    if let Some(ref existing_json) = *guard
-        && let Ok(existing) =
-            serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
-        && existing.locked
-    {
-        return Err(ScpError::Permission {
-            msg: "economic policy is locked and cannot be changed".to_owned(),
-            code: "SCP-CTX-2013".to_owned(),
-        });
-    }
-
-    let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(&policy_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("invalid economic policy JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
-        })?;
-
-    *guard = Some(policy_json);
-    Ok(())
+    let _ = (handle, policy_json);
+    Err(ScpError::Permission {
+        msg: "economic policy changes must go through governance \
+              (propose SetEconomicPolicy action). Direct mutation is \
+              not permitted — see spec §19.3"
+            .to_owned(),
+        code: "SCP-CTX-2013".to_owned(),
+    })
 }
 
 /// Returns the economic policy for a context as a JSON string, or `None`.
@@ -8066,48 +8037,26 @@ mod tests {
         }
     }
 
-    /// Roundtrip set / get for economic policy on the `UniFFI` `ContextHandle`.
+    /// Direct `set_economic_policy` always rejects — must use governance (#728).
     #[test]
-    fn set_get_economic_policy_roundtrip() {
+    fn set_economic_policy_always_rejects_requires_governance() {
         let handle = test_handle();
 
         // Initially None.
         let result = get_economic_policy(Arc::clone(&handle)).unwrap();
         assert!(result.is_none());
 
-        // Set valid policy.
+        // Direct set always rejects.
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
-        set_economic_policy(Arc::clone(&handle), json.to_owned()).unwrap();
+        let result = set_economic_policy(Arc::clone(&handle), json.to_owned());
+        assert!(
+            result.is_err(),
+            "direct set must be rejected — use governance"
+        );
 
-        let result = get_economic_policy(Arc::clone(&handle)).unwrap();
-        assert_eq!(result.as_deref(), Some(json));
-
-        // Invalid JSON is rejected.
-        let err = set_economic_policy(Arc::clone(&handle), "not json".to_owned());
-        assert!(err.is_err());
-
-        // Original policy unchanged after rejected set.
+        // Policy should remain None.
         let result = get_economic_policy(handle).unwrap();
-        assert_eq!(result.as_deref(), Some(json));
-    }
-
-    /// Verifies that setting economic policy on a locked policy is rejected.
-    #[test]
-    fn set_economic_policy_rejects_when_locked() {
-        let handle = test_handle();
-
-        // Set a locked policy.
-        let locked_json = r#"{"locked":true,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
-        set_economic_policy(Arc::clone(&handle), locked_json.to_owned()).unwrap();
-
-        // Attempting to overwrite should fail.
-        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
-        let result = set_economic_policy(Arc::clone(&handle), new_json.to_owned());
-        assert!(result.is_err());
-
-        // Locked policy should be unchanged.
-        let result = get_economic_policy(handle).unwrap();
-        assert_eq!(result.as_deref(), Some(locked_json));
+        assert!(result.is_none());
     }
 
     #[test]

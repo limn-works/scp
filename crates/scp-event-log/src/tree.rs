@@ -410,6 +410,7 @@ pub(crate) const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::MediaSessionEnded => 20,
         EventType::PaymentReceived => 21,
         EventType::EconomicPolicyChanged => 22,
+        EventType::EconomicPolicyApplied => 33,
         EventType::SpendingUcanGranted => 23,
         EventType::SpendingUcanRevoked => 24,
         // Governance event types (ADR-031 §8)
@@ -964,6 +965,7 @@ mod tests {
             EventType::MediaSessionEnded,
             EventType::PaymentReceived,
             EventType::EconomicPolicyChanged,
+            EventType::EconomicPolicyApplied,
             EventType::SpendingUcanGranted,
             EventType::SpendingUcanRevoked,
         ];
@@ -987,7 +989,7 @@ mod tests {
             prev_hash = leaf_hash;
         }
 
-        assert_eq!(event_count(&log), 25);
+        assert_eq!(event_count(&log), 26);
     }
 
     // -----------------------------------------------------------------------

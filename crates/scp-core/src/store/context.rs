@@ -1733,6 +1733,7 @@ mod tests {
             approved_proposals: std::collections::HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),

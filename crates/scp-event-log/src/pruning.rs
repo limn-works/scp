@@ -538,6 +538,7 @@ mod tests {
             EventType::MediaSessionEnded => 20,
             EventType::PaymentReceived => 21,
             EventType::EconomicPolicyChanged => 22,
+            EventType::EconomicPolicyApplied => 33,
             EventType::SpendingUcanGranted => 23,
             EventType::SpendingUcanRevoked => 24,
             // Governance event types (ADR-031 §8)

@@ -108,6 +108,48 @@ impl PendingCeilingModification {
     }
 }
 
+/// Default economic policy change notification period in seconds (§19.3).
+///
+/// When a governed context's economic policy is changed, the new policy is
+/// pending for this duration before taking effect. Members are notified and
+/// may leave before the new pricing applies.
+///
+/// Spec §19.3: "economic policy changes MUST NOT take effect sooner than
+/// 24 hours after the `EconomicPolicyChanged` event."
+const ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS: u64 = 86_400; // 24 hours
+
+// ---------------------------------------------------------------------------
+// PendingEconomicPolicyChange (§19.3)
+// ---------------------------------------------------------------------------
+
+/// A pending economic policy change awaiting notification period expiry (§19.3).
+///
+/// When a `SetEconomicPolicy` governance action is approved, the new policy
+/// is not applied immediately. Instead, it enters a 24-hour notification
+/// period during which the previous policy remains in effect. Members may
+/// leave before the new pricing applies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEconomicPolicyChange {
+    /// The proposed new economic policy.
+    pub new_policy: EconomicPolicy,
+    /// Unix timestamp (seconds) when the notification period started.
+    pub notified_at: u64,
+    /// Unix timestamp (seconds) when the notification period expires and
+    /// the new policy can be applied.
+    pub effective_at: u64,
+    /// The governance proposal ID that approved this change.
+    pub proposal_id: ProposalId,
+}
+
+impl PendingEconomicPolicyChange {
+    /// Returns `true` if the notification period has expired and the
+    /// new policy can be applied.
+    #[must_use]
+    pub const fn is_effective(&self, current_timestamp: u64) -> bool {
+        current_timestamp >= self.effective_at
+    }
+}
+
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
@@ -389,6 +431,14 @@ pub struct ContextSnapshot {
     /// Format: `(new_ceiling_capabilities, notification_timestamp, proposal_id)`.
     #[serde(default)]
     pub pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Pending economic policy change (§19.3 notification period).
+    ///
+    /// When a `SetEconomicPolicy` governance action is approved, the new
+    /// policy is stored here with the notification timestamp. Members are
+    /// notified and the previous policy remains in effect until the 24-hour
+    /// notification period expires.
+    #[serde(default)]
+    pub pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
     /// mutating governance actions (`AddMember`, `RemoveMember`,
     /// `RevokeReadAccess`, `ResetMember`).
@@ -592,6 +642,8 @@ struct PerContextState {
     pending_epoch_resets: Vec<DID>,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
     pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Pending economic policy change awaiting notification period (§19.3).
+    pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
     /// `RevokeReadAccess`, `ResetMember`). Used to populate
@@ -1508,6 +1560,7 @@ impl ContextManager {
             approved_proposals: ctx.approved_proposals.clone(),
             governance_freeze: ctx.governance_freeze,
             pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
+            pending_economic_policy_change: ctx.pending_economic_policy_change.clone(),
             mls_epoch: ctx.mls_epoch,
             epoch_coordination_records: ctx.epoch_coordinator.records().to_vec(),
             grace_entries,
@@ -1655,6 +1708,7 @@ impl ContextManager {
             last_known_members: initial_members,
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
+            pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
             mls_epoch: ctx_snapshot.mls_epoch,
             epoch_coordinator: EpochCoordinator::from_records(
                 ctx_snapshot.epoch_coordination_records,
@@ -2080,6 +2134,7 @@ impl ContextManager {
             last_known_members: initial_members,
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
+            pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
             mls_epoch: export.snapshot.mls_epoch,
             epoch_coordinator: EpochCoordinator::from_records(
                 export.snapshot.epoch_coordination_records,
@@ -2224,6 +2279,7 @@ impl ContextManager {
             last_known_members: initial_members,
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordinator: EpochCoordinator::new(),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -2482,6 +2538,7 @@ impl ContextManager {
             last_known_members: HashSet::new(),
             pending_epoch_resets: Vec::new(),
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordinator: EpochCoordinator::new(),
             grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
@@ -6249,21 +6306,28 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Sets or updates the economic policy for a context (§19.3, ADR-033).
+    /// Stages an economic policy change with a 24-hour notification period
+    /// (§19.3, ADR-033).
     ///
-    /// If the existing policy is locked, rejects the change. If the new policy
-    /// has `locked: true`, it becomes immutable after this action.
+    /// The new policy is NOT applied immediately. Instead, it enters a
+    /// notification period during which the previous policy remains in effect.
+    /// Members are notified via [`ContextEvent::EconomicPolicyChangeNotification`]
+    /// and may leave before the new pricing applies.
+    ///
+    /// Call [`apply_pending_economic_policy_change`](Self::apply_pending_economic_policy_change)
+    /// after the notification period expires to apply the change.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::PermissionDenied`] if the existing policy is locked.
+    /// - [`ContextError::PermissionDenied`] if the existing policy is locked
+    ///   or an economic policy change is already pending.
     /// - [`ContextError::MembershipFailed`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     async fn execute_set_economic_policy(
         &self,
         context_id: &str,
         policy: &EconomicPolicy,
-        _proposal_id: ProposalId,
+        proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -6283,7 +6347,32 @@ impl ContextManager {
                 ));
             }
 
-            ctx.economic_policy = Some(policy.clone());
+            // Reject if an economic policy change is already pending.
+            if ctx.pending_economic_policy_change.is_some() {
+                return Err(ContextError::PermissionDenied(
+                    "an economic policy change is already pending notification period".to_owned(),
+                ));
+            }
+
+            // §19.3: Stage the change with a 24-hour notification period.
+            let now = crate::time::now_secs()
+                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+            ctx.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
+                new_policy: policy.clone(),
+                notified_at: now,
+                effective_at,
+                proposal_id,
+            });
+
+            // §19.3: Notify all members of the pending change.
+            ctx.receive_buffer
+                .push(ContextEvent::EconomicPolicyChangeNotification {
+                    notified_at: now,
+                    effective_at,
+                    proposal_id,
+                });
+
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -6297,6 +6386,57 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "EconomicPolicyChanged")?;
         Ok(())
+    }
+
+    /// Applies a pending economic policy change if its notification period
+    /// has expired (§19.3).
+    ///
+    /// Returns `true` if the pending change was applied, `false` if there
+    /// was no pending change or the notification period has not yet expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if the context is not found or is not active.
+    pub async fn apply_pending_economic_policy_change(
+        &self,
+        context_id: &str,
+        current_timestamp: u64,
+    ) -> Result<bool, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let (applied, snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let pending = match &ctx.pending_economic_policy_change {
+                Some(p) if p.is_effective(current_timestamp) => p.clone(),
+                _ => return Ok(false),
+            };
+
+            // Apply the pending policy.
+            ctx.economic_policy = Some(pending.new_policy);
+            ctx.pending_economic_policy_change = None;
+
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (true, snap)
+        };
+
+        if applied {
+            if let Some(snapshot) = snapshot {
+                self.persist_context_snapshot(context_id, snapshot);
+            }
+            self.event_log
+                .append_context_event(&context_id_bytes, "EconomicPolicyApplied")?;
+        }
+
+        Ok(applied)
     }
 
     /// Approves a spending authorization for a member (§19.5, ADR-033).
@@ -11928,6 +12068,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
@@ -12032,6 +12173,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
@@ -12124,6 +12266,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
@@ -12195,6 +12338,7 @@ mod tests {
                 approved_proposals: HashMap::new(),
                 governance_freeze: None,
                 pending_ceiling_modification: None,
+                pending_economic_policy_change: None,
                 mls_epoch: 0,
                 epoch_coordination_records: Vec::new(),
                 grace_entries: Vec::new(),
@@ -12265,6 +12409,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
@@ -12354,6 +12499,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 3,
             epoch_coordination_records: Vec::new(),
             grace_entries: vec![GraceEntry {
@@ -12453,6 +12599,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 3,
             epoch_coordination_records: Vec::new(),
             grace_entries: vec![GraceEntry {
@@ -12541,6 +12688,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch,
             grace_entries: grace,
             needs_reconnect: false,
@@ -12604,7 +12752,7 @@ mod tests {
 
         let result = manager
             .prepare_reconnection(
-                scp_identity::DID::from("did:dht:z6MkAlice"),
+                DID::from("did:dht:z6MkAlice"),
                 std::collections::HashMap::new(),
             )
             .await;
@@ -13770,6 +13918,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
             mls_epoch: 0,
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
@@ -17363,6 +17512,373 @@ mod tests {
                 "notification effective_at must be notified_at + 72h"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic policy notification period tests (§19.3, #728)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_economic_policy_change_effective_at_equals_notified_at_plus_86400() {
+        let notified_at = 1_000_000u64;
+        let pending = PendingEconomicPolicyChange {
+            new_policy: crate::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: crate::economy::types::CostSchedule {
+                    currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                    per_message: None,
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:dht:z6MkPayee"),
+            },
+            notified_at,
+            effective_at: notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+            proposal_id: [0u8; 32],
+        };
+        assert_eq!(
+            pending.effective_at,
+            notified_at + 86_400,
+            "effective_at must be notified_at + 24h (86,400s)"
+        );
+    }
+
+    #[test]
+    fn pending_economic_policy_is_effective_false_before_period_expires() {
+        let notified_at = 1_000_000u64;
+        let pending = PendingEconomicPolicyChange {
+            new_policy: crate::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: crate::economy::types::CostSchedule {
+                    currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                    per_message: None,
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:dht:z6MkPayee"),
+            },
+            notified_at,
+            effective_at: notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+            proposal_id: [0u8; 32],
+        };
+        assert!(
+            !pending.is_effective(pending.effective_at - 1),
+            "is_effective must return false before the notification period expires"
+        );
+    }
+
+    #[test]
+    fn pending_economic_policy_is_effective_true_after_period_expires() {
+        let notified_at = 1_000_000u64;
+        let pending = PendingEconomicPolicyChange {
+            new_policy: crate::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: crate::economy::types::CostSchedule {
+                    currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                    per_message: None,
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:dht:z6MkPayee"),
+            },
+            notified_at,
+            effective_at: notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+            proposal_id: [0u8; 32],
+        };
+        assert!(
+            pending.is_effective(pending.effective_at),
+            "is_effective must return true at exactly effective_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_set_economic_policy_stages_with_24h_delay() {
+        use super::super::governance::GovernanceAction;
+        use crate::economy::types::{CostSchedule, EconomicPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-econ-delay".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        };
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: policy.clone(),
+        };
+
+        let (_proposal, _events) = manager
+            .propose_governance_action("ctx-econ-delay", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-econ-delay").unwrap();
+        let pending = ctx
+            .pending_economic_policy_change
+            .as_ref()
+            .expect("pending economic policy change should exist");
+        assert_eq!(pending.new_policy, policy);
+        assert_eq!(
+            pending.effective_at,
+            pending.notified_at + 86_400,
+            "effective_at must be notified_at + 24h"
+        );
+        assert!(
+            ctx.economic_policy.is_none(),
+            "economic policy should not be applied yet (still in notification period)"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_pending_economic_policy_change_respects_notification_period() {
+        use super::super::governance::GovernanceAction;
+        use crate::economy::types::{CostSchedule, EconomicPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-econ-apply".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        };
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: policy.clone(),
+        };
+
+        let (_proposal, _events) = manager
+            .propose_governance_action("ctx-econ-apply", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        let notified_at = {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("ctx-econ-apply").unwrap();
+            ctx.pending_economic_policy_change
+                .as_ref()
+                .unwrap()
+                .notified_at
+        };
+
+        let applied = manager
+            .apply_pending_economic_policy_change("ctx-econ-apply", notified_at + 86_399)
+            .await
+            .unwrap();
+        assert!(
+            !applied,
+            "should not apply before notification period expires"
+        );
+
+        let applied = manager
+            .apply_pending_economic_policy_change("ctx-econ-apply", notified_at + 86_400)
+            .await
+            .unwrap();
+        assert!(applied, "should apply at exactly effective_at");
+
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-econ-apply").unwrap();
+        assert!(
+            ctx.pending_economic_policy_change.is_none(),
+            "pending change should be cleared after apply"
+        );
+        assert_eq!(
+            ctx.economic_policy.as_ref(),
+            Some(&policy),
+            "economic policy should now be set after apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_set_economic_policy_emits_notification_event() {
+        use super::super::governance::GovernanceAction;
+        use crate::context::membership::ContextEvent;
+        use crate::economy::types::{CostSchedule, EconomicPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-econ-notify".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        };
+        let action = GovernanceAction::SetEconomicPolicy { policy };
+
+        let (_proposal, _events) = manager
+            .propose_governance_action("ctx-econ-notify", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        let events = manager.drain_events("ctx-econ-notify").await;
+        let notification = events
+            .iter()
+            .find(|e| matches!(e, ContextEvent::EconomicPolicyChangeNotification { .. }));
+        assert!(
+            notification.is_some(),
+            "EconomicPolicyChangeNotification event should be emitted"
+        );
+        if let Some(ContextEvent::EconomicPolicyChangeNotification {
+            notified_at,
+            effective_at,
+            ..
+        }) = notification
+        {
+            assert_eq!(
+                *effective_at,
+                *notified_at + 86_400,
+                "notification effective_at must be notified_at + 24h"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_set_economic_policy_rejects_when_already_pending() {
+        use super::super::governance::GovernanceAction;
+        use crate::economy::types::{CostSchedule, EconomicPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let key_a = signing_key_for_did(&alice);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-econ-dup".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        };
+
+        let action1 = GovernanceAction::SetEconomicPolicy {
+            policy: policy.clone(),
+        };
+        let _ = manager
+            .propose_governance_action("ctx-econ-dup", &alice, action1, &key_a)
+            .await
+            .unwrap();
+
+        let action2 = GovernanceAction::SetEconomicPolicy { policy };
+        let result = manager
+            .propose_governance_action("ctx-econ-dup", &alice, action2, &key_a)
+            .await;
+        assert!(
+            result.is_err(),
+            "second SetEconomicPolicy should fail while one is already pending"
+        );
     }
 
     // -----------------------------------------------------------------------
