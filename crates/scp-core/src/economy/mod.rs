@@ -60,7 +60,8 @@ pub use pricing::{
 };
 pub use receipt::{
     PaymentVerifier, PaymentVerifierDyn, ReceiptFilter, ReceiptVerification,
-    ReceiptVerificationError, payment_history, verify_receipts, verify_receipts_dyn,
+    ReceiptVerificationError, all_receipts_valid, payment_history, verify_receipts,
+    verify_receipts_dyn,
 };
 pub use types::{
     Amount, COEFFICIENT_SCALE, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy,
