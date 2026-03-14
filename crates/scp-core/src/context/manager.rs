@@ -7032,11 +7032,19 @@ impl ContextManager {
         let new_epoch = ctx.mls_epoch;
         drop(contexts);
 
-        // Emit epoch advancement event to event log.
+        // Emit epoch advancement event to event log. Event log failures
+        // are non-fatal — recovery must not be blocked by logging issues.
         let context_id_bytes = context_id_to_bytes(context_id);
-        let _ = self
+        if let Err(e) = self
             .event_log
-            .append_context_event(&context_id_bytes, "recovery/epoch_advanced");
+            .append_context_event(&context_id_bytes, "recovery/epoch_advanced")
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to append recovery epoch advancement event to event log"
+            );
+        }
 
         // Persist if configured (best-effort).
         if self.has_persistence() {
@@ -7090,6 +7098,48 @@ impl ContextManager {
         self.transport.send_message(&context_id_bytes, &encrypted)?;
 
         Ok(())
+    }
+
+    /// Sends a recovery notification to a contact DID by finding shared
+    /// contexts where both the recovering DID and the contact are members,
+    /// then sending the notification through the first matching context.
+    ///
+    /// This is the correct entry point for step 5 contact notification (§9.12),
+    /// as opposed to `recovery_send_notification` which requires a known
+    /// `context_id`. Here the manager searches its registered contexts to find
+    /// an appropriate channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if no shared context is found
+    /// or the message cannot be sent.
+    pub async fn recovery_notify_contact(
+        &self,
+        recovering_did: &str,
+        contact_did: &str,
+        payload: &[u8],
+    ) -> Result<(), ContextError> {
+        // Find a context where both the recovering DID and the contact DID
+        // are members. The first matching context is used for delivery.
+        let shared_context_id = {
+            let contexts = self.contexts.lock().await;
+            contexts
+                .iter()
+                .find(|(_, ctx)| {
+                    ctx.membership.contains(recovering_did) && ctx.membership.contains(contact_did)
+                })
+                .map(|(id, _)| id.clone())
+        };
+
+        match shared_context_id {
+            Some(context_id) => {
+                self.recovery_send_notification(&context_id, recovering_did, payload)
+                    .await
+            }
+            None => Err(ContextError::TransportFailed(format!(
+                "no shared context found between {recovering_did} and {contact_did}"
+            ))),
+        }
     }
 }
 
