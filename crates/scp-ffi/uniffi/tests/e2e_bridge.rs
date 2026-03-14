@@ -282,7 +282,7 @@ async fn context_send_message() {
 #[tokio::test]
 async fn context_close_lifecycle() {
     let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    // Must include contextClose capability
+    // Must include context:close capability
     let handle = context_create(alice.clone(), full_capability_params())
         .await
         .unwrap();
@@ -757,7 +757,7 @@ async fn context_create_with_all_governance_models() {
         GovernanceModel::TokenVoting,
     ] {
         let params = ContextParams {
-            ceiling: vec!["messagesRead".to_owned()],
+            ceiling: vec!["messages:read".to_owned()],
             governance: model,
             memory_scope: MemoryScope::Ephemeral,
             ttl_seconds: 3600,
@@ -779,7 +779,7 @@ async fn context_create_with_all_memory_scopes() {
         MemoryScope::Full,
     ] {
         let params = ContextParams {
-            ceiling: vec!["messagesRead".to_owned()],
+            ceiling: vec!["messages:read".to_owned()],
             governance: GovernanceModel::SingleAdmin,
             memory_scope: scope,
             ttl_seconds: 3600,

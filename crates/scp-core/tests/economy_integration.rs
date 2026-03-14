@@ -536,7 +536,7 @@ fn invariant_2_paid_action_without_spending_ucan_rejected() {
             nnc: "test-nonce-action-1".to_owned(),
             att: vec![Attenuation {
                 with: "scp:context:ctx-1".to_owned(),
-                can: "messagesWrite".to_owned(),
+                can: "messages:write".to_owned(),
             }],
             prf: vec![],
             fct: None,
@@ -581,7 +581,7 @@ fn invariant_2_paid_action_with_spending_ucan_succeeds() {
             nnc: "test-nonce-action-2".to_owned(),
             att: vec![Attenuation {
                 with: "scp:context:ctx-econ-test".to_owned(),
-                can: "messagesWrite".to_owned(),
+                can: "messages:write".to_owned(),
             }],
             prf: vec![],
             fct: None,
