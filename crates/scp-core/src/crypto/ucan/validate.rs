@@ -914,9 +914,8 @@ fn verify_chain_recursive(
         // from leaf-token failures.  Without this, TokenExpired from a parent is
         // indistinguishable from TokenExpired on the leaf, causing optimistic
         // reporting of checks that never ran on the leaf (see issue #1026).
-        verify_expiry(&parent, clock_skew_tolerance_secs).map_err(|e| {
-            UcanError::DelegationChainBroken(format!("parent token failed: {e}"))
-        })?;
+        verify_expiry(&parent, clock_skew_tolerance_secs)
+            .map_err(|e| UcanError::DelegationChainBroken(format!("parent token failed: {e}")))?;
 
         // Verify parent token has not been revoked (spec 7.2).
         // Same wrapping rationale as expiry above (issue #1026).
