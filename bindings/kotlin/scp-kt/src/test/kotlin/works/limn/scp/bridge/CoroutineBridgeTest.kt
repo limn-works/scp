@@ -151,6 +151,31 @@ class CoroutineBridgeTest {
             }
 
         @Test
+        fun `toolInvoke forwards identityHandle`() =
+            runTest(ioDispatcher) {
+                stubBindings.toolInvokeResult = """{"ok":true}"""
+                bridge.tools.invoke(10L, "tool-001", """{}""", 42L, null)
+                assertEquals(42L, stubBindings.lastToolInvokeIdentityHandle)
+            }
+
+        @Test
+        fun `toolInvoke forwards ucanToken`() =
+            runTest(ioDispatcher) {
+                stubBindings.toolInvokeResult = """{"ok":true}"""
+                bridge.tools.invoke(10L, "tool-001", """{}""", 1L, "header.payload.signature")
+                assertEquals("header.payload.signature", stubBindings.lastToolInvokeUcanToken)
+            }
+
+        @Test
+        fun `toolInvoke forwards non-null proofTokens`() =
+            runTest(ioDispatcher) {
+                stubBindings.toolInvokeResult = """{"ok":true}"""
+                val proofs = listOf("proof1.token", "proof2.token")
+                bridge.tools.invoke(10L, "tool-001", """{}""", 1L, "ucan.tok", proofs)
+                assertEquals(proofs, stubBindings.lastToolInvokeProofTokens)
+            }
+
+        @Test
         fun `toolVerify dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.toolVerifyResult = true
@@ -548,6 +573,11 @@ class StubNativeBindings : NativeBindings {
     var lastMessageCallback: MessageCallback? = null
     var lastCancellationHandle: CancellationHandle? = null
 
+    // toolInvoke argument captures
+    var lastToolInvokeIdentityHandle: Long? = null
+    var lastToolInvokeUcanToken: String? = null
+    var lastToolInvokeProofTokens: List<String>? = null
+
     // Configurable results
     var identityCreateResult = 0L
     var identityCreateThrows: Exception? = null
@@ -698,7 +728,12 @@ class StubNativeBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
-    ): String = toolInvokeResult
+    ): String {
+        lastToolInvokeIdentityHandle = identityHandle
+        lastToolInvokeUcanToken = ucanToken
+        lastToolInvokeProofTokens = proofTokens
+        return toolInvokeResult
+    }
 
     override fun toolVerify(
         contextHandle: Long,
