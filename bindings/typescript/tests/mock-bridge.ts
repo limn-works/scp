@@ -814,6 +814,16 @@ export function createMockBridge(): Bridge & {
         throw new Error("[SCP-CTX-2001] Subscriber is blocked");
       }
       ctx.broadcastSubscribers.add(subscriberDid);
+
+      const subscribedEvent: Event = {
+        eventType: "BroadcastSubscribed",
+        actorDid: subscriberDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { subscriberDid },
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(subscribedEvent);
+      ctx.eventLog.push(subscribedEvent);
     },
 
     async broadcastUnsubscribe(
@@ -826,8 +836,18 @@ export function createMockBridge(): Bridge & {
         throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
       }
       ctx.broadcastSubscribers.delete(subscriberDid);
+
+      const unsubscribedEvent: Event = {
+        eventType: "BroadcastUnsubscribed",
+        actorDid: subscriberDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { subscriberDid },
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(unsubscribedEvent);
+      ctx.eventLog.push(unsubscribedEvent);
+
       if (rotateKeys === true) {
-        // Record a key rotation event so tests can verify the parameter was observed.
         const rotateEvent: Event = {
           eventType: "BroadcastKeyRotated",
           actorDid: handle.creatorDid,
@@ -843,7 +863,7 @@ export function createMockBridge(): Bridge & {
     async broadcastPublish(
       handle: BridgeContextHandle,
       authorDid: string,
-      _payload: Uint8Array,
+      payload: Uint8Array,
     ): Promise<void> {
       const ctx = getContext(handle);
       if (ctx.mode !== "Broadcast") {
@@ -852,12 +872,22 @@ export function createMockBridge(): Bridge & {
       if (!ctx.members.has(authorDid)) {
         throw new Error("[SCP-CTX-2001] Author is not a member of the context");
       }
+
+      const publishedEvent: Event = {
+        eventType: "BroadcastPublished",
+        actorDid: authorDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { size: payload.length },
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(publishedEvent);
+      ctx.eventLog.push(publishedEvent);
     },
 
     async broadcastBlockSubscriber(
       handle: BridgeContextHandle,
       subscriberDid: string,
-      _blockerDid: string,
+      blockerDid: string,
     ): Promise<void> {
       const ctx = getContext(handle);
       if (ctx.mode !== "Broadcast") {
@@ -865,18 +895,38 @@ export function createMockBridge(): Bridge & {
       }
       ctx.broadcastSubscribers.delete(subscriberDid);
       ctx.broadcastBlockedSubscribers.add(subscriberDid);
+
+      const blockedEvent: Event = {
+        eventType: "BroadcastSubscriberBlocked",
+        actorDid: blockerDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { subscriberDid },
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(blockedEvent);
+      ctx.eventLog.push(blockedEvent);
     },
 
     async broadcastUnblockSubscriber(
       handle: BridgeContextHandle,
       subscriberDid: string,
-      _unblockerDid: string,
+      unblockerDid: string,
     ): Promise<void> {
       const ctx = getContext(handle);
       if (ctx.mode !== "Broadcast") {
         throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
       }
       ctx.broadcastBlockedSubscribers.delete(subscriberDid);
+
+      const unblockedEvent: Event = {
+        eventType: "BroadcastSubscriberUnblocked",
+        actorDid: unblockerDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { subscriberDid },
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(unblockedEvent);
+      ctx.eventLog.push(unblockedEvent);
     },
 
     async broadcastHandleKeyRequest(
@@ -891,13 +941,27 @@ export function createMockBridge(): Bridge & {
       if (!ctx.members.has(authorDid)) {
         throw new Error("[SCP-CTX-2001] Author is not a member of the context");
       }
+
+      let result: string;
       if (ctx.broadcastBlockedSubscribers.has(requesterDid)) {
-        return "Denied(Blocked)";
+        result = "Denied(Blocked)";
+      } else if (ctx.broadcastSubscribers.has(requesterDid)) {
+        result = "Granted";
+      } else {
+        result = "Denied(NotSubscribed)";
       }
-      if (ctx.broadcastSubscribers.has(requesterDid)) {
-        return "Granted";
-      }
-      return "Denied(NotSubscribed)";
+
+      const keyRequestEvent: Event = {
+        eventType: "BroadcastKeyRequestHandled",
+        actorDid: authorDid,
+        timestamp: Math.floor(Date.now() / 1000),
+        payload: { requesterDid, result },
+        sequence: ctx.eventLog.length,
+      };
+      ctx.receiveBuffer.push(keyRequestEvent);
+      ctx.eventLog.push(keyRequestEvent);
+
+      return result;
     },
 
     async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
