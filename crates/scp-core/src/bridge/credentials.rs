@@ -41,6 +41,8 @@
 //!
 //! See ADR-023 in `.docs/adrs/phase-5.md`.
 
+use std::sync::LazyLock;
+
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
@@ -56,6 +58,17 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// AES-256-GCM nonce size in bytes.
 const NONCE_SIZE: usize = 12;
+
+/// Precomputed HKDF salt: SHA-256("SCP-BRIDGE-CREDENTIAL-V1").
+///
+/// Computed once on first access and reused for all subsequent
+/// `derive_credential_key` calls.
+static CREDENTIAL_HKDF_SALT: LazyLock<[u8; 32]> = LazyLock::new(|| {
+    let digest = Sha256::digest(b"SCP-BRIDGE-CREDENTIAL-V1");
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&digest);
+    salt
+});
 
 // ---------------------------------------------------------------------------
 // CredentialType
@@ -287,6 +300,51 @@ pub trait BridgeCredentialStore: Send + Sync {
         &self,
         bridge_id: &str,
     ) -> impl std::future::Future<Output = Result<Vec<CredentialType>, CredentialError>> + Send;
+
+    /// Store a bridge credential key in the custody boundary.
+    ///
+    /// Called once at bridge provisioning time with the output of
+    /// [`generate_bridge_credential_key`]. The key MUST be stored
+    /// securely — it is the root secret for all credential encryption
+    /// for this bridge instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::StorageError`] if the storage backend
+    /// fails.
+    fn store_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+        key: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<(), CredentialError>> + Send;
+
+    /// Retrieve the bridge credential key from the custody boundary.
+    ///
+    /// Returns the key wrapped in [`Zeroizing`] so it is zeroed on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NotFound`] if no key is stored for
+    /// the given bridge (bridge was never provisioned, or key was deleted
+    /// via [`delete_bridge_credential_key`](Self::delete_bridge_credential_key)).
+    fn get_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+    ) -> impl std::future::Future<Output = Result<Zeroizing<[u8; 32]>, CredentialError>> + Send;
+
+    /// Delete and zeroize the bridge credential key.
+    ///
+    /// Called during [`revoke`](Self::revoke) to destroy the root secret.
+    /// After this call, no credentials can be decrypted for this bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::StorageError`] if the storage backend
+    /// fails during deletion.
+    fn delete_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+    ) -> impl std::future::Future<Output = Result<(), CredentialError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,19 +380,27 @@ pub fn derive_credential_key(
     bridge_credential_key: &[u8; 32],
     bridge_id: &str,
 ) -> Result<Zeroizing<[u8; 32]>, CredentialError> {
-    // Salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1") — fixed 32-byte hash.
-    let salt = Sha256::digest(b"SCP-BRIDGE-CREDENTIAL-V1");
-
     // Info = "scp-bridge-credential:" || bridge_id.
     let info = format!("scp-bridge-credential:{bridge_id}");
 
-    let hk = Hkdf::<Sha256>::new(Some(&salt), bridge_credential_key);
+    let hk = Hkdf::<Sha256>::new(Some(&*CREDENTIAL_HKDF_SALT), bridge_credential_key);
     let mut okm = Zeroizing::new([0u8; 32]);
     hk.expand(info.as_bytes(), okm.as_mut())
         .map_err(|e| CredentialError::KeyDerivationError {
             reason: e.to_string(),
         })?;
     Ok(okm)
+}
+
+/// Generate a new random bridge credential key (32 bytes from CSPRNG).
+///
+/// Called once at bridge provisioning time. The returned key MUST be
+/// stored in the custody boundary via `ProtocolRepository`.
+#[must_use]
+pub fn generate_bridge_credential_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    key
 }
 
 /// Encrypts plaintext credential data with AES-256-GCM.
@@ -426,6 +492,12 @@ pub struct InMemoryCredentialStore {
 
     /// Set of bridge IDs that are currently suspended.
     suspended_bridges: tokio::sync::RwLock<std::collections::HashSet<String>>,
+
+    /// Bridge credential keys keyed by bridge ID.
+    ///
+    /// Each key is wrapped in [`Zeroizing`] so it is zeroed on drop.
+    bridge_credential_keys:
+        tokio::sync::RwLock<std::collections::HashMap<String, Zeroizing<[u8; 32]>>>,
 }
 
 impl InMemoryCredentialStore {
@@ -435,6 +507,7 @@ impl InMemoryCredentialStore {
         Self {
             credentials: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             suspended_bridges: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            bridge_credential_keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -589,7 +662,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
             }
         }
 
-        // Also remove from suspended set if present (lock dropped above).
+        // Destroy the bridge credential key (root secret).
+        self.delete_bridge_credential_key(bridge_id).await?;
+
+        // Also remove from suspended set if present.
         self.suspended_bridges.write().await.remove(bridge_id);
 
         Ok(())
@@ -605,6 +681,39 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
             .collect();
 
         Ok(types)
+    }
+
+    async fn store_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+        key: [u8; 32],
+    ) -> Result<(), CredentialError> {
+        self.bridge_credential_keys
+            .write()
+            .await
+            .insert(bridge_id.to_owned(), Zeroizing::new(key));
+        Ok(())
+    }
+
+    async fn get_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, CredentialError> {
+        self.bridge_credential_keys
+            .read()
+            .await
+            .get(bridge_id)
+            .cloned()
+            .ok_or_else(|| CredentialError::NotFound {
+                bridge_id: bridge_id.to_owned(),
+                credential_type: CredentialType::Custom("bridge_credential_key".to_owned()),
+            })
+    }
+
+    async fn delete_bridge_credential_key(&self, bridge_id: &str) -> Result<(), CredentialError> {
+        // Zeroizing<[u8; 32]> zeros on drop when removed from the HashMap.
+        self.bridge_credential_keys.write().await.remove(bridge_id);
+        Ok(())
     }
 }
 
@@ -1156,5 +1265,85 @@ mod tests {
                 .expect("retrieve");
             assert_eq!(retrieved.as_slice(), *expected);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 1: CSPRNG provisioning tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_bridge_credential_key_produces_unique_keys() {
+        let key1 = generate_bridge_credential_key();
+        let key2 = generate_bridge_credential_key();
+
+        assert_ne!(
+            key1, key2,
+            "two CSPRNG-generated keys must differ (collision probability ~2^-256)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 2: Bridge credential key custody tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_retrieve_bridge_credential_key_roundtrip() {
+        let store = InMemoryCredentialStore::new();
+        let key = generate_bridge_credential_key();
+
+        store
+            .store_bridge_credential_key("bridge-001", key)
+            .await
+            .expect("store key");
+
+        let retrieved = store
+            .get_bridge_credential_key("bridge-001")
+            .await
+            .expect("get key");
+
+        assert_eq!(*retrieved, key, "retrieved key must match stored key");
+    }
+
+    #[tokio::test]
+    async fn get_missing_bridge_credential_key_returns_not_found() {
+        let store = InMemoryCredentialStore::new();
+
+        let result = store.get_bridge_credential_key("bridge-nonexistent").await;
+
+        assert!(
+            matches!(result, Err(CredentialError::NotFound { .. })),
+            "missing bridge credential key must return NotFound"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 3: Revoke destroys bridge credential key
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn revoke_destroys_bridge_credential_key() {
+        let store = InMemoryCredentialStore::new();
+        let key = generate_bridge_credential_key();
+
+        // Store a key and a credential.
+        store
+            .store_bridge_credential_key("bridge-001", key)
+            .await
+            .expect("store key");
+
+        store
+            .provision("bridge-001", CredentialType::ApiKey, b"secret", &key)
+            .await
+            .expect("provision");
+
+        // Revoke the bridge.
+        store.revoke("bridge-001").await.expect("revoke");
+
+        // Bridge credential key must be gone.
+        let result = store.get_bridge_credential_key("bridge-001").await;
+        assert!(
+            matches!(result, Err(CredentialError::NotFound { .. })),
+            "bridge credential key must be destroyed after revoke"
+        );
     }
 }
