@@ -123,52 +123,52 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError
         })
 }
 
-/// Returns a reference to the shared `ContextManager` for infallible contexts.
+/// Builds a default `ContextManager` with bridge-local providers.
+///
+/// Uses `FfiBridgeCrypto` (no-op), `NotConfiguredTransportProvider`,
+/// `MerkleEventLogProvider` (persistent, #484), and a not-configured key
+/// resolver.
+///
+/// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
+/// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
+/// storage provider. Mobile apps (Swift/Kotlin) are killed aggressively by
+/// the OS, making persistence critical for data durability.
+fn build_default_context_manager() -> Arc<ContextManager> {
+    let event_log = build_event_log_provider();
+    Arc::new(ContextManager::new(
+        Box::new(FfiBridgeCrypto),
+        Box::new(scp_core::context::NotConfiguredTransportProvider),
+        event_log,
+        not_configured_key_resolver(),
+    ))
+}
+
+/// Returns a reference to the shared `ContextManager`, initializing it if
+/// necessary.
 ///
 /// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
 /// Option, ()), this provides access to the manager without requiring a
 /// `Result` return type. Callers should prefer [`context_manager`] when the
 /// return type supports `Result`.
 ///
-/// # Panics
-///
-/// Panics if the `ContextManager` has not been initialized via
-/// [`init_context_manager`] (called during `context_create`). This is
-/// intentional: silently auto-initializing with no-op providers contradicts
-/// issue #501's goal of eliminating silent degradation. The panic produces
-/// a clear error message that guides the caller to initialize first.
-#[allow(clippy::expect_used)]
+/// Auto-initializes via `get_or_init` on first access. The initialized
+/// manager uses `NotConfiguredTransportProvider` (which returns descriptive
+/// errors, not silent no-ops) and `FfiBridgeCrypto` (no-op crypto for state
+/// tracking). This is safe because standalone functions like
+/// `register_local_did` / `is_local_did` only access the DID registry, not
+/// transport or crypto, and should not require a prior `context_create` call.
 pub fn context_manager_or_init() -> &'static Arc<ContextManager> {
-    CONTEXT_MANAGER.get().expect(
-        "ContextManager not initialized — call context_create() first. \
-             The manager must be explicitly initialized before querying \
-             context state (membership, broadcast, events, TTL).",
-    )
+    CONTEXT_MANAGER.get_or_init(build_default_context_manager)
 }
 
 /// Initializes the global [`ContextManager`] with bridge-local providers.
 ///
-/// Uses `FfiBridgeCrypto` (no-op), `NotConfiguredTransportProvider`,
-/// `MerkleEventLogProvider` (persistent, #484), and a not-configured key
-/// resolver. This is called during `context_create` to ensure the manager
-/// is ready before any context operations.
-///
-/// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
-/// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
-/// storage provider. Mobile apps (Swift/Kotlin) are killed aggressively by
-/// the OS, making persistence critical for data durability.
+/// This is called during `context_create` to ensure the manager is ready
+/// before any context operations.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 pub fn init_context_manager() {
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let event_log = build_event_log_provider();
-        Arc::new(ContextManager::new(
-            Box::new(FfiBridgeCrypto),
-            Box::new(scp_core::context::NotConfiguredTransportProvider),
-            event_log,
-            not_configured_key_resolver(),
-        ))
-    });
+    let _ = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
