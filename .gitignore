@@ -40,3 +40,4 @@ bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/*.kt
 
 .mcp.json
 .mcp_data
+bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
