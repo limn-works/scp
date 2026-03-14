@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { _validateEconomicPolicyJson, Context } from "../src/context";
 import { ContextError, ValidationError } from "../src/errors";
+import { Identity } from "../src/identity";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
 import { defineToolDefinition } from "../src/tools";
 import { Transport } from "../src/transport";
@@ -1392,5 +1393,99 @@ describe("Broadcast mutation operations (mock bridge)", () => {
     const ctx = Context._fromHandle(handle, identity.did);
 
     expect(await ctx.broadcastAdmission()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Identity advanced operations — SDK wrapper level (#428)
+// ---------------------------------------------------------------------------
+
+describe("Identity SDK wrapper — advanced operations (#428)", () => {
+  beforeEach(() => {
+    _setBridge(mockBridge);
+  });
+
+  it("Identity.create returns identity with DID", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    expect(identity.did).toMatch(/^did:dht:/);
+    expect(identity.custodyType).toBe("in_memory");
+  });
+
+  it("Identity.createWithAgentKey returns identity with DID", async () => {
+    const identity = await Identity.createWithAgentKey({ custody: "in_memory" });
+    expect(identity.did).toMatch(/^did:dht:/);
+    expect(identity.custodyType).toBe("in_memory");
+  });
+
+  it("identity.addAgentKey returns updated identity with same DID", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const updated = await identity.addAgentKey();
+    expect(updated.did).toBe(identity.did);
+  });
+
+  it("identity.rotateAgentKey returns updated identity with same DID", async () => {
+    const identity = await Identity.createWithAgentKey({ custody: "in_memory" });
+    const rotated = await identity.rotateAgentKey();
+    expect(rotated.did).toBe(identity.did);
+  });
+
+  it("identity.removeAgentKey returns updated identity with same DID", async () => {
+    const identity = await Identity.createWithAgentKey({ custody: "in_memory" });
+    const removed = await identity.removeAgentKey();
+    expect(removed.did).toBe(identity.did);
+  });
+
+  it("identity.migrate returns identity with new DID", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const migrated = await identity.migrate();
+    expect(migrated.did).toMatch(/^did:dht:/);
+    expect(migrated.did).not.toBe(identity.did);
+  });
+
+  it("identity.attestDevice returns base64 token", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const token = await identity.attestDevice();
+    expect(typeof token).toBe("string");
+    expect(token.length).toBeGreaterThan(0);
+  });
+
+  it("identity.verifyDeviceAttestation returns true for valid token", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const token = await identity.attestDevice();
+    const isValid = await identity.verifyDeviceAttestation(token);
+    expect(isValid).toBe(true);
+  });
+
+  it("identity.verifyDeviceAttestation returns false for invalid token", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const isValid = await identity.verifyDeviceAttestation("aW52YWxpZA==");
+    expect(isValid).toBe(false);
+  });
+
+  it("identity.executeCustodyMigration returns migration result", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const result = await identity.executeCustodyMigration("hardware");
+    expect(result).toBeDefined();
+    expect(result.did).toBe(identity.did);
+    expect(result.target).toBe("hardware");
+    expect(result.key_generated).toBe(true);
+    expect(result.authorized).toBe(true);
+    expect(result.did_document_rotated).toBe(true);
+  });
+
+  it("identity.executeCustodyMigration rejects invalid target", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    await expect(identity.executeCustodyMigration("nonexistent" as "hardware")).rejects.toThrow(
+      /invalid custody migration target/,
+    );
+  });
+
+  it("identity.executeRecovery returns recovery result", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const result = await identity.executeRecovery("agent", ["ctx-1"]);
+    expect(result).toBeDefined();
+    expect(result.did).toBe(identity.did);
+    expect(result.tier).toBe("agent");
+    expect(result.key_rotation_completed).toBe(true);
   });
 });
