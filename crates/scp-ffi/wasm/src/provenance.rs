@@ -41,9 +41,9 @@ enum SourceType {
 impl SourceType {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "Persistent" | "persistent" => Some(Self::Persistent),
-            "Ephemeral" | "ephemeral" => Some(Self::Ephemeral),
-            "Summary" | "summary" => Some(Self::Summary),
+            "persistent" => Some(Self::Persistent),
+            "ephemeral" => Some(Self::Ephemeral),
+            "summary" => Some(Self::Summary),
             _ => None,
         }
     }
@@ -72,15 +72,11 @@ enum ContextState {
 impl ContextState {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "Active" | "active" => Some(Self::Active),
-            "ClosedWithSummaryVerified" | "closed_with_summary_verified" => {
-                Some(Self::ClosedWithSummaryVerified)
-            }
-            "ClosedWithSummaryUnverified" | "closed_with_summary_unverified" => {
-                Some(Self::ClosedWithSummaryUnverified)
-            }
-            "ClosedEphemeral" | "closed_ephemeral" => Some(Self::ClosedEphemeral),
-            "Unknown" | "unknown" => Some(Self::Unknown),
+            "active" => Some(Self::Active),
+            "closed_with_summary_verified" => Some(Self::ClosedWithSummaryVerified),
+            "closed_with_summary_unverified" => Some(Self::ClosedWithSummaryUnverified),
+            "closed_ephemeral" => Some(Self::ClosedEphemeral),
+            "unknown" => Some(Self::Unknown),
             _ => None,
         }
     }
@@ -108,9 +104,9 @@ enum MemoryScope {
 impl MemoryScope {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "Full" | "full" => Some(Self::Full),
-            "Summary" | "summary" => Some(Self::Summary),
-            "Ephemeral" | "ephemeral" => Some(Self::Ephemeral),
+            "full" => Some(Self::Full),
+            "summary" => Some(Self::Summary),
+            "ephemeral" => Some(Self::Ephemeral),
             _ => None,
         }
     }
@@ -201,12 +197,9 @@ pub fn provenance_check_chain_depth(depth: u32, max_depth_override: Option<u32>)
 /// # Arguments
 ///
 /// - `source_context` — Source context ID, or `None` (no provenance).
-/// - `source_type` — One of `"Persistent"` / `"persistent"`, `"Ephemeral"` / `"ephemeral"`,
-///   `"Summary"` / `"summary"`.
-/// - `context_state` — One of `"Active"` / `"active"`,
-///   `"ClosedWithSummaryVerified"` / `"closed_with_summary_verified"`,
-///   `"ClosedWithSummaryUnverified"` / `"closed_with_summary_unverified"`,
-///   `"ClosedEphemeral"` / `"closed_ephemeral"`, `"Unknown"` / `"unknown"`.
+/// - `source_type` — One of `"persistent"`, `"ephemeral"`, `"summary"`.
+/// - `context_state` — One of `"active"`, `"closed_with_summary_verified"`,
+///   `"closed_with_summary_unverified"`, `"closed_ephemeral"`, `"unknown"`.
 /// - `counterparties_json` — Optional JSON array of counterparty DID strings.
 ///   Non-empty array → counterparties known. `None` or `"[]"` → unknown.
 ///
@@ -267,10 +260,8 @@ pub fn evaluate_provenance_quality(
 /// # Arguments
 ///
 /// - `source_context_id` — ID of the source context.
-/// - `source_type` — One of `"Persistent"` / `"persistent"`, `"Ephemeral"` / `"ephemeral"`,
-///   `"Summary"` / `"summary"`.
-/// - `memory_scope` — One of `"Full"` / `"full"`, `"Summary"` / `"summary"`,
-///   `"Ephemeral"` / `"ephemeral"`.
+/// - `source_type` — One of `"persistent"`, `"ephemeral"`, `"summary"`.
+/// - `memory_scope` — One of `"full"`, `"summary"`, `"ephemeral"`.
 /// - `counterparties_json` — JSON array of DID strings.
 /// - `target_context_id` — ID of the target context.
 /// - `existing_chain_depth` — Chain depth from existing provenance, or -1 for first hop.
@@ -297,7 +288,7 @@ pub fn evaluate_provenance_quality(
 ///
 /// ```js
 /// const prov = provenance_attach(
-///   "ctx-source", "Persistent", "Full",
+///   "ctx-source", "persistent", "full",
 ///   '["did:key:alice"]', "ctx-target", -1, "[]",
 ///   "OutOfBand", null
 /// );
@@ -463,8 +454,8 @@ mod tests {
     fn evaluate_quality_persistent_active() {
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Persistent".to_owned(),
-            "Active".to_owned(),
+            "persistent".to_owned(),
+            "active".to_owned(),
             Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
@@ -474,7 +465,7 @@ mod tests {
     #[test]
     fn evaluate_quality_no_provenance() {
         let tier =
-            evaluate_provenance_quality(None, "Persistent".to_owned(), "Active".to_owned(), None)
+            evaluate_provenance_quality(None, "persistent".to_owned(), "active".to_owned(), None)
                 .unwrap();
         assert_eq!(tier, 0);
     }
@@ -483,8 +474,8 @@ mod tests {
     fn evaluate_quality_summary_verified() {
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Summary".to_owned(),
-            "ClosedWithSummaryVerified".to_owned(),
+            "summary".to_owned(),
+            "closed_with_summary_verified".to_owned(),
             Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
@@ -497,8 +488,8 @@ mod tests {
         // regardless of counterparties — matches scp-core evaluate_quality.
         let with_parties = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Ephemeral".to_owned(),
-            "Active".to_owned(),
+            "ephemeral".to_owned(),
+            "active".to_owned(),
             Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
@@ -506,8 +497,8 @@ mod tests {
 
         let without_parties = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Ephemeral".to_owned(),
-            "Active".to_owned(),
+            "ephemeral".to_owned(),
+            "active".to_owned(),
             None,
         )
         .unwrap();
@@ -519,8 +510,8 @@ mod tests {
         // Active + Summary also degrades to EphemeralKnownParties (1).
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Summary".to_owned(),
-            "Active".to_owned(),
+            "summary".to_owned(),
+            "active".to_owned(),
             None,
         )
         .unwrap();
@@ -531,8 +522,8 @@ mod tests {
     fn evaluate_quality_ephemeral_with_parties() {
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Ephemeral".to_owned(),
-            "ClosedEphemeral".to_owned(),
+            "ephemeral".to_owned(),
+            "closed_ephemeral".to_owned(),
             Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
@@ -543,8 +534,8 @@ mod tests {
     fn evaluate_quality_ephemeral_no_parties() {
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Ephemeral".to_owned(),
-            "ClosedEphemeral".to_owned(),
+            "ephemeral".to_owned(),
+            "closed_ephemeral".to_owned(),
             None,
         )
         .unwrap();
@@ -556,8 +547,8 @@ mod tests {
         // Empty counterparties array should be treated as no counterparties
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Ephemeral".to_owned(),
-            "ClosedEphemeral".to_owned(),
+            "ephemeral".to_owned(),
+            "closed_ephemeral".to_owned(),
             Some("[]".to_owned()),
         )
         .unwrap();
@@ -568,8 +559,8 @@ mod tests {
     fn evaluate_quality_unknown_state() {
         let tier = evaluate_provenance_quality(
             Some("ctx-1".to_owned()),
-            "Persistent".to_owned(),
-            "Unknown".to_owned(),
+            "persistent".to_owned(),
+            "unknown".to_owned(),
             Some("[\"did:key:alice\"]".to_owned()),
         )
         .unwrap();
@@ -581,7 +572,7 @@ mod tests {
         assert!(
             evaluate_provenance_quality(
                 Some("ctx-1".to_owned()),
-                "Persistent".to_owned(),
+                "persistent".to_owned(),
                 "InvalidState".to_owned(),
                 Some("[\"did:key:alice\"]".to_owned()),
             )
@@ -594,8 +585,8 @@ mod tests {
         assert!(
             evaluate_provenance_quality(
                 Some("ctx-1".to_owned()),
-                "Persistent".to_owned(),
-                "Active".to_owned(),
+                "persistent".to_owned(),
+                "active".to_owned(),
                 Some("not valid json".to_owned()),
             )
             .is_err()
@@ -606,8 +597,8 @@ mod tests {
     fn attach_first_hop() {
         let result = provenance_attach(
             "ctx-source".to_owned(),
-            "Persistent".to_owned(),
-            "Full".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
             "[\"did:key:alice\"]".to_owned(),
             "ctx-target".to_owned(),
             -1.0,
@@ -632,8 +623,8 @@ mod tests {
     fn attach_second_hop() {
         let result = provenance_attach(
             "ctx-hop2".to_owned(),
-            "Persistent".to_owned(),
-            "Full".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
             "[\"did:key:bob\"]".to_owned(),
             "ctx-target".to_owned(),
             0.0,
@@ -654,8 +645,8 @@ mod tests {
     fn attach_with_discovery_method() {
         let result = provenance_attach(
             "ctx-source".to_owned(),
-            "Persistent".to_owned(),
-            "Full".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
             "[]".to_owned(),
             "ctx-target".to_owned(),
             -1.0,
@@ -674,8 +665,8 @@ mod tests {
     fn attach_with_registry_discovery() {
         let result = provenance_attach(
             "ctx-source".to_owned(),
-            "Persistent".to_owned(),
-            "Full".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
             "[]".to_owned(),
             "ctx-target".to_owned(),
             -1.0,
@@ -694,8 +685,8 @@ mod tests {
         assert!(
             provenance_attach(
                 String::new(),
-                "Persistent".to_owned(),
-                "Full".to_owned(),
+                "persistent".to_owned(),
+                "full".to_owned(),
                 "[]".to_owned(),
                 "ctx-target".to_owned(),
                 -1.0,
@@ -713,7 +704,7 @@ mod tests {
             provenance_attach(
                 "ctx-source".to_owned(),
                 "InvalidType".to_owned(),
-                "Full".to_owned(),
+                "full".to_owned(),
                 "[]".to_owned(),
                 "ctx-target".to_owned(),
                 -1.0,
@@ -730,8 +721,8 @@ mod tests {
         assert!(
             provenance_attach(
                 "ctx-source".to_owned(),
-                "Persistent".to_owned(),
-                "Full".to_owned(),
+                "persistent".to_owned(),
+                "full".to_owned(),
                 "[]".to_owned(),
                 "ctx-target".to_owned(),
                 -1.0,
@@ -904,19 +895,11 @@ mod tests_native {
     // -- SourceType --
 
     #[test]
-    fn source_type_from_str_pascal_case() {
-        assert!(matches!(
-            SourceType::from_str("Persistent"),
-            Some(SourceType::Persistent)
-        ));
-        assert!(matches!(
-            SourceType::from_str("Ephemeral"),
-            Some(SourceType::Ephemeral)
-        ));
-        assert!(matches!(
-            SourceType::from_str("Summary"),
-            Some(SourceType::Summary)
-        ));
+    fn source_type_from_str_rejects_pascal_case() {
+        // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
+        assert!(SourceType::from_str("Persistent").is_none());
+        assert!(SourceType::from_str("Ephemeral").is_none());
+        assert!(SourceType::from_str("Summary").is_none());
     }
 
     #[test]
@@ -945,27 +928,13 @@ mod tests_native {
     // -- ContextState --
 
     #[test]
-    fn context_state_from_str_pascal_case() {
-        assert!(matches!(
-            ContextState::from_str("Active"),
-            Some(ContextState::Active)
-        ));
-        assert!(matches!(
-            ContextState::from_str("ClosedWithSummaryVerified"),
-            Some(ContextState::ClosedWithSummaryVerified)
-        ));
-        assert!(matches!(
-            ContextState::from_str("ClosedWithSummaryUnverified"),
-            Some(ContextState::ClosedWithSummaryUnverified)
-        ));
-        assert!(matches!(
-            ContextState::from_str("ClosedEphemeral"),
-            Some(ContextState::ClosedEphemeral)
-        ));
-        assert!(matches!(
-            ContextState::from_str("Unknown"),
-            Some(ContextState::Unknown)
-        ));
+    fn context_state_from_str_rejects_pascal_case() {
+        // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
+        assert!(ContextState::from_str("Active").is_none());
+        assert!(ContextState::from_str("ClosedWithSummaryVerified").is_none());
+        assert!(ContextState::from_str("ClosedWithSummaryUnverified").is_none());
+        assert!(ContextState::from_str("ClosedEphemeral").is_none());
+        assert!(ContextState::from_str("Unknown").is_none());
     }
 
     #[test]
@@ -1002,19 +971,11 @@ mod tests_native {
     // -- MemoryScope --
 
     #[test]
-    fn memory_scope_from_str_pascal_case() {
-        assert!(matches!(
-            MemoryScope::from_str("Full"),
-            Some(MemoryScope::Full)
-        ));
-        assert!(matches!(
-            MemoryScope::from_str("Summary"),
-            Some(MemoryScope::Summary)
-        ));
-        assert!(matches!(
-            MemoryScope::from_str("Ephemeral"),
-            Some(MemoryScope::Ephemeral)
-        ));
+    fn memory_scope_from_str_rejects_pascal_case() {
+        // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
+        assert!(MemoryScope::from_str("Full").is_none());
+        assert!(MemoryScope::from_str("Summary").is_none());
+        assert!(MemoryScope::from_str("Ephemeral").is_none());
     }
 
     #[test]
