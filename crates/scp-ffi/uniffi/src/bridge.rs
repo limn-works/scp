@@ -7610,6 +7610,91 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
 use scp_ffi_common::discovery::discovery_result_to_json;
 
 // ---------------------------------------------------------------------------
+// App Sandboxing (#595, spec §8.4.1, §8.4.2)
+// ---------------------------------------------------------------------------
+
+/// Validates a capability declaration JSON string against a context ceiling and
+/// role capabilities.
+///
+/// Returns a JSON string with fields: `valid` (bool), `granted_capabilities`
+/// (string[]), `error` (string | null), `app_did` (string).
+#[uniffi::export]
+pub fn sandbox_validate_declaration(
+    declaration_json: String,
+    ceiling_capabilities: Vec<String>,
+    role_capabilities: Vec<String>,
+) -> Result<String, ScpError> {
+    use scp_core::context::app_sandbox::{CapabilityDeclaration, validate_declaration};
+    use scp_core::context::roles::Capability;
+    use scp_core::context::{ContextHandle as CoreContextHandle, ContextParams};
+
+    let decl: CapabilityDeclaration =
+        serde_json::from_str(&declaration_json).map_err(|e| ScpError::Validation {
+            message: format!("invalid declaration JSON: {e}"),
+            code: "SCP-VALID-7070".to_owned(),
+        })?;
+
+    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
+    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+
+    let handle = CoreContextHandle::new("validation-context".to_owned(), ContextParams::default());
+
+    match validate_declaration(&decl, &ceiling, &role_caps, handle) {
+        Ok(scoped) => {
+            let granted: Vec<String> = scoped
+                .allowed_capabilities()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            serde_json::to_string(&serde_json::json!({
+                "valid": true,
+                "granted_capabilities": granted,
+                "error": null,
+                "app_did": decl.app_id.to_string()
+            }))
+            .map_err(|e| ScpError::Context {
+                message: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2030".to_owned(),
+            })
+        }
+        Err(e) => serde_json::to_string(&serde_json::json!({
+            "valid": false,
+            "granted_capabilities": [],
+            "error": e.to_string(),
+            "app_did": decl.app_id.to_string()
+        }))
+        .map_err(|e| ScpError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2031".to_owned(),
+        }),
+    }
+}
+
+/// Checks whether a given capability is allowed for an app binding.
+#[uniffi::export]
+#[must_use]
+pub fn sandbox_check_capability(
+    granted_capabilities: Vec<String>,
+    required_capability: String,
+) -> bool {
+    use scp_core::context::roles::Capability;
+    use std::collections::HashSet;
+
+    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
+    let required = Capability::new(&required_capability);
+
+    if granted.contains(&required) {
+        return true;
+    }
+    if matches!(&required, Capability::ToolInvoke(_))
+        && granted.contains(&Capability::ToolInvokeAll)
+    {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

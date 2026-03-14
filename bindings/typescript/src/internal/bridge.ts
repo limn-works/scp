@@ -333,6 +333,14 @@ export interface Bridge {
   identityAttestDevice(did: string): Promise<string>;
   identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean>;
 
+  // App Sandboxing (#595, spec §8.4.1, §8.4.2)
+  validateCapabilityDeclaration(
+    declarationJson: string,
+    ceilingCapabilities: string[],
+    roleCapabilities: string[],
+  ): string;
+  checkScopedCapability(grantedCapabilities: string[], requiredCapability: string): boolean;
+
   // Lifecycle
   version(): string;
   shutdown(timeoutSecs: number): void;

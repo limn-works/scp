@@ -568,3 +568,84 @@ public func joinContext(
 ) async throws {
     try await joinFn(handle, identity)
 }
+
+// MARK: - App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
+
+/// Result of validating a capability declaration.
+public struct DeclarationValidationResult: Sendable {
+    /// Whether the validation passed.
+    public let valid: Bool
+    /// Capabilities granted to the app (if valid).
+    public let grantedCapabilities: [String]
+    /// Error message if validation failed, nil otherwise.
+    public let error: String?
+    /// The DID of the app from the declaration.
+    public let appDid: String
+}
+
+/// Capability-restricted context handle (spec §8.4.2).
+///
+/// Wraps a `ContextHandle` with a whitelist of allowed capabilities. All protocol
+/// operations must check the whitelist before proceeding. An app cannot access
+/// protocol operations beyond its declared capabilities.
+///
+/// Once created, a `ScopedHandle` cannot gain additional capabilities
+/// (no escalation guarantee, spec 8.4.2 rule 4).
+public struct ScopedHandle: Sendable {
+    /// The wrapped context handle.
+    public let handle: ContextHandle
+    /// The capabilities granted to this app binding.
+    public let grantedCapabilities: [String]
+    /// The DID of the app.
+    public let appDid: String
+
+    /// Check whether a given capability is allowed.
+    public func hasCapability(_ capability: String) -> Bool {
+        sandboxCheckCapability(grantedCapabilities: grantedCapabilities, requiredCapability: capability)
+    }
+
+    /// Throws ``ScpError`` if the capability is not granted.
+    public func checkCapability(_ capability: String) throws {
+        guard hasCapability(capability) else {
+            throw ScpError.Context(
+                message: "capability denied: \(capability) not granted to app \(appDid)",
+                code: "SCP-SANDBOX-8001"
+            )
+        }
+    }
+}
+
+/// Validates a capability declaration against a context ceiling and role capabilities.
+///
+/// Returns a ``DeclarationValidationResult`` with the validation outcome.
+/// See spec §8.4.1.
+///
+/// - Parameters:
+///   - declarationJson: JSON string of the capability declaration.
+///   - ceilingCapabilities: List of capability name strings in the context ceiling.
+///   - roleCapabilities: List of capability name strings in the agent's role.
+/// - Throws: ``ScpError`` if the declaration JSON is malformed.
+public func validateCapabilityDeclaration(
+    declarationJson: String,
+    ceilingCapabilities: [String],
+    roleCapabilities: [String]
+) throws -> DeclarationValidationResult {
+    let resultJson = try sandboxValidateDeclaration(
+        declarationJson: declarationJson,
+        ceilingCapabilities: ceilingCapabilities,
+        roleCapabilities: roleCapabilities
+    )
+    guard let data = resultJson.data(using: .utf8),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw ScpError.Context(
+            message: "failed to parse validation result JSON",
+            code: "SCP-SANDBOX-8002"
+        )
+    }
+    return DeclarationValidationResult(
+        valid: json["valid"] as? Bool ?? false,
+        grantedCapabilities: json["granted_capabilities"] as? [String] ?? [],
+        error: json["error"] as? String,
+        appDid: json["app_did"] as? String ?? ""
+    )
+}

@@ -101,3 +101,67 @@ enum class ShadowStatus(val rawValue: String) {
         fun fromRawValue(value: String): ShadowStatus? = entries.find { it.rawValue == value }
     }
 }
+
+// ---------------------------------------------------------------------------
+// App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of validating a capability declaration.
+ *
+ * See spec sections 8.4.1 and 8.4.2.
+ */
+data class DeclarationValidationResult(
+    /** Whether the validation passed. */
+    val valid: Boolean,
+    /** Capabilities granted to the app (if valid). */
+    val grantedCapabilities: List<String>,
+    /** Error message if validation failed, null otherwise. */
+    val error: String?,
+    /** The DID of the app from the declaration. */
+    val appDid: String,
+)
+
+/**
+ * Capability-restricted context handle (spec §8.4.2).
+ *
+ * Wraps a context with a whitelist of allowed capabilities. All protocol
+ * operations must check the whitelist before proceeding. An app cannot access
+ * protocol operations beyond its declared capabilities.
+ *
+ * Once created, a [ScopedHandle] cannot gain additional capabilities
+ * (no escalation guarantee, spec 8.4.2 rule 4).
+ *
+ * @property contextId The context ID this handle is scoped to.
+ * @property grantedCapabilities The capabilities granted to this app binding.
+ * @property appDid The DID of the app.
+ */
+data class ScopedHandle(
+    val contextId: String,
+    val grantedCapabilities: List<String>,
+    val appDid: String,
+) {
+    /**
+     * Check whether a given capability is allowed.
+     */
+    fun hasCapability(capability: String): Boolean {
+        if (grantedCapabilities.contains(capability)) return true
+        // ToolInvokeAll covers any specific ToolInvoke
+        if (capability.startsWith("tool:invoke:") &&
+            capability != "tool:invoke:*" &&
+            grantedCapabilities.contains("tool:invoke:*")
+        ) {
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Throws [IllegalStateException] if the capability is not granted.
+     */
+    fun checkCapability(capability: String) {
+        check(hasCapability(capability)) {
+            "capability denied: $capability not granted to app $appDid"
+        }
+    }
+}

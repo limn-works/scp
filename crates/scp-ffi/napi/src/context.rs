@@ -1770,6 +1770,81 @@ pub fn context_get_economic_policy(handle: &NapiContextHandle) -> Option<String>
 }
 
 // ---------------------------------------------------------------------------
+// App Sandboxing (#595, spec §8.4.1, §8.4.2)
+// ---------------------------------------------------------------------------
+
+/// Validates a capability declaration JSON string against context ceiling and role.
+///
+/// Returns a JSON string with fields: `valid` (bool), `grantedCapabilities`
+/// (string[]), `error` (string | null), and `appDid` (string).
+#[napi]
+pub fn validate_capability_declaration(
+    declaration_json: String,
+    ceiling_capabilities: Vec<String>,
+    role_capabilities: Vec<String>,
+) -> napi::Result<String> {
+    use scp_core::context::app_sandbox::{CapabilityDeclaration, validate_declaration};
+    use scp_core::context::roles::Capability;
+    use scp_core::context::{ContextHandle, ContextParams};
+
+    let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
+
+    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
+    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+
+    let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
+
+    let result_json = match validate_declaration(&decl, &ceiling, &role_caps, handle) {
+        Ok(scoped) => {
+            let granted: Vec<String> = scoped
+                .allowed_capabilities()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            serde_json::json!({
+                "valid": true,
+                "grantedCapabilities": granted,
+                "error": null,
+                "appDid": decl.app_id.to_string()
+            })
+        }
+        Err(e) => serde_json::json!({
+            "valid": false,
+            "grantedCapabilities": [],
+            "error": e.to_string(),
+            "appDid": decl.app_id.to_string()
+        }),
+    };
+
+    serde_json::to_string(&result_json)
+        .map_err(|e| NapiError::from_reason(format!("serialization failed: {e}")))
+}
+
+/// Checks whether a given capability is allowed for an app binding.
+#[napi]
+pub fn check_scoped_capability(
+    granted_capabilities: Vec<String>,
+    required_capability: String,
+) -> bool {
+    use scp_core::context::roles::Capability;
+    use std::collections::HashSet;
+
+    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
+    let required = Capability::new(&required_capability);
+
+    if granted.contains(&required) {
+        return true;
+    }
+    if matches!(&required, Capability::ToolInvoke(_))
+        && granted.contains(&Capability::ToolInvokeAll)
+    {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -2524,6 +2524,91 @@ fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyR
 // Module registration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// App Sandboxing (#595, spec §8.4.1, §8.4.2)
+// ---------------------------------------------------------------------------
+
+/// Validates a capability declaration JSON string against a context ceiling and
+/// role capabilities.
+///
+/// Returns a JSON string with fields: `valid` (bool), `granted_capabilities`
+/// (list of str), `error` (str or null), `app_did` (str).
+///
+/// # Errors
+///
+/// Returns `PyValueError` if the declaration JSON is malformed, or
+/// `PyRuntimeError` if serialization of the result fails.
+#[pyfunction]
+fn py_validate_capability_declaration(
+    declaration_json: String,
+    ceiling_capabilities: Vec<String>,
+    role_capabilities: Vec<String>,
+) -> PyResult<String> {
+    use scp_core::context::app_sandbox::{CapabilityDeclaration, validate_declaration};
+    use scp_core::context::roles::Capability;
+    use scp_core::context::{ContextHandle, ContextParams};
+
+    let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid declaration JSON: {e}")))?;
+
+    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
+    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+
+    let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
+
+    let result_json = match validate_declaration(&decl, &ceiling, &role_caps, handle) {
+        Ok(scoped) => {
+            let granted: Vec<String> = scoped
+                .allowed_capabilities()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            serde_json::json!({
+                "valid": true,
+                "granted_capabilities": granted,
+                "error": null,
+                "app_did": decl.app_id.to_string()
+            })
+        }
+        Err(e) => {
+            serde_json::json!({
+                "valid": false,
+                "granted_capabilities": [],
+                "error": e.to_string(),
+                "app_did": decl.app_id.to_string()
+            })
+        }
+    };
+
+    serde_json::to_string(&result_json)
+        .map_err(|e| PyRuntimeError::new_err(format!("serialization failed: {e}")))
+}
+
+/// Checks whether a given capability is allowed for an app binding.
+///
+/// Returns `True` if the capability is granted, `False` otherwise.
+#[pyfunction]
+fn py_check_scoped_capability(
+    granted_capabilities: Vec<String>,
+    required_capability: String,
+) -> bool {
+    use scp_core::context::roles::Capability;
+
+    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
+    let required = Capability::new(&required_capability);
+
+    if granted.contains(&required) {
+        return true;
+    }
+    // `ToolInvokeAll` covers any `ToolInvoke(specific)`
+    if matches!(&required, Capability::ToolInvoke(_))
+        && granted.contains(&Capability::ToolInvokeAll)
+    {
+        return true;
+    }
+    false
+}
+
 /// Registers all context bridge types and functions with the Python module.
 ///
 /// Called from `lib.rs` during module initialization.
@@ -2576,6 +2661,9 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_context_handle_ttl_expiry, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_propose_ttl_extension, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_reset_ttl_timer, m)?)?;
+    // App sandboxing (#595)
+    m.add_function(wrap_pyfunction!(py_validate_capability_declaration, m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_scoped_capability, m)?)?;
     Ok(())
 }
 

@@ -3,4 +3,6 @@ cognitive-complexity-threshold = 25
 # stack for the TestDescAndFn array (~3600 tests). This exceeds the default
 # 512 KiB threshold but is safe — test binaries run on threads with ample
 # stack space. Raising the threshold avoids a false positive on generated code.
-stack-size-threshold = 750000
+# Increased from 750000 to 800000 after app sandboxing tests (#595) added ~100
+# new test functions to scp-core.
+stack-size-threshold = 800000

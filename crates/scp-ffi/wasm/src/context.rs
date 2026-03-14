@@ -1137,6 +1137,153 @@ pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u3
 }
 
 // ---------------------------------------------------------------------------
+// App Sandboxing (#595, spec §8.4.1, §8.4.2)
+// ---------------------------------------------------------------------------
+
+/// Validates a capability declaration JSON string against a context ceiling and
+/// role capabilities. Returns a JSON string with validation result.
+///
+/// The declaration JSON must be a valid `CapabilityDeclaration` per spec §8.4.1.
+/// WASM bridge performs structural + capability validation but delegates
+/// signature verification to the caller (Ed25519 verification via `WebCrypto`).
+///
+/// Result JSON: `{ valid, grantedCapabilities, error, appDid }`.
+///
+/// # Errors
+///
+/// Returns `JsError` if the declaration JSON is malformed or serialization fails.
+#[wasm_bindgen]
+pub fn sandbox_validate_declaration(
+    declaration_json: String,
+    ceiling_capabilities: Vec<String>,
+    role_capabilities: Vec<String>,
+) -> Result<String, JsError> {
+    use std::collections::HashSet;
+
+    let decl: serde_json::Value = serde_json::from_str(&declaration_json)
+        .map_err(|e| JsError::new(&format!("invalid declaration JSON: {e}")))?;
+
+    let app_did = decl
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+
+    // Structural validation.
+    let app_name = decl.get("app_name").and_then(|v| v.as_str()).unwrap_or("");
+    if app_name.is_empty() || app_name.len() > 128 {
+        let result = serde_json::json!({
+            "valid": false,
+            "grantedCapabilities": [],
+            "error": "invalid app_name: must be 1-128 UTF-8 bytes",
+            "appDid": app_did
+        });
+        return serde_json::to_string(&result)
+            .map_err(|e| JsError::new(&format!("serialization failed: {e}")));
+    }
+
+    let capabilities = decl
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if capabilities.is_empty() || capabilities.len() > 64 {
+        let result = serde_json::json!({
+            "valid": false,
+            "grantedCapabilities": [],
+            "error": "capabilities must have 1-64 entries",
+            "appDid": app_did
+        });
+        return serde_json::to_string(&result)
+            .map_err(|e| JsError::new(&format!("serialization failed: {e}")));
+    }
+
+    // Extract requested capabilities from declaration.
+    let mut requested: Vec<String> = Vec::new();
+    for cap_entry in &capabilities {
+        let resource = cap_entry
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let actions = cap_entry
+            .get("actions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let category = resource.rsplit('/').next().unwrap_or(resource);
+        let parts: Vec<&str> = resource.split('/').collect();
+        let is_tool = parts.len() >= 2 && parts[parts.len() - 2] == "tools";
+
+        for action_val in &actions {
+            let action = action_val.as_str().unwrap_or("");
+            let cap_name = match (category, action, is_tool) {
+                (_, "invoke", true) => format!("tool:invoke:{category}"),
+                ("messaging" | "members", "read", _) => "messages:read".to_owned(),
+                ("messaging", "write", _) => "messages:write".to_owned(),
+                ("tools", "invoke", _) => "tool:invoke:*".to_owned(),
+                ("governance", "write", _) => "governance:propose".to_owned(),
+                _ => format!("{category}:{action}"),
+            };
+            requested.push(cap_name);
+        }
+    }
+
+    // All-or-nothing ceiling + role check.
+    let ceiling_set: HashSet<&str> = ceiling_capabilities.iter().map(String::as_str).collect();
+    let role_set: HashSet<&str> = role_capabilities.iter().map(String::as_str).collect();
+
+    for cap in &requested {
+        let in_ceiling = ceiling_set.contains(cap.as_str())
+            || (cap.starts_with("tool:invoke:") && ceiling_set.contains("tool:invoke:*"));
+        let in_role = role_set.contains(cap.as_str())
+            || (cap.starts_with("tool:invoke:") && role_set.contains("tool:invoke:*"));
+
+        if !in_ceiling || !in_role {
+            let result = serde_json::json!({
+                "valid": false,
+                "grantedCapabilities": [],
+                "error": format!("capability denied: {cap}"),
+                "appDid": app_did
+            });
+            return serde_json::to_string(&result)
+                .map_err(|e| JsError::new(&format!("serialization failed: {e}")));
+        }
+    }
+
+    let result = serde_json::json!({
+        "valid": true,
+        "grantedCapabilities": requested,
+        "error": null,
+        "appDid": app_did
+    });
+    serde_json::to_string(&result).map_err(|e| JsError::new(&format!("serialization failed: {e}")))
+}
+
+/// Checks whether a given capability is allowed for an app binding.
+#[wasm_bindgen]
+pub fn sandbox_check_capability(
+    granted_capabilities: Vec<String>,
+    required_capability: String,
+) -> bool {
+    use std::collections::HashSet;
+
+    let granted: HashSet<&str> = granted_capabilities.iter().map(String::as_str).collect();
+
+    if granted.contains(required_capability.as_str()) {
+        return true;
+    }
+    // ToolInvokeAll covers any specific ToolInvoke.
+    if required_capability.starts_with("tool:invoke:")
+        && required_capability != "tool:invoke:*"
+        && granted.contains("tool:invoke:*")
+    {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Bridge-level validation helpers
 // ---------------------------------------------------------------------------
 

@@ -1013,3 +1013,76 @@ export class Context implements AsyncDisposable {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
+// ---------------------------------------------------------------------------
+
+/** Result of validating a capability declaration. */
+export interface DeclarationValidationResult {
+  valid: boolean;
+  grantedCapabilities: string[];
+  error: string | null;
+  appDid: string;
+}
+
+/**
+ * Capability-restricted context handle (spec §8.4.2).
+ *
+ * Wraps a `Context` with a whitelist of allowed capabilities. All protocol
+ * operations must check the whitelist before proceeding. An app cannot access
+ * protocol operations beyond its declared capabilities.
+ *
+ * Once created, a `ScopedHandle` cannot gain additional capabilities
+ * (no escalation guarantee, spec 8.4.2 rule 4).
+ */
+export class ScopedHandle {
+  readonly context: Context;
+  readonly grantedCapabilities: string[];
+  readonly appDid: string;
+
+  constructor(
+    context: Context,
+    grantedCapabilities: string[],
+    appDid: string,
+  ) {
+    this.context = context;
+    this.grantedCapabilities = grantedCapabilities;
+    this.appDid = appDid;
+  }
+
+  /** Check whether a given capability is allowed. */
+  hasCapability(capability: string): boolean {
+    const bridge = getBridge();
+    return bridge.checkScopedCapability(this.grantedCapabilities, capability);
+  }
+
+  /** Throws `ContextError` if the capability is not granted. */
+  checkCapability(capability: string): void {
+    if (!this.hasCapability(capability)) {
+      throw new ContextError(
+        `capability denied: ${capability} not granted to app ${this.appDid}`,
+        "SCP-SANDBOX-8001",
+      );
+    }
+  }
+}
+
+/**
+ * Validates a capability declaration against a context ceiling and role capabilities.
+ *
+ * Returns a result object with validation outcome. See spec §8.4.1.
+ */
+export async function validateCapabilityDeclaration(
+  declarationJson: string,
+  ceilingCapabilities: string[],
+  roleCapabilities: string[],
+): Promise<DeclarationValidationResult> {
+  const bridge = getBridge();
+  const resultJson = bridge.validateCapabilityDeclaration(
+    declarationJson,
+    ceilingCapabilities,
+    roleCapabilities,
+  );
+  return JSON.parse(resultJson) as DeclarationValidationResult;
+}

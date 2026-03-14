@@ -432,6 +432,23 @@ pub enum ContextEvent {
         /// The MLS epoch at the time of detection, if applicable.
         resulting_epoch: Option<u64>,
     },
+    /// An app was bound to the context (spec §8.4.2).
+    ///
+    /// Recorded in the event log for auditability. Context members can
+    /// inspect which apps are bound and what capabilities they hold.
+    AppBound {
+        /// The DID of the app that was bound.
+        app_did: DID,
+        /// The capabilities granted to the app.
+        capabilities: Vec<super::roles::Capability>,
+    },
+    /// An app was unbound from the context (spec §8.4.2).
+    ///
+    /// Recorded in the event log when an app is removed.
+    AppUnbound {
+        /// The DID of the app that was unbound.
+        app_did: DID,
+    },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.
