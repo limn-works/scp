@@ -446,3 +446,50 @@ public func migrateIdentity(
 ) async throws -> Identity {
     try await migrateFn(identity)
 }
+
+// MARK: - Recovery and Custody Migration
+
+/// Executes the compromise recovery protocol for an identity.
+///
+/// Runs the 6-step recovery protocol from spec section 9.12.
+///
+/// - Parameters:
+///   - did: The DID string to recover.
+///   - tier: Compromise tier: `"agent"`, `"active_signing"`, or `"identity_key"`.
+///   - contextIds: Context IDs where this DID is a member.
+/// - Returns: JSON string with the recovery result.
+/// - Throws: ``ScpError/Identity(message:code:)`` if recovery fails.
+///
+/// ## Provenance
+///
+/// - Spec section 9.12 (Compromise Recovery)
+public func executeRecovery(
+    did: String,
+    tier: String,
+    contextIds: [String] = []
+) async throws -> String {
+    try await identityExecuteRecovery(did: did, tier: tier, contextIds: contextIds)
+}
+
+/// Executes the custody migration protocol for an identity.
+///
+/// Runs the 5-step migration protocol from spec section 3.2.1.
+///
+/// - Parameters:
+///   - did: The DID string to migrate.
+///   - target: Target custody type: `"platform_managed"`, `"hardware"`,
+///     `"software"`, or `"in_memory"`.
+///   - contextIds: Context IDs where this DID is a member.
+/// - Returns: JSON string with the migration result.
+/// - Throws: ``ScpError/Identity(message:code:)`` if migration fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3.2.1 (Key Custody Migration Protocol)
+public func executeCustodyMigration(
+    did: String,
+    target: String,
+    contextIds: [String] = []
+) async throws -> String {
+    try await identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
+}

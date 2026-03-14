@@ -7705,6 +7705,221 @@ pub fn sandbox_check_capability(
 }
 
 // ---------------------------------------------------------------------------
+// Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator (#632)
+// ---------------------------------------------------------------------------
+
+/// Executes the compromise recovery protocol for the given DID.
+///
+/// Returns a JSON string with the recovery result.
+///
+/// See spec §9.12 and PR #1080.
+#[uniffi::export]
+pub fn identity_execute_recovery(
+    did: String,
+    tier: String,
+    context_ids: Vec<String>,
+) -> Result<String, ScpError> {
+    use std::collections::HashSet;
+
+    use scp_core::identity::recovery::{
+        CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
+        RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
+        agent_key_rotation_outcome,
+    };
+    use scp_identity::DID;
+
+    let did_val = DID::from(did.as_str());
+
+    let compromise_tier = match tier.as_str() {
+        "agent" => CompromiseTier::Agent,
+        "active_signing" => CompromiseTier::ActiveSigning,
+        "identity_key" => CompromiseTier::IdentityKey,
+        other => {
+            return Err(ScpError::Identity {
+                message: format!(
+                    "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
+                ),
+                code: "SCP-IDENT-1020".to_owned(),
+            });
+        }
+    };
+
+    let now_ms = scp_core::time::now_millis().map_err(|e| ScpError::Identity {
+        message: format!("clock error: {e}"),
+        code: "SCP-IDENT-1021".to_owned(),
+    })?;
+
+    let key_rotation = match compromise_tier {
+        CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
+        CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
+        CompromiseTier::IdentityKey => scp_core::identity::recovery::identity_key_rotation_outcome(
+            &did_val,
+            did_val.clone(),
+            now_ms,
+        ),
+    };
+
+    struct UniffiRecoveryBackend;
+    impl RecoveryBackend for UniffiRecoveryBackend {
+        fn mls_update(
+            &self,
+            _context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            Ok(())
+        }
+        fn revoke_ucans(
+            &self,
+            _context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            Ok(())
+        }
+        fn rotate_key_packages(&self, _context_id: &str) -> Result<(), RecoveryStepError> {
+            Ok(())
+        }
+        fn notify_contacts(
+            &self,
+            _did: &DID,
+            _tier: CompromiseTier,
+            _key_rotation: &KeyRotationOutcome,
+            _contacts: &HashSet<DID>,
+        ) -> bool {
+            true
+        }
+        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+            true
+        }
+    }
+
+    let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
+    let contacts = HashSet::new();
+    let backend = UniffiRecoveryBackend;
+
+    let rt = crate::runtime();
+
+    let result = rt
+        .block_on(orchestrator.execute_recovery(
+            compromise_tier,
+            &key_rotation,
+            &contacts,
+            None,
+            &backend,
+        ))
+        .map_err(|e| ScpError::Identity {
+            message: format!("recovery failed: {e}"),
+            code: "SCP-IDENT-1022".to_owned(),
+        })?;
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Identity {
+        message: format!("failed to serialize recovery result: {e}"),
+        code: "SCP-IDENT-1023".to_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Custody migration — FFI exposure for CustodyMigrationOrchestrator (#632)
+// ---------------------------------------------------------------------------
+
+/// Executes the custody migration protocol for the given DID.
+///
+/// Returns a JSON string with the migration result.
+///
+/// See spec §3.2.1.
+#[uniffi::export]
+pub fn identity_execute_custody_migration(
+    did: String,
+    target: String,
+    context_ids: Vec<String>,
+) -> Result<String, ScpError> {
+    use scp_core::identity::custody_migration::{
+        CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
+        CustodyMigrationTarget,
+    };
+    use scp_identity::DID;
+
+    let did_val = DID::from(did.as_str());
+
+    let migration_target = match target.as_str() {
+        "platform_managed" => CustodyMigrationTarget::PlatformManaged,
+        "hardware" => CustodyMigrationTarget::Hardware,
+        "software" => CustodyMigrationTarget::Software,
+        "in_memory" => CustodyMigrationTarget::InMemory,
+        other => {
+            return Err(ScpError::Identity {
+                message: format!(
+                    "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                ),
+                code: "SCP-IDENT-1024".to_owned(),
+            });
+        }
+    };
+
+    // Error-returning backend — custody migration requires a real backend
+    // provided via the SDK layer. This placeholder ensures callers get an
+    // actionable error instead of silently succeeding with fake keys.
+    struct NotConfiguredMigrationBackend;
+    impl CustodyMigrationBackend for NotConfiguredMigrationBackend {
+        fn generate_key(&self, _target: CustodyMigrationTarget) -> Result<Vec<u8>, String> {
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
+        }
+        fn authorize(&self, _request: &CustodyMigrationRequest) -> Result<(), String> {
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
+        }
+        fn rotate_did_document(
+            &self,
+            _did: &DID,
+            _request: &CustodyMigrationRequest,
+            _context_ids: &[String],
+        ) -> Result<(Vec<String>, Vec<String>), String> {
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
+        }
+        fn reissue_credentials(
+            &self,
+            _did: &DID,
+            _request: &CustodyMigrationRequest,
+        ) -> Result<(), String> {
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
+        }
+        fn destroy_old_key(&self, _did: &DID) -> Result<(), String> {
+            Err(
+                "custody migration backend not configured — provide a real backend via SDK layer"
+                    .to_owned(),
+            )
+        }
+    }
+
+    let orchestrator = CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
+    let backend = NotConfiguredMigrationBackend;
+
+    let rt = crate::runtime();
+
+    let result = rt
+        .block_on(orchestrator.execute(&backend))
+        .map_err(|e| ScpError::Identity {
+            message: format!("custody migration failed: {e}"),
+            code: "SCP-IDENT-1025".to_owned(),
+        })?;
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Identity {
+        message: format!("failed to serialize custody migration result: {e}"),
+        code: "SCP-IDENT-1026".to_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

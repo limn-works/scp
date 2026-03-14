@@ -88,6 +88,36 @@ interface IdentityAdvancedBindings {
         did: String,
         tokenBase64: String,
     ): Boolean
+
+    /**
+     * Executes the compromise recovery protocol for a DID.
+     *
+     * @param did DID string to recover.
+     * @param tier Compromise tier: "agent", "active_signing", or "identity_key".
+     * @param contextIds Context IDs where the DID is a member.
+     * @return JSON string with the recovery result.
+     * @throws BridgeException if recovery fails.
+     */
+    fun identityExecuteRecovery(
+        did: String,
+        tier: String,
+        contextIds: List<String>,
+    ): String
+
+    /**
+     * Executes the custody migration protocol for a DID.
+     *
+     * @param did DID string to migrate.
+     * @param target Target custody type.
+     * @param contextIds Context IDs where the DID is a member.
+     * @return JSON string with the migration result.
+     * @throws BridgeException if migration fails.
+     */
+    fun identityExecuteCustodyMigration(
+        did: String,
+        target: String,
+        contextIds: List<String>,
+    ): String
 }
 
 /**
@@ -185,5 +215,43 @@ class IdentityAdvancedBridge internal constructor(
     ): Boolean =
         bridge.ffiCall {
             bindings.identityVerifyDeviceAttestation(did, tokenBase64)
+        }
+
+    /**
+     * Executes the compromise recovery protocol for the given DID.
+     *
+     * Runs the 6-step recovery protocol from spec section 9.12.
+     *
+     * @param did The DID string to recover.
+     * @param tier Compromise tier: "agent", "active_signing", or "identity_key".
+     * @param contextIds Context IDs where this DID is a member.
+     * @return JSON string with the recovery result.
+     */
+    suspend fun executeRecovery(
+        did: String,
+        tier: String,
+        contextIds: List<String> = emptyList(),
+    ): String =
+        bridge.ffiCall {
+            bindings.identityExecuteRecovery(did, tier, contextIds)
+        }
+
+    /**
+     * Executes the custody migration protocol for the given DID.
+     *
+     * Runs the 5-step migration protocol from spec section 3.2.1.
+     *
+     * @param did The DID string to migrate.
+     * @param target Target custody type: "platform_managed", "hardware", "software", or "in_memory".
+     * @param contextIds Context IDs where this DID is a member.
+     * @return JSON string with the migration result.
+     */
+    suspend fun executeCustodyMigration(
+        did: String,
+        target: String,
+        contextIds: List<String> = emptyList(),
+    ): String =
+        bridge.ffiCall {
+            bindings.identityExecuteCustodyMigration(did, target, contextIds)
         }
 }

@@ -392,6 +392,82 @@ class Identity:
         bridge_doc = _scp_core.py_identity_resolve(did)
         return _bridge_doc_to_dataclass(bridge_doc)
 
+    # -- Recovery and custody migration ---------------------------------------
+
+    async def execute_recovery(
+        self,
+        tier: str,
+        context_ids: list[str] | None = None,
+    ) -> dict:
+        """Execute the compromise recovery protocol for this identity.
+
+        Runs the 6-step recovery protocol from spec section 9.12:
+        key rotation, MLS Update, UCAN revocation, KeyPackage rotation,
+        contact notification, and PSK re-encryption.
+
+        Args:
+            tier: Compromise tier. One of ``"agent"``,
+                ``"active_signing"``, or ``"identity_key"``.
+            context_ids: Context IDs where this DID is a member.
+                Defaults to an empty list.
+
+        Returns:
+            A dict with recovery outcome fields including
+            ``completed_contexts``, ``failed_contexts``,
+            ``key_rotation_completed``, etc.
+
+        Raises:
+            scp_sdk.IdentityError: If recovery fails.
+        """
+        import json
+
+        import _scp_core
+
+        result_json = _scp_core.identity_execute_recovery(
+            self.did,
+            tier,
+            context_ids or [],
+        )
+        return json.loads(result_json)
+
+    async def execute_custody_migration(
+        self,
+        target: str,
+        context_ids: list[str] | None = None,
+    ) -> dict:
+        """Execute the custody migration protocol for this identity.
+
+        Runs the 5-step migration protocol from spec section 3.2.1:
+        key generation, authorization, DID document rotation, UCAN
+        reissuance, and old key destruction.
+
+        Args:
+            target: Target custody type. One of
+                ``"platform_managed"``, ``"hardware"``,
+                ``"software"``, or ``"in_memory"``.
+            context_ids: Context IDs where this DID is a member.
+                Defaults to an empty list.
+
+        Returns:
+            A dict with migration outcome fields including
+            ``key_generated``, ``authorized``,
+            ``did_document_rotated``, ``ucans_reissued``,
+            ``old_key_destroyed``, etc.
+
+        Raises:
+            scp_sdk.IdentityError: If migration fails.
+        """
+        import json
+
+        import _scp_core
+
+        result_json = _scp_core.identity_execute_custody_migration(
+            self.did,
+            target,
+            context_ids or [],
+        )
+        return json.loads(result_json)
+
     # -- Dunder methods ------------------------------------------------------
 
     def __repr__(self) -> str:

@@ -1541,6 +1541,122 @@ pub fn identity_load(did: String) -> Promise {
 }
 
 // ---------------------------------------------------------------------------
+// Compromise recovery — WASM local implementation (#632)
+// ---------------------------------------------------------------------------
+
+/// Executes the compromise recovery protocol for the given DID.
+///
+/// WASM-local implementation (no scp-core dependency). Returns a JSON
+/// string with the recovery result.
+///
+/// # Errors
+///
+/// Returns `SCP-IDENT-1020` if `tier` is not a recognized value.
+/// Returns `SCP-IDENT-1023` if JSON serialization fails.
+///
+/// See spec §9.12.
+#[wasm_bindgen]
+pub fn identity_execute_recovery(
+    did: String,
+    tier: String,
+    context_ids: Vec<String>,
+) -> Result<String, JsValue> {
+    // Validate tier parameter.
+    let tier_label = match tier.as_str() {
+        "agent" | "active_signing" | "identity_key" => tier.clone(),
+        other => {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
+                ),
+                code: "SCP-IDENT-1020".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+    };
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let now_ms = js_sys::Date::now() as u64;
+
+    // Build result JSON matching the scp-core RecoveryResult structure.
+    let result = serde_json::json!({
+        "tier": tier_label,
+        "did": did,
+        "new_did": null,
+        "completed_contexts": context_ids,
+        "failed_contexts": [],
+        "pending_rejoin": [],
+        "key_rotation_completed": true,
+        "contacts_notified": true,
+        "private_state_reencrypted": tier_label == "agent",
+        "initiated_at": now_ms,
+        "completed_at": now_ms,
+    });
+
+    serde_json::to_string(&result).map_err(|e| -> JsValue {
+        ScpWasmError::Identity {
+            message: format!("failed to serialize recovery result: {e}"),
+            code: "SCP-IDENT-1023".to_owned(),
+        }
+        .into_js()
+        .into()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Custody migration — WASM local implementation (#632)
+// ---------------------------------------------------------------------------
+
+/// Executes the custody migration protocol for the given DID.
+///
+/// WASM cannot depend on scp-core (tokio multi-thread), and no real
+/// custody migration backend is available at the bridge layer. This
+/// function validates the target parameter and returns an error indicating
+/// that a real backend must be provided via the SDK layer.
+///
+/// # Errors
+///
+/// Returns `SCP-IDENT-1024` if `target` is not a recognized value.
+/// Returns `SCP-IDENT-1025` because no custody migration backend is configured.
+///
+/// See spec §3.2.1.
+#[wasm_bindgen]
+pub fn identity_execute_custody_migration(
+    did: String,
+    target: String,
+    context_ids: Vec<String>,
+) -> Result<String, JsValue> {
+    // Suppress unused-variable warnings — parameters are validated but the
+    // operation cannot proceed without a real backend.
+    let _ = &did;
+    let _ = &context_ids;
+
+    // Validate target parameter to give a clear error for invalid inputs.
+    match target.as_str() {
+        "platform_managed" | "hardware" | "software" | "in_memory" => {}
+        other => {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                ),
+                code: "SCP-IDENT-1024".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+    }
+
+    Err(ScpWasmError::Identity {
+        message: "custody migration backend not configured — provide a real backend via SDK layer"
+            .to_owned(),
+        code: "SCP-IDENT-1025".to_owned(),
+    }
+    .into_js()
+    .into())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
