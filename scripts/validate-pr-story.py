@@ -22,17 +22,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-REQUIRED_STORY_FIELDS = [
-    "id", "title", "gate", "priority", "severity", "status",
-    "files", "description", "acceptanceCriteria", "actionItems",
-    "blockedBy", "sources", "details",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -104,21 +97,6 @@ def extract_checked_ac(body: str) -> tuple[list[str], list[str]]:
     return checked, unchecked
 
 
-def extract_pr_files(body: str) -> list[str]:
-    """Extract files listed under 'Added/Modified (in this PR)' section."""
-    files: list[str] = []
-    m = re.search(
-        r"### Added/Modified.*?\n(.*?)(?=\n## |\n### |\Z)",
-        body, re.DOTALL
-    )
-    if m:
-        for line in m.group(1).splitlines():
-            line = line.strip().lstrip("- `").rstrip("`").strip()
-            if line and not line.startswith("_"):
-                files.append(line)
-    return files
-
-
 # ---------------------------------------------------------------------------
 # Story lookup
 # ---------------------------------------------------------------------------
@@ -143,12 +121,6 @@ def find_story(story_id: str) -> tuple[dict | None, str | None]:
             continue
 
     return None, None
-
-
-def find_story_status(story_id: str) -> str:
-    """Get the status of a story by ID."""
-    story, _ = find_story(story_id)
-    return story.get("status", "unknown") if story else "not-found"
 
 
 def collect_all_stories() -> dict[str, dict]:

@@ -24,7 +24,7 @@ jobs:
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          RESULT=$(echo "$ISSUE_BODY" | python3 scripts/validate-issue-story.py) || true
+          RESULT=$(printf '%s' "$ISSUE_BODY" | python3 scripts/validate-issue-story.py) || true
           echo "$RESULT" > /tmp/validation-result.json
 
           # Extract report for the comment

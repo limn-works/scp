@@ -182,7 +182,7 @@ jobs:
 
             ## Perspectives
 
-            Review the PR from these 5 perspectives. For each, read the agent file first:
+            Review the PR from these 6 perspectives. For each, read the agent file first:
 
             ### 1. Architecture (read `.claude/agents/architecture-reviewer.md`)
             - Completeness, scalability, maintainability

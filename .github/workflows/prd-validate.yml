@@ -143,9 +143,9 @@ jobs:
             For each story in scope, check ALL of these (from `.docs/standards/prd.md`):
 
             ### Structure
-            - All 14 required fields present (`id`, `title`, `gate`, `priority`,
+            - All 13 required fields present (`id`, `title`, `gate`, `priority`,
               `severity`, `status`, `files`, `description`, `acceptanceCriteria`,
-              `actionItems`, `blockedBy`, `tools`, `sources`, `details`)
+              `actionItems`, `blockedBy`, `sources`, `details`)
             - `priority` is P0/P1/P2; `severity` is critical/major/moderate/minor;
               `status` is pending/in-progress/done
             - `id` follows PREFIX-NNN format (zero-padded 3 digits)

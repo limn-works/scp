@@ -35,13 +35,6 @@ REQUIRED_STORY_FIELDS = [
 VALID_PRIORITIES = {"P0", "P1", "P2"}
 VALID_SEVERITIES = {"critical", "major", "moderate", "minor"}
 VALID_STATUSES = {"pending", "in-progress", "done"}
-VALID_PRD_FILES = {
-    "agent-binding", "bridge-cooperative", "capability-registry",
-    "content-access", "governance-gaps", "governance-integration",
-    "http-features", "main", "participation-admission", "persistence",
-    "reachability", "transport-expansion",
-}
-
 ID_PATTERN = re.compile(r"^[A-Z]+-\d{3}$")
 
 
