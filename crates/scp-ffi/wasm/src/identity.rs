@@ -1665,8 +1665,9 @@ pub(crate) mod test_helpers {
     use super::*;
 
     /// Register an Ed25519 identity with a separate agent key in
-    /// `IDENTITY_REGISTRY`. Returns `(did, agent_signing_key)` so callers can
-    /// produce real Ed25519 signatures under the agent VM (`kid: "#agent"`).
+    /// `IDENTITY_REGISTRY`. Returns `(did, identity_signing_key, agent_signing_key)`
+    /// so callers can produce real Ed25519 signatures under the identity VM
+    /// (`kid: "#0"`) or agent VM (`kid: "#agent"`).
     ///
     /// Used by `ucan::tests` for E2E integration tests that exercise the full
     /// `validate_ucan_full` pipeline with real cryptography (issue #1012).
