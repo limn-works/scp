@@ -10,7 +10,7 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 **Architecture (post-#386 rewrite):** Context lifecycle is delegated to a shared `Arc<ContextManager>` stored in `OnceLock<Arc<ContextManager>>`. Per-context FFI-specific state lives in `FfiBridgeState` in a `OnceLock<DashMap<String, FfiBridgeState>>`.
 
-**ContextManager (shared):** Owns context lifecycle state — membership, roles, governance, broadcast, TTL. All `py_context_*` functions delegate to `ContextManager::create_context`, `join_context`, `leave_context`, `close_context`, `send_message`. Initialized via `init_context_manager()` with no-op providers at bridge layer.
+**ContextManager (shared):** Owns context lifecycle state — membership, roles, governance, broadcast, TTL. All `py_context_*` functions delegate to `ContextManager::create_context`, `join_context`, `leave_context`, `close_context`, `send_message`. Initialized via `init_context_manager()` with production-appropriate providers: `NoOpCryptoProvider` (bridge-layer crypto uses `KeyCustody`), `NotConfiguredTransportProvider` (returns descriptive errors until relay is configured via `transport_connect`), `NoOpEventLogProvider` (bridge-level `EventLog` instances handle Merkle ops), and a `not_configured_key_resolver` that logs errors on every lookup rather than silently skipping verification (#501).
 
 **FfiBridgeState (per-context, FFI-only):** Does NOT duplicate ContextManager state:
 - `ToolRegistry` — tool registration/invocation

@@ -14,7 +14,7 @@ delegate to a shared `Arc<ContextManager>` initialized once via `OnceLock` in `r
 
 The `ContextManager` is constructed with bridge-local provider implementations:
 - `NapiBridgeCryptoProvider` — no-op MLS/sender-key operations
-- `NapiBridgeTransportProvider` — reports connected, no-op send
+- `NotConfiguredTransportProvider` (from `scp-core`) — returns descriptive errors until relay configured (#501)
 - `MerkleEventLogProvider` — persistent Merkle-chained event log backed by
   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484)
 - `NapiBridgePersistence` — in-memory `DashMap`-backed persistence

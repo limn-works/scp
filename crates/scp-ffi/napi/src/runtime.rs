@@ -10,8 +10,8 @@
 //!
 //! - `NapiBridgeCryptoProvider` — No-op MLS/sender-key operations. Real
 //!   encryption is handled at the SDK layer above the FFI bridge.
-//! - `NapiBridgeTransportProvider` — Reports connected, no-op send/publish.
-//!   Real transport is handled via `NapiTransportManager`.
+//! - `NotConfiguredTransportProvider` (from `scp-core`) — Returns descriptive
+//!   errors until transport is configured. See issue #501.
 //! - `MerkleEventLogProvider` — Persistent Merkle-chained event log backed by
 //!   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484).
 //! - `NapiBridgePersistence` — In-memory persistence via `DashMap`.
@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use dashmap::DashMap;
 use scp_core::context::ContextError;
 use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::providers::MerkleEventLogProvider;
@@ -78,22 +78,22 @@ where
     )));
 }
 
-/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+/// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Governance vote signature verification is not yet wired at the NAPI layer —
-/// the no-op resolver returns `None` for all DIDs, which causes vote
-/// verification to be skipped (permissive mode). A warning is emitted on
-/// first invocation to alert operators.
-fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|_| {
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-        WARN_ONCE.call_once(|| {
-            tracing::warn!(
-                "noop_key_resolver: returning None for all DIDs — \
-                 governance vote signature verification is skipped. \
-                 Wire a production KeyResolver before deploying."
-            );
-        });
+/// Unlike the previous `noop_key_resolver` (which silently returned `None`,
+/// causing governance vote signature verification to be skipped), this
+/// resolver logs a prominent error on every lookup, making it clear that
+/// key resolution is not configured. It still returns `None` (the
+/// `KeyResolver` type signature does not support `Result`), but the error
+/// log ensures the gap is visible rather than silent.
+fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|did| {
+        tracing::error!(
+            did = %did.0,
+            "key resolver not configured — cannot resolve verifying key for DID. \
+             Governance vote signature verification will be skipped for this DID. \
+             Wire a production KeyResolver to enable signature verification."
+        );
         None
     })
 }
@@ -111,7 +111,7 @@ fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
 pub fn context_manager() -> &'static Arc<ContextManager> {
     CONTEXT_MANAGER.get_or_init(|| {
         let crypto = Box::new(NapiBridgeCryptoProvider);
-        let transport = Box::new(NapiBridgeTransportProvider);
+        let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
         let event_log = build_event_log_provider();
         let persistence = Box::new(NapiBridgePersistence::new());
         Arc::new(ContextManager::with_persistence(
@@ -119,7 +119,7 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             transport,
             event_log,
             persistence,
-            noop_key_resolver(),
+            not_configured_key_resolver(),
         ))
     })
 }
@@ -148,6 +148,23 @@ fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
     let store = Arc::new(ProtocolRepository::new(encrypted));
     let bridge = ProtocolRepositoryEventLogBridge::new(store);
     Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+}
+
+/// Test variant of [`context_manager`] initialization that uses
+/// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider) instead of
+/// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider).
+///
+/// Must be called before the first `context_manager()` call in tests.
+/// `OnceLock::get_or_init` ensures only the first initialization wins.
+#[cfg(test)]
+pub(crate) fn init_context_manager_for_test() {
+    let _ = CONTEXT_MANAGER.set(Arc::new(ContextManager::with_persistence(
+        Box::new(NapiBridgeCryptoProvider),
+        Box::new(scp_core::context::LocalTransportProvider),
+        build_event_log_provider(),
+        Box::new(NapiBridgePersistence::new()),
+        not_configured_key_resolver(),
+    )));
 }
 
 // ---------------------------------------------------------------------------
@@ -692,36 +709,13 @@ impl ContextCryptoProvider for NapiBridgeCryptoProvider {
 }
 
 // ---------------------------------------------------------------------------
-// NapiBridgeTransportProvider — no-op transport
+// Transport provider — uses NotConfiguredTransportProvider from scp-core
 // ---------------------------------------------------------------------------
-
-/// Bridge transport provider for the NAPI layer.
-///
-/// Reports connected and succeeds all operations. Real transport is
-/// managed by `NapiTransportManager` at the SDK layer.
-struct NapiBridgeTransportProvider;
-
-impl ContextTransportProvider for NapiBridgeTransportProvider {
-    fn is_connected(&self) -> bool {
-        true
-    }
-
-    fn publish_context(
-        &self,
-        _context_id: &[u8; 32],
-        _params: &scp_core::context::ContextParams,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn send_message(&self, _context_id: &[u8; 32], _encrypted: &[u8]) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
+//
+// The NAPI bridge uses `scp_core::context::NotConfiguredTransportProvider`
+// instead of a bridge-local no-op. This returns descriptive errors when
+// transport operations are attempted without configuring a relay, rather
+// than silently succeeding. See issue #501.
 
 // NapiBridgeEventLogProvider removed — replaced by MerkleEventLogProvider
 // with ProtocolRepositoryEventLogBridge persistence (issue #484).

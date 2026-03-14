@@ -1865,6 +1865,7 @@ mod tests {
     /// creator); after a join it becomes 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
+        crate::runtime::init_context_manager_for_test();
         let manager = context_manager();
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
@@ -1973,6 +1974,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
+        crate::runtime::init_context_manager_for_test();
         let manager = context_manager();
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
@@ -2033,6 +2035,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
+        crate::runtime::init_context_manager_for_test();
         let manager = context_manager();
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
@@ -2084,6 +2087,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
+        crate::runtime::init_context_manager_for_test();
         let manager = context_manager();
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";

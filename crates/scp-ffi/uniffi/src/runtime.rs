@@ -28,12 +28,12 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use scp_core::context::ContextError;
 use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
 };
 use scp_core::context::manager::ContextManager;
 use scp_core::context::providers::MerkleEventLogProvider;
-use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -83,22 +83,22 @@ where
     )));
 }
 
-/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+/// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Governance vote signature verification is not yet wired at the `UniFFI` layer —
-/// the no-op resolver returns `None` for all DIDs, which causes vote
-/// verification to be skipped (permissive mode). A warning is emitted on
-/// first invocation to alert operators.
-fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|_| {
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-        WARN_ONCE.call_once(|| {
-            tracing::warn!(
-                "noop_key_resolver: returning None for all DIDs — \
-                 governance vote signature verification is skipped. \
-                 Wire a production KeyResolver before deploying."
-            );
-        });
+/// Unlike the previous `noop_key_resolver` (which silently returned `None`,
+/// causing governance vote signature verification to be skipped), this
+/// resolver logs a prominent error on every lookup, making it clear that
+/// key resolution is not configured. It still returns `None` (the
+/// `KeyResolver` type signature does not support `Result`), but the error
+/// log ensures the gap is visible rather than silent.
+fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|did| {
+        tracing::error!(
+            did = %did.0,
+            "key resolver not configured — cannot resolve verifying key for DID. \
+             Governance vote signature verification will be skipped for this DID. \
+             Wire a production KeyResolver to enable signature verification."
+        );
         None
     })
 }
@@ -125,9 +125,9 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
         let event_log = build_event_log_provider();
         Arc::new(ContextManager::new(
             Box::new(FfiBridgeCrypto),
-            Box::new(FfiBridgeTransport),
+            Box::new(scp_core::context::NotConfiguredTransportProvider),
             event_log,
-            noop_key_resolver(),
+            not_configured_key_resolver(),
         ))
     })
 }
@@ -488,37 +488,9 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
     }
 }
 
-/// Stub transport provider for the FFI bridge `ContextManager`.
-///
-/// Reports as connected and succeeds on all operations. Real transport
-/// operations are handled by the `TransportManager` and relay adapters.
-struct FfiBridgeTransport;
-
-impl ContextTransportProvider for FfiBridgeTransport {
-    fn is_connected(&self) -> bool {
-        true
-    }
-
-    fn publish_context(
-        &self,
-        _context_id: &[u8; 32],
-        _params: &ContextParams,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn send_message(
-        &self,
-        _context_id: &[u8; 32],
-        _encrypted_payload: &[u8],
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
+// Transport provider: uses `scp_core::context::NotConfiguredTransportProvider`
+// instead of a bridge-local no-op. Returns descriptive errors when transport
+// operations are attempted without configuring a relay. See issue #501.
 
 // FfiBridgeEventLog removed — replaced by MerkleEventLogProvider with
 // ProtocolRepositoryEventLogBridge persistence (issue #484).

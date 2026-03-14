@@ -553,6 +553,59 @@ impl ContextTransportProvider for LocalTransportProvider {
 }
 
 // ---------------------------------------------------------------------------
+// NotConfiguredTransportProvider -- returns errors for unconfigured transport
+// ---------------------------------------------------------------------------
+
+/// [`ContextTransportProvider`] that returns descriptive errors for all operations.
+///
+/// Use this at the FFI bridge layer when no relay transport has been configured.
+/// Unlike [`LocalTransportProvider`] (which silently succeeds), this provider
+/// makes it explicit that transport is not configured — all publish/send/delete
+/// calls return errors, and `is_connected()` returns `false`.
+///
+/// This prevents silent data loss where callers believe messages were sent
+/// successfully when no relay is actually reachable.
+pub struct NotConfiguredTransportProvider;
+
+impl ContextTransportProvider for NotConfiguredTransportProvider {
+    fn is_connected(&self) -> bool {
+        false
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Err(ContextCreationError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before publishing contexts"
+                .to_owned(),
+        ))
+    }
+
+    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Err(ContextCreationError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before deleting published contexts"
+                .to_owned(),
+        ))
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "transport not configured — call transport_connect() to set up a relay \
+             before sending messages"
+                .to_owned(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Opaque resource handles -- represent ownership for rollback tracking
 // ---------------------------------------------------------------------------
 

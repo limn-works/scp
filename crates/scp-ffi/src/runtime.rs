@@ -122,13 +122,16 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     })
 }
 
-/// Initializes the global [`ContextManager`] with mock providers.
+/// Initializes the global [`ContextManager`] with production-appropriate providers.
 ///
-/// Uses no-op mock providers suitable for the current bridge layer where
-/// MLS, transport, and event log are not yet fully wired through the
-/// `ContextManager` path. The bridge-level `EventLog`, `ToolRegistry`, etc.
-/// remain in [`FfiBridgeState`] for subsystem operations (tools.rs, ucan.rs,
-/// `event_log.rs`).
+/// Uses `NoOpCryptoProvider` (crypto operations handled by bridge-level
+/// `KeyCustody` and the `MlsCryptoProvider` singleton), `NotConfiguredTransportProvider`
+/// (returns descriptive errors until transport is configured via `transport_connect`),
+/// and `NoOpEventLogProvider` (bridge-level `EventLog` instances handle Merkle ops).
+///
+/// The key resolver rejects all lookups with an error rather than silently
+/// returning `None`, ensuring governance vote signature verification failures
+/// are visible rather than silently skipped.
 ///
 /// When the global storage provider (`STORAGE_PROVIDER`) has been
 /// initialized via [`init_storage`], a [`ProtocolRepositoryContextBridge`] is
@@ -142,7 +145,7 @@ pub fn init_context_manager() {
         let persistence = build_persistence_provider();
         build_context_manager(
             Box::new(NoOpCryptoProvider),
-            Box::new(LocalTransportProvider),
+            Box::new(NotConfiguredTransportProvider),
             Box::new(NoOpEventLogProvider),
             persistence,
         )
@@ -166,6 +169,27 @@ pub fn init_context_manager_with(
     let _ = CONTEXT_MANAGER.get_or_init(|| {
         let persistence = persistence.or_else(build_persistence_provider);
         build_context_manager(crypto, transport, event_log, persistence)
+    });
+}
+
+/// Test variant of [`init_context_manager`] that uses [`LocalTransportProvider`]
+/// instead of [`NotConfiguredTransportProvider`].
+///
+/// Production code uses `NotConfiguredTransportProvider` to surface errors when
+/// transport is not configured. Tests need `LocalTransportProvider` because
+/// `create_context` checks `is_connected()` and returns `TransportNotConnected`.
+///
+/// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
+/// compile as separate crates and need access to this function.
+pub fn init_context_manager_for_test() {
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let persistence = build_persistence_provider();
+        build_context_manager(
+            Box::new(NoOpCryptoProvider),
+            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(NoOpEventLogProvider),
+            persistence,
+        )
     });
 }
 
@@ -206,13 +230,13 @@ fn build_context_manager(
             transport,
             event_log,
             p,
-            noop_key_resolver(),
+            not_configured_key_resolver(),
         )),
         None => Arc::new(ContextManager::new(
             crypto,
             transport,
             event_log,
-            noop_key_resolver(),
+            not_configured_key_resolver(),
         )),
     }
 }
@@ -260,23 +284,23 @@ where
 // Key resolver helper
 // ---------------------------------------------------------------------------
 
-/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+/// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Governance vote signature verification is not yet wired at the FFI layer —
-/// the no-op resolver returns `None` for all DIDs, which causes vote
-/// verification to be skipped (permissive mode). A warning is emitted on
-/// first invocation to alert operators.
-fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
+/// Unlike the previous `noop_key_resolver` (which silently returned `None`,
+/// causing governance vote signature verification to be skipped), this
+/// resolver logs a prominent error on every lookup, making it clear that
+/// key resolution is not configured. It still returns `None` (the
+/// `KeyResolver` type signature does not support `Result`), but the error
+/// log ensures the gap is visible rather than silent.
+fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     Arc::new(
-        |_: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> {
-            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-            WARN_ONCE.call_once(|| {
-                tracing::warn!(
-                    "noop_key_resolver: returning None for all DIDs — \
-                 governance vote signature verification is skipped. \
-                 Wire a production KeyResolver before deploying."
-                );
-            });
+        |did: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> {
+            tracing::error!(
+                did = %did.0,
+                "key resolver not configured — cannot resolve verifying key for DID. \
+                 Governance vote signature verification will be skipped for this DID. \
+                 Wire a production KeyResolver to enable signature verification."
+            );
             None
         },
     )
@@ -363,8 +387,10 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     }
 }
 
-// Use the production no-op transport from scp-core.
-use scp_core::context::LocalTransportProvider;
+// Use the not-configured transport provider from scp-core (#501).
+// Unlike `LocalTransportProvider` (which silently succeeds), this returns
+// descriptive errors when transport operations are attempted without a relay.
+use scp_core::context::NotConfiguredTransportProvider;
 
 /// No-op event log provider for bridge-layer `ContextManager` initialization.
 struct NoOpEventLogProvider;
@@ -1082,6 +1108,12 @@ pub fn clear_relay_connection() -> Result<(), ScpPyError> {
 /// Returns `ScpPyError::ContextError` if registration fails.
 pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
     // Ensure the ContextManager is initialized.
+    // Tests use LocalTransportProvider so create_context doesn't fail on
+    // the is_connected() check. Production uses NotConfiguredTransportProvider
+    // to surface errors when transport is not configured (#501).
+    #[cfg(test)]
+    init_context_manager_for_test();
+    #[cfg(not(test))]
     init_context_manager();
 
     // Register FFI-specific state.
@@ -1370,9 +1402,9 @@ mod tests {
 
     #[test]
     fn context_manager_initializes_once() {
-        init_context_manager();
+        init_context_manager_for_test();
         let mgr1 = context_manager().unwrap();
-        init_context_manager();
+        init_context_manager_for_test();
         let mgr2 = context_manager().unwrap();
         // Same Arc (same pointer).
         assert!(Arc::ptr_eq(mgr1, mgr2));
