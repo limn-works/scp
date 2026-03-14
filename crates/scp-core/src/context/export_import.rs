@@ -294,6 +294,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         governance_freeze: None,
         pending_ceiling_modification: None,
         mls_epoch: 0,
+        // Epoch coordination records are stripped in public scope —
+        // they are auditable but internal governance state.
+        epoch_coordination_records: Vec::new(),
         // Grace entries are not exported in public scope — they are
         // runtime state that is only meaningful to the local node.
         grace_entries: Vec::new(),
@@ -397,6 +400,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),

@@ -189,6 +189,7 @@ mod tests {
             governance_freeze: None,
             pending_ceiling_modification: None,
             mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),

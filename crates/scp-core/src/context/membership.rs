@@ -480,6 +480,24 @@ pub enum ContextEvent {
         /// Number of events dropped since the last successful consumption.
         dropped_count: u64,
     },
+    /// A governance action execution has triggered checkpoint cosignature
+    /// collection (ADR-031 §9, issue #630).
+    ///
+    /// Emitted after governance actions in multi-admin contexts (Threshold,
+    /// Majority, Unanimity) to notify the SDK that a checkpoint should be
+    /// created and cosignatures collected from governance quorum members.
+    /// `SingleAdmin` contexts do not require cosignatures and will not emit
+    /// this event.
+    CheckpointCosignatureRequired {
+        /// The governance proposal that triggered checkpoint collection.
+        proposal_id: [u8; 32],
+        /// DIDs required to cosign the checkpoint.
+        required_signers: Vec<DID>,
+        /// Minimum cosignature count for `FullyAttested` status.
+        minimum_count: usize,
+        /// The MLS epoch at which the checkpoint should be taken.
+        at_epoch: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
