@@ -241,6 +241,32 @@ struct ContextTests {
         #expect(payloads[0] == payload)
     }
 
+    @Test("send forwards identity to bridge function")
+    func sendForwardsIdentity() async throws {
+        let capturedIdentity = Locked<Identity?>(nil)
+        let handle = MockContextHandle()
+        let identity = Identity(noPointer: .init())
+
+        let sendFn: ContextBridge.SendFn = { _, id, _ in
+            capturedIdentity.withLock { $0 = id }
+        }
+
+        let context = Context(
+            handle: handle,
+            identity: identity,
+            sendFn: sendFn,
+            subscribeFn: { _, _ in },
+            leaveFn: { _, _ in },
+            closeFn: { _, _ in }
+        )
+
+        try await context.send(Data("test".utf8))
+
+        let forwarded = capturedIdentity.current
+        #expect(forwarded != nil)
+        #expect(forwarded === identity)
+    }
+
     @Test("send throws when context is closed")
     func sendThrowsWhenClosed() async throws {
         let context = makeTestContext()
@@ -434,6 +460,32 @@ struct ContextTests {
         #expect(received.count == 1)
     }
 
+    @Test("leave forwards identity to bridge function")
+    func leaveForwardsIdentity() async throws {
+        let capturedIdentity = Locked<Identity?>(nil)
+        let handle = MockContextHandle()
+        let identity = Identity(noPointer: .init())
+
+        let leaveFn: ContextBridge.LeaveFn = { _, id in
+            capturedIdentity.withLock { $0 = id }
+        }
+
+        let context = Context(
+            handle: handle,
+            identity: identity,
+            sendFn: { _, _, _ in },
+            subscribeFn: { _, _ in },
+            leaveFn: leaveFn,
+            closeFn: { _, _ in }
+        )
+
+        try await context.leave()
+
+        let forwarded = capturedIdentity.current
+        #expect(forwarded != nil)
+        #expect(forwarded === identity)
+    }
+
     @Test("leave throws when context is already closed")
     func leaveThrowsWhenClosed() async throws {
         let context = makeTestContext()
@@ -457,6 +509,32 @@ struct ContextTests {
 
         #expect(await context.state == .closed)
         #expect(closeCalled.current)
+    }
+
+    @Test("close forwards identity to bridge function")
+    func closeForwardsIdentity() async throws {
+        let capturedIdentity = Locked<Identity?>(nil)
+        let handle = MockContextHandle()
+        let identity = Identity(noPointer: .init())
+
+        let closeFn: ContextBridge.CloseFn = { _, id in
+            capturedIdentity.withLock { $0 = id }
+        }
+
+        let context = Context(
+            handle: handle,
+            identity: identity,
+            sendFn: { _, _, _ in },
+            subscribeFn: { _, _ in },
+            leaveFn: { _, _ in },
+            closeFn: closeFn
+        )
+
+        try await context.close()
+
+        let forwarded = capturedIdentity.current
+        #expect(forwarded != nil)
+        #expect(forwarded === identity)
     }
 
     @Test("close is idempotent -- calling twice does not throw")
