@@ -38,59 +38,6 @@ fn validate_non_negative_epoch(value: f64) -> Result<u64, ScpWasmError> {
 }
 
 // ---------------------------------------------------------------------------
-// WasmEvent
-// ---------------------------------------------------------------------------
-
-/// A protocol event from the context event log.
-#[wasm_bindgen]
-#[derive(Debug, Clone)]
-pub struct WasmEvent {
-    event_type: String,
-    actor_did: String,
-    timestamp: f64,
-    payload_json: String,
-    sequence: u64,
-}
-
-#[wasm_bindgen]
-impl WasmEvent {
-    /// Returns the event type string (e.g., `"MessageSent"`, `"MemberJoined"`).
-    #[must_use]
-    #[wasm_bindgen(getter, js_name = "eventType")]
-    pub fn event_type(&self) -> String {
-        self.event_type.clone()
-    }
-
-    /// Returns the DID of the actor who produced this event.
-    #[must_use]
-    #[wasm_bindgen(getter, js_name = "actorDid")]
-    pub fn actor_did(&self) -> String {
-        self.actor_did.clone()
-    }
-
-    /// Returns the event timestamp as seconds since the Unix epoch.
-    #[must_use]
-    #[wasm_bindgen(getter)]
-    pub fn timestamp(&self) -> f64 {
-        self.timestamp
-    }
-
-    /// Returns the event payload as a JSON string.
-    #[must_use]
-    #[wasm_bindgen(getter, js_name = "payloadJson")]
-    pub fn payload_json(&self) -> String {
-        self.payload_json.clone()
-    }
-
-    /// Returns the event's sequence number within the log.
-    #[must_use]
-    #[wasm_bindgen(getter)]
-    pub fn sequence(&self) -> u32 {
-        u32::try_from(self.sequence).unwrap_or(u32::MAX)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // WasmProof
 // ---------------------------------------------------------------------------
 
