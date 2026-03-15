@@ -29,18 +29,24 @@ use std::sync::{Arc, OnceLock};
 
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(test)]
+#[cfg(any(test, feature = "allow_in_memory_custody"))]
 use scp_identity::InMemoryDhtClient;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
 use scp_identity::PkarrDhtClient;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 /// DHT client type alias: production builds use [`PkarrDhtClient`] for real
-/// Mainline DHT resolution; test builds use [`InMemoryDhtClient`] to avoid
-/// network I/O and enable deterministic identity roundtrips.
-#[cfg(not(test))]
+/// Mainline DHT resolution; test and `allow_in_memory_custody` builds use
+/// [`InMemoryDhtClient`] to avoid network I/O and enable deterministic
+/// identity roundtrips.
+///
+/// `#[cfg(test)]` alone is insufficient: integration tests (`tests/` directory)
+/// compile the crate as a dependency where `cfg(test)` is false. The
+/// `allow_in_memory_custody` feature (already required by CI for integration
+/// tests) provides the correct gate for both unit and integration test builds.
+#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
 type FfiDhtClient = PkarrDhtClient;
-#[cfg(test)]
+#[cfg(any(test, feature = "allow_in_memory_custody"))]
 type FfiDhtClient = InMemoryDhtClient;
 
 /// Constructs a new [`FfiDhtClient`].
@@ -51,11 +57,11 @@ type FfiDhtClient = InMemoryDhtClient;
 macro_rules! new_ffi_dht_client {
     () => {{
         let result: Result<FfiDhtClient, IdentityError> = {
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "allow_in_memory_custody")))]
             {
                 FfiDhtClient::new()
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "allow_in_memory_custody"))]
             {
                 Ok(FfiDhtClient::new())
             }
