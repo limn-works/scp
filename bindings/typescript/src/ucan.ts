@@ -76,11 +76,7 @@ export async function mintUcan(
  *   Must be the token's issuer or the context creator.
  * @throws {UcanPermissionError} If revocation fails (unauthorized, malformed, etc.).
  */
-export async function revokeUcan(
-  ctx: Context,
-  token: string,
-  revokerDid: string,
-): Promise<void> {
+export async function revokeUcan(ctx: Context, token: string, revokerDid: string): Promise<void> {
   try {
     const bridge = await getBridge();
     await bridge.ucanRevoke(ctx._handle, token, revokerDid);

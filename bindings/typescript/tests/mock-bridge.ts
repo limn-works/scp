@@ -525,7 +525,11 @@ export function createMockBridge(): Bridge & {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, token: string, _revokerDid: string): Promise<void> {
+    async ucanRevoke(
+      handle: BridgeContextHandle,
+      token: string,
+      _revokerDid: string,
+    ): Promise<void> {
       const ctx = getContext(handle);
       ctx.revokedTokens.add(token);
     },
@@ -988,6 +992,128 @@ export function createMockBridge(): Bridge & {
         return null;
       }
       return ctx.broadcastAdmission;
+    },
+
+    // Governance lifecycle (#559)
+    async contextExecuteGovernanceAction(
+      _handle: BridgeContextHandle,
+      _actionJson: string,
+      _proposerDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "executed" });
+    },
+
+    async contextGovernancePropose(
+      _handle: BridgeContextHandle,
+      _actionJson: string,
+      _proposerDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ proposal_id: generateId("proposal") });
+    },
+
+    async contextGovernanceApprove(
+      _handle: BridgeContextHandle,
+      _proposalIdHex: string,
+      _voterDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "approved" });
+    },
+
+    async contextGovernanceReject(
+      _handle: BridgeContextHandle,
+      _proposalIdHex: string,
+      _voterDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "rejected" });
+    },
+
+    async contextGovernanceWithdraw(
+      _handle: BridgeContextHandle,
+      _proposalIdHex: string,
+      _voterDid: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "withdrawn" });
+    },
+
+    async contextGovernanceGetProposal(
+      _handle: BridgeContextHandle,
+      _proposalIdHex: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "pending", votes: [] });
+    },
+
+    async contextGovernanceListProposals(_handle: BridgeContextHandle): Promise<string> {
+      return JSON.stringify([]);
+    },
+
+    async contextApplyPendingCeilingModification(
+      _handle: BridgeContextHandle,
+      _currentTimestamp: number,
+    ): Promise<boolean> {
+      return false;
+    },
+
+    async contextFinalizeClose(handle: BridgeContextHandle): Promise<void> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx !== undefined) {
+        ctx.state = "closed";
+      }
+    },
+
+    async contextCreateGovernanceCheckpoint(
+      _handle: BridgeContextHandle,
+      _checkpointSeq: number,
+      _merkleRootHex: string,
+      _eventCount: number,
+      _lastEventHashHex: string,
+      _stateSnapshotHashHex: string,
+      _creatorDid: string,
+      _creatorSignatureHex: string,
+    ): Promise<string> {
+      return JSON.stringify({ checkpoint_seq: _checkpointSeq, status: "created" });
+    },
+
+    async contextAddCheckpointCosignature(
+      _handle: BridgeContextHandle,
+      _checkpointJson: string,
+      _signerDid: string,
+      _signatureHex: string,
+    ): Promise<string> {
+      return JSON.stringify({ attestation_status: "cosigned" });
+    },
+
+    async contextRestore(_contextId: string): Promise<void> {
+      // Mock: no-op
+    },
+
+    async contextRestoreAll(): Promise<string> {
+      return JSON.stringify([]);
+    },
+
+    // Membership queries
+    async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx === undefined) return null;
+      return ctx.members.size;
+    },
+
+    async contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx === undefined) return false;
+      return ctx.members.has(did);
+    },
+
+    async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
+      const ctx = contexts.get(handle.contextId);
+      if (ctx === undefined) return [];
+      return [...ctx.members];
+    },
+
+    async contextMemberRole(
+      _handle: BridgeContextHandle,
+      _did: string,
+    ): Promise<import("../src/types").MemberRole | null> {
+      return null;
     },
 
     // SCPID authentication (§3.11)

@@ -383,6 +383,80 @@ export function createNativeBridge(): Bridge {
       )(handle, actionJson, proposerDid);
     },
 
+    // Governance lifecycle (#559)
+    async contextApplyPendingCeilingModification(
+      handle: BridgeContextHandle,
+      currentTimestamp: number,
+    ): Promise<boolean> {
+      return await (
+        addon.contextApplyPendingCeilingModification as (
+          h: BridgeContextHandle,
+          t: number,
+        ) => Promise<boolean>
+      )(handle, currentTimestamp);
+    },
+
+    async contextFinalizeClose(handle: BridgeContextHandle): Promise<void> {
+      await (addon.contextFinalizeClose as (h: BridgeContextHandle) => Promise<void>)(handle);
+    },
+
+    async contextCreateGovernanceCheckpoint(
+      handle: BridgeContextHandle,
+      checkpointSeq: number,
+      merkleRootHex: string,
+      eventCount: number,
+      lastEventHashHex: string,
+      stateSnapshotHashHex: string,
+      creatorDid: string,
+      creatorSignatureHex: string,
+    ): Promise<string> {
+      return await (
+        addon.contextCreateGovernanceCheckpoint as (
+          h: BridgeContextHandle,
+          seq: number,
+          root: string,
+          count: number,
+          lastHash: string,
+          stateHash: string,
+          creator: string,
+          sig: string,
+        ) => Promise<string>
+      )(
+        handle,
+        checkpointSeq,
+        merkleRootHex,
+        eventCount,
+        lastEventHashHex,
+        stateSnapshotHashHex,
+        creatorDid,
+        creatorSignatureHex,
+      );
+    },
+
+    async contextAddCheckpointCosignature(
+      handle: BridgeContextHandle,
+      checkpointJson: string,
+      signerDid: string,
+      signatureHex: string,
+    ): Promise<string> {
+      return await (
+        addon.contextAddCheckpointCosignature as (
+          h: BridgeContextHandle,
+          c: string,
+          s: string,
+          sig: string,
+        ) => Promise<string>
+      )(handle, checkpointJson, signerDid, signatureHex);
+    },
+
+    async contextRestore(contextId: string): Promise<void> {
+      await (addon.contextRestore as (id: string) => Promise<void>)(contextId);
+    },
+
+    async contextRestoreAll(): Promise<string> {
+      return await (addon.contextRestoreAll as () => Promise<string>)();
+    },
+
     // Governance proposal lifecycle (#621)
     async contextGovernancePropose(
       handle: BridgeContextHandle,
@@ -677,10 +751,16 @@ export function createNativeBridge(): Bridge {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, token: string, revokerDid: string): Promise<void> {
-      await (
-        addon.ucanRevoke as (h: BridgeContextHandle, t: string, r: string) => Promise<void>
-      )(handle, token, revokerDid);
+    async ucanRevoke(
+      handle: BridgeContextHandle,
+      token: string,
+      revokerDid: string,
+    ): Promise<void> {
+      await (addon.ucanRevoke as (h: BridgeContextHandle, t: string, r: string) => Promise<void>)(
+        handle,
+        token,
+        revokerDid,
+      );
     },
 
     async ucanDelegate(
@@ -1209,6 +1289,262 @@ export function createNativeBridge(): Bridge {
       return (addon.checkScopedCapability as (g: string[], r: string) => boolean)(
         [...grantedCapabilities],
         requiredCapability,
+      );
+    },
+
+    // Invitation evaluation
+    evaluateInvitation(
+      paramsJson: string,
+      inviterDid: string,
+      identityDid: string,
+      policyJson: string | null,
+      spendingJson: string | null,
+      trustedDidsJson: string | null,
+    ) {
+      return (
+        addon.evaluateInvitation as (
+          p: string,
+          i: string,
+          id: string,
+          pol: string | null,
+          sp: string | null,
+          td: string | null,
+        ) => { decision: string }
+      )(paramsJson, inviterDid, identityDid, policyJson, spendingJson, trustedDidsJson);
+    },
+
+    // MetadataRecord inspection (§5.7.2, #615)
+    metadataRecordToJson(
+      contextId: string,
+      sequence: number,
+      signerDid: string,
+      timestamp: number,
+      structuralJson: string,
+      operationalJson: string,
+      signatureHex: string,
+    ): string {
+      return (
+        addon.metadataRecordToJson as (
+          c: string,
+          s: number,
+          sd: string,
+          t: number,
+          st: string,
+          op: string,
+          sig: string,
+        ) => string
+      )(contextId, sequence, signerDid, timestamp, structuralJson, operationalJson, signatureHex);
+    },
+
+    metadataRecordFromJson(jsonStr: string): string {
+      return (addon.metadataRecordFromJson as (j: string) => string)(jsonStr);
+    },
+
+    // Context template inspection (§5.14, #615)
+    templateGetParams(templateId: string): string {
+      return (addon.templateGetParams as (t: string) => string)(templateId);
+    },
+
+    validateAgainstTemplate(paramsJson: string): string | null {
+      return (addon.validateAgainstTemplate as (p: string) => string | null)(paramsJson);
+    },
+
+    validateContextParams(paramsJson: string): string | null {
+      return (addon.validateContextParams as (p: string) => string | null)(paramsJson);
+    },
+
+    // Economy (§19, ADR-033)
+    economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number {
+      return (addon.economyEstimateCost as (p: string, a: string, m: string) => number)(
+        policyJson,
+        actionType,
+        metricsJson,
+      );
+    },
+
+    economyPolicyRequiresPayment(policyJson: string): boolean {
+      return (addon.economyPolicyRequiresPayment as (p: string) => boolean)(policyJson);
+    },
+
+    economyAutoAcceptBlocked(policyJson: string): boolean {
+      return (addon.economyAutoAcceptBlocked as (p: string) => boolean)(policyJson);
+    },
+
+    economyCheckPolicyLock(policyJson: string): boolean {
+      return (addon.economyCheckPolicyLock as (p: string) => boolean)(policyJson);
+    },
+
+    economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean {
+      return (addon.economyValidatePolicyChange as (c: string, p: string) => boolean)(
+        currentJson,
+        proposedJson,
+      );
+    },
+
+    economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
+      return (addon.economyEvaluateFormula as (f: string, m: string) => number)(
+        formulaJson,
+        metricsJson,
+      );
+    },
+
+    economyAdjustRelayPrice(configJson: string, utilizationPct: number) {
+      return (
+        addon.economyAdjustRelayPrice as (
+          c: string,
+          u: number,
+        ) => { newBasePrice: number; previousBasePrice: number; direction: string }
+      )(configJson, utilizationPct);
+    },
+
+    economyBudgetRemaining(contextId: string, did: string): number {
+      return (addon.economyBudgetRemaining as (c: string, d: string) => number)(contextId, did);
+    },
+
+    economyBudgetGrant(contextId: string, did: string, amount: number): void {
+      (addon.economyBudgetGrant as (c: string, d: string, a: number) => void)(
+        contextId,
+        did,
+        amount,
+      );
+    },
+
+    economyBudgetRecordSpend(contextId: string, did: string, amount: number): void {
+      (addon.economyBudgetRecordSpend as (c: string, d: string, a: number) => void)(
+        contextId,
+        did,
+        amount,
+      );
+    },
+
+    economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void {
+      (addon.economyAntispamRecord as (c: string, s: string, t: number) => void)(
+        contextId,
+        senderDid,
+        timestamp,
+      );
+    },
+
+    economyAntispamVelocity(contextId: string, senderDid: string, now: number): number {
+      return (addon.economyAntispamVelocity as (c: string, s: string, n: number) => number)(
+        contextId,
+        senderDid,
+        now,
+      );
+    },
+
+    economyAntispamEscalatedCost(
+      contextId: string,
+      senderDid: string,
+      now: number,
+      baseCost: number,
+      thresholdsJson: string,
+      floor: number | null,
+      cap: number | null,
+    ): number {
+      return (
+        addon.economyAntispamEscalatedCost as (
+          c: string,
+          s: string,
+          n: number,
+          b: number,
+          t: string,
+          f: number | null,
+          cp: number | null,
+        ) => number
+      )(contextId, senderDid, now, baseCost, thresholdsJson, floor, cap);
+    },
+
+    // Media (ADR-024)
+    mediaCheckCapability(ceiling: string[], capability: string): boolean {
+      return (addon.mediaCheckCapability as (c: string[], cap: string) => boolean)(
+        ceiling,
+        capability,
+      );
+    },
+
+    mediaInitiateSession(
+      contextId: string,
+      ceiling: string[],
+      capabilities: string[],
+      participants: string[],
+      timestamp: number,
+    ): string {
+      return (
+        addon.mediaInitiateSession as (
+          c: string,
+          cl: string[],
+          caps: string[],
+          p: string[],
+          t: number,
+        ) => string
+      )(contextId, ceiling, capabilities, participants, timestamp);
+    },
+
+    mediaActivateSession(sessionJson: string): string {
+      return (addon.mediaActivateSession as (s: string) => string)(sessionJson);
+    },
+
+    mediaJoinSession(sessionJson: string, participantDid: string): string {
+      return (addon.mediaJoinSession as (s: string, p: string) => string)(
+        sessionJson,
+        participantDid,
+      );
+    },
+
+    mediaEndSession(sessionJson: string, timestamp: number): string {
+      return (addon.mediaEndSession as (s: string, t: number) => string)(sessionJson, timestamp);
+    },
+
+    mediaCreateOffer(sessionId: string, sdp: string, senderDid: string): string {
+      return (addon.mediaCreateOffer as (s: string, sdp: string, d: string) => string)(
+        sessionId,
+        sdp,
+        senderDid,
+      );
+    },
+
+    mediaCreateAnswer(sessionId: string, sdp: string, senderDid: string): string {
+      return (addon.mediaCreateAnswer as (s: string, sdp: string, d: string) => string)(
+        sessionId,
+        sdp,
+        senderDid,
+      );
+    },
+
+    mediaCreateIceCandidate(
+      sessionId: string,
+      candidate: string,
+      senderDid: string,
+      sdpMid?: string,
+      sdpMlineIndex?: number,
+    ): string {
+      return (
+        addon.mediaCreateIceCandidate as (
+          s: string,
+          c: string,
+          d: string,
+          m: string | undefined,
+          i: number | undefined,
+        ) => string
+      )(sessionId, candidate, senderDid, sdpMid, sdpMlineIndex);
+    },
+
+    mediaCreateSessionEnd(sessionId: string, senderDid: string): string {
+      return (addon.mediaCreateSessionEnd as (s: string, d: string) => string)(
+        sessionId,
+        senderDid,
+      );
+    },
+
+    mediaSendSignaling(signalingJson: string): string {
+      return (addon.mediaSendSignaling as (s: string) => string)(signalingJson);
+    },
+
+    mediaVerifySenderAttribution(signalingJson: string, envelopeSenderDid: string): boolean {
+      return (addon.mediaVerifySenderAttribution as (s: string, e: string) => boolean)(
+        signalingJson,
+        envelopeSenderDid,
       );
     },
 

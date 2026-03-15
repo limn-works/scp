@@ -1366,6 +1366,9 @@ export async function evaluateInvitation(
   } catch (error) {
     throw mapBridgeError(error);
   }
+}
+
+// ---------------------------------------------------------------------------
 // MetadataRecord inspection (§5.7.2, #615)
 // ---------------------------------------------------------------------------
 
