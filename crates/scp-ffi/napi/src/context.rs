@@ -2065,6 +2065,11 @@ pub fn evaluate_invitation(
         Err(e) => Err(napi::Error::from(ScpNapiError::Context {
             message: format!("invitation evaluation failed: {e}"),
             code: "SCP-CTX-2060".to_owned(),
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MetadataRecord inspection (§5.7.2, #615)
 // ---------------------------------------------------------------------------
 
@@ -2167,6 +2172,25 @@ pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
             code: "SCP-VALID-7001".to_owned(),
         })
     })?;
+
+    // F6: sequence must be >= 1 (spec §5.7.2)
+    if record.sequence == 0 {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        }));
+    }
+
+    // F7: signature must be exactly 64 bytes (Ed25519)
+    if record.signature.len() != 64 {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "signature must be 64 bytes (got {})",
+                record.signature.len()
+            ),
+            code: "SCP-VALID-7001".to_owned(),
+        }));
+    }
 
     serde_json::to_string(&record).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {

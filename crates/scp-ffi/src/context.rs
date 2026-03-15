@@ -2865,6 +2865,11 @@ pub fn py_evaluate_invitation(
         Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "[SCP-CTX-2060] invitation evaluation failed: {e}"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MetadataRecord inspection (§5.7.2, #615)
 // ---------------------------------------------------------------------------
 
@@ -2958,6 +2963,23 @@ pub fn py_metadata_record_from_json(json_str: String) -> PyResult<String> {
     let record: MetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
         crate::error::ScpPyError::validation(format!("invalid MetadataRecord JSON: {e}"))
     })?;
+
+    // F6: sequence must be >= 1 (spec §5.7.2)
+    if record.sequence == 0 {
+        return Err(crate::error::ScpPyError::validation(
+            "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
+        )
+        .into());
+    }
+
+    // F7: signature must be exactly 64 bytes (Ed25519)
+    if record.signature.len() != 64 {
+        return Err(crate::error::ScpPyError::validation(format!(
+            "signature must be 64 bytes (got {})",
+            record.signature.len()
+        ))
+        .into());
+    }
 
     // Re-serialize to ensure canonical output
     serde_json::to_string(&record).map_err(|e| {

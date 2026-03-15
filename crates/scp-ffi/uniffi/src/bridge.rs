@@ -9472,6 +9472,11 @@ fn parse_paid_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, 
                  ContextJoin, SubscriptionPeriod, ByteStored"
             ),
             code: "SCP-VALID-7050".to_owned(),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MetadataRecord inspection (§5.7.2, #615)
 // ---------------------------------------------------------------------------
 
@@ -9553,6 +9558,25 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, ScpError> {
             msg: format!("invalid MetadataRecord JSON: {e}"),
             code: "SCP-VALID-7001".to_owned(),
         })?;
+
+    // F6: sequence must be >= 1 (spec §5.7.2)
+    if record.sequence == 0 {
+        return Err(ScpError::Validation {
+            msg: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        });
+    }
+
+    // F7: signature must be exactly 64 bytes (Ed25519)
+    if record.signature.len() != 64 {
+        return Err(ScpError::Validation {
+            msg: format!(
+                "signature must be 64 bytes (got {})",
+                record.signature.len()
+            ),
+            code: "SCP-VALID-7001".to_owned(),
+        });
+    }
 
     serde_json::to_string(&record).map_err(|e| ScpError::Validation {
         msg: format!("failed to re-serialize MetadataRecord: {e}"),
