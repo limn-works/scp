@@ -230,12 +230,16 @@ pub enum ToolError {
     },
 
     /// Cross-context interface rate limit exceeded.
-    #[error("rate limit exceeded: {max_calls} calls per {window_ms}ms")]
+    #[error(
+        "rate limit exceeded: {max_calls} calls per {window_ms}ms (retry after {retry_after_secs}s)"
+    )]
     InterfaceRateLimited {
         /// Maximum calls allowed.
         max_calls: u64,
         /// Window duration in milliseconds.
         window_ms: u64,
+        /// Seconds until the next call will be accepted (spec §6.2.0.2).
+        retry_after_secs: u64,
     },
 
     /// Context ID mismatch in cross-context interface.
