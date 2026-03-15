@@ -340,6 +340,7 @@ public actor Context {
         getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
             = ContextBridge.defaultGetEconomicPolicy,
         contextId: String? = nil,
+        creatorDid: String? = nil,
         initialState: ContextState? = nil
     ) async throws -> Context {
         let rawHandle = try await createFn(identity, params)
@@ -353,6 +354,7 @@ public actor Context {
             handle: handle,
             identity: identity,
             contextId: contextId,
+            creatorDid: creatorDid,
             initialState: initialState,
             sendFn: sendFn,
             subscribeFn: subscribeFn,

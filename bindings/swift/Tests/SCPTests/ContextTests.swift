@@ -82,6 +82,7 @@ struct ContextTests {
             handle: handle,
             identity: identity,
             contextId: contextId,
+            creatorDid: "did:dht:z6MkTestCreator",
             initialState: initialState,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
@@ -144,6 +145,7 @@ struct ContextTests {
             leaveFn: noOpLeave,
             closeFn: noOpClose,
             contextId: "ctx-create-test",
+            creatorDid: "did:dht:z6MkTestCreator",
             initialState: .active
         )
 
@@ -226,6 +228,7 @@ struct ContextTests {
             handle: handle,
             identity: identity,
             contextId: "test-send-identity",
+            creatorDid: "did:dht:z6MkTest",
             initialState: .active,
             sendFn: sendFn,
             subscribeFn: { _, _ in },
@@ -447,6 +450,7 @@ struct ContextTests {
             handle: handle,
             identity: identity,
             contextId: "test-leave-identity",
+            creatorDid: "did:dht:z6MkTest",
             initialState: .active,
             sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
@@ -500,6 +504,7 @@ struct ContextTests {
             handle: handle,
             identity: identity,
             contextId: "test-close-identity",
+            creatorDid: "did:dht:z6MkTest",
             initialState: .active,
             sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
@@ -721,6 +726,7 @@ struct ContextTests {
             handle: handle,
             identity: Identity(noPointer: .init()),
             contextId: "econ-policy-test",
+            creatorDid: "did:dht:z6MkTest",
             initialState: .active,
             sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
