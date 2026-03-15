@@ -272,6 +272,84 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
+    // Dispatcher assignment tests — tool session operations
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class ToolSessionDispatcherTests {
+        @Test
+        fun `invokeCrossContext dispatches on IO and forwards all arguments`() =
+            runTest(ioDispatcher) {
+                stubBindings.toolInvokeCrossContextResult = """{"output":"xctx"}"""
+                val result = bridge.tools.invokeCrossContext(
+                    1L,
+                    2L,
+                    "tool-001",
+                    """{"query":"test"}""",
+                    42L,
+                    "ucan.tok.sig",
+                    1,
+                    listOf("proof1"),
+                )
+                assertEquals("""{"output":"xctx"}""", result)
+                assertEquals(1L, stubBindings.lastCrossContextSourceHandle)
+                assertEquals(2L, stubBindings.lastCrossContextTargetHandle)
+                assertEquals("tool-001", stubBindings.lastCrossContextToolId)
+                assertEquals("""{"query":"test"}""", stubBindings.lastCrossContextInputJson)
+                assertEquals(42L, stubBindings.lastCrossContextIdentityHandle)
+                assertEquals("ucan.tok.sig", stubBindings.lastCrossContextUcanToken)
+                assertEquals(1, stubBindings.lastCrossContextChainDepth)
+                assertEquals(listOf("proof1"), stubBindings.lastCrossContextProofTokens)
+            }
+
+        @Test
+        fun `sessionCreate dispatches on IO and forwards arguments`() =
+            runTest(ioDispatcher) {
+                stubBindings.toolSessionCreateResult = "session-abc"
+                val result = bridge.tools.sessionCreate(10L, "tool-001", "src-ctx", 3600L)
+                assertEquals("session-abc", result)
+                assertEquals("tool-001", stubBindings.lastSessionCreateToolId)
+                assertEquals("src-ctx", stubBindings.lastSessionCreateSourceContextId)
+                assertEquals(3600L, stubBindings.lastSessionCreateTtlSeconds)
+            }
+
+        @Test
+        fun `sessionCreate forwards null ttlSeconds`() =
+            runTest(ioDispatcher) {
+                bridge.tools.sessionCreate(10L, "tool-001", "src-ctx", null)
+                assertEquals(null, stubBindings.lastSessionCreateTtlSeconds)
+            }
+
+        @Test
+        fun `sessionInvoke dispatches on IO and forwards all arguments`() =
+            runTest(ioDispatcher) {
+                stubBindings.toolSessionInvokeResult = """{"out":"ok"}"""
+                val result = bridge.tools.sessionInvoke(
+                    10L,
+                    "session-001",
+                    """{"input":"data"}""",
+                    42L,
+                    "ucan.tok",
+                    listOf("proof1", "proof2"),
+                )
+                assertEquals("""{"out":"ok"}""", result)
+                assertEquals("session-001", stubBindings.lastSessionInvokeSessionId)
+                assertEquals("""{"input":"data"}""", stubBindings.lastSessionInvokeInputJson)
+                assertEquals(42L, stubBindings.lastSessionInvokeIdentityHandle)
+                assertEquals("ucan.tok", stubBindings.lastSessionInvokeUcanToken)
+                assertEquals(listOf("proof1", "proof2"), stubBindings.lastSessionInvokeProofTokens)
+            }
+
+        @Test
+        fun `sessionClose dispatches on IO and forwards sessionId`() =
+            runTest(ioDispatcher) {
+                bridge.tools.sessionClose(10L, "session-001")
+                assertTrue(stubBindings.toolSessionCloseCalled)
+                assertEquals("session-001", stubBindings.lastSessionCloseSessionId)
+            }
+    }
+
+    // -------------------------------------------------------------------
     // CPU-bound dispatcher test
     // -------------------------------------------------------------------
 
@@ -687,6 +765,27 @@ class StubNativeBindings : NativeBindings {
     override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
         """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
     override fun governanceListProposals(contextHandle: Long): String = "[]"
+    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
+    override fun finalizeClose(contextHandle: Long) = Unit
+    @Suppress("LongParameterList")
+    override fun createGovernanceCheckpoint(
+        contextHandle: Long,
+        checkpointSeq: Long,
+        merkleRootHex: String,
+        eventCount: Long,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String = "{}"
+    override fun addCheckpointCosignature(
+        contextHandle: Long,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String = "{}"
+    override fun restoreContext(contextId: String) = Unit
+    override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
     var broadcastBlockCalled = false
@@ -716,6 +815,32 @@ class StubNativeBindings : NativeBindings {
     override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
     override fun broadcastAdmission(contextHandle: Long): String? = "Open"
 
+    // Tool session argument captures
+    var lastCrossContextSourceHandle: Long? = null
+    var lastCrossContextTargetHandle: Long? = null
+    var lastCrossContextToolId: String? = null
+    var lastCrossContextInputJson: String? = null
+    var lastCrossContextIdentityHandle: Long? = null
+    var lastCrossContextUcanToken: String? = null
+    var lastCrossContextChainDepth: Int? = null
+    var lastCrossContextProofTokens: List<String>? = null
+    var toolInvokeCrossContextResult = """{"output":"cross"}"""
+
+    var lastSessionCreateToolId: String? = null
+    var lastSessionCreateSourceContextId: String? = null
+    var lastSessionCreateTtlSeconds: Long? = null
+    var toolSessionCreateResult = "session-001"
+
+    var lastSessionInvokeSessionId: String? = null
+    var lastSessionInvokeInputJson: String? = null
+    var lastSessionInvokeIdentityHandle: Long? = null
+    var lastSessionInvokeUcanToken: String? = null
+    var lastSessionInvokeProofTokens: List<String>? = null
+    var toolSessionInvokeResult = """{"output":"session"}"""
+
+    var toolSessionCloseCalled = false
+    var lastSessionCloseSessionId: String? = null
+
     override fun toolRegister(
         contextHandle: Long,
         definitionJson: String,
@@ -739,6 +864,80 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         toolId: String,
     ): String = toolVerifyResult
+
+    override fun toolInterfaceExpose(
+        contextHandle: Long,
+        toolId: String,
+        targetContextId: String,
+        rateLimitJson: String?,
+    ): String = """{"interface_id":"iface-001"}"""
+
+    override fun toolInterfaceAccept(
+        contextHandle: Long,
+        interfaceJson: String,
+    ): String = """{"interface_id":"iface-001","approved_by_target":true}"""
+
+    override fun toolInterfaceRevoke(
+        contextHandle: Long,
+        interfaceIdHex: String,
+    ): String = """{"revoked":true}"""
+
+    override fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String {
+        lastCrossContextSourceHandle = sourceContextHandle
+        lastCrossContextTargetHandle = targetContextHandle
+        lastCrossContextToolId = toolId
+        lastCrossContextInputJson = inputJson
+        lastCrossContextIdentityHandle = identityHandle
+        lastCrossContextUcanToken = ucanToken
+        lastCrossContextChainDepth = chainDepth
+        lastCrossContextProofTokens = proofTokens
+        return toolInvokeCrossContextResult
+    }
+
+    override fun toolSessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long?,
+    ): String {
+        lastSessionCreateToolId = toolId
+        lastSessionCreateSourceContextId = sourceContextId
+        lastSessionCreateTtlSeconds = ttlSeconds
+        return toolSessionCreateResult
+    }
+
+    override fun toolSessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String {
+        lastSessionInvokeSessionId = sessionId
+        lastSessionInvokeInputJson = inputJson
+        lastSessionInvokeIdentityHandle = identityHandle
+        lastSessionInvokeUcanToken = ucanToken
+        lastSessionInvokeProofTokens = proofTokens
+        return toolSessionInvokeResult
+    }
+
+    override fun toolSessionClose(
+        contextHandle: Long,
+        sessionId: String,
+    ) {
+        toolSessionCloseCalled = true
+        lastSessionCloseSessionId = sessionId
+    }
 
     override fun ucanValidate(
         contextHandle: Long,

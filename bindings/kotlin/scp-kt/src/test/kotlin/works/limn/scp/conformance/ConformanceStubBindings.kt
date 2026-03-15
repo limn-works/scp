@@ -252,6 +252,38 @@ class ConformanceStubBindings : NativeBindings {
         interfaceIdHex: String,
     ): String = """{"interface_id":"$interfaceIdHex","revoking_context":"ctx-revoker","revoked_at":1700000000000}"""
 
+    override fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String = """{"output":"cross-context"}"""
+
+    override fun toolSessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long?,
+    ): String = "session-stub-001"
+
+    override fun toolSessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String = """{"output":"session-result"}"""
+
+    override fun toolSessionClose(
+        contextHandle: Long,
+        sessionId: String,
+    ) = Unit
+
     override fun ucanValidate(
         contextHandle: Long,
         token: String,

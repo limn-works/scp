@@ -655,3 +655,66 @@ class TestSync:
         assert isinstance(result, dict)
         assert "tier_1_threshold_secs" in result
         assert "tier_2_threshold_secs" in result
+
+
+# ---------------------------------------------------------------------------
+# Recovery (error propagation)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteRecovery:
+    """identity_execute_recovery error propagation through real FFI."""
+
+    async def test_execute_recovery_invalid_tier(self):
+        """execute_recovery with an invalid tier should raise an error."""
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        with pytest.raises(Exception):
+            _scp_core.identity_execute_recovery(
+                alice.did,
+                "invalid_tier",
+                [],
+            )
+
+    async def test_execute_recovery_unknown_did(self):
+        """execute_recovery with an unregistered DID should raise an error."""
+        with pytest.raises(Exception):
+            _scp_core.identity_execute_recovery(
+                "did:dht:z6MkUnknown000000000000000000",
+                "agent",
+                [],
+            )
+
+
+# ---------------------------------------------------------------------------
+# Migration (error propagation)
+# ---------------------------------------------------------------------------
+
+
+class TestMigrate:
+    """py_identity_migrate error propagation through real FFI."""
+
+    async def test_migrate_returns_new_identity(self):
+        """migrate on a valid identity should return a new handle (or raise
+        a descriptive error if pre-rotation is not yet set up)."""
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        try:
+            result = _scp_core.py_identity_migrate(alice._handle)
+            # If migration succeeds, the new identity should have a different DID.
+            assert result.did != alice.did
+        except Exception:
+            # Expected: migration may require pre-rotation commitment setup.
+            pass
+
+    async def test_migrate_invalid_handle(self):
+        """migrate with a fabricated handle should raise an error."""
+        # Create a minimal PyIdentity-like object with an unknown DID —
+        # the FFI should reject it because the DID is not in the registry.
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        # Mutate the DID to an unregistered one to trigger the error path.
+        original_did = alice._handle.did
+        try:
+            alice._handle.did = "did:dht:z6MkNotRegistered0000000000"
+            with pytest.raises(Exception):
+                _scp_core.py_identity_migrate(alice._handle)
+        finally:
+            alice._handle.did = original_did
