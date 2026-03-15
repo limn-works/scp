@@ -539,13 +539,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await interfaceExposeFn(contextHandle, toolId, targetContextId, rateLimitJson)
+        return try await interfaceExposeFn(handle, toolId, targetContextId, rateLimitJson)
     }
 
     /// Accepts a cross-context tool interface (step 4).
@@ -568,13 +562,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await interfaceAcceptFn(contextHandle, interfaceJson)
+        return try await interfaceAcceptFn(handle, interfaceJson)
     }
 
     /// Revokes a cross-context tool interface (step 5).
@@ -596,12 +584,6 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await interfaceRevokeFn(contextHandle, interfaceIdHex)
+        return try await interfaceRevokeFn(handle, interfaceIdHex)
     }
 }

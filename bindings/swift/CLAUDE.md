@@ -34,7 +34,7 @@ Trust and MCP do not have Rust bridge function exports yet. Their `*Bridge` defa
 ## Gotchas
 
 - **Context.handle is `internal`** -- Extensions in other files (Tools.swift, etc.) access `handle` directly for UniFFI bridge calls. `private` would make this impossible.
-- **Context.handle is concrete `ContextHandle`** -- All bridge function typealiases and the actor property use the concrete `ContextHandle` type, not `any ContextHandleProtocol`. No guard-casts needed.
+- **Context.handle is concrete `ContextHandle`** -- All bridge function typealiases (except `CreateFn`, which returns `any ContextHandleProtocol`) and the actor property use the concrete `ContextHandle` type, not `any ContextHandleProtocol`. No guard-casts needed.
 - **No `withCheckedThrowingContinuation`** -- UniFFI async functions are already `async throws` in Swift. Direct `try await` is correct. The old callback-based stubs used continuations; those are gone.
 - **`ContextHandle(noPointer: .init())`** -- Use this in tests to create a fake handle. Pass `contextId`, `creatorDid`, and `initialState` overrides to `Context.init` to avoid calling handle methods on a null pointer.
 - **Error code namespacing** -- Tool extensions use `SCP-CTX-2001` (not `SCP-CTX-001`) to avoid collision with Context.swift. EventLog uses `SCP-CTX-2030/2031`. Transport uses `SCP-TRANS-5001`. MCP stubs use `SCP-MCP-10001`-`10004`.

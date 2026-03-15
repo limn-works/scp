@@ -26,6 +26,7 @@ struct ToolsTests {
     /// and initialState, avoiding protocol-type mock handles.
     private func makeTestContext(
         contextId: String = "tool-test-ctx",
+        creatorDid: String = "did:dht:z6MkTest",
         initialState: ContextState = .active
     ) -> Context {
         let handle = ContextHandle(noPointer: .init())
@@ -39,6 +40,7 @@ struct ToolsTests {
             handle: handle,
             identity: Identity(noPointer: .init()),
             contextId: contextId,
+            creatorDid: creatorDid,
             initialState: initialState,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
