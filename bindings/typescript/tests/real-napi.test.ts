@@ -489,8 +489,8 @@ if (bridge === null) {
       );
 
       const proof = await napi.eventLogVerify(ctx, { type: "inclusion", leafIndex: 0 });
-      expect(typeof proof.verified).toBe("boolean");
-      expect(typeof proof.proofType).toBe("string");
+      expect(proof.verified).toBe(true);
+      expect(proof.proofType).toBe("inclusion");
     });
 
     test.skip("creates a checkpoint (NapiIdentity class required — #1144)", async () => {
