@@ -212,6 +212,11 @@ private class TestNativeBindings : NativeBindings {
     ): String = ""
     override fun toolVerify(contextHandle: Long, toolId: String): String =
         """{"tool_id":"$toolId","passed":false,"failures":[]}"""
+    override fun toolInterfaceExpose(
+        contextHandle: Long, toolId: String, targetContextId: String, rateLimitJson: String?,
+    ): String = "{}"
+    override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
+    override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
     override fun ucanValidate(
         contextHandle: Long,
         token: String,
