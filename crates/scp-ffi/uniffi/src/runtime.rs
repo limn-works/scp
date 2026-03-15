@@ -182,11 +182,33 @@ pub fn init_context_manager() {
 /// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
 /// feature (which also exposes `InMemoryKeyCustody`) is not required in
 /// production mobile builds. See issue #484.
+/// Global `ProtocolRepository` instance, shared between the event log
+/// provider and the trust store bridge. Exposed via [`protocol_repository()`]
+/// for trust aggregation (issue #502).
+static PROTOCOL_REPOSITORY: OnceLock<
+    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+> = OnceLock::new();
+
+/// Returns the global `ProtocolRepository` if initialized.
+///
+/// Used by the trust aggregation bridge to construct a
+/// `ProtocolRepositoryTrustBridge` backed by persistent (in-process) storage.
+/// Returns `None` if `build_event_log_provider` has not been called yet.
+#[must_use]
+pub fn protocol_repository()
+-> Option<&'static Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>> {
+    PROTOCOL_REPOSITORY.get()
+}
+
 fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
     let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
     let store = Arc::new(ProtocolRepository::new(encrypted));
+
+    // Expose the ProtocolRepository globally for trust store usage (#502).
+    let _ = PROTOCOL_REPOSITORY.set(Arc::clone(&store));
+
     let bridge = ProtocolRepositoryEventLogBridge::new(store);
     Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
 }
@@ -206,7 +228,7 @@ fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
 /// dependencies. Only used as the backing store for the
 /// `EncryptingAdapter`-wrapped `ProtocolRepository` that feeds the
 /// `MerkleEventLogProvider`.
-struct BridgeInMemoryStorage {
+pub struct BridgeInMemoryStorage {
     data: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 

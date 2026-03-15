@@ -29,6 +29,7 @@ pub mod tls;
 pub mod tofu;
 pub mod tools;
 pub mod transport;
+pub mod trust;
 pub mod ucan;
 pub mod wrapping_key;
 

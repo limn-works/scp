@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use scp_core::trust::aggregate::{CachedAttestation, TrustProtocolRepository};
 use scp_core::trust::{ChallengeVerification, TrustError};
+use scp_event_log::Event;
 
 /// In-memory implementation of `TrustProtocolRepository` for the FFI bridge.
 ///
@@ -60,7 +61,7 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         Ok(store.get(&key).cloned().unwrap_or_default())
     }
 
-    fn cache_attestation(
+    fn store_cached_attestation(
         &self,
         context_id: &str,
         entry: CachedAttestation,
@@ -84,7 +85,7 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         Ok(store.get(context_id).cloned().unwrap_or_default())
     }
 
-    fn set_revocation_state(
+    fn store_revocation_state(
         &self,
         context_id: &str,
         state: &HashMap<String, bool>,
@@ -114,6 +115,66 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         store.entry(key).or_default().push(result.clone());
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared aggregation helper — used by all FFI bridges
+// ---------------------------------------------------------------------------
+
+/// Populates a trust store and runs the aggregation pipeline.
+///
+/// Generic over the store implementation to support both persistent
+/// (`ProtocolRepositoryTrustBridge`) and ephemeral (`InMemoryFfiTrustStore`)
+/// stores. Returns the aggregated `TrustInput` as a JSON string. See #502.
+///
+/// # Errors
+///
+/// Returns [`TrustError`] if store population, aggregation, or serialization
+/// fails.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub fn populate_and_aggregate<S: TrustProtocolRepository>(
+    store: S,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<CachedAttestation>,
+    challenge_results: &[ChallengeVerification],
+    events: &[Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &[scp_core::trust::ConsequenceRule],
+    threshold_requirements: &HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &HashMap<scp_core::trust::AttestationType, Vec<scp_core::trust::AttestorInfo>>,
+) -> Result<String, TrustError> {
+    for ca in cached_attestations {
+        store.store_cached_attestation(context_id, ca)?;
+    }
+    for cr in challenge_results {
+        store.store_challenge_result(context_id, cr)?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id,
+        subject_did,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx)?;
+    serde_json::to_string(&trust_input).map_err(|e| TrustError::StoreError {
+        reason: format!("failed to serialize TrustInput: {e}"),
+    })
 }
 
 #[cfg(test)]
@@ -150,7 +211,7 @@ mod tests {
         state.insert("att-1".to_owned(), true);
         state.insert("att-2".to_owned(), false);
 
-        store.set_revocation_state("ctx-1", &state).unwrap();
+        store.store_revocation_state("ctx-1", &state).unwrap();
         let retrieved = store.get_revocation_state("ctx-1").unwrap();
         assert_eq!(retrieved, state);
     }
@@ -165,7 +226,7 @@ mod tests {
             verified_at: 1000,
             ttl_secs: 300,
         };
-        store.cache_attestation("ctx-1", entry1).unwrap();
+        store.store_cached_attestation("ctx-1", entry1).unwrap();
 
         // Cache the same attestation ID again with updated verified_at.
         let entry2 = CachedAttestation {
@@ -173,7 +234,7 @@ mod tests {
             verified_at: 2000,
             ttl_secs: 300,
         };
-        store.cache_attestation("ctx-1", entry2).unwrap();
+        store.store_cached_attestation("ctx-1", entry2).unwrap();
 
         // Should have exactly 1 entry (deduplicated by ID), with updated timestamp.
         let cached = store
@@ -275,7 +336,9 @@ mod tests {
             verified_at: 1900, // fresh: 1900 + 600 = 2500 > 2000
             ttl_secs: 600,
         };
-        store.cache_attestation(context_id, cached_att).unwrap();
+        store
+            .store_cached_attestation(context_id, cached_att)
+            .unwrap();
 
         let cr = make_challenge_result("cv-1", subject_did, context_id);
         store.store_challenge_result(context_id, &cr).unwrap();
