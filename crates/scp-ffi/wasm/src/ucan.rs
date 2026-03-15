@@ -1073,145 +1073,20 @@ pub fn ucan_mint(
 
 /// Delegates a UCAN token to another member.
 ///
-/// Validates the parent token and delegation parameters. UCAN delegation
-/// requires key custody (`WebCrypto`), which is managed by the TypeScript SDK.
-/// The bridge validates inputs; the TS wrapper signs.
-///
-/// # Arguments
-///
-/// * `context` — The context the token belongs to.
-/// * `delegator_did` — The DID of the entity delegating.
-/// * `delegatee_did` — The DID of the entity receiving the delegation.
-/// * `parent_token` — The encoded parent UCAN token (JWT format).
-/// * `capabilities_json` — JSON array of capability URI strings to delegate.
-///
-/// # Errors
-///
-/// Returns `SCP-VALID-7000` if `delegator_did` or `delegatee_did` fails
-/// [`validate_did`] (empty, malformed `did:{method}:{id}` format, or
-/// control characters), if `parent_token` fails
-/// [`validate_ucan_token`] (empty, too long, or control characters),
-/// or if `capabilities_json` is not a valid JSON array of capability URI
-/// strings (parsed via [`CapabilityUri::parse`]).
-///
-/// Returns `SCP-PERM-3000` since UCAN delegation requires JS-side key custody.
+/// UCAN delegation requires key custody (`WebCrypto`) which is only available
+/// on the JS side. Always returns `SCP-PERM-3000` — use the TypeScript SDK
+/// wrapper's `delegateUcan()` method which signs via `SubtleCrypto`.
 ///
 /// See ADR-016 criterion 4.
 #[wasm_bindgen]
 pub fn ucan_delegate(
-    context: &WasmContextHandle,
-    delegator_did: String,
-    delegatee_did: String,
-    parent_token: String,
-    capabilities_json: String,
+    _context: &WasmContextHandle,
+    _delegator_did: String,
+    _delegatee_did: String,
+    _parent_token: String,
+    _capabilities_json: String,
 ) -> Promise {
-    if let Err(e) = validate_did(&delegator_did) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
-    }
-    if let Err(e) = validate_did(&delegatee_did) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
-    }
-    if let Err(e) = validate_ucan_token(&parent_token) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
-    }
-    let context_id = context.context_id();
-
-    future_to_promise(async move {
-        // Parse and validate the parent token.
-        let parsed_parent = parse_ucan(&parent_token).map_err(|e| {
-            ScpWasmError::Permission {
-                message: format!("malformed parent token: {e}"),
-                code: "SCP-PERM-3000".to_owned(),
-            }
-            .into_js()
-        })?;
-
-        // Verify delegator matches parent audience.
-        if parsed_parent.payload.aud != delegator_did {
-            return Err(ScpWasmError::Permission {
-                message: format!(
-                    "delegator DID '{}' does not match parent token audience '{}'",
-                    delegator_did, parsed_parent.payload.aud
-                ),
-                code: "SCP-PERM-3000".to_owned(),
-            }
-            .into_js()
-            .into());
-        }
-
-        // Parse and validate capabilities.
-        let cap_strings: Vec<String> = serde_json::from_str(&capabilities_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("capabilities_json is not a valid JSON array: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            }
-            .into_js()
-        })?;
-
-        // Validate each capability URI.
-        for cap in &cap_strings {
-            CapabilityUri::parse(cap).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("invalid capability URI '{cap}': {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
-                }
-                .into_js()
-            })?;
-        }
-
-        // Verify attenuation: each delegated capability must be in the parent.
-        let parent_caps: Vec<CapabilityUri> = parsed_parent
-            .payload
-            .att
-            .iter()
-            .map(|att| CapabilityUri::parse(&att.with))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                ScpWasmError::Permission {
-                    message: format!("unparseable capability in parent token: {e}"),
-                    code: "SCP-PERM-3000".to_owned(),
-                }
-                .into_js()
-            })?;
-
-        for cap_str in &cap_strings {
-            let child_cap = CapabilityUri::parse(cap_str).map_err(|e| {
-                ScpWasmError::Permission {
-                    message: format!("unparseable child capability: {e}"),
-                    code: "SCP-PERM-3000".to_owned(),
-                }
-                .into_js()
-            })?;
-            let is_subset = parent_caps.iter().any(|p| p.matches(&child_cap));
-            if !is_subset {
-                return Err(ScpWasmError::Permission {
-                    message: format!(
-                        "attenuation violation: capability '{cap_str}' not granted by parent"
-                    ),
-                    code: "SCP-PERM-3000".to_owned(),
-                }
-                .into_js()
-                .into());
-            }
-        }
-
-        // Verify context exists.
-        with_manager(|mgr| {
-            if !mgr.has_context(&context_id) {
-                return Err(ScpWasmError::Context {
-                    message: format!("context '{context_id}' not found"),
-                    code: "SCP-CTX-2001".to_owned(),
-                });
-            }
-            Ok(())
-        })
-        .map_err(ScpWasmError::into_js)?;
-
-        let _ = delegatee_did;
-
-        // UCAN delegation requires key custody (WebCrypto), which is managed by
-        // the TypeScript SDK wrapper. The bridge validates inputs and enforces
-        // attenuation; the TS wrapper signs the token using SubtleCrypto.
+    future_to_promise(async {
         Err(ScpWasmError::Permission {
             message: "UCAN delegation requires JS-side key custody (WebCrypto) — use the \
                       TypeScript SDK wrapper's delegateUcan() method which signs via SubtleCrypto"
