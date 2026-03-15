@@ -47,6 +47,7 @@ declare module "@limn-works/scp-ts-wasm" {
         payloadBase64: string;
         timestamp: number;
         contextId: string;
+        sequence: number;
       }) => void;
       onComplete: () => void;
     },

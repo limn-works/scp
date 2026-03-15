@@ -195,6 +195,7 @@ pub struct WasmMessage {
     payload_base64: String,
     timestamp: f64,
     context_id: String,
+    sequence: u64,
 }
 
 #[wasm_bindgen]
@@ -225,6 +226,13 @@ impl WasmMessage {
     #[wasm_bindgen(getter, js_name = "contextId")]
     pub fn context_id(&self) -> String {
         self.context_id.clone()
+    }
+
+    /// Returns the per-sender sequence number for this message.
+    #[must_use]
+    #[wasm_bindgen(getter)]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 }
 
