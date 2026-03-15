@@ -9,6 +9,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
+import type { BridgeMode, ShadowStatus } from "../src/bridge";
 import type {
   Bridge,
   BridgeContextHandle,
@@ -1175,6 +1176,482 @@ export function createMockBridge(): Bridge & {
         signing_key_id: response.signing_key_id,
         signed_at: response.signed_at,
       });
+    },
+
+    // Tool interface (§6.2.0.1)
+    async toolInterfaceExpose(
+      _handle: BridgeContextHandle,
+      _toolId: string,
+      _targetContextId: string,
+      _rateLimitJson?: string,
+    ): Promise<string> {
+      return JSON.stringify({ interface_id: generateId("iface"), status: "exposed" });
+    },
+
+    async toolInterfaceAccept(
+      _handle: BridgeContextHandle,
+      _interfaceJson: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "accepted" });
+    },
+
+    async toolInterfaceRevoke(
+      _handle: BridgeContextHandle,
+      _interfaceIdHex: string,
+    ): Promise<string> {
+      return JSON.stringify({ status: "revoked" });
+    },
+
+    // Trust Aggregation
+    async aggregateTrustInput(
+      _contextId: string,
+      _subjectDid: string,
+      _eventsJson: string,
+      _merkleRootJson: string,
+      _consequenceRulesJson: string,
+      _thresholdRequirementsJson: string,
+      _attestorSetsJson: string,
+      _cachedAttestationsJson: string,
+      _challengeResultsJson: string,
+    ): Promise<string> {
+      return JSON.stringify({ trust_score: 1.0, details: {} });
+    },
+
+    // Bridge Connector
+    bridgeRegister(
+      contextId: string,
+      operatorDid: string,
+      _governanceDid: string,
+      platform: string,
+      mode: BridgeMode,
+    ): {
+      bridge_id: string;
+      operator_did: string;
+      platform: string;
+      mode: BridgeMode;
+      status: string;
+      context_id: string;
+    } {
+      return {
+        bridge_id: generateId("bridge"),
+        operator_did: operatorDid,
+        platform,
+        mode,
+        status: "active",
+        context_id: contextId,
+      };
+    },
+
+    bridgeEvaluateTrust(
+      _isBridged: boolean,
+      _isNativeTransport: boolean,
+      _shadowStatus: ShadowStatus,
+    ): number {
+      return 3;
+    },
+
+    bridgeCreateShadow(
+      bridgeId: string,
+      platformHandle: string,
+      _bridgeMode: BridgeMode,
+      _contextId: string | undefined,
+    ): {
+      shadow_id: string;
+      platform_handle: string;
+      bridge_id: string;
+      attributed_role: string;
+      provenance_status: ShadowStatus;
+    } {
+      return {
+        shadow_id: generateId("shadow"),
+        platform_handle: platformHandle,
+        bridge_id: bridgeId,
+        attributed_role: "observer",
+        provenance_status: "shadow",
+      };
+    },
+
+    // Discovery
+    discoveryParseAddress(address: string): string {
+      return JSON.stringify({ address, parsed: true });
+    },
+
+    discoveryCreateQuery(
+      _capabilities: string[] | undefined,
+      _keywords: string[] | undefined,
+      _minHistorySecs: number | undefined,
+    ): string {
+      return JSON.stringify({ query_id: generateId("query") });
+    },
+
+    discoveryNormalizeAddress(address: string): string {
+      return address.toLowerCase().trim();
+    },
+
+    async contextDiscover(_query: string): Promise<string> {
+      return JSON.stringify([]);
+    },
+
+    // Petnames (section 22.4)
+    petnameSet(_ownerDid: string, _targetDid: string, _name: string): void {
+      // no-op
+    },
+
+    petnameRemove(_ownerDid: string, _targetDid: string): void {
+      // no-op
+    },
+
+    petnameSetContext(_ownerDid: string, _contextId: string, _name: string): void {
+      // no-op
+    },
+
+    petnameRemoveContext(_ownerDid: string, _contextId: string): void {
+      // no-op
+    },
+
+    petnameResolveDid(_ownerDid: string, _name: string): string {
+      return "";
+    },
+
+    petnameResolveContext(_ownerDid: string, _name: string): string {
+      return "";
+    },
+
+    petnameGetForDid(_ownerDid: string, _targetDid: string): string | null {
+      return null;
+    },
+
+    petnameGetForContext(_ownerDid: string, _contextId: string): string | null {
+      return null;
+    },
+
+    // Handle Registry (section 22.3.1)
+    handleRegister(
+      _discoveryContextId: string,
+      handle: string,
+      _targetJson: string,
+      _registrantDid: string,
+      _description: string | undefined,
+      _tags: string[] | undefined,
+    ): string {
+      return JSON.stringify({ handle, status: "registered" });
+    },
+
+    handleLookup(
+      _discoveryContextId: string,
+      handle: string,
+      _typeFilter: string | undefined,
+    ): string {
+      return JSON.stringify({ handle, results: [] });
+    },
+
+    handleDeregister(_discoveryContextId: string, handle: string, _did: string): string {
+      return JSON.stringify({ handle, status: "deregistered" });
+    },
+
+    // Address Resolution (section 22.8)
+    async addressResolve(
+      _ownerDid: string,
+      _address: string,
+      _knownContextsJson: string | undefined,
+    ): Promise<string> {
+      return JSON.stringify([]);
+    },
+
+    // Provenance
+    async evaluateProvenanceQuality(
+      _sourceContext: string | undefined,
+      _sourceType: string,
+      _contextState: string,
+      _counterparties: string[] | undefined,
+    ): Promise<number> {
+      return 1.0;
+    },
+
+    provenanceAttach(
+      sourceContextId: string,
+      _sourceType: string,
+      _memoryScope: string,
+      _members: string[],
+      targetContextId: string,
+      _existingChainDepth: number | undefined,
+      _discoveryMethod: string | undefined,
+      _purpose: string | undefined,
+      _counterpartyPolicy: string | undefined,
+    ): string {
+      return JSON.stringify({
+        source_context_id: sourceContextId,
+        target_context_id: targetContextId,
+        chain_depth: 1,
+      });
+    },
+
+    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined): boolean {
+      return maxDepth === undefined || chainDepth <= maxDepth;
+    },
+
+    // Sync
+    syncClassifyOffline(_lastRelayContact: number, _now: number): string {
+      return "online";
+    },
+
+    syncClassifyOfflineCustom(
+      _lastRelayContact: number,
+      _now: number,
+      _tier1ThresholdSecs: number,
+      _tier2ThresholdSecs: number,
+    ): string {
+      return "online";
+    },
+
+    syncGetPolicy(): {
+      tier_1_threshold_secs: number;
+      tier_2_threshold_secs: number;
+      gap_timeout_secs: number;
+      reorder_buffer_capacity: number;
+      max_sequential_commits: number;
+      commit_process_timeout_secs: number;
+      sender_key_timeout_secs: number;
+      reconnection_dedup_window_secs: number;
+    } {
+      return {
+        tier_1_threshold_secs: 300,
+        tier_2_threshold_secs: 3600,
+        gap_timeout_secs: 30,
+        reorder_buffer_capacity: 100,
+        max_sequential_commits: 10,
+        commit_process_timeout_secs: 5,
+        sender_key_timeout_secs: 60,
+        reconnection_dedup_window_secs: 10,
+      };
+    },
+
+    // Identity Advanced
+    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
+      const did = generateDid();
+      const identity: MockIdentity = { did, custodyType: custody };
+      identities.set(did, identity);
+      return { did, custodyType: custody };
+    },
+
+    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityAttestDevice(_did: string): Promise<string> {
+      return JSON.stringify({ attestation_token: "mock-token" });
+    },
+
+    async identityVerifyDeviceAttestation(_did: string, _tokenBase64: string): Promise<boolean> {
+      return true;
+    },
+
+    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    async identityExecuteRecovery(
+      _did: string,
+      _tier: string,
+      _contextIds: string[],
+    ): Promise<string> {
+      return JSON.stringify({ status: "recovered" });
+    },
+
+    async identityExecuteCustodyMigration(
+      _did: string,
+      _target: string,
+      _contextIds: string[],
+    ): Promise<string> {
+      return JSON.stringify({ status: "migrated" });
+    },
+
+    // App Sandboxing (#595, spec §8.4.1, §8.4.2)
+    validateCapabilityDeclaration(
+      _declarationJson: string,
+      _ceilingCapabilities: string[],
+      _roleCapabilities: string[],
+    ): string {
+      return JSON.stringify({ valid: true, errors: [] });
+    },
+
+    checkScopedCapability(
+      _grantedCapabilities: readonly string[],
+      _requiredCapability: string,
+    ): boolean {
+      return true;
+    },
+
+    // Invitation evaluation (§5.x, context.ts)
+    evaluateInvitation(
+      _paramsJson: string,
+      _inviterDid: string,
+      _identityDid: string,
+      _policyJson: string | null,
+      _spendingJson: string | null,
+      _trustedDidsJson: string | null,
+    ): { decision: string } {
+      return { decision: "accept" };
+    },
+
+    // MetadataRecord inspection (§5.7.2, #615)
+    metadataRecordToJson(
+      _contextId: string,
+      _sequence: number,
+      _signerDid: string,
+      _timestamp: number,
+      _structuralJson: string,
+      _operationalJson: string,
+      _signatureHex: string,
+    ): string {
+      return JSON.stringify({ context_id: _contextId, sequence: _sequence });
+    },
+
+    metadataRecordFromJson(_jsonStr: string): string {
+      return JSON.stringify({ parsed: true });
+    },
+
+    // Context template inspection (§5.14, #615)
+    templateGetParams(_templateId: string): string {
+      return JSON.stringify({ params: {} });
+    },
+
+    validateAgainstTemplate(_paramsJson: string): string | null {
+      return null;
+    },
+
+    validateContextParams(_paramsJson: string): string | null {
+      return null;
+    },
+
+    // Economy (§19, ADR-033)
+    economyEstimateCost(_policyJson: string, _actionType: string, _metricsJson: string): number {
+      return 0;
+    },
+
+    economyPolicyRequiresPayment(_policyJson: string): boolean {
+      return false;
+    },
+
+    economyAutoAcceptBlocked(_policyJson: string): boolean {
+      return false;
+    },
+
+    economyCheckPolicyLock(_policyJson: string): boolean {
+      return false;
+    },
+
+    economyValidatePolicyChange(_currentJson: string, _proposedJson: string): boolean {
+      return true;
+    },
+
+    economyEvaluateFormula(_formulaJson: string, _metricsJson: string): number {
+      return 0;
+    },
+
+    economyAdjustRelayPrice(
+      _configJson: string,
+      _utilizationPct: number,
+    ): { newBasePrice: number; previousBasePrice: number; direction: string } {
+      return { newBasePrice: 0, previousBasePrice: 0, direction: "unchanged" };
+    },
+
+    economyBudgetRemaining(_contextId: string, _did: string): number {
+      return 0;
+    },
+
+    economyBudgetGrant(_contextId: string, _did: string, _amount: number): void {
+      // no-op
+    },
+
+    economyBudgetRecordSpend(_contextId: string, _did: string, _amount: number): void {
+      // no-op
+    },
+
+    economyAntispamRecord(_contextId: string, _senderDid: string, _timestamp: number): void {
+      // no-op
+    },
+
+    economyAntispamVelocity(_contextId: string, _senderDid: string, _now: number): number {
+      return 0;
+    },
+
+    economyAntispamEscalatedCost(
+      _contextId: string,
+      _senderDid: string,
+      _now: number,
+      baseCost: number,
+      _thresholdsJson: string,
+      _floor: number | null,
+      _cap: number | null,
+    ): number {
+      return baseCost;
+    },
+
+    // Media (ADR-024)
+    mediaCheckCapability(_ceiling: string[], _capability: string): boolean {
+      return true;
+    },
+
+    mediaInitiateSession(
+      _contextId: string,
+      _ceiling: string[],
+      _capabilities: string[],
+      _participants: string[],
+      _timestamp: number,
+    ): string {
+      return JSON.stringify({ session_id: generateId("media"), status: "initiated" });
+    },
+
+    mediaActivateSession(_sessionJson: string): string {
+      return JSON.stringify({ status: "active" });
+    },
+
+    mediaJoinSession(_sessionJson: string, _participantDid: string): string {
+      return JSON.stringify({ status: "joined" });
+    },
+
+    mediaEndSession(_sessionJson: string, _timestamp: number): string {
+      return JSON.stringify({ status: "ended" });
+    },
+
+    mediaCreateOffer(_sessionId: string, _sdp: string, _senderDid: string): string {
+      return JSON.stringify({ type: "offer", session_id: _sessionId });
+    },
+
+    mediaCreateAnswer(_sessionId: string, _sdp: string, _senderDid: string): string {
+      return JSON.stringify({ type: "answer", session_id: _sessionId });
+    },
+
+    mediaCreateIceCandidate(
+      _sessionId: string,
+      _candidate: string,
+      _senderDid: string,
+      _sdpMid?: string,
+      _sdpMlineIndex?: number,
+    ): string {
+      return JSON.stringify({ type: "ice_candidate", session_id: _sessionId });
+    },
+
+    mediaCreateSessionEnd(_sessionId: string, _senderDid: string): string {
+      return JSON.stringify({ type: "session_end", session_id: _sessionId });
+    },
+
+    mediaSendSignaling(_signalingJson: string): string {
+      return JSON.stringify({ status: "sent" });
+    },
+
+    mediaVerifySenderAttribution(_signalingJson: string, _envelopeSenderDid: string): boolean {
+      return true;
     },
 
     // Trust — participation verification (SCP-BA-004, §7.3.2.1)

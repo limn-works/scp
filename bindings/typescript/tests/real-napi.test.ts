@@ -13,6 +13,8 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
+import type { BridgeMode } from "../src/bridge";
+import type { MemberRole } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
@@ -81,8 +83,8 @@ if (bridge === null) {
       expect(doc.authentication.length).toBeGreaterThanOrEqual(1);
       // Verification methods must have non-empty publicKeyMultibase (issue #547).
       expect(doc.verificationMethods.length).toBeGreaterThanOrEqual(1);
-      expect(doc.verificationMethods[0].publicKeyMultibase).toBeTruthy();
-      expect(doc.verificationMethods[0].publicKeyMultibase.startsWith("z")).toBe(true);
+      expect(doc.verificationMethods[0]?.publicKeyMultibase).toBeTruthy();
+      expect(doc.verificationMethods[0]?.publicKeyMultibase.startsWith("z")).toBe(true);
       // Identity created without agent key: hasAgentKey must be false.
       expect(doc.hasAgentKey).toBe(false);
       expect(doc.agentPublicKey).toBeUndefined();
@@ -301,7 +303,7 @@ if (bridge === null) {
       );
       const role = await napi.contextMemberRole(ctx, identity.did);
       // NAPI bridge returns lowercase role names.
-      expect(role).toBe("admin");
+      expect(role).toBe("admin" as MemberRole);
     });
   });
 
@@ -425,7 +427,8 @@ if (bridge === null) {
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
       // NAPI bridge requires full capability URI with scp:ctx:{contextId}/ prefix.
       const fullUri = token.capabilities[0];
-      await napi.ucanValidate(ctx, token.encoded, fullUri);
+      expect(fullUri).toBeDefined();
+      await napi.ucanValidate(ctx, token.encoded, fullUri as string);
     });
 
     test("rejects validation for an ungranted capability", async () => {
@@ -464,9 +467,9 @@ if (bridge === null) {
       );
       const events = await napi.eventLogQuery(ctx, undefined);
       expect(events.length).toBeGreaterThanOrEqual(1);
-      expect(events[0].eventType).toBeTruthy();
-      expect(events[0].actorDid).toBeTruthy();
-      expect(typeof events[0].sequence).toBe("number");
+      expect(events[0]?.eventType).toBeTruthy();
+      expect(events[0]?.actorDid).toBeTruthy();
+      expect(typeof events[0]?.sequence).toBe("number");
     });
 
     test.skip("queries events with a filter (contextSend needs crypto — #1144)", async () => {
@@ -759,7 +762,12 @@ if (bridge === null) {
     });
 
     test("registers bridges with all four modes", () => {
-      for (const mode of ["relay", "puppet", "api", "cooperative"]) {
+      for (const mode of [
+        "relay",
+        "puppet",
+        "api",
+        "cooperative",
+      ] as const satisfies readonly BridgeMode[]) {
         const reg = napi.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
         expect(reg.status).toBe("active");
       }

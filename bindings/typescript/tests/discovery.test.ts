@@ -109,11 +109,11 @@ describe("AddressResolution discriminated union", () => {
     expect(identities).toHaveLength(1);
     expect(contexts).toHaveLength(1);
 
-    if (identities[0].type === "Identity") {
-      expect(identities[0].did).toBe("did:dht:z6MkAlice");
+    if (identities[0]?.type === "Identity") {
+      expect(identities[0]?.did).toBe("did:dht:z6MkAlice");
     }
-    if (contexts[0].type === "Context") {
-      expect(contexts[0].contextId).toBe("abc123");
+    if (contexts[0]?.type === "Context") {
+      expect(contexts[0]?.contextId).toBe("abc123");
     }
   });
 
@@ -163,7 +163,7 @@ describe("AddressResolution discriminated union", () => {
     expect(resolution.trustLevel.kind).toBe("MultiLayerCorroborated");
     if (resolution.trustLevel.kind === "MultiLayerCorroborated") {
       expect(resolution.trustLevel.sources).toHaveLength(2);
-      expect(resolution.trustLevel.sources[0].layer).toBe("Petname");
+      expect(resolution.trustLevel.sources?.[0]?.layer).toBe("Petname");
     }
   });
 

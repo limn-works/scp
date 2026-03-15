@@ -61,7 +61,7 @@ describe("Identity runtime (mock bridge)", () => {
     const doc = await mockBridge.identityResolve(handle.did);
     expect(doc.id).toBe(handle.did);
     expect(doc.verificationMethods.length).toBeGreaterThanOrEqual(1);
-    expect(doc.verificationMethods[0].type).toBe("Ed25519VerificationKey2020");
+    expect(doc.verificationMethods[0]?.type).toBe("Ed25519VerificationKey2020");
     expect(doc.authentication.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -105,8 +105,8 @@ describe("Context runtime (mock bridge)", () => {
     );
     const events = await mockBridge.eventLogQuery(ctx, undefined);
     expect(events.length).toBe(1);
-    expect(events[0].eventType).toBe("ContextCreated");
-    expect(events[0].actorDid).toBe(identity.did);
+    expect(events[0]?.eventType).toBe("ContextCreated");
+    expect(events[0]?.actorDid).toBe(identity.did);
   });
 
   it("allows join and records MemberJoined event", async () => {
@@ -123,7 +123,7 @@ describe("Context runtime (mock bridge)", () => {
       eventType: "MemberJoined",
     });
     expect(events.length).toBe(1);
-    expect(events[0].actorDid).toBe(joiner.did);
+    expect(events[0]?.actorDid).toBe(joiner.did);
   });
 
   it("sends a message and delivers to subscribers", async () => {
@@ -145,8 +145,8 @@ describe("Context runtime (mock bridge)", () => {
     await mockBridge.contextSend(ctx, identity.did, payload);
 
     expect(received.length).toBe(1);
-    expect(received[0].senderDid).toBe(identity.did);
-    expect(received[0].content).toBeInstanceOf(Uint8Array);
+    expect(received[0]?.senderDid).toBe(identity.did);
+    expect(received[0]?.content).toBeInstanceOf(Uint8Array);
   });
 
   it("leave records MemberLeft and notifies subscribers", async () => {
@@ -275,7 +275,7 @@ describe("Tool runtime (mock bridge)", () => {
 
     const toolId = await mockBridge.toolRegister(ctx, def);
 
-    await expect(mockBridge.toolInvoke(ctx, toolId, "{}", identity.did)).rejects.toThrow(
+    await expect(mockBridge.toolInvoke(ctx, toolId, "{}", identity.did, "")).rejects.toThrow(
       /SCP-VALID-7000/,
     );
   });
@@ -350,8 +350,8 @@ describe("Tool runtime (mock bridge)", () => {
       outputSchema: { type: "object" },
       operator: identity.did,
       testVectors: [
-        { input: { a: 2, b: 3 }, expectedOutput: { product: 6 } },
-        { input: { a: 0, b: 5 }, expectedOutput: { product: 0 } },
+        { input: { a: 2, b: 3 }, expectedOutput: { product: 6 }, description: "2 * 3 = 6" },
+        { input: { a: 0, b: 5 }, expectedOutput: { product: 0 }, description: "0 * 5 = 0" },
       ],
     });
 
@@ -381,7 +381,7 @@ describe("Tool runtime (mock bridge)", () => {
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
-      testVectors: [{ input: { x: 1 }, expectedOutput: { y: 2 } }],
+      testVectors: [{ input: { x: 1 }, expectedOutput: { y: 2 }, description: "x=1 maps to y=2" }],
     });
 
     const toolId = await mockBridge.toolRegister(ctx, def);
@@ -509,9 +509,9 @@ describe("Event log runtime (mock bridge)", () => {
     const events = await mockBridge.eventLogQuery(ctx, undefined);
     // ContextCreated + 2 MessageSent
     expect(events.length).toBe(3);
-    expect(events[0].eventType).toBe("ContextCreated");
-    expect(events[1].eventType).toBe("MessageSent");
-    expect(events[2].eventType).toBe("MessageSent");
+    expect(events[0]?.eventType).toBe("ContextCreated");
+    expect(events[1]?.eventType).toBe("MessageSent");
+    expect(events[2]?.eventType).toBe("MessageSent");
   });
 
   it("filters events by type", async () => {
@@ -529,7 +529,7 @@ describe("Event log runtime (mock bridge)", () => {
       eventType: "MessageSent",
     });
     expect(events.length).toBe(1);
-    expect(events[0].eventType).toBe("MessageSent");
+    expect(events[0]?.eventType).toBe("MessageSent");
   });
 
   it("filters events by actor DID", async () => {
@@ -769,7 +769,7 @@ describe("Participation verification (mock bridge)", () => {
     // Override mock to capture the JSON arguments.
     let capturedProfileJson = "";
     let capturedRequirementsJson = "";
-    (mockBridge as Record<string, unknown>).verifyParticipationRequirements = (
+    (mockBridge as unknown as Record<string, unknown>).verifyParticipationRequirements = (
       profileJson: string,
       requirementsJson: string,
     ): boolean => {
@@ -811,16 +811,16 @@ describe("Participation verification (mock bridge)", () => {
     // Verify the JSON matches the Rust serde format (snake_case).
     const profiles = JSON.parse(capturedProfileJson) as Record<string, unknown>[];
     expect(profiles).toHaveLength(1);
-    expect(profiles[0].subject_did).toBe("did:dht:z6MkBob");
-    expect(profiles[0].participation_duration_secs).toBe(100);
-    expect(profiles[0].tool_invocation_count).toBe(55);
+    expect(profiles[0]?.subject_did).toBe("did:dht:z6MkBob");
+    expect(profiles[0]?.participation_duration_secs).toBe(100);
+    expect(profiles[0]?.tool_invocation_count).toBe(55);
 
     const requirements = JSON.parse(capturedRequirementsJson) as Record<string, unknown>[];
     expect(requirements).toHaveLength(1);
-    expect(requirements[0].fact).toBe("ToolInvocationCount");
-    expect(requirements[0].threshold).toEqual({ GreaterThan: 50 });
-    expect(requirements[0].max_age_secs).toBe(7200);
-    expect(requirements[0].min_contexts).toBe(3);
+    expect(requirements[0]?.fact).toBe("ToolInvocationCount");
+    expect(requirements[0]?.threshold).toEqual({ GreaterThan: 50 });
+    expect(requirements[0]?.max_age_secs).toBe(7200);
+    expect(requirements[0]?.min_contexts).toBe(3);
   });
 });
 
@@ -857,13 +857,13 @@ describe("End-to-end context lifecycle", () => {
     // Alice sends a message
     await mockBridge.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));
     expect(messages.length).toBe(1);
-    expect(messages[0].senderDid).toBe(alice.did);
-    expect(messages[0].contextId).toBe(ctx.contextId);
+    expect(messages[0]?.senderDid).toBe(alice.did);
+    expect(messages[0]?.contextId).toBe(ctx.contextId);
 
     // Bob sends a message
     await mockBridge.contextSend(ctx, bob.did, new TextEncoder().encode("hello alice"));
     expect(messages.length).toBe(2);
-    expect(messages[1].senderDid).toBe(bob.did);
+    expect(messages[1]?.senderDid).toBe(bob.did);
 
     // Verify event log
     const allEvents = await mockBridge.eventLogQuery(ctx, undefined);
@@ -1475,8 +1475,8 @@ describe("Broadcast mutation operations (mock bridge)", () => {
     const rotateEvents =
       mockCtx?.eventLog.filter((e) => e.eventType === "BroadcastKeyRotated") ?? [];
     expect(rotateEvents.length).toBe(1);
-    expect(rotateEvents[0].payload.reason).toBe("subscriber_removed");
-    expect(rotateEvents[0].payload.subscriberDid).toBe(subscriber.did);
+    expect(rotateEvents[0]?.payload.reason).toBe("subscriber_removed");
+    expect(rotateEvents[0]?.payload.subscriberDid).toBe(subscriber.did);
   });
 
   it("broadcastPublish succeeds for context member", async () => {

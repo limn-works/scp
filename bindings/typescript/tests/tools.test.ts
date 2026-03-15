@@ -24,7 +24,7 @@ describe("defineToolDefinition", () => {
   });
 
   it("includes optional fields when provided", () => {
-    const testVectors = [{ input: { x: 1 }, expectedOutput: { y: 2 } }];
+    const testVectors = [{ input: { x: 1 }, expectedOutput: { y: 2 }, description: "maps x to y" }];
     const hash = new Uint8Array(32);
 
     const def = defineToolDefinition({
