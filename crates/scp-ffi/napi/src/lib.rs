@@ -160,10 +160,14 @@ pub(crate) fn increment_handle_count() {
     HANDLE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Decrements the live handle count.
+/// Decrements the live handle count, saturating at zero.
 #[inline]
 pub(crate) fn decrement_handle_count() {
-    HANDLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    HANDLE_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+            Some(if val > 0 { val - 1 } else { 0 })
+        })
+        .ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -247,5 +251,18 @@ mod tests {
         assert_eq!(HANDLE_COUNT.load(Ordering::SeqCst), baseline + 1);
         decrement_handle_count();
         assert_eq!(HANDLE_COUNT.load(Ordering::SeqCst), baseline);
+    }
+
+    #[test]
+    fn handle_count_saturates_at_zero() {
+        let baseline = HANDLE_COUNT.load(Ordering::SeqCst);
+        // Extra decrement when already at baseline should not underflow
+        decrement_handle_count();
+        let after = HANDLE_COUNT.load(Ordering::SeqCst);
+        // Should be at most baseline (saturated, not wrapped to usize::MAX)
+        assert!(
+            after <= baseline,
+            "expected saturated at {baseline}, got {after}"
+        );
     }
 }
