@@ -31,6 +31,14 @@ try:
 except ImportError:
     pass  # Native extension not available (pure-Python / mocked tests)
 
+from scp_sdk.auth import (
+    ScpIdAuthentication,
+    ScpIdChallenge,
+    ScpIdResponse,
+    scpid_challenge,
+    scpid_sign,
+    scpid_verify,
+)
 from scp_sdk.bridge import (
     create_shadow,
 )
@@ -179,6 +187,9 @@ __all__ = [
     "ProvenanceQuality",
     "RequireParticipation",
     "ScpError",
+    "ScpIdAuthentication",
+    "ScpIdChallenge",
+    "ScpIdResponse",
     "ShadowStatus",
     "SourceType",
     "TestVector",
@@ -228,6 +239,9 @@ __all__ = [
     "reset_ttl_timer",
     "revoke",
     "run_sync",
+    "scpid_challenge",
+    "scpid_sign",
+    "scpid_verify",
     "serve_mcp",
     "session_close",
     "session_create",

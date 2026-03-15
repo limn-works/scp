@@ -352,6 +352,11 @@ export interface Bridge {
     requiredCapability: string,
   ): boolean;
 
+  // SCPID authentication (§3.11)
+  scpidChallenge(audience: string, ttlSeconds: number): string;
+  scpidSign(did: string, signingKeyId: string, challengeJson: string): string;
+  scpidVerify(responseJson: string, challengeJson: string): string;
+
   // Lifecycle
   version(): string;
   shutdown(timeoutSecs: number): void;
