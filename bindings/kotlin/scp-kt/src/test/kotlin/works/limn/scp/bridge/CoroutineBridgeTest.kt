@@ -178,7 +178,7 @@ class CoroutineBridgeTest {
         @Test
         fun `toolVerify dispatches on IO`() =
             runTest(ioDispatcher) {
-                stubBindings.toolVerifyResult = true
+                stubBindings.toolVerifyResult = """{"tool_id":"tool-001","passed":true,"failures":[]}"""
                 val result = bridge.tools.verify(10L, "tool-001")
                 assertTrue(result.contains("\"passed\":true"))
             }
@@ -587,7 +587,7 @@ class StubNativeBindings : NativeBindings {
     var contextSubscribeResult = 0L
     var toolRegisterResult = ""
     var toolInvokeResult = ""
-    var toolVerifyResult = false
+    var toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
     var ucanMintResult = ""
     var ucanDelegateResult = ""
     var eventLogQueryResult = ""
@@ -738,7 +738,7 @@ class StubNativeBindings : NativeBindings {
     override fun toolVerify(
         contextHandle: Long,
         toolId: String,
-    ): String = """{"tool_id":"$toolId","passed":$toolVerifyResult,"failures":[]}"""
+    ): String = toolVerifyResult
 
     override fun ucanValidate(
         contextHandle: Long,

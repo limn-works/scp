@@ -53,7 +53,7 @@ class ConformanceStubBindings : NativeBindings {
     var toolRegisterError: BridgeException? = null
     var toolInvokeResult: String = """{"output":"ok"}"""
     var toolInvokeError: BridgeException? = null
-    var toolVerifyResult: Boolean = true // kept as Boolean, serialized to JSON in toolVerify()
+    var toolVerifyResult: String = """{"tool_id":"stub","passed":true,"failures":[]}"""
     var toolVerifyError: BridgeException? = null
 
     var ucanValidateError: BridgeException? = null
@@ -207,8 +207,7 @@ class ConformanceStubBindings : NativeBindings {
         toolId: String,
     ): String {
         toolVerifyError?.let { throw it }
-        @Suppress("MaxLineLength")
-        return """{"tool_id":"$toolId","passed":$toolVerifyResult,"failures":[]}"""
+        return toolVerifyResult
     }
 
     override fun ucanValidate(
@@ -316,7 +315,7 @@ class ConformanceStubBindings : NativeBindings {
         toolRegisterError = null
         toolInvokeResult = """{"output":"ok"}"""
         toolInvokeError = null
-        toolVerifyResult = true
+        toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
         toolVerifyError = null
         ucanValidateError = null
         ucanMintResult = "minted-token"
