@@ -563,6 +563,151 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
 }
 
 // ---------------------------------------------------------------------------
+// BridgeRevocationAuthorizer (issue #499)
+// ---------------------------------------------------------------------------
+
+/// Bridge [`RevocationAuthorizer`] that checks the revoker DID against the
+/// token's issuer DID and the context creator DID.
+///
+/// The authorizer is constructed with the issuer DID extracted from the parsed
+/// UCAN token. Authorization succeeds if the revoker is either the token's
+/// issuer or the context creator, matching the spec (ADR-016 acceptance
+/// criterion 5).
+///
+/// This is not a lookup-based authorizer (unlike a full runtime that would
+/// index token CID -> issuer). Instead, the bridge parses the token before
+/// calling `revoke_ucan` and pre-populates the issuer DID.
+pub struct BridgeRevocationAuthorizer {
+    /// The DID of the token's issuer (extracted from the parsed UCAN).
+    pub issuer_did: String,
+    /// The DID of the context creator.
+    pub creator_did: String,
+}
+
+impl scp_core::crypto::ucan::revoke::RevocationAuthorizer for BridgeRevocationAuthorizer {
+    fn authorize_revocation(
+        &self,
+        _token_cid: &str,
+        revoker_did: &str,
+    ) -> Result<(), CoreUcanError> {
+        if revoker_did == self.issuer_did || revoker_did == self.creator_did {
+            Ok(())
+        } else {
+            Err(CoreUcanError::RevocationUnauthorized(format!(
+                "revoker '{revoker_did}' is neither the token issuer ('{}') nor the context creator ('{}')",
+                self.issuer_did, self.creator_did
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BridgeRevocationDistributor (issue #499)
+// ---------------------------------------------------------------------------
+
+/// No-op [`RevocationDistributor`] for FFI bridges.
+///
+/// FFI bridges do not have direct access to MLS group state for distributing
+/// revocations to context members. In the full runtime, revocations would be
+/// broadcast as MLS application messages. In the bridge layer, the local
+/// revocation list is updated immediately and distribution is deferred to the
+/// transport layer (when connected).
+///
+/// This distributor always succeeds, logging the revocation for observability.
+pub struct BridgeRevocationDistributor;
+
+impl scp_core::crypto::ucan::revoke::RevocationDistributor for BridgeRevocationDistributor {
+    fn distribute_revocation(
+        &self,
+        context_id: &str,
+        token_cid: &str,
+    ) -> Result<(), CoreUcanError> {
+        info!(
+            context_id = context_id,
+            token_cid = token_cid,
+            "revocation recorded locally (bridge-layer distribution — MLS broadcast deferred to transport)"
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BridgeRevocationEventLogger (issue #499)
+// ---------------------------------------------------------------------------
+
+/// Bridge [`RevocationEventLogger`] that appends unsigned `TokenRevoked`
+/// events to the context's Merkle event log.
+///
+/// Uses `append_unsigned_event` because `KeyCustody::sign()` is async and
+/// the revocation path is called from sync FFI bridge functions. The event
+/// is chain-validated and Merkle-committed but carries an empty signature.
+/// This follows the same pattern as `FfiBridgeProvider::invoke_tool` in
+/// `crates/scp-ffi/src/mcp.rs`.
+///
+/// When async FFI signing lands (SCP-214 migration), migrate to signed events
+/// via `scp_event_log::tree::append`.
+pub struct BridgeRevocationEventLogger<'a> {
+    /// Mutable reference to the context's event log, wrapped in `RefCell`
+    /// because the `RevocationEventLogger` trait takes `&self`.
+    pub event_log: &'a std::cell::RefCell<&'a mut scp_event_log::EventLog>,
+}
+
+impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationEventLogger<'_> {
+    fn log_token_revoked(
+        &self,
+        context_id: &str,
+        token_cid: &str,
+        revoker_did: &str,
+    ) -> Result<(), CoreUcanError> {
+        let mut event_log = self.event_log.borrow_mut();
+        let sequence = scp_event_log::tree::event_count(&event_log);
+        let prev_hash = if event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            event_log.leaves()[event_log.leaves().len() - 1]
+        };
+
+        // Build payload: JSON object with token_cid, revoker_did, context_id.
+        let payload_json = serde_json::json!({
+            "token_cid": token_cid,
+            "revoker_did": revoker_did,
+            "context_id": context_id,
+        });
+        let payload_data = serde_json::to_vec(&payload_json).unwrap_or_default();
+
+        // Unix timestamp seconds fit in u64 for centuries.
+        #[allow(clippy::cast_possible_truncation)]
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let event = scp_event_log::Event {
+            event_type: scp_event_log::EventType::TokenRevoked,
+            actor_did: scp_event_log::DID(revoker_did.to_owned()),
+            timestamp,
+            sequence,
+            payload: scp_event_log::EventPayload { data: payload_data },
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        scp_event_log::tree::append_unsigned_event(&mut event_log, &event).map_err(|e| {
+            CoreUcanError::RevocationFailed(format!("event log append failed: {e}"))
+        })?;
+
+        info!(
+            context_id = context_id,
+            token_cid = token_cid,
+            revoker_did = revoker_did,
+            sequence = sequence,
+            "TokenRevoked event appended to event log"
+        );
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (#311)
 // ---------------------------------------------------------------------------
 

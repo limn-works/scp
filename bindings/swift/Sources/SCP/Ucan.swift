@@ -81,7 +81,8 @@ public enum UcanBridge {
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
     public typealias RevokeFn = @Sendable (
         _ handle: ContextHandle,
-        _ token: String
+        _ token: String,
+        _ revokerDid: String
     ) async throws -> Void
 
     /// Default validate function that delegates to the UniFFI-generated binding.
@@ -95,8 +96,8 @@ public enum UcanBridge {
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
-    public static let defaultRevoke: RevokeFn = { handle, token in
-        try await ucanRevoke(handle: handle, token: token)
+    public static let defaultRevoke: RevokeFn = { handle, token, revokerDid in
+        try await ucanRevoke(handle: handle, token: token, revokerDid: revokerDid)
     }
 
     /// Delegate a UCAN token. Maps to ``ucanDelegate`` in ScpBindings.
@@ -173,27 +174,36 @@ public func mintUcanToken(
     try await mintFn(handle, memberDid, capabilities)
 }
 
-/// Revokes a UCAN token.
+/// Revokes a UCAN token using the full revocation pipeline.
+///
+/// Performs authorization (revoker must be the token's issuer or the context
+/// creator), adds the token to the revocation list, and appends a
+/// `TokenRevoked` event to the Merkle event log.
 ///
 /// Delegates to the UniFFI ``ucanRevoke`` bridge function.
 ///
 /// - Parameters:
 ///   - handle: The ``ContextHandle`` for the context.
 ///   - token: The full encoded JWT string of the token to revoke.
+///   - revokerDid: The DID of the entity requesting the revocation. Must be
+///     the token's issuer or the context creator.
 ///   - revokeFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Permission(msg:code:)`` if revocation fails.
+/// - Throws: ``ScpError/Permission(msg:code:)`` if revocation fails
+///   (unauthorized revoker, malformed token, etc.).
 ///
 /// ## Provenance
 ///
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+/// - Closes #499
 public func revokeUcanToken(
     handle: ContextHandle,
     token: String,
+    revokerDid: String,
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
-    try await revokeFn(handle, token)
+    try await revokeFn(handle, token, revokerDid)
 }
 
 /// Delegates a UCAN token to another entity.
@@ -304,8 +314,8 @@ public func mint(
 public func revoke(
     handle: ContextHandle,
     encoded: String,
-    revokerDid _: String,
+    revokerDid: String,
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
-    try await revokeFn(handle, encoded)
+    try await revokeFn(handle, encoded, revokerDid)
 }

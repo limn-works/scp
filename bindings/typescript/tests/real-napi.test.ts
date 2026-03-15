@@ -443,8 +443,8 @@ if (bridge === null) {
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
-      // Revocation should not throw.
-      await napi.ucanRevoke(ctx, token.encoded);
+      // Revocation by the context creator should not throw.
+      await napi.ucanRevoke(ctx, token.encoded, admin.did);
     });
   });
 
@@ -907,8 +907,8 @@ if (bridge === null) {
       await napi.ucanValidate(ctx, token.encoded, readCap);
       await napi.ucanValidate(ctx, token.encoded, writeCap);
 
-      // Revoke.
-      await napi.ucanRevoke(ctx, token.encoded);
+      // Revoke (revoker is the admin/context creator).
+      await napi.ucanRevoke(ctx, token.encoded, admin.did);
 
       // Validation should now fail.
       await expect(napi.ucanValidate(ctx, token.encoded, readCap)).rejects.toThrow();

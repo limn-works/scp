@@ -40,7 +40,7 @@ use scp_core::crypto::ucan::Attenuation;
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, delegate_ucan, mint_ucan};
-use scp_core::crypto::ucan::revoke::compute_revocation_cid;
+use scp_core::crypto::ucan::revoke::revoke_ucan as core_revoke_ucan;
 use scp_core::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
 };
@@ -421,39 +421,67 @@ pub fn py_ucan_delegate(
     })
 }
 
-/// Revokes a UCAN token.
+/// Revokes a UCAN token using the full revocation pipeline.
 ///
-/// Adds the token to the context's revocation list. Revoked tokens are
-/// no longer accepted by validation. In the full runtime, revocation is
-/// distributed to all context members via MLS.
+/// Performs the complete UCAN revocation flow from ADR-016:
 ///
-/// The token is identified by its content-hash CID (SHA-256 of the JSON-
-/// serialized payload), matching the identifier used by scp-core's
-/// `compute_revocation_cid`. This format is consistent with the CID
-/// checked by the full validation pipeline in step 10.
+/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
+///    context creator via [`BridgeRevocationAuthorizer`].
+/// 2. **Local revocation** -- Adds the token CID to the context's
+///    [`RevocationList`] (fail-closed via `RevocationPending` state).
+/// 3. **Distribution** -- Logs the revocation for transport-layer broadcast
+///    (MLS distribution deferred to transport connection).
+/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
+///    Merkle event log.
 ///
 /// # Arguments
 ///
 /// * `context_id` -- The ID of the context the token belongs to.
 /// * `token` -- The full encoded UCAN token string (JWT format).
+/// * `revoker_did` -- The DID of the entity requesting the revocation. Must
+///   be either the token's issuer or the context creator.
 ///
 /// # Errors
 ///
-/// Raises `UcanError` if revocation fails: context not found, malformed
-/// token, etc.
+/// Raises `UcanError` if revocation fails: unauthorized revoker, context not
+/// found, malformed token, or event log append failure.
 ///
-/// See ADR-013 §6: `py_ucan_revoke(handle, token) -> None`.
+/// See ADR-016 acceptance criterion 5. Closes #499.
 #[pyfunction]
 #[pyo3(name = "ucan_revoke")]
-pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
+pub fn py_ucan_revoke(context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
     validate::validate_ucan_token(token)?;
+    validate::validate_did(revoker_did)?;
+
+    // Parse the token to extract the issuer DID for authorization.
+    let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
+
     crate::runtime::with_context(context_id, |rt| {
-        // Compute the revocation CID from the raw JWT string, matching
-        // scp-core's format (SHA-256 of the encoded token).
-        let token_cid = compute_revocation_cid(token);
-        rt.revocation_list.revoke(token_cid);
-        Ok(())
+        use crate::bridge_adapters::{
+            BridgeRevocationAuthorizer, BridgeRevocationDistributor, BridgeRevocationEventLogger,
+        };
+        use std::cell::RefCell;
+
+        let authorizer = BridgeRevocationAuthorizer {
+            issuer_did: parsed.payload.iss.clone(),
+            creator_did: rt.creator_did.clone(),
+        };
+        let distributor = BridgeRevocationDistributor;
+        let event_log_cell = RefCell::new(&mut rt.event_log);
+        let event_logger = BridgeRevocationEventLogger {
+            event_log: &event_log_cell,
+        };
+
+        core_revoke_ucan(
+            &mut rt.revocation_list,
+            token,
+            revoker_did,
+            &authorizer,
+            &distributor,
+            &event_logger,
+        )
+        .map_err(ScpPyError::from)
     })?;
 
     Ok(())

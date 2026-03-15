@@ -289,15 +289,39 @@ if (bridge === null || wasmModule === null) {
       ).rejects.toThrow();
     });
 
-    test("ucan_revoke does not throw for a token CID", async () => {
+    test("ucan_revoke succeeds for authorized revoker", async () => {
       const identity = await raw.identity_create("in_memory");
       const ctx = await raw.context_create(
         identity.did,
         JSON.stringify({ ceiling: ["messages:read"] }),
       );
 
-      // Revocation of any string should succeed (adds CID to revocation set).
-      await raw.ucan_revoke(ctx, "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0IjoxfQ.AAAA");
+      // Construct a valid UCAN JWT for revocation (issuer = creator DID).
+      const header = btoa(JSON.stringify({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" }))
+        .replace(/=/g, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
+      const payload = btoa(
+        JSON.stringify({
+          iss: identity.did,
+          aud: "did:dht:zMember",
+          exp: 9999999999,
+          nnc: "1699999000000-aabbccdd11223344",
+          att: [],
+          prf: [],
+        }),
+      )
+        .replace(/=/g, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
+      const sig = btoa("test-signature-bytes-000000000000")
+        .replace(/=/g, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
+      const testJwt = `${header}.${payload}.${sig}`;
+
+      // Revocation by the context creator (authorized) should succeed.
+      await raw.ucan_revoke(ctx, testJwt, identity.did);
     });
   });
 

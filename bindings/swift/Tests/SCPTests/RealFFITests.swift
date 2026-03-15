@@ -1159,11 +1159,16 @@ struct RealFFIUcanAndGovernanceTests {
 
         let handle = try await contextCreate(identity: identity, params: params)
 
-        // Call ucanRevoke with a non-existent token — exercises the FFI path.
-        // Revocation is idempotent: revoking a non-existent token succeeds.
+        // Call ucanRevoke with a valid UCAN token — exercises the full
+        // revocation pipeline including authorization and event logging.
+        // The revoker is the context creator (authorized).
+        let testToken = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9." +
+            "eyJpc3MiOiJkaWQ6ZGh0OnpUZXN0SXNzdWVyIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ." +
+            "dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw"
         try await ucanRevoke(
             handle: handle,
-            token: "not-a-valid-ucan-token"
+            token: testToken,
+            revokerDid: identity.did
         )
     }
 

@@ -316,13 +316,12 @@ class RealFFITest {
             val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
             assertNotNull(token.tokenData(), "Minted token should have data")
 
-            // Revoke the token. The bridge accepts the raw JWT string.
-            // Revocation is idempotent — revoking a non-existent or already-
-            // revoked token succeeds without error.
-            uniffi.scp.ucanRevoke(handle, "not-a-valid-ucan-token")
-
-            // A second revocation of the same string also succeeds (idempotent).
-            uniffi.scp.ucanRevoke(handle, "not-a-valid-ucan-token")
+            // Revoke a valid UCAN token. The revoker is the context creator.
+            val testToken =
+                "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9." +
+                    "eyJpc3MiOiJkaWQ6ZGh0OnpUZXN0SXNzdWVyIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ." +
+                    "dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw"
+            uniffi.scp.ucanRevoke(handle, testToken, alice.did())
         }
     }
 

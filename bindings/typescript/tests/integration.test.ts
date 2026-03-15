@@ -326,7 +326,7 @@ describe("Tool runtime (mock bridge)", () => {
     const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
 
     // Revoke the token
-    await mockBridge.ucanRevoke(ctx, ucan.encoded);
+    await mockBridge.ucanRevoke(ctx, ucan.encoded, identity.did);
 
     // Invocation should fail
     await expect(
@@ -481,7 +481,7 @@ describe("UCAN runtime (mock bridge)", () => {
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
     const token = await mockBridge.ucanMint(ctx, memberDid, ["messages:read"]);
 
-    await mockBridge.ucanRevoke(ctx, token.encoded);
+    await mockBridge.ucanRevoke(ctx, token.encoded, identity.did);
 
     await expect(mockBridge.ucanValidate(ctx, token.encoded, "messages:read")).rejects.toThrow(
       /SCP-PERM-3001/,
@@ -802,8 +802,8 @@ describe("UCAN full lifecycle", () => {
     await mockBridge.ucanValidate(ctx, token.encoded, "messages:read");
     await mockBridge.ucanValidate(ctx, token.encoded, "messages:write");
 
-    // Revoke
-    await mockBridge.ucanRevoke(ctx, token.encoded);
+    // Revoke (revoker is the admin/context creator)
+    await mockBridge.ucanRevoke(ctx, token.encoded, admin.did);
 
     // Validate fails after revocation
     await expect(mockBridge.ucanValidate(ctx, token.encoded, "messages:read")).rejects.toThrow(

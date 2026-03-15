@@ -463,9 +463,9 @@ async fn ucan_mint_and_revoke() {
     let caps = token.capabilities();
     assert!(!caps.is_empty(), "Capabilities should be non-empty");
 
-    // Revoke the token
-    let revoke_result = ucan_revoke(handle, token_id).await;
-    // Revocation may succeed or fail based on implementation, but should not panic
+    // Revoke the token (revoker is the context creator).
+    let revoke_result = ucan_revoke(handle, token.encoded(), alice.did()).await;
+    // Revocation may succeed or fail based on implementation, but should not panic.
     let _ = revoke_result;
 }
 

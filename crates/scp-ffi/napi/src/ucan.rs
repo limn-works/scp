@@ -40,7 +40,8 @@ use scp_core::crypto::ucan::validate::{
 };
 
 use scp_ffi_common::{
-    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, DispatchDidResolver,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationAuthorizer, BridgeRevocationChecker,
+    BridgeRevocationDistributor, BridgeRevocationEventLogger, DispatchDidResolver,
 };
 
 use crate::context::NapiContextHandle;
@@ -587,34 +588,72 @@ pub async fn ucan_delegate(
     }
 }
 
-/// Revokes a UCAN token.
+/// Revokes a UCAN token using the full revocation pipeline.
 ///
-/// Adds the token to the context's persistent revocation list. Revoked tokens
-/// are rejected by subsequent `ucan_validate` calls on the same context.
+/// Performs the complete UCAN revocation flow from ADR-016:
+///
+/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
+///    context creator.
+/// 2. **Local revocation** -- Adds the token CID to the context's
+///    `RevocationList` (fail-closed via `RevocationPending` state).
+/// 3. **Distribution** -- Logs the revocation for transport-layer broadcast.
+/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
+///    Merkle event log.
 ///
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
 /// * `token` — The full encoded JWT string of the token to revoke.
+/// * `revoker_did` — The DID of the entity requesting the revocation. Must
+///   be either the token's issuer or the context creator.
 ///
 /// # Errors
 ///
 /// - Rejects with `SCP-CTX-2023` if the context runtime is not initialized.
 /// - Rejects with `SCP-PERM-3001` if the token cannot be parsed.
+/// - Rejects with `SCP-PERM-3008` if the revoker is unauthorized.
+///
+/// Closes #499.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Result<()> {
+pub async fn ucan_revoke(
+    handle: &NapiContextHandle,
+    token: String,
+    revoker_did: String,
+) -> napi::Result<()> {
+    validate_ucan_token(&token).map_err(ScpNapiError::from)?;
+    validate_did(&revoker_did).map_err(ScpNapiError::from)?;
+
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
-    // Validate the token is a well-formed UCAN before revoking.
-    let _parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
+    // Parse the token to extract the issuer DID for authorization.
+    let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::with_context(&context_id, |rt| {
-        // Compute the content-hash CID matching scp-core's format (SHA-256 of raw JWT).
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
-        rt.revocation_list.revoke(token_cid);
+        use std::cell::RefCell;
+
+        let authorizer = BridgeRevocationAuthorizer {
+            issuer_did: parsed.payload.iss.clone(),
+            creator_did: rt.creator_did.clone(),
+        };
+        let distributor = BridgeRevocationDistributor;
+        let event_log_cell = RefCell::new(&mut rt.event_log);
+        let event_logger = BridgeRevocationEventLogger {
+            event_log: &event_log_cell,
+        };
+
+        scp_core::crypto::ucan::revoke::revoke_ucan(
+            &mut rt.revocation_list,
+            &token,
+            &revoker_did,
+            &authorizer,
+            &distributor,
+            &event_logger,
+        )
+        .map_err(ScpNapiError::from)?;
+
         Ok(())
     })
     .map_err(napi::Error::from)?;
@@ -974,20 +1013,49 @@ mod tests {
     #[test]
     fn revoke_then_check_revocation_list() {
         use crate::runtime;
+        use std::cell::RefCell;
 
         let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
-        runtime::register_test_context(&context_id, "did:dht:zCreator");
+        let creator_did = "did:dht:zCreator";
+        runtime::register_test_context(&context_id, creator_did);
 
-        let token_cid = "revoked-token-cid-abc".to_owned();
+        // Build a deterministic token string for revocation.
+        let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+            eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+            dGVzdC1zaWduYXR1cmU";
 
-        // Simulate what ucan_revoke does: revoke via runtime registry.
+        // Parse outside the closure so the issuer DID can be moved.
+        let parsed = parse_ucan(test_token).unwrap();
+        let issuer_did = parsed.payload.iss;
+
+        // Simulate the full revocation pipeline via revoke_ucan.
         runtime::with_context(&context_id, |rt| {
-            rt.revocation_list.revoke(token_cid.clone());
+            let authorizer = BridgeRevocationAuthorizer {
+                issuer_did: issuer_did.clone(),
+                creator_did: rt.creator_did.clone(),
+            };
+            let distributor = BridgeRevocationDistributor;
+            let event_log_cell = RefCell::new(&mut rt.event_log);
+            let event_logger = BridgeRevocationEventLogger {
+                event_log: &event_log_cell,
+            };
+
+            scp_core::crypto::ucan::revoke::revoke_ucan(
+                &mut rt.revocation_list,
+                test_token,
+                creator_did,
+                &authorizer,
+                &distributor,
+                &event_logger,
+            )
+            .unwrap();
+
             Ok(())
         })
         .unwrap();
 
-        // Simulate what ucan_validate does: check revocation via runtime registry.
+        // Verify revocation is detected by the checker.
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(test_token);
         let checker_says_revoked = runtime::with_context(&context_id, |rt| {
             let checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
@@ -998,7 +1066,64 @@ mod tests {
 
         assert!(
             checker_says_revoked,
-            "token revoked via ucan_revoke must be detected by ucan_validate's revocation checker"
+            "token revoked via revoke_ucan must be detected by ucan_validate's revocation checker"
+        );
+
+        // Verify a TokenRevoked event was appended to the event log.
+        let event_count = runtime::with_context(&context_id, |rt| {
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap();
+        assert!(
+            event_count > 0,
+            "event log must contain at least one event after revocation"
+        );
+    }
+
+    #[test]
+    fn revoke_rejects_unauthorized_revoker() {
+        use crate::runtime;
+        use std::cell::RefCell;
+
+        let context_id = format!("ctx-revoke-unauth-{}", uuid::Uuid::new_v4());
+        let creator_did = "did:dht:zCreator";
+        runtime::register_test_context(&context_id, creator_did);
+
+        let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+            eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+            dGVzdC1zaWduYXR1cmU";
+
+        // Parse outside the closure so the issuer DID can be moved.
+        let parsed = parse_ucan(test_token).unwrap();
+        let issuer_did = parsed.payload.iss;
+
+        // Attempt revocation by an unauthorized DID (not issuer, not creator).
+        let result = runtime::with_context(&context_id, |rt| {
+            let authorizer = BridgeRevocationAuthorizer {
+                issuer_did: issuer_did.clone(),
+                creator_did: rt.creator_did.clone(),
+            };
+            let distributor = BridgeRevocationDistributor;
+            let event_log_cell = RefCell::new(&mut rt.event_log);
+            let event_logger = BridgeRevocationEventLogger {
+                event_log: &event_log_cell,
+            };
+
+            let result = scp_core::crypto::ucan::revoke::revoke_ucan(
+                &mut rt.revocation_list,
+                test_token,
+                "did:dht:zUnauthorized",
+                &authorizer,
+                &distributor,
+                &event_logger,
+            );
+            Ok(result)
+        })
+        .unwrap();
+
+        assert!(
+            result.is_err(),
+            "revocation by unauthorized DID must be rejected"
         );
     }
 

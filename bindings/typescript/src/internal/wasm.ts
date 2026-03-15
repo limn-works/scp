@@ -138,7 +138,7 @@ interface WasmModule {
     expiresAt: number | null;
     encoded: string;
   }>;
-  ucan_revoke: (handle: BridgeContextHandle, token: string) => Promise<void>;
+  ucan_revoke: (handle: BridgeContextHandle, token: string, revokerDid: string) => Promise<void>;
   // Bridge Connector
   bridge_register: (
     contextId: string,
@@ -965,9 +965,9 @@ export function createWasmBridge(): Bridge {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void> {
+    async ucanRevoke(handle: BridgeContextHandle, token: string, revokerDid: string): Promise<void> {
       const wasm = getWasm();
-      await wasm.ucan_revoke(handle, token);
+      await wasm.ucan_revoke(handle, token, revokerDid);
     },
 
     async ucanDelegate(
