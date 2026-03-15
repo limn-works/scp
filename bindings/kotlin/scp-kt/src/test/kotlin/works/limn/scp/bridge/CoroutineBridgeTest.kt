@@ -272,67 +272,19 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
-<<<<<<< HEAD
-    // Dispatcher assignment tests — tool session operations
-=======
     // Dispatcher assignment tests — tool session + cross-context operations
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
     // -------------------------------------------------------------------
 
     @Nested
     inner class ToolSessionDispatcherTests {
         @Test
-<<<<<<< HEAD
         fun `invokeCrossContext dispatches on IO and forwards all arguments`() =
             runTest(ioDispatcher) {
                 stubBindings.toolInvokeCrossContextResult = """{"output":"xctx"}"""
-=======
-        fun `toolSessionCreate dispatches on IO and forwards arguments`() =
-            runTest(ioDispatcher) {
-                stubBindings.toolSessionCreateResult = "session-abc"
-                val result = bridge.tools.sessionCreate(10L, "tool-001", "src-ctx-1", 300L)
-                assertEquals("session-abc", result)
-                assertTrue(stubBindings.toolSessionCreateCalled)
-                assertEquals("tool-001", stubBindings.lastSessionCreateToolId)
-                assertEquals("src-ctx-1", stubBindings.lastSessionCreateSourceContextId)
-                assertEquals(300L, stubBindings.lastSessionCreateTtl)
-            }
-
-        @Test
-        fun `toolSessionInvoke dispatches on IO and forwards arguments`() =
-            runTest(ioDispatcher) {
-                stubBindings.toolSessionInvokeResult = """{"output":"result"}"""
-                val result = bridge.tools.sessionInvoke(
-                    10L,
-                    "session-abc",
-                    """{"x":1}""",
-                    1L,
-                    "ucan.token.sig",
-                )
-                assertEquals("""{"output":"result"}""", result)
-                assertTrue(stubBindings.toolSessionInvokeCalled)
-                assertEquals("session-abc", stubBindings.lastSessionInvokeSessionId)
-                assertEquals("""{"x":1}""", stubBindings.lastSessionInvokeInputJson)
-            }
-
-        @Test
-        fun `toolSessionClose dispatches on IO and forwards arguments`() =
-            runTest(ioDispatcher) {
-                bridge.tools.sessionClose(10L, "session-abc")
-                assertTrue(stubBindings.toolSessionCloseCalled)
-                assertEquals("session-abc", stubBindings.lastSessionCloseSessionId)
-            }
-
-        @Test
-        fun `toolInvokeCrossContext dispatches on IO and forwards arguments`() =
-            runTest(ioDispatcher) {
-                stubBindings.toolInvokeCrossContextResult = """{"cross":"ok"}"""
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
                 val result = bridge.tools.invokeCrossContext(
                     1L,
                     2L,
                     "tool-001",
-<<<<<<< HEAD
                     """{"query":"test"}""",
                     42L,
                     "ucan.tok.sig",
@@ -394,20 +346,6 @@ class CoroutineBridgeTest {
                 bridge.tools.sessionClose(10L, "session-001")
                 assertTrue(stubBindings.toolSessionCloseCalled)
                 assertEquals("session-001", stubBindings.lastSessionCloseSessionId)
-=======
-                    """{"a":1}""",
-                    3L,
-                    "ucan.token.sig",
-                    2,
-                )
-                assertEquals("""{"cross":"ok"}""", result)
-                assertTrue(stubBindings.toolInvokeCrossContextCalled)
-                assertEquals(1L, stubBindings.lastCrossContextSourceHandle)
-                assertEquals(2L, stubBindings.lastCrossContextTargetHandle)
-                assertEquals("tool-001", stubBindings.lastCrossContextToolId)
-                assertEquals("""{"a":1}""", stubBindings.lastCrossContextInputJson)
-                assertEquals(2, stubBindings.lastCrossContextChainDepth)
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
             }
     }
 
@@ -927,7 +865,6 @@ class StubNativeBindings : NativeBindings {
         toolId: String,
     ): String = toolVerifyResult
 
-<<<<<<< HEAD
     override fun toolInterfaceExpose(
         contextHandle: Long,
         toolId: String,
@@ -944,16 +881,6 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         interfaceIdHex: String,
     ): String = """{"revoked":true}"""
-=======
-    // toolInvokeCrossContext tracking
-    var toolInvokeCrossContextCalled = false
-    var lastCrossContextSourceHandle: Long? = null
-    var lastCrossContextTargetHandle: Long? = null
-    var lastCrossContextToolId: String? = null
-    var lastCrossContextInputJson: String? = null
-    var lastCrossContextChainDepth: Int? = null
-    var toolInvokeCrossContextResult = """{"cross_context":"ok"}"""
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
 
     @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(
@@ -966,33 +893,16 @@ class StubNativeBindings : NativeBindings {
         chainDepth: Int,
         proofTokens: List<String>?,
     ): String {
-<<<<<<< HEAD
-=======
-        toolInvokeCrossContextCalled = true
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
         lastCrossContextSourceHandle = sourceContextHandle
         lastCrossContextTargetHandle = targetContextHandle
         lastCrossContextToolId = toolId
         lastCrossContextInputJson = inputJson
-<<<<<<< HEAD
         lastCrossContextIdentityHandle = identityHandle
         lastCrossContextUcanToken = ucanToken
         lastCrossContextChainDepth = chainDepth
         lastCrossContextProofTokens = proofTokens
         return toolInvokeCrossContextResult
     }
-=======
-        lastCrossContextChainDepth = chainDepth
-        return toolInvokeCrossContextResult
-    }
-
-    // toolSessionCreate tracking
-    var toolSessionCreateCalled = false
-    var lastSessionCreateToolId: String? = null
-    var lastSessionCreateSourceContextId: String? = null
-    var lastSessionCreateTtl: Long? = null
-    var toolSessionCreateResult = "session-stub-001"
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
 
     override fun toolSessionCreate(
         contextHandle: Long,
@@ -1000,26 +910,11 @@ class StubNativeBindings : NativeBindings {
         sourceContextId: String,
         ttlSeconds: Long?,
     ): String {
-<<<<<<< HEAD
         lastSessionCreateToolId = toolId
         lastSessionCreateSourceContextId = sourceContextId
         lastSessionCreateTtlSeconds = ttlSeconds
         return toolSessionCreateResult
     }
-=======
-        toolSessionCreateCalled = true
-        lastSessionCreateToolId = toolId
-        lastSessionCreateSourceContextId = sourceContextId
-        lastSessionCreateTtl = ttlSeconds
-        return toolSessionCreateResult
-    }
-
-    // toolSessionInvoke tracking
-    var toolSessionInvokeCalled = false
-    var lastSessionInvokeSessionId: String? = null
-    var lastSessionInvokeInputJson: String? = null
-    var toolSessionInvokeResult = """{"session":"ok"}"""
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
 
     @Suppress("LongParameterList")
     override fun toolSessionInvoke(
@@ -1030,7 +925,6 @@ class StubNativeBindings : NativeBindings {
         ucanToken: String,
         proofTokens: List<String>?,
     ): String {
-<<<<<<< HEAD
         lastSessionInvokeSessionId = sessionId
         lastSessionInvokeInputJson = inputJson
         lastSessionInvokeIdentityHandle = identityHandle
@@ -1038,17 +932,6 @@ class StubNativeBindings : NativeBindings {
         lastSessionInvokeProofTokens = proofTokens
         return toolSessionInvokeResult
     }
-=======
-        toolSessionInvokeCalled = true
-        lastSessionInvokeSessionId = sessionId
-        lastSessionInvokeInputJson = inputJson
-        return toolSessionInvokeResult
-    }
-
-    // toolSessionClose tracking
-    var toolSessionCloseCalled = false
-    var lastSessionCloseSessionId: String? = null
->>>>>>> 51cc6436 (fix(sdk): address tool session review findings — validation, tests, provenance (#526))
 
     override fun toolSessionClose(
         contextHandle: Long,
