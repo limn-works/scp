@@ -839,6 +839,95 @@ def verify_participation_requirements(
     bridge.verify_participation_requirements(profile_json, requirements_json)
 
 
+def aggregate_trust_input(
+    context_id: str,
+    subject_did: str,
+    events: list[dict[str, Any]],
+    merkle_root: list[int],
+    consequence_rules: list[dict[str, Any]] | None = None,
+    threshold_requirements: dict[str, Any] | None = None,
+    attestor_sets: dict[str, Any] | None = None,
+    cached_attestations: list[dict[str, Any]] | None = None,
+    challenge_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Aggregate all trust engine layers into a single TrustInput.
+
+    Combines participation records, attestation verification, challenge
+    results, consequence structure, and threshold counts into a single
+    aggregated result for agent-level evaluation.
+
+    Delegates to the Rust ``scp-core`` implementation via the PyO3
+    bridge, which uses concrete implementations for the generic trait
+    bounds: ``InMemoryTrustStore`` for ``TrustProtocolRepository``,
+    ``IdentityDidPublicKeyResolver`` for ``DidPublicKeyResolver``, and
+    ``SystemClock`` for ``Clock``.
+
+    Args:
+        context_id: The context to aggregate trust inputs for.
+        subject_did: The DID of the subject to evaluate.
+        events: List of event log entry dicts.
+        merkle_root: 32-byte Merkle root as a list of integers.
+        consequence_rules: Optional list of consequence rule dicts.
+        threshold_requirements: Optional dict mapping attestation type
+            names to threshold requirement dicts.
+        attestor_sets: Optional dict mapping attestation type names to
+            lists of attestor info dicts.
+        cached_attestations: Optional list of cached attestation dicts
+            to pre-populate the in-memory trust store.
+        challenge_results: Optional list of challenge verification
+            dicts to pre-populate the in-memory trust store.
+
+    Returns:
+        A dict containing the aggregated ``TrustInput`` fields:
+        ``verified_attestations``, ``participation_record``,
+        ``challenge_results``, ``consequence_structure``, and
+        ``threshold_counts``.
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        ValueError: If any input is malformed or aggregation fails.
+
+    Example::
+
+        result = aggregate_trust_input(
+            context_id="ctx_abc123",
+            subject_did="did:dht:z6MkBob...",
+            events=[{
+                "event_type": "MessageSent",
+                "actor_did": "did:dht:z6MkBob...",
+                "timestamp": 1700000000,
+                "sequence": 1,
+                "payload": {"data": ""},
+            }],
+            merkle_root=[0] * 32,
+        )
+        print(result["participation_record"]["participation_count"])
+    """
+    bridge = _bridge()
+
+    events_json = json.dumps(events)
+    merkle_root_json = json.dumps(merkle_root)
+    consequence_rules_json = json.dumps(consequence_rules or [])
+    threshold_requirements_json = json.dumps(threshold_requirements or {})
+    attestor_sets_json = json.dumps(attestor_sets or {})
+    cached_attestations_json = json.dumps(cached_attestations or [])
+    challenge_results_json = json.dumps(challenge_results or [])
+
+    result_json = bridge.aggregate_trust_input(
+        context_id,
+        subject_did,
+        events_json,
+        merkle_root_json,
+        consequence_rules_json,
+        threshold_requirements_json,
+        attestor_sets_json,
+        cached_attestations_json,
+        challenge_results_json,
+    )
+
+    return json.loads(result_json)
+
+
 __all__ = [
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
@@ -852,6 +941,7 @@ __all__ = [
     "ParticipationThreshold",
     "RequireParticipation",
     "TrustEvaluation",
+    "aggregate_trust_input",
     "evaluate_trust",
     "verify_participation_requirements",
 ]

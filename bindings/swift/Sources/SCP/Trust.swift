@@ -373,6 +373,100 @@ public func verifyChallengeResponse(
     try verifyResponseFn(challengeJson, responseJson)
 }
 
+// MARK: - Trust Aggregation
+
+/// Aggregated trust input result.
+///
+/// Contains the JSON-decoded output of the trust aggregation pipeline.
+/// Each field corresponds to one of the four trust layers.
+///
+/// ## Provenance
+///
+/// - ADR-017 acceptance criterion 9
+/// - Spec section 7.3
+public nonisolated struct AggregatedTrustInput: Sendable {
+    /// Verified attestations (Layer 3), as raw JSON-decoded objects.
+    public let verifiedAttestations: [[String: Any]]
+
+    /// Participation record (Layer 2), as a raw JSON-decoded object.
+    public let participationRecord: [String: Any]
+
+    /// Challenge-response results (Layer 3), as raw JSON-decoded objects.
+    public let challengeResults: [[String: Any]]
+
+    /// Consequence rules (Layer 4), as raw JSON-decoded objects.
+    public let consequenceStructure: [[String: Any]]
+
+    /// Threshold counts per attestation type: [met, required].
+    public let thresholdCounts: [String: [Int]]
+}
+
+/// Aggregates all trust engine layers into a single `TrustInput` for
+/// agent-level evaluation.
+///
+/// Combines participation records, attestation verification, challenge
+/// results, consequence structure, and threshold counts. The returned
+/// object contains verifiable facts -- agents apply their own criteria.
+///
+/// Delegates to the UniFFI ``aggregateTrustInput`` bridge function.
+///
+/// - Parameters:
+///   - contextId: The context to aggregate trust inputs for.
+///   - subjectDid: The DID of the subject to evaluate.
+///   - eventsJson: JSON array of event log entries.
+///   - merkleRootJson: JSON array of 32 bytes (Merkle root).
+///   - consequenceRulesJson: JSON array of consequence rules.
+///   - thresholdRequirementsJson: JSON object of threshold requirements.
+///   - attestorSetsJson: JSON object of attestor sets.
+///   - cachedAttestationsJson: JSON array of cached attestations.
+///   - challengeResultsJson: JSON array of challenge results.
+/// - Returns: An ``AggregatedTrustInput`` with all trust layers.
+/// - Throws: ``ScpError`` if inputs are malformed or aggregation fails.
+///
+/// ## Provenance
+///
+/// - ADR-017 acceptance criterion 9
+/// - Spec section 7.3
+public func aggregateTrustInput(
+    contextId: String,
+    subjectDid: String,
+    eventsJson: String,
+    merkleRootJson: String,
+    consequenceRulesJson: String = "[]",
+    thresholdRequirementsJson: String = "{}",
+    attestorSetsJson: String = "{}",
+    cachedAttestationsJson: String = "[]",
+    challengeResultsJson: String = "[]"
+) throws -> AggregatedTrustInput {
+    let resultJson = try SCP.aggregateTrustInput(
+        contextId: contextId,
+        subjectDid: subjectDid,
+        eventsJson: eventsJson,
+        merkleRootJson: merkleRootJson,
+        consequenceRulesJson: consequenceRulesJson,
+        thresholdRequirementsJson: thresholdRequirementsJson,
+        attestorSetsJson: attestorSetsJson,
+        cachedAttestationsJson: cachedAttestationsJson,
+        challengeResultsJson: challengeResultsJson
+    )
+
+    guard let data = resultJson.data(using: .utf8),
+          let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw ScpError.Validation(
+            msg: "failed to parse aggregation result JSON",
+            code: "SCP-VALID-7060"
+        )
+    }
+
+    return AggregatedTrustInput(
+        verifiedAttestations: json["verified_attestations"] as? [[String: Any]] ?? [],
+        participationRecord: json["participation_record"] as? [String: Any] ?? [:],
+        challengeResults: json["challenge_results"] as? [[String: Any]] ?? [],
+        consequenceStructure: json["consequence_structure"] as? [[String: Any]] ?? [],
+        thresholdCounts: json["threshold_counts"] as? [String: [Int]] ?? [:]
+    )
+}
+
 // MARK: - Participation Types
 
 /// A verifiable participation fact type.

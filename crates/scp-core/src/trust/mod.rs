@@ -409,7 +409,7 @@ pub struct AttestationReference {
 /// each agent applies its own criteria.
 ///
 /// See ADR-017 in `.docs/adrs/phase-4.md`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustInput {
     /// Verified attestations (Layer 3). Each attestation has been signature-
     /// verified and checked for expiry and revocation.

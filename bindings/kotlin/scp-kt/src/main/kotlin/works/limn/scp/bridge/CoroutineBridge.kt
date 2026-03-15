@@ -990,6 +990,7 @@ interface NativeBindings :
  * @property bridgeConnector Bridge connector trust, registration, and shadow bindings.
  * @property identityAdvanced Agent key, migration, and device attestation bindings.
  * @property scpId SCPID DID authentication bindings (spec section 3.11).
+ * @property trust Trust aggregation bindings.
  */
 data class ExtendedBindings(
     val provenance: ProvenanceBindings? = null,
@@ -998,6 +999,7 @@ data class ExtendedBindings(
     val bridgeConnector: BridgeConnectorBindings? = null,
     val identityAdvanced: IdentityAdvancedBindings? = null,
     val scpId: ScpIdBindings? = null,
+    val trust: TrustBindings? = null,
 )
 
 /**

@@ -8,6 +8,9 @@
 //! - [`py_trust_create_challenge`] — Create a challenge request for capability
 //!   verification.
 //! - [`py_trust_verify_response`] — Verify a challenge response.
+//! - [`py_aggregate_trust_input`] — Aggregate all trust engine layers into a
+//!   single [`TrustInput`](scp_core::trust::TrustInput) for agent-level
+//!   evaluation.
 //!
 //! The trust engine does not produce trust "scores" — it provides verifiable
 //! facts (participation records, attestation verification results, challenge
@@ -19,6 +22,8 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_core::trust::aggregate::TrustProtocolRepository;
+use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
 
 use crate::validate;
 
@@ -292,6 +297,159 @@ pub fn py_verify_participation_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// aggregate_trust_input (§7.3)
+// ---------------------------------------------------------------------------
+
+/// Aggregates all trust engine layers into a single `TrustInput` for
+/// agent-level evaluation.
+///
+/// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
+/// as a JSON string. This is the FFI-concrete wrapper around
+/// `scp_core::trust::aggregate::aggregate_trust_input`, which is generic over
+/// three trait bounds (`TrustProtocolRepository`, `DidPublicKeyResolver`,
+/// `Clock`). The bridge provides concrete implementations:
+///
+/// - `InMemoryTrustStore` for `TrustProtocolRepository` (populated with
+///   provided cached attestations and challenge results).
+/// - `IdentityDidPublicKeyResolver` for `DidPublicKeyResolver`.
+/// - `SystemClock` for `Clock`.
+///
+/// # Arguments
+///
+/// - `context_id` — The context to aggregate trust inputs for.
+/// - `subject_did` — The DID of the subject to evaluate.
+/// - `events_json` — JSON array of `Event` objects (event log entries).
+/// - `merkle_root_json` — JSON array of 32 u8 values (Merkle root bytes).
+/// - `consequence_rules_json` — JSON array of `ConsequenceRule` objects.
+/// - `threshold_requirements_json` — JSON object mapping `AttestationType`
+///   variant names to `ThresholdRequirement` objects.
+/// - `attestor_sets_json` — JSON object mapping `AttestationType` variant
+///   names to arrays of `AttestorInfo` objects.
+/// - `cached_attestations_json` — JSON array of `CachedAttestation` objects
+///   to pre-populate the in-memory trust store.
+/// - `challenge_results_json` — JSON array of `ChallengeVerification` objects
+///   to pre-populate the in-memory trust store.
+///
+/// # Returns
+///
+/// A JSON string containing the serialized `TrustInput`.
+///
+/// # Errors
+///
+/// Returns `ScpError` if any JSON input is malformed or if aggregation fails.
+///
+/// See ADR-017 acceptance criterion 9, spec §7.3.
+#[pyfunction]
+#[pyo3(name = "aggregate_trust_input")]
+#[allow(clippy::too_many_arguments)]
+pub fn py_aggregate_trust_input(
+    context_id: &str,
+    subject_did: &str,
+    events_json: &str,
+    merkle_root_json: &str,
+    consequence_rules_json: &str,
+    threshold_requirements_json: &str,
+    attestor_sets_json: &str,
+    cached_attestations_json: &str,
+    challenge_results_json: &str,
+) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(subject_did)?;
+
+    // Parse all JSON inputs.
+    let events: Vec<scp_event_log::Event> = serde_json::from_str(events_json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("failed to parse events JSON: {e}"))
+    })?;
+
+    let merkle_root_vec: Vec<u8> = serde_json::from_str(merkle_root_json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("failed to parse merkle_root JSON: {e}"))
+    })?;
+    let merkle_root: [u8; 32] = merkle_root_vec.try_into().map_err(|v: Vec<u8>| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "merkle_root must be exactly 32 bytes, got {}",
+            v.len()
+        ))
+    })?;
+
+    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
+        serde_json::from_str(consequence_rules_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse consequence_rules JSON: {e}"
+            ))
+        })?;
+
+    let threshold_requirements: std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    > = serde_json::from_str(threshold_requirements_json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to parse threshold_requirements JSON: {e}"
+        ))
+    })?;
+
+    let attestor_sets: std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    > = serde_json::from_str(attestor_sets_json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("failed to parse attestor_sets JSON: {e}"))
+    })?;
+
+    let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+        serde_json::from_str(cached_attestations_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse cached_attestations JSON: {e}"
+            ))
+        })?;
+
+    let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(challenge_results_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse challenge_results JSON: {e}"
+            ))
+        })?;
+
+    // Build an in-memory trust store and populate it.
+    let store = InMemoryFfiTrustStore::new();
+    for ca in cached_attestations {
+        store.cache_attestation(context_id, ca).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to cache attestation: {e}"))
+        })?;
+    }
+    for cr in &challenge_results {
+        store.store_challenge_result(context_id, cr).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to store challenge result: {e}"
+            ))
+        })?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id,
+        subject_did,
+        events: &events,
+        merkle_root,
+        consequence_rules: &consequence_rules,
+        threshold_requirements: &threshold_requirements,
+        attestor_sets: &attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("trust aggregation failed: {e}"))
+    })?;
+
+    serde_json::to_string(&trust_input).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to serialize TrustInput: {e}"))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -302,6 +460,7 @@ pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
+    m.add_function(wrap_pyfunction!(py_aggregate_trust_input, m)?)?;
     Ok(())
 }
 
@@ -403,5 +562,53 @@ mod tests {
         let result = py_verify_participation_requirements("[]", "[]");
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_events_json() {
+        let result = py_aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "not json",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_wrong_merkle_root_length() {
+        let result = py_aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_did() {
+        let result = py_aggregate_trust_input(
+            "ctx-1",
+            "",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
     }
 }

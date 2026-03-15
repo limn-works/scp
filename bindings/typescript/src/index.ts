@@ -59,7 +59,8 @@ export { defineToolDefinition } from "./tools";
 // Trust
 // ---------------------------------------------------------------------------
 
-export { evaluateTrust, verifyParticipationRequirements } from "./trust";
+export type { AggregatedTrustInput, AggregationInput } from "./trust";
+export { aggregateTrustInput, evaluateTrust, verifyParticipationRequirements } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log

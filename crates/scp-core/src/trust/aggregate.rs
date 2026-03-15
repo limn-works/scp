@@ -127,7 +127,7 @@ pub trait TrustProtocolRepository {
 /// The `verified_at` timestamp records when the attestation was last verified.
 /// The `ttl_secs` field determines when the cache entry should be refreshed.
 /// An entry is considered expired when `verified_at + ttl_secs < now`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedAttestation {
     /// The verified attestation.
     pub attestation: Attestation,

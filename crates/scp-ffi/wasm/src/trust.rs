@@ -7,6 +7,7 @@
 //! - `trust_create_challenge` — Create a challenge request.
 //! - `trust_verify_response` — Verify a challenge response (throws — requires `WebCrypto`).
 //! - `verify_participation_requirements` — Verify a DID meets participation requirements.
+//! - `aggregate_trust_input` — Aggregate trust inputs (throws — requires native bridge).
 //!
 //! # WASM constraints
 //!
@@ -16,6 +17,8 @@
 //! throw `SCP-TRUST-800x` errors to prevent silent false negatives — the
 //! TypeScript wrapper layer must implement these via `WebCrypto`. The query
 //! and challenge creation functions work fully using WASM-local state.
+//! `aggregate_trust_input` requires the full scp-core trust pipeline and
+//! must be implemented via the native (NAPI) bridge.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
@@ -363,5 +366,52 @@ pub fn verify_participation_requirements(
         });
 
         Ok(JsValue::from_str(&result.to_string()))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// aggregate_trust_input
+// ---------------------------------------------------------------------------
+
+/// Aggregates all trust engine layers into a single `TrustInput`.
+///
+/// **Always throws** `SCP-VALID-7072` — full trust aggregation requires the
+/// scp-core trust pipeline (participation record computation, attestation
+/// cache with TTL-based refresh, threshold counting) which depends on tokio
+/// multi-thread and cannot run in `wasm32-unknown-unknown`. Use the native
+/// (NAPI) bridge for trust aggregation.
+///
+/// # JS usage
+///
+/// ```js
+/// try {
+///     await aggregate_trust_input(contextId, subjectDid, ...);
+/// } catch (e) {
+///     // e.message contains "[SCP-VALID-7072] trust error: ..."
+///     // Use the native (NAPI) bridge instead.
+/// }
+/// ```
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn aggregate_trust_input(
+    _context_id: String,
+    _subject_did: String,
+    _events_json: String,
+    _merkle_root_json: String,
+    _consequence_rules_json: String,
+    _threshold_requirements_json: String,
+    _attestor_sets_json: String,
+    _cached_attestations_json: String,
+    _challenge_results_json: String,
+) -> Promise {
+    future_to_promise(async move {
+        Err(ScpWasmError::Trust {
+            message: "trust aggregation requires the full scp-core pipeline \
+                      — use the native (NAPI) bridge instead of the WASM bridge"
+                .to_owned(),
+            code: "SCP-VALID-7072".to_owned(),
+        }
+        .into_js()
+        .into())
     })
 }

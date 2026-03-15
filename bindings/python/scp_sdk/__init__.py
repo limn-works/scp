@@ -137,6 +137,7 @@ from scp_sdk.trust import (
     ParticipationThreshold,
     RequireParticipation,
     TrustEvaluation,
+    aggregate_trust_input,
     evaluate_trust,
     verify_participation_requirements,
 )
@@ -219,6 +220,7 @@ __all__ = [
     "UcanToken",
     "ValidationError",
     "__version__",
+    "aggregate_trust_input",
     "approve_governance_proposal",
     "bridge_evaluate_trust",
     "bridge_register",
