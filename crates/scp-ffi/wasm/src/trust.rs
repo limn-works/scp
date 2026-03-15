@@ -247,126 +247,185 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
 }
 
 // ---------------------------------------------------------------------------
-// verify_participation_requirements
+// verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies that a DID's participation profile meets minimum requirements.
+/// Local re-implementation of `scp_core::trust::ParticipationFact` for WASM.
 ///
-/// Accepts a JSON participation profile and a JSON requirements object,
-/// then checks each requirement threshold against the profile.
+/// Matches the Rust serde representation exactly (unit enum variants).
+#[derive(serde::Deserialize)]
+enum WasmParticipationFact {
+    ParticipationDuration,
+    GovernanceActionsAgainst,
+    GovernanceActionsBy,
+    ToolInvocationCount,
+    ContextCreationCount,
+    RoleProgressionCount,
+    AttestationCount,
+}
+
+impl WasmParticipationFact {
+    fn extract_value(&self, profile: &WasmParticipationProfile) -> u64 {
+        match self {
+            Self::ParticipationDuration => profile.participation_duration_secs,
+            Self::GovernanceActionsAgainst => profile.governance_actions_against,
+            Self::GovernanceActionsBy => profile.governance_actions_by,
+            Self::ToolInvocationCount => profile.tool_invocation_count,
+            Self::ContextCreationCount => profile.context_creation_count,
+            Self::RoleProgressionCount => profile.role_progression_count,
+            Self::AttestationCount => profile.attestation_count,
+        }
+    }
+}
+
+/// Local re-implementation of `scp_core::trust::ParticipationThreshold` for WASM.
 ///
-/// # Arguments
+/// Matches the Rust serde representation (externally tagged enum with value).
+#[derive(serde::Deserialize)]
+enum WasmParticipationThreshold {
+    GreaterThan(u64),
+    LessThan(u64),
+    AtLeast(u64),
+    AtMost(u64),
+    Equals(u64),
+}
+
+impl WasmParticipationThreshold {
+    fn is_satisfied(&self, value: u64) -> bool {
+        match self {
+            Self::GreaterThan(threshold) => value > *threshold,
+            Self::LessThan(threshold) => value < *threshold,
+            Self::AtLeast(threshold) => value >= *threshold,
+            Self::AtMost(threshold) => value <= *threshold,
+            Self::Equals(threshold) => value == *threshold,
+        }
+    }
+}
+
+/// Local re-implementation of `scp_core::trust::RequireParticipation` for WASM.
+#[derive(serde::Deserialize)]
+struct WasmRequireParticipation {
+    fact: WasmParticipationFact,
+    threshold: WasmParticipationThreshold,
+    max_age_secs: u64,
+    min_contexts: u32,
+}
+
+/// Local re-implementation of `scp_core::trust::ParticipationProfile` for WASM.
+#[derive(serde::Deserialize)]
+struct WasmParticipationProfile {
+    #[allow(dead_code)]
+    subject_did: String,
+    participation_duration_secs: u64,
+    governance_actions_against: u64,
+    governance_actions_by: u64,
+    tool_invocation_count: u64,
+    context_creation_count: u64,
+    role_progression_count: u64,
+    attestation_count: u64,
+    updated_at: u64,
+    #[allow(dead_code)]
+    event_log_root: Vec<u8>,
+    signer_public_key: Vec<u8>,
+    #[allow(dead_code)]
+    signature: Vec<u8>,
+}
+
+/// Verifies participation profiles against admission requirements.
 ///
-/// - `profile_json` — JSON object with fields: `message_count` (number),
-///   `governance_count` (number), `contexts` (number), `age_secs` (number).
-/// - `requirements_json` — JSON object with optional threshold fields:
-///   `min_message_count`, `min_governance_count`, `min_contexts`, `max_age_secs`.
+/// Both inputs are JSON strings:
+/// - `profile_json`: JSON array of `ParticipationProfile` objects matching
+///   the `scp-core` type (with `subject_did`, fact count fields, `updated_at`,
+///   `event_log_root`, `signer_public_key`, `signature`).
+/// - `requirements_json`: JSON array of `RequireParticipation` objects
+///   matching the `scp-core` type (with `fact`, `threshold`, `max_age_secs`,
+///   `min_contexts`).
 ///
-/// Returns a JSON string with `{ "met": bool, "violations": [...] }`.
+/// Returns `true` if all requirements are satisfied. Throws an error with
+/// a diagnostic message if any requirement fails or if the JSON is malformed.
+///
+/// **Note:** Signature verification is NOT performed in the WASM bridge
+/// (requires Ed25519 via `WebCrypto`). Only threshold, freshness, and
+/// `min_contexts` checks are applied. The TypeScript wrapper should verify
+/// signatures via `WebCrypto` before calling this function.
+///
+/// See §7.3.2.1.
+///
+/// # Errors
+///
+/// Returns `JsValue` error if JSON parsing fails or if any participation
+/// requirement is not satisfied (with a diagnostic message).
 ///
 /// # JS usage
 ///
 /// ```js
-/// const result = await verify_participation_requirements(
-///     '{"message_count": 5, "governance_count": 2, "contexts": 1, "age_secs": 86400}',
-///     '{"min_message_count": 10}'
+/// const ok = verify_participation_requirements(
+///     '[{"subject_did":"did:dht:z6MkAlice","participation_duration_secs":3600,...}]',
+///     '[{"fact":"ParticipationDuration","threshold":{"AtLeast":100},"max_age_secs":3600,"min_contexts":1}]'
 /// );
-/// const obj = JSON.parse(result);
-/// console.log(obj.met);        // false
-/// console.log(obj.violations); // ["message_count: 5 < required 10"]
+/// // ok === true on success, throws on failure
 /// ```
 #[wasm_bindgen]
 pub fn verify_participation_requirements(
     profile_json: String,
     requirements_json: String,
-) -> Promise {
-    future_to_promise(async move {
-        if profile_json.is_empty() {
-            return Err(ScpWasmError::validation("profile JSON must not be empty"));
+) -> Result<bool, JsValue> {
+    let profiles: Vec<WasmParticipationProfile> =
+        serde_json::from_str(&profile_json).map_err(|e| {
+            ScpWasmError::validation(&format!(
+                "failed to parse participation profiles JSON: {e}"
+            ))
+        })?;
+
+    let requirements: Vec<WasmRequireParticipation> =
+        serde_json::from_str(&requirements_json).map_err(|e| {
+            ScpWasmError::validation(&format!(
+                "failed to parse participation requirements JSON: {e}"
+            ))
+        })?;
+
+    // Current time in seconds since UNIX epoch (using js_sys::Date for WASM).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let current_time = (js_sys::Date::now() / 1000.0) as u64;
+
+    for requirement in &requirements {
+        // Freshness: filter out stale profiles.
+        let fresh_profiles: Vec<&WasmParticipationProfile> = profiles
+            .iter()
+            .filter(|p| {
+                let age = current_time.saturating_sub(p.updated_at);
+                age <= requirement.max_age_secs
+            })
+            .collect();
+
+        // Threshold + min_contexts: count distinct signers only from profiles
+        // that satisfy the threshold. A profile that is fresh but below the
+        // threshold should NOT contribute to the min_contexts count.
+        let mut distinct_signers = std::collections::HashSet::new();
+        for p in &fresh_profiles {
+            let value = requirement.fact.extract_value(p);
+            if requirement.threshold.is_satisfied(value) {
+                distinct_signers.insert(&p.signer_public_key);
+            }
         }
-        if requirements_json.is_empty() {
+
+        if distinct_signers.is_empty() {
             return Err(ScpWasmError::validation(
-                "requirements JSON must not be empty",
+                "participation admission verification failed: threshold not met",
             ));
         }
 
-        let profile: serde_json::Value = serde_json::from_str(&profile_json).map_err(|e| {
-            JsValue::from_str(&format!(
-                "[SCP-VALID-7018] failed to parse profile JSON: {e}"
-            ))
-        })?;
-        let requirements: serde_json::Value =
-            serde_json::from_str(&requirements_json).map_err(|e| {
-                JsValue::from_str(&format!(
-                    "[SCP-VALID-7019] failed to parse requirements JSON: {e}"
-                ))
-            })?;
-
-        let mut violations = Vec::new();
-
-        // Check min_message_count
-        if let Some(min) = requirements
-            .get("min_message_count")
-            .and_then(serde_json::Value::as_u64)
-        {
-            let actual = profile
-                .get("message_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if actual < min {
-                violations.push(format!("message_count: {actual} < required {min}"));
-            }
+        #[allow(clippy::cast_possible_truncation)]
+        if (distinct_signers.len() as u32) < requirement.min_contexts {
+            return Err(ScpWasmError::validation(&format!(
+                "participation admission verification failed: need {} distinct source contexts, got {}",
+                requirement.min_contexts,
+                distinct_signers.len()
+            )));
         }
+    }
 
-        // Check min_governance_count
-        if let Some(min) = requirements
-            .get("min_governance_count")
-            .and_then(serde_json::Value::as_u64)
-        {
-            let actual = profile
-                .get("governance_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if actual < min {
-                violations.push(format!("governance_count: {actual} < required {min}"));
-            }
-        }
-
-        // Check min_contexts
-        if let Some(min) = requirements
-            .get("min_contexts")
-            .and_then(serde_json::Value::as_u64)
-        {
-            let actual = profile
-                .get("contexts")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if actual < min {
-                violations.push(format!("contexts: {actual} < required {min}"));
-            }
-        }
-
-        // Check max_age_secs
-        if let Some(max) = requirements
-            .get("max_age_secs")
-            .and_then(serde_json::Value::as_u64)
-        {
-            let actual = profile
-                .get("age_secs")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if actual > max {
-                violations.push(format!("age_secs: {actual} > maximum {max}"));
-            }
-        }
-
-        let result = serde_json::json!({
-            "met": violations.is_empty(),
-            "violations": violations,
-        });
-
-        Ok(JsValue::from_str(&result.to_string()))
-    })
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

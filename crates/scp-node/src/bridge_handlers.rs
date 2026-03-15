@@ -828,7 +828,6 @@ async fn process_webhook_event(
 /// See SCP-BCH-006 and spec section 12.10.4.
 async fn webhook_handler(
     State(bridge_state): State<Arc<BridgeState>>,
-    Extension(_auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
     Json(body): Json<WebhookRequest>,
 ) -> impl IntoResponse {
     if !VALID_EVENT_TYPES.contains(&body.event_type.as_str()) {
@@ -904,6 +903,18 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
         .route("/v1/scp/bridge/attest", post(attest_handler))
         .route("/v1/scp/bridge/message", post(emit_message_handler))
         .route("/v1/scp/bridge/status", get(status_handler))
+        .with_state(state)
+}
+
+/// Creates an axum [`Router`] for webhook-only bridge endpoints.
+///
+/// Separated from [`bridge_router`] because webhook callbacks from external
+/// platforms authenticate via `X-SCP-Signature` headers (spec section 12.10.2),
+/// NOT the JWT Bearer auth used by other bridge endpoints. Applying
+/// `bridge_auth_middleware_dyn` to the webhook route would reject all
+/// legitimate platform webhook callbacks with 401.
+pub fn bridge_webhook_router(state: Arc<BridgeState>) -> Router {
+    Router::new()
         .route("/v1/scp/bridge/webhook", post(webhook_handler))
         .with_state(state)
 }
@@ -957,11 +968,17 @@ mod tests {
         }
     }
 
-    /// Builds the router with `BridgeAuthContext` injected as an extension
-    /// (bypasses real auth middleware for unit tests).
+    /// Builds the router mirroring production routing topology.
+    ///
+    /// JWT-authenticated routes carry `BridgeAuthContext` via an extension
+    /// layer (bypassing real auth middleware for unit tests). The webhook
+    /// route is mounted separately without the extension — matching
+    /// production where it uses `webhook_auth_middleware` instead.
     fn test_app(state: Arc<BridgeState>) -> Router {
         let auth_ctx = test_auth_ctx();
-        Router::new()
+
+        // JWT-authenticated bridge routes (mirrors `bridge_router`).
+        let authed = Router::new()
             .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
             .route(
                 "/v1/scp/bridge/shadow/{shadow_id}",
@@ -970,9 +987,15 @@ mod tests {
             .route("/v1/scp/bridge/attest", post(attest_handler))
             .route("/v1/scp/bridge/message", post(emit_message_handler))
             .route("/v1/scp/bridge/status", get(status_handler))
-            .route("/v1/scp/bridge/webhook", post(webhook_handler))
             .layer(axum::Extension(auth_ctx))
-            .with_state(state)
+            .with_state(Arc::clone(&state));
+
+        // Webhook route — no BridgeAuthContext (mirrors `bridge_webhook_router`).
+        let webhook = Router::new()
+            .route("/v1/scp/bridge/webhook", post(webhook_handler))
+            .with_state(state);
+
+        authed.merge(webhook)
     }
 
     fn create_request(body: serde_json::Value) -> Request<Body> {

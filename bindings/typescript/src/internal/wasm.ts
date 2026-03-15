@@ -373,6 +373,8 @@ interface WasmModule {
     roleCapabilities: string[],
   ) => string;
   sandbox_check_capability: (grantedCapabilities: string[], requiredCapability: string) => boolean;
+  // Trust — participation verification (SCP-BA-004, §7.3.2.1)
+  verify_participation_requirements: (profileJson: string, requirementsJson: string) => boolean;
   // SCPID (§3.11) — challenge + sign only; verify requires DID resolution (not in WASM)
   scpid_challenge: (audience: string, ttlSeconds: number) => string;
   scpid_sign: (did: string, signingKeyId: string, challengeJson: string) => string;
@@ -1406,6 +1408,14 @@ export function createWasmBridge(): Bridge {
           "and a full DID resolver. Use the native (napi-rs) bridge instead.",
         "SCP-IDENT-1033",
       );
+    },
+
+    // Trust — participation verification (SCP-BA-004, §7.3.2.1)
+    verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
+      const wasm = getWasm();
+      // The WASM bridge function is synchronous (returns Result<bool, JsValue>).
+      // Throws on validation/verification failure.
+      return wasm.verify_participation_requirements(profileJson, requirementsJson) as boolean;
     },
 
     // Lifecycle

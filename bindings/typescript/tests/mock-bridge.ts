@@ -1051,6 +1051,12 @@ export function createMockBridge(): Bridge & {
       });
     },
 
+    // Trust — participation verification (SCP-BA-004, §7.3.2.1)
+    verifyParticipationRequirements(_profileJson: string, _requirementsJson: string): boolean {
+      // Mock: always succeeds. Tests that need failure behavior should override.
+      return true;
+    },
+
     // Lifecycle
     version(): string {
       return "0.1.0-mock";

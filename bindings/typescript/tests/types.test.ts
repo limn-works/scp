@@ -13,7 +13,11 @@ import type {
   DIDDocument,
   Event,
   Message,
+  ParticipationFact,
+  ParticipationProfile,
+  ParticipationThreshold,
   Proof,
+  RequireParticipation,
   ResolutionPath,
   ToolDefinition,
   TransportStatus,
@@ -243,5 +247,84 @@ describe("type definitions", () => {
     if (resolution.type === "Context") {
       expect(resolution.mode).toBeNull();
     }
+  });
+
+  // -- Participation types (§7.3.2.1, SCP-BA-004) ----------------------------
+
+  it("ParticipationFact accepts all 7 variants", () => {
+    const facts: ParticipationFact[] = [
+      "ParticipationDuration",
+      "GovernanceActionsAgainst",
+      "GovernanceActionsBy",
+      "ToolInvocationCount",
+      "ContextCreationCount",
+      "RoleProgressionCount",
+      "AttestationCount",
+    ];
+    expect(facts).toHaveLength(7);
+  });
+
+  it("ParticipationThreshold accepts all 5 operator variants", () => {
+    const thresholds: ParticipationThreshold[] = [
+      { GreaterThan: 10 },
+      { LessThan: 5 },
+      { AtLeast: 100 },
+      { AtMost: 50 },
+      { Equals: 42 },
+    ];
+    expect(thresholds).toHaveLength(5);
+  });
+
+  it("ParticipationProfile has all required fields", () => {
+    const profile: ParticipationProfile = {
+      subjectDid: "did:dht:z6MkAlice",
+      participationDurationSecs: 3600,
+      governanceActionsAgainst: 2,
+      governanceActionsBy: 5,
+      toolInvocationCount: 10,
+      contextCreationCount: 3,
+      roleProgressionCount: 1,
+      attestationCount: 7,
+      updatedAt: 1700000000,
+      eventLogRoot: new Array(32).fill(0),
+      signerPublicKey: new Array(32).fill(1),
+      signature: new Array(64).fill(2),
+    };
+    expect(profile.subjectDid).toBe("did:dht:z6MkAlice");
+    expect(profile.participationDurationSecs).toBe(3600);
+    expect(profile.governanceActionsAgainst).toBe(2);
+    expect(profile.governanceActionsBy).toBe(5);
+    expect(profile.toolInvocationCount).toBe(10);
+    expect(profile.contextCreationCount).toBe(3);
+    expect(profile.roleProgressionCount).toBe(1);
+    expect(profile.attestationCount).toBe(7);
+    expect(profile.updatedAt).toBe(1700000000);
+    expect(profile.eventLogRoot).toHaveLength(32);
+    expect(profile.signerPublicKey).toHaveLength(32);
+    expect(profile.signature).toHaveLength(64);
+  });
+
+  it("RequireParticipation has all required fields", () => {
+    const requirement: RequireParticipation = {
+      fact: "ParticipationDuration",
+      threshold: { AtLeast: 100 },
+      maxAgeSecs: 3600,
+      minContexts: 1,
+    };
+    expect(requirement.fact).toBe("ParticipationDuration");
+    expect(requirement.maxAgeSecs).toBe(3600);
+    expect(requirement.minContexts).toBe(1);
+  });
+
+  it("RequireParticipation with GreaterThan threshold", () => {
+    const requirement: RequireParticipation = {
+      fact: "ToolInvocationCount",
+      threshold: { GreaterThan: 50 },
+      maxAgeSecs: 7200,
+      minContexts: 3,
+    };
+    expect(requirement.fact).toBe("ToolInvocationCount");
+    expect(requirement.maxAgeSecs).toBe(7200);
+    expect(requirement.minContexts).toBe(3);
   });
 });

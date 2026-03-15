@@ -397,6 +397,9 @@ export interface Bridge {
   scpidSign(did: string, signingKeyId: string, challengeJson: string): string;
   scpidVerify(responseJson: string, challengeJson: string): string;
 
+  // Trust — participation verification (SCP-BA-004, §7.3.2.1)
+  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean;
+
   // Lifecycle
   version(): string;
   shutdown(timeoutSecs: number): void;

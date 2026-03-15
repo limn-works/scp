@@ -229,10 +229,14 @@ impl WasmMessage {
     }
 
     /// Returns the per-sender sequence number for this message.
+    ///
+    /// Returns `u32` (not `u64`) to avoid wasm-bindgen mapping to JavaScript
+    /// `BigInt`. Follows the crate convention used by `member_count()` and
+    /// `ttl_seconds()`.
     #[must_use]
     #[wasm_bindgen(getter)]
-    pub fn sequence(&self) -> u64 {
-        self.sequence
+    pub fn sequence(&self) -> u32 {
+        u32::try_from(self.sequence).unwrap_or(u32::MAX)
     }
 }
 

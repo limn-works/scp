@@ -205,6 +205,12 @@ public enum ScpId {
         ttl: TimeInterval = 300,
         challengeFn: ChallengeFn = defaultChallenge
     ) throws -> ScpIdChallenge {
+        guard ttl.isFinite, ttl >= 0 else {
+            throw ScpError.Validation(
+                msg: "TTL must be a finite non-negative value, got \(ttl)",
+                code: "SCP-IDENT-1038"
+            )
+        }
         let ttlSeconds = UInt64(ttl)
         let json = try challengeFn(audience, ttlSeconds)
         let wire = try JSONDecoder().decode(ChallengeWire.self, from: Data(json.utf8))

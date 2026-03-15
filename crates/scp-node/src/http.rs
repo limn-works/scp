@@ -596,20 +596,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         #[cfg(feature = "http3")]
         let http3_config = self.http3_config;
 
-        // Apply bridge auth middleware when a production BridgeLookup is
-        // configured (spec section 12.10.2). Without a lookup the bridge
-        // endpoints are mounted without authentication (test/dev mode).
-        let bridge = {
-            let base = crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state));
-            if let Some(ref lookup) = self.state.bridge_lookup {
-                base.layer(axum::middleware::from_fn_with_state(
-                    Arc::clone(lookup),
-                    crate::bridge_auth::bridge_auth_middleware_dyn,
-                ))
-            } else {
-                base
-            }
-        };
+        let (bridge, bridge_webhook) =
+            build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
         let relay = self.relay;
         let state = self.state;
 
@@ -622,6 +610,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             relay_rt,
             projection,
             bridge,
+            bridge_webhook,
             state.acme_challenges.as_ref(),
         );
 
@@ -702,6 +691,43 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 // Dev API spawning (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
 
+/// Builds the bridge and webhook routers with appropriate auth middleware.
+///
+/// JWT-authenticated bridge routes use `bridge_auth_middleware_dyn` (Bearer
+/// token). The webhook route uses `webhook_auth_middleware_dyn`
+/// (`X-SCP-Signature` header). When no `BridgeLookup` is configured (dev
+/// mode), both are mounted without authentication.
+///
+/// See spec section 12.10.2.
+fn build_bridge_routers(
+    bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
+    bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
+) -> (Router, Router) {
+    let bridge = {
+        let base = crate::bridge_handlers::bridge_router(Arc::clone(bridge_state));
+        if let Some(lookup) = bridge_lookup {
+            base.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(lookup),
+                crate::bridge_auth::bridge_auth_middleware_dyn,
+            ))
+        } else {
+            base
+        }
+    };
+    let bridge_webhook = {
+        let base = crate::bridge_handlers::bridge_webhook_router(Arc::clone(bridge_state));
+        if let Some(lookup) = bridge_lookup {
+            base.layer(axum::middleware::from_fn_with_state(
+                Arc::clone(lookup),
+                crate::bridge_auth::webhook_auth_middleware_dyn,
+            ))
+        } else {
+            base
+        }
+    };
+    (bridge, bridge_webhook)
+}
+
 /// Builds the merged axum router for `serve()`, combining SCP protocol
 /// routes (well-known, relay, projection, ACME challenges) with the
 /// application router. Extracted from `serve()` for clippy line limits.
@@ -711,13 +737,15 @@ fn build_merged_router(
     relay_rt: Router,
     projection: Router,
     bridge: Router,
+    bridge_webhook: Router,
     acme_challenges: Option<&Arc<RwLock<HashMap<String, String>>>>,
 ) -> Router {
     let merged = app_router
         .merge(well_known)
         .merge(relay_rt)
         .merge(projection)
-        .merge(bridge);
+        .merge(bridge)
+        .merge(bridge_webhook);
 
     // Mount ACME challenge router for renewal challenges (issue #305).
     // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can

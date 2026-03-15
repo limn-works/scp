@@ -557,7 +557,8 @@ pub fn py_bridge_claim_shadow(
     epoch,
     sequence,
     platform_message_id=None,
-    platform_timestamp=None
+    platform_timestamp=None,
+    attributed_role=None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn py_bridge_seal_shadow_envelope(
@@ -574,28 +575,33 @@ pub fn py_bridge_seal_shadow_envelope(
     sequence: u64,
     platform_message_id: Option<String>,
     platform_timestamp: Option<u64>,
+    attributed_role: Option<String>,
 ) -> PyResult<String> {
     crate::validate::validate_context_id(context_id)?;
     crate::validate::validate_did(operator_did)?;
 
     let mode = parse_bridge_mode(bridge_mode)?;
 
-    let key_bytes: [u8; 32] = <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
-        ScpPyError::ValidationError {
-            message: format!(
-                "sender_key_bytes must be exactly 32 bytes, got {}",
-                sender_key_bytes.len()
-            ),
-            code: "SCP-VALID-7054".to_string(),
-        }
-    })?;
-    let sender_key = SenderKey::from_bytes(key_bytes);
+    // Wrap raw key material in Zeroizing to prevent lingering in freed heap
+    // memory after the Vec is dropped (defense-in-depth for FFI boundary).
+    let sender_key_bytes = Zeroizing::new(sender_key_bytes);
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(<[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
+            ScpPyError::ValidationError {
+                message: format!(
+                    "sender_key_bytes must be exactly 32 bytes, got {}",
+                    sender_key_bytes.len()
+                ),
+                code: "SCP-VALID-7054".to_string(),
+            }
+        })?);
+    let sender_key = SenderKey::from_bytes(*key_bytes);
 
     let shadow = ShadowIdentity {
         shadow_id: shadow_id.to_string(),
         platform_handle: platform_handle.to_string(),
         bridge_id: bridge_id.to_string(),
-        attributed_role: "observer".to_string(),
+        attributed_role: attributed_role.unwrap_or_else(|| "observer".to_string()),
         provenance_status: ShadowProvenanceStatus::Shadow,
         created_at: 0,
     };
@@ -691,16 +697,20 @@ pub fn py_bridge_open_shadow_envelope(
             code: "SCP-VALID-7056".to_string(),
         })?;
 
-    let key_bytes: [u8; 32] = <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
-        ScpPyError::ValidationError {
-            message: format!(
-                "sender_key_bytes must be exactly 32 bytes, got {}",
-                sender_key_bytes.len()
-            ),
-            code: "SCP-VALID-7054".to_string(),
-        }
-    })?;
-    let sender_key = SenderKey::from_bytes(key_bytes);
+    // Wrap raw key material in Zeroizing to prevent lingering in freed heap
+    // memory after the Vec is dropped (defense-in-depth for FFI boundary).
+    let sender_key_bytes = Zeroizing::new(sender_key_bytes);
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(<[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
+            ScpPyError::ValidationError {
+                message: format!(
+                    "sender_key_bytes must be exactly 32 bytes, got {}",
+                    sender_key_bytes.len()
+                ),
+                code: "SCP-VALID-7054".to_string(),
+            }
+        })?);
+    let sender_key = SenderKey::from_bytes(*key_bytes);
 
     Ok(open_shadow_envelope(
         &envelope,
@@ -742,8 +752,9 @@ pub fn py_bridge_derive_credential_key(
     bridge_credential_key: Vec<u8>,
     bridge_id: &str,
 ) -> PyResult<Vec<u8>> {
-    let key_bytes: [u8; 32] =
-        <[u8; 32]>::try_from(bridge_credential_key.as_slice()).map_err(|_| {
+    let bridge_credential_key = Zeroizing::new(bridge_credential_key);
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(<[u8; 32]>::try_from(bridge_credential_key.as_slice()).map_err(|_| {
             ScpPyError::ValidationError {
                 message: format!(
                     "bridge_credential_key must be exactly 32 bytes, got {}",
@@ -751,7 +762,7 @@ pub fn py_bridge_derive_credential_key(
                 ),
                 code: "SCP-VALID-7057".to_string(),
             }
-        })?;
+        })?);
 
     let derived =
         derive_credential_key(&key_bytes, bridge_id).map_err(|e| ScpPyError::CryptoError {
@@ -1810,6 +1821,7 @@ mod tests {
             1,
             Some("msg-001".to_owned()),
             Some(1_700_000_000),
+            None, // attributed_role — defaults to "observer"
         )
         .unwrap();
 
@@ -1849,6 +1861,7 @@ mod tests {
             1,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1877,6 +1890,7 @@ mod tests {
             "ctx-test",
             0,
             1,
+            None,
             None,
             None,
         );

@@ -378,45 +378,96 @@ export interface AttestationSummary {
 }
 
 // ---------------------------------------------------------------------------
-// Participation (spec section 9.3, SCP-BA-004)
+// Participation (spec §7.3.2.1, SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/** A verified participation fact used in admission evaluation. */
-export interface ParticipationFact {
-  /** Type of participation fact (e.g., `"context_membership"`). */
-  readonly factType: string;
-  /** DID of the participant this fact pertains to. */
-  readonly participantDid: string;
-  /** Context ID where the fact was observed. */
-  readonly contextId: string;
-  /** Numeric value of the fact (e.g., participation count). */
-  readonly value: number;
-}
+/**
+ * Which category of participation fact to evaluate for admission.
+ *
+ * Each variant corresponds to one of the 7 fact categories in a
+ * `ParticipationProfile`. See §7.3.2.1.
+ *
+ * Values match the Rust `ParticipationFact` enum in `scp-core`.
+ */
+export type ParticipationFact =
+  | "ParticipationDuration"
+  | "GovernanceActionsAgainst"
+  | "GovernanceActionsBy"
+  | "ToolInvocationCount"
+  | "ContextCreationCount"
+  | "RoleProgressionCount"
+  | "AttestationCount";
 
-/** A threshold requirement for context admission. */
-export interface ParticipationThreshold {
-  /** The fact type this threshold applies to. */
-  readonly factType: string;
-  /** Minimum value required to satisfy the threshold. */
-  readonly minimum: number;
-  /** Optional maximum value constraint. */
-  readonly maximum?: number;
-}
+/**
+ * Comparison operator and value for participation admission thresholds.
+ *
+ * Used in `RequireParticipation` to specify the comparison a fact value
+ * must satisfy. See §7.3.2.1.
+ *
+ * Serialization matches the Rust `ParticipationThreshold` enum:
+ * `{ "GreaterThan": 50 }`, `{ "AtLeast": 100 }`, etc.
+ */
+export type ParticipationThreshold =
+  | { readonly GreaterThan: number }
+  | { readonly LessThan: number }
+  | { readonly AtLeast: number }
+  | { readonly AtMost: number }
+  | { readonly Equals: number };
 
-/** A participant's aggregated participation profile. */
+/**
+ * A context-hosted participation profile attesting to a member's
+ * verifiable participation facts.
+ *
+ * Produced by contexts for opted-in members. The profile is signed by a
+ * context-specific Ed25519 key (derived with domain separation) so that
+ * verifiers cannot correlate which contexts share a signer.
+ *
+ * See §7.3.2.1.
+ */
 export interface ParticipationProfile {
-  /** DID of the participant. */
-  readonly participantDid: string;
-  /** Verified participation facts. */
-  readonly facts: readonly ParticipationFact[];
+  /** DID of the member this profile is about. */
+  readonly subjectDid: string;
+  /** Total seconds of context participation. */
+  readonly participationDurationSecs: number;
+  /** Count of governance actions taken against this identity. */
+  readonly governanceActionsAgainst: number;
+  /** Count of governance actions initiated by this identity. */
+  readonly governanceActionsBy: number;
+  /** Total tool invocations across all tool types. */
+  readonly toolInvocationCount: number;
+  /** Number of contexts created. */
+  readonly contextCreationCount: number;
+  /** Number of role transitions. */
+  readonly roleProgressionCount: number;
+  /** Number of attestation events. */
+  readonly attestationCount: number;
+  /** Unix timestamp (seconds) of the last update to this profile. */
+  readonly updatedAt: number;
+  /** Merkle root of the context's event log at profile computation time (32 bytes). */
+  readonly eventLogRoot: readonly number[];
+  /** Context-specific Ed25519 public key used to sign this profile (32 bytes). */
+  readonly signerPublicKey: readonly number[];
+  /** Ed25519 signature over all fields except this one (64 bytes). */
+  readonly signature: readonly number[];
 }
 
-/** Participation-based admission requirement for a context. */
+/**
+ * A participation admission requirement declared by a context.
+ *
+ * Contexts include one or more `RequireParticipation` entries in their
+ * `ContextParams` admission requirements. Each entry specifies a
+ * participation fact, a threshold, a freshness requirement, and a minimum
+ * number of independent source contexts. See §7.3.2.1.
+ */
 export interface RequireParticipation {
-  /** Thresholds that must be met for admission. */
-  readonly thresholds: readonly ParticipationThreshold[];
-  /** Whether ALL thresholds must be met (true) or ANY (false). */
-  readonly requireAll: boolean;
+  /** Which participation category to evaluate. */
+  readonly fact: ParticipationFact;
+  /** Comparison operator and value. */
+  readonly threshold: ParticipationThreshold;
+  /** Maximum age in seconds for the profile's `updatedAt` timestamp. */
+  readonly maxAgeSecs: number;
+  /** Minimum number of independent source contexts (distinct signer keys). */
+  readonly minContexts: number;
 }
 
 // ---------------------------------------------------------------------------
