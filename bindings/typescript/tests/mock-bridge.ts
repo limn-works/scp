@@ -528,14 +528,17 @@ export function createMockBridge(): Bridge & {
       }
 
       const sessionId = `session-${nextId++}`;
-      ctx.sessions.set(sessionId, {
+      const session: MockSession = {
         sessionId,
         toolId,
         sourceContextId,
         callCount: 0,
-        ttlSeconds,
         createdAt: Date.now(),
-      });
+      };
+      if (ttlSeconds !== undefined) {
+        session.ttlSeconds = ttlSeconds;
+      }
+      ctx.sessions.set(sessionId, session);
       return sessionId;
     },
 
