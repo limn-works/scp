@@ -311,10 +311,13 @@ struct WasmRequireParticipation {
     min_contexts: u32,
 }
 
+/// Domain separator for participation profile signing (must match
+/// `scp_core::trust::participation::DOMAIN_PARTICIPATION_V1`).
+const DOMAIN_PARTICIPATION_V1: &[u8] = b"SCP-PARTICIPATION-V1:";
+
 /// Local re-implementation of `scp_core::trust::ParticipationProfile` for WASM.
 #[derive(serde::Deserialize)]
 struct WasmParticipationProfile {
-    #[allow(dead_code)]
     subject_did: String,
     participation_duration_secs: u64,
     governance_actions_against: u64,
@@ -324,11 +327,41 @@ struct WasmParticipationProfile {
     role_progression_count: u64,
     attestation_count: u64,
     updated_at: u64,
-    #[allow(dead_code)]
     event_log_root: Vec<u8>,
     signer_public_key: Vec<u8>,
-    #[allow(dead_code)]
     signature: Vec<u8>,
+}
+
+impl WasmParticipationProfile {
+    /// Returns the deterministic signable bytes for this profile.
+    ///
+    /// Must be algorithm-identical to `scp_core::trust::ParticipationProfile::signable_bytes`.
+    /// See that function for the byte layout specification.
+    fn signable_bytes(&self) -> Vec<u8> {
+        let did_bytes = self.subject_did.as_bytes();
+        let capacity = DOMAIN_PARTICIPATION_V1.len() + 4 + did_bytes.len() + 64 + 64;
+        let mut buf = Vec::with_capacity(capacity);
+
+        buf.extend_from_slice(DOMAIN_PARTICIPATION_V1);
+
+        #[allow(clippy::cast_possible_truncation)]
+        buf.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(did_bytes);
+
+        buf.extend_from_slice(&self.participation_duration_secs.to_be_bytes());
+        buf.extend_from_slice(&self.governance_actions_against.to_be_bytes());
+        buf.extend_from_slice(&self.governance_actions_by.to_be_bytes());
+        buf.extend_from_slice(&self.tool_invocation_count.to_be_bytes());
+        buf.extend_from_slice(&self.context_creation_count.to_be_bytes());
+        buf.extend_from_slice(&self.role_progression_count.to_be_bytes());
+        buf.extend_from_slice(&self.attestation_count.to_be_bytes());
+        buf.extend_from_slice(&self.updated_at.to_be_bytes());
+
+        buf.extend_from_slice(&self.event_log_root);
+        buf.extend_from_slice(&self.signer_public_key);
+
+        buf
+    }
 }
 
 /// Verifies participation profiles against admission requirements.
@@ -344,17 +377,17 @@ struct WasmParticipationProfile {
 /// Returns `true` if all requirements are satisfied. Throws an error with
 /// a diagnostic message if any requirement fails or if the JSON is malformed.
 ///
-/// **Note:** Signature verification is NOT performed in the WASM bridge
-/// (requires Ed25519 via `WebCrypto`). Only threshold, freshness, and
-/// `min_contexts` checks are applied. The TypeScript wrapper should verify
-/// signatures via `WebCrypto` before calling this function.
+/// Performs full Ed25519 signature verification on all profiles (matching
+/// `scp_core::trust::verify_participation_requirements`), followed by
+/// freshness, threshold, and `min_contexts` checks.
 ///
 /// See §7.3.2.1.
 ///
 /// # Errors
 ///
-/// Returns `JsValue` error if JSON parsing fails or if any participation
-/// requirement is not satisfied (with a diagnostic message).
+/// Returns `JsValue` error if JSON parsing fails, if any signature is
+/// invalid, or if any participation requirement is not satisfied (with a
+/// diagnostic message).
 ///
 /// # JS usage
 ///
@@ -370,6 +403,8 @@ pub fn verify_participation_requirements(
     profile_json: String,
     requirements_json: String,
 ) -> Result<bool, JsValue> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
     let profiles: Vec<WasmParticipationProfile> =
         serde_json::from_str(&profile_json).map_err(|e| {
             ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
@@ -382,6 +417,49 @@ pub fn verify_participation_requirements(
             ))
         })?;
 
+    // Step 1: Verify all signatures up front. Any invalid signature is a
+    // hard failure regardless of which requirements use it. Matches
+    // scp-core's verify_participation_requirements step 1.
+    for profile in &profiles {
+        let pk_bytes: [u8; 32] = profile
+            .signer_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                ScpWasmError::validation(&format!(
+                    "signer_public_key must be 32 bytes, got {}",
+                    profile.signer_public_key.len()
+                ))
+            })?;
+
+        let verifying_key = VerifyingKey::from_bytes(&pk_bytes).map_err(|e| {
+            ScpWasmError::validation(&format!(
+                "invalid signer public key for {}: {e}",
+                &profile.subject_did
+            ))
+        })?;
+
+        let sig_bytes: [u8; 64] = profile.signature.as_slice().try_into().map_err(|_| {
+            ScpWasmError::validation(&format!(
+                "signature must be 64 bytes, got {}",
+                profile.signature.len()
+            ))
+        })?;
+
+        let signature = Signature::from_bytes(&sig_bytes);
+        let signable = profile.signable_bytes();
+
+        verifying_key
+            .verify_strict(&signable, &signature)
+            .map_err(|e| {
+                ScpWasmError::validation(&format!(
+                    "participation profile signature verification failed for {}: {e}",
+                    &profile.subject_did
+                ))
+            })?;
+    }
+
+    // Step 2: Check each requirement independently.
     // Current time in seconds since UNIX epoch (using js_sys::Date for WASM).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let current_time = (js_sys::Date::now() / 1000.0) as u64;

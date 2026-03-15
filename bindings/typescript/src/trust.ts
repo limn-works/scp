@@ -216,7 +216,7 @@ function requirementToBridgeJson(requirement: RequireParticipation): Record<stri
  * 1. Freshness/staleness checking (`maxAgeSecs`).
  * 2. Distinct signer counting (`minContexts`).
  * 3. Threshold operator semantics (`ParticipationThreshold`).
- * 4. Signature verification (NAPI only; WASM defers to WebCrypto).
+ * 4. Ed25519 signature verification (both NAPI and WASM via `ed25519-dalek`).
  *
  * Success is indicated by returning without exception. Verification
  * failures throw an error with diagnostic details.
