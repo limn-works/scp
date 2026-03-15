@@ -1663,14 +1663,19 @@ pub async fn context_apply_pending_ceiling_modification(
 /// - Rejects with `SCP-CTX-2061` if the context is not in `Closing` state.
 #[napi(js_name = "contextFinalizeClose")]
 pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<()> {
-    let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
-    let core_handle = ContextHandle::new(context_id, ContextParams::default());
-    let _ = core_handle.transition_to(&ContextState::Active).await;
+    // Use the handle's actual core_handle (which carries correct ContextParams
+    // including memory_scope) instead of constructing one with default params.
+    // memory_scope governs key destruction behavior in finalize_close — using
+    // default (Ephemeral) would incorrectly destroy keys for Full-scope contexts.
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    // Ensure the core handle is in Closing state. If close_context already
+    // transitioned it, the transition_to call fails harmlessly (self-transition
+    // or invalid source state) and we ignore the error.
     let _ = core_handle.transition_to(&ContextState::Closing).await;
 
-    manager.finalize_close(&core_handle).await.map_err(|e| {
+    manager.finalize_close(core_handle).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("finalize_close failed: {e}"),
             code: "SCP-CTX-2061".to_owned(),
@@ -1826,7 +1831,20 @@ pub async fn context_add_checkpoint_cosignature(
 pub async fn context_restore(context_id: String) -> napi::Result<()> {
     let manager = context_manager()?;
 
-    let core_handle = ContextHandle::new(context_id.clone(), ContextParams::default());
+    // Load the persisted snapshot to obtain the correct ContextParams (including
+    // memory_scope). Using ContextParams::default() would give Ephemeral scope,
+    // which would cause incorrect key destruction on subsequent finalize_close.
+    let (snapshot, _broadcast) =
+        manager
+            .load_persisted_context_state(&context_id)
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("restore_context: failed to load persisted state: {e}"),
+                    code: "SCP-CTX-2064".to_owned(),
+                })
+            })?;
+
+    let core_handle = ContextHandle::new(context_id.clone(), snapshot.context_params.clone());
     let _ = core_handle.transition_to(&ContextState::Active).await;
 
     manager

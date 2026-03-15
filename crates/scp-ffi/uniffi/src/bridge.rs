@@ -1616,6 +1616,9 @@ pub struct ContextHandle {
     pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
     /// Optional economic policy as a JSON string (§19.3, ADR-033).
     pub(crate) economic_policy: std::sync::Mutex<Option<String>>,
+    /// Core context parameters, retained for `finalize_close` (`memory_scope`
+    /// governs key destruction) and `restore_context`.
+    pub(crate) core_context_params: scp_core::context::ContextParams,
 }
 
 impl std::fmt::Debug for ContextHandle {
@@ -2308,6 +2311,9 @@ pub async fn context_create(
 
             // Convert bridge ContextParams to scp-core ContextParams.
             let core_params = bridge_params_to_core(&params);
+            // Retain a clone for the FFI handle — finalize_close needs the real
+            // memory_scope to decide key destruction behavior.
+            let retained_core_params = core_params.clone();
 
             // Initialize the ContextManager if not already done (first context_create call).
             crate::runtime::init_context_manager();
@@ -2387,6 +2393,7 @@ pub async fn context_create(
                     scp_core::context::tools::SessionStore::new(),
                 ),
                 economic_policy: std::sync::Mutex::new(None),
+                core_context_params: retained_core_params,
             });
             increment_handle_count();
             Ok(handle)
@@ -5572,13 +5579,16 @@ pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> 
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
+    // Use the handle's stored core_context_params (which carries correct
+    // memory_scope) instead of ContextParams::default(). memory_scope
+    // governs key destruction behavior in finalize_close — Ephemeral scope
+    // destroys keys, Full scope retains them.
+    let core_params = handle.core_context_params.clone();
+
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
-            let core_handle = scp_core::context::ContextHandle::new(
-                context_id,
-                scp_core::context::ContextParams::default(),
-            );
+            let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
             let _ = core_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
@@ -5732,9 +5742,17 @@ pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
+            // Load the persisted snapshot to obtain the correct ContextParams
+            // (including memory_scope). Using ContextParams::default() would
+            // give Ephemeral scope, causing incorrect key destruction on
+            // subsequent finalize_close.
+            let (snapshot, _broadcast) = manager
+                .load_persisted_context_state(&ctx_id)
+                .map_err(ScpError::from)?;
+
             let core_handle = scp_core::context::ContextHandle::new(
                 ctx_id.clone(),
-                scp_core::context::ContextParams::default(),
+                snapshot.context_params.clone(),
             );
             let _ = core_handle
                 .transition_to(&scp_core::context::ContextState::Active)
@@ -10069,6 +10087,7 @@ mod tests {
             tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
         })
     }
 

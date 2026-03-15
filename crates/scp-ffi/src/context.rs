@@ -2444,9 +2444,21 @@ fn py_restore_context(context_id: &str) -> PyResult<()> {
     let context_id_owned = context_id.to_owned();
 
     rt.block_on(async move {
+        // Load the persisted snapshot to obtain the correct ContextParams
+        // (including memory_scope). Using ContextParams::default() would
+        // give Ephemeral scope, causing incorrect key destruction on
+        // subsequent finalize_close.
+        let (snapshot, _broadcast) = mgr
+            .load_persisted_context_state(&context_id_owned)
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2064: failed to load persisted state: {e}"
+                ))
+            })?;
+
         let core_handle = scp_core::context::ContextHandle::new(
             context_id_owned.clone(),
-            scp_core::context::ContextParams::default(),
+            snapshot.context_params.clone(),
         );
         let _ = core_handle
             .transition_to(&scp_core::context::ContextState::Active)
