@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(event["eventType"], "LogSummary");
         assert_eq!(event["actorDid"], "");
         assert_eq!(event["timestamp"], 1_700_000_000.0);
-        assert_eq!(event["sequence"], 4);
+        assert_eq!(event["sequence"], 4.0);
         // payloadJson is a nested JSON string.
         let payload_str = event["payloadJson"].as_str().unwrap();
         let payload: serde_json::Value = serde_json::from_str(payload_str).unwrap();
