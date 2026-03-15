@@ -88,7 +88,7 @@ fun rememberScpContext(
     identityHandle: Long,
     onDispose: (Long, Long) -> Unit,
 ): ScpContextHolder {
-    val holder = remember(contextHandle) {
+    val holder = remember(contextHandle, identityHandle) {
         ScpContextHolder(
             contextHandle = contextHandle,
             identityHandle = identityHandle,
@@ -96,7 +96,7 @@ fun rememberScpContext(
             onDispose = onDispose,
         )
     }
-    DisposableEffect(contextHandle) {
+    DisposableEffect(contextHandle, identityHandle) {
         onDispose { holder.dispose() }
     }
     return holder

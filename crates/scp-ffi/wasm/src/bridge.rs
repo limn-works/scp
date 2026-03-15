@@ -338,7 +338,7 @@ pub fn bridge_register(
     if context_id.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7053".to_owned(),
+            code: "SCP-VALID-7063".to_owned(),
         }
         .into_js());
     }
@@ -351,7 +351,7 @@ pub fn bridge_register(
     if platform.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform must not be empty".to_owned(),
-            code: "SCP-VALID-7054".to_owned(),
+            code: "SCP-VALID-7064".to_owned(),
         }
         .into_js());
     }
@@ -444,14 +444,14 @@ pub fn bridge_create_shadow(
     if bridge_id.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "bridge_id must not be empty".to_owned(),
-            code: "SCP-VALID-7055".to_owned(),
+            code: "SCP-VALID-7065".to_owned(),
         }
         .into_js());
     }
     if platform_handle.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform_handle must not be empty".to_owned(),
-            code: "SCP-VALID-7056".to_owned(),
+            code: "SCP-VALID-7066".to_owned(),
         }
         .into_js());
     }

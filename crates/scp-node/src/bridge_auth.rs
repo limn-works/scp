@@ -60,6 +60,13 @@ const JWT_ALG_EDDSA: &str = "EdDSA";
 /// The JWT `typ` header value.
 const JWT_TYP: &str = "JWT";
 
+/// Maximum allowed timestamp drift for webhook signature verification
+/// (300 seconds = 5 minutes).
+///
+/// Per spec §12.10.2, the `X-SCP-Timestamp` header must be within this
+/// window of the current time to prevent replay attacks.
+const WEBHOOK_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
+
 // ---------------------------------------------------------------------------
 // Bridge error responses (spec section 12.10.3)
 // ---------------------------------------------------------------------------
@@ -830,12 +837,40 @@ pub async fn bridge_auth_middleware_dyn(
 /// # Errors
 ///
 /// Returns a human-readable error string if verification fails.
+///
+/// # Replay protection
+///
+/// Per spec §12.10.2, the signed payload is `{timestamp}.{body}` where
+/// `timestamp` is the value of the `X-SCP-Timestamp` header. The timestamp
+/// must be within [`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`] of the current time.
 pub fn verify_webhook_signature(
     signature_header: &str,
     key_id: &str,
+    timestamp_header: Option<&str>,
     body: &[u8],
     lookup: &dyn BridgeLookup,
 ) -> Result<(), String> {
+    // Validate and check timestamp freshness (replay protection per §12.10.2).
+    let timestamp_str =
+        timestamp_header.ok_or_else(|| "missing X-SCP-Timestamp header".to_owned())?;
+
+    let timestamp_secs: u64 = timestamp_str
+        .parse()
+        .map_err(|_| format!("invalid X-SCP-Timestamp value: {timestamp_str}"))?;
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let drift = now_secs.abs_diff(timestamp_secs);
+
+    if drift > WEBHOOK_TIMESTAMP_TOLERANCE_SECS {
+        return Err(format!(
+            "webhook timestamp outside acceptable window: {drift}s drift (max {WEBHOOK_TIMESTAMP_TOLERANCE_SECS}s)"
+        ));
+    }
+
     // Look up the platform's signing key.
     let pub_key_bytes = lookup
         .find_webhook_key(key_id)
@@ -857,15 +892,22 @@ pub fn verify_webhook_signature(
     })?;
     let signature = Signature::from_bytes(&sig_array);
 
+    // Build the signed payload: "{timestamp}.{body}" per spec §12.10.2.
+    let mut signed_payload = Vec::with_capacity(timestamp_str.len() + 1 + body.len());
+    signed_payload.extend_from_slice(timestamp_str.as_bytes());
+    signed_payload.push(b'.');
+    signed_payload.extend_from_slice(body);
+
     verifying_key
-        .verify_strict(body, &signature)
+        .verify_strict(&signed_payload, &signature)
         .map_err(|e| format!("webhook signature verification failed: {e}"))
 }
 
 /// Axum middleware that validates webhook signatures from external platforms.
 ///
-/// Extracts the `X-SCP-Signature` and `X-SCP-Platform-Key-Id` headers and
-/// verifies the Ed25519 signature over the raw request body.
+/// Extracts the `X-SCP-Signature`, `X-SCP-Platform-Key-Id`, and
+/// `X-SCP-Timestamp` headers and verifies the Ed25519 signature over the
+/// timestamped request body per spec §12.10.2.
 ///
 /// On success, the request proceeds to the next handler. On failure,
 /// returns 401 with error code `BRIDGE_NOT_AUTHORIZED`.
@@ -899,6 +941,12 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
         }
     };
 
+    let timestamp_header = req
+        .headers()
+        .get("x-scp-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
     // We need to read the body for signature verification, then reconstruct
     // the request for downstream handlers.
     let (parts, body) = req.into_parts();
@@ -910,10 +958,14 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
         }
     };
 
-    // Verify the signature.
-    if let Err(msg) =
-        verify_webhook_signature(&signature_header, &key_id, &body_bytes, lookup.as_ref())
-    {
+    // Verify the signature (includes timestamp validation per §12.10.2).
+    if let Err(msg) = verify_webhook_signature(
+        &signature_header,
+        &key_id,
+        timestamp_header.as_deref(),
+        &body_bytes,
+        lookup.as_ref(),
+    ) {
         return bridge_not_authorized(msg).into_response();
     }
 
@@ -956,6 +1008,12 @@ pub async fn webhook_auth_middleware_dyn(
         }
     };
 
+    let timestamp_header = req
+        .headers()
+        .get("x-scp-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
     // Read the body for signature verification, then reconstruct.
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
@@ -966,10 +1024,14 @@ pub async fn webhook_auth_middleware_dyn(
         }
     };
 
-    // Verify the signature.
-    if let Err(msg) =
-        verify_webhook_signature(&signature_header, &key_id, &body_bytes, lookup.as_ref())
-    {
+    // Verify the signature (includes timestamp validation per §12.10.2).
+    if let Err(msg) = verify_webhook_signature(
+        &signature_header,
+        &key_id,
+        timestamp_header.as_deref(),
+        &body_bytes,
+        lookup.as_ref(),
+    ) {
         return bridge_not_authorized(msg).into_response();
     }
 
@@ -1558,6 +1620,24 @@ mod tests {
     // Webhook signature tests
     // -----------------------------------------------------------------------
 
+    /// Helper: build the signed payload `{timestamp}.{body}` per §12.10.2.
+    fn webhook_signed_payload(timestamp: &str, body: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(timestamp.len() + 1 + body.len());
+        payload.extend_from_slice(timestamp.as_bytes());
+        payload.push(b'.');
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    /// Helper: current Unix timestamp as string.
+    fn current_timestamp_str() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    }
+
     #[test]
     fn verify_valid_webhook_signature() {
         use ed25519_dalek::Signer;
@@ -1565,8 +1645,10 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let pub_key = *signing_key.verifying_key().as_bytes();
         let body = b"webhook payload content";
+        let ts = current_timestamp_str();
+        let signed_payload = webhook_signed_payload(&ts, body);
 
-        let signature = signing_key.sign(body);
+        let signature = signing_key.sign(&signed_payload);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
@@ -1574,7 +1656,7 @@ mod tests {
             .webhook_keys
             .push(("platform-key-1".to_owned(), pub_key));
 
-        let result = verify_webhook_signature(&sig_b64, "platform-key-1", body, &lookup);
+        let result = verify_webhook_signature(&sig_b64, "platform-key-1", Some(&ts), body, &lookup);
         assert!(result.is_ok());
     }
 
@@ -1586,9 +1668,11 @@ mod tests {
         let wrong_key = SigningKey::generate(&mut OsRng);
         let pub_key = *signing_key.verifying_key().as_bytes();
         let body = b"webhook payload content";
+        let ts = current_timestamp_str();
+        let signed_payload = webhook_signed_payload(&ts, body);
 
         // Sign with wrong key.
-        let signature = wrong_key.sign(body);
+        let signature = wrong_key.sign(&signed_payload);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
@@ -1596,7 +1680,7 @@ mod tests {
             .webhook_keys
             .push(("platform-key-1".to_owned(), pub_key));
 
-        let result = verify_webhook_signature(&sig_b64, "platform-key-1", body, &lookup);
+        let result = verify_webhook_signature(&sig_b64, "platform-key-1", Some(&ts), body, &lookup);
         assert!(result.is_err());
         assert!(
             result
@@ -1609,9 +1693,10 @@ mod tests {
     fn reject_unknown_webhook_key_id() {
         let body = b"webhook payload";
         let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        let ts = current_timestamp_str();
         let lookup = TestBridgeLookup::new("https://node.example.com");
 
-        let result = verify_webhook_signature(&sig_b64, "unknown-key", body, &lookup);
+        let result = verify_webhook_signature(&sig_b64, "unknown-key", Some(&ts), body, &lookup);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown platform key ID"));
     }
@@ -1624,8 +1709,10 @@ mod tests {
         let pub_key = *signing_key.verifying_key().as_bytes();
         let body = b"original payload";
         let tampered_body = b"tampered payload";
+        let ts = current_timestamp_str();
+        let signed_payload = webhook_signed_payload(&ts, body);
 
-        let signature = signing_key.sign(body);
+        let signature = signing_key.sign(&signed_payload);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
@@ -1633,8 +1720,63 @@ mod tests {
             .webhook_keys
             .push(("platform-key-1".to_owned(), pub_key));
 
-        let result = verify_webhook_signature(&sig_b64, "platform-key-1", tampered_body, &lookup);
+        let result = verify_webhook_signature(
+            &sig_b64,
+            "platform-key-1",
+            Some(&ts),
+            tampered_body,
+            &lookup,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_missing_webhook_timestamp() {
+        let body = b"webhook payload";
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.webhook_keys.push(("key-1".to_owned(), [0u8; 32]));
+
+        let result = verify_webhook_signature(&sig_b64, "key-1", None, body, &lookup);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("missing X-SCP-Timestamp"),
+            "expected missing timestamp error"
+        );
+    }
+
+    #[test]
+    fn reject_stale_webhook_timestamp() {
+        use ed25519_dalek::Signer;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key = *signing_key.verifying_key().as_bytes();
+        let body = b"webhook payload";
+        // Timestamp 600 seconds in the past (beyond 300s tolerance).
+        let stale_ts = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600)
+            .to_string();
+        let signed_payload = webhook_signed_payload(&stale_ts, body);
+        let signature = signing_key.sign(&signed_payload);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup
+            .webhook_keys
+            .push(("platform-key-1".to_owned(), pub_key));
+
+        let result =
+            verify_webhook_signature(&sig_b64, "platform-key-1", Some(&stale_ts), body, &lookup);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("timestamp outside acceptable window"),
+            "expected timestamp drift error"
+        );
     }
 
     // -------------------------------------------------------------------
