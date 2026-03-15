@@ -1084,3 +1084,72 @@ export function validateCapabilityDeclaration(
   );
   return JSON.parse(resultJson) as DeclarationValidationResult;
 }
+
+// ---------------------------------------------------------------------------
+// Invitation evaluation (#614)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of evaluating a context invitation.
+ */
+export interface InvitationEvaluationResult {
+  /** The pipeline decision: `"auto_accept"` or `"prompt_agent"`. */
+  readonly decision: "auto_accept" | "prompt_agent";
+}
+
+/**
+ * Evaluates a context invitation through the sequential pipeline.
+ *
+ * Runs the 4-step evaluation pipeline:
+ * 1. **Template check** -- validates params match the claimed template.
+ * 2. **Economic policy check** -- verifies spending capability for paid contexts.
+ * 3. **Auto-accept check** -- evaluates trust, TTL cap, and rate limit.
+ * 4. **Agent prompt** -- falls through if no auto-accept matches.
+ *
+ * @param paramsJson - JSON-serialized `ContextParams` from the invitation.
+ * @param inviterDid - DID string of the identity sending the invitation.
+ * @param identityDid - DID string of the local identity receiving the invitation.
+ * @param policyJson - Optional JSON-serialized `AutoAcceptPolicy`.
+ * @param spendingJson - Optional JSON-serialized `SpendingContext`.
+ * @param trustedDids - Optional array of trusted DID strings.
+ * @returns The evaluation result with the pipeline decision.
+ * @throws {ContextError} If pipeline evaluation fails.
+ * @throws {ValidationError} If input validation fails.
+ */
+export async function evaluateInvitation(
+  paramsJson: string,
+  inviterDid: string,
+  identityDid: string,
+  policyJson?: string,
+  spendingJson?: string,
+  trustedDids?: readonly string[],
+): Promise<InvitationEvaluationResult> {
+  try {
+    const bridge = await getBridge();
+    const trustedDidsJson = trustedDids ? JSON.stringify(trustedDids) : undefined;
+    const result = bridge.evaluateInvitation(
+      paramsJson,
+      inviterDid,
+      identityDid,
+      policyJson ?? null,
+      spendingJson ?? null,
+      trustedDidsJson ?? null,
+    );
+    // NAPI returns an object directly; WASM returns a JSON string promise.
+    if (typeof result === "string") {
+      return JSON.parse(result) as InvitationEvaluationResult;
+    }
+    // Handle promise (WASM)
+    if (result && typeof (result as Promise<string>).then === "function") {
+      const resolved = await (result as Promise<string>);
+      if (typeof resolved === "string") {
+        return JSON.parse(resolved) as InvitationEvaluationResult;
+      }
+      return resolved as unknown as InvitationEvaluationResult;
+    }
+    // NAPI returns object with decision field
+    return result as unknown as InvitationEvaluationResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}

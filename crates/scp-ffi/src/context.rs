@@ -2718,6 +2718,157 @@ fn py_check_scoped_capability(
     false
 }
 
+// ---------------------------------------------------------------------------
+// Invitation evaluation pipeline (#614)
+// ---------------------------------------------------------------------------
+
+/// FFI-concrete implementation of [`scp_core::context::invitation::TrustOracle`].
+///
+/// At the FFI boundary, we cannot accept a trait object. Instead, the caller
+/// provides a list of trusted DIDs. The bridge implements `TrustOracle` by
+/// checking membership in this list.
+struct FfiBridgeTrustOracle {
+    /// DIDs that the inviter is checked against for `SharedContext` and
+    /// `Explicit` trust requirements.
+    trusted_dids: Vec<scp_identity::DID>,
+}
+
+impl scp_core::context::invitation::TrustOracle for FfiBridgeTrustOracle {
+    fn satisfies_trust(
+        &self,
+        inviter: &scp_identity::DID,
+        requirement: &scp_core::context::policy::TrustRequirement,
+    ) -> bool {
+        match requirement {
+            scp_core::context::policy::TrustRequirement::Any => true,
+            scp_core::context::policy::TrustRequirement::SharedContext => {
+                self.trusted_dids.contains(inviter)
+            }
+            scp_core::context::policy::TrustRequirement::Explicit(dids) => dids.contains(inviter),
+        }
+    }
+}
+
+/// Evaluates a context invitation through the sequential pipeline.
+///
+/// Runs the 4-step evaluation pipeline from `scp-core`:
+/// 1. Template validation (rejects template spoofing).
+/// 2. Economic policy check (rejects insufficient spending capability).
+/// 3. Auto-accept evaluation (trust, TTL cap, rate limit).
+/// 4. Falls through to prompt-agent if no auto-accept matches.
+///
+/// # Arguments
+///
+/// * `params_json` -- JSON-serialized `ContextParams` from the invitation.
+/// * `inviter_did` -- DID string of the identity sending the invitation.
+/// * `identity_did` -- DID string of the local identity receiving the
+///   invitation. Used to key the rate limit tracker.
+/// * `policy_json` -- Optional JSON-serialized `AutoAcceptPolicy`. If `None`,
+///   the pipeline always falls through to prompt-agent.
+/// * `spending_json` -- Optional JSON-serialized `SpendingContext`. Required
+///   when the context has an economic policy requiring payment.
+/// * `trusted_dids_json` -- JSON array of DID strings representing identities
+///   trusted by the local identity (e.g., shared-context peers). Used for
+///   `SharedContext` trust requirement evaluation.
+///
+/// # Returns
+///
+/// `"auto_accept"` if the pipeline decided to auto-accept, `"prompt_agent"`
+/// if the agent should be prompted for a decision.
+///
+/// # Errors
+///
+/// Returns `ScpError` if:
+/// - JSON parsing fails for any input.
+/// - Template validation fails (template spoofing detected).
+/// - Economic policy checks fail (no spending UCAN, no compatible adapter,
+///   insufficient balance).
+/// - DID validation fails.
+///
+/// See `.docs/standards/sdk-common.md` "Invitation evaluation" and
+/// `.docs/specs/19-economic-governance.md` sections 19.3, 19.14.
+#[pyfunction]
+#[pyo3(
+    name = "evaluate_invitation",
+    signature = (params_json, inviter_did, identity_did, policy_json=None, spending_json=None, trusted_dids_json=None)
+)]
+pub fn py_evaluate_invitation(
+    params_json: &str,
+    inviter_did: &str,
+    identity_did: &str,
+    policy_json: Option<&str>,
+    spending_json: Option<&str>,
+    trusted_dids_json: Option<&str>,
+) -> PyResult<String> {
+    use scp_core::context::invitation::{EvaluationDecision, SpendingContext, evaluate_invitation};
+    use scp_core::context::policy::AutoAcceptPolicy;
+
+    validate::validate_did(inviter_did)?;
+    validate::validate_did(identity_did)?;
+
+    let params: scp_core::context::ContextParams =
+        serde_json::from_str(params_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse context params JSON: {e}"
+            ))
+        })?;
+
+    let policy: Option<AutoAcceptPolicy> = match policy_json {
+        Some(json) => Some(serde_json::from_str(json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse auto-accept policy JSON: {e}"
+            ))
+        })?),
+        None => None,
+    };
+
+    let spending: Option<SpendingContext> = match spending_json {
+        Some(json) => Some(serde_json::from_str(json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse spending context JSON: {e}"
+            ))
+        })?),
+        None => None,
+    };
+
+    let trusted_dids: Vec<scp_identity::DID> = match trusted_dids_json {
+        Some(json) => {
+            let did_strings: Vec<String> = serde_json::from_str(json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "failed to parse trusted DIDs JSON: {e}"
+                ))
+            })?;
+            did_strings
+                .into_iter()
+                .map(scp_identity::DID::from)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let oracle = FfiBridgeTrustOracle { trusted_dids };
+    let inviter = scp_identity::DID::from(inviter_did);
+
+    let decision = crate::runtime::with_rate_limit_tracker(identity_did, |tracker| {
+        evaluate_invitation(
+            &params,
+            &inviter,
+            policy.as_ref(),
+            spending.as_ref(),
+            &oracle,
+            tracker,
+        )
+    });
+
+    match decision {
+        Ok(EvaluationDecision::AutoAccept) => Ok("auto_accept".to_owned()),
+        Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "[SCP-CTX-2060] invitation evaluation failed: {e}"
+        ))),
+    }
+}
+
 /// Registers all context bridge types and functions with the Python module.
 ///
 /// Called from `lib.rs` during module initialization.
@@ -2776,6 +2927,8 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // App sandboxing (#595)
     m.add_function(wrap_pyfunction!(py_validate_capability_declaration, m)?)?;
     m.add_function(wrap_pyfunction!(py_check_scoped_capability, m)?)?;
+    // Invitation evaluation (#614)
+    m.add_function(wrap_pyfunction!(py_evaluate_invitation, m)?)?;
     Ok(())
 }
 
@@ -3505,5 +3658,63 @@ mod tests {
         })
         .unwrap();
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Invitation evaluation (#614)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_invitation_rejects_invalid_inviter_did() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let result = py_evaluate_invitation(
+                "{}",
+                "", // empty DID
+                "did:dht:z6MkLocal",
+                None,
+                None,
+                None,
+            );
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn evaluate_invitation_rejects_invalid_params_json() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let result = py_evaluate_invitation(
+                "not valid json",
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                None,
+                None,
+            );
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn evaluate_invitation_prompt_without_policy() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            // Use serde to produce a valid ContextParams JSON.
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                None,
+                None,
+            );
+            match &result {
+                Ok(v) => assert_eq!(v, "prompt_agent"),
+                Err(e) => panic!("expected Ok, got Err: {e}"),
+            }
+        });
     }
 }

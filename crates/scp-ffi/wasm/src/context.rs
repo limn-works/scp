@@ -1414,6 +1414,168 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
 }
 
 // ---------------------------------------------------------------------------
+// Invitation evaluation pipeline (#614)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the ceiling array contains any tool-related capability.
+fn ceiling_has_tool_caps(ceiling: Option<&serde_json::Value>) -> bool {
+    ceiling
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|caps| {
+            caps.iter().any(|c| {
+                let s = c.as_str().unwrap_or("");
+                s == "ToolInvokeAll" || s == "ToolRegister" || s.starts_with("ToolInvoke(")
+            })
+        })
+}
+
+/// Returns `true` if the params JSON has an economic policy requiring payment.
+fn params_require_payment(params: &serde_json::Value) -> bool {
+    params
+        .get("economic_policy")
+        .and_then(|ep| ep.get("cost_schedule"))
+        .is_some_and(|cs| {
+            cs.get("per_message").is_some_and(|v| !v.is_null())
+                || cs.get("per_tool_invoke").is_some_and(|v| !v.is_null())
+                || cs.get("per_join").is_some_and(|v| !v.is_null())
+                || cs.get("per_period").is_some_and(|v| !v.is_null())
+                || cs.get("per_byte_stored").is_some_and(|v| !v.is_null())
+        })
+        || params
+            .get("economic_policy")
+            .and_then(|ep| ep.get("pricing_formula"))
+            .is_some_and(|v| !v.is_null())
+}
+
+/// Checks trust requirement against the inviter and trusted DID list.
+fn check_trust(
+    policy: &serde_json::Value,
+    inviter_did: &str,
+    trusted_dids_json: Option<&String>,
+) -> bool {
+    match policy.get("from").and_then(serde_json::Value::as_str) {
+        Some("Any") => true,
+        Some("SharedContext") => {
+            let trusted: Vec<String> = trusted_dids_json.map_or_else(Vec::new, |json| {
+                serde_json::from_str(json).unwrap_or_default()
+            });
+            trusted.contains(&inviter_did.to_owned())
+        }
+        _ => policy.get("from").is_some_and(|from_obj| {
+            from_obj.get("Explicit").is_some_and(|explicit| {
+                explicit
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|d| d.as_str() == Some(inviter_did)))
+            })
+        }),
+    }
+}
+
+/// Evaluates a context invitation through the sequential pipeline.
+///
+/// WASM-local re-implementation of the 4-step pipeline from `scp-core`.
+/// Returns a Promise resolving to JSON: `{"decision": "auto_accept"|"prompt_agent"}`.
+#[wasm_bindgen]
+pub fn evaluate_invitation(
+    params_json: String,
+    inviter_did: String,
+    identity_did: String,
+    policy_json: Option<String>,
+    spending_json: Option<String>,
+    trusted_dids_json: Option<String>,
+) -> Promise {
+    future_to_promise(async move {
+        if inviter_did.is_empty() {
+            return Err(ScpWasmError::validation("inviter DID must not be empty"));
+        }
+        if identity_did.is_empty() {
+            return Err(ScpWasmError::validation("identity DID must not be empty"));
+        }
+
+        let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+            JsValue::from_str(&format!(
+                "[SCP-VALID-7010] failed to parse context params JSON: {e}"
+            ))
+        })?;
+
+        // Step 1: Template spoofing check.
+        if let Some(tid) = params
+            .get("template_id")
+            .and_then(serde_json::Value::as_str)
+            && ceiling_has_tool_caps(params.get("ceiling"))
+            && (tid == "BilateralEphemeral" || tid == "BilateralPersistent")
+        {
+            return Err(ScpWasmError::Context {
+                message: "template spoofing detected: tool capabilities in bilateral template"
+                    .to_owned(),
+                code: "SCP-CTX-2060".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        // Step 2: Economic policy check.
+        if params_require_payment(&params) {
+            let has_ucan = spending_json
+                .as_ref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|sp| {
+                    sp.get("has_spending_ucan")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(false);
+            if !has_ucan {
+                return Err(ScpWasmError::Context {
+                    message:
+                        "spending UCAN required: context has economic policy requiring payment"
+                            .to_owned(),
+                    code: "SCP-CTX-2060".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
+            // Paid contexts always prompt agent.
+            return Ok(JsValue::from_str(r#"{"decision":"prompt_agent"}"#));
+        }
+
+        // Step 3: Auto-accept check.
+        if let Some(ref pjson) = policy_json {
+            let policy: serde_json::Value = serde_json::from_str(pjson).map_err(|e| {
+                JsValue::from_str(&format!(
+                    "[SCP-VALID-7010] failed to parse auto-accept policy JSON: {e}"
+                ))
+            })?;
+
+            if !ceiling_has_tool_caps(params.get("ceiling")) {
+                let policy_template = policy.get("template").and_then(serde_json::Value::as_str);
+                let params_template = params
+                    .get("template_id")
+                    .and_then(serde_json::Value::as_str);
+
+                if policy_template.is_some()
+                    && policy_template == params_template
+                    && check_trust(&policy, &inviter_did, trusted_dids_json.as_ref())
+                {
+                    let ttl_ok = match (
+                        policy.get("max_ttl").and_then(serde_json::Value::as_f64),
+                        params.get("ttl").and_then(serde_json::Value::as_f64),
+                    ) {
+                        (Some(max), Some(actual)) => actual <= max,
+                        _ => true,
+                    };
+                    if ttl_ok {
+                        return Ok(JsValue::from_str(r#"{"decision":"auto_accept"}"#));
+                    }
+                }
+            }
+        }
+
+        // Step 4: Prompt agent (fallthrough).
+        Ok(JsValue::from_str(r#"{"decision":"prompt_agent"}"#))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

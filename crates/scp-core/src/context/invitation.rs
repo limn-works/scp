@@ -88,7 +88,7 @@ pub enum EvaluationDecision {
 
 /// Information about the local identity's spending capabilities, provided by
 /// the caller to the evaluation pipeline for economic policy checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpendingContext {
     /// Whether a valid spending UCAN exists covering the expected costs.
     pub has_spending_ucan: bool,

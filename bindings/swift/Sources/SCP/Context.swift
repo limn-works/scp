@@ -682,3 +682,50 @@ public func validateCapabilityDeclaration(
     )
     return try parseValidationResult(resultJson)
 }
+
+// MARK: - Invitation Evaluation (#614)
+
+/// The result of evaluating a context invitation through the pipeline.
+public nonisolated struct InvitationEvaluationResult: Sendable {
+    /// The pipeline decision: ``autoAccept`` or ``promptAgent``.
+    public let decision: String
+
+    /// Whether the invitation was auto-accepted.
+    public var isAutoAccept: Bool { decision == "auto_accept" }
+}
+
+/// Evaluates a context invitation through the sequential pipeline.
+///
+/// Runs the 4-step evaluation pipeline:
+/// 1. **Template check** -- validates params match the claimed template.
+/// 2. **Economic policy check** -- verifies spending capability for paid contexts.
+/// 3. **Auto-accept check** -- evaluates trust, TTL cap, and rate limit.
+/// 4. **Agent prompt** -- falls through if no auto-accept matches.
+///
+/// - Parameters:
+///   - paramsJson: JSON-serialized ``ContextParams`` from the invitation.
+///   - inviterDid: DID string of the identity sending the invitation.
+///   - identityDid: DID string of the local identity receiving the invitation.
+///   - policyJson: Optional JSON-serialized ``AutoAcceptPolicy``.
+///   - spendingJson: Optional JSON-serialized ``SpendingContext``.
+///   - trustedDids: Optional array of trusted DID strings.
+/// - Returns: An ``InvitationEvaluationResult`` with the pipeline decision.
+/// - Throws: ``ScpError`` if evaluation fails.
+public func evaluateContextInvitation(
+    paramsJson: String,
+    inviterDid: String,
+    identityDid: String,
+    policyJson: String? = nil,
+    spendingJson: String? = nil,
+    trustedDids: [String] = []
+) throws -> InvitationEvaluationResult {
+    let decision = try evaluateInvitation(
+        paramsJson: paramsJson,
+        inviterDid: inviterDid,
+        identityDid: identityDid,
+        policyJson: policyJson,
+        spendingJson: spendingJson,
+        trustedDids: trustedDids
+    )
+    return InvitationEvaluationResult(decision: decision)
+}

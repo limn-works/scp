@@ -124,6 +124,7 @@ pub use bridge::{
     discovery_create_query,
     discovery_normalize_address,
     discovery_parse_address,
+    evaluate_invitation,
     evaluate_provenance_quality,
     // Free functions — event log
     event_log_query,
