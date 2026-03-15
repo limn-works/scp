@@ -12,7 +12,7 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { TransportError } from "../errors";
+import { IdentityError, TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -357,6 +357,9 @@ interface WasmModule {
     roleCapabilities: string[],
   ) => string;
   sandbox_check_capability: (grantedCapabilities: string[], requiredCapability: string) => boolean;
+  // SCPID (§3.11) — challenge + sign only; verify requires DID resolution (not in WASM)
+  scpid_challenge: (audience: string, ttlSeconds: number) => string;
+  scpid_sign: (did: string, signingKeyId: string, challengeJson: string) => string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1318,26 @@ export function createWasmBridge(): Bridge {
     ): boolean {
       const wasm = getWasm();
       return wasm.sandbox_check_capability([...grantedCapabilities], requiredCapability);
+    },
+
+    // SCPID authentication (§3.11)
+    scpidChallenge(audience: string, ttlSeconds: number): string {
+      const wasm = getWasm();
+      return wasm.scpid_challenge(audience, ttlSeconds);
+    },
+
+    scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
+      const wasm = getWasm();
+      return wasm.scpid_sign(did, signingKeyId, challengeJson);
+    },
+
+    scpidVerify(_responseJson: string, _challengeJson: string): string {
+      throw new IdentityError(
+        "SCPID verification is not available in the WASM bridge — " +
+          "it requires DID document resolution which depends on network access " +
+          "and a full DID resolver. Use the native (napi-rs) bridge instead.",
+        "SCP-IDENT-1033",
+      );
     },
 
     // Lifecycle

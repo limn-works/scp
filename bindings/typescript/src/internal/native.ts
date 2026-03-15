@@ -1136,6 +1136,23 @@ export function createNativeBridge(): Bridge {
       );
     },
 
+    // SCPID authentication (§3.11)
+    scpidChallenge(audience: string, ttlSeconds: number): string {
+      return (addon.scpidChallenge as (a: string, t: number) => string)(audience, ttlSeconds);
+    },
+
+    scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
+      return (addon.scpidSign as (d: string, k: string, c: string) => string)(
+        did,
+        signingKeyId,
+        challengeJson,
+      );
+    },
+
+    scpidVerify(responseJson: string, challengeJson: string): string {
+      return (addon.scpidVerify as (r: string, c: string) => string)(responseJson, challengeJson);
+    },
+
     // Lifecycle
     version(): string {
       return (addon.scpVersion as () => string)();

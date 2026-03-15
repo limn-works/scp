@@ -895,6 +895,67 @@ export function createMockBridge(): Bridge & {
       return ctx.broadcastAdmission;
     },
 
+    // SCPID authentication (§3.11)
+    scpidChallenge(audience: string, ttlSeconds: number): string {
+      if (audience === "") {
+        throw new Error("[SCP-VALID-7000] audience must not be empty");
+      }
+      if (ttlSeconds <= 0 || ttlSeconds > 300) {
+        throw new Error("[SCP-VALID-7000] ttl_seconds must be between 1 and 300");
+      }
+      const issuedAt = Date.now();
+      const expiresAt = issuedAt + ttlSeconds * 1000;
+      const nonce = Array.from({ length: 64 }, () =>
+        Math.floor(Math.random() * 16).toString(16),
+      ).join("");
+      return JSON.stringify({
+        protocol: "scpid/1.0",
+        nonce,
+        audience,
+        issued_at: issuedAt,
+        expires_at: expiresAt,
+      });
+    },
+
+    scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
+      if (signingKeyId !== "#active" && signingKeyId !== "#agent") {
+        throw new Error(
+          `[SCP-IDENT-1034] invalid signing_key_id '${signingKeyId}': expected '#active' or '#agent'`,
+        );
+      }
+      const challenge = JSON.parse(challengeJson) as {
+        protocol: string;
+        nonce: string;
+        audience: string;
+      };
+      const signedAt = Date.now();
+      const signature = Array.from({ length: 128 }, () =>
+        Math.floor(Math.random() * 16).toString(16),
+      ).join("");
+      return JSON.stringify({
+        protocol: challenge.protocol,
+        did,
+        signing_key_id: signingKeyId,
+        nonce: challenge.nonce,
+        audience: challenge.audience,
+        signed_at: signedAt,
+        signature,
+      });
+    },
+
+    scpidVerify(responseJson: string, _challengeJson: string): string {
+      const response = JSON.parse(responseJson) as {
+        did: string;
+        signing_key_id: string;
+        signed_at: number;
+      };
+      return JSON.stringify({
+        did: response.did,
+        signing_key_id: response.signing_key_id,
+        signed_at: response.signed_at,
+      });
+    },
+
     // Lifecycle
     version(): string {
       return "0.1.0-mock";
