@@ -345,7 +345,7 @@ public actor Context {
         let rawHandle = try await createFn(identity, params)
         guard let handle = rawHandle as? ContextHandle else {
             throw ScpError.Context(
-                message: "createFn returned a non-concrete ContextHandle",
+                msg: "createFn returned a non-concrete ContextHandle",
                 code: "SCP-CTX-2002"
             )
         }
