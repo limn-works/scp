@@ -862,6 +862,10 @@ async fn run_node_with<
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
+    let use_dns_provider = env::var("SCP_NODE_DNS_PROVIDER")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+
     let projection_rate: u32 = env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
@@ -875,7 +879,38 @@ async fn run_node_with<
         .http_bind_addr(http_addr)
         .projection_rate_limit(projection_rate);
 
-    if use_self_signed {
+    if use_dns_provider {
+        // DNS subdomain provider: derive domain from DID, register with DNS
+        // API for zero-config TLS (#642). The domain set above is overridden
+        // during build() after identity resolution.
+        let public_ip: std::net::IpAddr = env::var("SCP_NODE_PUBLIC_IP")
+            .unwrap_or_else(|_| {
+                tracing::error!("SCP_NODE_PUBLIC_IP is required when SCP_NODE_DNS_PROVIDER=1");
+                std::process::exit(1);
+            })
+            .parse()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "invalid SCP_NODE_PUBLIC_IP");
+                std::process::exit(1);
+            });
+
+        let port = http_addr.port();
+
+        let mut dns_config = scp_node::dns_provider::DnsProviderConfig::new(public_ip, port);
+        if let Ok(base) = env::var("SCP_NODE_DNS_BASE_DOMAIN") {
+            dns_config = dns_config.with_base_domain(&base);
+        }
+        if let Ok(url) = env::var("SCP_NODE_DNS_API_URL") {
+            dns_config = dns_config.with_api_url(&url);
+        }
+
+        tracing::info!(
+            public_ip = %public_ip,
+            port = port,
+            "using DNS subdomain provider for zero-config TLS"
+        );
+        builder = builder.dns_provider(dns_config);
+    } else if use_self_signed {
         tracing::info!(domain = %domain, "using self-signed TLS certificate (development mode)");
         builder = builder.tls_provider(Arc::new(SelfSignedTlsProvider {
             domain: domain.clone(),
