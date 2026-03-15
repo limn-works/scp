@@ -2582,7 +2582,7 @@ impl WasmContextManager {
             implementation_hash: [0u8; 32],
             test_vectors: Vec::new(),
             operator_did: ctx.creator_did.clone(),
-            economic_metadata: None,
+            cost: None,
             registered_at,
             signature: Vec::new(),
         };

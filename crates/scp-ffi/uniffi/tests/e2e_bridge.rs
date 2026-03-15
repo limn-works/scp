@@ -424,6 +424,7 @@ async fn tool_register_and_verify() {
         operator_did: alice.did(),
         test_vectors_json: None,
         implementation_hash: None,
+        cost: None,
     };
 
     let tool_id = tool_register(handle.clone(), definition).await.unwrap();

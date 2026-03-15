@@ -1415,7 +1415,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         })

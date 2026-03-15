@@ -949,7 +949,7 @@ impl DataProvenance {
 
 /// Tool definition for registration in a context.
 ///
-/// See ADR-010 (Tool Registry) and spec §6 (Tools).
+/// See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ToolDefinition {
     /// Human-readable tool name.
@@ -966,6 +966,21 @@ pub struct ToolDefinition {
     pub test_vectors_json: Option<String>,
     /// SHA-256 hash of the implementation binary (32 bytes).
     pub implementation_hash: Option<Vec<u8>>,
+    /// Optional per-invocation cost metadata (spec §5.4.1).
+    pub cost: Option<ToolCostDefinition>,
+}
+
+/// Per-invocation cost metadata for a tool (spec §5.4.1).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ToolCostDefinition {
+    /// Cost per invocation in the smallest currency unit.
+    pub amount: u64,
+    /// ISO 4217 or protocol-defined currency code.
+    pub currency: String,
+    /// DID of the payment recipient. May differ from `operator_did`.
+    pub payee: String,
+    /// Optional pricing formula identifier for dynamic pricing (§19.4).
+    pub cost_formula: Option<String>,
 }
 
 /// Result of verifying a tool against its test vectors.
@@ -2889,6 +2904,13 @@ pub async fn tool_register(
 
             let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
+            let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
+                amount: c.amount,
+                currency: c.currency,
+                payee: c.payee.into(),
+                cost_formula: c.cost_formula,
+            });
+
             let core_registration = scp_core::context::tools::ToolRegistration {
                 tool_id: tool_id.clone(),
                 name: definition.name,
@@ -2900,7 +2922,7 @@ pub async fn tool_register(
                 implementation_hash,
                 test_vectors,
                 operator_did: definition.operator_did.into(),
-                economic_metadata: None,
+                cost,
                 registered_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -10058,6 +10080,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10086,6 +10109,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10116,6 +10140,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10148,6 +10173,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10182,6 +10208,7 @@ mod tests {
             test_vectors_json: Some(r#"{"not": "an array"}"#.to_owned()),
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10211,6 +10238,7 @@ mod tests {
             test_vectors_json: Some(r#"[{"bad": "entry"}]"#.to_owned()),
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10237,6 +10265,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: Some(vec![0u8; 16]), // 16 bytes, not 32
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10269,6 +10298,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: Some(vec![0u8; 64]), // 64 bytes, not 32
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let err = tool_register(handle, def)
@@ -10404,6 +10434,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: None,
             operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
         };
 
         let tool_id = tool_register(handle.clone(), def)

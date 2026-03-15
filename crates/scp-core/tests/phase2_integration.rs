@@ -335,7 +335,7 @@ async fn phase2_end_to_end_integration() {
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         }],
@@ -385,7 +385,7 @@ async fn phase2_end_to_end_integration() {
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
         operator_did: alice_did.clone(),
-        economic_metadata: None,
+        cost: None,
         registered_at: 0,
         signature: Vec::new(),
     };

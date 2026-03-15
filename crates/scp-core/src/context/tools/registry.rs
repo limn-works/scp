@@ -60,23 +60,26 @@ pub struct TestVector {
 }
 
 // ---------------------------------------------------------------------------
-// ToolEconomicMetadata
+// ToolCost
 // ---------------------------------------------------------------------------
 
-/// Optional economic metadata for a tool (spec section 19.3).
+/// Per-invocation cost metadata for a tool (spec §5.4.1, §19.3).
 ///
 /// Tool-level costs are additive with context costs. A tool calling an
 /// external API can pass through its cost. Tool costs carry their own payee
 /// DID (may differ from context payee).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolEconomicMetadata {
+pub struct ToolCost {
     /// Cost per invocation in the smallest currency unit.
-    pub cost_per_invoke: u64,
-    /// Optional pricing formula identifier for dynamic pricing.
-    pub cost_formula: Option<String>,
+    pub amount: u64,
+    /// ISO 4217 or protocol-defined currency code.
+    pub currency: String,
     /// The DID that receives tool invocation payments. May differ from the
     /// context payee.
     pub payee: DID,
+    /// Optional pricing formula identifier for dynamic pricing (§19.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_formula: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,8 +114,8 @@ pub struct ToolRegistration {
     pub test_vectors: Vec<TestVector>,
     /// The DID of the operator accountable for this tool.
     pub operator_did: DID,
-    /// Optional economic metadata for per-invocation costs (spec section 19.3).
-    pub economic_metadata: Option<ToolEconomicMetadata>,
+    /// Optional per-invocation cost metadata (spec §5.4.1, §19.3).
+    pub cost: Option<ToolCost>,
     /// Unix timestamp (seconds) when the tool was registered.
     ///
     /// Provides temporal provenance for tool registrations. Defaults to 0 for
@@ -496,7 +499,7 @@ where
 /// - `test_vectors` (count + hashes)
 /// - `operator_did`
 /// - `registered_at` (timestamp)
-/// - `economic_metadata` (if present)
+/// - `cost` (if present)
 #[must_use]
 pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration) -> Vec<u8> {
     use sha2::{Digest, Sha256};
@@ -536,19 +539,20 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     length_prefix(&mut hasher, registration.operator_did.as_bytes());
     hasher.update(registration.registered_at.to_be_bytes());
 
-    // Economic metadata presence flag + contents.
-    match &registration.economic_metadata {
-        Some(em) => {
+    // Cost metadata presence flag + contents.
+    match &registration.cost {
+        Some(tc) => {
             hasher.update([0x01]);
-            hasher.update(em.cost_per_invoke.to_be_bytes());
-            match &em.cost_formula {
+            hasher.update(tc.amount.to_be_bytes());
+            length_prefix(&mut hasher, tc.currency.as_bytes());
+            match &tc.cost_formula {
                 Some(formula) => {
                     hasher.update([0x01]);
                     length_prefix(&mut hasher, formula.as_bytes());
                 }
                 None => hasher.update([0x00]),
             }
-            length_prefix(&mut hasher, em.payee.as_bytes());
+            length_prefix(&mut hasher, tc.payee.as_bytes());
         }
         None => hasher.update([0x00]),
     }
@@ -706,7 +710,7 @@ mod tests {
                 },
             ],
             operator_did: "did:dht:z6MkTestOperator".into(),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         }
@@ -935,14 +939,15 @@ mod tests {
     }
 
     #[test]
-    fn register_tool_with_economic_metadata() {
+    fn register_tool_with_cost() {
         let role_state = test_role_state("did:dht:z6MkCreator");
         let mut registry = ToolRegistry::new();
         let mut registration = valid_registration("tool-1");
-        registration.economic_metadata = Some(ToolEconomicMetadata {
-            cost_per_invoke: 100,
-            cost_formula: None,
+        registration.cost = Some(ToolCost {
+            amount: 100,
+            currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
         });
 
         let result = register_tool(
@@ -954,11 +959,9 @@ mod tests {
         assert!(result.is_ok());
 
         let stored = registry.get("tool-1").unwrap();
-        assert!(stored.economic_metadata.is_some());
-        assert_eq!(
-            stored.economic_metadata.as_ref().unwrap().cost_per_invoke,
-            100
-        );
+        assert!(stored.cost.is_some());
+        assert_eq!(stored.cost.as_ref().unwrap().amount, 100);
+        assert_eq!(stored.cost.as_ref().unwrap().currency, "USD");
     }
 
     // ----- update_tool tests -----
@@ -1448,17 +1451,18 @@ mod tests {
         assert!(event.changed_fields.contains(&"test_vectors".to_owned()));
     }
 
-    // ----- Economic metadata -----
+    // ----- ToolCost -----
 
     #[test]
-    fn tool_economic_metadata_serialization_roundtrip() {
-        let meta = ToolEconomicMetadata {
-            cost_per_invoke: 500,
-            cost_formula: Some("linear".to_owned()),
+    fn tool_cost_serialization_roundtrip() {
+        let cost = ToolCost {
+            amount: 500,
+            currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
+            cost_formula: Some("linear".to_owned()),
         };
-        let json = serde_json::to_string(&meta).unwrap();
-        let deserialized: ToolEconomicMetadata = serde_json::from_str(&json).unwrap();
-        assert_eq!(meta, deserialized);
+        let json = serde_json::to_string(&cost).unwrap();
+        let deserialized: ToolCost = serde_json::from_str(&json).unwrap();
+        assert_eq!(cost, deserialized);
     }
 }

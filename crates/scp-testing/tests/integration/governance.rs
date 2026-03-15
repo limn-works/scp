@@ -125,7 +125,7 @@ fn simple_tool_registration() -> scp_core::context::params::ToolRegistration {
         implementation_hash: [0u8; 32],
         test_vectors: vec![],
         operator_did: DID::from("did:dht:z6MkTestOperator"),
-        economic_metadata: None,
+        cost: None,
         registered_at: 0,
         signature: Vec::new(),
     }

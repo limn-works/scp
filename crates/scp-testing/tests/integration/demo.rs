@@ -1246,7 +1246,7 @@ async fn application_layer_demo() {
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
         operator_did: alice.clone(),
-        economic_metadata: None,
+        cost: None,
         registered_at: 1_700_000_000,
         signature: vec![],
     };
@@ -1294,7 +1294,7 @@ async fn application_layer_demo() {
         implementation_hash: [0xCD; 32],
         test_vectors: vec![],
         operator_did: alice.clone(),
-        economic_metadata: None,
+        cost: None,
         registered_at: 1_700_000_001,
         signature: vec![],
     };

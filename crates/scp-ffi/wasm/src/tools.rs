@@ -169,15 +169,10 @@ fn validate_test_vectors(
 // Provenance field parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed provenance fields: `(implementation_hash, signature, economic_metadata, registered_at)`.
-type ProvenanceFields = (
-    [u8; 32],
-    Vec<u8>,
-    Option<runtime::ToolEconomicMetadata>,
-    u64,
-);
+/// Parsed provenance fields: `(implementation_hash, signature, cost, registered_at)`.
+type ProvenanceFields = ([u8; 32], Vec<u8>, Option<runtime::ToolCost>, u64);
 
-/// Parses optional provenance and economic fields from the definition JSON.
+/// Parses optional provenance and cost fields from the definition JSON.
 ///
 /// When a field is absent, a safe default is used. When a field is present but
 /// malformed, returns `SCP-VALID-7038`.
@@ -221,41 +216,50 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
         }
     };
 
-    let economic_metadata = match def.get("economicMetadata") {
+    let cost = match def.get("cost") {
         None => None,
-        Some(em) => {
-            let cost_per_invoke = em
-                .get("costPerInvoke")
+        Some(c) => {
+            let amount = c
+                .get("amount")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| {
                     ScpWasmError::Validation {
-                        message: "invalid 'economicMetadata': missing or non-numeric \
-                                  'costPerInvoke'"
-                            .to_owned(),
+                        message: "invalid 'cost': missing or non-numeric 'amount'".to_owned(),
                         code: "SCP-VALID-7038".to_owned(),
                     }
                     .into_js()
                 })?;
-            let payee = em
-                .get("payee")
+            let currency = c
+                .get("currency")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     ScpWasmError::Validation {
-                        message: "invalid 'economicMetadata': missing or non-string 'payee'"
-                            .to_owned(),
+                        message: "invalid 'cost': missing or non-string 'currency'".to_owned(),
                         code: "SCP-VALID-7038".to_owned(),
                     }
                     .into_js()
                 })?
                 .to_owned();
-            let cost_formula = em
+            let payee = c
+                .get("payee")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpWasmError::Validation {
+                        message: "invalid 'cost': missing or non-string 'payee'".to_owned(),
+                        code: "SCP-VALID-7038".to_owned(),
+                    }
+                    .into_js()
+                })?
+                .to_owned();
+            let cost_formula = c
                 .get("costFormula")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned);
-            Some(runtime::ToolEconomicMetadata {
-                cost_per_invoke,
-                cost_formula,
+            Some(runtime::ToolCost {
+                amount,
+                currency,
                 payee,
+                cost_formula,
             })
         }
     };
@@ -265,12 +269,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
     // available on wasm32 — see crate::time module docs.
     let registered_at = crate::time::now_secs();
 
-    Ok((
-        implementation_hash,
-        signature,
-        economic_metadata,
-        registered_at,
-    ))
+    Ok((implementation_hash, signature, cost, registered_at))
 }
 
 // ---------------------------------------------------------------------------
@@ -379,8 +378,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 
         let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
-        let (implementation_hash, signature, economic_metadata, registered_at) =
-            parse_provenance_fields(&def)?;
+        let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(&def)?;
 
         let registration = runtime::ToolRegistration {
             tool_id: tool_id.clone(),
@@ -391,7 +389,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             implementation_hash,
             test_vectors,
             operator_did,
-            economic_metadata,
+            cost,
             registered_at,
             signature,
         };

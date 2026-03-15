@@ -62,8 +62,8 @@ pub use lifecycle::{
     ToolInvokedEvent, ToolRequest, ToolResponse, ToolStatus, sha256_json,
 };
 pub use registry::{
-    TestVector, ToolEconomicMetadata, ToolRegistration, ToolRegistry, ToolSchema,
-    ToolVerificationResult, VectorResult, register_tool, update_tool, verify_tool,
+    TestVector, ToolCost, ToolRegistration, ToolRegistry, ToolSchema, ToolVerificationResult,
+    VectorResult, register_tool, update_tool, verify_tool,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 pub use session::{

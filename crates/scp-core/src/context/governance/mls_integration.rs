@@ -617,7 +617,7 @@ mod tests {
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
                 operator_did: "did:dht:z6MkTestOperator".into(),
-                economic_metadata: None,
+                cost: None,
                 registered_at: 0,
                 signature: Vec::new(),
             }),

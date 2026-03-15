@@ -221,8 +221,8 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     // Per spec §5.4: content-addressable reference to the tool's implementation.
     let implementation_hash = extract_implementation_hash(registration)?;
 
-    // Extract economic metadata (optional, per spec §5.4).
-    let economic_metadata = extract_economic_metadata(registration)?;
+    // Extract cost metadata (optional, per spec §5.4.1).
+    let cost = extract_cost(registration)?;
 
     // Generate a tool ID from the name (deterministic, human-readable).
     let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
@@ -239,7 +239,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         implementation_hash,
         test_vectors,
         operator_did: operator_did.into(),
-        economic_metadata,
+        cost,
         registered_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -598,27 +598,35 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     Ok(hash)
 }
 
-/// Extracts optional `economic_metadata` from the registration dict.
+/// Extracts optional `cost` metadata from the registration dict.
 ///
-/// Accepts a Python dict with `cost_per_invoke` (int), optional
-/// `cost_formula` (str), and `payee` (str DID). Per spec §5.4.
-fn extract_economic_metadata(
+/// Accepts a Python dict with `amount` (int), `currency` (str),
+/// `payee` (str DID), and optional `cost_formula` (str). Per spec §5.4.1.
+fn extract_cost(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Option<scp_core::context::tools::ToolEconomicMetadata>> {
-    let meta_obj = match registration.get_item("economic_metadata")? {
+) -> PyResult<Option<scp_core::context::tools::ToolCost>> {
+    let meta_obj = match registration.get_item("cost")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(None),
     };
 
     let dict = meta_obj
         .downcast::<PyDict>()
-        .map_err(|_| ScpPyError::validation("'economic_metadata' must be a dict".to_owned()))?;
+        .map_err(|_| ScpPyError::validation("'cost' must be a dict".to_owned()))?;
 
-    let cost_per_invoke: u64 = dict
-        .get_item("cost_per_invoke")?
-        .ok_or_else(|| {
-            ScpPyError::validation("economic_metadata missing 'cost_per_invoke'".to_owned())
-        })?
+    let amount: u64 = dict
+        .get_item("amount")?
+        .ok_or_else(|| ScpPyError::validation("cost missing 'amount'".to_owned()))?
+        .extract()?;
+
+    let currency: String = dict
+        .get_item("currency")?
+        .ok_or_else(|| ScpPyError::validation("cost missing 'currency'".to_owned()))?
+        .extract()?;
+
+    let payee: String = dict
+        .get_item("payee")?
+        .ok_or_else(|| ScpPyError::validation("cost missing 'payee'".to_owned()))?
         .extract()?;
 
     let cost_formula: Option<String> = dict
@@ -627,15 +635,11 @@ fn extract_economic_metadata(
         .map(|v| v.extract())
         .transpose()?;
 
-    let payee: String = dict
-        .get_item("payee")?
-        .ok_or_else(|| ScpPyError::validation("economic_metadata missing 'payee'".to_owned()))?
-        .extract()?;
-
-    Ok(Some(scp_core::context::tools::ToolEconomicMetadata {
-        cost_per_invoke,
-        cost_formula,
+    Ok(Some(scp_core::context::tools::ToolCost {
+        amount,
+        currency,
         payee: payee.into(),
+        cost_formula,
     }))
 }
 
