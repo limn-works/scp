@@ -229,9 +229,9 @@ struct UcanTests {
     func revokeRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
         nonisolated(unsafe) var revokedToken: String?
-        let mockRevoke: UcanBridge.RevokeFn = { _, token in revokedToken = token }
+        let mockRevoke: UcanBridge.RevokeFn = { _, token, _ in revokedToken = token }
         try await revokeUcanToken(
-            handle: handle, token: "header.payload.signature", revokeFn: mockRevoke
+            handle: handle, token: "header.payload.signature", revokerDid: "did:dht:z6MkRevoker", revokeFn: mockRevoke
         )
         #expect(revokedToken == "header.payload.signature")
     }
@@ -282,7 +282,7 @@ struct UcanTests {
     func legacyRevokeRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
         nonisolated(unsafe) var revoked = false
-        let mockRevoke: UcanBridge.RevokeFn = { _, _ in revoked = true }
+        let mockRevoke: UcanBridge.RevokeFn = { _, _, _ in revoked = true }
 
         try await revoke(
             handle: handle,
