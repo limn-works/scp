@@ -969,19 +969,13 @@ pub fn ucan_validate(
 
 /// Mints a new UCAN token for a context member.
 ///
-/// Validates capability URIs and returns an error since UCAN minting
-/// requires key custody (`WebCrypto`), which is managed by the TypeScript SDK.
-/// The bridge validates inputs; the TS wrapper signs.
-///
-/// # Errors
-///
-/// Returns `SCP-VALID-7000` if `member_did` fails [`validate_did`]
-/// (empty, malformed `did:{method}:{id}` format, or control characters),
-/// Returns `SCP-PERM-3000` since UCAN minting requires JS-side key custody.
-///
 /// UCAN minting requires key custody (`WebCrypto`) which is only available
 /// on the JS side. Always returns `SCP-PERM-3000` — use the TypeScript SDK
 /// wrapper's `mintUcan()` method which signs via `SubtleCrypto`.
+///
+/// # Errors
+///
+/// Always returns `SCP-PERM-3000` since UCAN minting requires JS-side key custody.
 ///
 /// See ADR-016 criterion 3.
 #[wasm_bindgen]
