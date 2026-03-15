@@ -7941,37 +7941,60 @@ impl ContextManager {
     /// Advances the MLS epoch for a context as part of compromise recovery
     /// (spec §9.12 step 2).
     ///
-    /// Issues an MLS epoch advancement to provide post-compromise security:
-    /// new epoch keys are derived from new key material, making the
-    /// compromised old key useless for future messages.
+    /// Issues an MLS Update + self-Commit via the crypto provider to ratchet
+    /// the group to a new epoch with fresh key material, providing
+    /// post-compromise security: the compromised old epoch key becomes
+    /// useless for future messages.
     ///
     /// Returns the new epoch number on success.
     ///
-    /// If the context requires rejoin (Tier 3 per ADR-029), returns
-    /// `Err(ContextError::MembershipFailed)` with "requires rejoin" in the
-    /// message so the orchestrator can flag it.
+    /// # Atomicity
+    ///
+    /// The crypto operation (`advance_epoch`) is performed **before** the
+    /// epoch counter is incremented. If the crypto call fails the counter
+    /// stays unchanged, preventing a desync between MLS state and the
+    /// bookkeeping counter.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::MembershipFailed`] if the context is not
-    /// registered or the member requires rejoin.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::CryptoFailed`] if the MLS update/commit fails.
     pub async fn recovery_advance_epoch(&self, context_id: &str) -> Result<u64, ContextError> {
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-
-        // Advance epoch — same pattern as governance MLS-mutating actions.
-        let old_epoch = ctx.mls_epoch;
-        ctx.mls_epoch = old_epoch.saturating_add(1);
-        let _expired = ctx.grace_store.add_epoch(old_epoch);
-
-        let new_epoch = ctx.mls_epoch;
-        drop(contexts);
-
-        // Emit epoch advancement event to event log. Event log failures
-        // are non-fatal — recovery must not be blocked by logging issues.
         let context_id_bytes = context_id_to_bytes(context_id);
+
+        // 1. Validate the context exists and is active (lock scoped).
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+        }
+
+        // 2. Perform the MLS epoch advance (Update + self-Commit).
+        //    If this fails the counter is NOT incremented.
+        self.crypto.advance_epoch(&context_id_bytes)?;
+
+        // 3. Increment bookkeeping counter and manage grace store.
+        let new_epoch = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            // Re-validate after the crypto op to close the TOCTOU window between
+            // the active check in step 1 and the counter increment here. A
+            // concurrent close_context could have transitioned the handle while
+            // we awaited the MLS commit.
+            require_active(&ctx.handle)?;
+            let old_epoch = ctx.mls_epoch;
+            ctx.mls_epoch = old_epoch.saturating_add(1);
+            let _expired = ctx.grace_store.add_epoch(old_epoch);
+            ctx.mls_epoch
+        };
+
+        // 4. Emit epoch advancement event to event log. Event log failures
+        //    are non-fatal — recovery must not be blocked by logging issues.
         if let Err(e) = self
             .event_log
             .append_context_event(&context_id_bytes, "recovery/epoch_advanced")
@@ -7983,7 +8006,7 @@ impl ContextManager {
             );
         }
 
-        // Persist if configured (best-effort).
+        // 5. Persist if configured (best-effort).
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
@@ -8189,6 +8212,7 @@ mod tests {
     struct MockCrypto {
         fail_create_mls: AtomicBool,
         fail_validate_key_package: AtomicBool,
+        fail_advance_epoch: AtomicBool,
         mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
         sender_keys_created: std::sync::Mutex<Vec<[u8; 32]>>,
         broadcast_created: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -8199,6 +8223,10 @@ mod tests {
         sender_keys_distributed: std::sync::Mutex<Vec<String>>,
         sender_keys_removed: std::sync::Mutex<Vec<String>>,
         messages_encrypted: std::sync::Mutex<Vec<Vec<u8>>>,
+        epochs_advanced: std::sync::Mutex<Vec<[u8; 32]>>,
+        /// Shared handle for test code to observe `advance_epoch` calls after
+        /// the mock has been moved into the `ContextManager`.
+        epochs_advanced_shared: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
     }
 
     impl ContextCryptoProvider for MockCrypto {
@@ -8308,6 +8336,20 @@ mod tests {
                 .push(payload.to_vec());
             // Mock: return payload as-is (no real encryption).
             Ok(payload.to_vec())
+        }
+
+        fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+            if self.fail_advance_epoch.load(Ordering::Relaxed) {
+                return Err(ContextError::CryptoFailed(
+                    "mock advance_epoch failure".into(),
+                ));
+            }
+            self.epochs_advanced.lock().unwrap().push(*context_id);
+            self.epochs_advanced_shared
+                .lock()
+                .unwrap()
+                .push(*context_id);
+            Ok(())
         }
     }
 
@@ -19055,5 +19097,143 @@ mod tests {
             .filter(|e| matches!(e, ContextEvent::DegradedMode { .. }))
             .collect();
         assert_eq!(degraded_events.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // recovery_advance_epoch tests (#1250, #1248)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_recovery_advance_epoch_calls_crypto_provider() {
+        let shared_epochs: Arc<std::sync::Mutex<Vec<[u8; 32]>>> = Arc::default();
+        let crypto = MockCrypto {
+            epochs_advanced_shared: Arc::clone(&shared_epochs),
+            ..MockCrypto::default()
+        };
+
+        let manager = ContextManager::new(
+            Box::new(crypto),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let _handle = manager
+            .create_context(
+                "recovery-epoch-1".into(),
+                ContextParams::default(),
+                "did:key:creator".into(),
+            )
+            .await
+            .unwrap();
+
+        let expected_bytes = context_id_to_bytes("recovery-epoch-1");
+
+        let new_epoch = manager
+            .recovery_advance_epoch("recovery-epoch-1")
+            .await
+            .unwrap();
+
+        assert_eq!(new_epoch, 1, "epoch should advance from 0 to 1");
+
+        // Verify the crypto provider was actually called with the correct id.
+        {
+            let calls = shared_epochs.lock().unwrap();
+            assert_eq!(calls.len(), 1, "crypto provider should be called once");
+            assert_eq!(
+                calls[0], expected_bytes,
+                "crypto provider should receive the context id bytes"
+            );
+        }
+
+        // A second advance should yield epoch 2, confirming the counter
+        // increments correctly and the crypto provider is called each time.
+        let epoch2 = manager
+            .recovery_advance_epoch("recovery-epoch-1")
+            .await
+            .unwrap();
+        assert_eq!(epoch2, 2, "second advance should yield epoch 2");
+
+        // Verify two total crypto calls after the second advance.
+        {
+            let calls = shared_epochs.lock().unwrap();
+            assert_eq!(calls.len(), 2, "crypto provider should be called twice");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recovery_advance_epoch_rollback_on_crypto_failure() {
+        let crypto = MockCrypto::default();
+        crypto.fail_advance_epoch.store(true, Ordering::Relaxed);
+
+        let manager = ContextManager::new(
+            Box::new(crypto),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let _handle = manager
+            .create_context(
+                "recovery-fail-1".into(),
+                ContextParams::default(),
+                "did:key:creator".into(),
+            )
+            .await
+            .unwrap();
+
+        let result = manager.recovery_advance_epoch("recovery-fail-1").await;
+
+        assert!(result.is_err(), "should fail when crypto fails");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::CryptoFailed(_)),
+            "should return CryptoFailed variant"
+        );
+
+        // Epoch counter must NOT have been incremented.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("recovery-fail-1").unwrap();
+        assert_eq!(
+            ctx.mls_epoch, 0,
+            "epoch counter must not increment on crypto failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_advance_epoch_rejects_inactive_context() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let handle = manager
+            .create_context(
+                "recovery-inactive-1".into(),
+                ContextParams::default(),
+                "did:key:creator".into(),
+            )
+            .await
+            .unwrap();
+
+        // Transition to Closing — no longer Active.
+        handle.transition_to(&ContextState::Closing).await.unwrap();
+
+        let result = manager.recovery_advance_epoch("recovery-inactive-1").await;
+
+        assert!(result.is_err(), "should fail for non-active context");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::ContextNotActive),
+            "should return ContextNotActive"
+        );
+
+        // Verify epoch was not advanced.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("recovery-inactive-1").unwrap();
+        assert_eq!(
+            ctx.mls_epoch, 0,
+            "epoch must not change for inactive context"
+        );
     }
 }
