@@ -585,7 +585,9 @@ def tool_register(context_id: str, registration: dict[str, Any]) -> str:
     Args:
         context_id: The ID of the context to register the tool in.
         registration: A dict containing tool registration data (``name``,
-            ``description``, ``schema``, ``test_vectors``, ``operator_did``).
+            ``description``, ``schema``, ``test_vectors``, ``operator_did``,
+            and optional ``cost`` dict with ``amount`` (int), ``currency``
+            (str), ``payee`` (str DID), and optional ``cost_formula`` (str)).
 
     Returns:
         The tool ID (string) assigned to the registered tool.

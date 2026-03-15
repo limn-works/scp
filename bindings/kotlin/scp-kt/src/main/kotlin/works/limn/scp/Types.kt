@@ -105,6 +105,85 @@ enum class ShadowStatus(val rawValue: String) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool definitions (spec §5.4.1, ADR-010)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-invocation cost metadata for a tool (spec section 5.4.1).
+ *
+ * All monetary values are in the smallest currency unit (e.g., cents
+ * for USD, satoshis for BTC).
+ *
+ * @property amount Cost per invocation in the smallest currency unit.
+ * @property currency ISO 4217 or protocol-defined currency code.
+ * @property payee DID of the payment recipient. May differ from the tool operator.
+ * @property costFormula Optional pricing formula identifier for dynamic pricing (spec section 19.4).
+ */
+data class ToolCost(
+    val amount: Long,
+    val currency: String,
+    val payee: String,
+    val costFormula: String? = null,
+)
+
+/**
+ * Definition of a tool that can be registered in an SCP context.
+ *
+ * Provides a typed Kotlin data class for constructing tool definitions
+ * that are serialized to JSON for the FFI bridge layer.
+ *
+ * See ADR-010 (Tool Registry) and spec section 5.4.1.
+ *
+ * @property name Human-readable tool name.
+ * @property description Tool description.
+ * @property inputSchemaJson JSON Schema for tool input (as a JSON string).
+ * @property outputSchemaJson JSON Schema for tool output (as a JSON string).
+ * @property operatorDid DID of the tool operator (responsible party).
+ * @property testVectorsJson Test vectors for integrity verification (serialized as JSON string).
+ * @property implementationHashHex SHA-256 hash of the implementation binary as hex string.
+ * @property cost Optional per-invocation cost metadata (spec section 5.4.1).
+ */
+data class ToolDefinition(
+    val name: String,
+    val description: String,
+    val inputSchemaJson: String,
+    val outputSchemaJson: String,
+    val operatorDid: String,
+    val testVectorsJson: String? = null,
+    val implementationHashHex: String? = null,
+    val cost: ToolCost? = null,
+) {
+    /**
+     * Serializes this definition to a JSON string suitable for the FFI bridge.
+     */
+    fun toJson(): String = buildString {
+        append("{")
+        append("\"name\":\""); append(name); append("\",")
+        append("\"description\":\""); append(description); append("\",")
+        append("\"input_schema_json\":"); append(inputSchemaJson); append(",")
+        append("\"output_schema_json\":"); append(outputSchemaJson); append(",")
+        append("\"operator_did\":\""); append(operatorDid); append("\"")
+        if (testVectorsJson != null) {
+            append(",\"test_vectors_json\":"); append(testVectorsJson)
+        }
+        if (implementationHashHex != null) {
+            append(",\"implementation_hash\":\""); append(implementationHashHex); append("\"")
+        }
+        if (cost != null) {
+            append(",\"cost\":{")
+            append("\"amount\":"); append(cost.amount); append(",")
+            append("\"currency\":\""); append(cost.currency); append("\",")
+            append("\"payee\":\""); append(cost.payee); append("\"")
+            if (cost.costFormula != null) {
+                append(",\"cost_formula\":\""); append(cost.costFormula); append("\"")
+            }
+            append("}")
+        }
+        append("}")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
 // ---------------------------------------------------------------------------
 

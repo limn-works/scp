@@ -73,6 +73,13 @@ export interface Provenance {
   readonly signature: Uint8Array;
 }
 
+export interface ToolCost {
+  readonly amount: number;
+  readonly currency: string;
+  readonly payee: string;
+  readonly costFormula?: string;
+}
+
 export interface ToolDefinition {
   readonly name: string;
   readonly description: string;
@@ -81,6 +88,7 @@ export interface ToolDefinition {
   readonly operator: Identity | string;
   readonly testVectors?: TestVector[];
   readonly implementationHash?: Uint8Array;
+  readonly cost?: ToolCost;
 }
 
 export interface TestVector {

@@ -63,6 +63,27 @@ class TestVector:
 
 
 @dataclass
+class ToolCost:
+    """Per-invocation cost metadata for a tool (spec section 5.4.1).
+
+    All monetary values are in the smallest currency unit (e.g., cents
+    for USD, satoshis for BTC).
+    """
+
+    #: Cost per invocation in the smallest currency unit.
+    amount: int
+
+    #: ISO 4217 or protocol-defined currency code.
+    currency: str
+
+    #: DID of the payment recipient.  May differ from the tool operator.
+    payee: str
+
+    #: Optional pricing formula identifier for dynamic pricing (spec section 19.4).
+    cost_formula: str | None = None
+
+
+@dataclass
 class ToolDefinition:
     """Definition of a tool registered in an SCP context.
 
@@ -102,6 +123,9 @@ class ToolDefinition:
 
     #: Optional implementation hash for integrity verification.
     implementation_hash: bytes | None = None
+
+    #: Optional per-invocation cost metadata (spec section 5.4.1).
+    cost: ToolCost | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +366,6 @@ async def session_close(context_id: str, session_id: str) -> None:
         raise _translate_bridge_error(exc) from exc
 
 
-
 # ---------------------------------------------------------------------------
 # Bidirectional consent protocol (spec section 6.2.0.1)
 # ---------------------------------------------------------------------------
@@ -487,6 +510,7 @@ async def interface_revoke(
 
 __all__ = [
     "TestVector",
+    "ToolCost",
     "ToolDefinition",
     "interface_accept",
     "interface_expose",

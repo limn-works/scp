@@ -100,14 +100,8 @@ interface WasmModule {
     targetContextId: string,
     rateLimitJson: string | undefined,
   ) => Promise<string>;
-  tool_interface_accept: (
-    handle: BridgeContextHandle,
-    interfaceJson: string,
-  ) => Promise<string>;
-  tool_interface_revoke: (
-    handle: BridgeContextHandle,
-    interfaceIdHex: string,
-  ) => Promise<string>;
+  tool_interface_accept: (handle: BridgeContextHandle, interfaceJson: string) => Promise<string>;
+  tool_interface_revoke: (handle: BridgeContextHandle, interfaceIdHex: string) => Promise<string>;
   transport_connect: (relayUrl: string) => Promise<{
     connected: boolean;
     relayUrl: string | null;
@@ -863,6 +857,14 @@ export function createWasmBridge(): Bridge {
           expectedOutput: tv.expectedOutput,
           description: tv.description,
         })),
+        cost: definition.cost
+          ? {
+              amount: definition.cost.amount,
+              currency: definition.cost.currency,
+              payee: definition.cost.payee,
+              costFormula: definition.cost.costFormula,
+            }
+          : undefined,
       });
       return await wasm.tool_register(handle, definitionJson);
     },
@@ -902,10 +904,7 @@ export function createWasmBridge(): Bridge {
       return await wasm.tool_interface_expose(handle, toolId, targetContextId, rateLimitJson);
     },
 
-    async toolInterfaceAccept(
-      handle: BridgeContextHandle,
-      interfaceJson: string,
-    ): Promise<string> {
+    async toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string> {
       const wasm = getWasm();
       return await wasm.tool_interface_accept(handle, interfaceJson);
     },
