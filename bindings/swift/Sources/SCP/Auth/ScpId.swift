@@ -205,9 +205,9 @@ public enum ScpId {
         ttl: TimeInterval = 300,
         challengeFn: ChallengeFn = defaultChallenge
     ) throws -> ScpIdChallenge {
-        guard ttl.isFinite, ttl >= 0 else {
+        guard ttl.isFinite, ttl >= 1, ttl <= 300 else {
             throw ScpError.Validation(
-                msg: "TTL must be a finite non-negative value, got \(ttl)",
+                msg: "ttl must be between 1 and 300 seconds",
                 code: "SCP-IDENT-1038"
             )
         }

@@ -41,6 +41,7 @@ from scp_sdk.auth import (
     scpid_verify,
 )
 from scp_sdk.identity import Identity
+from scp_sdk.sync import run_sync
 from scp_sdk.types import CustodyType
 
 # ---------------------------------------------------------------------------
@@ -97,8 +98,8 @@ class TestScpIdChallenge:
 class TestScpIdSign:
     """Tests for SCPID challenge signing."""
 
-    async def test_sign_with_active_key(self) -> None:
-        identity = await Identity.create(CustodyType.IN_MEMORY)
+    def test_sign_with_active_key(self) -> None:
+        identity = Identity.create_sync(CustodyType.IN_MEMORY)
         challenge = scpid_challenge("https://example.com", 120)
 
         response = scpid_sign(identity, "#active", challenge)
@@ -111,23 +112,23 @@ class TestScpIdSign:
         assert isinstance(response.signature, str)
         assert len(response.signature) > 0
 
-    async def test_sign_with_agent_key(self) -> None:
-        identity = await Identity.create_with_agent_key(CustodyType.IN_MEMORY)
+    def test_sign_with_agent_key(self) -> None:
+        identity = run_sync(Identity.create_with_agent_key(CustodyType.IN_MEMORY))
         challenge = scpid_challenge("https://agent-service.example.com", 60)
 
         response = scpid_sign(identity, "#agent", challenge)
         assert response.did == identity.did
         assert response.signing_key_id == "#agent"
 
-    async def test_sign_rejects_invalid_key_id(self) -> None:
-        identity = await Identity.create(CustodyType.IN_MEMORY)
+    def test_sign_rejects_invalid_key_id(self) -> None:
+        identity = Identity.create_sync(CustodyType.IN_MEMORY)
         challenge = scpid_challenge("https://example.com", 60)
 
         with pytest.raises(Exception):
             scpid_sign(identity, "#owner", challenge)
 
-    async def test_response_json_roundtrip(self) -> None:
-        identity = await Identity.create(CustodyType.IN_MEMORY)
+    def test_response_json_roundtrip(self) -> None:
+        identity = Identity.create_sync(CustodyType.IN_MEMORY)
         challenge = scpid_challenge("https://example.com", 120)
 
         response = scpid_sign(identity, "#active", challenge)
@@ -158,9 +159,9 @@ class TestScpIdVerify:
     suite validates the full roundtrip with a shared InMemoryDhtClient.
     """
 
-    async def test_verify_raises_did_resolution_error(self) -> None:
+    def test_verify_raises_did_resolution_error(self) -> None:
         """Verify raises IdentityError when the DID is not published to DHT."""
-        identity = await Identity.create(CustodyType.IN_MEMORY)
+        identity = Identity.create_sync(CustodyType.IN_MEMORY)
         challenge = scpid_challenge("https://example.com", 120)
         response = scpid_sign(identity, "#active", challenge)
 
