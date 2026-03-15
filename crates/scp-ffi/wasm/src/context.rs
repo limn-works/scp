@@ -231,8 +231,8 @@ impl WasmMessage {
     /// Returns the per-sender sequence number for this message.
     ///
     /// Returns `u32` (not `u64`) to avoid wasm-bindgen mapping to JavaScript
-    /// `BigInt`. Follows the crate convention used by `member_count()`,
-    /// `ttl_seconds()`, and `WasmEvent::sequence()`.
+    /// `BigInt`. Follows the crate convention used by `member_count()` and
+    /// `ttl_seconds()`.
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn sequence(&self) -> u32 {

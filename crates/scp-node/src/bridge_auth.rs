@@ -922,6 +922,62 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
     next.run(req).await.into_response()
 }
 
+/// Type-erased variant of [`webhook_auth_middleware`] for use with
+/// `Arc<dyn BridgeLookup>`.
+///
+/// Mirrors [`bridge_auth_middleware_dyn`] — enables the production router to
+/// apply webhook signature verification without knowing the concrete
+/// `StorageBridgeLookup<S>` type at the router construction site.
+pub async fn webhook_auth_middleware_dyn(
+    State(lookup): State<Arc<dyn BridgeLookup>>,
+    req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Extract required headers.
+    let signature_header = match req
+        .headers()
+        .get("x-scp-signature")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) => s.to_owned(),
+        None => {
+            return bridge_not_authorized("missing X-SCP-Signature header").into_response();
+        }
+    };
+
+    let key_id = match req
+        .headers()
+        .get("x-scp-platform-key-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(k) => k.to_owned(),
+        None => {
+            return bridge_not_authorized("missing X-SCP-Platform-Key-Id header").into_response();
+        }
+    };
+
+    // Read the body for signature verification, then reconstruct.
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return bridge_not_authorized(format!("failed to read request body: {e}"))
+                .into_response();
+        }
+    };
+
+    // Verify the signature.
+    if let Err(msg) =
+        verify_webhook_signature(&signature_header, &key_id, &body_bytes, lookup.as_ref())
+    {
+        return bridge_not_authorized(msg).into_response();
+    }
+
+    // Reconstruct the request with the body bytes.
+    let req = Request::from_parts(parts, Body::from(body_bytes));
+    next.run(req).await.into_response()
+}
+
 // ---------------------------------------------------------------------------
 // JWT creation helper (for testing and bridge operators)
 // ---------------------------------------------------------------------------
