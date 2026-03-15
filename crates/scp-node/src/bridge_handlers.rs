@@ -904,6 +904,18 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
         .route("/v1/scp/bridge/attest", post(attest_handler))
         .route("/v1/scp/bridge/message", post(emit_message_handler))
         .route("/v1/scp/bridge/status", get(status_handler))
+        .with_state(state)
+}
+
+/// Creates an axum [`Router`] for webhook-only bridge endpoints.
+///
+/// Separated from [`bridge_router`] because webhook callbacks from external
+/// platforms authenticate via `X-SCP-Signature` headers (spec section 12.10.2),
+/// NOT the JWT Bearer auth used by other bridge endpoints. Applying
+/// `bridge_auth_middleware_dyn` to the webhook route would reject all
+/// legitimate platform webhook callbacks with 401.
+pub fn bridge_webhook_router(state: Arc<BridgeState>) -> Router {
+    Router::new()
         .route("/v1/scp/bridge/webhook", post(webhook_handler))
         .with_state(state)
 }

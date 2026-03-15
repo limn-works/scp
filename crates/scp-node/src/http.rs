@@ -599,6 +599,11 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         // Apply bridge auth middleware when a production BridgeLookup is
         // configured (spec section 12.10.2). Without a lookup the bridge
         // endpoints are mounted without authentication (test/dev mode).
+        //
+        // The webhook route is separated and mounted without JWT auth because
+        // platform webhooks authenticate via X-SCP-Signature headers, not JWT
+        // Bearer tokens (spec section 12.10.2). Applying JWT auth would reject
+        // all legitimate webhook callbacks with 401.
         let bridge = {
             let base = crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state));
             if let Some(ref lookup) = self.state.bridge_lookup {
@@ -610,6 +615,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
                 base
             }
         };
+        let bridge_webhook =
+            crate::bridge_handlers::bridge_webhook_router(Arc::clone(&self.state.bridge_state));
         let relay = self.relay;
         let state = self.state;
 
@@ -622,6 +629,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             relay_rt,
             projection,
             bridge,
+            bridge_webhook,
             state.acme_challenges.as_ref(),
         );
 
@@ -711,13 +719,15 @@ fn build_merged_router(
     relay_rt: Router,
     projection: Router,
     bridge: Router,
+    bridge_webhook: Router,
     acme_challenges: Option<&Arc<RwLock<HashMap<String, String>>>>,
 ) -> Router {
     let merged = app_router
         .merge(well_known)
         .merge(relay_rt)
         .merge(projection)
-        .merge(bridge);
+        .merge(bridge)
+        .merge(bridge_webhook);
 
     // Mount ACME challenge router for renewal challenges (issue #305).
     // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can
