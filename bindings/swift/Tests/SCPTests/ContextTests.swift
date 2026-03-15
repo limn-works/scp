@@ -225,6 +225,8 @@ struct ContextTests {
         let context = Context(
             handle: handle,
             identity: identity,
+            contextId: "test-send-identity",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
@@ -444,6 +446,8 @@ struct ContextTests {
         let context = Context(
             handle: handle,
             identity: identity,
+            contextId: "test-leave-identity",
+            initialState: .active,
             sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: leaveFn,
@@ -495,6 +499,8 @@ struct ContextTests {
         let context = Context(
             handle: handle,
             identity: identity,
+            contextId: "test-close-identity",
+            initialState: .active,
             sendFn: { _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
