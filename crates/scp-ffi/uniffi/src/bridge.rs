@@ -9477,6 +9477,47 @@ mod tests {
     }
 
     #[test]
+    fn media_send_signaling_from_offer() {
+        // Create an offer via media_create_offer
+        let offer_json = media_create_offer(
+            "session-1".to_owned(),
+            "v=0\r\n".to_owned(),
+            "did:dht:z6MkSender".to_owned(),
+        )
+        .unwrap();
+
+        // Extract the signaling message JSON from the offer result
+        let offer: serde_json::Value = serde_json::from_str(&offer_json).unwrap();
+        let signaling_json = offer["message"].as_str().unwrap().to_owned();
+
+        // Pass the signaling JSON through media_send_signaling
+        let result_json = media_send_signaling(signaling_json).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+
+        // Verify output contains "payload" (base64 string) and "message_type"
+        let payload = result["payload"]
+            .as_str()
+            .expect("payload must be a string");
+        assert!(
+            !payload.is_empty(),
+            "payload must be a non-empty base64 string"
+        );
+        // Verify it is valid base64
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("payload must be valid base64");
+
+        let message_type = result["message_type"]
+            .as_str()
+            .expect("message_type must be a string");
+        assert!(
+            !message_type.is_empty(),
+            "message_type must be a non-empty string"
+        );
+    }
+
+    #[test]
     fn media_verify_sender_attribution_mismatch() {
         let (_, msg) = scp_media::signaling::create_offer(
             "s1",
