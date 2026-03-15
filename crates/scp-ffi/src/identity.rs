@@ -1130,8 +1130,10 @@ fn py_identity_attest_device(py: Python<'_>, identity_did: &str) -> PyResult<Str
                 .map_err(|e| ScpPyError::identity(format!("device attestation failed: {e}")))?;
 
             // Extract the attestation token from the updated document's
-            // service entries.
-            let token_bytes = new_document
+            // service entries. The service_endpoint is already base64-encoded
+            // by `set_device_attestation_token`, so return it directly —
+            // no double-encoding.
+            let token_b64 = new_document
                 .service
                 .iter()
                 .find(|s| s.service_type == "ScpDeviceAttestation")
@@ -1147,8 +1149,7 @@ fn py_identity_attest_device(py: Python<'_>, identity_did: &str) -> PyResult<Str
             // Update the identity's document with the attestation.
             entry.document = new_document;
 
-            use base64::Engine;
-            Ok(base64::engine::general_purpose::STANDARD.encode(token_bytes.as_bytes()))
+            Ok(token_b64)
         })
     })
     .map_err(PyErr::from)
