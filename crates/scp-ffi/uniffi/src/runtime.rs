@@ -574,3 +574,58 @@ pub const fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u6
     // Full trust scoring requires ContextManager event log integration.
     (0, 0)
 }
+
+// ---------------------------------------------------------------------------
+// Economy state registries
+// ---------------------------------------------------------------------------
+
+/// Per-context member budget trackers for economic governance.
+static ECONOMY_BUDGETS: OnceLock<DashMap<String, scp_core::economy::MemberBudgetTracker>> =
+    OnceLock::new();
+
+fn economy_budget_registry() -> &'static DashMap<String, scp_core::economy::MemberBudgetTracker> {
+    ECONOMY_BUDGETS.get_or_init(DashMap::new)
+}
+
+/// Per-context antispam velocity trackers.
+static ECONOMY_ANTISPAM: OnceLock<DashMap<String, scp_core::economy::SenderVelocityTracker>> =
+    OnceLock::new();
+
+const ANTISPAM_DEFAULT_WINDOW_SECS: u64 = 60;
+
+fn economy_antispam_registry() -> &'static DashMap<String, scp_core::economy::SenderVelocityTracker>
+{
+    ECONOMY_ANTISPAM.get_or_init(DashMap::new)
+}
+
+/// Reads the budget tracker for a context (creates if absent).
+pub fn with_economy_budget<T, F>(context_id: &str, f: F) -> T
+where
+    F: FnOnce(&scp_core::economy::MemberBudgetTracker) -> T,
+{
+    let registry = economy_budget_registry();
+    let entry = registry.entry(context_id.to_owned()).or_default();
+    f(entry.value())
+}
+
+/// Mutably accesses the budget tracker for a context (creates if absent).
+pub fn with_economy_budget_mut<T, F>(context_id: &str, f: F) -> T
+where
+    F: FnOnce(&mut scp_core::economy::MemberBudgetTracker) -> T,
+{
+    let registry = economy_budget_registry();
+    let mut entry = registry.entry(context_id.to_owned()).or_default();
+    f(entry.value_mut())
+}
+
+/// Accesses the antispam velocity tracker for a context (creates if absent).
+pub fn with_economy_antispam<T, F>(context_id: &str, f: F) -> T
+where
+    F: FnOnce(&scp_core::economy::SenderVelocityTracker) -> T,
+{
+    let registry = economy_antispam_registry();
+    let entry = registry.entry(context_id.to_owned()).or_insert_with(|| {
+        scp_core::economy::SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS)
+    });
+    f(entry.value())
+}

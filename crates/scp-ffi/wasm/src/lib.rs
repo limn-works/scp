@@ -80,6 +80,8 @@ pub mod context;
 pub mod custody;
 /// Context discovery operations.
 pub mod discovery;
+/// Economic governance operations (cost estimation, budget, antispam, pricing).
+pub mod economy;
 /// Error hierarchy and `ScpWasmError` to `JsError` mapping.
 pub mod error;
 /// Event log queries, Merkle proofs, and consistency checkpoints.

@@ -79,6 +79,7 @@ use napi_derive::napi;
 pub mod bridge_connector;
 pub mod context;
 pub mod discovery;
+pub mod economy;
 pub mod error;
 pub mod event_log;
 pub mod identity;
