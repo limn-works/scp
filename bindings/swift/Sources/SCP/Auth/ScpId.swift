@@ -18,7 +18,7 @@ import Foundation
 /// Produced by ``ScpId/challenge(audience:ttl:challengeFn:)`` and consumed
 /// by ``ScpId/sign(identity:signingKeyId:challenge:signFn:)`` and
 /// ``ScpId/verify(response:challenge:verifyFn:)``.
-public nonisolated struct ScpIdChallenge: Sendable, Codable {
+public nonisolated struct ScpIdChallenge: Sendable {
     /// Protocol identifier and version (always `"scpid/1.0"`).
     public let protocolVersion: String
 
@@ -38,21 +38,13 @@ public nonisolated struct ScpIdChallenge: Sendable, Codable {
     /// to ``ScpId/sign(identity:signingKeyId:challenge:signFn:)`` and
     /// ``ScpId/verify(response:challenge:verifyFn:)`` without re-serialization.
     public let json: String
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol"
-        case nonce
-        case audience
-        case issuedAt = "issued_at"
-        case expiresAt = "expires_at"
-    }
 }
 
 /// SCPID signed response from the client (spec section 3.11.3).
 ///
 /// Contains the signer's DID, signing key selection, echoed challenge
 /// fields, and the Ed25519 signature.
-public nonisolated struct ScpIdResponse: Sendable, Codable {
+public nonisolated struct ScpIdResponse: Sendable {
     /// Protocol identifier and version (always `"scpid/1.0"`).
     public let protocolVersion: String
 
@@ -77,23 +69,13 @@ public nonisolated struct ScpIdResponse: Sendable, Codable {
     /// The raw JSON string returned by the bridge. Preserved for passing
     /// to ``ScpId/verify(response:challenge:verifyFn:)`` without re-serialization.
     public let json: String
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol"
-        case did
-        case signingKeyId = "signing_key_id"
-        case nonce
-        case audience
-        case signedAt = "signed_at"
-        case signature
-    }
 }
 
 /// Result of a successful SCPID verification (spec section 3.11.4).
 ///
 /// Returned by ``ScpId/verify(response:challenge:verifyFn:)`` when all
 /// verification steps pass.
-public nonisolated struct ScpIdAuthentication: Sendable, Codable {
+public nonisolated struct ScpIdAuthentication: Sendable {
     /// The authenticated DID.
     public let did: String
 
@@ -102,6 +84,51 @@ public nonisolated struct ScpIdAuthentication: Sendable, Codable {
 
     /// Unix timestamp (milliseconds) when the client signed.
     public let signedAt: UInt64
+}
+
+// MARK: - Wire Types (JSON Decoding)
+
+/// Wire type for deserializing challenge JSON from the bridge.
+private struct ChallengeWire: Decodable {
+    let protocolVersion: String
+    let nonce: String
+    let audience: String
+    let issuedAt: UInt64
+    let expiresAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol"
+        case nonce, audience
+        case issuedAt = "issued_at"
+        case expiresAt = "expires_at"
+    }
+}
+
+/// Wire type for deserializing response JSON from the bridge.
+private struct ResponseWire: Decodable {
+    let protocolVersion: String
+    let did: String
+    let signingKeyId: String
+    let nonce: String
+    let audience: String
+    let signedAt: UInt64
+    let signature: String
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol"
+        case did
+        case signingKeyId = "signing_key_id"
+        case nonce, audience
+        case signedAt = "signed_at"
+        case signature
+    }
+}
+
+/// Wire type for deserializing authentication JSON from the bridge.
+private struct AuthenticationWire: Decodable {
+    let did: String
+    let signingKeyId: String
+    let signedAt: UInt64
 
     enum CodingKeys: String, CodingKey {
         case did
@@ -180,18 +207,15 @@ public enum ScpId {
     ) throws -> ScpIdChallenge {
         let ttlSeconds = UInt64(ttl)
         let json = try challengeFn(audience, ttlSeconds)
-
-        let decoder = JSONDecoder()
-        var result = try decoder.decode(ScpIdChallenge.self, from: Data(json.utf8))
-        result = ScpIdChallenge(
-            protocolVersion: result.protocolVersion,
-            nonce: result.nonce,
-            audience: result.audience,
-            issuedAt: result.issuedAt,
-            expiresAt: result.expiresAt,
+        let wire = try JSONDecoder().decode(ChallengeWire.self, from: Data(json.utf8))
+        return ScpIdChallenge(
+            protocolVersion: wire.protocolVersion,
+            nonce: wire.nonce,
+            audience: wire.audience,
+            issuedAt: wire.issuedAt,
+            expiresAt: wire.expiresAt,
             json: json
         )
-        return result
     }
 
     /// Signs an SCPID challenge with the identity's key (spec section 3.11.3).
@@ -218,20 +242,17 @@ public enum ScpId {
         signFn: SignFn = defaultSign
     ) throws -> ScpIdResponse {
         let json = try signFn(identity, signingKeyId, challenge.json)
-
-        let decoder = JSONDecoder()
-        var result = try decoder.decode(ScpIdResponse.self, from: Data(json.utf8))
-        result = ScpIdResponse(
-            protocolVersion: result.protocolVersion,
-            did: result.did,
-            signingKeyId: result.signingKeyId,
-            nonce: result.nonce,
-            audience: result.audience,
-            signedAt: result.signedAt,
-            signature: result.signature,
+        let wire = try JSONDecoder().decode(ResponseWire.self, from: Data(json.utf8))
+        return ScpIdResponse(
+            protocolVersion: wire.protocolVersion,
+            did: wire.did,
+            signingKeyId: wire.signingKeyId,
+            nonce: wire.nonce,
+            audience: wire.audience,
+            signedAt: wire.signedAt,
+            signature: wire.signature,
             json: json
         )
-        return result
     }
 
     /// Verifies a signed SCPID response against the original challenge (spec section 3.11.4).
@@ -257,8 +278,11 @@ public enum ScpId {
         verifyFn: VerifyFn = defaultVerify
     ) throws -> ScpIdAuthentication {
         let json = try verifyFn(response.json, challenge.json)
-
-        let decoder = JSONDecoder()
-        return try decoder.decode(ScpIdAuthentication.self, from: Data(json.utf8))
+        let wire = try JSONDecoder().decode(AuthenticationWire.self, from: Data(json.utf8))
+        return ScpIdAuthentication(
+            did: wire.did,
+            signingKeyId: wire.signingKeyId,
+            signedAt: wire.signedAt
+        )
     }
 }
