@@ -75,6 +75,17 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Subagents: use liberally, one task each, keep main context clean
 - Verify all gates, tests, and builds pass before deciding you are done
 
+**Change protocol (MANDATORY for all code changes):**
+- Use subagents with worktree isolation for all changes
+- Add and update tests for every change — no untested code ships
+- Review locally using the full review roster, in logical units
+  - Validate and address every item, then re-run the full review
+  - Repeat until zero items remain
+  - Do NOT ignore or dismiss review items as "out of scope" or "preexisting." Prefer to fix them inline. At minimum, file GitHub issues — but fixing is always preferred over filing.
+- Run CI locally before pushing. **Always.** No exceptions.
+  - CI failures are never acceptable, whether you introduced them or not. Fix them properly before pushing.
+- **Never bypass branch protection rules** with `--force`, `--admin`, or any other mechanism. No exceptions, no matter how confident you are.
+
 **Architecture:**
 - Protocol-first design; inject through initializers; no singletons
 - APIs: self-evident, one happy path
