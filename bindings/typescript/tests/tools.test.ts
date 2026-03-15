@@ -281,7 +281,7 @@ describe("toolSessionInvoke", () => {
     _resetBridge();
   });
 
-  it("invokes a tool within a session and returns output", async () => {
+  it("invokes a tool within a session and returns typed result with provenance", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const handle = await mockBridge.contextCreate(identity, "{}");
 
@@ -294,7 +294,7 @@ describe("toolSessionInvoke", () => {
     });
 
     const session = await toolSessionCreate(handle, toolId, "source-ctx-1");
-    const output = await toolSessionInvoke(
+    const result = await toolSessionInvoke(
       handle,
       session.sessionId,
       '{"x": 42}',
@@ -302,7 +302,14 @@ describe("toolSessionInvoke", () => {
       "mock-ucan-token",
     );
 
-    const parsed = JSON.parse(output);
+    // Verify provenance metadata on the result
+    expect(result.sessionId).toBe(session.sessionId);
+    expect(result.contextId).toBe(handle.contextId);
+    expect(result.invokerDid).toBe(identity.did);
+    expect(result.timestamp).toBeGreaterThan(0);
+
+    // Verify the raw bridge output is in the output field
+    const parsed = JSON.parse(result.output);
     expect(parsed.tool).toBe(toolId);
     expect(parsed.session_id).toBe(session.sessionId);
     expect(parsed.call_count).toBe(1);
@@ -324,7 +331,7 @@ describe("toolSessionInvoke", () => {
     const session = await toolSessionCreate(handle, toolId, "source-ctx-1");
 
     await toolSessionInvoke(handle, session.sessionId, "{}", identity.did, "token");
-    const output2 = await toolSessionInvoke(
+    const result2 = await toolSessionInvoke(
       handle,
       session.sessionId,
       "{}",
@@ -332,7 +339,7 @@ describe("toolSessionInvoke", () => {
       "token",
     );
 
-    const parsed = JSON.parse(output2);
+    const parsed = JSON.parse(result2.output);
     expect(parsed.call_count).toBe(2);
   });
 });

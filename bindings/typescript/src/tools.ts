@@ -22,6 +22,7 @@ import type {
   TestVector,
   ToolCost,
   ToolDefinition,
+  ToolSessionInvokeResult,
   ToolSessionResult,
 } from "./types";
 
@@ -101,7 +102,8 @@ export function defineToolDefinition(params: {
  * @param inputJson - Input data as a JSON string matching the tool's input schema.
  * @param invokerDid - The DID of the participant invoking the tool.
  * @param ucanToken - JWT-encoded UCAN token authorizing the invocation.
- * @param chainDepth - Current cross-context chain depth (0 for first hop). Must be 0-255.
+ * @param chainDepth - Current cross-context chain depth (0 for first hop). Must be 0-255
+ *   (u8 range). The core enforces context-configurable max (default 3, protocol hard max 5 per spec §24.4).
  * @param proofTokens - Optional list of encoded parent UCAN token strings.
  * @returns A {@link CrossContextInvocationResult} with the tool output and provenance.
  * @throws {ValidationError} If chainDepth is out of range.
@@ -206,7 +208,7 @@ export async function toolSessionCreate(
  * @param invokerDid - The DID of the invoker (capability checked per call).
  * @param ucanToken - JWT-encoded UCAN token authorizing the invocation.
  * @param proofTokens - Optional list of encoded parent UCAN token strings.
- * @returns The tool output as a JSON string.
+ * @returns A {@link ToolSessionInvokeResult} with the tool output and provenance.
  * @throws {ContextError} If the session is not found or has expired.
  */
 export async function toolSessionInvoke(
@@ -216,10 +218,10 @@ export async function toolSessionInvoke(
   invokerDid: string,
   ucanToken: string,
   proofTokens?: readonly string[],
-): Promise<string> {
+): Promise<ToolSessionInvokeResult> {
   const bridge = await getBridge();
   try {
-    return await bridge.toolSessionInvoke(
+    const output = await bridge.toolSessionInvoke(
       handle,
       sessionId,
       inputJson,
@@ -227,6 +229,13 @@ export async function toolSessionInvoke(
       ucanToken,
       proofTokens,
     );
+    return {
+      output,
+      sessionId,
+      contextId: handle.contextId,
+      invokerDid,
+      timestamp: Date.now(),
+    };
   } catch (error) {
     throw mapBridgeError(error);
   }

@@ -478,9 +478,9 @@ export function createMockBridge(): Bridge & {
           `[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`,
         );
       }
-      if (chainDepth > 3) {
+      if (chainDepth > 5) {
         throw new Error(
-          `[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds maximum 3`,
+          `[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds protocol hard maximum 5`,
         );
       }
 

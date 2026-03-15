@@ -266,7 +266,7 @@ export type {
   TestVector,
   ToolCost,
   ToolDefinition,
-  ToolInvocationResult,
+  ToolSessionInvokeResult,
   ToolSessionResult,
   ToolVerificationResult,
   TransportConfig,
