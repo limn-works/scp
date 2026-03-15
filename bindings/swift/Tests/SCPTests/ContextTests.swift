@@ -215,7 +215,7 @@ struct ContextTests {
     @Test("send forwards identity to bridge function")
     func sendForwardsIdentity() async throws {
         let capturedIdentity = Locked<Identity?>(nil)
-        let handle = MockContextHandle()
+        let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
         let sendFn: ContextBridge.SendFn = { _, id, _ in
@@ -434,7 +434,7 @@ struct ContextTests {
     @Test("leave forwards identity to bridge function")
     func leaveForwardsIdentity() async throws {
         let capturedIdentity = Locked<Identity?>(nil)
-        let handle = MockContextHandle()
+        let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
         let leaveFn: ContextBridge.LeaveFn = { _, id in
@@ -485,7 +485,7 @@ struct ContextTests {
     @Test("close forwards identity to bridge function")
     func closeForwardsIdentity() async throws {
         let capturedIdentity = Locked<Identity?>(nil)
-        let handle = MockContextHandle()
+        let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
         let closeFn: ContextBridge.CloseFn = { _, id in
