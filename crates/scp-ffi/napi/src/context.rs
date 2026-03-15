@@ -2065,6 +2065,205 @@ pub fn evaluate_invitation(
         Err(e) => Err(napi::Error::from(ScpNapiError::Context {
             message: format!("invitation evaluation failed: {e}"),
             code: "SCP-CTX-2060".to_owned(),
+// MetadataRecord inspection (§5.7.2, #615)
+// ---------------------------------------------------------------------------
+
+/// Serializes a `MetadataRecord` to a JSON string.
+///
+/// Constructs a `MetadataRecord` from the provided fields and returns its
+/// JSON representation. The `signature` field is provided as a hex-encoded
+/// string (64 bytes = 128 hex characters).
+#[napi]
+pub fn metadata_record_to_json(
+    context_id: String,
+    sequence: u32,
+    signer_did: String,
+    timestamp: f64,
+    structural_json: String,
+    operational_json: String,
+    signature_hex: String,
+) -> napi::Result<String> {
+    use scp_core::context::metadata::{MetadataRecord, OperationalMetadata, StructuralMetadata};
+    use scp_ffi_common::validate::{validate_context_id, validate_did};
+
+    validate_context_id(&context_id).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: e.to_string(),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })?;
+    validate_did(&signer_did).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: e.to_string(),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })?;
+
+    if sequence == 0 {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        }));
+    }
+
+    let structural: StructuralMetadata = serde_json::from_str(&structural_json).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid structural metadata JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })?;
+
+    let operational: OperationalMetadata =
+        serde_json::from_str(&operational_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid operational metadata JSON: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            })
+        })?;
+
+    let signature = hex::decode(&signature_hex).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid signature hex: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })?;
+    if signature.len() != 64 {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: format!("signature must be 64 bytes (got {})", signature.len()),
+            code: "SCP-VALID-7001".to_owned(),
+        }));
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ts = timestamp as u64;
+    let record = MetadataRecord {
+        context_id,
+        sequence: u64::from(sequence),
+        signer_did: scp_identity::DID::from(signer_did),
+        timestamp: ts,
+        structural,
+        operational,
+        signature,
+    };
+
+    serde_json::to_string(&record).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("failed to serialize MetadataRecord: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })
+}
+
+/// Deserializes a `MetadataRecord` from a JSON string.
+///
+/// Returns the validated and re-serialized JSON.
+#[napi]
+pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
+    use scp_core::context::metadata::MetadataRecord;
+
+    let record: MetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid MetadataRecord JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })?;
+
+    serde_json::to_string(&record).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("failed to re-serialize MetadataRecord: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Context template inspection (§5.14, #615)
+// ---------------------------------------------------------------------------
+
+/// Returns the canonical `ContextParams` for a given template ID as JSON.
+#[napi]
+pub fn template_get_params(template_id: String) -> napi::Result<String> {
+    use scp_core::context::templates::template_params;
+
+    let tid = parse_template_id_napi(&template_id)?;
+    let params = template_params(&tid);
+    serde_json::to_string(&params).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("failed to serialize template params: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+    })
+}
+
+/// Validates that a `ContextParams` JSON matches its template definition.
+///
+/// Returns `null` on success, or a string error message on validation failure.
+#[napi]
+pub fn validate_against_template(params_json: String) -> napi::Result<Option<String>> {
+    use scp_core::context::templates::validate_against_template;
+
+    let params: scp_core::context::ContextParams =
+        serde_json::from_str(&params_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid ContextParams JSON: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            })
+        })?;
+
+    match validate_against_template(&params) {
+        Ok(()) => Ok(None),
+        Err(e) => Ok(Some(e.to_string())),
+    }
+}
+
+/// Validates cross-field invariants for `ContextParams` regardless of template.
+///
+/// Returns `null` on success, or a string error message on validation failure.
+#[napi]
+pub fn validate_context_params(params_json: String) -> napi::Result<Option<String>> {
+    use scp_core::context::templates::validate_context_params;
+
+    let params: scp_core::context::ContextParams =
+        serde_json::from_str(&params_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid ContextParams JSON: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            })
+        })?;
+
+    match validate_context_params(&params) {
+        Ok(()) => Ok(None),
+        Err(e) => Ok(Some(e.to_string())),
+    }
+}
+
+/// Parses a template ID string into a `TemplateId` enum value.
+fn parse_template_id_napi(
+    template_id: &str,
+) -> napi::Result<scp_core::context::params::TemplateId> {
+    use scp_core::context::params::TemplateId;
+
+    match template_id {
+        "BilateralEphemeral" => Ok(TemplateId::BilateralEphemeral),
+        "BilateralPersistent" => Ok(TemplateId::BilateralPersistent),
+        "Coordination" => Ok(TemplateId::Coordination),
+        "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
+        "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
+        "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
+        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+            Ok(TemplateId::ToolInterfaceTemplate)
+        }
+        "PaidService" => Ok(TemplateId::PaidService),
+        "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
+        "DiscoveryContext" => Ok(TemplateId::DiscoveryContext),
+        _ => Err(NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
+                 BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
+                 GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+                 DiscoveryContext"
+            ),
+            code: "SCP-VALID-7001".to_owned(),
         })),
     }
 }

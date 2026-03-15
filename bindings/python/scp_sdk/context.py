@@ -17,6 +17,7 @@ canonical design.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import deque
 from collections.abc import AsyncIterator
@@ -1086,10 +1087,133 @@ def evaluate_invitation(
     )
 
 
+def metadata_record_to_json(
+    context_id: str,
+    sequence: int,
+    signer_did: str,
+    timestamp: int,
+    structural: dict[str, Any],
+    operational: dict[str, Any],
+    signature_hex: str,
+) -> str:
+    """Serialize a MetadataRecord to a JSON string (spec section 5.7.2).
+
+    Args:
+        context_id: The context this metadata describes.
+        sequence: Monotonically increasing sequence number (starts at 1).
+        signer_did: DID of the admin who signed this record.
+        timestamp: Unix timestamp in milliseconds.
+        structural: Structural metadata dict (always visible).
+        operational: Operational metadata dict (visibility-governed).
+        signature_hex: Ed25519 signature as hex string (128 hex chars).
+
+    Returns:
+        JSON string of the MetadataRecord.
+
+    Raises:
+        ValidationError: If any input is malformed.
+    """
+    import _scp_core
+
+    return _scp_core.metadata_record_to_json(
+        context_id,
+        sequence,
+        signer_did,
+        timestamp,
+        json.dumps(structural),
+        json.dumps(operational),
+        signature_hex,
+    )
+
+
+def metadata_record_from_json(json_str: str) -> dict[str, Any]:
+    """Deserialize a MetadataRecord from a JSON string (spec section 5.7.2).
+
+    Args:
+        json_str: JSON string of a MetadataRecord.
+
+    Returns:
+        Parsed MetadataRecord as a dict.
+
+    Raises:
+        ValidationError: If the JSON is malformed or does not match the schema.
+    """
+    import _scp_core
+
+    validated = _scp_core.metadata_record_from_json(json_str)
+    return json.loads(validated)
+
+
+def template_get_params(template_id: str) -> dict[str, Any]:
+    """Get the canonical ContextParams for a well-known template (spec section 5.12.1).
+
+    Args:
+        template_id: One of ``BilateralEphemeral``, ``BilateralPersistent``,
+            ``Coordination``, ``GroupDiscussion``, ``PublicBroadcast``,
+            ``GatedBroadcast``, ``scp:template/tool-interface``,
+            ``PaidService``, ``PaidBroadcast``, ``DiscoveryContext``.
+
+    Returns:
+        ContextParams as a dict.
+
+    Raises:
+        ValidationError: If the template ID is not recognized.
+    """
+    import _scp_core
+
+    result = _scp_core.template_get_params(template_id)
+    return json.loads(result)
+
+
+def validate_against_template(params: dict[str, Any]) -> str | None:
+    """Validate that ContextParams match their template definition.
+
+    When ``params`` contains a ``template_id``, every field is compared
+    against the canonical template definition.
+
+    Args:
+        params: ContextParams dict to validate.
+
+    Returns:
+        ``None`` on success, or a string error message on validation failure.
+
+    Raises:
+        ValidationError: If the params dict cannot be serialized to JSON.
+    """
+    import _scp_core
+
+    return _scp_core.validate_against_template(json.dumps(params))
+
+
+def validate_context_params(params: dict[str, Any]) -> str | None:
+    """Validate cross-field invariants for ContextParams regardless of template.
+
+    Currently enforces: ``projection_policy`` must be ``None`` for
+    ``Encrypted`` contexts.
+
+    Args:
+        params: ContextParams dict to validate.
+
+    Returns:
+        ``None`` on success, or a string error message on validation failure.
+
+    Raises:
+        ValidationError: If the params dict cannot be serialized to JSON.
+    """
+    import _scp_core
+
+    return _scp_core.validate_context_params(json.dumps(params))
+
+
 __all__ = [
     "Context",
     "Membership",
     "ScopedHandle",
     "evaluate_invitation",
+    "metadata_record_from_json",
+    "metadata_record_to_json",
+    "template_get_params",
+    "validate_against_template",
     "validate_capability_declaration",
+    "validate_context_params",
 ]

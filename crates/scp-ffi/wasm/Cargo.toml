@@ -33,6 +33,7 @@ hmac = { workspace = true }
 base64 = { workspace = true }
 jsonschema = { workspace = true }
 hex = { workspace = true }
+serde_bytes = { workspace = true }
 scp-ffi-common = { path = "../common", default-features = false }
 zeroize = { workspace = true }
 subtle = { workspace = true }

@@ -2865,6 +2865,219 @@ pub fn py_evaluate_invitation(
         Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "[SCP-CTX-2060] invitation evaluation failed: {e}"
+// MetadataRecord inspection (§5.7.2, #615)
+// ---------------------------------------------------------------------------
+
+/// Serializes a `MetadataRecord` to a JSON string.
+///
+/// Constructs a `MetadataRecord` from the provided fields and returns its
+/// JSON representation. The `signature` field is provided as a hex-encoded
+/// string (64 bytes = 128 hex characters).
+///
+/// # Errors
+///
+/// Raises `ValidationError` if:
+/// - `signer_did` is not a valid DID
+/// - `context_id` is not a valid context ID
+/// - `structural_json` or `operational_json` are not valid JSON
+/// - `signature_hex` is not valid hex or wrong length
+/// - Serialization fails
+#[pyfunction]
+#[pyo3(name = "metadata_record_to_json")]
+pub fn py_metadata_record_to_json(
+    context_id: String,
+    sequence: u64,
+    signer_did: String,
+    timestamp: u64,
+    structural_json: String,
+    operational_json: String,
+    signature_hex: String,
+) -> PyResult<String> {
+    use scp_core::context::metadata::{MetadataRecord, OperationalMetadata, StructuralMetadata};
+
+    validate::validate_context_id(&context_id)?;
+    validate::validate_did(&signer_did)?;
+
+    if sequence == 0 {
+        return Err(crate::error::ScpPyError::validation(
+            "MetadataRecord sequence must start at 1 (per spec §5.7.2)",
+        )
+        .into());
+    }
+
+    let structural: StructuralMetadata = serde_json::from_str(&structural_json).map_err(|e| {
+        crate::error::ScpPyError::validation(format!("invalid structural metadata JSON: {e}"))
+    })?;
+
+    let operational: OperationalMetadata =
+        serde_json::from_str(&operational_json).map_err(|e| {
+            crate::error::ScpPyError::validation(format!("invalid operational metadata JSON: {e}"))
+        })?;
+
+    let signature = hex::decode(&signature_hex)
+        .map_err(|e| crate::error::ScpPyError::validation(format!("invalid signature hex: {e}")))?;
+    if signature.len() != 64 {
+        return Err(crate::error::ScpPyError::validation(format!(
+            "signature must be 64 bytes (got {})",
+            signature.len()
+        ))
+        .into());
+    }
+
+    let record = MetadataRecord {
+        context_id,
+        sequence,
+        signer_did: scp_identity::DID::from(signer_did),
+        timestamp,
+        structural,
+        operational,
+        signature,
+    };
+
+    serde_json::to_string(&record).map_err(|e| {
+        crate::error::ScpPyError::validation(format!("failed to serialize MetadataRecord: {e}"))
+            .into()
+    })
+}
+
+/// Deserializes a `MetadataRecord` from a JSON string.
+///
+/// Returns a dict with all fields of the metadata record. The `signature`
+/// field is returned as a hex-encoded string.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if the JSON is malformed or does not match the
+/// `MetadataRecord` schema.
+#[pyfunction]
+#[pyo3(name = "metadata_record_from_json")]
+pub fn py_metadata_record_from_json(json_str: String) -> PyResult<String> {
+    use scp_core::context::metadata::MetadataRecord;
+
+    // Validate that it parses, then return the normalized JSON
+    let record: MetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
+        crate::error::ScpPyError::validation(format!("invalid MetadataRecord JSON: {e}"))
+    })?;
+
+    // Re-serialize to ensure canonical output
+    serde_json::to_string(&record).map_err(|e| {
+        crate::error::ScpPyError::validation(format!("failed to re-serialize MetadataRecord: {e}"))
+            .into()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Context template inspection (§5.14, #615)
+// ---------------------------------------------------------------------------
+
+/// Returns the canonical `ContextParams` for a given template ID as JSON.
+///
+/// Template IDs are well-known protocol constants (spec §5.12.1). The
+/// returned JSON matches the `ContextParams` struct from `scp-core`.
+///
+/// Valid template IDs:
+/// - `"BilateralEphemeral"`
+/// - `"BilateralPersistent"`
+/// - `"Coordination"`
+/// - `"GroupDiscussion"`
+/// - `"PublicBroadcast"`
+/// - `"GatedBroadcast"`
+/// - `"scp:template/tool-interface"`
+/// - `"PaidService"`
+/// - `"PaidBroadcast"`
+/// - `"DiscoveryContext"`
+///
+/// # Errors
+///
+/// Raises `ValidationError` if the template ID is not recognized.
+#[pyfunction]
+#[pyo3(name = "template_get_params")]
+pub fn py_template_get_params(template_id: String) -> PyResult<String> {
+    use scp_core::context::templates::template_params;
+
+    let tid = parse_template_id(&template_id)?;
+    let params = template_params(&tid);
+    serde_json::to_string(&params).map_err(|e| {
+        crate::error::ScpPyError::validation(format!("failed to serialize template params: {e}"))
+            .into()
+    })
+}
+
+/// Validates that a `ContextParams` JSON matches its template definition.
+///
+/// When the params contain a `template_id`, every field is compared against
+/// the canonical template definition. Returns `None` on success, or a string
+/// error message on validation failure.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if the JSON is malformed.
+#[pyfunction]
+#[pyo3(name = "validate_against_template")]
+pub fn py_validate_against_template(params_json: String) -> PyResult<Option<String>> {
+    use scp_core::context::templates::validate_against_template;
+
+    let params: scp_core::context::ContextParams =
+        serde_json::from_str(&params_json).map_err(|e| {
+            crate::error::ScpPyError::validation(format!("invalid ContextParams JSON: {e}"))
+        })?;
+
+    match validate_against_template(&params) {
+        Ok(()) => Ok(None),
+        Err(e) => Ok(Some(e.to_string())),
+    }
+}
+
+/// Validates cross-field invariants for `ContextParams` regardless of template.
+///
+/// Currently enforces: `projection_policy` must be `None` for Encrypted contexts.
+/// Returns `None` on success, or a string error message on validation failure.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if the JSON is malformed.
+#[pyfunction]
+#[pyo3(name = "validate_context_params")]
+pub fn py_validate_context_params(params_json: String) -> PyResult<Option<String>> {
+    use scp_core::context::templates::validate_context_params;
+
+    let params: scp_core::context::ContextParams =
+        serde_json::from_str(&params_json).map_err(|e| {
+            crate::error::ScpPyError::validation(format!("invalid ContextParams JSON: {e}"))
+        })?;
+
+    match validate_context_params(&params) {
+        Ok(()) => Ok(None),
+        Err(e) => Ok(Some(e.to_string())),
+    }
+}
+
+/// Parses a template ID string into a `TemplateId` enum value.
+///
+/// Accepts both the variant name and the serde-renamed form.
+fn parse_template_id(
+    template_id: &str,
+) -> Result<scp_core::context::params::TemplateId, crate::error::ScpPyError> {
+    use scp_core::context::params::TemplateId;
+
+    match template_id {
+        "BilateralEphemeral" => Ok(TemplateId::BilateralEphemeral),
+        "BilateralPersistent" => Ok(TemplateId::BilateralPersistent),
+        "Coordination" => Ok(TemplateId::Coordination),
+        "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
+        "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
+        "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
+        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+            Ok(TemplateId::ToolInterfaceTemplate)
+        }
+        "PaidService" => Ok(TemplateId::PaidService),
+        "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
+        "DiscoveryContext" => Ok(TemplateId::DiscoveryContext),
+        _ => Err(crate::error::ScpPyError::validation(format!(
+            "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
+             BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
+             GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+             DiscoveryContext"
         ))),
     }
 }
@@ -2929,6 +3142,12 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_check_scoped_capability, m)?)?;
     // Invitation evaluation (#614)
     m.add_function(wrap_pyfunction!(py_evaluate_invitation, m)?)?;
+    // MetadataRecord and ContextTemplate inspection (#615)
+    m.add_function(wrap_pyfunction!(py_metadata_record_to_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_metadata_record_from_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_template_get_params, m)?)?;
+    m.add_function(wrap_pyfunction!(py_validate_against_template, m)?)?;
+    m.add_function(wrap_pyfunction!(py_validate_context_params, m)?)?;
     Ok(())
 }
 

@@ -375,6 +375,23 @@ export interface Bridge {
     requiredCapability: string,
   ): boolean;
 
+  // MetadataRecord inspection (§5.7.2, #615)
+  metadataRecordToJson(
+    contextId: string,
+    sequence: number,
+    signerDid: string,
+    timestamp: number,
+    structuralJson: string,
+    operationalJson: string,
+    signatureHex: string,
+  ): string;
+  metadataRecordFromJson(jsonStr: string): string;
+
+  // Context template inspection (§5.14, #615)
+  templateGetParams(templateId: string): string;
+  validateAgainstTemplate(paramsJson: string): string | null;
+  validateContextParams(paramsJson: string): string | null;
+
   // SCPID authentication (§3.11)
   scpidChallenge(audience: string, ttlSeconds: number): string;
   scpidSign(did: string, signingKeyId: string, challengeJson: string): string;

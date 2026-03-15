@@ -729,3 +729,85 @@ public func evaluateContextInvitation(
     )
     return InvitationEvaluationResult(decision: decision)
 }
+
+// MARK: - MetadataRecord Inspection (§5.7.2, #615)
+
+/// Serializes a MetadataRecord to a JSON string (spec §5.7.2).
+///
+/// Delegates to UniFFI ``metadataRecordToJson``.
+///
+/// - Parameters:
+///   - contextId: The context this metadata describes.
+///   - sequence: Monotonically increasing sequence number (starts at 1).
+///   - signerDid: DID of the admin who signed this record.
+///   - timestamp: Unix timestamp in milliseconds.
+///   - structuralJson: Structural metadata as a JSON string.
+///   - operationalJson: Operational metadata as a JSON string.
+///   - signatureHex: Ed25519 signature as hex string (128 hex chars).
+/// - Returns: JSON string of the MetadataRecord.
+/// - Throws: ``ScpError`` if any input is malformed.
+public func serializeMetadataRecord(
+    contextId: String,
+    sequence: UInt64,
+    signerDid: String,
+    timestamp: UInt64,
+    structuralJson: String,
+    operationalJson: String,
+    signatureHex: String
+) throws -> String {
+    try metadataRecordToJson(
+        contextId: contextId,
+        sequence: sequence,
+        signerDid: signerDid,
+        timestamp: timestamp,
+        structuralJson: structuralJson,
+        operationalJson: operationalJson,
+        signatureHex: signatureHex
+    )
+}
+
+/// Deserializes a MetadataRecord from a JSON string (spec §5.7.2).
+///
+/// Delegates to UniFFI ``metadataRecordFromJson``.
+///
+/// - Parameter jsonStr: JSON string of a MetadataRecord.
+/// - Returns: Validated and re-serialized JSON string.
+/// - Throws: ``ScpError`` if the JSON is malformed.
+public func deserializeMetadataRecord(jsonStr: String) throws -> String {
+    try metadataRecordFromJson(jsonStr: jsonStr)
+}
+
+// MARK: - Context Template Inspection (§5.14, #615)
+
+/// Gets the canonical ContextParams for a well-known template (spec §5.12.1).
+///
+/// Delegates to UniFFI ``templateGetParams``.
+///
+/// - Parameter templateId: Template identifier string.
+/// - Returns: JSON string of the canonical ContextParams.
+/// - Throws: ``ScpError`` if the template ID is not recognized.
+public func getTemplateParams(templateId: String) throws -> String {
+    try templateGetParams(templateId: templateId)
+}
+
+/// Validates that ContextParams match their template definition.
+///
+/// Delegates to UniFFI ``validateAgainstTemplate``.
+///
+/// - Parameter paramsJson: ContextParams as a JSON string.
+/// - Returns: `nil` on success, or a string error message on validation failure.
+/// - Throws: ``ScpError`` if the JSON is malformed.
+public func validateParamsAgainstTemplate(paramsJson: String) throws -> String? {
+    try validateAgainstTemplate(paramsJson: paramsJson)
+}
+
+/// Validates cross-field invariants for ContextParams regardless of template.
+///
+/// Delegates to UniFFI ``validateContextParams``.
+///
+/// - Parameter paramsJson: ContextParams as a JSON string.
+/// - Returns: `nil` on success, or a string error message on validation failure.
+/// - Throws: ``ScpError`` if the JSON is malformed.
+public func validateParams(paramsJson: String) throws -> String? {
+    try validateContextParams(paramsJson: paramsJson)
+}
