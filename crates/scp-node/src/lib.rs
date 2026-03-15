@@ -761,8 +761,12 @@ pub struct DefaultNatStrategy {
     stun_server: Option<String>,
     /// Bridge relay URL override (if set via `.bridge_relay()`).
     bridge_relay: Option<String>,
-    /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
+    /// Optional primary port mapper for Tier 1 (spec 10.12.2).
+    /// Typically UPnP-IGD, tried first.
     port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
+    /// Optional fallback port mapper for Tier 1 (spec 10.12.2).
+    /// Typically NAT-PMP/PCP, tried if the primary mapper fails.
+    fallback_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
     /// Optional reachability probe for self-test (spec 10.12.2 step 4, SCP-242).
     /// If `None`, a [`DefaultReachabilityProbe`](scp_transport::nat::DefaultReachabilityProbe)
     /// is constructed from the first STUN endpoint.
@@ -777,14 +781,24 @@ impl DefaultNatStrategy {
             stun_server,
             bridge_relay,
             port_mapper: None,
+            fallback_mapper: None,
             reachability_probe: None,
         }
     }
 
-    /// Sets the UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
+    /// Sets the primary port mapper for Tier 1 (spec 10.12.2).
     #[must_use]
     pub fn with_port_mapper(mut self, mapper: Arc<dyn scp_transport::nat::PortMapper>) -> Self {
         self.port_mapper = Some(mapper);
+        self
+    }
+
+    /// Sets the fallback port mapper for Tier 1 (spec 10.12.2).
+    ///
+    /// Tried when the primary mapper fails. Typically NAT-PMP/PCP.
+    #[must_use]
+    pub fn with_fallback_mapper(mut self, mapper: Arc<dyn scp_transport::nat::PortMapper>) -> Self {
+        self.fallback_mapper = Some(mapper);
         self
     }
 
@@ -833,48 +847,67 @@ impl DefaultNatStrategy {
 
     /// Attempts Tier 1 `UPnP`/NAT-PMP port mapping with reachability self-test.
     ///
-    /// Returns `Some(ReachabilityTier::Upnp)` if mapping and self-test both
-    /// succeed, `None` if either fails (caller should fall through to Tier 2).
+    /// Tries the primary mapper first, then the fallback mapper if the primary
+    /// fails. Returns `Some(ReachabilityTier::Upnp)` if mapping and self-test
+    /// both succeed, `None` if all attempts fail (caller should fall through
+    /// to Tier 2).
     async fn try_tier1_upnp(
         &self,
         relay_port: u16,
         socket: &tokio::net::UdpSocket,
         probe: &dyn scp_transport::nat::ReachabilityProbe,
     ) -> Option<ReachabilityTier> {
-        let mapper = self.port_mapper.as_ref()?;
-        tracing::info!("attempting Tier 1 UPnP/NAT-PMP port mapping");
-        match mapper.map_port(relay_port).await {
-            Ok(mapping) => {
-                tracing::info!(
-                    protocol = %mapping.protocol,
-                    external_addr = %mapping.external_addr,
-                    "UPnP port mapping acquired, running reachability self-test"
-                );
-                let reachable = probe
-                    .probe_reachability(socket, mapping.external_addr)
-                    .await
-                    .unwrap_or(false);
+        // Build the ordered list of mappers to try: primary, then fallback.
+        let mappers: Vec<&Arc<dyn scp_transport::nat::PortMapper>> = self
+            .port_mapper
+            .iter()
+            .chain(self.fallback_mapper.iter())
+            .collect();
 
-                if reachable {
+        if mappers.is_empty() {
+            return None;
+        }
+
+        tracing::info!("attempting Tier 1 UPnP/NAT-PMP port mapping");
+
+        for mapper in &mappers {
+            match mapper.map_port(relay_port).await {
+                Ok(mapping) => {
                     tracing::info!(
+                        protocol = %mapping.protocol,
                         external_addr = %mapping.external_addr,
-                        "Tier 1 reachability self-test passed"
+                        "port mapping acquired, running reachability self-test"
                     );
-                    return Some(ReachabilityTier::Upnp {
-                        external_addr: mapping.external_addr,
-                    });
+                    let reachable = probe
+                        .probe_reachability(socket, mapping.external_addr)
+                        .await
+                        .unwrap_or(false);
+
+                    if reachable {
+                        tracing::info!(
+                            external_addr = %mapping.external_addr,
+                            "Tier 1 reachability self-test passed"
+                        );
+                        return Some(ReachabilityTier::Upnp {
+                            external_addr: mapping.external_addr,
+                        });
+                    }
+                    tracing::warn!(
+                        "Tier 1 reachability self-test failed for {:?}, trying next mapper",
+                        mapping.protocol
+                    );
                 }
-                tracing::warn!("Tier 1 reachability self-test failed, falling through to Tier 2");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "UPnP port mapping failed, falling through to Tier 2"
-                );
-                None
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "port mapping failed, trying next mapper"
+                    );
+                }
             }
         }
+
+        tracing::warn!("all Tier 1 port mappers exhausted, falling through to Tier 2");
+        None
     }
 }
 
@@ -2517,6 +2550,15 @@ fn resolve_nat(
 
         if let Some(mapper) = port_mapper {
             default = default.with_port_mapper(mapper);
+        }
+
+        // Wire the NAT-PMP fallback mapper per spec 10.12.2:
+        // "NAT-PMP/PCP as fallback" after UPnP-IGD.
+        #[cfg(feature = "upnp")]
+        {
+            let natpmp_mapper = Arc::new(scp_transport::NatPmpPortMapper::new())
+                as Arc<dyn scp_transport::nat::PortMapper>;
+            default = default.with_fallback_mapper(natpmp_mapper);
         }
 
         if let Some(probe) = reachability_probe {

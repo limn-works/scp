@@ -535,6 +535,11 @@ pub struct UpnpPortMapper {
     lease_duration: u32,
     /// Discovery timeout for SSDP search.
     discovery_timeout: Duration,
+    /// The external port assigned by the gateway during `map_port()`.
+    /// Stored so that `remove()` can remove the correct mapping, since
+    /// `get_any_address()` may assign a different external port than
+    /// the internal port.
+    mapped_external_port: std::sync::Mutex<Option<u16>>,
 }
 
 #[cfg(feature = "upnp")]
@@ -548,6 +553,7 @@ impl UpnpPortMapper {
         Self {
             lease_duration: DEFAULT_UPNP_LEASE_SECS,
             discovery_timeout: UPNP_DISCOVERY_TIMEOUT,
+            mapped_external_port: std::sync::Mutex::new(None),
         }
     }
 
@@ -563,6 +569,7 @@ impl UpnpPortMapper {
         Self {
             lease_duration,
             discovery_timeout,
+            mapped_external_port: std::sync::Mutex::new(None),
         }
     }
 
@@ -638,6 +645,11 @@ impl PortMapper for UpnpPortMapper {
                     PortMappingError::MappingRejected(format!("UPnP add_any_port: {e}"))
                 })?;
 
+            // Store the external port so remove() can use the correct value.
+            if let Ok(mut guard) = self.mapped_external_port.lock() {
+                *guard = Some(external_addr.port());
+            }
+
             info!(
                 external_addr = %external_addr,
                 lease_secs = self.lease_duration,
@@ -667,28 +679,28 @@ impl PortMapper for UpnpPortMapper {
         &self,
         internal_port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<(), PortMappingError>> + Send + '_>> {
+        // Read the stored external port before entering the async block.
+        // Falls back to internal_port if no mapping was recorded.
+        let external_port = self
+            .mapped_external_port
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(internal_port);
+
         Box::pin(async move {
             let gateway = self.discover_gateway().await?;
-            let local_addr = Self::resolve_local_addr(gateway.addr, internal_port)?;
 
-            // To remove we need the external port. We request the same mapping
-            // to find it, but since we used add_any_port we need to know the
-            // external port. Use internal_port as the best guess -- routers
-            // commonly assign the same port when available.
-            //
-            // Try removing internal_port first. If that fails, it's best-effort.
             debug!(
                 gateway = %gateway.addr,
-                external_port = internal_port,
+                external_port,
                 "attempting UPnP-IGD port mapping removal"
             );
 
-            // Best-effort: try the internal port as the external port.
-            // get_any_address may have assigned a different port, but we
-            // don't persist state across calls. The PortMappingManager
-            // calls remove on both mappers as best-effort cleanup.
+            // Remove using the actual external port assigned by
+            // get_any_address during map_port().
             let _ = gateway
-                .remove_port(igd_next::PortMappingProtocol::TCP, local_addr.port())
+                .remove_port(igd_next::PortMappingProtocol::TCP, external_port)
                 .await;
 
             Ok(())

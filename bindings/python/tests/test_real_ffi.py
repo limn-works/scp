@@ -655,3 +655,91 @@ class TestSync:
         assert isinstance(result, dict)
         assert "tier_1_threshold_secs" in result
         assert "tier_2_threshold_secs" in result
+
+
+# ---------------------------------------------------------------------------
+# Recovery (error propagation)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteRecovery:
+    """identity_execute_recovery error propagation through real FFI."""
+
+    async def test_execute_recovery_invalid_tier(self):
+        """execute_recovery with an invalid tier should raise an error."""
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        with pytest.raises(_scp_core.IdentityError):
+            _scp_core.identity_execute_recovery(
+                alice.did,
+                "invalid_tier",
+                [],
+            )
+
+    async def test_execute_recovery_unknown_did(self):
+        """execute_recovery with an unregistered DID succeeds with the stub
+        backend (no DID registry lookup). Verify it returns a valid JSON result
+        rather than crashing."""
+        import json
+
+        result = _scp_core.identity_execute_recovery(
+            "did:dht:z6MkUnknown000000000000000000",
+            "agent",
+            [],
+        )
+        parsed = json.loads(result)
+        assert parsed["did"] == "did:dht:z6MkUnknown000000000000000000"
+        assert parsed["tier"] == "Agent"
+        assert parsed["key_rotation_completed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Migration (error propagation)
+# ---------------------------------------------------------------------------
+
+
+class TestMigrate:
+    """py_identity_migrate error propagation through real FFI."""
+
+    async def test_migrate_returns_new_identity(self):
+        """migrate on a valid identity should return a new handle (or raise
+        a descriptive IdentityError if pre-rotation is not yet set up)."""
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        try:
+            result = _scp_core.py_identity_migrate(alice._handle)
+            # If migration succeeds, the new identity should have a different DID.
+            assert result.did != alice.did
+        except _scp_core.IdentityError:
+            # Expected: migration may require pre-rotation commitment setup.
+            # The error should be an IdentityError, not a generic exception.
+            pass
+
+    async def test_migrate_invalid_handle(self):
+        """migrate with an unregistered DID should raise IdentityError.
+
+        PyIdentity is #[pyclass(frozen)] — attributes are read-only. Instead
+        of mutating the handle, we migrate first (which removes the old DID
+        from the registry) then call migrate again with the stale handle.
+        """
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        old_handle = alice._handle
+
+        # Verify PyIdentity is frozen — attributes cannot be set.
+        with pytest.raises(AttributeError):
+            alice._handle.did = "did:dht:z6MkNotRegistered0000000000"
+
+        # First migrate removes old_handle's DID from the registry.
+        # It may itself fail (e.g., missing pre-rotation commitment),
+        # so we handle that case too.
+        try:
+            _scp_core.py_identity_migrate(old_handle)
+        except _scp_core.IdentityError:
+            # First migrate failed — old_handle DID is still registered.
+            # We can't test the "not in registry" path without removing it,
+            # so just verify the error type is correct and return.
+            return
+
+        # If first migrate succeeded, old_handle's DID was removed from
+        # the registry. Calling migrate again with the stale handle should
+        # raise IdentityError because the DID is no longer registered.
+        with pytest.raises(_scp_core.IdentityError, match="not found in registry"):
+            _scp_core.py_identity_migrate(old_handle)

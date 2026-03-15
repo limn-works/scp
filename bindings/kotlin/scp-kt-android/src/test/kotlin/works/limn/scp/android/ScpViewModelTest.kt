@@ -189,6 +189,27 @@ private class TestNativeBindings : NativeBindings {
     override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
         """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
     override fun governanceListProposals(contextHandle: Long): String = "[]"
+    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
+    override fun finalizeClose(contextHandle: Long) { /* no-op */ }
+    @Suppress("LongParameterList")
+    override fun createGovernanceCheckpoint(
+        contextHandle: Long,
+        checkpointSeq: Long,
+        merkleRootHex: String,
+        eventCount: Long,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String = "{}"
+    override fun addCheckpointCosignature(
+        contextHandle: Long,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String = "{}"
+    override fun restoreContext(contextId: String) { /* no-op */ }
+    override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
@@ -217,6 +238,31 @@ private class TestNativeBindings : NativeBindings {
     ): String = "{}"
     override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
     override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
+    override fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String = "{}"
+    override fun toolSessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long?,
+    ): String = ""
+    override fun toolSessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String = "{}"
+    override fun toolSessionClose(contextHandle: Long, sessionId: String) { /* no-op */ }
     override fun ucanValidate(
         contextHandle: Long,
         token: String,
@@ -241,29 +287,6 @@ private class TestNativeBindings : NativeBindings {
     override fun transportConnect(configJson: String, cancellationHandle: CancellationHandle?): Long = 0L
     override fun transportStatus(transportHandle: Long): String = ""
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
-
-    // GovernanceBindings — lifecycle (#559)
-    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
-    override fun finalizeClose(contextHandle: Long) { /* no-op */ }
-    @Suppress("LongParameterList")
-    override fun createGovernanceCheckpoint(
-        contextHandle: Long,
-        checkpointSeq: Long,
-        merkleRootHex: String,
-        eventCount: Long,
-        lastEventHashHex: String,
-        stateSnapshotHashHex: String,
-        creatorDid: String,
-        creatorSignatureHex: String,
-    ): String = "{}"
-    override fun addCheckpointCosignature(
-        contextHandle: Long,
-        checkpointJson: String,
-        signerDid: String,
-        signatureHex: String,
-    ): String = "{}"
-    override fun restoreContext(contextId: String) { /* no-op */ }
-    override fun restoreAllContexts(): String = "[]"
 }
 
 /**
