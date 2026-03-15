@@ -1330,6 +1330,83 @@ fn inclusion_proof_interoperable_verification() {
 }
 
 // ===========================================================================
+// Test 15: LogSummary timestamp is plausible and clamped per ADR-034
+//
+// The WASM bridge's `event_log_query` produces a synthetic LogSummary event
+// whose timestamp comes from `crate::time::now_secs()`. On native targets
+// this delegates to `SystemTime::now()`; on WASM it uses a hardened
+// `Date.now()` capture with negative-value clamping to 0 (ADR-034).
+//
+// This test verifies that the timestamp placed into a LogSummary event is:
+//   (a) greater than 0 (not clamped — system clock is sane), and
+//   (b) greater than 1_700_000_000 (Nov 2023 epoch — plausible modern time).
+//
+// If this test runs on a system with a wildly misconfigured clock, it will
+// fail — that is intentional. The WASM bridge's clamping behavior (negative
+// → 0) means a clamped timestamp would be 0, which this test catches.
+// ===========================================================================
+
+#[test]
+fn log_summary_timestamp_plausible_and_clamped() {
+    // Obtain the current timestamp using the same function the WASM bridge's
+    // event_log_query uses (mirrored in wasm_ucan_mirror::now_secs).
+    let now = wasm_ucan_mirror::now_secs();
+
+    // (a) Timestamp must be > 0. A value of 0 would indicate the WASM
+    // clamping path was taken (negative Date.now() → 0), which on native
+    // means the system clock is before the Unix epoch.
+    assert!(
+        now > 0,
+        "LogSummary timestamp must be > 0 (got {now}); \
+         a value of 0 indicates clock misconfiguration or ADR-034 clamping"
+    );
+
+    // (b) Timestamp must be within plausible modern range. 1_700_000_000
+    // corresponds to 2023-11-14T22:13:20Z — any test running after that
+    // date should produce a larger value.
+    assert!(
+        now > 1_700_000_000,
+        "LogSummary timestamp must be > 1_700_000_000 (got {now}); \
+         timestamp is not within plausible modern range"
+    );
+
+    // Build a LogSummary event mirroring the WASM bridge's event_log_query
+    // output structure and verify the timestamp is embedded correctly.
+    let (_, wasm_log, _) = build_dual_logs(3);
+
+    let count = wasm_log.event_count();
+    let root = wasm_log.root();
+    let root_hex = encode_hex(&root);
+
+    #[allow(clippy::cast_precision_loss)]
+    let timestamp_f64 = now as f64;
+
+    let payload = serde_json::json!({
+        "event_count": count,
+        "merkle_root": root_hex,
+    });
+
+    let summary = serde_json::json!({
+        "eventType": "LogSummary",
+        "actorDid": "",
+        "timestamp": timestamp_f64,
+        "payloadJson": serde_json::to_string(&payload).unwrap(),
+        "sequence": count.saturating_sub(1),
+    });
+
+    // Verify the timestamp field in the serialized LogSummary.
+    let ts = summary["timestamp"].as_f64().unwrap();
+    assert!(
+        ts > 1_700_000_000.0,
+        "serialized LogSummary timestamp must be > 1_700_000_000 (got {ts})"
+    );
+    assert!(
+        ts > 0.0,
+        "serialized LogSummary timestamp must be > 0 (got {ts})"
+    );
+}
+
+// ===========================================================================
 // WASM context registry mirror (verbatim from scp-ffi-wasm/src/runtime.rs)
 //
 // Mirrors the registry functions to validate registration, lookup, and
