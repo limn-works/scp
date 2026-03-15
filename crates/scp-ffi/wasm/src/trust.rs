@@ -15,10 +15,13 @@
 //! with `wasm32-unknown-unknown`). Trust functions that require Ed25519
 //! signature verification (`trust_verify_attestation`, `trust_verify_response`)
 //! throw `SCP-TRUST-800x` errors to prevent silent false negatives — the
-//! TypeScript wrapper layer must implement these via `WebCrypto`. The query
-//! and challenge creation functions work fully using WASM-local state.
-//! `aggregate_trust_input` requires the full scp-core trust pipeline and
-//! must be implemented via the native (NAPI) bridge.
+//! TypeScript wrapper layer must implement these via `WebCrypto`.
+//! `verify_participation_requirements` is the exception: it performs Ed25519
+//! verification directly via `ed25519-dalek` (compiled to WASM) and does NOT
+//! require WebCrypto delegation. The query and challenge creation functions
+//! work fully using WASM-local state. `aggregate_trust_input` requires the
+//! full scp-core trust pipeline and must be implemented via the native (NAPI)
+//! bridge.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
