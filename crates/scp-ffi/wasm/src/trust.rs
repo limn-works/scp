@@ -398,11 +398,23 @@ pub fn verify_participation_requirements(
             })
             .collect();
 
-        // min_contexts: count distinct signer public keys.
+        // Threshold + min_contexts: count distinct signers only from profiles
+        // that satisfy the threshold. A profile that is fresh but below the
+        // threshold should NOT contribute to the min_contexts count.
         let mut distinct_signers = std::collections::HashSet::new();
         for p in &fresh_profiles {
-            distinct_signers.insert(&p.signer_public_key);
+            let value = requirement.fact.extract_value(p);
+            if requirement.threshold.is_satisfied(value) {
+                distinct_signers.insert(&p.signer_public_key);
+            }
         }
+
+        if distinct_signers.is_empty() {
+            return Err(ScpWasmError::validation(
+                "participation admission verification failed: threshold not met",
+            ));
+        }
+
         #[allow(clippy::cast_possible_truncation)]
         if (distinct_signers.len() as u32) < requirement.min_contexts {
             return Err(ScpWasmError::validation(&format!(
@@ -410,18 +422,6 @@ pub fn verify_participation_requirements(
                 requirement.min_contexts,
                 distinct_signers.len()
             )));
-        }
-
-        // Threshold: check that at least one fresh profile satisfies the threshold.
-        let any_satisfies = fresh_profiles.iter().any(|p| {
-            let value = requirement.fact.extract_value(p);
-            requirement.threshold.is_satisfied(value)
-        });
-
-        if !any_satisfies {
-            return Err(ScpWasmError::validation(
-                "participation admission verification failed: threshold not met",
-            ));
         }
     }
 
