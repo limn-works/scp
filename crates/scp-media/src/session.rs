@@ -98,6 +98,19 @@ impl MediaCapability {
             Self::ScreenShare => "media:screen_share",
         }
     }
+
+    /// Returns the corresponding [`ParamCapability`] enum variant.
+    ///
+    /// Converts this media capability to the typed `Capability` variant used
+    /// in context parameter ceilings. Prefer this over string comparison.
+    #[must_use]
+    pub const fn to_capability(&self) -> ParamCapability {
+        match self {
+            Self::Voice => ParamCapability::MediaVoice,
+            Self::Video => ParamCapability::MediaVideo,
+            Self::ScreenShare => ParamCapability::MediaScreenShare,
+        }
+    }
 }
 
 /// Lifecycle state of a [`MediaSession`].
@@ -186,11 +199,13 @@ pub fn check_media_capability(
     ceiling: &[ParamCapability],
     capability: &MediaCapability,
 ) -> Result<(), MediaError> {
-    let name = capability.ceiling_name();
-    if ceiling.iter().any(|c| c.name() == name) {
+    let expected = capability.to_capability();
+    if ceiling.contains(&expected) {
         Ok(())
     } else {
-        Err(MediaError::CapabilityNotInCeiling(name.to_owned()))
+        Err(MediaError::CapabilityNotInCeiling(
+            capability.ceiling_name().to_owned(),
+        ))
     }
 }
 
