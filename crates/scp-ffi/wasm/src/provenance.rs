@@ -268,7 +268,7 @@ pub fn evaluate_provenance_quality(
 /// - `memory_scope` — One of `"full"`, `"summary"`, `"ephemeral"`.
 /// - `counterparties_json` — JSON array of DID strings.
 /// - `target_context_id` — ID of the target context.
-/// - `existing_chain_depth` — Chain depth from existing provenance, or -1 for first hop.
+/// - `existing_chain_depth` — Chain depth from existing provenance, or `undefined`/`null` for first hop.
 /// - `existing_chain_path_json` — JSON array of context IDs from existing provenance, or empty.
 /// - `discovery_method` — Optional: `"OutOfBand"`, `"out_of_band"`, `"shared_context:<id>"`, or `"registry:<id>"`. `"none"`/`"None"` accepted for backward compat.
 /// - `purpose` — Optional human-readable purpose description.
@@ -293,7 +293,7 @@ pub fn evaluate_provenance_quality(
 /// ```js
 /// const prov = provenance_attach(
 ///   "ctx-source", "persistent", "full",
-///   '["did:key:alice"]', "ctx-target", -1, "[]",
+///   '["did:key:alice"]', "ctx-target", undefined, "[]",
 ///   "OutOfBand", null
 /// );
 /// ```
@@ -305,7 +305,7 @@ pub fn provenance_attach(
     memory_scope: String,
     counterparties_json: String,
     target_context_id: String,
-    existing_chain_depth: f64,
+    existing_chain_depth: Option<u32>,
     existing_chain_path_json: String,
     discovery_method: Option<String>,
     purpose: Option<String>,
@@ -341,24 +341,29 @@ pub fn provenance_attach(
 
     let dm = parse_wasm_discovery_method(discovery_method.as_deref())?;
 
-    // Compute chain depth and path
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (chain_depth, chain_path) = if existing_chain_depth < 0.0 {
-        // First hop
-        (0_u32, serde_json::Value::Null)
-    } else {
-        let prev_depth = existing_chain_depth.max(0.0) as u32;
-        let new_depth = prev_depth.saturating_add(1);
+    // Compute chain depth and path.
+    // When `existing_chain_depth` is `None` (JS `undefined`/`null`), this is
+    // the first hop: chain_depth starts at 0 and chain_path is null.
+    // When `Some(depth)`, depth is incremented by 1 and the source context is
+    // appended to the chain path — matching scp-core `compute_chain` semantics.
+    let (chain_depth, chain_path) = match existing_chain_depth {
+        None => {
+            // First hop — no existing provenance
+            (0_u32, serde_json::Value::Null)
+        }
+        Some(prev_depth) => {
+            let new_depth = prev_depth.saturating_add(1);
 
-        let mut path: Vec<String> =
-            serde_json::from_str(&existing_chain_path_json).map_err(|e| {
-                JsError::new(&format!(
-                    "[SCP-VALID-7215] existing_chain_path_json is not valid JSON: {e}"
-                ))
-            })?;
-        path.push(source_context_id.clone());
+            let mut path: Vec<String> =
+                serde_json::from_str(&existing_chain_path_json).map_err(|e| {
+                    JsError::new(&format!(
+                        "[SCP-VALID-7215] existing_chain_path_json is not valid JSON: {e}"
+                    ))
+                })?;
+            path.push(source_context_id.clone());
 
-        (new_depth, serde_json::json!(path))
+            (new_depth, serde_json::json!(path))
+        }
     };
 
     // WASM has no real timer — age is always 0 at attachment time.
@@ -771,7 +776,7 @@ mod tests {
             "full".to_owned(),
             "[\"did:key:alice\"]".to_owned(),
             "ctx-target".to_owned(),
-            -1.0,
+            None,
             "[]".to_owned(),
             None,
             None,
@@ -797,7 +802,7 @@ mod tests {
             "full".to_owned(),
             "[\"did:key:bob\"]".to_owned(),
             "ctx-target".to_owned(),
-            0.0,
+            Some(0),
             "[]".to_owned(),
             None,
             None,
@@ -819,7 +824,7 @@ mod tests {
             "full".to_owned(),
             "[]".to_owned(),
             "ctx-target".to_owned(),
-            -1.0,
+            None,
             "[]".to_owned(),
             Some("shared_context:ctx-shared".to_owned()),
             Some("data sharing".to_owned()),
@@ -839,7 +844,7 @@ mod tests {
             "full".to_owned(),
             "[]".to_owned(),
             "ctx-target".to_owned(),
-            -1.0,
+            None,
             "[]".to_owned(),
             Some("registry:ctx-registry".to_owned()),
             None,
@@ -859,7 +864,7 @@ mod tests {
                 "full".to_owned(),
                 "[]".to_owned(),
                 "ctx-target".to_owned(),
-                -1.0,
+                None,
                 "[]".to_owned(),
                 None,
                 None,
@@ -877,7 +882,7 @@ mod tests {
                 "full".to_owned(),
                 "[]".to_owned(),
                 "ctx-target".to_owned(),
-                -1.0,
+                None,
                 "[]".to_owned(),
                 None,
                 None,
@@ -895,7 +900,7 @@ mod tests {
                 "full".to_owned(),
                 "[]".to_owned(),
                 "ctx-target".to_owned(),
-                -1.0,
+                None,
                 "[]".to_owned(),
                 Some("invalid_method".to_owned()),
                 None,
@@ -1001,7 +1006,7 @@ mod tests {
             "full".to_owned(),
             "[\"did:key:alice\"]".to_owned(),
             "ctx-target".to_owned(),
-            -1.0,
+            None,
             "[]".to_owned(),
             None,
             None,
@@ -1022,7 +1027,7 @@ mod tests {
             "summary".to_owned(),
             "[]".to_owned(),
             "ctx-target".to_owned(),
-            -1.0,
+            None,
             "[]".to_owned(),
             None,
             None,
@@ -1042,7 +1047,7 @@ mod tests {
             "ephemeral".to_owned(),
             "[]".to_owned(),
             "ctx-target".to_owned(),
-            -1.0,
+            None,
             "[]".to_owned(),
             None,
             None,
