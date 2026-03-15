@@ -8518,11 +8518,11 @@ public func toolSessionClose(handle: ContextHandle, sessionId: String)async thro
  *
  * The session ID (UUID string).
  */
-public func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64)async throws  -> String  {
+public func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_create(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterUInt64.lower(ttlSeconds)
+                uniffi_scp_ffi_uniffi_fn_func_tool_session_create(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
