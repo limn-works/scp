@@ -55,6 +55,7 @@ describe("WASM bridge rejection paths", () => {
     // With rotateKeys=false (or undefined), the WASM bridge should proceed to
     // the actual WASM call — which will fail because WASM is not initialized.
     // The important thing is it does NOT throw a SCP-TRANS-5003 error.
+    expect.assertions(2);
     const wasmBridge = createWasmBridge();
     const fakeHandle = { contextId: "ctx-fake", state: "active", creatorDid: "did:dht:fake" };
 
@@ -68,6 +69,7 @@ describe("WASM bridge rejection paths", () => {
   });
 
   it("broadcastUnsubscribe with rotateKeys=undefined does not throw SCP-TRANS-5003", async () => {
+    expect.assertions(2);
     const wasmBridge = createWasmBridge();
     const fakeHandle = { contextId: "ctx-fake", state: "active", creatorDid: "did:dht:fake" };
 

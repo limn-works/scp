@@ -1369,41 +1369,6 @@ fn log_summary_timestamp_plausible_and_clamped() {
         "LogSummary timestamp must be > 1_700_000_000 (got {now}); \
          timestamp is not within plausible modern range"
     );
-
-    // Build a LogSummary event mirroring the WASM bridge's event_log_query
-    // output structure and verify the timestamp is embedded correctly.
-    let (_, wasm_log, _) = build_dual_logs(3);
-
-    let count = wasm_log.event_count();
-    let root = wasm_log.root();
-    let root_hex = encode_hex(&root);
-
-    #[allow(clippy::cast_precision_loss)]
-    let timestamp_f64 = now as f64;
-
-    let payload = serde_json::json!({
-        "event_count": count,
-        "merkle_root": root_hex,
-    });
-
-    let summary = serde_json::json!({
-        "eventType": "LogSummary",
-        "actorDid": "",
-        "timestamp": timestamp_f64,
-        "payloadJson": serde_json::to_string(&payload).unwrap(),
-        "sequence": count.saturating_sub(1),
-    });
-
-    // Verify the timestamp field in the serialized LogSummary.
-    let ts = summary["timestamp"].as_f64().unwrap();
-    assert!(
-        ts > 1_700_000_000.0,
-        "serialized LogSummary timestamp must be > 1_700_000_000 (got {ts})"
-    );
-    assert!(
-        ts > 0.0,
-        "serialized LogSummary timestamp must be > 0 (got {ts})"
-    );
 }
 
 // ===========================================================================
