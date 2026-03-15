@@ -585,8 +585,8 @@ pub fn py_bridge_seal_shadow_envelope(
     // Wrap raw key material in Zeroizing to prevent lingering in freed heap
     // memory after the Vec is dropped (defense-in-depth for FFI boundary).
     let sender_key_bytes = Zeroizing::new(sender_key_bytes);
-    let key_bytes: Zeroizing<[u8; 32]> =
-        Zeroizing::new(<[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
+    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
             ScpPyError::ValidationError {
                 message: format!(
                     "sender_key_bytes must be exactly 32 bytes, got {}",
@@ -594,7 +594,8 @@ pub fn py_bridge_seal_shadow_envelope(
                 ),
                 code: "SCP-VALID-7054".to_string(),
             }
-        })?);
+        })?,
+    );
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
     let shadow = ShadowIdentity {
@@ -700,8 +701,8 @@ pub fn py_bridge_open_shadow_envelope(
     // Wrap raw key material in Zeroizing to prevent lingering in freed heap
     // memory after the Vec is dropped (defense-in-depth for FFI boundary).
     let sender_key_bytes = Zeroizing::new(sender_key_bytes);
-    let key_bytes: Zeroizing<[u8; 32]> =
-        Zeroizing::new(<[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
+    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
             ScpPyError::ValidationError {
                 message: format!(
                     "sender_key_bytes must be exactly 32 bytes, got {}",
@@ -709,7 +710,8 @@ pub fn py_bridge_open_shadow_envelope(
                 ),
                 code: "SCP-VALID-7054".to_string(),
             }
-        })?);
+        })?,
+    );
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
     Ok(open_shadow_envelope(
@@ -753,8 +755,8 @@ pub fn py_bridge_derive_credential_key(
     bridge_id: &str,
 ) -> PyResult<Vec<u8>> {
     let bridge_credential_key = Zeroizing::new(bridge_credential_key);
-    let key_bytes: Zeroizing<[u8; 32]> =
-        Zeroizing::new(<[u8; 32]>::try_from(bridge_credential_key.as_slice()).map_err(|_| {
+    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        <[u8; 32]>::try_from(bridge_credential_key.as_slice()).map_err(|_| {
             ScpPyError::ValidationError {
                 message: format!(
                     "bridge_credential_key must be exactly 32 bytes, got {}",
@@ -762,7 +764,8 @@ pub fn py_bridge_derive_credential_key(
                 ),
                 code: "SCP-VALID-7057".to_string(),
             }
-        })?);
+        })?,
+    );
 
     let derived =
         derive_credential_key(&key_bytes, bridge_id).map_err(|e| ScpPyError::CryptoError {
@@ -1821,7 +1824,7 @@ mod tests {
             1,
             Some("msg-001".to_owned()),
             Some(1_700_000_000),
-            None, // attributed_role — defaults to "observer"
+            None,
         )
         .unwrap();
 

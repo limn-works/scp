@@ -419,9 +419,7 @@ async def apply_pending_ceiling_modification(
             code="SCP-CTX-2001",
         ) from exc
 
-    return _scp_core.py_apply_pending_ceiling_modification(
-        context._handle, current_timestamp
-    )
+    return _scp_core.py_apply_pending_ceiling_modification(context._handle, current_timestamp)
 
 
 async def finalize_close(context: Context) -> None:
