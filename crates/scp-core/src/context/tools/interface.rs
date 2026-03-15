@@ -413,6 +413,25 @@ impl RateLimit {
             Ok(false)
         }
     }
+
+    /// Returns the number of seconds until the current window resets.
+    ///
+    /// This is the `Retry-After` value per spec §6.2.0.2: the time a caller
+    /// must wait before the next call will be accepted. The value is rounded
+    /// up so callers never retry too early.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn retry_after_secs(&self) -> Result<u64, crate::time::ClockError> {
+        let now = crate::time::now_millis()?;
+        let window_ms = self.window.as_millis() as u64;
+        let elapsed = now.saturating_sub(self.window_start);
+        let remaining_ms = window_ms.saturating_sub(elapsed);
+        // Ceiling division: round up so callers never retry too early.
+        Ok(remaining_ms.div_ceil(1000))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +615,28 @@ impl PerCallerRateLimit {
         } else {
             Ok(false)
         }
+    }
+
+    /// Returns the number of seconds until the given caller's window resets.
+    ///
+    /// This is the `Retry-After` value per spec §6.2.0.2. Returns 0 if the
+    /// caller has no tracked state (i.e., has never called). The value is
+    /// rounded up so callers never retry too early.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn retry_after_secs_for(&self, caller_did: &DID) -> Result<u64, crate::time::ClockError> {
+        let now = crate::time::now_millis()?;
+        let window_ms = self.window.as_millis() as u64;
+        let Some(state) = self.callers.get(caller_did) else {
+            return Ok(0);
+        };
+        let elapsed = now.saturating_sub(state.window_start);
+        let remaining_ms = window_ms.saturating_sub(elapsed);
+        // Ceiling division: round up so callers never retry too early.
+        Ok(remaining_ms.div_ceil(1000))
     }
 }
 
@@ -949,9 +990,11 @@ where
     {
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = rate_limit.window.as_millis() as u64;
+        let retry_after_secs = rate_limit.retry_after_secs()?;
         return Err(ToolError::InterfaceRateLimited {
             max_calls: rate_limit.max_calls,
             window_ms,
+            retry_after_secs,
         });
     }
 
@@ -961,9 +1004,11 @@ where
         && !per_caller_rl.check_and_increment(invoker_did)?
     {
         let window_ms = per_caller_rl.window.as_millis() as u64;
+        let retry_after_secs = per_caller_rl.retry_after_secs_for(invoker_did)?;
         return Err(ToolError::InterfaceRateLimited {
             max_calls: per_caller_rl.max_calls_per_caller,
             window_ms,
+            retry_after_secs,
         });
     }
 
