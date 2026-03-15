@@ -27,10 +27,42 @@
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-#[cfg(feature = "allow_in_memory_custody")]
+use scp_identity::DidCache;
 use scp_identity::IdentityError;
+#[cfg(test)]
+use scp_identity::InMemoryDhtClient;
+#[cfg(not(test))]
+use scp_identity::PkarrDhtClient;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
-use scp_identity::{DidCache, InMemoryDhtClient};
+
+/// DHT client type alias: production builds use [`PkarrDhtClient`] for real
+/// Mainline DHT resolution; test builds use [`InMemoryDhtClient`] to avoid
+/// network I/O and enable deterministic identity roundtrips.
+#[cfg(not(test))]
+type FfiDhtClient = PkarrDhtClient;
+#[cfg(test)]
+type FfiDhtClient = InMemoryDhtClient;
+
+/// Constructs a new [`FfiDhtClient`].
+///
+/// Production builds create a [`PkarrDhtClient`] (fallible — Mainline DHT
+/// socket binding can fail). Test builds create an [`InMemoryDhtClient`]
+/// (infallible).
+macro_rules! new_ffi_dht_client {
+    () => {{
+        let result: Result<FfiDhtClient, IdentityError> = {
+            #[cfg(not(test))]
+            {
+                FfiDhtClient::new()
+            }
+            #[cfg(test)]
+            {
+                Ok(FfiDhtClient::new())
+            }
+        };
+        result
+    }};
+}
 use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -84,7 +116,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer(
     custody: &Arc<OpaqueInMemoryKeyCustody>,
-) -> DidDht<InMemoryDhtClient, scp_identity::cache::SystemClock> {
+) -> Result<DidDht<FfiDhtClient, scp_identity::cache::SystemClock>, IdentityError> {
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -105,11 +137,11 @@ fn make_dht_with_signer(
             Ok(sig.into_bytes())
         })
     });
-    DidDht::with_client_and_signer(
-        Arc::new(InMemoryDhtClient::new()),
+    Ok(DidDht::with_client_and_signer(
+        Arc::new(new_ffi_dht_client!()?),
         Arc::new(DidCache::new()),
         sign_fn,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,7 +1263,7 @@ impl Identity {
 
         #[cfg(feature = "allow_in_memory_custody")]
         if let Some(ref custody) = self.in_memory_custody {
-            let dht = make_dht_with_signer(custody);
+            let dht = make_dht_with_signer(custody)?;
             let (new_identity, new_document) = dht
                 .rotate(core_id, &custody.0)
                 .await
@@ -1360,7 +1392,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
-            let dht = make_dht_with_signer(&custody);
+            let dht = make_dht_with_signer(&custody)?;
 
             runtime()
                 .spawn(async move {
@@ -1448,7 +1480,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = self.in_memory_custody.clone();
-            let dht = make_dht_with_signer(custody);
+            let dht = make_dht_with_signer(custody)?;
 
             runtime()
                 .spawn(async move {
@@ -1534,7 +1566,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
-            let dht = make_dht_with_signer(&custody);
+            let dht = make_dht_with_signer(&custody)?;
 
             runtime()
                 .spawn(async move {
@@ -1849,17 +1881,17 @@ impl Drop for TransportManager {
 ///
 /// Ensures the global production DID resolver is initialized.
 ///
-/// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
+/// Creates a `DualLayerResolver` backed by [`FfiDhtClient`] and
 /// `NoOpRelayQuerier`. The resolver is shared across all UCAN validation
 /// calls. Idempotent: subsequent calls are no-ops.
 ///
 /// See #311 for the DID resolver unification design.
-fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) {
+fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) -> Result<(), ScpError> {
     if crate::runtime::did_resolver().is_some() {
-        return;
+        return Ok(());
     }
 
-    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let dht_client = Arc::new(new_ffi_dht_client!().map_err(ScpError::from)?);
     let relay_querier = Arc::new(NoOpRelayQuerier);
     let cache = Arc::new(DidCache::new());
     let bootstrap_relays = Vec::new();
@@ -1872,6 +1904,7 @@ fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) {
     ));
 
     crate::runtime::init_did_resolver(resolver, handle);
+    Ok(())
 }
 
 /// # In-memory custody (feature-gated)
@@ -1928,7 +1961,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
 
                         // Initialize the production DID resolver for UCAN
                         // validation (H4 — matching PyO3/NAPI behavior).
-                        ensure_did_resolver_initialized(tokio::runtime::Handle::current());
+                        ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
                         let handle = Arc::new(Identity {
                             did: identity.did.clone(),
@@ -2015,7 +2048,7 @@ pub async fn identity_create_with_custody(
                 .map_err(ScpError::from)?;
 
             // Initialize the production DID resolver for UCAN validation.
-            ensure_did_resolver_initialized(tokio::runtime::Handle::current());
+            ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
             let handle = Arc::new(Identity {
                 did: identity.did.clone(),
@@ -9599,7 +9632,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             .map_err(ScpError::from)?;
 
                         // Initialize the production DID resolver for UCAN validation.
-                        ensure_did_resolver_initialized(tokio::runtime::Handle::current());
+                        ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
                         let handle = Arc::new(Identity {
                             did: identity.did.clone(),
