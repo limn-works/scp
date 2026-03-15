@@ -166,9 +166,9 @@ class TestIdentity:
             # Migration succeeded — new identity should have a different DID
             assert new_identity.did != identity.did
             assert new_identity.did.startswith("did:dht:")
-        except Exception:
+        except _scp_core.IdentityError:
             # Migration may require pre-rotation commitment setup.
-            # The SDK wrapper must propagate the error, not crash.
+            # The SDK wrapper must propagate the error as IdentityError.
             pass
 
 
