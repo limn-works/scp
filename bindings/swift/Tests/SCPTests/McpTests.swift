@@ -7,69 +7,53 @@ import Testing
 /// Tests for MCP (Model Context Protocol) server and client operations:
 /// serveMcp, McpClient connect, list tools, and invoke.
 ///
-/// MCP operations do not yet have UniFFI bridge exports. The injectable
-/// bridge pattern provides testable stubs with descriptive error messages
-/// that will be replaced when the MCP Rust exports land.
-///
-/// Async roundtrip tests inject mock bridge functions to verify the delegation
-/// pattern works end-to-end.
+/// Server-side MCP operations use UniFFI-generated types (McpServerConfig,
+/// McpToolInfo, McpInvokeResult, McpAllowlistState in ScpBindings.swift).
+/// Client-side operations use the injectable bridge pattern with testable
+/// stubs.
 ///
 /// See ADR-015 (MCP), ADR-026 (Swift SDK), and story SCP-221.
 struct McpTests {
-    // MARK: - McpServerConfig type shape
+    // MARK: - McpServerConfig type shape (UniFFI-generated)
 
-    @Test("McpServerConfig stores context IDs and transport")
+    @Test("McpServerConfig stores identity DID, context IDs, and transport")
     func serverConfigFields() {
         let config = McpServerConfig(
+            identityDid: "did:dht:z6MkTest",
             contextIds: ["ctx-1", "ctx-2"],
-            transport: .stdio
+            transport: "stdio",
+            ucanToken: nil,
+            proofTokens: nil
         )
         #expect(config.contextIds.count == 2)
         #expect(config.contextIds[0] == "ctx-1")
+        #expect(config.identityDid == "did:dht:z6MkTest")
+        #expect(config.transport == "stdio")
     }
 
-    @Test("McpServerConfig with SSE transport stores port")
+    @Test("McpServerConfig with SSE transport stores mode string")
     func serverConfigSseTransport() {
         let config = McpServerConfig(
+            identityDid: "did:dht:z6MkTest",
             contextIds: ["ctx-1"],
-            transport: .sse(port: 8080)
+            transport: "sse",
+            ucanToken: nil,
+            proofTokens: nil
         )
-        if case let .sse(port) = config.transport {
-            #expect(port == 8080)
-        } else {
-            Issue.record("Expected SSE transport")
-        }
+        #expect(config.transport == "sse")
     }
 
-    @Test("McpServerConfig is Sendable")
-    func serverConfigIsSendable() {
-        let config: any Sendable = McpServerConfig(
-            contextIds: ["ctx"],
-            transport: .stdio
+    @Test("McpServerConfig with UCAN token and proofs")
+    func serverConfigWithUcan() {
+        let config = McpServerConfig(
+            identityDid: "did:dht:z6MkTest",
+            contextIds: ["ctx-1"],
+            transport: "stdio",
+            ucanToken: "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9...",
+            proofTokens: ["proof-1", "proof-2"]
         )
-        #expect(config is McpServerConfig)
-    }
-
-    // MARK: - McpTransportType type shape
-
-    @Test("McpTransportType stdio variant")
-    func transportTypeStdio() {
-        let transport = McpTransportType.stdio
-        if case .stdio = transport {
-            // Matches expected variant
-        } else {
-            Issue.record("Expected stdio transport type")
-        }
-    }
-
-    @Test("McpTransportType sse variant with port")
-    func transportTypeSse() {
-        let transport = McpTransportType.sse(port: 3000)
-        if case let .sse(port) = transport {
-            #expect(port == 3000)
-        } else {
-            Issue.record("Expected sse transport type")
-        }
+        #expect(config.ucanToken == "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9...")
+        #expect(config.proofTokens?.count == 2)
     }
 
     // MARK: - McpClientConfig type shape
@@ -174,8 +158,11 @@ struct McpTests {
         }
 
         let config = McpServerConfig(
+            identityDid: "did:dht:z6MkTest",
             contextIds: ["ctx-1", "ctx-2"],
-            transport: .stdio
+            transport: "stdio",
+            ucanToken: nil,
+            proofTokens: nil
         )
         try await serveMcp(config: config, serveFn: mockServe)
 
@@ -185,7 +172,13 @@ struct McpTests {
 
     @Test("serveMcp default throws awaiting UniFFI export")
     func serveMcpDefaultThrows() async {
-        let config = McpServerConfig(contextIds: ["ctx-1"], transport: .stdio)
+        let config = McpServerConfig(
+            identityDid: "did:dht:z6MkTest",
+            contextIds: ["ctx-1"],
+            transport: "stdio",
+            ucanToken: nil,
+            proofTokens: nil
+        )
         do {
             try await serveMcp(config: config)
             Issue.record("Expected serveMcp to throw")

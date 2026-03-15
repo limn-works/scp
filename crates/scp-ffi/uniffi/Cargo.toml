@@ -44,6 +44,7 @@ hex = { workspace = true }
 # The `allow_in_memory_custody` feature above adds `scp-platform/testing`
 # for dev/test/desktop builds only.
 scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting"] }
+scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }

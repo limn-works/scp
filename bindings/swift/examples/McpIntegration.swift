@@ -1,8 +1,7 @@
 // MCP integration: expose SCP tools via MCP and consume external MCP servers.
 //
-// Demonstrates the McpServerConfig, McpClient, and serveMcp APIs using the
-// actual SCP Swift SDK surface. Note: MCP bridge functions are not yet wired
-// to UniFFI (see Mcp.swift) — this example shows the intended API shape.
+// Demonstrates the McpServerConfig (UniFFI-generated), McpClient, and serveMcp
+// APIs using the actual SCP Swift SDK surface.
 
 import Foundation
 import SCP
@@ -39,8 +38,11 @@ struct McpIntegration {
         // Note: serveMcp takes an McpServerConfig, not a Context.
         // The bridge function is not yet wired — this will throw SCP-MCP-10001.
         let serverConfig = McpServerConfig(
+            identityDid: identity.did(),
             contextIds: [handle.contextId()],
-            transport: .stdio
+            transport: "stdio",
+            ucanToken: nil,
+            proofTokens: nil
         )
         do {
             try await serveMcp(config: serverConfig)
