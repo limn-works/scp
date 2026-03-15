@@ -1,6 +1,7 @@
 //! `PyO3` bridge functions for provenance operations.
 //!
-//! Exposes SCP provenance types and quality evaluation to Python:
+//! Exposes SCP provenance types, quality evaluation, and privacy operations
+//! to Python:
 //!
 //! - [`py_evaluate_provenance_quality`] -- Evaluate the provenance quality tier
 //!   for a given provenance record and source context state.
@@ -8,6 +9,11 @@
 //!   boundaries.
 //! - [`py_provenance_check_chain_depth`] -- Check whether a provenance chain
 //!   depth is within the allowed limit.
+//! - [`py_provenance_redact_counterparties`] -- Remove counterparty DIDs (§24.3.5).
+//! - [`py_provenance_pseudonymize_counterparties`] -- Replace DIDs with
+//!   pseudonyms (§24.3.5).
+//! - [`py_provenance_update_source_type`] -- Update source type for state
+//!   changes (ADR-019 AC5).
 //!
 //! See spec section 24 (Provenance System) and ADR-019.
 
@@ -17,8 +23,9 @@ use pyo3::types::PyDict;
 use scp_core::context::MemoryScope;
 use scp_core::provenance::attach::{
     DEFAULT_MAX_CHAIN_DEPTH, SourceContextInfo, attach_provenance, check_chain_depth,
+    pseudonymize_counterparties, redact_counterparties,
 };
-use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality};
+use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality, update_source_type};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
 use crate::error::ScpPyError;
@@ -155,6 +162,112 @@ pub fn py_provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -
     check_chain_depth(&prov, max).is_ok()
 }
 
+/// Redacts counterparties from a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record, removes all counterparty DIDs,
+/// and returns the modified record as a JSON string.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if `provenance_json` is not valid JSON or cannot
+/// be deserialized as a `DataProvenance` record.
+#[pyfunction]
+#[pyo3(name = "provenance_redact_counterparties")]
+pub fn py_provenance_redact_counterparties(provenance_json: &str) -> PyResult<String> {
+    let mut prov: DataProvenance =
+        serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_string(),
+        })?;
+
+    redact_counterparties(&mut prov);
+
+    serde_json::to_string(&prov).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("failed to serialize provenance: {e}"),
+            code: "SCP-VALID-7051".to_string(),
+        }
+        .into()
+    })
+}
+
+/// Pseudonymizes counterparties in a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record and a pseudonym key (as a
+/// hex-encoded string). Replaces real counterparty DIDs with deterministic
+/// context-scoped pseudonyms derived from the key. Returns the modified
+/// record as a JSON string.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if `provenance_json` is not valid JSON, cannot
+/// be deserialized as a `DataProvenance` record, or if `pseudonym_key_hex`
+/// is not valid hex.
+#[pyfunction]
+#[pyo3(name = "provenance_pseudonymize_counterparties")]
+pub fn py_provenance_pseudonymize_counterparties(
+    provenance_json: &str,
+    pseudonym_key_hex: &str,
+) -> PyResult<String> {
+    let mut prov: DataProvenance =
+        serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_string(),
+        })?;
+
+    let key = hex::decode(pseudonym_key_hex).map_err(|e| ScpPyError::ValidationError {
+        message: format!("invalid pseudonym_key_hex: {e}"),
+        code: "SCP-VALID-7052".to_string(),
+    })?;
+
+    pseudonymize_counterparties(&mut prov, &key);
+
+    serde_json::to_string(&prov).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("failed to serialize provenance: {e}"),
+            code: "SCP-VALID-7051".to_string(),
+        }
+        .into()
+    })
+}
+
+/// Updates the source type of a provenance record to reflect a new context
+/// state (ADR-019 AC5).
+///
+/// Accepts a JSON-serialized provenance record and a context state string.
+/// Updates the `source_type` field to match the new state and returns the
+/// modified record as a JSON string.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if `provenance_json` is not valid JSON, cannot
+/// be deserialized as a `DataProvenance` record, or if `new_state` is not
+/// a recognized context state value.
+#[pyfunction]
+#[pyo3(name = "provenance_update_source_type")]
+pub fn py_provenance_update_source_type(
+    provenance_json: &str,
+    new_state: &str,
+) -> PyResult<String> {
+    let mut prov: DataProvenance =
+        serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_string(),
+        })?;
+
+    let state = parse_context_state(new_state)?;
+
+    update_source_type(&mut prov, &state);
+
+    serde_json::to_string(&prov).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("failed to serialize provenance: {e}"),
+            code: "SCP-VALID-7051".to_string(),
+        }
+        .into()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -243,6 +356,12 @@ pub fn register_provenance(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_evaluate_provenance_quality, m)?)?;
     m.add_function(wrap_pyfunction!(py_provenance_attach, m)?)?;
     m.add_function(wrap_pyfunction!(py_provenance_check_chain_depth, m)?)?;
+    m.add_function(wrap_pyfunction!(py_provenance_redact_counterparties, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_provenance_pseudonymize_counterparties,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(py_provenance_update_source_type, m)?)?;
     Ok(())
 }
 
@@ -331,5 +450,147 @@ mod tests {
     fn check_chain_depth_exceeds_limit() {
         assert!(!py_provenance_check_chain_depth(4, None));
         assert!(!py_provenance_check_chain_depth(2, Some(1)));
+    }
+
+    #[test]
+    fn redact_counterparties_removes_dids() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice", "did:dht:z6MkBob"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result = py_provenance_redact_counterparties(&prov_json.to_string()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["counterparties"], serde_json::json!([]));
+        assert_eq!(parsed["source_context"], "ctx-test");
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_produces_deterministic_pseudonyms() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let key_hex = hex::encode(b"test-key");
+        let result1 =
+            py_provenance_pseudonymize_counterparties(&prov_json.to_string(), &key_hex).unwrap();
+        let result2 =
+            py_provenance_pseudonymize_counterparties(&prov_json.to_string(), &key_hex).unwrap();
+
+        // Deterministic: same input → same output
+        assert_eq!(result1, result2);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        let parties = parsed["counterparties"].as_array().unwrap();
+        assert_eq!(parties.len(), 1);
+        assert!(parties[0].as_str().unwrap().starts_with("did:pseudo:"));
+    }
+
+    #[test]
+    fn update_source_type_changes_type() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result =
+            py_provenance_update_source_type(&prov_json.to_string(), "closed_ephemeral").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Ephemeral");
+    }
+
+    #[test]
+    fn update_source_type_preserves_on_unknown() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Summary",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result = py_provenance_update_source_type(&prov_json.to_string(), "unknown").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Summary");
+    }
+
+    #[test]
+    fn redact_counterparties_invalid_json_fails() {
+        assert!(py_provenance_redact_counterparties("not json").is_err());
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_invalid_hex_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        assert!(
+            py_provenance_pseudonymize_counterparties(&prov_json.to_string(), "not-hex-zz")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn update_source_type_invalid_state_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        assert!(py_provenance_update_source_type(&prov_json.to_string(), "invalid_state").is_err());
     }
 }

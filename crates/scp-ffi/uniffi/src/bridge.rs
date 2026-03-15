@@ -6693,6 +6693,123 @@ pub fn provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> b
     scp_core::provenance::attach::check_chain_depth(&prov, max).is_ok()
 }
 
+/// Redacts counterparties from a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record, removes all counterparty DIDs,
+/// and returns the modified record as a JSON string.
+///
+/// # Errors
+///
+/// Returns [`ScpError::Validation`] if the JSON is invalid or cannot be
+/// deserialized as a provenance record.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
+pub fn provenance_redact_counterparties(provenance_json: String) -> Result<String, ScpError> {
+    let mut prov: scp_core::provenance::DataProvenance = serde_json::from_str(&provenance_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+
+    scp_core::provenance::attach::redact_counterparties(&mut prov);
+
+    serde_json::to_string(&prov).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize provenance: {e}"),
+        code: "SCP-VALID-7051".to_owned(),
+    })
+}
+
+/// Pseudonymizes counterparties in a provenance record (§24.3.5).
+///
+/// Accepts a JSON-serialized provenance record and a hex-encoded pseudonym key.
+/// Replaces real counterparty DIDs with deterministic context-scoped pseudonyms.
+/// Returns the modified record as a JSON string.
+///
+/// # Errors
+///
+/// Returns [`ScpError::Validation`] if the JSON is invalid, cannot be
+/// deserialized as a provenance record, or if `pseudonym_key_hex` is not
+/// valid hex.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
+pub fn provenance_pseudonymize_counterparties(
+    provenance_json: String,
+    pseudonym_key_hex: String,
+) -> Result<String, ScpError> {
+    let mut prov: scp_core::provenance::DataProvenance = serde_json::from_str(&provenance_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+
+    let key = hex::decode(&pseudonym_key_hex).map_err(|e| ScpError::Validation {
+        msg: format!("invalid pseudonym_key_hex: {e}"),
+        code: "SCP-VALID-7052".to_owned(),
+    })?;
+
+    scp_core::provenance::attach::pseudonymize_counterparties(&mut prov, &key);
+
+    serde_json::to_string(&prov).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize provenance: {e}"),
+        code: "SCP-VALID-7051".to_owned(),
+    })
+}
+
+/// Updates the source type of a provenance record to reflect a new context
+/// state (ADR-019 AC5).
+///
+/// Accepts a JSON-serialized provenance record and a context state string.
+/// Returns the modified record as a JSON string.
+///
+/// # Errors
+///
+/// Returns [`ScpError::Validation`] if the JSON is invalid, cannot be
+/// deserialized as a provenance record, or if `new_state` is not a
+/// recognized context state value.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
+pub fn provenance_update_source_type(
+    provenance_json: String,
+    new_state: String,
+) -> Result<String, ScpError> {
+    use scp_core::provenance::evaluate::{SourceContextState, update_source_type};
+
+    let mut prov: scp_core::provenance::DataProvenance = serde_json::from_str(&provenance_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid provenance JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+
+    let state = match new_state.as_str() {
+        "active" => SourceContextState::Active,
+        "closed_with_summary_verified" => SourceContextState::ClosedWithSummary {
+            summary_verified: true,
+        },
+        "closed_with_summary_unverified" => SourceContextState::ClosedWithSummary {
+            summary_verified: false,
+        },
+        "closed_ephemeral" => SourceContextState::ClosedEphemeral,
+        "unknown" => SourceContextState::Unknown,
+        other => {
+            return Err(ScpError::Validation {
+                msg: format!(
+                    "invalid context_state '{other}': expected 'active', \
+                     'closed_with_summary_verified', 'closed_with_summary_unverified', \
+                     'closed_ephemeral', or 'unknown'"
+                ),
+                code: "SCP-VALID-7053".to_owned(),
+            });
+        }
+    };
+
+    update_source_type(&mut prov, &state);
+
+    serde_json::to_string(&prov).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize provenance: {e}"),
+        code: "SCP-VALID-7051".to_owned(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Media — session lifecycle and signaling (#597)
 // ---------------------------------------------------------------------------
@@ -9881,6 +9998,109 @@ mod tests {
         );
     }
 
+    // -- provenance privacy functions (#585) ---------------------------------
+
+    #[test]
+    fn provenance_redact_counterparties_removes_dids() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice", "did:dht:z6MkBob"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result = provenance_redact_counterparties(prov_json.to_string()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["counterparties"], serde_json::json!([]));
+        assert_eq!(parsed["source_context"], "ctx-test");
+    }
+
+    #[test]
+    fn provenance_pseudonymize_counterparties_deterministic() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let key_hex = hex::encode(b"test-key");
+        let result1 =
+            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex.clone()).unwrap();
+        let result2 =
+            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex).unwrap();
+        assert_eq!(result1, result2);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        let parties = parsed["counterparties"].as_array().unwrap();
+        assert_eq!(parties.len(), 1);
+        assert!(parties[0].as_str().unwrap().starts_with("did:pseudo:"));
+    }
+
+    #[test]
+    fn provenance_update_source_type_changes_type() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        let result =
+            provenance_update_source_type(prov_json.to_string(), "closed_ephemeral".to_owned())
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source_type"], "Ephemeral");
+    }
+
+    #[test]
+    fn provenance_redact_counterparties_invalid_json_fails() {
+        assert!(provenance_redact_counterparties("not json".to_owned()).is_err());
+    }
+
+    #[test]
+    fn provenance_pseudonymize_counterparties_invalid_hex_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": ["did:dht:z6MkAlice"],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        assert!(
+            provenance_pseudonymize_counterparties(prov_json.to_string(), "not-hex-zz".to_owned())
+                .is_err()
+        );
+    }
+
     #[test]
     fn media_verify_sender_attribution_mismatch() {
         let (_, msg) = scp_media::signaling::create_offer(
@@ -9895,5 +10115,26 @@ mod tests {
         let result =
             media_verify_sender_attribution(json, "did:dht:zEve".to_owned());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn provenance_update_source_type_invalid_state_fails() {
+        let prov_json = serde_json::json!({
+            "source_context": "ctx-test",
+            "source_type": "Persistent",
+            "counterparties": [],
+            "purpose": null,
+            "discovery_method": "OutOfBand",
+            "age": { "secs": 0, "nanos": 0 },
+            "memory_scope": "Full",
+            "chain_depth": 0,
+            "chain_path": null,
+            "payment_amount": null,
+            "payment_adapter": null,
+            "payment_receipt_id": null
+        });
+        assert!(
+            provenance_update_source_type(prov_json.to_string(), "invalid".to_owned()).is_err()
+        );
     }
 }
