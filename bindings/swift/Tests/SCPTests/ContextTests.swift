@@ -337,13 +337,16 @@ struct ContextTests {
         #expect(received[1].provenance?.sourceContext == "other-ctx")
     }
 
-    @Test("messages stream finishes on error")
+    @Test("messages stream finishes on error and stores lastError")
     func messagesStreamFinishesOnError() async throws {
         let capturedListener = Locked<(any MessageListener)?>(nil)
 
         let context = makeTestContext(captureListener: { listener in
             capturedListener.withLock { $0 = listener }
         })
+
+        // lastError is nil before any error
+        #expect(await context.lastError == nil)
 
         let stream = try await context.messages
 
@@ -376,6 +379,119 @@ struct ContextTests {
 
         #expect(received.count == 1)
         #expect(received[0].senderDid == "did:dht:alice")
+
+        // lastError is set after stream terminates due to error
+        let lastError = await context.lastError
+        guard case let .Transport(message, code) = lastError else {
+            Issue.record("Expected ScpError.Transport, got \(String(describing: lastError))")
+            return
+        }
+        #expect(message == "connection lost")
+        #expect(code == "SCP-TRANS-5001")
+    }
+
+    @Test("lastError is nil after clean stream close")
+    func lastErrorNilAfterCleanClose() async throws {
+        let capturedListener = Locked<(any MessageListener)?>(nil)
+
+        let context = makeTestContext(captureListener: { listener in
+            capturedListener.withLock { $0 = listener }
+        })
+
+        let stream = try await context.messages
+
+        var listener: (any MessageListener)?
+        for _ in 0 ..< 100 {
+            listener = capturedListener.current
+            if listener != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        guard let resolvedListener = listener else {
+            Issue.record("Listener was not captured")
+            return
+        }
+
+        // Push a message then complete normally (no error)
+        resolvedListener.onMessage(message: makeTestMessage(
+            sender: "did:dht:alice",
+            payload: "clean-close"
+        ))
+        resolvedListener.onComplete()
+
+        var received: [Message] = []
+        for await message in stream {
+            received.append(message)
+        }
+
+        #expect(received.count == 1)
+
+        // lastError should remain nil — clean close, not an error
+        #expect(await context.lastError == nil)
+    }
+
+    @Test("re-subscribing via messages clears lastError")
+    func resubscribeClearsLastError() async throws {
+        // Mutable listener capture — each subscribe call sets a new listener.
+        let capturedListener = Locked<(any MessageListener)?>(nil)
+
+        let context = makeTestContext(captureListener: { listener in
+            capturedListener.withLock { $0 = listener }
+        })
+
+        // --- First stream: trigger an error ---
+        let stream1 = try await context.messages
+
+        var listener: (any MessageListener)?
+        for _ in 0 ..< 100 {
+            listener = capturedListener.current
+            if listener != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard let listener1 = listener else {
+            Issue.record("Listener was not captured for first stream")
+            return
+        }
+
+        listener1.onError(error: ScpError.Transport(
+            msg: "connection lost",
+            code: "SCP-TRANS-5001"
+        ))
+
+        // Consume the first stream to completion (triggers onTermination).
+        for await _ in stream1 {}
+
+        // Verify lastError is set from the first stream's error.
+        let errorAfterFirst = await context.lastError
+        #expect(errorAfterFirst != nil)
+
+        // Wait for onTermination to clear streamContinuation so re-subscribe
+        // doesn't throw SCP-CTX-2003.
+        for _ in 0 ..< 100 {
+            do {
+                // Reset captured listener so we can detect the new one.
+                capturedListener.withLock { $0 = nil }
+                let stream2 = try await context.messages
+
+                // lastError must be nil — streamError.reset() was called.
+                #expect(await context.lastError == nil)
+
+                // Clean up: finish the second stream.
+                var listener2: (any MessageListener)?
+                for _ in 0 ..< 100 {
+                    listener2 = capturedListener.current
+                    if listener2 != nil { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                listener2?.onComplete()
+                for await _ in stream2 {}
+                return
+            } catch {
+                // streamContinuation not yet cleared — wait and retry.
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        Issue.record("Failed to re-subscribe: streamContinuation was never cleared")
     }
 
     // MARK: - Leave tests

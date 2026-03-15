@@ -102,6 +102,38 @@ public enum ContextBridge {
     }
 }
 
+// MARK: - SharedError
+
+/// Thread-safe container for the last error received by a message stream.
+///
+/// `MessageListenerAdapter` writes the error from the Rust callback thread;
+/// the `Context` actor reads it from its own isolation domain. `NSLock`
+/// provides the cross-isolation synchronization. This is `@unchecked Sendable`
+/// because access is guarded by the lock — see `.docs/adrs/phase-5.md`
+/// §ADR-026 acceptance criterion 11.
+private final class SharedError: @unchecked Sendable {
+    private var error: ScpError?
+    private let lock = NSLock()
+
+    func set(_ error: ScpError) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.error = error
+    }
+
+    func get() -> ScpError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return error
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        error = nil
+    }
+}
+
 // MARK: - MessageListenerAdapter
 
 /// Adapts the UniFFI ``MessageListener`` callback interface to an
@@ -114,26 +146,27 @@ public enum ContextBridge {
 /// Note: This class uses `@unchecked Sendable` because it is accessed from the
 /// Rust callback thread (via UniFFI) and the actor-isolated stream consumer.
 /// The `AsyncStream.Continuation` it wraps is itself thread-safe (documented
-/// by Apple as safe to call from any context). See `.docs/standards/swift.md`
-/// for the UniFFI callback exception to the `@unchecked Sendable` prohibition.
+/// by Apple as safe to call from any context). See `.docs/adrs/phase-5.md`
+/// §ADR-026 acceptance criterion 11.
 ///
 /// See ADR-026 §`MessageListenerAdapter` for the design.
 private final class MessageListenerAdapter: MessageListener, @unchecked Sendable {
     private let continuation: AsyncStream<Message>.Continuation
+    private let sharedError: SharedError
 
-    init(continuation: AsyncStream<Message>.Continuation) {
+    init(continuation: AsyncStream<Message>.Continuation, sharedError: SharedError) {
         self.continuation = continuation
+        self.sharedError = sharedError
     }
 
     func onMessage(message: Message) {
         continuation.yield(message)
     }
 
-    func onError(error _: ScpError) {
-        // Finish the stream on error. Consumers detect end-of-stream via
-        // the `for await` loop terminating. The specific error is not
-        // propagated through AsyncStream (which has no error channel);
-        // consumers should check context state if they need error details.
+    func onError(error: ScpError) {
+        // Store the error so consumers can distinguish connection failures
+        // from clean stream termination via `Context.lastError`.
+        sharedError.set(error)
         continuation.finish()
     }
 
@@ -187,6 +220,20 @@ public actor Context {
     /// The current lifecycle state of this context.
     public internal(set) var state: ContextState
 
+    /// The last error received by the message stream, if any.
+    ///
+    /// When the message subscription encounters an error (e.g. a transport
+    /// failure), ``MessageListenerAdapter/onError(error:)`` stores it here
+    /// before finishing the stream. Consumers can check this property after
+    /// the `for await` loop terminates to distinguish connection failures
+    /// from clean stream close.
+    ///
+    /// The value is `nil` when no error has occurred, or when the stream
+    /// ended normally via ``onComplete()``, ``leave()``, or ``close()``.
+    public var lastError: ScpError? {
+        streamError.get()
+    }
+
     // MARK: - Internal state
 
     /// The identity of the local participant in this context.
@@ -204,6 +251,11 @@ public actor Context {
     /// The continuation for the active message stream, if any.
     /// Retained so that ``close()`` and ``leave()`` can finish the stream.
     private var streamContinuation: AsyncStream<Message>.Continuation?
+
+    /// Thread-safe error storage shared with ``MessageListenerAdapter``.
+    /// The adapter writes errors from the Rust callback thread; the actor
+    /// reads them via the ``lastError`` computed property.
+    private let streamError = SharedError()
 
     /// Whether ``close()`` or ``leave()`` has already been called.
     /// Checked in `deinit` to avoid redundant cleanup. Marked
@@ -423,6 +475,20 @@ public actor Context {
     /// yields ``Message`` values as they arrive and finishes when the context
     /// is closed, left, or the subscription encounters an error.
     ///
+    /// When the stream terminates due to an error (e.g. a transport failure),
+    /// the error is stored in ``lastError``. Check this property after the
+    /// `for await` loop exits to distinguish error termination from clean close:
+    ///
+    /// ```swift
+    /// let stream = try await context.messages
+    /// for await message in stream {
+    ///     print(message.senderDid, message.payload)
+    /// }
+    /// if let error = await context.lastError {
+    ///     // Connection failure or subscription error
+    /// }
+    /// ```
+    ///
     /// Only one active message stream per context is supported. Accessing this
     /// property while a previous stream is still active throws
     /// ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2003"`.
@@ -457,6 +523,7 @@ public actor Context {
                 )
             }
 
+            streamError.reset()
             let (stream, continuation) = AsyncStream<Message>.makeStream()
             streamContinuation = continuation
             continuation.onTermination = { [weak self] _ in
@@ -465,7 +532,7 @@ public actor Context {
                 guard let self else { return }
                 Task { await self.clearStreamContinuation() }
             }
-            let listener = MessageListenerAdapter(continuation: continuation)
+            let listener = MessageListenerAdapter(continuation: continuation, sharedError: streamError)
             subscribeFn(handle, listener)
             return stream
         }
