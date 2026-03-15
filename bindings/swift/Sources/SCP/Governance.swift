@@ -1134,7 +1134,7 @@ public extension Context {
     ///   - createFn: Bridge function override for testing.
     /// - Returns: JSON string with the ``ContextCheckpoint`` object.
     /// - Throws: ``ScpError/Context(msg:code:)`` if creation fails.
-    func createGovernanceCheckpoint( // swiftlint:disable:this function_parameter_count
+    func createGovernanceCheckpoint(
         checkpointSeq: UInt64,
         merkleRootHex: String,
         eventCount: UInt64,
