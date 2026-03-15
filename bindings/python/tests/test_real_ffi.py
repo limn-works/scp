@@ -695,26 +695,44 @@ class TestMigrate:
 
     async def test_migrate_returns_new_identity(self):
         """migrate on a valid identity should return a new handle (or raise
-        a descriptive error if pre-rotation is not yet set up)."""
+        a descriptive IdentityError if pre-rotation is not yet set up)."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         try:
             result = _scp_core.py_identity_migrate(alice._handle)
             # If migration succeeds, the new identity should have a different DID.
             assert result.did != alice.did
-        except Exception:
+        except _scp_core.IdentityError:
             # Expected: migration may require pre-rotation commitment setup.
+            # The error should be an IdentityError, not a generic exception.
             pass
 
     async def test_migrate_invalid_handle(self):
-        """migrate with a fabricated handle should raise an error."""
-        # Create a minimal PyIdentity-like object with an unknown DID —
-        # the FFI should reject it because the DID is not in the registry.
+        """migrate with an unregistered DID should raise IdentityError.
+
+        PyIdentity is #[pyclass(frozen)] — attributes are read-only. Instead
+        of mutating the handle, we migrate first (which removes the old DID
+        from the registry) then call migrate again with the stale handle.
+        """
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        # Mutate the DID to an unregistered one to trigger the error path.
-        original_did = alice._handle.did
-        try:
+        old_handle = alice._handle
+
+        # Verify PyIdentity is frozen — attributes cannot be set.
+        with pytest.raises(AttributeError):
             alice._handle.did = "did:dht:z6MkNotRegistered0000000000"
-            with pytest.raises(Exception):
-                _scp_core.py_identity_migrate(alice._handle)
-        finally:
-            alice._handle.did = original_did
+
+        # First migrate removes old_handle's DID from the registry.
+        # It may itself fail (e.g., missing pre-rotation commitment),
+        # so we handle that case too.
+        try:
+            _scp_core.py_identity_migrate(old_handle)
+        except _scp_core.IdentityError:
+            # First migrate failed — old_handle DID is still registered.
+            # We can't test the "not in registry" path without removing it,
+            # so just verify the error type is correct and return.
+            return
+
+        # If first migrate succeeded, old_handle's DID was removed from
+        # the registry. Calling migrate again with the stale handle should
+        # raise IdentityError because the DID is no longer registered.
+        with pytest.raises(_scp_core.IdentityError, match="not found in registry"):
+            _scp_core.py_identity_migrate(old_handle)
