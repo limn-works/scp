@@ -1105,13 +1105,7 @@ public extension Context {
                 code: "SCP-CTX-2060"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await applyFn(contextHandle, currentTimestamp)
+        return try await applyFn(handle, currentTimestamp)
     }
 
     /// Finalizes the cooperative close flow for a context in ``Closing`` state.
@@ -1123,13 +1117,7 @@ public extension Context {
         finalizeFn: GovernanceBridge.FinalizeCloseFn =
             GovernanceBridge.defaultFinalizeClose
     ) async throws {
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await finalizeFn(contextHandle)
+        try await finalizeFn(handle)
     }
 
     // swiftlint:disable function_parameter_count
@@ -1163,14 +1151,8 @@ public extension Context {
                 code: "SCP-CTX-2062"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
         return try await createFn(
-            contextHandle, checkpointSeq, merkleRootHex, eventCount,
+            handle, checkpointSeq, merkleRootHex, eventCount,
             lastEventHashHex, stateSnapshotHashHex, creatorDid,
             creatorSignatureHex
         )
@@ -1200,13 +1182,7 @@ public extension Context {
                 code: "SCP-CTX-2063"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await addFn(contextHandle, checkpointJson, signerDid, signatureHex)
+        return try await addFn(handle, checkpointJson, signerDid, signatureHex)
     }
 }
 
