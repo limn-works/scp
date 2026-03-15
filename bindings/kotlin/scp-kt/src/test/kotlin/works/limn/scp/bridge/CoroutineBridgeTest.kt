@@ -272,7 +272,7 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
-    // Dispatcher assignment tests — tool session operations
+    // Dispatcher assignment tests — tool session + cross-context operations
     // -------------------------------------------------------------------
 
     @Nested
@@ -882,6 +882,7 @@ class StubNativeBindings : NativeBindings {
         interfaceIdHex: String,
     ): String = """{"revoked":true}"""
 
+    @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
@@ -915,6 +916,7 @@ class StubNativeBindings : NativeBindings {
         return toolSessionCreateResult
     }
 
+    @Suppress("LongParameterList")
     override fun toolSessionInvoke(
         contextHandle: Long,
         sessionId: String,

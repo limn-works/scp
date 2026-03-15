@@ -12,7 +12,7 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { IdentityError, TransportError } from "../errors";
+import { IdentityError, ToolError, TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -1086,6 +1086,61 @@ export function createWasmBridge(): Bridge {
     ): Promise<string> {
       const wasm = getWasm();
       return await wasm.tool_interface_revoke(handle, interfaceIdHex);
+    },
+
+    // Cross-context tool invocation (spec section 6.2) — not available in WASM (ADR-034)
+    async toolInvokeCrossContext(
+      _sourceHandle: BridgeContextHandle,
+      _targetHandle: BridgeContextHandle,
+      _toolId: string,
+      _inputJson: string,
+      _invokerDid: string,
+      _ucanToken: string,
+      _chainDepth: number,
+      _proofTokens?: readonly string[],
+    ): Promise<string> {
+      throw new ToolError(
+        "toolInvokeCrossContext is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for cross-context tool invocation.",
+        "SCP-TOOL-6040",
+      );
+    },
+
+    // Stateful tool sessions (spec section 6.2.1) — not available in WASM (ADR-034)
+    async toolSessionCreate(
+      _handle: BridgeContextHandle,
+      _toolId: string,
+      _sourceContextId: string,
+      _ttlSeconds?: number,
+    ): Promise<string> {
+      throw new ToolError(
+        "toolSessionCreate is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for stateful tool sessions.",
+        "SCP-TOOL-6040",
+      );
+    },
+
+    async toolSessionInvoke(
+      _handle: BridgeContextHandle,
+      _sessionId: string,
+      _inputJson: string,
+      _invokerDid: string,
+      _ucanToken: string,
+      _proofTokens?: readonly string[],
+    ): Promise<string> {
+      throw new ToolError(
+        "toolSessionInvoke is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for stateful tool sessions.",
+        "SCP-TOOL-6040",
+      );
+    },
+
+    async toolSessionClose(_handle: BridgeContextHandle, _sessionId: string): Promise<void> {
+      throw new ToolError(
+        "toolSessionClose is not available in the WASM bridge (ADR-034). " +
+          "Use the native (NAPI) bridge for stateful tool sessions.",
+        "SCP-TOOL-6040",
+      );
     },
 
     // Transport

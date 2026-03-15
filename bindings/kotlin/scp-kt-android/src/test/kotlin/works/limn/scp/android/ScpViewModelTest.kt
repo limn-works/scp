@@ -231,13 +231,7 @@ private class TestNativeBindings : NativeBindings {
         ucanToken: String?,
         proofTokens: List<String>?,
     ): String = ""
-    override fun toolVerify(contextHandle: Long, toolId: String): String =
-        """{"tool_id":"$toolId","passed":false,"failures":[]}"""
-    override fun toolInterfaceExpose(
-        contextHandle: Long, toolId: String, targetContextId: String, rateLimitJson: String?,
-    ): String = "{}"
-    override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
-    override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
+    @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
@@ -247,13 +241,21 @@ private class TestNativeBindings : NativeBindings {
         ucanToken: String,
         chainDepth: Int,
         proofTokens: List<String>?,
+    ): String = ""
+    override fun toolVerify(contextHandle: Long, toolId: String): String =
+        """{"tool_id":"$toolId","passed":false,"failures":[]}"""
+    override fun toolInterfaceExpose(
+        contextHandle: Long, toolId: String, targetContextId: String, rateLimitJson: String?,
     ): String = "{}"
+    override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
+    override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
     override fun toolSessionCreate(
         contextHandle: Long,
         toolId: String,
         sourceContextId: String,
         ttlSeconds: Long?,
-    ): String = ""
+    ): String = "\"00000000-0000-0000-0000-000000000000\""
+    @Suppress("LongParameterList")
     override fun toolSessionInvoke(
         contextHandle: Long,
         sessionId: String,

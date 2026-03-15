@@ -71,7 +71,13 @@ export {
 // Tools
 // ---------------------------------------------------------------------------
 
-export { defineToolDefinition } from "./tools";
+export {
+  defineToolDefinition,
+  toolInvokeCrossContext,
+  toolSessionClose,
+  toolSessionCreate,
+  toolSessionInvoke,
+} from "./tools";
 
 // ---------------------------------------------------------------------------
 // Trust
@@ -239,6 +245,7 @@ export type {
   Capability,
   Checkpoint,
   ContextParams,
+  CrossContextInvocationResult,
   DIDDocument,
   Event,
   EventClaim,
@@ -259,6 +266,8 @@ export type {
   TestVector,
   ToolCost,
   ToolDefinition,
+  ToolSessionInvokeResult,
+  ToolSessionResult,
   ToolVerificationResult,
   TransportConfig,
   TransportStatus,
