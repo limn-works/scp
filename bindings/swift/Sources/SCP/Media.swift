@@ -70,6 +70,11 @@ public enum MediaBridge {
         _ senderDid: String
     ) throws -> String
 
+    /// Send a signaling message (serialize to payload bytes + message type).
+    public typealias SendSignalingFn = @Sendable (
+        _ signalingJson: String
+    ) throws -> String
+
     /// Verify sender attribution.
     public typealias VerifySenderAttributionFn = @Sendable (
         _ signalingJson: String,
@@ -121,6 +126,11 @@ public enum MediaBridge {
     /// Default create session end -- delegates to UniFFI ``mediaCreateSessionEnd``.
     public static let defaultCreateSessionEnd: CreateSessionEndFn = { sessionId, senderDid in
         try mediaCreateSessionEnd(sessionId: sessionId, senderDid: senderDid)
+    }
+
+    /// Default send signaling -- delegates to UniFFI ``mediaSendSignaling``.
+    public static let defaultSendSignaling: SendSignalingFn = { signalingJson in
+        try mediaSendSignaling(signalingJson: signalingJson)
     }
 
     /// Default verify sender attribution -- delegates to UniFFI ``mediaVerifySenderAttribution``.
@@ -325,6 +335,24 @@ public func createMediaSessionEnd(
     createSessionEndFn: MediaBridge.CreateSessionEndFn = MediaBridge.defaultCreateSessionEnd
 ) throws -> String {
     try createSessionEndFn(sessionId, senderDid)
+}
+
+/// Serializes a signaling message and returns payload bytes with message type.
+///
+/// - Parameters:
+///   - signalingJson: JSON string representing a signaling message.
+///   - sendSignalingFn: Bridge function override for testing.
+/// - Returns: JSON string with `payload` (base64-encoded bytes) and `message_type` keys.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the JSON is invalid or serialization fails.
+///
+/// ## Provenance
+///
+/// - ADR-024 (Media)
+public func sendSignaling(
+    signalingJson: String,
+    sendSignalingFn: MediaBridge.SendSignalingFn = MediaBridge.defaultSendSignaling
+) throws -> String {
+    try sendSignalingFn(signalingJson)
 }
 
 /// Verifies that the sender DID in a signaling message matches the envelope sender.

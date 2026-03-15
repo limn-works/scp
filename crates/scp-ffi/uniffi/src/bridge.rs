@@ -6655,6 +6655,35 @@ pub fn media_create_session_end(
     signaling_to_json(&sid, &msg)
 }
 
+/// Serializes a signaling message and returns payload bytes with message type.
+///
+/// Returns a JSON string with `payload` (base64-encoded bytes) and `message_type` keys.
+#[uniffi::export]
+pub fn media_send_signaling(signaling_json: String) -> Result<String, ScpError> {
+    let msg =
+        scp_media::signaling::deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
+            ScpError::Validation {
+                msg: format!("invalid signaling JSON: {e}"),
+                code: "SCP-VALID-7303".to_owned(),
+            }
+        })?;
+    let (payload, message_type) =
+        scp_media::signaling::send_signaling(&msg).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize signaling: {e}"),
+            code: "SCP-VALID-7302".to_owned(),
+        })?;
+
+    use base64::Engine;
+    serde_json::to_string(&serde_json::json!({
+        "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
+        "message_type": format!("{message_type:?}"),
+    }))
+    .map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize result: {e}"),
+        code: "SCP-VALID-7302".to_owned(),
+    })
+}
+
 /// Verifies that the sender DID in a signaling message matches the envelope sender.
 ///
 /// Returns `true` if valid.
@@ -9409,5 +9438,57 @@ mod tests {
 
         assert_eq!(auth.did, identity.did);
         assert_eq!(auth.signing_key_id, scp_identity::SigningKeyId::Active);
+    }
+
+    // -- Media bridge tests --------------------------------------------------
+
+    #[test]
+    fn media_check_capability_valid() {
+        let result = media_check_capability(
+            vec!["media:voice".to_owned(), "messages:read".to_owned()],
+            "voice".to_owned(),
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn media_check_capability_missing() {
+        let result =
+            media_check_capability(vec!["messages:read".to_owned()], "voice".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn media_verify_sender_attribution_match() {
+        let (_, msg) = scp_media::signaling::create_offer(
+            "s1",
+            "v=0\r\n".into(),
+            "did:dht:zAlice".into(),
+        );
+        let json = String::from_utf8(
+            scp_media::signaling::serialize_signaling(&msg).unwrap(),
+        )
+        .unwrap();
+        let result =
+            media_verify_sender_attribution(json, "did:dht:zAlice".to_owned());
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn media_verify_sender_attribution_mismatch() {
+        let (_, msg) = scp_media::signaling::create_offer(
+            "s1",
+            "v=0\r\n".into(),
+            "did:dht:zAlice".into(),
+        );
+        let json = String::from_utf8(
+            scp_media::signaling::serialize_signaling(&msg).unwrap(),
+        )
+        .unwrap();
+        let result =
+            media_verify_sender_attribution(json, "did:dht:zEve".to_owned());
+        assert!(result.is_err());
     }
 }

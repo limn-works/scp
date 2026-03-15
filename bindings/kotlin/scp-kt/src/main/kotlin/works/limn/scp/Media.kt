@@ -126,6 +126,15 @@ interface MediaBindings {
     fun mediaCreateSessionEnd(sessionId: String, senderDid: String): String
 
     /**
+     * Serializes a signaling message and returns payload bytes with message type.
+     *
+     * @param signalingJson JSON string representing a signaling message.
+     * @return JSON string with `payload` (base64-encoded bytes) and `message_type` keys.
+     * @throws BridgeException if the JSON is invalid or serialization fails.
+     */
+    fun mediaSendSignaling(signalingJson: String): String
+
+    /**
      * Verifies that the sender DID in a signaling message matches the envelope sender.
      *
      * @param signalingJson JSON string representing a signaling message.
@@ -275,6 +284,17 @@ class MediaBridge internal constructor(
     suspend fun createSessionEnd(sessionId: String, senderDid: String): String =
         bridge.ffiCall {
             bindings.mediaCreateSessionEnd(sessionId, senderDid)
+        }
+
+    /**
+     * Serializes a signaling message and returns payload bytes with message type.
+     *
+     * @param signalingJson JSON string representing a signaling message.
+     * @return JSON string with `payload` (base64-encoded bytes) and `message_type` keys.
+     */
+    suspend fun sendSignaling(signalingJson: String): String =
+        bridge.ffiCall {
+            bindings.mediaSendSignaling(signalingJson)
         }
 
     /**
