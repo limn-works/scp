@@ -387,10 +387,214 @@ async def list_governance_proposals(context: Context) -> str:
     return _scp_core.py_governance_list_proposals(context._handle)
 
 
+# ---------------------------------------------------------------------------
+# Ceiling modification, close, checkpoint, restore (#559)
+# ---------------------------------------------------------------------------
+
+
+async def apply_pending_ceiling_modification(
+    context: Context,
+    current_timestamp: int,
+) -> bool:
+    """Apply a pending ceiling modification if the notification period has elapsed.
+
+    Delegates to ``_scp_core.py_apply_pending_ceiling_modification``.
+
+    Args:
+        context: The context to apply the modification on.
+        current_timestamp: Current Unix timestamp in seconds.
+
+    Returns:
+        ``True`` if the modification was applied, ``False`` otherwise.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If the operation fails (SCP-CTX-2060).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    return _scp_core.py_apply_pending_ceiling_modification(
+        context._handle, current_timestamp
+    )
+
+
+async def finalize_close(context: Context) -> None:
+    """Finalize the cooperative close flow for a context in Closing state.
+
+    Transitions the context from ``Closing`` to ``Closed``, destroys keys
+    per memory scope, and records a ``ContextClosed`` event.
+
+    Delegates to ``_scp_core.py_finalize_close``.
+
+    Args:
+        context: The context to finalize (must be in ``Closing`` state).
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If the context is not in Closing state or
+            finalization fails (SCP-CTX-2061).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    _scp_core.py_finalize_close(context._handle)
+
+
+async def create_governance_checkpoint(
+    context: Context,
+    *,
+    checkpoint_seq: int,
+    merkle_root_hex: str,
+    event_count: int,
+    last_event_hash_hex: str,
+    state_snapshot_hash_hex: str,
+    creator_did: str | None = None,
+    creator_signature_hex: str,
+) -> str:
+    """Create a governance checkpoint (ADR-031 section 9).
+
+    Delegates to ``_scp_core.py_create_governance_checkpoint``.
+
+    Args:
+        context: The context to create the checkpoint for.
+        checkpoint_seq: Sequence number in the event log.
+        merkle_root_hex: Hex-encoded 32-byte Merkle root.
+        event_count: Number of events included.
+        last_event_hash_hex: Hex-encoded 32-byte hash of the last event.
+        state_snapshot_hash_hex: Hex-encoded 32-byte state snapshot hash.
+        creator_did: DID of the creator. Defaults to context creator.
+        creator_signature_hex: Hex-encoded Ed25519 signature (64 bytes).
+
+    Returns:
+        JSON string with the full ``ContextCheckpoint`` object.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If checkpoint creation fails (SCP-CTX-2062).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    did = creator_did or context._creator_did
+    return _scp_core.py_create_governance_checkpoint(
+        context._handle,
+        checkpoint_seq,
+        merkle_root_hex,
+        event_count,
+        last_event_hash_hex,
+        state_snapshot_hash_hex,
+        did,
+        creator_signature_hex,
+    )
+
+
+async def add_checkpoint_cosignature(
+    context: Context,
+    checkpoint_json: str,
+    *,
+    signer_did: str,
+    signature_hex: str,
+) -> str:
+    """Add a cosignature to an existing governance checkpoint (ADR-031 section 9).
+
+    Delegates to ``_scp_core.py_add_checkpoint_cosignature``.
+
+    Args:
+        context: The context containing the checkpoint.
+        checkpoint_json: JSON-serialized ``ContextCheckpoint``.
+        signer_did: DID of the cosigner.
+        signature_hex: Hex-encoded Ed25519 signature (64 bytes).
+
+    Returns:
+        JSON string with ``attestation_status`` and updated ``checkpoint``.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If cosignature validation fails (SCP-CTX-2063).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    return _scp_core.py_add_checkpoint_cosignature(
+        context._handle, checkpoint_json, signer_did, signature_hex
+    )
+
+
+async def restore_context(context_id: str) -> None:
+    """Restore a single persisted context from storage.
+
+    Delegates to ``_scp_core.py_restore_context``.
+
+    Args:
+        context_id: The context ID to restore.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If restoration fails (SCP-CTX-2064).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    _scp_core.py_restore_context(context_id)
+
+
+async def restore_all_contexts() -> str:
+    """Restore all persisted contexts from storage.
+
+    Delegates to ``_scp_core.py_restore_all_contexts``.
+
+    Returns:
+        JSON array of restored context ID strings.
+
+    Raises:
+        ContextError: If the bridge is unavailable.
+        RuntimeError: If restoration fails (SCP-CTX-2065).
+    """
+    try:
+        import _scp_core
+    except ImportError as exc:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        ) from exc
+
+    return _scp_core.py_restore_all_contexts()
+
+
 __all__ = [
     "GovernanceActionResult",
+    "add_checkpoint_cosignature",
+    "apply_pending_ceiling_modification",
     "approve_governance_proposal",
+    "create_governance_checkpoint",
     "execute_governance_action",
+    "finalize_close",
     "get_governance_proposal",
     "handle_ttl_expiry",
     "list_governance_proposals",
@@ -398,5 +602,7 @@ __all__ = [
     "propose_ttl_extension",
     "reject_governance_proposal",
     "reset_ttl_timer",
+    "restore_all_contexts",
+    "restore_context",
     "withdraw_governance_vote",
 ]

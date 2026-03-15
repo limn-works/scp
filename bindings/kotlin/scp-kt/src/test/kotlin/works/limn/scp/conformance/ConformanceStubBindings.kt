@@ -169,6 +169,30 @@ class ConformanceStubBindings : NativeBindings {
     override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
         """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
     override fun governanceListProposals(contextHandle: Long): String = "[]"
+    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
+    override fun finalizeClose(contextHandle: Long) = Unit
+
+    @Suppress("LongParameterList")
+    override fun createGovernanceCheckpoint(
+        contextHandle: Long,
+        checkpointSeq: Long,
+        merkleRootHex: String,
+        eventCount: Long,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String = "{}"
+
+    override fun addCheckpointCosignature(
+        contextHandle: Long,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String = "{}"
+
+    override fun restoreContext(contextId: String) = Unit
+    override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit

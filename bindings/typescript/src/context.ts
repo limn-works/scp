@@ -837,6 +837,113 @@ export class Context implements AsyncDisposable {
   }
 
   // ---------------------------------------------------------------------------
+  // Ceiling modification, close, checkpoint, restore (#559)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Applies a pending ceiling modification if the notification period has elapsed.
+   *
+   * @param currentTimestamp - Current Unix timestamp in seconds.
+   * @returns `true` if the modification was applied, `false` otherwise.
+   * @throws {ContextError} If the operation fails (SCP-CTX-2060).
+   */
+  async applyPendingCeilingModification(currentTimestamp: number): Promise<boolean> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextApplyPendingCeilingModification(this._handle, currentTimestamp);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Finalizes the cooperative close flow for a context in `Closing` state.
+   *
+   * Transitions from `Closing` to `Closed`, destroys keys per memory scope,
+   * and records a `ContextClosed` event.
+   *
+   * @throws {ContextError} If the context is not in Closing state (SCP-CTX-2061).
+   */
+  async finalizeClose(): Promise<void> {
+    try {
+      const bridge = await getBridge();
+      await bridge.contextFinalizeClose(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Creates a governance checkpoint (ADR-031 section 9).
+   *
+   * @param params - Checkpoint parameters.
+   * @param params.checkpointSeq - Sequence number in the event log.
+   * @param params.merkleRootHex - Hex-encoded 32-byte Merkle root.
+   * @param params.eventCount - Number of events included.
+   * @param params.lastEventHashHex - Hex-encoded 32-byte hash.
+   * @param params.stateSnapshotHashHex - Hex-encoded 32-byte hash.
+   * @param params.creatorDid - DID of the creator. Defaults to context identity.
+   * @param params.creatorSignatureHex - Hex-encoded Ed25519 signature.
+   * @returns JSON string with the `ContextCheckpoint` object.
+   * @throws {ContextError} If checkpoint creation fails (SCP-CTX-2062).
+   */
+  async createGovernanceCheckpoint(params: {
+    checkpointSeq: number;
+    merkleRootHex: string;
+    eventCount: number;
+    lastEventHashHex: string;
+    stateSnapshotHashHex: string;
+    creatorDid?: string;
+    creatorSignatureHex: string;
+  }): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextCreateGovernanceCheckpoint(
+        this._handle,
+        params.checkpointSeq,
+        params.merkleRootHex,
+        params.eventCount,
+        params.lastEventHashHex,
+        params.stateSnapshotHashHex,
+        params.creatorDid ?? this._identityDid,
+        params.creatorSignatureHex,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Adds a cosignature to an existing governance checkpoint (ADR-031 section 9).
+   *
+   * @param checkpointJson - JSON-serialized checkpoint.
+   * @param signerDid - DID of the cosigner.
+   * @param signatureHex - Hex-encoded Ed25519 signature.
+   * @returns JSON string with `attestation_status` and updated `checkpoint`.
+   * @throws {ContextError} If cosignature validation fails (SCP-CTX-2063).
+   */
+  async addCheckpointCosignature(
+    checkpointJson: string,
+    signerDid: string,
+    signatureHex: string,
+  ): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextAddCheckpointCosignature(
+        this._handle,
+        checkpointJson,
+        signerDid,
+        signatureHex,
+      );
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // TTL
   // ---------------------------------------------------------------------------
 
@@ -1081,6 +1188,43 @@ export class Context implements AsyncDisposable {
         "SCP-CTX-2030",
       );
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Context restoration (#559)
+// ---------------------------------------------------------------------------
+
+/**
+ * Restores a single persisted context from storage.
+ *
+ * @param contextId - The context ID to restore.
+ * @throws {ContextError} If restoration fails (SCP-CTX-2064).
+ */
+export async function restoreContext(contextId: string): Promise<void> {
+  try {
+    const bridge = await getBridge();
+    await bridge.contextRestore(contextId);
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Restores all persisted contexts from storage.
+ *
+ * Only contexts in `Active` state are restored. Contexts in `Closing`,
+ * `Closed`, or `Expired` states are skipped.
+ *
+ * @returns JSON array of restored context ID strings.
+ * @throws {ContextError} If restoration fails (SCP-CTX-2065).
+ */
+export async function restoreAllContexts(): Promise<string> {
+  try {
+    const bridge = await getBridge();
+    return await bridge.contextRestoreAll();
+  } catch (error) {
+    throw mapBridgeError(error);
   }
 }
 

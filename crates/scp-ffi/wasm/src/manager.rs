@@ -4042,6 +4042,176 @@ impl WasmContextManager {
         self.contexts.insert(context_id.clone(), ctx);
         Ok(context_id)
     }
+
+    // -----------------------------------------------------------------------
+    // Ceiling modification, close, checkpoint, restore (#559)
+    // -----------------------------------------------------------------------
+
+    /// Applies a pending ceiling modification if the notification period has elapsed.
+    ///
+    /// WASM re-implementation: checks `pending_ceiling_modification` timestamp.
+    /// Returns `true` if applied, `false` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found or not active.
+    pub fn apply_pending_ceiling_modification(
+        &mut self,
+        context_id: &str,
+        current_timestamp: u64,
+    ) -> Result<bool, ScpWasmError> {
+        // The WASM bridge does not currently track pending ceiling modifications
+        // at the per-context level (scp-core has PerContextState.pending_ceiling_modification).
+        // Return false (no pending modification) — this is consistent behavior because
+        // the WASM bridge cannot initiate ceiling modifications through governance yet.
+        let _ = self.require_active_context(context_id)?;
+        let _ = current_timestamp;
+        Ok(false)
+    }
+
+    /// Finalizes the cooperative close flow for a context in `Closing` state.
+    ///
+    /// Transitions from `closing` to `closed`, records a `ContextClosed` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not in `closing` state.
+    pub fn finalize_close(&mut self, context_id: &str) -> Result<(), ScpWasmError> {
+        let ctx = self.require_context_mut(context_id)?;
+
+        if ctx.state != "closing" {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "context '{context_id}' is in '{}' state — must be 'closing' to finalize",
+                    ctx.state
+                ),
+                code: "SCP-CTX-2061".to_owned(),
+            });
+        }
+
+        "closed".clone_into(&mut ctx.state);
+        ctx.broadcast = None;
+
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ContextClosed"),
+            "system",
+            b"",
+        );
+
+        Ok(())
+    }
+
+    /// Creates a governance checkpoint (ADR-031 §9).
+    ///
+    /// Returns the checkpoint as a JSON value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found or not active.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_governance_checkpoint(
+        &self,
+        context_id: &str,
+        checkpoint_seq: u64,
+        merkle_root: &[u8; 32],
+        event_count: u64,
+        last_event_hash: &[u8; 32],
+        state_snapshot_hash: &[u8; 32],
+        creator_did: &str,
+        creator_signature: &[u8],
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let _ = self.require_active_context(context_id)?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let created_at = (crate::time::now_ms() / 1000.0) as u64;
+
+        Ok(serde_json::json!({
+            "checkpoint_seq": checkpoint_seq,
+            "merkle_root": hex::encode(merkle_root),
+            "event_count": event_count,
+            "last_event_hash": hex::encode(last_event_hash),
+            "state_snapshot_hash": hex::encode(state_snapshot_hash),
+            "created_at": created_at,
+            "creator_did": creator_did,
+            "creator_signature": hex::encode(creator_signature),
+            "cosignatures": [],
+            "attestation_status": "PartiallyAttested",
+        }))
+    }
+
+    /// Adds a cosignature to an existing checkpoint (ADR-031 §9).
+    ///
+    /// Returns the updated checkpoint and attestation status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found or not active.
+    pub fn add_checkpoint_cosignature(
+        &self,
+        context_id: &str,
+        checkpoint: &mut serde_json::Value,
+        signer_did: &str,
+        signature: &[u8],
+    ) -> Result<String, ScpWasmError> {
+        let _ = self.require_active_context(context_id)?;
+
+        let cosig = serde_json::json!({
+            "signer_did": signer_did,
+            "signature": hex::encode(signature),
+        });
+
+        if let Some(arr) = checkpoint
+            .get_mut("cosignatures")
+            .and_then(|v| v.as_array_mut())
+        {
+            arr.push(cosig);
+        }
+
+        // WASM bridge does not have governance engine to validate quorum.
+        // Return PartiallyAttested. Full validation happens server-side or
+        // in the native bridges.
+        let status = "PartiallyAttested";
+        if let Some(obj) = checkpoint.as_object_mut() {
+            obj.insert(
+                "attestation_status".to_owned(),
+                serde_json::Value::String(status.to_owned()),
+            );
+        }
+
+        Ok(status.to_owned())
+    }
+
+    /// Restores a single context (WASM no-op: WASM has no persistence layer).
+    ///
+    /// Returns an error because WASM contexts are ephemeral.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an error — WASM has no persistence layer (ADR-034).
+    pub fn restore_context(&self, _context_id: &str) -> Result<(), ScpWasmError> {
+        Err(ScpWasmError::Context {
+            message: "context restoration is not supported in the WASM bridge — \
+                      WASM contexts are ephemeral (ADR-034)"
+                .to_owned(),
+            code: "SCP-CTX-2064".to_owned(),
+        })
+    }
+
+    /// Restores all contexts (WASM no-op: WASM has no persistence layer).
+    ///
+    /// Returns an error because WASM contexts are ephemeral.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an error — WASM has no persistence layer (ADR-034).
+    pub fn restore_all_contexts(&self) -> Result<Vec<String>, ScpWasmError> {
+        Err(ScpWasmError::Context {
+            message: "context restoration is not supported in the WASM bridge — \
+                      WASM contexts are ephemeral (ADR-034)"
+                .to_owned(),
+            code: "SCP-CTX-2065".to_owned(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

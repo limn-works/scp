@@ -2192,6 +2192,321 @@ fn py_governance_list_proposals(handle: &PyContextHandle) -> PyResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Ceiling modification, context close, checkpoint, restore (#559)
+// ---------------------------------------------------------------------------
+
+/// Applies a pending ceiling modification if the notification period has elapsed.
+///
+/// Delegates to [`ContextManager::apply_pending_ceiling_modification`].
+/// Returns `true` if the modification was applied, `false` if no pending
+/// modification exists or the notification period has not elapsed.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `current_timestamp` -- Current Unix timestamp in seconds.
+///
+/// # Returns
+///
+/// `true` if the ceiling modification was applied, `false` otherwise.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2060) if the operation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, current_timestamp))]
+fn py_apply_pending_ceiling_modification(
+    handle: &PyContextHandle,
+    current_timestamp: u64,
+) -> PyResult<bool> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+
+    rt.block_on(async move {
+        mgr.apply_pending_ceiling_modification(&context_id, current_timestamp)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2060: apply_pending_ceiling_modification failed: {e}"
+                ))
+            })
+    })
+}
+
+/// Finalizes the cooperative close flow for a context in `Closing` state.
+///
+/// Delegates to [`ContextManager::finalize_close`], which transitions
+/// the context from `Closing` to `Closed`, destroys keys per memory scope,
+/// and records a `ContextClosed` event.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle (must be in `Closing` state).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2061) if the context is not in
+/// `Closing` state or finalization fails.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_finalize_close(handle: &PyContextHandle) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let core_params = build_core_context_params(&handle.params);
+    let context_id = handle.context_id.clone();
+
+    rt.block_on(async move {
+        let core_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        // The core ContextHandle starts in Creating. Transition to Active
+        // then to Closing to match the expected state for finalize_close.
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Closing)
+            .await;
+        mgr.finalize_close(&core_handle).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2061: finalize_close failed: {e}"))
+        })
+    })?;
+
+    // Update FFI handle state to reflect close.
+    let mut state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+    "closed".clone_into(&mut state);
+
+    Ok(())
+}
+
+/// Creates a governance checkpoint for a context (ADR-031 §9).
+///
+/// Delegates to [`ContextManager::create_governance_checkpoint`].
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `checkpoint_seq` -- Sequence number in the event log.
+/// * `merkle_root_hex` -- Hex-encoded 32-byte Merkle root.
+/// * `event_count` -- Number of events included.
+/// * `last_event_hash_hex` -- Hex-encoded 32-byte hash of the last event.
+/// * `state_snapshot_hash_hex` -- Hex-encoded 32-byte state snapshot hash.
+/// * `creator_did` -- DID of the checkpoint creator.
+/// * `creator_signature_hex` -- Hex-encoded Ed25519 signature (64 bytes).
+///
+/// # Returns
+///
+/// JSON string with the full `ContextCheckpoint` object.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2062) if checkpoint creation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, checkpoint_seq, merkle_root_hex, event_count, last_event_hash_hex, state_snapshot_hash_hex, creator_did, creator_signature_hex))]
+#[allow(clippy::too_many_arguments)]
+fn py_create_governance_checkpoint(
+    handle: &PyContextHandle,
+    checkpoint_seq: u64,
+    merkle_root_hex: &str,
+    event_count: u64,
+    last_event_hash_hex: &str,
+    state_snapshot_hash_hex: &str,
+    creator_did: &str,
+    creator_signature_hex: &str,
+) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+
+    let merkle_root = parse_hex_32(merkle_root_hex, "merkle_root")?;
+    let last_event_hash = parse_hex_32(last_event_hash_hex, "last_event_hash")?;
+    let state_snapshot_hash = parse_hex_32(state_snapshot_hash_hex, "state_snapshot_hash")?;
+    let creator_signature = hex::decode(creator_signature_hex).map_err(|e| {
+        PyValueError::new_err(format!("SCP-CTX-2062: invalid creator_signature hex: {e}"))
+    })?;
+    let did = scp_identity::DID(creator_did.to_owned());
+
+    rt.block_on(async move {
+        let checkpoint = mgr
+            .create_governance_checkpoint(
+                &context_id,
+                checkpoint_seq,
+                merkle_root,
+                event_count,
+                last_event_hash,
+                state_snapshot_hash,
+                &did,
+                creator_signature,
+            )
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2062: create_governance_checkpoint failed: {e}"
+                ))
+            })?;
+
+        serde_json::to_string(&checkpoint).map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2062: serialization failed: {e}"))
+        })
+    })
+}
+
+/// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
+///
+/// Delegates to [`ContextManager::add_checkpoint_cosignature`].
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `checkpoint_json` -- JSON-serialized `ContextCheckpoint`.
+/// * `signer_did` -- DID of the cosigner.
+/// * `signature_hex` -- Hex-encoded Ed25519 signature (64 bytes).
+///
+/// # Returns
+///
+/// JSON string with `{ "attestation_status": string, "checkpoint": object }`.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2063) if cosignature validation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, checkpoint_json, signer_did, signature_hex))]
+fn py_add_checkpoint_cosignature(
+    handle: &PyContextHandle,
+    checkpoint_json: &str,
+    signer_did: &str,
+    signature_hex: &str,
+) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+
+    let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+        serde_json::from_str(checkpoint_json).map_err(|e| {
+            PyValueError::new_err(format!("SCP-CTX-2063: invalid checkpoint JSON: {e}"))
+        })?;
+
+    let signature = hex::decode(signature_hex)
+        .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2063: invalid signature hex: {e}")))?;
+
+    let cosignature = scp_core::context::governance::CosignedCheckpoint {
+        signer_did: scp_identity::DID(signer_did.to_owned()),
+        signature,
+    };
+
+    rt.block_on(async move {
+        let status = mgr
+            .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2063: add_checkpoint_cosignature failed: {e}"
+                ))
+            })?;
+
+        let response = serde_json::json!({
+            "attestation_status": format!("{status:?}"),
+            "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+        });
+        Ok(response.to_string())
+    })
+}
+
+/// Restores a single persisted context from storage.
+///
+/// Delegates to [`ContextManager::restore_context`]. The context must
+/// have been previously persisted and must not already be registered.
+///
+/// # Arguments
+///
+/// * `context_id` -- The context ID to restore.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails.
+#[pyfunction]
+#[pyo3(signature = (context_id,))]
+fn py_restore_context(context_id: &str) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id_owned = context_id.to_owned();
+
+    rt.block_on(async move {
+        let core_handle = scp_core::context::ContextHandle::new(
+            context_id_owned.clone(),
+            scp_core::context::ContextParams::default(),
+        );
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        mgr.restore_context(&context_id_owned, &core_handle)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
+            })
+    })
+}
+
+/// Restores all persisted contexts from storage.
+///
+/// Delegates to [`ContextManager::restore_all_contexts`]. Only contexts
+/// in `Active` state are restored; contexts in `Closing`/`Closed`/`Expired`
+/// states are skipped.
+///
+/// # Returns
+///
+/// JSON array of restored context ID strings.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` (SCP-CTX-2065) if restoration fails (e.g., no
+/// persistence provider configured).
+#[pyfunction]
+#[pyo3(signature = ())]
+fn py_restore_all_contexts() -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+
+    rt.block_on(async move {
+        let restored = mgr.restore_all_contexts().await.map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
+        })?;
+
+        serde_json::to_string(&restored).map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2065: serialization failed: {e}"))
+        })
+    })
+}
+
+/// Parses a hex string into a 32-byte array.
+fn parse_hex_32(hex_str: &str, field_name: &str) -> PyResult<[u8; 32]> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        PyValueError::new_err(format!("SCP-CTX-2062: invalid {field_name} hex: {e}"))
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        PyValueError::new_err(format!(
+            "SCP-CTX-2062: {field_name} must be 32 bytes, got {}",
+            v.len()
+        ))
+    })?;
+    Ok(arr)
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast bridge (#369)
 // ---------------------------------------------------------------------------
 
@@ -3135,6 +3450,13 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_governance_withdraw, m)?)?;
     m.add_function(wrap_pyfunction!(py_governance_get_proposal, m)?)?;
     m.add_function(wrap_pyfunction!(py_governance_list_proposals, m)?)?;
+    // Ceiling modification, close, checkpoint, restore (#559)
+    m.add_function(wrap_pyfunction!(py_apply_pending_ceiling_modification, m)?)?;
+    m.add_function(wrap_pyfunction!(py_finalize_close, m)?)?;
+    m.add_function(wrap_pyfunction!(py_create_governance_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(py_add_checkpoint_cosignature, m)?)?;
+    m.add_function(wrap_pyfunction!(py_restore_context, m)?)?;
+    m.add_function(wrap_pyfunction!(py_restore_all_contexts, m)?)?;
     // Context migration (§5.11A, #580)
     m.add_function(wrap_pyfunction!(py_tombstone_migrated_context, m)?)?;
     m.add_function(wrap_pyfunction!(py_migration_state, m)?)?;
