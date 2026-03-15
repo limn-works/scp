@@ -703,4 +703,49 @@ mod tests {
             all_keys.len()
         );
     }
+
+    // -------------------------------------------------------------------
+    // delete_context cleans up trust keys
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_context_removes_trust_keys() {
+        let store = new_store();
+
+        // Store trust data across all three sub-domains.
+        let att = make_cached("att-del", "did:key:alice", 1000, 300);
+        store
+            .store_trust_cached_attestation("ctx-del", &att)
+            .await
+            .unwrap();
+
+        let mut revocation = HashMap::new();
+        revocation.insert("att-del".to_owned(), true);
+        store
+            .store_trust_revocation_state("ctx-del", &revocation)
+            .await
+            .unwrap();
+
+        let cr = make_challenge_result("cv-del", "did:key:alice");
+        store
+            .store_trust_challenge_result("ctx-del", &cr)
+            .await
+            .unwrap();
+
+        // Verify data exists.
+        let keys_before = store.storage().list_keys("trust/ctx-del/").await.unwrap();
+        assert!(
+            keys_before.len() >= 3,
+            "trust data should exist before delete"
+        );
+
+        // delete_context should remove trust/ keys for this context.
+        store.delete_context("ctx-del").await.unwrap();
+
+        let keys_after = store.storage().list_keys("trust/ctx-del/").await.unwrap();
+        assert!(
+            keys_after.is_empty(),
+            "trust keys should be gone after delete_context, found: {keys_after:?}"
+        );
+    }
 }
