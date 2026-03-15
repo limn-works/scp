@@ -2453,9 +2453,20 @@ fn resolve_nat(
 ) -> Arc<dyn NatStrategy> {
     strategy.unwrap_or_else(|| {
         let mut default = DefaultNatStrategy::new(stun_server, bridge_relay);
+
+        // Wire the port mapper: use the explicitly provided one, or construct
+        // a production `UPnP` mapper when the `upnp` feature is enabled.
+        // The `UpnpPortMapper` is the primary tier per spec 10.12.2.
+        #[cfg(feature = "upnp")]
+        let port_mapper = port_mapper.or_else(|| {
+            Some(Arc::new(scp_transport::UpnpPortMapper::new())
+                as Arc<dyn scp_transport::nat::PortMapper>)
+        });
+
         if let Some(mapper) = port_mapper {
             default = default.with_port_mapper(mapper);
         }
+
         if let Some(probe) = reachability_probe {
             default = default.with_reachability_probe(probe);
         }

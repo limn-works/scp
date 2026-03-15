@@ -494,6 +494,401 @@ async fn try_acquire_with(
 }
 
 // ---------------------------------------------------------------------------
+// Production PortMapper implementations (feature = "upnp")
+// ---------------------------------------------------------------------------
+
+/// Default lease duration for `UPnP` port mappings (seconds).
+///
+/// Per spec 10.12.2: typical `UPnP` leases are 10-60 minutes. We request
+/// 30 minutes (1800s); the gateway may grant a shorter TTL.
+#[cfg(feature = "upnp")]
+const DEFAULT_UPNP_LEASE_SECS: u32 = 1800;
+
+/// Default lease duration for NAT-PMP port mappings (seconds).
+///
+/// NAT-PMP/PCP uses explicit lifetimes (RFC 6886 section 3.3 recommends
+/// 7200s = 2 hours). We request 3600s (1 hour) as a reasonable default.
+#[cfg(feature = "upnp")]
+const DEFAULT_NATPMP_LEASE_SECS: u32 = 3600;
+
+/// Discovery timeout for `UPnP` SSDP gateway search.
+#[cfg(feature = "upnp")]
+const UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for NAT-PMP request/response cycles.
+#[cfg(feature = "upnp")]
+const NATPMP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// UPnP-IGD port mapper using the `igd-next` crate.
+///
+/// Discovers the local UPnP-IGD gateway via SSDP multicast, then uses
+/// the gateway's SOAP API to add/renew/remove TCP port mappings.
+///
+/// Per spec 10.12.2: "Discover local gateway via `UPnP` SSDP multicast."
+///
+/// # Feature gate
+///
+/// Requires the `upnp` feature on `scp-transport`.
+#[cfg(feature = "upnp")]
+pub struct UpnpPortMapper {
+    /// Lease duration to request from the gateway (seconds).
+    lease_duration: u32,
+    /// Discovery timeout for SSDP search.
+    discovery_timeout: Duration,
+}
+
+#[cfg(feature = "upnp")]
+impl UpnpPortMapper {
+    /// Creates a new UPnP-IGD port mapper with default settings.
+    ///
+    /// Default lease: 1800 seconds (30 minutes).
+    /// Default discovery timeout: 5 seconds.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            lease_duration: DEFAULT_UPNP_LEASE_SECS,
+            discovery_timeout: UPNP_DISCOVERY_TIMEOUT,
+        }
+    }
+
+    /// Creates a new UPnP-IGD port mapper with custom settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `lease_duration` -- Lease duration in seconds to request from the
+    ///   gateway. The gateway may grant a shorter TTL.
+    /// * `discovery_timeout` -- Timeout for the SSDP discovery phase.
+    #[must_use]
+    pub const fn with_options(lease_duration: u32, discovery_timeout: Duration) -> Self {
+        Self {
+            lease_duration,
+            discovery_timeout,
+        }
+    }
+
+    /// Discovers the UPnP-IGD gateway on the local network.
+    async fn discover_gateway(
+        &self,
+    ) -> Result<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>, PortMappingError> {
+        let options = igd_next::SearchOptions {
+            timeout: Some(self.discovery_timeout),
+            ..Default::default()
+        };
+        igd_next::aio::tokio::search_gateway(options)
+            .await
+            .map_err(|e| PortMappingError::DiscoveryFailed(format!("UPnP SSDP discovery: {e}")))
+    }
+
+    /// Resolves the local address to bind for port mapping requests.
+    ///
+    /// The local address is needed by `igd-next` to tell the gateway where
+    /// to forward traffic. We discover it by connecting a UDP socket to the
+    /// gateway and reading the local endpoint.
+    fn resolve_local_addr(
+        gateway_addr: std::net::SocketAddr,
+        internal_port: u16,
+    ) -> Result<std::net::SocketAddr, PortMappingError> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| PortMappingError::Internal(format!("UDP bind for local addr: {e}")))?;
+        socket.connect(gateway_addr).map_err(|e| {
+            PortMappingError::Internal(format!("UDP connect to gateway for local addr: {e}"))
+        })?;
+        let local_ip = socket
+            .local_addr()
+            .map_err(|e| PortMappingError::Internal(format!("read local addr after connect: {e}")))?
+            .ip();
+        Ok(std::net::SocketAddr::new(local_ip, internal_port))
+    }
+}
+
+#[cfg(feature = "upnp")]
+impl Default for UpnpPortMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "upnp")]
+impl PortMapper for UpnpPortMapper {
+    fn map_port(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let gateway = self.discover_gateway().await?;
+            let local_addr = Self::resolve_local_addr(gateway.addr, internal_port)?;
+
+            debug!(
+                gateway = %gateway.addr,
+                local_addr = %local_addr,
+                lease_secs = self.lease_duration,
+                "requesting UPnP-IGD port mapping"
+            );
+
+            let external_addr = gateway
+                .get_any_address(
+                    igd_next::PortMappingProtocol::TCP,
+                    local_addr,
+                    self.lease_duration,
+                    "SCP relay",
+                )
+                .await
+                .map_err(|e| {
+                    PortMappingError::MappingRejected(format!("UPnP add_any_port: {e}"))
+                })?;
+
+            info!(
+                external_addr = %external_addr,
+                lease_secs = self.lease_duration,
+                "UPnP-IGD port mapping created"
+            );
+
+            Ok(PortMappingResult {
+                external_addr,
+                ttl: Duration::from_secs(u64::from(self.lease_duration)),
+                protocol: MappingProtocol::UpnpIgd,
+            })
+        })
+    }
+
+    fn renew(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>>
+    {
+        // UPnP-IGD renewal is implemented as a fresh mapping request.
+        // Per the UPnP-IGD spec, re-adding the same mapping refreshes
+        // the lease without creating a duplicate entry.
+        self.map_port(internal_port)
+    }
+
+    fn remove(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PortMappingError>> + Send + '_>> {
+        Box::pin(async move {
+            let gateway = self.discover_gateway().await?;
+            let local_addr = Self::resolve_local_addr(gateway.addr, internal_port)?;
+
+            // To remove we need the external port. We request the same mapping
+            // to find it, but since we used add_any_port we need to know the
+            // external port. Use internal_port as the best guess -- routers
+            // commonly assign the same port when available.
+            //
+            // Try removing internal_port first. If that fails, it's best-effort.
+            debug!(
+                gateway = %gateway.addr,
+                external_port = internal_port,
+                "attempting UPnP-IGD port mapping removal"
+            );
+
+            // Best-effort: try the internal port as the external port.
+            // get_any_address may have assigned a different port, but we
+            // don't persist state across calls. The PortMappingManager
+            // calls remove on both mappers as best-effort cleanup.
+            let _ = gateway
+                .remove_port(igd_next::PortMappingProtocol::TCP, local_addr.port())
+                .await;
+
+            Ok(())
+        })
+    }
+}
+
+/// NAT-PMP/PCP port mapper using the `natpmp` crate.
+///
+/// Discovers the default gateway and sends NAT-PMP (RFC 6886) port mapping
+/// requests. Falls back to this when UPnP-IGD is not available.
+///
+/// Per spec 10.12.2: "NAT-PMP/PCP as fallback" after UPnP-IGD.
+///
+/// # Feature gate
+///
+/// Requires the `upnp` feature on `scp-transport`.
+#[cfg(feature = "upnp")]
+pub struct NatPmpPortMapper {
+    /// Lease duration to request (seconds).
+    lease_duration: u32,
+    /// Timeout for NAT-PMP request/response cycles.
+    timeout: Duration,
+}
+
+#[cfg(feature = "upnp")]
+impl NatPmpPortMapper {
+    /// Creates a new NAT-PMP port mapper with default settings.
+    ///
+    /// Default lease: 3600 seconds (1 hour).
+    /// Default timeout: 5 seconds.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            lease_duration: DEFAULT_NATPMP_LEASE_SECS,
+            timeout: NATPMP_TIMEOUT,
+        }
+    }
+
+    /// Creates a new NAT-PMP port mapper with custom settings.
+    #[must_use]
+    pub const fn with_options(lease_duration: u32, timeout: Duration) -> Self {
+        Self {
+            lease_duration,
+            timeout,
+        }
+    }
+
+    /// Sends a port mapping request and reads the response.
+    ///
+    /// The NAT-PMP protocol is a simple request/response over UDP to the
+    /// default gateway on port 5351.
+    async fn request_mapping(
+        &self,
+        internal_port: u16,
+        lifetime: u32,
+    ) -> Result<PortMappingResult, PortMappingError> {
+        let client = natpmp::new_tokio_natpmp()
+            .await
+            .map_err(|e| PortMappingError::DiscoveryFailed(format!("NAT-PMP gateway: {e}")))?;
+
+        let gateway_ip = *client.gateway();
+
+        // First, get the external IP via a public address request.
+        // We need a mutable reference for `send_public_address_request`.
+        // The natpmp crate's async API requires &mut for address requests
+        // but &self for port mapping (quirk of the crate API).
+        //
+        // We work around this by creating a separate client for the
+        // address request.
+        let mut addr_client = natpmp::new_tokio_natpmp().await.map_err(|e| {
+            PortMappingError::DiscoveryFailed(format!("NAT-PMP gateway (addr): {e}"))
+        })?;
+
+        addr_client
+            .send_public_address_request()
+            .await
+            .map_err(|e| {
+                PortMappingError::Internal(format!("NAT-PMP public address request: {e}"))
+            })?;
+
+        let external_ip = tokio::time::timeout(self.timeout, addr_client.read_response_or_retry())
+            .await
+            .map_err(|_| PortMappingError::Timeout)?
+            .map_err(|e| {
+                PortMappingError::Internal(format!("NAT-PMP public address response: {e}"))
+            })
+            .and_then(|resp| match resp {
+                natpmp::Response::Gateway(gw) => Ok(std::net::IpAddr::V4(*gw.public_address())),
+                other => Err(PortMappingError::Internal(format!(
+                    "unexpected NAT-PMP response type: {other:?}"
+                ))),
+            })?;
+
+        debug!(
+            gateway = %gateway_ip,
+            external_ip = %external_ip,
+            internal_port,
+            lifetime,
+            "sending NAT-PMP port mapping request"
+        );
+
+        // Send the TCP port mapping request.
+        // Request the same external port as the internal port (NAT-PMP
+        // convention). The gateway may assign a different port.
+        client
+            .send_port_mapping_request(
+                natpmp::Protocol::TCP,
+                internal_port,
+                internal_port,
+                lifetime,
+            )
+            .await
+            .map_err(|e| {
+                PortMappingError::MappingRejected(format!("NAT-PMP mapping request: {e}"))
+            })?;
+
+        let mapping = tokio::time::timeout(self.timeout, client.read_response_or_retry())
+            .await
+            .map_err(|_| PortMappingError::Timeout)?
+            .map_err(|e| {
+                PortMappingError::MappingRejected(format!("NAT-PMP mapping response: {e}"))
+            })?;
+
+        match mapping {
+            natpmp::Response::TCP(m) | natpmp::Response::UDP(m) => {
+                let external_addr = std::net::SocketAddr::new(external_ip, m.public_port());
+                let ttl = *m.lifetime();
+
+                info!(
+                    external_addr = %external_addr,
+                    ttl_secs = ttl.as_secs(),
+                    "NAT-PMP port mapping created"
+                );
+
+                Ok(PortMappingResult {
+                    external_addr,
+                    ttl,
+                    protocol: MappingProtocol::NatPmp,
+                })
+            }
+            natpmp::Response::Gateway(_) => Err(PortMappingError::Internal(
+                "unexpected gateway response to mapping request".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "upnp")]
+impl Default for NatPmpPortMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "upnp")]
+impl PortMapper for NatPmpPortMapper {
+    fn map_port(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.request_mapping(internal_port, self.lease_duration)
+                .await
+        })
+    }
+
+    fn renew(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>>
+    {
+        // NAT-PMP renewal is a fresh mapping request with the same parameters.
+        // Per RFC 6886 section 3.3: "To refresh a mapping, the client sends
+        // a new mapping request."
+        Box::pin(async move {
+            self.request_mapping(internal_port, self.lease_duration)
+                .await
+        })
+    }
+
+    fn remove(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PortMappingError>> + Send + '_>> {
+        Box::pin(async move {
+            // Per RFC 6886 section 3.4: "To destroy a mapping, the client
+            // sends a mapping request with a lifetime of zero."
+            debug!(
+                internal_port,
+                "sending NAT-PMP mapping removal (lifetime=0)"
+            );
+            let _ = self.request_mapping(internal_port, 0).await;
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

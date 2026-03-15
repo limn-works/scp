@@ -264,11 +264,9 @@ async fn application_node_relay_publish_subscribe_roundtrip() {
 /// via `include_str!` and searched for `impl PortMapper for` outside of
 /// `#[cfg(test)]` blocks.
 ///
-/// The `UpnpPortMapper` production implementation (gated behind the `upnp`
-/// crate feature) satisfies this check. The implementation lives in the
-/// demo-apps PR (feat/demo-apps) — ignored until merged.
+/// The `UpnpPortMapper` and `NatPmpPortMapper` production implementations
+/// (gated behind the `upnp` crate feature) satisfy this check.
 #[test]
-#[ignore = "UpnpPortMapper production impl is in the feat/demo-apps branch"]
 fn port_mapper_has_real_implementation() {
     println!("\n=== 2: PortMapper has a production impl ===\n");
 

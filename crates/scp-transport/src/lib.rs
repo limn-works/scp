@@ -74,6 +74,8 @@ pub use nat::{
     MappingProtocol, NatKeepalive, NatProbeResult, NatProber, NatTierChange, NatType, PortMapper,
     PortMappingError, PortMappingManager, PortMappingResult, StunEndpoint,
 };
+#[cfg(feature = "upnp")]
+pub use nat::{NatPmpPortMapper, UpnpPortMapper};
 pub use pool::{ConnectionPool, PoolKey, TransportType};
 pub use profile::{CoverTrafficTier, TransportProfile};
 pub use provider::RelayTransportProvider;
