@@ -55,6 +55,13 @@ class ConformanceStubBindings : NativeBindings {
     var toolInvokeError: BridgeException? = null
     var toolVerifyResult: String = """{"tool_id":"stub","passed":true,"failures":[]}"""
     var toolVerifyError: BridgeException? = null
+    var toolInvokeCrossContextResult: String = """{"cross_context":"ok"}"""
+    var toolInvokeCrossContextError: BridgeException? = null
+    var toolSessionCreateResult: String = "session-001"
+    var toolSessionCreateError: BridgeException? = null
+    var toolSessionInvokeResult: String = """{"session":"ok"}"""
+    var toolSessionInvokeError: BridgeException? = null
+    var toolSessionCloseError: BridgeException? = null
 
     var ucanValidateError: BridgeException? = null
     var ucanMintResult: String = "minted-token"
@@ -210,6 +217,51 @@ class ConformanceStubBindings : NativeBindings {
         return toolVerifyResult
     }
 
+    @Suppress("LongParameterList")
+    override fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String {
+        toolInvokeCrossContextError?.let { throw it }
+        return toolInvokeCrossContextResult
+    }
+
+    override fun toolSessionCreate(
+        contextHandle: Long,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: Long?,
+    ): String {
+        toolSessionCreateError?.let { throw it }
+        return toolSessionCreateResult
+    }
+
+    @Suppress("LongParameterList")
+    override fun toolSessionInvoke(
+        contextHandle: Long,
+        sessionId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String {
+        toolSessionInvokeError?.let { throw it }
+        return toolSessionInvokeResult
+    }
+
+    override fun toolSessionClose(
+        contextHandle: Long,
+        sessionId: String,
+    ) {
+        toolSessionCloseError?.let { throw it }
+    }
+
     override fun ucanValidate(
         contextHandle: Long,
         token: String,
@@ -317,6 +369,13 @@ class ConformanceStubBindings : NativeBindings {
         toolInvokeError = null
         toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
         toolVerifyError = null
+        toolInvokeCrossContextResult = """{"cross_context":"ok"}"""
+        toolInvokeCrossContextError = null
+        toolSessionCreateResult = "session-001"
+        toolSessionCreateError = null
+        toolSessionInvokeResult = """{"session":"ok"}"""
+        toolSessionInvokeError = null
+        toolSessionCloseError = null
         ucanValidateError = null
         ucanMintResult = "minted-token"
         ucanMintError = null
