@@ -2506,6 +2506,17 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         "application node started (domain mode, TLS active)"
     );
 
+    // Build the production bridge auth lookup, hydrating from storage.
+    // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
+    let audience = format!("https://{domain}");
+    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
+        Arc::clone(&storage),
+        audience,
+    ));
+    if let Err(e) = bridge_lookup.load_from_storage().await {
+        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
+    }
+
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
@@ -2531,6 +2542,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         subscription_registry,
         acme_challenges,
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
+        bridge_lookup: Some(bridge_lookup),
     });
 
     Ok(ApplicationNode {
@@ -2639,6 +2651,16 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         TIER_REEVALUATION_INTERVAL,
     );
 
+    // Build the production bridge auth lookup, hydrating from storage.
+    // In no-domain mode the audience is the relay URL itself (spec 12.10.2).
+    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
+        Arc::clone(&storage),
+        relay_url.clone(),
+    ));
+    if let Err(e) = bridge_lookup.load_from_storage().await {
+        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
+    }
+
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
@@ -2664,6 +2686,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         subscription_registry,
         acme_challenges: None,
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
+        bridge_lookup: Some(bridge_lookup),
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).

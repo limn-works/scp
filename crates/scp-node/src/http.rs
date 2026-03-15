@@ -181,6 +181,14 @@ pub struct NodeState {
     /// bridge shadow creation endpoint (`POST /v1/scp/bridge/shadow`).
     /// See SCP-BCH-002.
     pub(crate) bridge_state: Arc<crate::bridge_handlers::BridgeState>,
+
+    /// Production bridge lookup for bridge auth middleware (spec section 12.10.2).
+    ///
+    /// When `Some`, the bridge router is wrapped with [`bridge_auth_middleware`]
+    /// and [`webhook_auth_middleware`] using this lookup. When `None` (e.g., in
+    /// tests or when bridges are not configured), the bridge router is mounted
+    /// without authentication.
+    pub(crate) bridge_lookup: Option<Arc<dyn crate::bridge_auth::BridgeLookup>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +596,20 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         #[cfg(feature = "http3")]
         let http3_config = self.http3_config;
 
-        let bridge = crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state));
+        // Apply bridge auth middleware when a production BridgeLookup is
+        // configured (spec section 12.10.2). Without a lookup the bridge
+        // endpoints are mounted without authentication (test/dev mode).
+        let bridge = {
+            let base = crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state));
+            if let Some(ref lookup) = self.state.bridge_lookup {
+                base.layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(lookup),
+                    crate::bridge_auth::bridge_auth_middleware_dyn,
+                ))
+            } else {
+                base
+            }
+        };
         let relay = self.relay;
         let state = self.state;
 
@@ -848,6 +869,7 @@ mod tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
+            bridge_lookup: None,
         })
     }
 
