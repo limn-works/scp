@@ -533,6 +533,33 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
 // FfiBridgeEventLog removed — replaced by MerkleEventLogProvider with
 // ProtocolRepositoryEventLogBridge persistence (issue #484).
 
+// ---------------------------------------------------------------------------
+// Invitation rate limit tracker registry (#614)
+// ---------------------------------------------------------------------------
+
+/// Global rate limit tracker registry for invitation auto-accept, keyed by
+/// identity DID.
+static RATE_LIMIT_TRACKERS: OnceLock<
+    DashMap<String, scp_core::context::invitation::RateLimitTracker>,
+> = OnceLock::new();
+
+/// Returns a reference to the global rate limit tracker registry.
+fn rate_limit_registry() -> &'static DashMap<String, scp_core::context::invitation::RateLimitTracker>
+{
+    RATE_LIMIT_TRACKERS.get_or_init(DashMap::new)
+}
+
+/// Returns a mutable reference to the rate limit tracker for the given
+/// identity DID, creating one if it does not exist.
+pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
+where
+    F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
+{
+    let registry = rate_limit_registry();
+    let mut entry = registry.entry(identity_did.to_owned()).or_default();
+    f(entry.value_mut())
+}
+
 /// Queries event counts for trust scoring within a context.
 ///
 /// Returns `(message_count, governance_count)` derived from the context's

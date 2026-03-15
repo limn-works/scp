@@ -1920,6 +1920,152 @@ pub fn check_scoped_capability(
 }
 
 // ---------------------------------------------------------------------------
+// Invitation evaluation pipeline (#614)
+// ---------------------------------------------------------------------------
+
+/// Result of invitation evaluation.
+#[napi(object)]
+pub struct NapiEvaluationResult {
+    /// The decision: `"auto_accept"` or `"prompt_agent"`.
+    pub decision: String,
+}
+
+/// FFI-concrete implementation of `TrustOracle`.
+struct NapiBridgeTrustOracle {
+    trusted_dids: Vec<scp_identity::DID>,
+}
+
+impl scp_core::context::invitation::TrustOracle for NapiBridgeTrustOracle {
+    fn satisfies_trust(
+        &self,
+        inviter: &scp_identity::DID,
+        requirement: &scp_core::context::policy::TrustRequirement,
+    ) -> bool {
+        match requirement {
+            scp_core::context::policy::TrustRequirement::Any => true,
+            scp_core::context::policy::TrustRequirement::SharedContext => {
+                self.trusted_dids.contains(inviter)
+            }
+            scp_core::context::policy::TrustRequirement::Explicit(dids) => dids.contains(inviter),
+        }
+    }
+}
+
+/// Evaluates a context invitation through the sequential pipeline.
+///
+/// Runs the 4-step evaluation pipeline from `scp-core`:
+/// 1. Template validation (rejects template spoofing).
+/// 2. Economic policy check (rejects insufficient spending capability).
+/// 3. Auto-accept evaluation (trust, TTL cap, rate limit).
+/// 4. Falls through to prompt-agent if no auto-accept matches.
+///
+/// @param paramsJson - JSON-serialized `ContextParams` from the invitation.
+/// @param inviterDid - DID string of the identity sending the invitation.
+/// @param identityDid - DID string of the local identity receiving the invitation.
+/// @param policyJson - Optional JSON-serialized `AutoAcceptPolicy`.
+/// @param spendingJson - Optional JSON-serialized `SpendingContext`.
+/// @param trustedDidsJson - Optional JSON array of trusted DID strings.
+/// @returns `NapiEvaluationResult` with the decision.
+#[napi]
+pub fn evaluate_invitation(
+    params_json: String,
+    inviter_did: String,
+    identity_did: String,
+    policy_json: Option<String>,
+    spending_json: Option<String>,
+    trusted_dids_json: Option<String>,
+) -> napi::Result<NapiEvaluationResult> {
+    use scp_core::context::invitation::{
+        EvaluationDecision, SpendingContext, evaluate_invitation as core_evaluate,
+    };
+    use scp_core::context::policy::AutoAcceptPolicy;
+
+    validate_did(&inviter_did).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: e.message,
+            code: "SCP-VALID-7010".to_owned(),
+        })
+    })?;
+    validate_did(&identity_did).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: e.message,
+            code: "SCP-VALID-7010".to_owned(),
+        })
+    })?;
+
+    let params: scp_core::context::ContextParams =
+        serde_json::from_str(&params_json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("failed to parse context params JSON: {e}"),
+                code: "SCP-VALID-7010".to_owned(),
+            })
+        })?;
+
+    let policy: Option<AutoAcceptPolicy> = match policy_json {
+        Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("failed to parse auto-accept policy JSON: {e}"),
+                code: "SCP-VALID-7010".to_owned(),
+            })
+        })?),
+        None => None,
+    };
+
+    let spending: Option<SpendingContext> = match spending_json {
+        Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("failed to parse spending context JSON: {e}"),
+                code: "SCP-VALID-7010".to_owned(),
+            })
+        })?),
+        None => None,
+    };
+
+    let trusted_dids: Vec<scp_identity::DID> = match trusted_dids_json {
+        Some(ref json) => {
+            let did_strings: Vec<String> = serde_json::from_str(json).map_err(|e| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!("failed to parse trusted DIDs JSON: {e}"),
+                    code: "SCP-VALID-7010".to_owned(),
+                })
+            })?;
+            did_strings
+                .into_iter()
+                .map(scp_identity::DID::from)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let oracle = NapiBridgeTrustOracle { trusted_dids };
+    let inviter = scp_identity::DID::from(inviter_did.as_str());
+
+    let decision = crate::runtime::with_rate_limit_tracker(&identity_did, |tracker| {
+        core_evaluate(
+            &params,
+            &inviter,
+            policy.as_ref(),
+            spending.as_ref(),
+            &oracle,
+            tracker,
+        )
+    });
+
+    match decision {
+        Ok(EvaluationDecision::AutoAccept) => Ok(NapiEvaluationResult {
+            decision: "auto_accept".to_owned(),
+        }),
+        Ok(EvaluationDecision::PromptAgent) => Ok(NapiEvaluationResult {
+            decision: "prompt_agent".to_owned(),
+        }),
+        Err(e) => Err(napi::Error::from(ScpNapiError::Context {
+            message: format!("invitation evaluation failed: {e}"),
+            code: "SCP-CTX-2060".to_owned(),
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

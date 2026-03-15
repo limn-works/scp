@@ -8347,6 +8347,119 @@ pub fn sandbox_check_capability(
 }
 
 // ---------------------------------------------------------------------------
+// Invitation evaluation pipeline (#614)
+// ---------------------------------------------------------------------------
+
+/// FFI-concrete implementation of `TrustOracle`.
+struct UniffiBridgeTrustOracle {
+    trusted_dids: Vec<scp_identity::DID>,
+}
+
+impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
+    fn satisfies_trust(
+        &self,
+        inviter: &scp_identity::DID,
+        requirement: &scp_core::context::policy::TrustRequirement,
+    ) -> bool {
+        match requirement {
+            scp_core::context::policy::TrustRequirement::Any => true,
+            scp_core::context::policy::TrustRequirement::SharedContext => {
+                self.trusted_dids.contains(inviter)
+            }
+            scp_core::context::policy::TrustRequirement::Explicit(dids) => dids.contains(inviter),
+        }
+    }
+}
+
+/// Evaluates a context invitation through the sequential pipeline.
+///
+/// Runs the 4-step evaluation pipeline from `scp-core`:
+/// 1. Template validation (rejects template spoofing).
+/// 2. Economic policy check (rejects insufficient spending capability).
+/// 3. Auto-accept evaluation (trust, TTL cap, rate limit).
+/// 4. Falls through to prompt-agent if no auto-accept matches.
+///
+/// Returns `"auto_accept"` or `"prompt_agent"`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if JSON parsing fails.
+/// Returns `ScpError::Context` if pipeline produces a rejection error
+/// (template spoofing, economic policy failure).
+#[uniffi::export]
+pub fn evaluate_invitation(
+    params_json: String,
+    inviter_did: String,
+    identity_did: String,
+    policy_json: Option<String>,
+    spending_json: Option<String>,
+    trusted_dids: Vec<String>,
+) -> Result<String, ScpError> {
+    use scp_core::context::invitation::{
+        EvaluationDecision, SpendingContext, evaluate_invitation as core_evaluate,
+    };
+    use scp_core::context::policy::AutoAcceptPolicy;
+
+    validate_did(&inviter_did)?;
+    validate_did(&identity_did)?;
+
+    let params: scp_core::context::params::ContextParams = serde_json::from_str(&params_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse context params JSON: {e}"),
+            code: "SCP-VALID-7010".to_owned(),
+        })?;
+
+    let policy: Option<AutoAcceptPolicy> = match policy_json {
+        Some(ref json) => Some(
+            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse auto-accept policy JSON: {e}"),
+                code: "SCP-VALID-7010".to_owned(),
+            })?,
+        ),
+        None => None,
+    };
+
+    let spending: Option<SpendingContext> = match spending_json {
+        Some(ref json) => Some(
+            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse spending context JSON: {e}"),
+                code: "SCP-VALID-7010".to_owned(),
+            })?,
+        ),
+        None => None,
+    };
+
+    let oracle_dids: Vec<scp_identity::DID> = trusted_dids
+        .into_iter()
+        .map(scp_identity::DID::from)
+        .collect();
+    let oracle = UniffiBridgeTrustOracle {
+        trusted_dids: oracle_dids,
+    };
+    let inviter = scp_identity::DID::from(inviter_did.as_str());
+
+    let decision = crate::runtime::with_rate_limit_tracker(&identity_did, |tracker| {
+        core_evaluate(
+            &params,
+            &inviter,
+            policy.as_ref(),
+            spending.as_ref(),
+            &oracle,
+            tracker,
+        )
+    });
+
+    match decision {
+        Ok(EvaluationDecision::AutoAccept) => Ok("auto_accept".to_owned()),
+        Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
+        Err(e) => Err(ScpError::Context {
+            msg: format!("invitation evaluation failed: {e}"),
+            code: "SCP-CTX-2060".to_owned(),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator (#632)
 // ---------------------------------------------------------------------------
 

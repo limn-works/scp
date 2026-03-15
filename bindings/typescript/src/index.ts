@@ -46,8 +46,8 @@ export { Identity } from "./identity";
 // Context
 // ---------------------------------------------------------------------------
 
-export type { DeclarationValidationResult } from "./context";
-export { Context, ScopedHandle, validateCapabilityDeclaration } from "./context";
+export type { DeclarationValidationResult, InvitationEvaluationResult } from "./context";
+export { Context, ScopedHandle, evaluateInvitation, validateCapabilityDeclaration } from "./context";
 
 // ---------------------------------------------------------------------------
 // Tools

@@ -1414,6 +1414,427 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
 }
 
 // ---------------------------------------------------------------------------
+// Invitation evaluation pipeline (#614)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// WASM-local rate limit tracker (B1 — #614)
+// ---------------------------------------------------------------------------
+
+/// WASM-local rate limit tracker for invitation auto-accept.
+///
+/// Mirrors `scp_core::context::invitation::RateLimitTracker` behavior using
+/// `js_sys::Date::now()` timestamps (milliseconds since epoch) instead of
+/// `std::time::Instant` (unavailable on `wasm32-unknown-unknown`).
+///
+/// Stored per-identity-DID in a `thread_local` `HashMap`.
+struct WasmRateLimitTracker {
+    /// Timestamps of auto-accept events in milliseconds since epoch.
+    accepts_ms: Vec<f64>,
+}
+
+impl WasmRateLimitTracker {
+    /// Creates a new empty tracker.
+    const fn new() -> Self {
+        Self {
+            accepts_ms: Vec::new(),
+        }
+    }
+
+    /// Records an auto-accept event at the current time.
+    fn record_accept(&mut self) {
+        self.accepts_ms.push(js_sys::Date::now());
+    }
+
+    /// Checks whether an additional auto-accept is allowed under the given
+    /// rate limit (`max_count` within `window_secs`). Prunes expired entries.
+    fn is_allowed(&mut self, max_count: u32, window_secs: f64) -> bool {
+        let now_ms = js_sys::Date::now();
+        let window_ms = window_secs * 1000.0;
+        self.accepts_ms
+            .retain(|&t| (now_ms - t) < window_ms);
+        self.accepts_ms.len() < max_count as usize
+    }
+}
+
+thread_local! {
+    /// Per-identity-DID rate limit trackers for invitation auto-accept.
+    static RATE_LIMIT_TRACKERS: std::cell::RefCell<std::collections::HashMap<String, WasmRateLimitTracker>>
+        = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Executes `f` with a mutable reference to the rate limit tracker for the
+/// given identity DID, creating one if it does not exist.
+fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
+where
+    F: FnOnce(&mut WasmRateLimitTracker) -> T,
+{
+    RATE_LIMIT_TRACKERS.with(|trackers| {
+        let mut map = trackers.borrow_mut();
+        let tracker = map
+            .entry(identity_did.to_owned())
+            .or_insert_with(WasmRateLimitTracker::new);
+        f(tracker)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Template validation (B2 — #614)
+// ---------------------------------------------------------------------------
+
+/// Validates context params against the claimed template.
+///
+/// Full re-implementation of `scp-core`'s `validate_against_template`. Checks
+/// mode, ceiling caps, and `ceiling_policy` for ALL template types — not just
+/// bilateral templates. Returns an error message on mismatch, or `None` if
+/// validation passes (or no template is claimed).
+fn validate_against_template(params: &serde_json::Value) -> Result<(), ScpWasmError> {
+    let Some(tid) = params
+        .get("template_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+
+    // Expected (mode, ceiling_policy, has_tool_caps) per template.
+    // Mode strings match serde serialization of ContextMode.
+    let (expected_mode, expected_ceiling_policy, allows_tool_caps) = match tid {
+        "BilateralEphemeral" | "BilateralPersistent" => ("Encrypted", "Immutable", false),
+        "Coordination" | "scp:template/tool-interface" | "scp:template/paid-service"
+        | "scp:template/discovery" => ("Encrypted", "Immutable", true),
+        "GroupDiscussion" => ("Encrypted", "Governed", false),
+        "PublicBroadcast" | "GatedBroadcast" | "scp:template/paid-broadcast" => {
+            ("Broadcast", "Immutable", false)
+        }
+        // Unknown template — skip validation (forward-compatible).
+        _ => return Ok(()),
+    };
+
+    // Check mode.
+    let actual_mode = params
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Encrypted");
+    if actual_mode != expected_mode {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "template spoofing detected: template {tid} expects mode {expected_mode}, got {actual_mode}"
+            ),
+            code: "SCP-CTX-2060".to_owned(),
+        });
+    }
+
+    // Check ceiling_policy.
+    let actual_policy = params
+        .get("ceiling_policy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Immutable");
+    if actual_policy != expected_ceiling_policy {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "template spoofing detected: template {tid} expects ceiling_policy {expected_ceiling_policy}, got {actual_policy}"
+            ),
+            code: "SCP-CTX-2060".to_owned(),
+        });
+    }
+
+    // Check tool capabilities: if the template does not allow tool caps but
+    // the ceiling contains them, reject.
+    if !allows_tool_caps && ceiling_has_tool_caps(params.get("ceiling")) {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "template spoofing detected: tool capabilities in {tid} template"
+            ),
+            code: "SCP-CTX-2060".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns `true` if the ceiling array contains any tool-related capability.
+fn ceiling_has_tool_caps(ceiling: Option<&serde_json::Value>) -> bool {
+    ceiling
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|caps| {
+            caps.iter().any(|c| {
+                let s = c.as_str().unwrap_or("");
+                s == "ToolInvokeAll" || s == "ToolRegister" || s.starts_with("ToolInvoke(")
+            })
+        })
+}
+
+/// Returns `true` if the params JSON has an economic policy requiring payment.
+fn params_require_payment(params: &serde_json::Value) -> bool {
+    params
+        .get("economic_policy")
+        .and_then(|ep| ep.get("cost_schedule"))
+        .is_some_and(|cs| {
+            cs.get("per_message").is_some_and(|v| !v.is_null())
+                || cs.get("per_tool_invoke").is_some_and(|v| !v.is_null())
+                || cs.get("per_join").is_some_and(|v| !v.is_null())
+                || cs.get("per_period").is_some_and(|v| !v.is_null())
+                || cs.get("per_byte_stored").is_some_and(|v| !v.is_null())
+        })
+        || params
+            .get("economic_policy")
+            .and_then(|ep| ep.get("pricing_formula"))
+            .is_some_and(|v| !v.is_null())
+}
+
+/// Checks trust requirement against the inviter and trusted DID list.
+fn check_trust(
+    policy: &serde_json::Value,
+    inviter_did: &str,
+    trusted_dids_json: Option<&String>,
+) -> bool {
+    match policy.get("from").and_then(serde_json::Value::as_str) {
+        Some("Any") => true,
+        Some("SharedContext") => {
+            let trusted: Vec<String> = trusted_dids_json.map_or_else(Vec::new, |json| {
+                serde_json::from_str(json).unwrap_or_default()
+            });
+            trusted.contains(&inviter_did.to_owned())
+        }
+        _ => policy.get("from").is_some_and(|from_obj| {
+            from_obj.get("Explicit").is_some_and(|explicit| {
+                explicit
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|d| d.as_str() == Some(inviter_did)))
+            })
+        }),
+    }
+}
+
+/// Checks economic policy constraints: spending UCAN, adapter compatibility,
+/// and balance sufficiency. Returns an error `JsValue` on failure, or
+/// `Ok(())` if all checks pass.
+fn check_economic_policy(
+    params: &serde_json::Value,
+    spending_json: Option<&String>,
+) -> Result<(), JsValue> {
+    let spending: Option<serde_json::Value> =
+        spending_json.and_then(|json| serde_json::from_str(json).ok());
+
+    let has_ucan = spending
+        .as_ref()
+        .and_then(|sp| {
+            sp.get("has_spending_ucan")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+
+    if !has_ucan {
+        return Err(ScpWasmError::Context {
+            message: "spending UCAN required: context has economic policy requiring payment"
+                .to_owned(),
+            code: "SCP-CTX-2060".to_owned(),
+        }
+        .into_js()
+        .into());
+    }
+
+    let Some(ref sp) = spending else {
+        return Ok(());
+    };
+
+    // Check compatible payment adapter.
+    let configured_adapters: Vec<String> = sp
+        .get("configured_adapters")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(accepted_adapters) = params
+        .get("economic_policy")
+        .and_then(|ep| ep.get("payment_adapters"))
+        .and_then(serde_json::Value::as_array)
+    {
+        let has_compatible = accepted_adapters.iter().any(|a| {
+            a.as_str()
+                .is_some_and(|s| configured_adapters.contains(&s.to_owned()))
+        });
+
+        if !has_compatible {
+            let accepted: Vec<String> = accepted_adapters
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "no compatible payment adapter: context accepts {accepted:?}, configured {configured_adapters:?}"
+                ),
+                code: "SCP-CTX-2060".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+    }
+
+    // Check balance covers at least per_join cost.
+    let available_balance = sp
+        .get("available_balance")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    if let Some(per_join) = params
+        .get("economic_policy")
+        .and_then(|ep| ep.get("cost_schedule"))
+        .and_then(|cs| cs.get("per_join"))
+        .and_then(serde_json::Value::as_u64)
+        && available_balance < per_join
+    {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "insufficient balance: estimated cost {per_join}, available {available_balance}"
+            ),
+            code: "SCP-CTX-2060".to_owned(),
+        }
+        .into_js()
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Evaluates the auto-accept policy against invitation params.
+///
+/// Returns `Some("auto_accept")` if the policy matches and all constraints
+/// (trust, TTL, rate limit) pass. Returns `None` to fall through to
+/// prompt-agent.
+fn check_auto_accept(
+    params: &serde_json::Value,
+    policy_json: Option<&String>,
+    inviter_did: &str,
+    identity_did: &str,
+    trusted_dids_json: Option<&String>,
+) -> Result<Option<&'static str>, JsValue> {
+    let Some(pjson) = policy_json else {
+        return Ok(None);
+    };
+
+    let policy: serde_json::Value = serde_json::from_str(pjson).map_err(|e| {
+        JsValue::from_str(&format!(
+            "[SCP-VALID-7010] failed to parse auto-accept policy JSON: {e}"
+        ))
+    })?;
+
+    if ceiling_has_tool_caps(params.get("ceiling")) {
+        return Ok(None);
+    }
+
+    let policy_template = policy.get("template").and_then(serde_json::Value::as_str);
+    let params_template = params
+        .get("template_id")
+        .and_then(serde_json::Value::as_str);
+
+    if policy_template.is_none()
+        || policy_template != params_template
+        || !check_trust(&policy, inviter_did, trusted_dids_json)
+    {
+        return Ok(None);
+    }
+
+    let ttl_ok = match (
+        policy.get("max_ttl").and_then(serde_json::Value::as_f64),
+        params.get("ttl").and_then(serde_json::Value::as_f64),
+    ) {
+        (Some(max), Some(actual)) => actual <= max,
+        _ => true,
+    };
+
+    if !ttl_ok {
+        return Ok(None);
+    }
+
+    // Rate limit check.
+    let rate_ok = match (
+        policy
+            .get("rate_limit")
+            .and_then(|rl| rl.get("max_count"))
+            .and_then(serde_json::Value::as_u64),
+        policy
+            .get("rate_limit")
+            .and_then(|rl| rl.get("window"))
+            .and_then(serde_json::Value::as_f64),
+    ) {
+        (Some(max_count), Some(window_secs)) => {
+            let max = u32::try_from(max_count).unwrap_or(u32::MAX);
+            with_rate_limit_tracker(identity_did, |tracker| {
+                tracker.is_allowed(max, window_secs)
+            })
+        }
+        _ => true,
+    };
+
+    if rate_ok {
+        with_rate_limit_tracker(identity_did, |tracker| {
+            tracker.record_accept();
+        });
+        return Ok(Some("auto_accept"));
+    }
+
+    Ok(None)
+}
+
+/// Evaluates a context invitation through the sequential pipeline.
+///
+/// WASM-local re-implementation of the 4-step pipeline from `scp-core`.
+/// Returns a Promise resolving to JSON: `{"decision": "auto_accept"|"prompt_agent"}`.
+///
+/// Includes rate limiting (B1), full template validation (B2), and
+/// adapter/balance economic checks (B3) per #614 review findings.
+#[wasm_bindgen]
+pub fn evaluate_invitation(
+    params_json: String,
+    inviter_did: String,
+    identity_did: String,
+    policy_json: Option<String>,
+    spending_json: Option<String>,
+    trusted_dids_json: Option<String>,
+) -> Promise {
+    future_to_promise(async move {
+        validate_did(&inviter_did).map_err(|e| ScpWasmError::from(e).into_js())?;
+        validate_did(&identity_did).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+            JsValue::from_str(&format!(
+                "[SCP-VALID-7010] failed to parse context params JSON: {e}"
+            ))
+        })?;
+
+        // Step 1: Template validation (B2 — all template types).
+        validate_against_template(&params).map_err(ScpWasmError::into_js)?;
+
+        // Step 2: Economic policy check (B3 — adapter/balance checks).
+        if params_require_payment(&params) {
+            check_economic_policy(&params, spending_json.as_ref())?;
+            return Ok(JsValue::from_str(r#"{"decision":"prompt_agent"}"#));
+        }
+
+        // Step 3: Auto-accept check (B1 — rate limiting).
+        if let Some(decision) = check_auto_accept(
+            &params,
+            policy_json.as_ref(),
+            &inviter_did,
+            &identity_did,
+            trusted_dids_json.as_ref(),
+        )? {
+            return Ok(JsValue::from_str(&format!(r#"{{"decision":"{decision}"}}"#)));
+        }
+
+        // Step 4: Prompt agent (fallthrough).
+        Ok(JsValue::from_str(r#"{"decision":"prompt_agent"}"#))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
