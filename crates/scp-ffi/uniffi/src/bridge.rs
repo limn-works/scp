@@ -9151,6 +9151,319 @@ const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Economic governance
+// ---------------------------------------------------------------------------
+
+/// Estimates the cost for a given action in a context.
+///
+/// Returns the estimated cost (smallest currency unit), or `None` on overflow.
+/// Pass empty string or `"null"` for free contexts (returns 0).
+#[uniffi::export]
+pub fn economy_estimate_cost(
+    policy_json: String,
+    action_type: String,
+    metrics_json: String,
+) -> Result<Option<u64>, ScpError> {
+    let action = parse_paid_action_type(&action_type)?;
+    let metrics = parse_observable_metrics(&metrics_json)?;
+
+    let policy = if policy_json.is_empty() || policy_json == "null" {
+        None
+    } else {
+        let p: scp_core::economy::EconomicPolicy =
+            serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid economic policy JSON: {e}"),
+                code: "SCP-VALID-7050".to_owned(),
+            })?;
+        Some(p)
+    };
+
+    Ok(
+        scp_core::economy::estimate_cost(policy.as_ref(), &action, &metrics)
+            .map(scp_core::economy::Amount::value),
+    )
+}
+
+/// Returns `true` if the economic policy requires payment for any action.
+#[uniffi::export]
+pub fn economy_policy_requires_payment(policy_json: String) -> Result<bool, ScpError> {
+    if policy_json.is_empty() || policy_json == "null" {
+        return Ok(false);
+    }
+    let policy: scp_core::economy::EconomicPolicy =
+        serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid economic policy JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+    Ok(scp_core::economy::policy_requires_payment(&policy))
+}
+
+/// Returns `true` if auto-accept is blocked by economic policy.
+#[uniffi::export]
+pub fn economy_auto_accept_blocked(policy_json: String) -> Result<bool, ScpError> {
+    if policy_json.is_empty() || policy_json == "null" {
+        return Ok(false);
+    }
+    let policy: scp_core::economy::EconomicPolicy =
+        serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid economic policy JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+    Ok(scp_core::economy::auto_accept_blocked_by_economics(Some(
+        &policy,
+    )))
+}
+
+/// Returns `true` if the economic policy is locked (immutable).
+#[uniffi::export]
+pub fn economy_check_policy_lock(policy_json: String) -> Result<bool, ScpError> {
+    if policy_json.is_empty() || policy_json == "null" {
+        return Ok(false);
+    }
+    let policy: scp_core::economy::EconomicPolicy =
+        serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid economic policy JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+    Ok(scp_core::economy::check_policy_lock(&policy).is_err())
+}
+
+/// Validates a proposed economic policy change.
+#[uniffi::export]
+pub fn economy_validate_policy_change(
+    current_policy_json: String,
+    proposed_policy_json: String,
+) -> Result<bool, ScpError> {
+    let current: scp_core::economy::EconomicPolicy = serde_json::from_str(&current_policy_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid current policy JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+    let proposed: scp_core::economy::EconomicPolicy = serde_json::from_str(&proposed_policy_json)
+        .map_err(|e| ScpError::Validation {
+        msg: format!("invalid proposed policy JSON: {e}"),
+        code: "SCP-VALID-7050".to_owned(),
+    })?;
+    scp_core::economy::validate_policy_change(&current, &proposed).map_err(|e| {
+        ScpError::Validation {
+            msg: format!("policy change rejected: {e}"),
+            code: "SCP-VALID-7051".to_owned(),
+        }
+    })?;
+    Ok(true)
+}
+
+/// Evaluates a pricing formula against observable metrics.
+#[uniffi::export]
+pub fn economy_evaluate_formula(
+    formula_json: String,
+    metrics_json: String,
+) -> Result<Option<u64>, ScpError> {
+    let formula: scp_core::economy::PricingFormula =
+        serde_json::from_str(&formula_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid formula JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+    let metrics = parse_observable_metrics(&metrics_json)?;
+    Ok(scp_core::economy::evaluate_formula(&formula, &metrics)
+        .map(scp_core::economy::Amount::value))
+}
+
+/// Computes an EIP-1559-style relay price adjustment. Returns JSON.
+#[uniffi::export]
+pub fn economy_adjust_relay_price(
+    config_json: String,
+    actual_utilization_pct: u64,
+) -> Result<String, ScpError> {
+    let config: scp_core::economy::RelayPricingConfig = serde_json::from_str(&config_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid relay pricing config JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+    let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct);
+    let direction = match result.direction {
+        scp_core::economy::PriceDirection::Increased => "Increased",
+        scp_core::economy::PriceDirection::Decreased => "Decreased",
+        scp_core::economy::PriceDirection::Unchanged => "Unchanged",
+    };
+    let json = serde_json::json!({
+        "new_base_price": result.new_base_price.value(),
+        "previous_base_price": result.previous_base_price.value(),
+        "direction": direction,
+    });
+    Ok(json.to_string())
+}
+
+/// Queries the remaining budget for a member in a context.
+#[uniffi::export]
+pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, ScpError> {
+    validate_did(&did)?;
+    let member_did = scp_identity::DID::from(did.as_str());
+    let remaining =
+        crate::runtime::with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
+    Ok(remaining.value())
+}
+
+/// Grants spending budget to a member.
+#[uniffi::export]
+pub fn economy_budget_grant(context_id: String, did: String, amount: u64) -> Result<(), ScpError> {
+    validate_did(&did)?;
+    let member_did = scp_identity::DID::from(did.as_str());
+    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+        tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
+    });
+    Ok(())
+}
+
+/// Records a spend against a member's budget.
+#[uniffi::export]
+pub fn economy_budget_record_spend(
+    context_id: String,
+    did: String,
+    amount: u64,
+) -> Result<(), ScpError> {
+    validate_did(&did)?;
+    let member_did = scp_identity::DID::from(did.as_str());
+    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+        tracker
+            .record_spend(&member_did, scp_core::economy::Amount::new(amount))
+            .map_err(|e| ScpError::Validation {
+                msg: format!("{e}"),
+                code: "SCP-VALID-7052".to_owned(),
+            })
+    })
+}
+
+/// Records a message for antispam velocity tracking.
+#[uniffi::export]
+pub fn economy_antispam_record(
+    context_id: String,
+    sender_did: String,
+    timestamp: u64,
+) -> Result<(), ScpError> {
+    validate_did(&sender_did)?;
+    let did = scp_identity::DID::from(sender_did.as_str());
+    crate::runtime::with_economy_antispam(&context_id, |tracker| {
+        tracker.record_message(&did, timestamp);
+    });
+    Ok(())
+}
+
+/// Queries sender velocity (messages within sliding window).
+#[uniffi::export]
+pub fn economy_antispam_velocity(
+    context_id: String,
+    sender_did: String,
+    now: u64,
+) -> Result<u64, ScpError> {
+    validate_did(&sender_did)?;
+    let did = scp_identity::DID::from(sender_did.as_str());
+    let velocity = crate::runtime::with_economy_antispam(&context_id, |tracker| {
+        tracker.get_velocity(&did, now)
+    });
+    Ok(velocity)
+}
+
+/// Computes escalated cost for a sender based on antispam velocity.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn economy_antispam_escalated_cost(
+    context_id: String,
+    sender_did: String,
+    now: u64,
+    base_cost: u64,
+    thresholds_json: String,
+    floor: Option<u64>,
+    cap: Option<u64>,
+) -> Result<u64, ScpError> {
+    validate_did(&sender_did)?;
+    let thresholds: Vec<(u64, u64)> =
+        serde_json::from_str(&thresholds_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid thresholds JSON: {e}"),
+            code: "SCP-VALID-7050".to_owned(),
+        })?;
+
+    let config = scp_core::economy::EscalationConfig {
+        thresholds: thresholds
+            .into_iter()
+            .map(|(vel, cost)| scp_core::economy::EscalationThreshold {
+                velocity_threshold: vel,
+                additional_cost: scp_core::economy::Amount::new(cost),
+            })
+            .collect(),
+    };
+
+    let did = scp_identity::DID::from(sender_did.as_str());
+    let cost = crate::runtime::with_economy_antispam(&context_id, |tracker| {
+        tracker.compute_escalated_cost(
+            &did,
+            now,
+            scp_core::economy::Amount::new(base_cost),
+            &config,
+            floor.map(scp_core::economy::Amount::new),
+            cap.map(scp_core::economy::Amount::new),
+        )
+    });
+    Ok(cost.value())
+}
+
+// ---------------------------------------------------------------------------
+// Economy helpers
+// ---------------------------------------------------------------------------
+
+fn parse_paid_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, ScpError> {
+    match s {
+        "MessageSend" | "message_send" => Ok(scp_core::economy::PaidActionType::MessageSend),
+        "ToolInvoke" | "tool_invoke" => Ok(scp_core::economy::PaidActionType::ToolInvoke),
+        "ContextJoin" | "context_join" => Ok(scp_core::economy::PaidActionType::ContextJoin),
+        "SubscriptionPeriod" | "subscription_period" => {
+            Ok(scp_core::economy::PaidActionType::SubscriptionPeriod)
+        }
+        "ByteStored" | "byte_stored" => Ok(scp_core::economy::PaidActionType::ByteStored),
+        _ => Err(ScpError::Validation {
+            msg: format!(
+                "invalid action type: {s:?} — expected one of: MessageSend, ToolInvoke, \
+                 ContextJoin, SubscriptionPeriod, ByteStored"
+            ),
+            code: "SCP-VALID-7050".to_owned(),
+        }),
+    }
+}
+
+fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableMetrics, ScpError> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| ScpError::Validation {
+        msg: format!("invalid metrics JSON: {e}"),
+        code: "SCP-VALID-7050".to_owned(),
+    })?;
+    Ok(scp_core::economy::ObservableMetrics {
+        context_message_rate: v
+            .get("context_message_rate")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        member_count: v
+            .get("member_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        relay_queue_depth: v
+            .get("relay_queue_depth")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        time_of_day: v
+            .get("time_of_day")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        sender_velocity: v
+            .get("sender_velocity")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        storage_usage: v
+            .get("storage_usage")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

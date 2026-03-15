@@ -46,6 +46,7 @@
 #![allow(unsafe_code)]
 
 pub mod context;
+pub mod economy;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -225,6 +226,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Step 6: Register domain bridge modules.
     context::register_context(m)?;
     discovery::register_discovery(m)?;
+    economy::register_economy(m)?;
     tools::register_tools(m)?;
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;

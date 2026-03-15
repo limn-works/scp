@@ -1266,6 +1266,88 @@ pub fn remove_identity_if_present(did: &str) -> bool {
     identity_registry().remove(did).is_some()
 }
 
+// ---------------------------------------------------------------------------
+// Economy state registries
+// ---------------------------------------------------------------------------
+
+/// Per-context member budget trackers for economic governance.
+///
+/// Keyed by context ID. Created lazily on first access via
+/// [`with_economy_budget`] / [`with_economy_budget_mut`]. Budget trackers are
+/// NOT removed automatically when contexts are closed -- call
+/// [`remove_economy_state`] for cleanup in long-running processes.
+static ECONOMY_BUDGETS: OnceLock<DashMap<String, scp_core::economy::MemberBudgetTracker>> =
+    OnceLock::new();
+
+fn economy_budget_registry() -> &'static DashMap<String, scp_core::economy::MemberBudgetTracker> {
+    ECONOMY_BUDGETS.get_or_init(DashMap::new)
+}
+
+/// Per-context antispam velocity trackers for economic governance.
+///
+/// Keyed by context ID. Created lazily on first access with a default 60-second
+/// sliding window. The window duration matches the spec section 19.7 example.
+static ECONOMY_ANTISPAM: OnceLock<DashMap<String, scp_core::economy::SenderVelocityTracker>> =
+    OnceLock::new();
+
+/// Default sliding window duration for antispam velocity tracking (seconds).
+/// Matches the spec section 19.7 example.
+const ANTISPAM_DEFAULT_WINDOW_SECS: u64 = 60;
+
+fn economy_antispam_registry() -> &'static DashMap<String, scp_core::economy::SenderVelocityTracker>
+{
+    ECONOMY_ANTISPAM.get_or_init(DashMap::new)
+}
+
+/// Reads the budget tracker for a context, creating one if it doesn't exist.
+///
+/// The closure receives an immutable reference to the tracker.
+pub fn with_economy_budget<T, F>(context_id: &str, f: F) -> T
+where
+    F: FnOnce(&scp_core::economy::MemberBudgetTracker) -> T,
+{
+    let registry = economy_budget_registry();
+    let entry = registry.entry(context_id.to_owned()).or_default();
+    f(entry.value())
+}
+
+/// Mutably accesses the budget tracker for a context, creating one if needed.
+///
+/// The closure receives a mutable reference to the tracker.
+pub fn with_economy_budget_mut<T, F>(context_id: &str, f: F) -> T
+where
+    F: FnOnce(&mut scp_core::economy::MemberBudgetTracker) -> T,
+{
+    let registry = economy_budget_registry();
+    let mut entry = registry.entry(context_id.to_owned()).or_default();
+    f(entry.value_mut())
+}
+
+/// Accesses the antispam velocity tracker for a context, creating one if needed.
+///
+/// The closure receives a reference to the tracker (which is internally
+/// `Mutex`-protected, so `&self` methods like `record_message` and
+/// `get_velocity` work without `&mut`).
+pub fn with_economy_antispam<T, F>(context_id: &str, f: F) -> T
+where
+    F: FnOnce(&scp_core::economy::SenderVelocityTracker) -> T,
+{
+    let registry = economy_antispam_registry();
+    let entry = registry.entry(context_id.to_owned()).or_insert_with(|| {
+        scp_core::economy::SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS)
+    });
+    f(entry.value())
+}
+
+/// Removes economy state (budget tracker and antispam tracker) for a context.
+///
+/// Should be called during context cleanup for long-running processes.
+#[allow(dead_code)]
+pub fn remove_economy_state(context_id: &str) {
+    economy_budget_registry().remove(context_id);
+    economy_antispam_registry().remove(context_id);
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
