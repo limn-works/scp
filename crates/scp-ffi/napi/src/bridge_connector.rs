@@ -297,9 +297,9 @@ pub fn bridge_create_shadow(
         &params,
     )
     .map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
+        napi::Error::from(ScpNapiError::Context {
             message: format!("shadow creation failed: {e}"),
-            code: "SCP-VALID-7014".to_owned(),
+            code: "SCP-CTX-2102".to_owned(),
         })
     })?;
 

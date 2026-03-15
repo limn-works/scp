@@ -56,7 +56,7 @@ class ScpContextHolder(
  * Remember an SCP context scoped to the Composable's lifetime.
  *
  * Creates a [ScpContextHolder] that persists across recompositions for the
- * same [contextHandle]. When the Composable leaves composition, the
+ * same [contextHandle] and [identityHandle]. When the Composable leaves composition, the
  * [onDispose] callback is invoked to clean up the context (e.g., call
  * `contextBridge.leave(handle, identityHandle)`), and the internal coroutine
  * scope is cancelled.
@@ -88,7 +88,7 @@ fun rememberScpContext(
     identityHandle: Long,
     onDispose: (Long, Long) -> Unit,
 ): ScpContextHolder {
-    val holder = remember(contextHandle) {
+    val holder = remember(contextHandle, identityHandle) {
         ScpContextHolder(
             contextHandle = contextHandle,
             identityHandle = identityHandle,
@@ -96,7 +96,7 @@ fun rememberScpContext(
             onDispose = onDispose,
         )
     }
-    DisposableEffect(contextHandle) {
+    DisposableEffect(contextHandle, identityHandle) {
         onDispose { holder.dispose() }
     }
     return holder
