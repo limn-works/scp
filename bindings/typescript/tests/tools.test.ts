@@ -145,7 +145,7 @@ describe("toolInvokeCrossContext", () => {
     expect(output.status).toBe("validated");
   });
 
-  it("rejects chainDepth > 255", async () => {
+  it("rejects chainDepth > 5 (protocol hard max per spec §24.4)", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
@@ -158,9 +158,35 @@ describe("toolInvokeCrossContext", () => {
         "{}",
         identity.did,
         "token",
-        256,
+        6,
       ),
     ).rejects.toThrow(ValidationError);
+  });
+
+  it("accepts chainDepth at protocol hard max (5)", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    const targetHandle = await mockBridge.contextCreate(identity, "{}");
+
+    const toolId = await mockBridge.toolRegister(targetHandle, {
+      name: "deep-tool",
+      description: "Deep chain tool",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+
+    const result = await toolInvokeCrossContext(
+      sourceHandle,
+      targetHandle,
+      toolId,
+      "{}",
+      identity.did,
+      "token",
+      5,
+    );
+
+    expect(result.chainDepth).toBe(5);
   });
 
   it("rejects negative chainDepth", async () => {
@@ -254,18 +280,18 @@ describe("toolSessionCreate", () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const handle = await mockBridge.contextCreate(identity, "{}");
 
-    await expect(
-      toolSessionCreate(handle, "tool-test", "source-ctx-1", -1),
-    ).rejects.toThrow(ValidationError);
+    await expect(toolSessionCreate(handle, "tool-test", "source-ctx-1", -1)).rejects.toThrow(
+      ValidationError,
+    );
   });
 
   it("rejects non-integer ttlSeconds", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const handle = await mockBridge.contextCreate(identity, "{}");
 
-    await expect(
-      toolSessionCreate(handle, "tool-test", "source-ctx-1", 1.5),
-    ).rejects.toThrow(ValidationError);
+    await expect(toolSessionCreate(handle, "tool-test", "source-ctx-1", 1.5)).rejects.toThrow(
+      ValidationError,
+    );
   });
 });
 
@@ -331,13 +357,7 @@ describe("toolSessionInvoke", () => {
     const session = await toolSessionCreate(handle, toolId, "source-ctx-1");
 
     await toolSessionInvoke(handle, session.sessionId, "{}", identity.did, "token");
-    const result2 = await toolSessionInvoke(
-      handle,
-      session.sessionId,
-      "{}",
-      identity.did,
-      "token",
-    );
+    const result2 = await toolSessionInvoke(handle, session.sessionId, "{}", identity.did, "token");
 
     const parsed = JSON.parse(result2.output);
     expect(parsed.call_count).toBe(2);
@@ -381,8 +401,6 @@ describe("toolSessionClose", () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const handle = await mockBridge.contextCreate(identity, "{}");
 
-    await expect(toolSessionClose(handle, "nonexistent-session")).rejects.toThrow(
-      /SCP-TOOL-6021/,
-    );
+    await expect(toolSessionClose(handle, "nonexistent-session")).rejects.toThrow(/SCP-TOOL-6021/);
   });
 });

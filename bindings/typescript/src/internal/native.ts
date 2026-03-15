@@ -726,7 +726,16 @@ export function createNativeBridge(): Bridge {
           depth: number,
           proofs: readonly string[] | undefined,
         ) => Promise<string>
-      )(sourceHandle, targetHandle, toolId, inputJson, invokerDid, ucanToken, chainDepth, proofTokens);
+      )(
+        sourceHandle,
+        targetHandle,
+        toolId,
+        inputJson,
+        invokerDid,
+        ucanToken,
+        chainDepth,
+        proofTokens,
+      );
     },
 
     // Stateful tool sessions (spec section 6.2.1)
@@ -767,9 +776,10 @@ export function createNativeBridge(): Bridge {
     },
 
     async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
-      await (
-        addon.toolSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>
-      )(handle, sessionId);
+      await (addon.toolSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>)(
+        handle,
+        sessionId,
+      );
     },
 
     // Transport

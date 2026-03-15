@@ -469,14 +469,10 @@ export function createMockBridge(): Bridge & {
       const targetCtx = getContext(targetHandle);
 
       if (sourceCtx.state !== "active") {
-        throw new Error(
-          `[SCP-TOOL-6010] Source context in "${sourceCtx.state}" state`,
-        );
+        throw new Error(`[SCP-TOOL-6010] Source context in "${sourceCtx.state}" state`);
       }
       if (targetCtx.state !== "active") {
-        throw new Error(
-          `[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`,
-        );
+        throw new Error(`[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`);
       }
       if (chainDepth > 5) {
         throw new Error(
@@ -486,9 +482,7 @@ export function createMockBridge(): Bridge & {
 
       const tool = targetCtx.tools.get(toolId);
       if (tool === undefined) {
-        throw new Error(
-          `[SCP-TOOL-6002] Tool '${toolId}' not found in target context`,
-        );
+        throw new Error(`[SCP-TOOL-6002] Tool '${toolId}' not found in target context`);
       }
 
       const input = JSON.parse(inputJson);
@@ -517,9 +511,7 @@ export function createMockBridge(): Bridge & {
     ): Promise<string> {
       const ctx = getContext(handle);
       if (ctx.state !== "active") {
-        throw new Error(
-          `[SCP-TOOL-6014] Cannot create session in context in "${ctx.state}" state`,
-        );
+        throw new Error(`[SCP-TOOL-6014] Cannot create session in context in "${ctx.state}" state`);
       }
 
       if (!ctx.tools.has(toolId)) {
@@ -532,9 +524,7 @@ export function createMockBridge(): Bridge & {
         if (session.sourceContextId === sourceContextId) callerSessions++;
       }
       if (callerSessions >= 5) {
-        throw new Error(
-          `[SCP-TOOL-6015] Session cap exceeded for caller '${sourceContextId}'`,
-        );
+        throw new Error(`[SCP-TOOL-6015] Session cap exceeded for caller '${sourceContextId}'`);
       }
 
       const sessionId = `session-${nextId++}`;
@@ -559,9 +549,7 @@ export function createMockBridge(): Bridge & {
     ): Promise<string> {
       const ctx = getContext(handle);
       if (ctx.state !== "active") {
-        throw new Error(
-          `[SCP-TOOL-6017] Cannot invoke session in context in "${ctx.state}" state`,
-        );
+        throw new Error(`[SCP-TOOL-6017] Cannot invoke session in context in "${ctx.state}" state`);
       }
 
       const session = ctx.sessions.get(sessionId);

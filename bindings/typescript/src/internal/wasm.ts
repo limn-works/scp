@@ -12,7 +12,7 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { IdentityError, TransportError } from "../errors";
+import { IdentityError, ToolError, TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -1099,10 +1099,10 @@ export function createWasmBridge(): Bridge {
       _chainDepth: number,
       _proofTokens?: readonly string[],
     ): Promise<string> {
-      throw new TransportError(
+      throw new ToolError(
         "toolInvokeCrossContext is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for cross-context tool invocation.",
-        "SCP-TRANS-5004",
+        "SCP-TOOL-6040",
       );
     },
 
@@ -1113,10 +1113,10 @@ export function createWasmBridge(): Bridge {
       _sourceContextId: string,
       _ttlSeconds?: number,
     ): Promise<string> {
-      throw new TransportError(
+      throw new ToolError(
         "toolSessionCreate is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
-        "SCP-TRANS-5004",
+        "SCP-TOOL-6040",
       );
     },
 
@@ -1128,18 +1128,18 @@ export function createWasmBridge(): Bridge {
       _ucanToken: string,
       _proofTokens?: readonly string[],
     ): Promise<string> {
-      throw new TransportError(
+      throw new ToolError(
         "toolSessionInvoke is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
-        "SCP-TRANS-5004",
+        "SCP-TOOL-6040",
       );
     },
 
     async toolSessionClose(_handle: BridgeContextHandle, _sessionId: string): Promise<void> {
-      throw new TransportError(
+      throw new ToolError(
         "toolSessionClose is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
-        "SCP-TRANS-5004",
+        "SCP-TOOL-6040",
       );
     },
 
