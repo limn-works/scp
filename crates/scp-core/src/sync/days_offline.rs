@@ -433,12 +433,12 @@ pub enum DaysOfflineError {
         context_id: ContextId,
     },
 
-    /// Snapshot data was present but could not be deserialized.
-    #[error("snapshot deserialization failed for context {context_id}: {reason}")]
-    DeserializationFailed {
-        /// The context whose snapshot failed to deserialize.
+    /// Snapshot data could not be serialized or deserialized.
+    #[error("snapshot codec failed for context {context_id}: {reason}")]
+    SnapshotCodecFailed {
+        /// The context whose snapshot codec operation failed.
         context_id: ContextId,
-        /// Human-readable reason for the deserialization failure.
+        /// Human-readable reason for the codec failure.
         reason: String,
     },
 
@@ -980,7 +980,7 @@ impl<T: SnapshotTransport> DeltaSyncEngine for RelayBackedDeltaSyncEngine<T> {
         };
 
         let snapshot: ContextSnapshot =
-            rmp_serde::from_slice(&data).map_err(|e| DaysOfflineError::DeserializationFailed {
+            rmp_serde::from_slice(&data).map_err(|e| DaysOfflineError::SnapshotCodecFailed {
                 context_id: context_id.to_owned(),
                 reason: e.to_string(),
             })?;
@@ -1022,7 +1022,7 @@ impl<T: SnapshotTransport> DeltaSyncEngine for RelayBackedDeltaSyncEngine<T> {
 
     async fn publish_snapshot(&self, snapshot: &ContextSnapshot) -> Result<(), DaysOfflineError> {
         let data = rmp_serde::to_vec_named(snapshot).map_err(|e| {
-            DaysOfflineError::DeserializationFailed {
+            DaysOfflineError::SnapshotCodecFailed {
                 context_id: snapshot.context_id.clone(),
                 reason: format!("serialization failed: {e}"),
             }
@@ -1736,6 +1736,18 @@ mod tests {
         };
         assert!(err.to_string().contains("250"));
         assert!(err.to_string().contains("ctx-2"));
+
+        let err = DaysOfflineError::SnapshotCodecFailed {
+            context_id: "ctx-3".to_owned(),
+            reason: "invalid msgpack".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ctx-3"), "should contain context_id: {msg}");
+        assert!(
+            msg.contains("invalid msgpack"),
+            "should contain reason: {msg}"
+        );
+        assert!(msg.contains("codec failed"), "should mention codec: {msg}");
     }
 
     // -----------------------------------------------------------------------
