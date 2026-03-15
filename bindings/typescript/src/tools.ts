@@ -108,7 +108,7 @@ export function defineToolDefinition(params: {
  * @param proofTokens - Optional list of encoded parent UCAN token strings.
  * @returns A {@link CrossContextInvocationResult} with the tool output and provenance.
  * @throws {ValidationError} If chainDepth is out of range (0-5).
- * @throws {ContextError} If the bridge is not available.
+ * @throws {ToolError} If the bridge call fails (inactive context, rate limit, etc.).
  */
 export async function toolInvokeCrossContext(
   sourceHandle: BridgeContextHandle,
@@ -172,7 +172,7 @@ export async function toolInvokeCrossContext(
  * @param ttlSeconds - Optional time-to-live in seconds. Omit for context-lifetime session.
  * @returns A {@link ToolSessionResult} containing the session ID.
  * @throws {ValidationError} If ttlSeconds is negative or not an integer.
- * @throws {ContextError} If the bridge is not available.
+ * @throws {ToolError} If the bridge call fails (inactive context, session cap, etc.).
  */
 export async function toolSessionCreate(
   handle: BridgeContextHandle,
@@ -213,7 +213,7 @@ export async function toolSessionCreate(
  * @param ucanToken - JWT-encoded UCAN token authorizing the invocation.
  * @param proofTokens - Optional list of encoded parent UCAN token strings.
  * @returns A {@link ToolSessionInvokeResult} with the tool output and provenance.
- * @throws {ContextError} If the session is not found or has expired.
+ * @throws {ToolError} If the session is not found or has expired.
  */
 export async function toolSessionInvoke(
   handle: BridgeContextHandle,
@@ -253,7 +253,7 @@ export async function toolSessionInvoke(
  *
  * @param handle - Bridge handle for the context containing the tool session.
  * @param sessionId - The session to close.
- * @throws {ContextError} If the session is not found.
+ * @throws {ToolError} If the session is not found.
  */
 export async function toolSessionClose(
   handle: BridgeContextHandle,

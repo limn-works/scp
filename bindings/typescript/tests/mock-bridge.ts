@@ -125,11 +125,16 @@ export function createMockBridge(): Bridge & {
     return `${prefix}-${nextId++}`;
   }
 
-  function getContext(handle: BridgeContextHandle): MockContext {
+  function getContextRaw(handle: BridgeContextHandle): MockContext {
     const ctx = contexts.get(handle.contextId);
     if (ctx === undefined) {
       throw new Error(`[SCP-CTX-2001] Context not found: ${handle.contextId}`);
     }
+    return ctx;
+  }
+
+  function getContext(handle: BridgeContextHandle): MockContext {
+    const ctx = getContextRaw(handle);
     if (ctx.state !== "active") {
       throw new Error(`[SCP-CTX-2030] Context is not active: ${handle.contextId}`);
     }
@@ -465,8 +470,8 @@ export function createMockBridge(): Bridge & {
       chainDepth: number,
       _proofTokens?: readonly string[],
     ): Promise<string> {
-      const sourceCtx = getContext(sourceHandle);
-      const targetCtx = getContext(targetHandle);
+      const sourceCtx = getContextRaw(sourceHandle);
+      const targetCtx = getContextRaw(targetHandle);
 
       if (sourceCtx.state !== "active") {
         throw new Error(`[SCP-TOOL-6010] Source context in "${sourceCtx.state}" state`);

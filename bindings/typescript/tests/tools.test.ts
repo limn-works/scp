@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { ValidationError } from "../src/errors";
+import { ToolError, ValidationError } from "../src/errors";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
 import {
   defineToolDefinition,
@@ -223,6 +223,78 @@ describe("toolInvokeCrossContext", () => {
         1.5,
       ),
     ).rejects.toThrow(ValidationError);
+  });
+
+  it("throws ToolError SCP-TOOL-6010 when source context is not active", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    const targetHandle = await mockBridge.contextCreate(identity, "{}");
+
+    // Close the source context to make it inactive
+    await mockBridge.contextClose(sourceHandle, identity.did);
+
+    await expect(
+      toolInvokeCrossContext(
+        sourceHandle,
+        targetHandle,
+        "tool-test",
+        "{}",
+        identity.did,
+        "token",
+        0,
+      ),
+    ).rejects.toThrow(ToolError);
+
+    try {
+      await toolInvokeCrossContext(
+        sourceHandle,
+        targetHandle,
+        "tool-test",
+        "{}",
+        identity.did,
+        "token",
+        0,
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ToolError);
+      expect((error as ToolError).code).toBe("SCP-TOOL-6010");
+    }
+  });
+
+  it("throws ToolError SCP-TOOL-6011 when target context is not active", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    const targetHandle = await mockBridge.contextCreate(identity, "{}");
+
+    // Close the target context to make it inactive
+    await mockBridge.contextClose(targetHandle, identity.did);
+
+    await expect(
+      toolInvokeCrossContext(
+        sourceHandle,
+        targetHandle,
+        "tool-test",
+        "{}",
+        identity.did,
+        "token",
+        0,
+      ),
+    ).rejects.toThrow(ToolError);
+
+    try {
+      await toolInvokeCrossContext(
+        sourceHandle,
+        targetHandle,
+        "tool-test",
+        "{}",
+        identity.did,
+        "token",
+        0,
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ToolError);
+      expect((error as ToolError).code).toBe("SCP-TOOL-6011");
+    }
   });
 });
 
