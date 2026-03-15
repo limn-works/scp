@@ -568,6 +568,12 @@ pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
         let _ = tx.send(());
     }
 
+    // Release the mutable ref before removing (DashMap requires no outstanding refs).
+    drop(entry);
+
+    // Remove the server entry from the registry to prevent memory leak (#1165).
+    mcp_server_registry().remove(&handle.handle_id);
+
     Ok(())
 }
 
