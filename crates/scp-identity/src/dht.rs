@@ -254,6 +254,101 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
             post_resolve_hook: None,
         }
     }
+
+    /// Creates a `DidDht` instance with in-memory DHT, cache, and a signing
+    /// function derived from the provided [`KeyCustody`].
+    ///
+    /// This is the recommended constructor for tests and examples that need
+    /// to create identities and publish DID documents. Equivalent to manually
+    /// constructing an `InMemoryDhtClient`, `DidCache`, calling `make_sign_fn`,
+    /// and wiring them together via `with_client_and_signer`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use scp_identity::dht::DidDht;
+    /// use scp_identity::DidMethod;
+    /// use scp_platform::testing::InMemoryKeyCustody;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let custody = Arc::new(InMemoryKeyCustody::new());
+    /// let did_dht = DidDht::with_in_memory_custody(Arc::clone(&custody));
+    /// let (identity, document) = did_dht.create(&*custody).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// See issue #530.
+    #[must_use]
+    pub fn with_in_memory_custody<K: KeyCustody + 'static>(key_custody: Arc<K>) -> Self {
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let sign_fn = Self::make_sign_fn(key_custody);
+        Self {
+            dht_client,
+            cache,
+            sequence: AtomicU64::new(0),
+            sign_fn: Some(sign_fn),
+            sequence_store: None,
+            post_resolve_hook: None,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl DidDht<InMemoryDhtClient, SystemClock> {
+    /// Creates an in-memory identity in a single call.
+    ///
+    /// Wires up [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody),
+    /// `InMemoryDhtClient`, `DidCache`, and the signing function, then calls
+    /// [`DidMethod::create`] to generate the identity. Returns all components
+    /// the caller needs for subsequent operations.
+    ///
+    /// This replaces the 5-line boilerplate pattern:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use scp_identity::dht::DidDht;
+    /// # use scp_identity::DidMethod;
+    /// # use scp_platform::testing::InMemoryKeyCustody;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Before (5 lines):
+    /// let custody = Arc::new(InMemoryKeyCustody::new());
+    /// let dht_client = Arc::new(scp_identity::dht_client::InMemoryDhtClient::new());
+    /// let cache = Arc::new(scp_identity::cache::DidCache::new());
+    /// let sign_fn = DidDht::make_sign_fn(Arc::clone(&custody));
+    /// let did_dht = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
+    /// let (identity, document) = did_dht.create(&*custody).await?;
+    ///
+    /// // After (1 line):
+    /// let (identity, document, custody, did_dht) = DidDht::create_in_memory().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// See issue #530.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] if key generation or identity creation fails
+    /// (should not happen with in-memory backends).
+    pub async fn create_in_memory() -> Result<
+        (
+            ScpIdentity,
+            DidDocument,
+            Arc<scp_platform::testing::InMemoryKeyCustody>,
+            Self,
+        ),
+        IdentityError,
+    > {
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_dht = Self::with_in_memory_custody(Arc::clone(&custody));
+        let (identity, document) = did_dht.create(&*custody).await?;
+        Ok((identity, document, custody, did_dht))
+    }
 }
 
 impl<D: DhtClient> DidDht<D, SystemClock> {
@@ -3830,5 +3925,55 @@ mod tests {
         let original_token = updated_doc.device_attestation_token().unwrap().unwrap();
         let parsed_token = parsed.device_attestation_token().unwrap().unwrap();
         assert_eq!(original_token, parsed_token);
+    }
+
+    // -----------------------------------------------------------------------
+    // Convenience constructor tests (issue #530)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn with_in_memory_custody_creates_signing_capable_instance() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = DidDht::with_in_memory_custody(Arc::clone(&custody));
+        let (identity, doc) = dht.create(&*custody).await.unwrap();
+
+        // DID is valid.
+        assert!(identity.did.starts_with("did:dht:z"));
+        assert_eq!(doc.id, identity.did);
+
+        // Publish works (signing is wired up).
+        dht.publish(&identity, &doc).await.unwrap();
+
+        // Resolve returns the published document.
+        let resolved = dht.resolve(&identity.did).await.unwrap();
+        assert_eq!(resolved.id, identity.did);
+    }
+
+    #[tokio::test]
+    async fn create_in_memory_returns_all_components() {
+        let (identity, document, custody, did_dht) = DidDht::create_in_memory().await.unwrap();
+
+        // Identity is valid.
+        assert!(identity.did.starts_with("did:dht:z"));
+        assert_eq!(document.id, identity.did);
+
+        // Custody is functional — can sign with identity keys.
+        let sig = custody
+            .sign(&identity.active_signing_key, b"test")
+            .await
+            .unwrap();
+        assert_eq!(sig.as_bytes().len(), 64);
+
+        // DidDht is functional — publish and resolve work.
+        did_dht.publish(&identity, &document).await.unwrap();
+        let resolved = did_dht.resolve(&identity.did).await.unwrap();
+        assert_eq!(resolved.id, identity.did);
+    }
+
+    #[tokio::test]
+    async fn create_in_memory_produces_unique_identities() {
+        let (id1, _, _, _) = DidDht::create_in_memory().await.unwrap();
+        let (id2, _, _, _) = DidDht::create_in_memory().await.unwrap();
+        assert_ne!(id1.did, id2.did, "each call must produce a unique DID");
     }
 }
