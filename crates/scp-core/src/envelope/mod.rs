@@ -79,6 +79,33 @@ pub enum VersionCompatibility {
     },
 }
 
+impl VersionCompatibility {
+    /// Returns `true` if this result indicates degraded mode (§13.6).
+    #[must_use]
+    pub const fn is_degraded(&self) -> bool {
+        matches!(self, Self::DegradedMode { .. })
+    }
+
+    /// Returns `true` if this result indicates exact version match.
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact)
+    }
+
+    /// Returns the local and remote minor versions if degraded, or `None` if
+    /// the versions match exactly.
+    #[must_use]
+    pub const fn degraded_versions(&self) -> Option<(u8, u8)> {
+        match self {
+            Self::DegradedMode {
+                local_minor,
+                remote_minor,
+            } => Some((*local_minor, *remote_minor)),
+            Self::Exact => None,
+        }
+    }
+}
+
 /// Checks whether a wire version is compatible with the local protocol version.
 ///
 /// Per spec §13.5, same-major envelopes are always accepted:
@@ -442,5 +469,41 @@ mod tests {
             matches!(result.unwrap(), VersionCompatibility::DegradedMode { .. }),
             "different minor should trigger degraded mode"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // VersionCompatibility helper methods (#606)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_degraded_returns_true_for_degraded_mode() {
+        let compat = VersionCompatibility::DegradedMode {
+            local_minor: 0,
+            remote_minor: 1,
+        };
+        assert!(compat.is_degraded());
+        assert!(!compat.is_exact());
+    }
+
+    #[test]
+    fn is_degraded_returns_false_for_exact() {
+        let compat = VersionCompatibility::Exact;
+        assert!(!compat.is_degraded());
+        assert!(compat.is_exact());
+    }
+
+    #[test]
+    fn degraded_versions_returns_some_for_degraded_mode() {
+        let compat = VersionCompatibility::DegradedMode {
+            local_minor: 0,
+            remote_minor: 3,
+        };
+        assert_eq!(compat.degraded_versions(), Some((0, 3)));
+    }
+
+    #[test]
+    fn degraded_versions_returns_none_for_exact() {
+        let compat = VersionCompatibility::Exact;
+        assert_eq!(compat.degraded_versions(), None);
     }
 }
