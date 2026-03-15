@@ -6,7 +6,7 @@
       "id": "gate-participation-admission-types",
       "name": "Participation Admission Types and Context Integration",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-BA-001",
         "SCP-BA-002"
@@ -16,7 +16,7 @@
       "id": "gate-participation-admission-production",
       "name": "Context-Hosted Statement Production and Discovery",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-BA-005",
         "SCP-BA-006"
@@ -26,7 +26,7 @@
       "id": "gate-participation-admission-verification",
       "name": "Participation Admission Verification and FFI",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-BA-003",
         "SCP-BA-004"
@@ -40,7 +40,7 @@
       "gate": "gate-participation-admission-types",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/trust/participation.rs",
         "crates/scp-core/src/trust/mod.rs"
@@ -95,7 +95,7 @@
       "gate": "gate-participation-admission-types",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/params.rs",
         "crates/scp-core/src/context/mod.rs"
@@ -137,7 +137,7 @@
       "gate": "gate-participation-admission-verification",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/trust/participation.rs",
         "crates/scp-core/src/trust/mod.rs"
@@ -193,7 +193,7 @@
       "gate": "gate-participation-admission-verification",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/src/trust.rs",
         "bindings/python/src/context.rs",
@@ -239,7 +239,7 @@
       "gate": "gate-participation-admission-production",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/trust/participation.rs",
         "crates/scp-core/src/trust/mod.rs",
@@ -297,7 +297,7 @@
       "gate": "gate-participation-admission-production",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/identity/did_document.rs",
         "crates/scp-core/src/identity/mod.rs"

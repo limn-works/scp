@@ -6,7 +6,7 @@
       "id": "gate-bridge-http-binding",
       "name": "Cooperative Mode HTTP Binding Endpoints",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-BCH-001",
         "SCP-BCH-002",
@@ -21,7 +21,7 @@
       "id": "gate-bridge-credential-lifecycle",
       "name": "Bridge Credential Lifecycle",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-BCH-008",
         "SCP-BCH-009"
@@ -31,7 +31,7 @@
       "id": "gate-bridge-sender-key",
       "name": "Bridge Sender Key Encryption Model",
       "priority": "P1",
-      "status": "pending",
+      "status": "done",
       "stories": [
         "SCP-BCH-010",
         "SCP-BCH-011",
@@ -47,7 +47,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/bridge_auth.rs",
         "crates/scp-node/src/lib.rs"
@@ -99,7 +99,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/bridge_handlers.rs",
         "crates/scp-node/src/lib.rs"
@@ -144,7 +144,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
@@ -188,7 +188,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
@@ -230,7 +230,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
@@ -275,7 +275,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/bridge_handlers.rs",
         "crates/scp-node/src/bridge_webhook.rs",
@@ -325,7 +325,7 @@
       "gate": "gate-bridge-http-binding",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/http.rs",
         "crates/scp-node/src/lib.rs",
@@ -378,7 +378,7 @@
       "gate": "gate-bridge-credential-lifecycle",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/credentials.rs",
         "crates/scp-core/src/bridge/mod.rs"
@@ -430,7 +430,7 @@
       "gate": "gate-bridge-credential-lifecycle",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/credentials.rs",
         "crates/scp-core/src/bridge/oauth.rs",
@@ -489,7 +489,7 @@
       "gate": "gate-bridge-sender-key",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/shadow.rs",
         "crates/scp-core/src/crypto/sender_keys/mod.rs"
@@ -528,7 +528,7 @@
       "gate": "gate-bridge-sender-key",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
         "crates/scp-core/src/bridge/mod.rs"
@@ -574,7 +574,7 @@
       "gate": "gate-bridge-sender-key",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/mod.rs",
         "crates/scp-core/src/envelope/inner.rs"
@@ -621,7 +621,7 @@
       "gate": "gate-bridge-sender-key",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/bridge/registration.rs",
         "crates/scp-core/src/context/params.rs"
