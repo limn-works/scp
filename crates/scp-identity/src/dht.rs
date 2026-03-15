@@ -307,24 +307,17 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
     ///
     /// This replaces the 5-line boilerplate pattern:
     ///
-    /// ```no_run
-    /// # use std::sync::Arc;
-    /// # use scp_identity::dht::DidDht;
-    /// # use scp_identity::DidMethod;
-    /// # use scp_platform::testing::InMemoryKeyCustody;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// ```text
     /// // Before (5 lines):
     /// let custody = Arc::new(InMemoryKeyCustody::new());
-    /// let dht_client = Arc::new(scp_identity::dht_client::InMemoryDhtClient::new());
-    /// let cache = Arc::new(scp_identity::cache::DidCache::new());
+    /// let dht_client = Arc::new(InMemoryDhtClient::new());
+    /// let cache = Arc::new(DidCache::new());
     /// let sign_fn = DidDht::make_sign_fn(Arc::clone(&custody));
     /// let did_dht = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
     /// let (identity, document) = did_dht.create(&*custody).await?;
     ///
     /// // After (1 line):
     /// let (identity, document, custody, did_dht) = DidDht::create_in_memory().await?;
-    /// # Ok(())
-    /// # }
     /// ```
     ///
     /// See issue #530.
