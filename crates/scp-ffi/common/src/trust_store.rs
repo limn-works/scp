@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use scp_core::trust::aggregate::{CachedAttestation, TrustProtocolRepository};
 use scp_core::trust::{ChallengeVerification, TrustError};
+use scp_event_log::Event;
 
 /// In-memory implementation of `TrustProtocolRepository` for the FFI bridge.
 ///
@@ -114,6 +115,66 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         store.entry(key).or_default().push(result.clone());
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared aggregation helper — used by all FFI bridges
+// ---------------------------------------------------------------------------
+
+/// Populates a trust store and runs the aggregation pipeline.
+///
+/// Generic over the store implementation to support both persistent
+/// (`ProtocolRepositoryTrustBridge`) and ephemeral (`InMemoryFfiTrustStore`)
+/// stores. Returns the aggregated `TrustInput` as a JSON string. See #502.
+///
+/// # Errors
+///
+/// Returns [`TrustError`] if store population, aggregation, or serialization
+/// fails.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub fn populate_and_aggregate<S: TrustProtocolRepository>(
+    store: S,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<CachedAttestation>,
+    challenge_results: &[ChallengeVerification],
+    events: &[Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &[scp_core::trust::ConsequenceRule],
+    threshold_requirements: &HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &HashMap<scp_core::trust::AttestationType, Vec<scp_core::trust::AttestorInfo>>,
+) -> Result<String, TrustError> {
+    for ca in cached_attestations {
+        store.cache_attestation(context_id, ca)?;
+    }
+    for cr in challenge_results {
+        store.store_challenge_result(context_id, cr)?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id,
+        subject_did,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx)?;
+    serde_json::to_string(&trust_input).map_err(|e| TrustError::StoreError {
+        reason: format!("failed to serialize TrustInput: {e}"),
+    })
 }
 
 #[cfg(test)]

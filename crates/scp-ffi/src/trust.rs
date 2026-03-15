@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_core::trust::aggregate::TrustProtocolRepository;
 use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
 
 use crate::validate;
@@ -302,68 +301,6 @@ pub fn py_verify_participation_requirements(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-/// Populates a trust store with caller-provided data and runs the full
-/// aggregation pipeline. Generic over the store implementation so it works
-/// with both the persistent `ProtocolRepositoryTrustBridge` and the
-/// ephemeral `InMemoryFfiTrustStore`.
-#[allow(clippy::too_many_arguments)]
-fn populate_and_aggregate<S: TrustProtocolRepository>(
-    store: S,
-    context_id: &str,
-    subject_did: &str,
-    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
-    challenge_results: &[scp_core::trust::ChallengeVerification],
-    events: &[scp_event_log::Event],
-    merkle_root: [u8; 32],
-    consequence_rules: &[scp_core::trust::ConsequenceRule],
-    threshold_requirements: &std::collections::HashMap<
-        scp_core::trust::AttestationType,
-        scp_core::trust::ThresholdRequirement,
-    >,
-    attestor_sets: &std::collections::HashMap<
-        scp_core::trust::AttestationType,
-        Vec<scp_core::trust::AttestorInfo>,
-    >,
-) -> PyResult<String> {
-    for ca in cached_attestations {
-        store.cache_attestation(context_id, ca).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to cache attestation: {e}"))
-        })?;
-    }
-    for cr in challenge_results {
-        store.store_challenge_result(context_id, cr).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to store challenge result: {e}"
-            ))
-        })?;
-    }
-
-    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
-
-    let ctx = scp_core::trust::aggregate::AggregationContext {
-        context_id,
-        subject_did,
-        events,
-        merkle_root,
-        consequence_rules,
-        threshold_requirements,
-        attestor_sets,
-        cache: &cache,
-        resolver: &resolver,
-        clock: &clock,
-    };
-
-    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("trust aggregation failed: {e}"))
-    })?;
-
-    serde_json::to_string(&trust_input).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to serialize TrustInput: {e}"))
-    })
-}
-
 /// Aggregates all trust engine layers into a single `TrustInput` for
 /// agent-level evaluation.
 ///
@@ -457,7 +394,7 @@ pub fn py_aggregate_trust_input(
             storage,
         )));
         let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-        populate_and_aggregate(
+        scp_ffi_common::trust_store::populate_and_aggregate(
             bridge,
             context_id,
             subject_did,
@@ -469,8 +406,9 @@ pub fn py_aggregate_trust_input(
             &threshold_requirements,
             &attestor_sets,
         )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     } else {
-        populate_and_aggregate(
+        scp_ffi_common::trust_store::populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             context_id,
             subject_did,
@@ -482,6 +420,7 @@ pub fn py_aggregate_trust_input(
             &threshold_requirements,
             &attestor_sets,
         )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
 
