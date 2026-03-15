@@ -27,8 +27,6 @@
 
 use std::sync::OnceLock;
 
-use std::sync::OnceLock;
-
 use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -53,7 +51,7 @@ use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow
 use scp_core::bridge::{
     BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus,
 };
-use scp_core::crypto::sender_keys::SenderKeyStore;
+use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::Attestation;
 use zeroize::Zeroizing;
@@ -85,6 +83,31 @@ static BRIDGE_STATE: OnceLock<DashMap<String, BridgeContextState>> = OnceLock::n
 /// Returns a reference to the bridge state registry, initializing on first access.
 fn bridge_state_registry() -> &'static DashMap<String, BridgeContextState> {
     BRIDGE_STATE.get_or_init(DashMap::new)
+}
+
+/// Removes per-context bridge state on context close, preventing unbounded
+/// memory growth in long-running processes. Called from `runtime::remove_ffi_state`.
+pub(crate) fn remove_bridge_state(context_id: &str) {
+    bridge_state_registry().remove(context_id);
+}
+
+// ---------------------------------------------------------------------------
+// Global credential store (in-memory, per-process)
+// ---------------------------------------------------------------------------
+
+/// Global in-memory credential store for bridge credential lifecycle.
+///
+/// Uses `OnceLock` for single-initialization, matching the runtime registry
+/// pattern used throughout the `PyO3` bridge. The `InMemoryCredentialStore` is
+/// thread-safe via internal `tokio::sync::RwLock`.
+///
+/// Production deployments should replace this with a `Storage`-backed
+/// implementation when it lands (see §12.11.2).
+static CREDENTIAL_STORE: OnceLock<InMemoryCredentialStore> = OnceLock::new();
+
+/// Returns or initializes the global credential store.
+fn credential_store() -> &'static InMemoryCredentialStore {
+    CREDENTIAL_STORE.get_or_init(InMemoryCredentialStore::new)
 }
 
 // ---------------------------------------------------------------------------
