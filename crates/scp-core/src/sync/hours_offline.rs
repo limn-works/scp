@@ -1212,7 +1212,16 @@ impl ReconnectionCoordinator {
                     ),
                 }
             }
-            _ => (0, SyncOutcome::FullyCaughtUp),
+            (Some(_local), Some(_target)) => {
+                // target <= local — already caught up.
+                (0, SyncOutcome::FullyCaughtUp)
+            }
+            (None, _) | (_, None) => (
+                0,
+                SyncOutcome::Failed {
+                    reason: "epoch state unavailable".to_owned(),
+                },
+            ),
         }
     }
 
@@ -2558,9 +2567,15 @@ mod tests {
         );
 
         let mut driver = MockSyncDriver::new();
-        // No messages → epoch matches → FullyCaughtUp.
-        driver.relay_messages = Vec::new();
+        // Messages present but target epoch matches local → FullyCaughtUp.
         driver.local_epoch_val = Some(5);
+        driver.relay_messages = vec![BufferedMessage {
+            blob_id: "b0".to_owned(),
+            context_id: "ctx-1".to_owned(),
+            payload: vec![1],
+            stored_at: now - 500,
+            epoch: Some(5), // same as local — already caught up
+        }];
 
         let report = coord.execute(now, &driver).await;
         assert_eq!(report.contexts_synced.len(), 1);
@@ -2570,6 +2585,35 @@ mod tests {
         assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
         assert!(result.mls_update_issued);
         assert_eq!(result.events_recovered, 5);
+    }
+
+    #[tokio::test]
+    async fn execute_tier1_epoch_unavailable_returns_failed() {
+        let now = 1_010_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-1".to_owned(), now - 3600);
+
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-1".to_owned()],
+            contacts,
+        );
+
+        let mut driver = MockSyncDriver::new();
+        // No messages → observed_target_epoch returns None → epoch state
+        // unavailable → Failed (not silently FullyCaughtUp).
+        driver.relay_messages = Vec::new();
+        driver.local_epoch_val = Some(5);
+
+        let report = coord.execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(
+            reason.contains("epoch state unavailable"),
+            "reason should mention epoch state: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -2686,7 +2730,18 @@ mod tests {
             contacts,
         );
 
-        let driver = MockSyncDriver::new();
+        let mut driver = MockSyncDriver::new();
+        // Provide a message so the Short context's observed_target_epoch
+        // resolves, allowing epoch reconciliation to succeed and queue drain
+        // to run.
+        driver.relay_messages = vec![BufferedMessage {
+            blob_id: "b0".to_owned(),
+            context_id: "ctx-short".to_owned(),
+            payload: vec![1],
+            stored_at: now - 500,
+            epoch: Some(1), // matches local_epoch_val default (1)
+        }];
+
         let report = coord.execute(now, &driver).await;
         assert_eq!(report.contexts_synced.len(), 3);
         assert_eq!(report.contexts_synced[0].tier, OfflineTier::Short);
