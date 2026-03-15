@@ -2506,6 +2506,9 @@ fn resolve_nat(
         // Wire the port mapper: use the explicitly provided one, or construct
         // a production `UPnP` mapper when the `upnp` feature is enabled.
         // The `UpnpPortMapper` is the primary tier per spec 10.12.2.
+        // NOTE: NAT-PMP/PCP fallback (#1154) requires `PortMappingManager`
+        // integration which accepts (upnp, natpmp, port, channel) — tracked
+        // for follow-up wiring to `DefaultNatStrategy`.
         #[cfg(feature = "upnp")]
         let port_mapper = port_mapper.or_else(|| {
             Some(Arc::new(scp_transport::UpnpPortMapper::new())

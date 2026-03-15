@@ -372,13 +372,11 @@ pub fn verify_participation_requirements(
 ) -> Result<bool, JsValue> {
     let profiles: Vec<WasmParticipationProfile> =
         serde_json::from_str(&profile_json).map_err(|e| {
-            ScpWasmError::validation(&format!(
-                "failed to parse participation profiles JSON: {e}"
-            ))
+            ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
         })?;
 
-    let requirements: Vec<WasmRequireParticipation> =
-        serde_json::from_str(&requirements_json).map_err(|e| {
+    let requirements: Vec<WasmRequireParticipation> = serde_json::from_str(&requirements_json)
+        .map_err(|e| {
             ScpWasmError::validation(&format!(
                 "failed to parse participation requirements JSON: {e}"
             ))
