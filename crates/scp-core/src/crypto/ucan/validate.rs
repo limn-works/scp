@@ -816,8 +816,11 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// Returns [`UcanError::DelegationChainBroken`] if any link is invalid.
 /// Returns [`UcanError::CircularDelegation`] if the chain contains a cycle.
 /// Returns [`UcanError::SignatureInvalid`] if any parent signature is invalid.
-/// Returns [`UcanError::TokenExpired`] if any parent token has expired.
-/// Returns [`UcanError::TokenRevoked`] if any parent token has been revoked.
+/// Returns [`UcanError::DelegationChainBroken`] (wrapping the original error)
+/// if any parent token has expired, is not yet valid, has an invalid time
+/// range, has an expiry too far in the future, or has been revoked.  This
+/// wrapping allows downstream classifiers to distinguish parent-token failures
+/// from leaf-token failures (see issue #1026).
 fn verify_delegation_chain(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
@@ -906,12 +909,21 @@ fn verify_chain_recursive(
         verify_signature(&parent, did_resolver)?;
 
         // Verify parent token has not expired (spec 7.2).
-        verify_expiry(&parent, clock_skew_tolerance_secs)?;
+        // Wrap expiry errors as DelegationChainBroken so downstream classifiers
+        // (e.g. Python _classify_ucan_error) can distinguish parent-token failures
+        // from leaf-token failures.  Without this, TokenExpired from a parent is
+        // indistinguishable from TokenExpired on the leaf, causing optimistic
+        // reporting of checks that never ran on the leaf (see issue #1026).
+        verify_expiry(&parent, clock_skew_tolerance_secs)
+            .map_err(|e| UcanError::DelegationChainBroken(format!("parent token failed: {e}")))?;
 
         // Verify parent token has not been revoked (spec 7.2).
+        // Same wrapping rationale as expiry above (issue #1026).
         let parent_revocation_cid = compute_revocation_cid(&parent.encoded);
         if revocation_checker.is_revoked(&parent_revocation_cid) {
-            return Err(UcanError::TokenRevoked(parent_revocation_cid));
+            return Err(UcanError::DelegationChainBroken(format!(
+                "parent token failed: token revoked: {parent_revocation_cid}"
+            )));
         }
 
         // Recurse to find the root.

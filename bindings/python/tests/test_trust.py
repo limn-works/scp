@@ -200,6 +200,38 @@ class TestClassifyUcanError:
         msg = "expiry too far in the future: 100000s exceeds 24h maximum"
         assert _classify_ucan_error(msg) == "expiry"
 
+    # -- Delegation chain parent-token failures (issue #1026) --
+    # These errors are now wrapped as DelegationChainBroken by Rust, so
+    # they classify as "signatures" (conservative) instead of the
+    # optimistic leaf-token stages they would have matched before.
+
+    def test_parent_token_expired_classifies_as_signatures(self) -> None:
+        """Parent expiry wrapped by Rust → 'signatures', not 'expiry'."""
+        msg = "delegation chain broken: parent token failed: token expired"
+        assert _classify_ucan_error(msg) == "signatures"
+
+    def test_parent_token_not_yet_valid_classifies_as_signatures(self) -> None:
+        msg = "delegation chain broken: parent token failed: token not yet valid"
+        assert _classify_ucan_error(msg) == "signatures"
+
+    def test_parent_token_invalid_time_range_classifies_as_signatures(self) -> None:
+        msg = (
+            "delegation chain broken: parent token failed: "
+            "invalid time range: nbf (1000) must be less than exp (999)"
+        )
+        assert _classify_ucan_error(msg) == "signatures"
+
+    def test_parent_token_expiry_too_far_classifies_as_signatures(self) -> None:
+        msg = (
+            "delegation chain broken: parent token failed: "
+            "expiry too far in the future: 100000s exceeds 24h maximum"
+        )
+        assert _classify_ucan_error(msg) == "signatures"
+
+    def test_parent_token_revoked_classifies_as_signatures(self) -> None:
+        msg = "delegation chain broken: parent token failed: token revoked: bafyabc123"
+        assert _classify_ucan_error(msg) == "signatures"
+
     # -- Unknown --
 
     def test_unknown_error(self) -> None:
@@ -486,6 +518,67 @@ class TestCapabilityValidationFieldIndependence:
         """Unrecognized errors set all fields to False (fail-closed)."""
         cv = self._run("something completely unexpected happened")
         assert cv.tokens_valid is False
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+
+    # -- Delegation chain parent-token failures (issue #1026) --
+    # Parent-token expiry/revocation now classifies conservatively: only
+    # tokens_valid is True (parse passed for the leaf), all other fields
+    # are False because steps 6-11 never ran on the leaf token.
+
+    def test_parent_expired_does_not_report_ceiling_true(self) -> None:
+        """AC: parent expired + leaf invalid ceiling → within_ceiling is not True."""
+        cv = self._run("delegation chain broken: parent token failed: token expired")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+
+    def test_parent_revoked_does_not_report_nonce_or_revoked_true(self) -> None:
+        """AC: parent revoked + leaf valid → not_revoked and nonce_valid are not True."""
+        cv = self._run("delegation chain broken: parent token failed: token revoked: bafyabc123")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+
+    def test_parent_not_yet_valid_conservative(self) -> None:
+        """Parent not-yet-valid → conservative (only tokens_valid)."""
+        cv = self._run("delegation chain broken: parent token failed: token not yet valid")
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+
+    def test_parent_expiry_too_far_conservative(self) -> None:
+        """Parent expiry-too-far → conservative (only tokens_valid)."""
+        cv = self._run(
+            "delegation chain broken: parent token failed: "
+            "expiry too far in the future: 100000s exceeds 24h maximum"
+        )
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+
+    def test_parent_invalid_time_range_conservative(self) -> None:
+        """Parent invalid-time-range → conservative (only tokens_valid)."""
+        cv = self._run(
+            "delegation chain broken: parent token failed: "
+            "invalid time range: nbf (1000) must be less than exp (999)"
+        )
+        assert cv.tokens_valid is True
         assert cv.signatures_valid is False
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False

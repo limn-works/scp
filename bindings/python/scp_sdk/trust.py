@@ -72,6 +72,12 @@ _TOKEN_PARSE_PREFIXES: tuple[str, ...] = (
 #   5 (audience), 5a/5b (key scope), 6b (category A), 7 (attenuation).
 # Also includes DID resolution failures (step 2) that the Rust bridge
 # wraps as MalformedToken.
+#
+# Parent-token expiry/revocation in the delegation chain is also wrapped
+# as DelegationChainBroken by the Rust bridge (issue #1026), so those
+# errors match "delegation chain broken:" and classify conservatively
+# as "signatures" → _PASSED_BEFORE = {tokens_valid} only.  This avoids
+# optimistically reporting True for checks that never ran on the leaf.
 _SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
     "signature verification failed",
     "invalid issuer:",
