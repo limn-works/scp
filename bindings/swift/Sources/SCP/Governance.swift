@@ -318,10 +318,7 @@ public enum GovernanceBridge {
 
     /// Default create governance checkpoint function.
     public static let defaultCreateGovernanceCheckpoint:
-        CreateGovernanceCheckpointFn = {
-            handle, checkpointSeq, merkleRootHex, eventCount,
-            lastEventHashHex, stateSnapshotHashHex, creatorDid,
-            creatorSignatureHex in
+        CreateGovernanceCheckpointFn = { handle, checkpointSeq, merkleRootHex, eventCount, lastEventHashHex, stateSnapshotHashHex, creatorDid, creatorSignatureHex in
             try await createGovernanceCheckpoint(
                 handle: handle,
                 checkpointSeq: checkpointSeq,
@@ -1260,6 +1257,7 @@ public extension Context {
         try await finalizeFn(contextHandle)
     }
 
+    // swiftlint:disable function_parameter_count
     /// Creates a governance checkpoint (ADR-031 section 9).
     ///
     /// - Parameters:
@@ -1302,6 +1300,8 @@ public extension Context {
             creatorSignatureHex
         )
     }
+
+    // swiftlint:enable function_parameter_count
 
     /// Adds a cosignature to an existing governance checkpoint (ADR-031 section 9).
     ///

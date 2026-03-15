@@ -319,7 +319,9 @@ class RealFFITest {
             // Revoke a valid UCAN token. The revoker is the context creator.
             val testToken =
                 "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9." +
-                    "eyJpc3MiOiJkaWQ6ZGh0OnpUZXN0SXNzdWVyIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ." +
+                    "eyJpc3MiOiJkaWQ6ZGh0OnpUZXN0SXNzdWVyIiwiYXVkIjoiZGlkOmRodDp6" +
+                    "TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAw" +
+                    "LWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ." +
                     "dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw"
             uniffi.scp.ucanRevoke(handle, testToken, alice.did())
         }
