@@ -72,6 +72,7 @@ describe("type definitions", () => {
       assertionMethods: [],
       alsoKnownAs: [],
       serviceEndpoints: [],
+      hasAgentKey: false,
     };
     expect(doc.verificationMethods).toHaveLength(1);
   });
@@ -153,8 +154,8 @@ describe("type definitions", () => {
     const level: TrustLevel = {
       kind: "MultiLayerCorroborated",
       sources: [
-        { layer: "petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
-        { layer: "domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
+        { layer: "Petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
+        { layer: "Domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
       ],
     };
     expect(level.kind).toBe("MultiLayerCorroborated");
@@ -165,12 +166,12 @@ describe("type definitions", () => {
 
   it("ResolutionPath has all required fields", () => {
     const path: ResolutionPath = {
-      layer: "discovery_context",
+      layer: "DiscoveryContext",
       source: "cooking-community",
       sourceId: "ctx-disc-1",
       resolvedAt: 1700000000,
     };
-    expect(path.layer).toBe("discovery_context");
+    expect(path.layer).toBe("DiscoveryContext");
     expect(path.source).toBe("cooking-community");
     expect(path.sourceId).toBe("ctx-disc-1");
     expect(path.resolvedAt).toBe(1700000000);
@@ -178,7 +179,7 @@ describe("type definitions", () => {
 
   it("ResolutionPath allows null sourceId", () => {
     const path: ResolutionPath = {
-      layer: "domain",
+      layer: "Domain",
       source: "dht",
       sourceId: null,
       resolvedAt: 1700000000,
@@ -192,7 +193,7 @@ describe("type definitions", () => {
       did: "did:dht:z6MkAlice",
       trustLevel: { kind: "DiscoveryContextVerified" },
       resolutionPath: {
-        layer: "discovery_context",
+        layer: "DiscoveryContext",
         source: "cooking-community",
         sourceId: "ctx-disc-1",
         resolvedAt: 1700000000,
@@ -202,7 +203,7 @@ describe("type definitions", () => {
     if (resolution.type === "Identity") {
       expect(resolution.did).toBe("did:dht:z6MkAlice");
       expect(resolution.trustLevel.kind).toBe("DiscoveryContextVerified");
-      expect(resolution.resolutionPath.layer).toBe("discovery_context");
+      expect(resolution.resolutionPath.layer).toBe("DiscoveryContext");
     }
   });
 
@@ -214,7 +215,7 @@ describe("type definitions", () => {
       mode: "broadcast",
       trustLevel: { kind: "DomainVerified" },
       resolutionPath: {
-        layer: "domain",
+        layer: "Domain",
         source: "dht",
         sourceId: null,
         resolvedAt: 1700000000,
@@ -226,7 +227,7 @@ describe("type definitions", () => {
       expect(resolution.relayUrls).toEqual(["wss://relay.example.com/scp/v1"]);
       expect(resolution.mode).toBe("broadcast");
       expect(resolution.trustLevel.kind).toBe("DomainVerified");
-      expect(resolution.resolutionPath.layer).toBe("domain");
+      expect(resolution.resolutionPath.layer).toBe("Domain");
     }
   });
 
@@ -238,7 +239,7 @@ describe("type definitions", () => {
       mode: null,
       trustLevel: { kind: "DiscoveryContextVerified" },
       resolutionPath: {
-        layer: "discovery_context",
+        layer: "DiscoveryContext",
         source: "discovery_context",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,
