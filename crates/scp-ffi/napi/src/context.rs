@@ -572,6 +572,10 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
     // Clean up UCAN state for this context.
     crate::runtime::remove_context(&handle.context_id);
 
+    // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
+    // to prevent unbounded memory growth in long-running processes.
+    crate::bridge_connector::remove_bridge_state(&handle.context_id);
+
     Ok(())
 }
 
