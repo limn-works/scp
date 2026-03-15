@@ -468,38 +468,63 @@ pub fn verify_participation_requirements(
     let current_time = (js_sys::Date::now() / 1000.0) as u64;
 
     for requirement in &requirements {
-        // Freshness: filter out stale profiles.
-        let fresh_profiles: Vec<&WasmParticipationProfile> = profiles
-            .iter()
-            .filter(|p| {
-                let age = current_time.saturating_sub(p.updated_at);
-                age <= requirement.max_age_secs
-            })
-            .collect();
-
-        // Threshold + min_contexts: count distinct signers only from profiles
-        // that satisfy the threshold. A profile that is fresh but below the
-        // threshold should NOT contribute to the min_contexts count.
+        // Collect qualifying statements: fresh + threshold-satisfying.
+        // Mirrors scp-core's verify_participation_requirements step 2.
         let mut distinct_signers = std::collections::HashSet::new();
-        for p in &fresh_profiles {
-            let value = requirement.fact.extract_value(p);
-            if requirement.threshold.is_satisfied(value) {
-                distinct_signers.insert(&p.signer_public_key);
+        let mut newest_updated_at: u64 = 0;
+        let mut any_fresh = false;
+
+        for profile in &profiles {
+            newest_updated_at = newest_updated_at.max(profile.updated_at);
+
+            // Freshness check.
+            let age = current_time.saturating_sub(profile.updated_at);
+            if age > requirement.max_age_secs {
+                continue;
             }
+            any_fresh = true;
+
+            // Threshold check.
+            let value = requirement.fact.extract_value(profile);
+            if !requirement.threshold.is_satisfied(value) {
+                continue;
+            }
+
+            distinct_signers.insert(&profile.signer_public_key);
         }
 
-        if distinct_signers.is_empty() {
-            return Err(ScpWasmError::validation(
-                "participation admission verification failed: threshold not met",
-            ));
-        }
-
-        #[allow(clippy::cast_possible_truncation)]
-        if (distinct_signers.len() as u32) < requirement.min_contexts {
+        // If no statements were fresh enough, report staleness.
+        if !any_fresh && !profiles.is_empty() {
             return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: need {} distinct source contexts, got {}",
+                "participation admission verification failed: record too stale \
+                 (newest_updated_at={newest_updated_at}, current_time={current_time}, \
+                 max_age_secs={})",
+                requirement.max_age_secs
+            )));
+        }
+
+        // If no statements satisfied the threshold (but some were fresh),
+        // find the best value to report.
+        if distinct_signers.is_empty() {
+            let best_value = profiles
+                .iter()
+                .filter(|p| current_time.saturating_sub(p.updated_at) <= requirement.max_age_secs)
+                .map(|p| requirement.fact.extract_value(p))
+                .max()
+                .unwrap_or(0);
+
+            return Err(ScpWasmError::validation(&format!(
+                "participation admission verification failed: threshold not met (best value: {best_value})"
+            )));
+        }
+
+        // Check min_contexts.
+        #[allow(clippy::cast_possible_truncation)]
+        let found = distinct_signers.len() as u32;
+        if found < requirement.min_contexts {
+            return Err(ScpWasmError::validation(&format!(
+                "participation admission verification failed: need {} distinct source contexts, got {found}",
                 requirement.min_contexts,
-                distinct_signers.len()
             )));
         }
     }
