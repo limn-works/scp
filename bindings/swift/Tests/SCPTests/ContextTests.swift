@@ -332,13 +332,16 @@ struct ContextTests {
         #expect(received[1].provenance?.sourceContext == "other-ctx")
     }
 
-    @Test("messages stream finishes on error")
+    @Test("messages stream finishes on error and stores lastError")
     func messagesStreamFinishesOnError() async throws {
         let capturedListener = Locked<(any MessageListener)?>(nil)
 
         let context = makeTestContext(captureListener: { listener in
             capturedListener.withLock { $0 = listener }
         })
+
+        // lastError is nil before any error
+        #expect(await context.lastError == nil)
 
         let stream = try await context.messages
 
@@ -371,6 +374,55 @@ struct ContextTests {
 
         #expect(received.count == 1)
         #expect(received[0].senderDid == "did:dht:alice")
+
+        // lastError is set after stream terminates due to error
+        let lastError = await context.lastError
+        guard case let .Transport(message, code) = lastError else {
+            Issue.record("Expected ScpError.Transport, got \(String(describing: lastError))")
+            return
+        }
+        #expect(message == "connection lost")
+        #expect(code == "SCP-TRANS-5001")
+    }
+
+    @Test("lastError is nil after clean stream close")
+    func lastErrorNilAfterCleanClose() async throws {
+        let capturedListener = Locked<(any MessageListener)?>(nil)
+
+        let context = makeTestContext(captureListener: { listener in
+            capturedListener.withLock { $0 = listener }
+        })
+
+        let stream = try await context.messages
+
+        var listener: (any MessageListener)?
+        for _ in 0 ..< 100 {
+            listener = capturedListener.current
+            if listener != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        guard let resolvedListener = listener else {
+            Issue.record("Listener was not captured")
+            return
+        }
+
+        // Push a message then complete normally (no error)
+        resolvedListener.onMessage(message: makeTestMessage(
+            sender: "did:dht:alice",
+            payload: "clean-close"
+        ))
+        resolvedListener.onComplete()
+
+        var received: [Message] = []
+        for await message in stream {
+            received.append(message)
+        }
+
+        #expect(received.count == 1)
+
+        // lastError should remain nil — clean close, not an error
+        #expect(await context.lastError == nil)
     }
 
     // MARK: - Leave tests
