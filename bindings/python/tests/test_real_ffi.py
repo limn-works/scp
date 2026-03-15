@@ -310,13 +310,30 @@ class TestUcan:
         # expose the encoded JWT field. The revoker is the context creator.
         import base64
         import json
-        header = base64.urlsafe_b64encode(json.dumps(
-            {"alg": "EdDSA", "typ": "JWT", "ucv": "0.10.0"}
-        ).encode()).rstrip(b"=").decode()
-        payload = base64.urlsafe_b64encode(json.dumps(
-            {"iss": alice.did, "aud": bob.did, "exp": 9999999999,
-             "nnc": "1699999000000-aabbccdd11223344", "att": [], "prf": []}
-        ).encode()).rstrip(b"=").decode()
+
+        header = (
+            base64.urlsafe_b64encode(
+                json.dumps({"alg": "EdDSA", "typ": "JWT", "ucv": "0.10.0"}).encode()
+            )
+            .rstrip(b"=")
+            .decode()
+        )
+        payload = (
+            base64.urlsafe_b64encode(
+                json.dumps(
+                    {
+                        "iss": alice.did,
+                        "aud": bob.did,
+                        "exp": 9999999999,
+                        "nnc": "1699999000000-aabbccdd11223344",
+                        "att": [],
+                        "prf": [],
+                    }
+                ).encode()
+            )
+            .rstrip(b"=")
+            .decode()
+        )
         sig = base64.urlsafe_b64encode(b"test-sig-bytes-0000000000000000").rstrip(b"=").decode()
         test_jwt = f"{header}.{payload}.{sig}"
         try:
