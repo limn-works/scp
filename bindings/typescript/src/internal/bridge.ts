@@ -202,7 +202,7 @@ export interface Bridge {
     memberDid: string,
     capabilities: readonly string[],
   ): Promise<UcanToken>;
-  ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void>;
+  ucanRevoke(handle: BridgeContextHandle, token: string, revokerDid: string): Promise<void>;
   ucanDelegate(
     handle: BridgeContextHandle,
     delegatorDid: string,

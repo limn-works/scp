@@ -1037,9 +1037,11 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         let events = _scp_core::event_log::py_event_log_query(py, &ctx_id, None).unwrap();
         assert!(!events.is_empty());
 
-        // Revoke a token.
-        let dummy = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6a2V5OnRlc3QifQ.c2lnbmF0dXJl";
-        _scp_core::ucan::py_ucan_revoke(&ctx_id, dummy).unwrap();
+        // Revoke a token (revoker is the context creator).
+        let dummy = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+            eyJpc3MiOiJkaWQ6a2V5OnRlc3QiLCJhdWQiOiJkaWQ6a2V5OnRlc3QyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+            dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
+        _scp_core::ucan::py_ucan_revoke(&ctx_id, dummy, &did_a).unwrap();
 
         // Evaluate provenance.
         let q = _scp_core::provenance::py_evaluate_provenance_quality(

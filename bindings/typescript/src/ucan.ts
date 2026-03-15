@@ -64,20 +64,26 @@ export async function mintUcan(
 }
 
 /**
- * Revokes a UCAN token.
+ * Revokes a UCAN token using the full revocation pipeline.
  *
- * Adds the token to the context's revocation list. Revoked tokens are no
- * longer accepted by validation. Revocation is distributed to all context
- * members.
+ * Performs authorization (revoker must be the token's issuer or the context
+ * creator), adds the token to the context's revocation list, and appends a
+ * TokenRevoked event to the context's Merkle event log.
  *
  * @param ctx - The context the token belongs to.
  * @param token - The full encoded JWT string of the token to revoke.
- * @throws {UcanPermissionError} If revocation fails.
+ * @param revokerDid - The DID of the entity requesting the revocation.
+ *   Must be the token's issuer or the context creator.
+ * @throws {UcanPermissionError} If revocation fails (unauthorized, malformed, etc.).
  */
-export async function revokeUcan(ctx: Context, token: string): Promise<void> {
+export async function revokeUcan(
+  ctx: Context,
+  token: string,
+  revokerDid: string,
+): Promise<void> {
   try {
     const bridge = await getBridge();
-    await bridge.ucanRevoke(ctx._handle, token);
+    await bridge.ucanRevoke(ctx._handle, token, revokerDid);
   } catch (error) {
     throw mapBridgeError(error);
   }

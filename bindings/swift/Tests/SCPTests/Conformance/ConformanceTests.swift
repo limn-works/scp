@@ -122,7 +122,7 @@ struct ConformanceTests {
             let encoded = input["encoded"] ?? ""
             let revoker = input["revoker_did"] ?? ""
             let handle = ContextHandle(noPointer: .init())
-            let mockRevoke: UcanBridge.RevokeFn = { _, _ in
+            let mockRevoke: UcanBridge.RevokeFn = { _, _, _ in
                 throw ScpError.Validation(
                     msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-VALID-7999"

@@ -1731,11 +1731,20 @@ impl WasmContextManager {
     /// `WASM_REVOKED_TOKENS_CAP` entries — overflow of genuinely new
     /// tokens returns an error.
     ///
+    /// The `revoker_did` is used as the event actor in the event log. The
+    /// caller is responsible for authorization (verifying the revoker is the
+    /// token issuer or context creator) before calling this function.
+    ///
     /// # Errors
     ///
     /// Returns an error if the context is not active or the revocation set
     /// has reached capacity and the token is not already revoked.
-    pub fn ucan_revoke(&mut self, context_id: &str, token_cid: &str) -> Result<(), ScpWasmError> {
+    pub fn ucan_revoke(
+        &mut self,
+        context_id: &str,
+        token_cid: &str,
+        revoker_did: &str,
+    ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
         if ctx.revoked_tokens.len() >= WASM_REVOKED_TOKENS_CAP
@@ -1752,10 +1761,9 @@ impl WasmContextManager {
 
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
-        let actor = ctx.creator_did.clone();
         ctx.event_log.append_event(
             crate::runtime::wasm_event_type_tag("UcanRevoked"),
-            &actor,
+            revoker_did,
             token_cid.as_bytes(),
         );
 
@@ -5146,7 +5154,9 @@ mod tests {
         let mut mgr = make_manager_with_revoked_tokens("ctx-1", "did:dht:zcreator", revoked);
 
         // Revoking a genuinely new token at capacity must fail.
-        let err = mgr.ucan_revoke("ctx-1", "cid-brand-new").unwrap_err();
+        let err = mgr
+            .ucan_revoke("ctx-1", "cid-brand-new", "did:dht:zcreator")
+            .unwrap_err();
         assert!(
             matches!(err, ScpWasmError::Validation { .. }),
             "expected Validation error, got: {err:?}"

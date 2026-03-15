@@ -1138,22 +1138,88 @@ pub fn validate_tool_ucan_wasm(
     })
 }
 
-/// Revokes a UCAN token.
+/// Revokes a UCAN token with authorization checking.
 ///
-/// Delegates to `WasmContextManager::ucan_revoke`. Computes the revocation
-/// CID from the full JWT string (SHA-256 hex) and adds it to the context's
-/// revocation list. This MUST use `compute_revocation_cid` (not
-/// `compute_token_cid`) to match the format used in `ucan_validate` step 10.
+/// Performs the UCAN revocation flow (ADR-016, subset per ADR-034):
+///
+/// 1. **Parse** -- Extracts the issuer DID from the token for authorization.
+/// 2. **Authorization** -- Verifies the revoker is the token's issuer or the
+///    context creator. Rejects unauthorized revocation attempts.
+/// 3. **Local revocation** -- Computes the revocation CID from the full JWT
+///    string (SHA-256 hex) and delegates to `WasmContextManager::ucan_revoke`
+///    which adds it to the context's revocation list and appends a
+///    `UcanRevoked` event to the event log.
+///
+/// WASM uses a subset of the full pipeline per ADR-034: no MLS distribution
+/// (WASM has no transport layer). Authorization is enforced locally.
+///
+/// # Arguments
+///
+/// * `context` — The context the token belongs to.
+/// * `token` — The full encoded JWT string of the token to revoke.
+/// * `revoker_did` — The DID of the entity requesting the revocation.
+///
+/// Closes #499.
 #[wasm_bindgen]
-pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
+pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
+        validate_ucan_token(&token).map_err(|e| {
+            JsValue::from(
+                ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: "SCP-VALID-7010".to_owned(),
+                }
+                .into_js(),
+            )
+        })?;
+        validate_did(&revoker_did).map_err(|e| {
+            JsValue::from(
+                ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: "SCP-VALID-7011".to_owned(),
+                }
+                .into_js(),
+            )
+        })?;
+
+        // Parse the token to extract the issuer DID for authorization.
+        let parsed = parse_ucan(&token).map_err(|e| {
+            JsValue::from(
+                ScpWasmError::Permission {
+                    message: format!("malformed UCAN token: {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                }
+                .into_js(),
+            )
+        })?;
+
+        // Authorization check: revoker must be issuer or context creator.
+        let creator_did = with_manager(|mgr| {
+            let (_, creator, _) = mgr.ucan_context_state(&context_id)?;
+            Ok(creator)
+        })
+        .map_err(|e| JsValue::from(e.into_js()))?;
+
+        if revoker_did != parsed.payload.iss && revoker_did != creator_did {
+            return Err(JsValue::from(
+                ScpWasmError::Permission {
+                    message: format!(
+                        "revoker '{}' is neither the token issuer ('{}') nor the context creator ('{}')",
+                        revoker_did, parsed.payload.iss, creator_did
+                    ),
+                    code: "SCP-PERM-3008".to_owned(),
+                }
+                .into_js(),
+            ));
+        }
+
         // Compute the revocation CID from the full JWT string — matches
         // validation step 10.
         let token_cid = compute_revocation_cid(&token);
 
-        with_manager(|mgr| mgr.ucan_revoke(&context_id, &token_cid))
-            .map_err(ScpWasmError::into_js)?;
+        with_manager(|mgr| mgr.ucan_revoke(&context_id, &token_cid, &revoker_did))
+            .map_err(|e| JsValue::from(e.into_js()))?;
 
         Ok(JsValue::UNDEFINED)
     })

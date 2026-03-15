@@ -978,18 +978,21 @@ def ucan_delegate(
     """
     ...
 
-def ucan_revoke(context_id: str, token: str) -> None:
-    """Revoke a UCAN token.
+def ucan_revoke(context_id: str, token: str, revoker_did: str) -> None:
+    """Revoke a UCAN token using the full revocation pipeline.
 
-    Adds the token to the context's revocation list. The token is identified
-    by its content-hash CID (SHA-256 of the JSON-serialized payload).
+    Performs authorization (revoker must be token issuer or context creator),
+    adds the token to the context's revocation list, and appends a
+    TokenRevoked event to the Merkle event log.
 
     Args:
         context_id: The ID of the context the token belongs to.
         token: The full encoded UCAN token string (JWT format).
+        revoker_did: The DID of the entity requesting the revocation.
+            Must be the token's issuer or the context creator.
 
     Raises:
-        UcanError: If revocation fails.
+        UcanError: If revocation fails (unauthorized, malformed token, etc.).
     """
     ...
 

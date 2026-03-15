@@ -803,6 +803,7 @@ interface UcanBindings {
     fun ucanRevoke(
         contextHandle: Long,
         token: String,
+        revokerDid: String,
     )
 
     /**
@@ -1507,11 +1508,13 @@ class UcanBridge internal constructor(
      *
      * @param contextHandle Handle from context create or join.
      * @param token The full encoded JWT string of the token to revoke.
+     * @param revokerDid The DID of the entity requesting the revocation.
      */
     suspend fun revoke(
         contextHandle: Long,
         token: String,
-    ): Unit = bridge.ffiCall { bindings.ucanRevoke(contextHandle, token) }
+        revokerDid: String,
+    ): Unit = bridge.ffiCall { bindings.ucanRevoke(contextHandle, token, revokerDid) }
 
     /**
      * Delegate a UCAN token to another entity with attenuated capabilities.

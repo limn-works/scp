@@ -181,23 +181,25 @@ async def mint(
     return UcanToken._from_bridge(bridge_token)
 
 
-async def revoke(context: str, token: str) -> None:
-    """Revoke a UCAN token.
+async def revoke(context: str, token: str, revoker_did: str) -> None:
+    """Revoke a UCAN token using the full revocation pipeline.
 
-    Adds the token to the context's revocation list.  Revoked tokens are
-    immediately rejected by subsequent :func:`validate` calls.  The
-    revocation is distributed to all context members via MLS.
+    Performs authorization checking (revoker must be the token's issuer or
+    the context creator), adds the token to the context's revocation list,
+    and appends a ``TokenRevoked`` event to the Merkle event log.
 
     Args:
         context: The context ID the token belongs to.
         token: The full encoded JWT string of the token to revoke.
+        revoker_did: The DID of the entity requesting the revocation.
+            Must be the token's issuer or the context creator.
 
     Raises:
-        UcanPermissionError: If revocation fails (token not found, revoker
-            not authorized, etc.).
+        UcanPermissionError: If revocation fails (unauthorized revoker,
+            malformed token, etc.).
     """
     try:
-        await asyncio.to_thread(_scp_core.ucan_revoke, context, token)
+        await asyncio.to_thread(_scp_core.ucan_revoke, context, token, revoker_did)
     except Exception as exc:
         raise UcanPermissionError(str(exc)) from exc
 

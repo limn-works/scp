@@ -1688,9 +1688,7 @@ impl Drop for ContextHandle {
 pub struct UcanToken {
     /// Stable token data accessible to SDK consumers.
     pub(crate) data: UcanTokenData,
-    /// Raw encoded JWT string — held for use in validation operations.
-    /// Will be used when UCAN validation is wired to scp-core in a future story.
-    #[allow(dead_code)]
+    /// Raw encoded JWT string — used by `ucan_revoke` and `ucan_validate`.
     pub(crate) encoded: String,
 }
 
@@ -1730,6 +1728,15 @@ impl UcanToken {
     #[must_use]
     pub const fn expires_at(&self) -> Option<u64> {
         self.data.expires_at
+    }
+
+    /// Returns the full encoded JWT string of this token.
+    ///
+    /// Needed for revocation (`ucan_revoke`) and validation (`ucan_validate`)
+    /// which operate on the raw JWT.
+    #[must_use]
+    pub fn encoded(&self) -> String {
+        self.encoded.clone()
     }
 }
 
@@ -4288,26 +4295,57 @@ async fn ucan_mint_impl(
     })
 }
 
-/// Revokes a UCAN token.
+/// Revokes a UCAN token using the full revocation pipeline.
 ///
-/// Adds the token to the context's revocation list. Revoked tokens are no
-/// longer accepted by validation. Revocation is distributed to all context
-/// members.
+/// Performs the complete UCAN revocation flow from ADR-016:
+///
+/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
+///    context creator.
+/// 2. **Local revocation** -- Adds the token CID to the context's
+///    `RevocationList` (fail-closed via `RevocationPending` state).
+/// 3. **Distribution** -- Logs the revocation for transport-layer broadcast.
+/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
+///    Merkle event log.
 ///
 /// # Arguments
 ///
 /// * `handle` — The context the token belongs to.
 /// * `token` — The full encoded JWT string of the token to revoke.
+/// * `revoker_did` — The DID of the entity requesting the revocation. Must
+///   be either the token's issuer or the context creator.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Permission` if revocation fails (token not found,
-/// revoker not authorized — must be the token's issuer or context creator).
+/// Returns `ScpError::Permission` if revocation fails (revoker not authorized,
+/// token malformed, event log append failure).
+///
+/// Closes #499.
 #[uniffi::export]
-pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<(), ScpError> {
+pub async fn ucan_revoke(
+    handle: Arc<ContextHandle>,
+    token: String,
+    revoker_did: String,
+) -> Result<(), ScpError> {
+    validate_ucan_token(&token).map_err(|e| ScpError::Validation {
+        msg: e.to_string(),
+        code: "SCP-VALID-7010".to_owned(),
+    })?;
+    validate_did(&revoker_did).map_err(|e| ScpError::Validation {
+        msg: e.to_string(),
+        code: "SCP-VALID-7011".to_owned(),
+    })?;
+
     runtime()
         .spawn(async move {
-            use scp_core::crypto::ucan::revoke::compute_revocation_cid;
+            use scp_core::crypto::ucan::validate::parse_ucan;
+            use scp_ffi_common::{
+                BridgeRevocationAuthorizer, BridgeRevocationDistributor,
+                BridgeRevocationEventLogger,
+            };
+            use std::cell::RefCell;
+
+            // Parse the token to extract the issuer DID for authorization.
+            let parsed = parse_ucan(&token).map_err(ScpError::from)?;
 
             // Ensure UCAN state is registered for this context.
             crate::runtime::ensure_ucan_registered(
@@ -4316,16 +4354,32 @@ pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<()
                 &handle.ceiling_strings,
             );
 
-            // Compute the revocation CID from the raw JWT string (SHA-256 of
-            // the encoded token), matching scp-core's format.
+            // Execute the full revocation pipeline within the UCAN state closure.
             crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                let token_cid = compute_revocation_cid(&token);
-                ucan_state.revocation_list.revoke(token_cid);
+                let authorizer = BridgeRevocationAuthorizer {
+                    issuer_did: parsed.payload.iss.clone(),
+                    creator_did: ucan_state.creator_did.clone(),
+                };
+                let distributor = BridgeRevocationDistributor;
+                let event_log_cell = RefCell::new(&mut ucan_state.event_log);
+                let event_logger = BridgeRevocationEventLogger {
+                    event_log: &event_log_cell,
+                };
+
+                scp_core::crypto::ucan::revoke::revoke_ucan(
+                    &mut ucan_state.revocation_list,
+                    &token,
+                    &revoker_did,
+                    &authorizer,
+                    &distributor,
+                    &event_logger,
+                )
+                .map_err(ScpError::from)
             })
             .ok_or_else(|| ScpError::Permission {
                 msg: format!("context '{}' not found in UCAN registry", handle.context_id),
                 code: "SCP-PERM-3006".to_owned(),
-            })?;
+            })??;
 
             Ok(())
         })

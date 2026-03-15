@@ -677,11 +677,10 @@ export function createNativeBridge(): Bridge {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void> {
-      await (addon.ucanRevoke as (h: BridgeContextHandle, t: string) => Promise<void>)(
-        handle,
-        token,
-      );
+    async ucanRevoke(handle: BridgeContextHandle, token: string, revokerDid: string): Promise<void> {
+      await (
+        addon.ucanRevoke as (h: BridgeContextHandle, t: string, r: string) => Promise<void>
+      )(handle, token, revokerDid);
     },
 
     async ucanDelegate(

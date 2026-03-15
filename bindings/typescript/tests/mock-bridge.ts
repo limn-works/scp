@@ -525,7 +525,7 @@ export function createMockBridge(): Bridge & {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void> {
+    async ucanRevoke(handle: BridgeContextHandle, token: string, _revokerDid: string): Promise<void> {
       const ctx = getContext(handle);
       ctx.revokedTokens.add(token);
     },
