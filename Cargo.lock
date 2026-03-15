@@ -5045,6 +5045,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "scp-core",
+ "scp-event-log",
  "scp-identity",
  "scp-platform",
  "serde_json",

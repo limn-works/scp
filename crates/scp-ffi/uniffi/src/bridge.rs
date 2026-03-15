@@ -6481,6 +6481,7 @@ pub fn aggregate_trust_input(
     challenge_results_json: String,
 ) -> Result<String, ScpError> {
     use scp_core::trust::aggregate::TrustProtocolRepository;
+    use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
 
     if context_id.is_empty() {
         return Err(ScpError::Validation {
@@ -6594,140 +6595,6 @@ pub fn aggregate_trust_input(
         msg: format!("failed to serialize TrustInput: {e}"),
         code: "SCP-VALID-7053".to_owned(),
     })
-}
-
-// ---------------------------------------------------------------------------
-// InMemoryFfiTrustStore — concrete TrustProtocolRepository for UniFFI bridge
-// ---------------------------------------------------------------------------
-
-struct InMemoryFfiTrustStore {
-    attestations: std::sync::Mutex<
-        std::collections::HashMap<
-            (String, String),
-            Vec<scp_core::trust::aggregate::CachedAttestation>,
-        >,
-    >,
-    revocations: std::sync::Mutex<
-        std::collections::HashMap<String, std::collections::HashMap<String, bool>>,
-    >,
-    challenges: std::sync::Mutex<
-        std::collections::HashMap<(String, String), Vec<scp_core::trust::ChallengeVerification>>,
-    >,
-}
-
-impl InMemoryFfiTrustStore {
-    fn new() -> Self {
-        Self {
-            attestations: std::sync::Mutex::new(std::collections::HashMap::new()),
-            revocations: std::sync::Mutex::new(std::collections::HashMap::new()),
-            challenges: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-impl scp_core::trust::aggregate::TrustProtocolRepository for InMemoryFfiTrustStore {
-    fn get_cached_attestations(
-        &self,
-        context_id: &str,
-        subject_did: &str,
-    ) -> Result<Vec<scp_core::trust::aggregate::CachedAttestation>, scp_core::trust::TrustError>
-    {
-        let store = self.attestations.lock().map_err(|_| {
-            scp_core::trust::TrustError::InvalidEventData {
-                sequence: 0,
-                reason: "lock poisoned".to_owned(),
-            }
-        })?;
-        let key = (context_id.to_owned(), subject_did.to_owned());
-        Ok(store.get(&key).cloned().unwrap_or_default())
-    }
-
-    fn cache_attestation(
-        &self,
-        context_id: &str,
-        entry: scp_core::trust::aggregate::CachedAttestation,
-    ) -> Result<(), scp_core::trust::TrustError> {
-        let mut store = self.attestations.lock().map_err(|_| {
-            scp_core::trust::TrustError::InvalidEventData {
-                sequence: 0,
-                reason: "lock poisoned".to_owned(),
-            }
-        })?;
-        let key = (context_id.to_owned(), entry.attestation.subject.to_string());
-        let entries = store.entry(key).or_default();
-        if let Some(pos) = entries
-            .iter()
-            .position(|e| e.attestation.id == entry.attestation.id)
-        {
-            entries[pos] = entry;
-        } else {
-            entries.push(entry);
-        }
-        Ok(())
-    }
-
-    fn get_revocation_state(
-        &self,
-        context_id: &str,
-    ) -> Result<std::collections::HashMap<String, bool>, scp_core::trust::TrustError> {
-        let store =
-            self.revocations
-                .lock()
-                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
-                    sequence: 0,
-                    reason: "lock poisoned".to_owned(),
-                })?;
-        Ok(store.get(context_id).cloned().unwrap_or_default())
-    }
-
-    fn set_revocation_state(
-        &self,
-        context_id: &str,
-        state: &std::collections::HashMap<String, bool>,
-    ) -> Result<(), scp_core::trust::TrustError> {
-        let mut store =
-            self.revocations
-                .lock()
-                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
-                    sequence: 0,
-                    reason: "lock poisoned".to_owned(),
-                })?;
-        store.insert(context_id.to_owned(), state.clone());
-        Ok(())
-    }
-
-    fn get_challenge_results(
-        &self,
-        context_id: &str,
-        subject_did: &str,
-    ) -> Result<Vec<scp_core::trust::ChallengeVerification>, scp_core::trust::TrustError> {
-        let store =
-            self.challenges
-                .lock()
-                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
-                    sequence: 0,
-                    reason: "lock poisoned".to_owned(),
-                })?;
-        let key = (context_id.to_owned(), subject_did.to_owned());
-        Ok(store.get(&key).cloned().unwrap_or_default())
-    }
-
-    fn store_challenge_result(
-        &self,
-        context_id: &str,
-        result: &scp_core::trust::ChallengeVerification,
-    ) -> Result<(), scp_core::trust::TrustError> {
-        let mut store =
-            self.challenges
-                .lock()
-                .map_err(|_| scp_core::trust::TrustError::InvalidEventData {
-                    sequence: 0,
-                    reason: "lock poisoned".to_owned(),
-                })?;
-        let key = (context_id.to_owned(), result.subject_did.to_string());
-        store.entry(key).or_default().push(result.clone());
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
