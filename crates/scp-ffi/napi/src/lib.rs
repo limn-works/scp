@@ -260,6 +260,9 @@ mod tests {
         decrement_handle_count();
         let after = HANDLE_COUNT.load(Ordering::SeqCst);
         // Should be at most baseline (saturated, not wrapped to usize::MAX)
-        assert!(after <= baseline, "expected saturated at {baseline}, got {after}");
+        assert!(
+            after <= baseline,
+            "expected saturated at {baseline}, got {after}"
+        );
     }
 }
