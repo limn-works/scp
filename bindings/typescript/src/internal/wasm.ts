@@ -210,7 +210,7 @@ interface WasmModule {
     memoryScope: string,
     membersJson: string,
     targetContextId: string,
-    existingChainDepth: number,
+    existingChainDepth: number | undefined,
     existingChainPathJson: string,
     discoveryMethod: string | undefined,
     purpose: string | undefined,
@@ -1251,9 +1251,8 @@ export function createWasmBridge(): Bridge {
       _counterpartyPolicy: string | undefined,
     ) {
       const wasm = getWasm();
-      // WASM bridge uses f64 for existing_chain_depth (-1 means first hop)
-      // and a separate existing_chain_path_json parameter.
-      const depth = existingChainDepth !== undefined ? existingChainDepth : -1;
+      // WASM bridge uses Option<u32> for existing_chain_depth: undefined/null
+      // signals first hop (chain_depth 0), matching NAPI bridge semantics.
       // counterpartyPolicy is intentionally not forwarded to the WASM bridge.
       // The WASM bridge re-implements provenance locally (no scp-core dependency
       // per ADR-034) and its provenance_attach Rust export does not accept a
@@ -1269,7 +1268,7 @@ export function createWasmBridge(): Bridge {
         memoryScope,
         JSON.stringify(members),
         targetContextId,
-        depth,
+        existingChainDepth,
         "[]",
         discoveryMethod ?? undefined,
         purpose ?? undefined,
