@@ -30,6 +30,7 @@ z-base-32 = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 scp-core = { path = "../../scp-core" }
+scp-media = { path = "../../scp-media" }
 scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }

@@ -1432,6 +1432,189 @@ def bridge_create_shadow(
     ...
 
 # ---------------------------------------------------------------------------
+# Media — session lifecycle and signaling (#597)
+# ---------------------------------------------------------------------------
+
+def media_check_capability(ceiling: list[str], capability: str) -> bool:
+    """Check that a media capability is present in the context ceiling.
+
+    Args:
+        ceiling: List of capability name strings from the context ceiling.
+        capability: Media capability: ``"voice"``, ``"video"``, or
+            ``"screen_share"``.
+
+    Returns:
+        ``True`` if the capability is in the ceiling.
+
+    Raises:
+        ValidationError: If *capability* is invalid.
+        ContextError: If the capability is not in the ceiling.
+    """
+    ...
+
+def media_initiate_session(
+    context_id: str,
+    ceiling: list[str],
+    capabilities: list[str],
+    participants: list[str],
+    timestamp: int,
+) -> dict[str, Any]:
+    """Initiate a media session after validating capabilities against the ceiling.
+
+    Args:
+        context_id: The context hosting this media session.
+        ceiling: The context's capability ceiling as capability name strings.
+        capabilities: Media capabilities to activate.
+        participants: Initial participant DIDs.
+        timestamp: Unix timestamp (seconds) for session creation.
+
+    Returns:
+        A dict with session fields.
+
+    Raises:
+        ValidationError: If any capability string is invalid.
+        ContextError: If capabilities/participants are empty or capability
+            missing from ceiling.
+    """
+    ...
+
+def media_activate_session(session_json: str) -> dict[str, Any]:
+    """Activate a media session (transition from Initiating to Active).
+
+    Args:
+        session_json: JSON string representing the session.
+
+    Returns:
+        A dict with the updated session fields.
+
+    Raises:
+        ContextError: If the session is not in the Initiating state.
+    """
+    ...
+
+def media_join_session(session_json: str, participant_did: str) -> dict[str, Any]:
+    """Add a participant to a media session.
+
+    Args:
+        session_json: JSON string representing the session.
+        participant_did: DID of the participant to add.
+
+    Returns:
+        A dict with the updated session fields.
+
+    Raises:
+        ContextError: If the session has ended.
+    """
+    ...
+
+def media_end_session(session_json: str, timestamp: int) -> dict[str, Any]:
+    """End a media session and return metadata for event log recording.
+
+    Args:
+        session_json: JSON string representing the session.
+        timestamp: Unix timestamp (seconds) when the session ended.
+
+    Returns:
+        A dict with ``session`` and ``metadata`` keys.
+
+    Raises:
+        ContextError: If the session has already ended.
+    """
+    ...
+
+def media_create_offer(session_id: str, sdp: str, sender_did: str) -> dict[str, str]:
+    """Create an SDP offer signaling message.
+
+    Args:
+        session_id: The media session ID.
+        sdp: Raw SDP payload string.
+        sender_did: DID of the participant creating the offer.
+
+    Returns:
+        A dict with ``session_id`` and ``message`` keys.
+    """
+    ...
+
+def media_create_answer(session_id: str, sdp: str, sender_did: str) -> dict[str, str]:
+    """Create an SDP answer signaling message.
+
+    Args:
+        session_id: The media session ID.
+        sdp: Raw SDP payload string.
+        sender_did: DID of the participant creating the answer.
+
+    Returns:
+        A dict with ``session_id`` and ``message`` keys.
+    """
+    ...
+
+def media_create_ice_candidate(
+    session_id: str,
+    candidate: str,
+    sender_did: str,
+    sdp_mid: str | None = None,
+    sdp_mline_index: int | None = None,
+) -> dict[str, str]:
+    """Create an ICE candidate signaling message.
+
+    Args:
+        session_id: The media session ID.
+        candidate: ICE candidate attribute string.
+        sender_did: DID of the participant who gathered the candidate.
+        sdp_mid: Optional SDP media stream identification tag.
+        sdp_mline_index: Optional zero-based media description index.
+
+    Returns:
+        A dict with ``session_id`` and ``message`` keys.
+    """
+    ...
+
+def media_create_session_end(session_id: str, sender_did: str) -> dict[str, str]:
+    """Create a session-end signaling message.
+
+    Args:
+        session_id: The media session ID.
+        sender_did: DID of the participant ending the session.
+
+    Returns:
+        A dict with ``session_id`` and ``message`` keys.
+    """
+    ...
+
+def media_send_signaling(signaling_json: str) -> dict[str, str]:
+    """Serialize a signaling message for transport.
+
+    Args:
+        signaling_json: JSON string representing a signaling message.
+
+    Returns:
+        A dict with ``payload`` (base64) and ``message_type`` keys.
+
+    Raises:
+        ValidationError: If the JSON is not a valid signaling message.
+    """
+    ...
+
+def media_verify_sender_attribution(
+    signaling_json: str,
+    envelope_sender_did: str,
+) -> bool:
+    """Verify that the sender DID in a signaling message matches the envelope.
+
+    Args:
+        signaling_json: JSON string representing a signaling message.
+        envelope_sender_did: The DID from the authenticated SCP envelope.
+
+    Returns:
+        ``True`` if the sender attribution is valid.
+
+    Raises:
+        ValidationError: If the JSON is invalid.
+        ContextError: If the sender DID does not match.
+    """
+    ...
+
+# ---------------------------------------------------------------------------
 # Discovery bridge functions (crates/scp-ffi/src/discovery.rs)
 # ---------------------------------------------------------------------------
 
