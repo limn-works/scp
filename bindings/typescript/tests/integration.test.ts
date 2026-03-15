@@ -600,7 +600,7 @@ describe("Event log runtime (mock bridge)", () => {
 
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
-    const checkpoint = await mockBridge.eventLogCheckpoint(ctx);
+    const checkpoint = await mockBridge.eventLogCheckpoint(ctx, identity.did, 0);
     expect(checkpoint.root).toBeTruthy();
     expect(checkpoint.eventCount).toBe(2); // ContextCreated + MessageSent
     expect(checkpoint.timestamp).toBeGreaterThan(0);

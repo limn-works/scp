@@ -644,7 +644,11 @@ export function createMockBridge(): Bridge & {
       };
     },
 
-    async eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint> {
+    async eventLogCheckpoint(
+      handle: BridgeContextHandle,
+      _identityDid: string,
+      _epoch: number,
+    ): Promise<Checkpoint> {
       const ctx = getContext(handle);
       // Compute a simple mock root hash from event count
       const root = Buffer.from(`mock-root-${ctx.eventLog.length}`).toString("hex");
