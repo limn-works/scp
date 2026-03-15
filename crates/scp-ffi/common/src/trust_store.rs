@@ -61,7 +61,7 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         Ok(store.get(&key).cloned().unwrap_or_default())
     }
 
-    fn cache_attestation(
+    fn store_cached_attestation(
         &self,
         context_id: &str,
         entry: CachedAttestation,
@@ -85,7 +85,7 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         Ok(store.get(context_id).cloned().unwrap_or_default())
     }
 
-    fn set_revocation_state(
+    fn store_revocation_state(
         &self,
         context_id: &str,
         state: &HashMap<String, bool>,
@@ -148,7 +148,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     attestor_sets: &HashMap<scp_core::trust::AttestationType, Vec<scp_core::trust::AttestorInfo>>,
 ) -> Result<String, TrustError> {
     for ca in cached_attestations {
-        store.cache_attestation(context_id, ca)?;
+        store.store_cached_attestation(context_id, ca)?;
     }
     for cr in challenge_results {
         store.store_challenge_result(context_id, cr)?;
@@ -211,7 +211,7 @@ mod tests {
         state.insert("att-1".to_owned(), true);
         state.insert("att-2".to_owned(), false);
 
-        store.set_revocation_state("ctx-1", &state).unwrap();
+        store.store_revocation_state("ctx-1", &state).unwrap();
         let retrieved = store.get_revocation_state("ctx-1").unwrap();
         assert_eq!(retrieved, state);
     }
@@ -226,7 +226,7 @@ mod tests {
             verified_at: 1000,
             ttl_secs: 300,
         };
-        store.cache_attestation("ctx-1", entry1).unwrap();
+        store.store_cached_attestation("ctx-1", entry1).unwrap();
 
         // Cache the same attestation ID again with updated verified_at.
         let entry2 = CachedAttestation {
@@ -234,7 +234,7 @@ mod tests {
             verified_at: 2000,
             ttl_secs: 300,
         };
-        store.cache_attestation("ctx-1", entry2).unwrap();
+        store.store_cached_attestation("ctx-1", entry2).unwrap();
 
         // Should have exactly 1 entry (deduplicated by ID), with updated timestamp.
         let cached = store
@@ -336,7 +336,9 @@ mod tests {
             verified_at: 1900, // fresh: 1900 + 600 = 2500 > 2000
             ttl_secs: 600,
         };
-        store.cache_attestation(context_id, cached_att).unwrap();
+        store
+            .store_cached_attestation(context_id, cached_att)
+            .unwrap();
 
         let cr = make_challenge_result("cv-1", subject_did, context_id);
         store.store_challenge_result(context_id, &cr).unwrap();

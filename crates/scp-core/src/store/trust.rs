@@ -279,7 +279,7 @@ impl<S: Storage + 'static> TrustProtocolRepository for ProtocolRepositoryTrustBr
             .map_err(map_store_error)
     }
 
-    fn cache_attestation(
+    fn store_cached_attestation(
         &self,
         context_id: &str,
         entry: CachedAttestation,
@@ -299,7 +299,7 @@ impl<S: Storage + 'static> TrustProtocolRepository for ProtocolRepositoryTrustBr
             .map_err(map_store_error)
     }
 
-    fn set_revocation_state(
+    fn store_revocation_state(
         &self,
         context_id: &str,
         state: &HashMap<String, bool>,
@@ -631,7 +631,7 @@ mod tests {
 
         // Call from blocking thread (simulates FFI caller context).
         tokio::task::spawn_blocking(move || {
-            bridge.set_revocation_state("ctx-1", &state).unwrap();
+            bridge.store_revocation_state("ctx-1", &state).unwrap();
             let loaded = bridge.get_revocation_state("ctx-1").unwrap();
             assert_eq!(loaded, state);
         })

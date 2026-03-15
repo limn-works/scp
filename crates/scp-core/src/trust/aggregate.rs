@@ -46,7 +46,7 @@ use super::{AttestationType, TrustError, TrustInput};
 /// locking or cell types as appropriate).
 ///
 /// See ADR-017 acceptance criterion 10.
-pub trait TrustProtocolRepository {
+pub trait TrustProtocolRepository: Send + Sync {
     /// Retrieves cached verified attestations for a subject DID within a
     /// context. Returns all cached entries including expired ones —
     /// callers (e.g., `AttestationCache`) handle expiry and re-verification.
@@ -67,7 +67,7 @@ pub trait TrustProtocolRepository {
     /// # Errors
     ///
     /// Returns [`TrustError`] if the store write fails.
-    fn cache_attestation(
+    fn store_cached_attestation(
         &self,
         context_id: &str,
         entry: CachedAttestation,
@@ -89,7 +89,7 @@ pub trait TrustProtocolRepository {
     /// # Errors
     ///
     /// Returns [`TrustError`] if the store write fails.
-    fn set_revocation_state(
+    fn store_revocation_state(
         &self,
         context_id: &str,
         state: &HashMap<String, bool>,
@@ -222,7 +222,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
                         verified_at: now,
                         ttl_secs: self.ttl_secs,
                     };
-                    self.store.cache_attestation(context_id, refreshed)?;
+                    self.store.store_cached_attestation(context_id, refreshed)?;
                     result.push(entry.attestation);
                 }
                 // If verification fails, the entry is silently discarded.
@@ -256,7 +256,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
             verified_at: clock.now(),
             ttl_secs: self.ttl_secs,
         };
-        self.store.cache_attestation(context_id, entry)?;
+        self.store.store_cached_attestation(context_id, entry)?;
 
         Ok(())
     }
@@ -493,7 +493,7 @@ mod tests {
             Ok(store.get(&key).cloned().unwrap_or_default())
         }
 
-        fn cache_attestation(
+        fn store_cached_attestation(
             &self,
             context_id: &str,
             entry: CachedAttestation,
@@ -535,7 +535,7 @@ mod tests {
             Ok(store.get(context_id).cloned().unwrap_or_default())
         }
 
-        fn set_revocation_state(
+        fn store_revocation_state(
             &self,
             context_id: &str,
             state: &HashMap<String, bool>,
@@ -740,7 +740,7 @@ mod tests {
             ttl_secs: 300,
         };
 
-        store.cache_attestation("ctx-1", entry).unwrap();
+        store.store_cached_attestation("ctx-1", entry).unwrap();
 
         let cached = store
             .get_cached_attestations("ctx-1", "did:key:alice")
@@ -765,8 +765,8 @@ mod tests {
             ttl_secs: 300,
         };
 
-        store.cache_attestation("ctx-1", entry1).unwrap();
-        store.cache_attestation("ctx-1", entry2).unwrap();
+        store.store_cached_attestation("ctx-1", entry1).unwrap();
+        store.store_cached_attestation("ctx-1", entry2).unwrap();
 
         let cached = store
             .get_cached_attestations("ctx-1", "did:key:alice")
@@ -793,7 +793,7 @@ mod tests {
         state.insert("att-1".to_owned(), true);
         state.insert("att-2".to_owned(), false);
 
-        store.set_revocation_state("ctx-1", &state).unwrap();
+        store.store_revocation_state("ctx-1", &state).unwrap();
 
         let retrieved = store.get_revocation_state("ctx-1").unwrap();
         assert_eq!(retrieved.len(), 2);
@@ -856,7 +856,7 @@ mod tests {
             ttl_secs: 300,
         };
 
-        store.cache_attestation("ctx-1", entry).unwrap();
+        store.store_cached_attestation("ctx-1", entry).unwrap();
 
         let cache = AttestationCache::new(store);
         let resolver = TestResolver::new();
@@ -884,7 +884,7 @@ mod tests {
             ttl_secs: 300,
         };
 
-        store.cache_attestation("ctx-1", entry).unwrap();
+        store.store_cached_attestation("ctx-1", entry).unwrap();
 
         let cache = AttestationCache::new(store);
         // No keys in resolver -> verification will fail.
@@ -923,7 +923,7 @@ mod tests {
             verified_at: 1900,
             ttl_secs: 300,
         };
-        store.cache_attestation("ctx-1", entry).unwrap();
+        store.store_cached_attestation("ctx-1", entry).unwrap();
 
         // Seed the store with challenge results.
         let cv = make_challenge_verification("ch-1", "did:key:alice", 1500);
