@@ -21,7 +21,8 @@ struct ToolInvocation {
             outputSchemaJson: #"{"type":"object","properties":{"tempC":{"type":"number"},"condition":{"type":"string"}}}"#,
             operatorDid: identity.did(),
             testVectorsJson: #"[{"input":{"city":"Berlin"},"expected":{"tempC":18,"condition":"cloudy"}}]"#,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
 
         // Create a context and register the tool
