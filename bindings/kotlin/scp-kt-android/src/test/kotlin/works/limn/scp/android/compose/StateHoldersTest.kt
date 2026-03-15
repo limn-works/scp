@@ -32,27 +32,32 @@ class StateHoldersTest {
     @Test
     fun `rememberScpContext creates holder with correct handle`() {
         var capturedHandle = -1L
+        var capturedIdentityHandle = -1L
 
         composeRule.setContent {
-            val holder = rememberScpContext(contextHandle = 42L) { _ -> }
+            val holder = rememberScpContext(contextHandle = 42L, identityHandle = 99L) { _, _ -> }
             capturedHandle = holder.contextHandle
+            capturedIdentityHandle = holder.identityHandle
         }
 
         composeRule.waitForIdle()
         assertEquals(42L, capturedHandle)
+        assertEquals(99L, capturedIdentityHandle)
     }
 
     @Test
     fun `rememberScpContext calls onDispose when leaving composition`() {
         val disposed = AtomicBoolean(false)
         val disposedHandle = AtomicLong(-1L)
+        val disposedIdentityHandle = AtomicLong(-1L)
         val showComposable = MutableStateFlow(true)
 
         composeRule.setContent {
             val show by showComposable.collectAsStateCompat()
             if (show) {
-                rememberScpContext(contextHandle = 7L) { handle ->
+                rememberScpContext(contextHandle = 7L, identityHandle = 13L) { handle, identityHandle ->
                     disposedHandle.set(handle)
+                    disposedIdentityHandle.set(identityHandle)
                     disposed.set(true)
                 }
             }
@@ -66,6 +71,7 @@ class StateHoldersTest {
 
         assertEquals(true, disposed.get())
         assertEquals(7L, disposedHandle.get())
+        assertEquals(13L, disposedIdentityHandle.get())
     }
 
     @Test
@@ -278,7 +284,7 @@ class StateHoldersTest {
         composeRule.setContent {
             val show by showComposable.collectAsStateCompat()
             if (show) {
-                capturedHolder = rememberScpContext(contextHandle = 1L) { _ -> }
+                capturedHolder = rememberScpContext(contextHandle = 1L, identityHandle = 2L) { _, _ -> }
             }
         }
 
