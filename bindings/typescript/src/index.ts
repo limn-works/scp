@@ -125,6 +125,31 @@ export {
 } from "./discovery";
 
 // ---------------------------------------------------------------------------
+// Media
+// ---------------------------------------------------------------------------
+
+export type {
+  EndSessionResult,
+  MediaSession,
+  SendSignalingResult,
+  SessionMetadata,
+  SignalingResult,
+} from "./media";
+export {
+  mediaActivateSession,
+  mediaCheckCapability,
+  mediaCreateAnswer,
+  mediaCreateIceCandidate,
+  mediaCreateOffer,
+  mediaCreateSessionEnd,
+  mediaEndSession,
+  mediaInitiateSession,
+  mediaJoinSession,
+  mediaSendSignaling,
+  mediaVerifySenderAttribution,
+} from "./media";
+
+// ---------------------------------------------------------------------------
 // Provenance
 // ---------------------------------------------------------------------------
 

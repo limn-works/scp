@@ -6443,6 +6443,316 @@ pub fn provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> b
 }
 
 // ---------------------------------------------------------------------------
+// Media — session lifecycle and signaling (#597)
+// ---------------------------------------------------------------------------
+
+/// Checks that a media capability is present in the context's capability ceiling.
+///
+/// Returns `true` if the capability is present in the ceiling.
+///
+/// # Arguments
+///
+/// * `ceiling` - List of capability name strings from the context ceiling.
+/// * `capability` - Media capability: `"voice"`, `"video"`, or `"screen_share"`.
+#[uniffi::export]
+pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> Result<bool, ScpError> {
+    let cap = parse_media_capability(&capability)?;
+    let param_caps: Vec<scp_core::context::params::Capability> = ceiling
+        .iter()
+        .map(scp_core::context::params::Capability::new)
+        .collect();
+    scp_media::session::check_media_capability(&param_caps, &cap).map_err(|e| {
+        ScpError::Context {
+            msg: e.to_string(),
+            code: "SCP-CTX-2500".to_owned(),
+        }
+    })?;
+    Ok(true)
+}
+
+/// Initiates a media session after validating capabilities against the ceiling.
+///
+/// Returns a JSON string with session fields.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn media_initiate_session(
+    context_id: String,
+    ceiling: Vec<String>,
+    capabilities: Vec<String>,
+    participants: Vec<String>,
+    timestamp: u64,
+) -> Result<String, ScpError> {
+    let caps: Vec<scp_media::session::MediaCapability> = capabilities
+        .iter()
+        .map(|s| parse_media_capability(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let param_caps: Vec<scp_core::context::params::Capability> = ceiling
+        .iter()
+        .map(scp_core::context::params::Capability::new)
+        .collect();
+
+    let session = scp_media::session::initiate_media_session(
+        context_id,
+        &param_caps,
+        caps,
+        participants
+            .into_iter()
+            .map(scp_identity::DID::from)
+            .collect(),
+        timestamp,
+    )
+    .map_err(|e| ScpError::Context {
+        msg: e.to_string(),
+        code: "SCP-CTX-2500".to_owned(),
+    })?;
+
+    media_session_to_json(&session)
+}
+
+/// Activates a media session (transitions from Initiating to Active).
+///
+/// Takes a JSON string representing the session and returns the updated session.
+#[uniffi::export]
+pub fn media_activate_session(session_json: String) -> Result<String, ScpError> {
+    let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid session JSON: {e}"),
+            code: "SCP-VALID-7301".to_owned(),
+        })?;
+
+    scp_media::session::activate_session(&mut session).map_err(|e| ScpError::Context {
+        msg: e.to_string(),
+        code: "SCP-CTX-2500".to_owned(),
+    })?;
+
+    media_session_to_json(&session)
+}
+
+/// Adds a participant to a media session.
+///
+/// Takes a JSON string and returns the updated session.
+#[uniffi::export]
+pub fn media_join_session(
+    session_json: String,
+    participant_did: String,
+) -> Result<String, ScpError> {
+    let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid session JSON: {e}"),
+            code: "SCP-VALID-7301".to_owned(),
+        })?;
+
+    scp_media::session::join_media_session(&mut session, participant_did.into()).map_err(|e| {
+        ScpError::Context {
+            msg: e.to_string(),
+            code: "SCP-CTX-2500".to_owned(),
+        }
+    })?;
+
+    media_session_to_json(&session)
+}
+
+/// Ends a media session and returns metadata for event log recording.
+///
+/// Returns a JSON string with `session` and `metadata` keys.
+#[uniffi::export]
+pub fn media_end_session(session_json: String, timestamp: u64) -> Result<String, ScpError> {
+    let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid session JSON: {e}"),
+            code: "SCP-VALID-7301".to_owned(),
+        })?;
+
+    let metadata = scp_media::session::end_media_session(&mut session, timestamp).map_err(|e| {
+        ScpError::Context {
+            msg: e.to_string(),
+            code: "SCP-CTX-2500".to_owned(),
+        }
+    })?;
+
+    serde_json::to_string(&serde_json::json!({
+        "session": {
+            "session_id": session.session_id,
+            "context_id": session.context_id,
+            "participants": session.participants,
+            "capabilities": session.capabilities.iter().map(media_capability_to_string).collect::<Vec<_>>(),
+            "state": media_state_to_string(&session.state),
+            "started_at": session.started_at,
+        },
+        "metadata": {
+            "session_id": metadata.session_id,
+            "context_id": metadata.context_id,
+            "participants": metadata.participants,
+            "capabilities": metadata.capabilities.iter().map(media_capability_to_string).collect::<Vec<_>>(),
+            "started_at": metadata.started_at,
+            "ended_at": metadata.ended_at,
+        },
+    }))
+    .map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize result: {e}"),
+        code: "SCP-VALID-7301".to_owned(),
+    })
+}
+
+/// Creates an SDP offer signaling message.
+///
+/// Returns a JSON string with `session_id` and `message` keys.
+#[uniffi::export]
+pub fn media_create_offer(
+    session_id: String,
+    sdp: String,
+    sender_did: String,
+) -> Result<String, ScpError> {
+    let (sid, msg) = scp_media::signaling::create_offer(&session_id, sdp, sender_did.into());
+    signaling_to_json(&sid, &msg)
+}
+
+/// Creates an SDP answer signaling message.
+///
+/// Returns a JSON string with `session_id` and `message` keys.
+#[uniffi::export]
+pub fn media_create_answer(
+    session_id: String,
+    sdp: String,
+    sender_did: String,
+) -> Result<String, ScpError> {
+    let (sid, msg) = scp_media::signaling::create_answer(&session_id, sdp, sender_did.into());
+    signaling_to_json(&sid, &msg)
+}
+
+/// Creates an ICE candidate signaling message.
+///
+/// Returns a JSON string with `session_id` and `message` keys.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn media_create_ice_candidate(
+    session_id: String,
+    candidate: String,
+    sender_did: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<String, ScpError> {
+    let (sid, msg) = scp_media::signaling::create_ice_candidate(
+        &session_id,
+        candidate,
+        sdp_mid,
+        sdp_mline_index,
+        sender_did.into(),
+    );
+    signaling_to_json(&sid, &msg)
+}
+
+/// Creates a session-end signaling message.
+///
+/// Returns a JSON string with `session_id` and `message` keys.
+#[uniffi::export]
+pub fn media_create_session_end(
+    session_id: String,
+    sender_did: String,
+) -> Result<String, ScpError> {
+    let (sid, msg) = scp_media::signaling::create_session_end(&session_id, sender_did.into());
+    signaling_to_json(&sid, &msg)
+}
+
+/// Verifies that the sender DID in a signaling message matches the envelope sender.
+///
+/// Returns `true` if valid.
+#[uniffi::export]
+pub fn media_verify_sender_attribution(
+    signaling_json: String,
+    envelope_sender_did: String,
+) -> Result<bool, ScpError> {
+    let msg =
+        scp_media::signaling::deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
+            ScpError::Validation {
+                msg: format!("invalid signaling JSON: {e}"),
+                code: "SCP-VALID-7303".to_owned(),
+            }
+        })?;
+    scp_media::signaling::verify_sender_attribution(&msg, &envelope_sender_did).map_err(|e| {
+        ScpError::Context {
+            msg: format!("sender attribution verification failed: {e}"),
+            code: "SCP-CTX-2501".to_owned(),
+        }
+    })?;
+    Ok(true)
+}
+
+// Media helpers
+
+fn parse_media_capability(s: &str) -> Result<scp_media::session::MediaCapability, ScpError> {
+    match s {
+        "voice" => Ok(scp_media::session::MediaCapability::Voice),
+        "video" => Ok(scp_media::session::MediaCapability::Video),
+        "screen_share" => Ok(scp_media::session::MediaCapability::ScreenShare),
+        other => Err(ScpError::Validation {
+            msg: format!(
+                "invalid media capability '{other}': expected 'voice', 'video', or 'screen_share'"
+            ),
+            code: "SCP-VALID-7300".to_owned(),
+        }),
+    }
+}
+
+const fn media_capability_to_string(cap: &scp_media::session::MediaCapability) -> &'static str {
+    match cap {
+        scp_media::session::MediaCapability::Voice => "voice",
+        scp_media::session::MediaCapability::Video => "video",
+        scp_media::session::MediaCapability::ScreenShare => "screen_share",
+    }
+}
+
+const fn media_state_to_string(state: &scp_media::session::MediaSessionState) -> &'static str {
+    match state {
+        scp_media::session::MediaSessionState::Initiating => "initiating",
+        scp_media::session::MediaSessionState::Active => "active",
+        scp_media::session::MediaSessionState::Ended => "ended",
+    }
+}
+
+fn media_session_to_json(session: &scp_media::session::MediaSession) -> Result<String, ScpError> {
+    serde_json::to_string(&serde_json::json!({
+        "session_id": session.session_id,
+        "context_id": session.context_id,
+        "participants": session.participants,
+        "capabilities": session.capabilities.iter().map(media_capability_to_string).collect::<Vec<_>>(),
+        "state": media_state_to_string(&session.state),
+        "started_at": session.started_at,
+    }))
+    .map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize session: {e}"),
+        code: "SCP-VALID-7301".to_owned(),
+    })
+}
+
+fn signaling_to_json(
+    session_id: &str,
+    msg: &scp_media::signaling::SignalingMessage,
+) -> Result<String, ScpError> {
+    let msg_json =
+        String::from_utf8(scp_media::signaling::serialize_signaling(msg).map_err(|e| {
+            ScpError::Validation {
+                msg: format!("failed to serialize signaling: {e}"),
+                code: "SCP-VALID-7302".to_owned(),
+            }
+        })?)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("signaling bytes are not valid UTF-8: {e}"),
+            code: "SCP-VALID-7302".to_owned(),
+        })?;
+
+    serde_json::to_string(&serde_json::json!({
+        "session_id": session_id,
+        "message": msg_json,
+    }))
+    .map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize result: {e}"),
+        code: "SCP-VALID-7302".to_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Bridge connector — trust evaluation (#370)
 // ---------------------------------------------------------------------------
 

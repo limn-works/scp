@@ -60,6 +60,7 @@ pub mod error;
 pub mod event_log;
 pub mod identity;
 pub mod mcp;
+pub mod media;
 pub mod provenance;
 pub mod runtime;
 pub mod scpid;
@@ -234,6 +235,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     bridge_connector::register_bridge_connector(m)?;
     sync::register_sync(m)?;
     scpid::register_scpid(m)?;
+    media::register_media(m)?;
 
     Ok(())
 }
