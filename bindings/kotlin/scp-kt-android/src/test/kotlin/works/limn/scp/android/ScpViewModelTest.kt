@@ -231,6 +231,17 @@ private class TestNativeBindings : NativeBindings {
         ucanToken: String?,
         proofTokens: List<String>?,
     ): String = ""
+    @Suppress("LongParameterList")
+    override fun toolInvokeCrossContext(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        toolId: String,
+        inputJson: String,
+        identityHandle: Long,
+        ucanToken: String,
+        chainDepth: Int,
+        proofTokens: List<String>?,
+    ): String = ""
     override fun toolVerify(contextHandle: Long, toolId: String): String =
         """{"tool_id":"$toolId","passed":false,"failures":[]}"""
     override fun toolInterfaceExpose(
@@ -253,7 +264,8 @@ private class TestNativeBindings : NativeBindings {
         toolId: String,
         sourceContextId: String,
         ttlSeconds: Long?,
-    ): String = ""
+    ): String = "\"00000000-0000-0000-0000-000000000000\""
+    @Suppress("LongParameterList")
     override fun toolSessionInvoke(
         contextHandle: Long,
         sessionId: String,
