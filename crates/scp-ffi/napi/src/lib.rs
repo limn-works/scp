@@ -160,10 +160,14 @@ pub(crate) fn increment_handle_count() {
     HANDLE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Decrements the live handle count.
+/// Decrements the live handle count, saturating at zero.
 #[inline]
 pub(crate) fn decrement_handle_count() {
-    HANDLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    HANDLE_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+            Some(if val > 0 { val - 1 } else { 0 })
+        })
+        .ok();
 }
 
 // ---------------------------------------------------------------------------
