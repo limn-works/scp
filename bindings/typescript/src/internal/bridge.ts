@@ -375,6 +375,16 @@ export interface Bridge {
     requiredCapability: string,
   ): boolean;
 
+  // Invitation evaluation (§5.x, context.ts)
+  evaluateInvitation(
+    paramsJson: string,
+    inviterDid: string,
+    identityDid: string,
+    policyJson: string | null,
+    spendingJson: string | null,
+    trustedDidsJson: string | null,
+  ): { decision: string } | string | Promise<string>;
+
   // MetadataRecord inspection (§5.7.2, #615)
   metadataRecordToJson(
     contextId: string,
@@ -391,6 +401,57 @@ export interface Bridge {
   templateGetParams(templateId: string): string;
   validateAgainstTemplate(paramsJson: string): string | null;
   validateContextParams(paramsJson: string): string | null;
+
+  // Economy (§19, ADR-033)
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number;
+  economyPolicyRequiresPayment(policyJson: string): boolean;
+  economyAutoAcceptBlocked(policyJson: string): boolean;
+  economyCheckPolicyLock(policyJson: string): boolean;
+  economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean;
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): number;
+  economyAdjustRelayPrice(
+    configJson: string,
+    utilizationPct: number,
+  ): { newBasePrice: number; previousBasePrice: number; direction: string };
+  economyBudgetRemaining(contextId: string, did: string): number;
+  economyBudgetGrant(contextId: string, did: string, amount: number): void;
+  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void;
+  economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void;
+  economyAntispamVelocity(contextId: string, senderDid: string, now: number): number;
+  economyAntispamEscalatedCost(
+    contextId: string,
+    senderDid: string,
+    now: number,
+    baseCost: number,
+    thresholdsJson: string,
+    floor: number | null,
+    cap: number | null,
+  ): number;
+
+  // Media (ADR-024)
+  mediaCheckCapability(ceiling: string[], capability: string): boolean;
+  mediaInitiateSession(
+    contextId: string,
+    ceiling: string[],
+    capabilities: string[],
+    participants: string[],
+    timestamp: number,
+  ): string;
+  mediaActivateSession(sessionJson: string): string;
+  mediaJoinSession(sessionJson: string, participantDid: string): string;
+  mediaEndSession(sessionJson: string, timestamp: number): string;
+  mediaCreateOffer(sessionId: string, sdp: string, senderDid: string): string;
+  mediaCreateAnswer(sessionId: string, sdp: string, senderDid: string): string;
+  mediaCreateIceCandidate(
+    sessionId: string,
+    candidate: string,
+    senderDid: string,
+    sdpMid?: string,
+    sdpMlineIndex?: number,
+  ): string;
+  mediaCreateSessionEnd(sessionId: string, senderDid: string): string;
+  mediaSendSignaling(signalingJson: string): string;
+  mediaVerifySenderAttribution(signalingJson: string, envelopeSenderDid: string): boolean;
 
   // SCPID authentication (§3.11)
   scpidChallenge(audience: string, ttlSeconds: number): string;

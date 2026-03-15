@@ -369,9 +369,94 @@ interface WasmModule {
   sandbox_check_capability: (grantedCapabilities: string[], requiredCapability: string) => boolean;
   // Trust — participation verification (SCP-BA-004, §7.3.2.1)
   verify_participation_requirements: (profileJson: string, requirementsJson: string) => boolean;
+  // Trust aggregation
+  aggregate_trust_input: (
+    contextId: string,
+    subjectDid: string,
+    eventsJson: string,
+    merkleRootJson: string,
+    consequenceRulesJson: string,
+    thresholdRequirementsJson: string,
+    attestorSetsJson: string,
+    cachedAttestationsJson: string,
+    challengeResultsJson: string,
+  ) => string;
   // SCPID (§3.11) — challenge + sign only; verify requires DID resolution (not in WASM)
   scpid_challenge: (audience: string, ttlSeconds: number) => string;
   scpid_sign: (did: string, signingKeyId: string, challengeJson: string) => string;
+  // Economy (§19)
+  economy_estimate_cost: (policyJson: string, actionType: string, metricsJson: string) => number;
+  economy_policy_requires_payment: (policyJson: string) => boolean;
+  economy_auto_accept_blocked: (policyJson: string) => boolean;
+  economy_check_policy_lock: (policyJson: string) => boolean;
+  economy_validate_policy_change: (currentJson: string, proposedJson: string) => boolean;
+  economy_evaluate_formula: (formulaJson: string, metricsJson: string) => number;
+  economy_adjust_relay_price: (
+    configJson: string,
+    utilizationPct: number,
+  ) => { newBasePrice: number; previousBasePrice: number; direction: string };
+  economy_budget_remaining: (contextId: string, did: string) => number;
+  economy_budget_grant: (contextId: string, did: string, amount: number) => void;
+  economy_budget_record_spend: (contextId: string, did: string, amount: number) => void;
+  economy_antispam_record: (contextId: string, senderDid: string, timestamp: number) => void;
+  economy_antispam_velocity: (contextId: string, senderDid: string, now: number) => number;
+  economy_antispam_escalated_cost: (
+    contextId: string,
+    senderDid: string,
+    now: number,
+    baseCost: number,
+    thresholdsJson: string,
+    floor: number | null,
+    cap: number | null,
+  ) => number;
+  // Media (ADR-024)
+  media_check_capability: (ceiling: string[], capability: string) => boolean;
+  media_initiate_session: (
+    contextId: string,
+    ceiling: string[],
+    capabilities: string[],
+    participants: string[],
+    timestamp: number,
+  ) => string;
+  media_activate_session: (sessionJson: string) => string;
+  media_join_session: (sessionJson: string, participantDid: string) => string;
+  media_end_session: (sessionJson: string, timestamp: number) => string;
+  media_create_offer: (sessionId: string, sdp: string, senderDid: string) => string;
+  media_create_answer: (sessionId: string, sdp: string, senderDid: string) => string;
+  media_create_ice_candidate: (
+    sessionId: string,
+    candidate: string,
+    senderDid: string,
+    sdpMid: string | undefined,
+    sdpMlineIndex: number | undefined,
+  ) => string;
+  media_create_session_end: (sessionId: string, senderDid: string) => string;
+  media_send_signaling: (signalingJson: string) => string;
+  media_verify_sender_attribution: (signalingJson: string, envelopeSenderDid: string) => boolean;
+  // Invitation evaluation
+  evaluate_invitation: (
+    paramsJson: string,
+    inviterDid: string,
+    identityDid: string,
+    policyJson: string | null,
+    spendingJson: string | null,
+    trustedDidsJson: string | null,
+  ) => string;
+  // MetadataRecord (§5.7.2)
+  metadata_record_to_json: (
+    contextId: string,
+    sequence: number,
+    signerDid: string,
+    timestamp: number,
+    structuralJson: string,
+    operationalJson: string,
+    signatureHex: string,
+  ) => string;
+  metadata_record_from_json: (jsonStr: string) => string;
+  // Context template (§5.14)
+  template_get_params: (templateId: string) => string;
+  validate_against_template: (paramsJson: string) => string | null;
+  validate_context_params: (paramsJson: string) => string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -966,7 +1051,11 @@ export function createWasmBridge(): Bridge {
       return token;
     },
 
-    async ucanRevoke(handle: BridgeContextHandle, token: string, revokerDid: string): Promise<void> {
+    async ucanRevoke(
+      handle: BridgeContextHandle,
+      token: string,
+      revokerDid: string,
+    ): Promise<void> {
       const wasm = getWasm();
       await wasm.ucan_revoke(handle, token, revokerDid);
     },
@@ -1023,7 +1112,7 @@ export function createWasmBridge(): Bridge {
         attestorSetsJson,
         cachedAttestationsJson,
         challengeResultsJson,
-      ) as Promise<string>;
+      ) as unknown as Promise<string>;
     },
 
     // Event Log -- delegates to WASM-local Merkle tree
@@ -1415,6 +1504,225 @@ export function createWasmBridge(): Bridge {
       // The WASM bridge function is synchronous (returns Result<bool, JsValue>).
       // Throws on validation/verification failure.
       return wasm.verify_participation_requirements(profileJson, requirementsJson) as boolean;
+    },
+
+    // Invitation evaluation
+    evaluateInvitation(
+      paramsJson: string,
+      inviterDid: string,
+      identityDid: string,
+      policyJson: string | null,
+      spendingJson: string | null,
+      trustedDidsJson: string | null,
+    ) {
+      const wasm = getWasm();
+      return wasm.evaluate_invitation(
+        paramsJson,
+        inviterDid,
+        identityDid,
+        policyJson,
+        spendingJson,
+        trustedDidsJson,
+      );
+    },
+
+    // MetadataRecord inspection (§5.7.2, #615)
+    metadataRecordToJson(
+      contextId: string,
+      sequence: number,
+      signerDid: string,
+      timestamp: number,
+      structuralJson: string,
+      operationalJson: string,
+      signatureHex: string,
+    ): string {
+      const wasm = getWasm();
+      return wasm.metadata_record_to_json(
+        contextId,
+        sequence,
+        signerDid,
+        timestamp,
+        structuralJson,
+        operationalJson,
+        signatureHex,
+      );
+    },
+
+    metadataRecordFromJson(jsonStr: string): string {
+      const wasm = getWasm();
+      return wasm.metadata_record_from_json(jsonStr);
+    },
+
+    // Context template inspection (§5.14, #615)
+    templateGetParams(templateId: string): string {
+      const wasm = getWasm();
+      return wasm.template_get_params(templateId);
+    },
+
+    validateAgainstTemplate(paramsJson: string): string | null {
+      const wasm = getWasm();
+      return wasm.validate_against_template(paramsJson);
+    },
+
+    validateContextParams(paramsJson: string): string | null {
+      const wasm = getWasm();
+      return wasm.validate_context_params(paramsJson);
+    },
+
+    // Economy (§19, ADR-033)
+    economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number {
+      const wasm = getWasm();
+      return wasm.economy_estimate_cost(policyJson, actionType, metricsJson);
+    },
+
+    economyPolicyRequiresPayment(policyJson: string): boolean {
+      const wasm = getWasm();
+      return wasm.economy_policy_requires_payment(policyJson);
+    },
+
+    economyAutoAcceptBlocked(policyJson: string): boolean {
+      const wasm = getWasm();
+      return wasm.economy_auto_accept_blocked(policyJson);
+    },
+
+    economyCheckPolicyLock(policyJson: string): boolean {
+      const wasm = getWasm();
+      return wasm.economy_check_policy_lock(policyJson);
+    },
+
+    economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean {
+      const wasm = getWasm();
+      return wasm.economy_validate_policy_change(currentJson, proposedJson);
+    },
+
+    economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
+      const wasm = getWasm();
+      return wasm.economy_evaluate_formula(formulaJson, metricsJson);
+    },
+
+    economyAdjustRelayPrice(configJson: string, utilizationPct: number) {
+      const wasm = getWasm();
+      return wasm.economy_adjust_relay_price(configJson, utilizationPct);
+    },
+
+    economyBudgetRemaining(contextId: string, did: string): number {
+      const wasm = getWasm();
+      return wasm.economy_budget_remaining(contextId, did);
+    },
+
+    economyBudgetGrant(contextId: string, did: string, amount: number): void {
+      const wasm = getWasm();
+      wasm.economy_budget_grant(contextId, did, amount);
+    },
+
+    economyBudgetRecordSpend(contextId: string, did: string, amount: number): void {
+      const wasm = getWasm();
+      wasm.economy_budget_record_spend(contextId, did, amount);
+    },
+
+    economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void {
+      const wasm = getWasm();
+      wasm.economy_antispam_record(contextId, senderDid, timestamp);
+    },
+
+    economyAntispamVelocity(contextId: string, senderDid: string, now: number): number {
+      const wasm = getWasm();
+      return wasm.economy_antispam_velocity(contextId, senderDid, now);
+    },
+
+    economyAntispamEscalatedCost(
+      contextId: string,
+      senderDid: string,
+      now: number,
+      baseCost: number,
+      thresholdsJson: string,
+      floor: number | null,
+      cap: number | null,
+    ): number {
+      const wasm = getWasm();
+      return wasm.economy_antispam_escalated_cost(
+        contextId,
+        senderDid,
+        now,
+        baseCost,
+        thresholdsJson,
+        floor,
+        cap,
+      );
+    },
+
+    // Media (ADR-024)
+    mediaCheckCapability(ceiling: string[], capability: string): boolean {
+      const wasm = getWasm();
+      return wasm.media_check_capability(ceiling, capability);
+    },
+
+    mediaInitiateSession(
+      contextId: string,
+      ceiling: string[],
+      capabilities: string[],
+      participants: string[],
+      timestamp: number,
+    ): string {
+      const wasm = getWasm();
+      return wasm.media_initiate_session(contextId, ceiling, capabilities, participants, timestamp);
+    },
+
+    mediaActivateSession(sessionJson: string): string {
+      const wasm = getWasm();
+      return wasm.media_activate_session(sessionJson);
+    },
+
+    mediaJoinSession(sessionJson: string, participantDid: string): string {
+      const wasm = getWasm();
+      return wasm.media_join_session(sessionJson, participantDid);
+    },
+
+    mediaEndSession(sessionJson: string, timestamp: number): string {
+      const wasm = getWasm();
+      return wasm.media_end_session(sessionJson, timestamp);
+    },
+
+    mediaCreateOffer(sessionId: string, sdp: string, senderDid: string): string {
+      const wasm = getWasm();
+      return wasm.media_create_offer(sessionId, sdp, senderDid);
+    },
+
+    mediaCreateAnswer(sessionId: string, sdp: string, senderDid: string): string {
+      const wasm = getWasm();
+      return wasm.media_create_answer(sessionId, sdp, senderDid);
+    },
+
+    mediaCreateIceCandidate(
+      sessionId: string,
+      candidate: string,
+      senderDid: string,
+      sdpMid?: string,
+      sdpMlineIndex?: number,
+    ): string {
+      const wasm = getWasm();
+      return wasm.media_create_ice_candidate(
+        sessionId,
+        candidate,
+        senderDid,
+        sdpMid,
+        sdpMlineIndex,
+      );
+    },
+
+    mediaCreateSessionEnd(sessionId: string, senderDid: string): string {
+      const wasm = getWasm();
+      return wasm.media_create_session_end(sessionId, senderDid);
+    },
+
+    mediaSendSignaling(signalingJson: string): string {
+      const wasm = getWasm();
+      return wasm.media_send_signaling(signalingJson);
+    },
+
+    mediaVerifySenderAttribution(signalingJson: string, envelopeSenderDid: string): boolean {
+      const wasm = getWasm();
+      return wasm.media_verify_sender_attribution(signalingJson, envelopeSenderDid);
     },
 
     // Lifecycle

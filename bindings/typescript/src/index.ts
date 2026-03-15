@@ -55,12 +55,12 @@ export type {
 } from "./context";
 export {
   Context,
-  ScopedHandle,
   evaluateInvitation,
   metadataRecordFromJson,
   metadataRecordToJson,
   restoreAllContexts,
   restoreContext,
+  ScopedHandle,
   templateGetParams,
   validateAgainstTemplate,
   validateCapabilityDeclaration,
