@@ -1478,6 +1478,219 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// MetadataRecord inspection (§5.7.2, #615)
+// ---------------------------------------------------------------------------
+
+/// WASM-local `MetadataRecord` definition, algorithm-identical to scp-core's
+/// `context::metadata::MetadataRecord`. Uses the same serde field names.
+/// See ADR-034 -- WASM cannot depend on scp-core.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WasmMetadataRecord {
+    context_id: String,
+    sequence: u64,
+    signer_did: String,
+    timestamp: u64,
+    structural: serde_json::Value,
+    operational: serde_json::Value,
+    #[serde(with = "serde_bytes")]
+    signature: Vec<u8>,
+}
+
+/// Serializes a `MetadataRecord` to a JSON string.
+///
+/// Constructs a `MetadataRecord` from the provided fields and returns its
+/// JSON representation. The `signature` field is provided as a hex-encoded
+/// string (64 bytes = 128 hex characters).
+///
+/// WASM re-implementation per ADR-034 (no scp-core dependency).
+///
+/// # Errors
+///
+/// Returns `JsError` if any input is malformed or serialization fails.
+#[wasm_bindgen(js_name = "metadataRecordToJson")]
+pub fn metadata_record_to_json(
+    context_id: String,
+    sequence: u32,
+    signer_did: String,
+    timestamp: f64,
+    structural_json: String,
+    operational_json: String,
+    signature_hex: String,
+) -> Result<String, JsError> {
+    use scp_ffi_common::validate::{validate_context_id, validate_did};
+
+    validate_context_id(&context_id)
+        .map_err(|e| ScpWasmError::Validation {
+            message: e.to_string(),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+    validate_did(&signer_did)
+        .map_err(|e| ScpWasmError::Validation {
+            message: e.to_string(),
+            code: "SCP-VALID-7001".to_owned(),
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+    if sequence == 0 {
+        return Err(ScpWasmError::Validation {
+            message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js());
+    }
+
+    let structural: serde_json::Value = serde_json::from_str(&structural_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid structural metadata JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    let operational: serde_json::Value = serde_json::from_str(&operational_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid operational metadata JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    let signature = hex::decode(&signature_hex).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid signature hex: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+    if signature.len() != 64 {
+        return Err(ScpWasmError::Validation {
+            message: format!("signature must be 64 bytes (got {})", signature.len()),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js());
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let ts = timestamp as u64;
+    let record = WasmMetadataRecord {
+        context_id,
+        sequence: u64::from(sequence),
+        signer_did,
+        timestamp: ts,
+        structural,
+        operational,
+        signature,
+    };
+
+    serde_json::to_string(&record).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("failed to serialize MetadataRecord: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })
+}
+
+/// Deserializes a `MetadataRecord` from a JSON string.
+///
+/// Returns the validated and re-serialized JSON.
+///
+/// # Errors
+///
+/// Returns `JsError` if the JSON is malformed, or if semantic validation
+/// fails (sequence < 1, signature length != 64, missing structural/operational
+/// fields).
+#[wasm_bindgen(js_name = "metadataRecordFromJson")]
+pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
+    let record: WasmMetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid MetadataRecord JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    // F6: sequence must be >= 1 (spec §5.7.2)
+    if record.sequence == 0 {
+        return Err(ScpWasmError::Validation {
+            message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js());
+    }
+
+    // F7: signature must be exactly 64 bytes (Ed25519)
+    if record.signature.len() != 64 {
+        return Err(ScpWasmError::Validation {
+            message: format!(
+                "signature must be 64 bytes (got {})",
+                record.signature.len()
+            ),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js());
+    }
+
+    // F4: Validate required structural fields (context_id, mode)
+    if let Some(obj) = record.structural.as_object() {
+        if !obj.contains_key("context_id") {
+            return Err(ScpWasmError::Validation {
+                message: "structural metadata must contain 'context_id' field".to_owned(),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js());
+        }
+        if !obj.contains_key("mode") {
+            return Err(ScpWasmError::Validation {
+                message: "structural metadata must contain 'mode' field".to_owned(),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js());
+        }
+    } else {
+        return Err(ScpWasmError::Validation {
+            message: "structural metadata must be a JSON object".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js());
+    }
+
+    // F4: Validate required operational fields (version, capabilities)
+    if let Some(obj) = record.operational.as_object() {
+        if !obj.contains_key("version") {
+            return Err(ScpWasmError::Validation {
+                message: "operational metadata must contain 'version' field".to_owned(),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js());
+        }
+        if !obj.contains_key("capabilities") {
+            return Err(ScpWasmError::Validation {
+                message: "operational metadata must contain 'capabilities' field".to_owned(),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js());
+        }
+    } else {
+        return Err(ScpWasmError::Validation {
+            message: "operational metadata must be a JSON object".to_owned(),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js());
+    }
+
+    serde_json::to_string(&record).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("failed to re-serialize MetadataRecord: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Template validation (B2 — #614)
 // ---------------------------------------------------------------------------
 
@@ -1487,7 +1700,7 @@ where
 /// mode, ceiling caps, and `ceiling_policy` for ALL template types — not just
 /// bilateral templates. Returns an error message on mismatch, or `None` if
 /// validation passes (or no template is claimed).
-fn validate_against_template(params: &serde_json::Value) -> Result<(), ScpWasmError> {
+fn validate_invitation_template(params: &serde_json::Value) -> Result<(), ScpWasmError> {
     let Some(tid) = params
         .get("template_id")
         .and_then(serde_json::Value::as_str)
@@ -1601,6 +1814,242 @@ fn check_trust(
                     .as_array()
                     .is_some_and(|arr| arr.iter().any(|d| d.as_str() == Some(inviter_did)))
             })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context template inspection (§5.14, #615)
+//
+// WASM re-implementation per ADR-034. Template definitions are protocol
+// constants, reproduced here as JSON objects to avoid scp-core dependency.
+// ---------------------------------------------------------------------------
+
+/// Well-known template IDs and their canonical `ContextParams` JSON.
+///
+/// These MUST stay in sync with `scp_core::context::templates::template_params`.
+/// The WASM conformance tests validate this.
+///
+/// # Errors
+///
+/// Returns `JsError` if the template ID is not recognized.
+#[allow(clippy::too_many_lines)] // one arm per template variant; splitting hurts readability
+fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError> {
+    let vis = wasm_visibility_policies();
+    let caps = wasm_capability_sets();
+    let default_cp = serde_json::json!({"require_verified": false, "trust_threshold": null});
+
+    let make = |mode,
+                ceiling: &serde_json::Value,
+                gov,
+                mem,
+                vis: &serde_json::Value,
+                proj: Option<serde_json::Value>,
+                disc,
+                promo: &str| {
+        serde_json::json!({
+            "mode": mode, "ceiling": ceiling, "ceiling_policy": "Immutable",
+            "promotion_policy": promo, "roles": [], "tools": [], "ttl": null,
+            "memory_scope": mem, "governance": gov, "template_id": null,
+            "economic_policy": null, "metadata_visibility": vis,
+            "projection_policy": proj, "discoverable": disc,
+            "max_chain_depth": null, "counterparty_policy": default_cp,
+            "participation_requirements": [],
+            "incomplete_verification_policy": "AllowWithWarning",
+            "min_protocol_version": null, "migration_source": null
+        })
+    };
+    let pub_proj = || Some(serde_json::json!({"rule": "Public", "allowed_dids": []}));
+    let gated_proj = || Some(serde_json::json!({"rule": "Gated", "allowed_dids": []}));
+
+    let mut params = match template_id {
+        "BilateralEphemeral" => make(
+            "Encrypted",
+            &caps.msg_ban,
+            "SingleAdmin",
+            "Ephemeral",
+            &vis.private_encrypted,
+            None,
+            false,
+            "NoPromotion",
+        ),
+        "BilateralPersistent" => make(
+            "Encrypted",
+            &caps.msg_ban,
+            "SingleAdmin",
+            "Full",
+            &vis.private_encrypted,
+            None,
+            false,
+            "NoPromotion",
+        ),
+        "Coordination" => make(
+            "Encrypted",
+            &caps.msg_tools_invoke_ban,
+            "SingleAdmin",
+            "Summary",
+            &vis.private_encrypted,
+            None,
+            false,
+            "NoPromotion",
+        ),
+        // F2: governance=SingleAdmin, promotion_policy=Promotable (matches scp-core)
+        "GroupDiscussion" => make(
+            "Encrypted",
+            &caps.msg_invite_ban,
+            "SingleAdmin",
+            "Full",
+            &vis.group_discussion,
+            None,
+            false,
+            "Promotable",
+        ),
+        "PublicBroadcast" => make(
+            "Broadcast",
+            &caps.msg_tools,
+            "SingleAdmin",
+            "Full",
+            &vis.default_vis,
+            pub_proj(),
+            true,
+            "NoPromotion",
+        ),
+        // F1: DiscoveryContext is separate from PublicBroadcast — Encrypted mode,
+        // messaging_tool_invoke_ban ceiling, no projection (matches scp-core)
+        "scp:template/discovery-context" | "DiscoveryContext" => make(
+            "Encrypted",
+            &caps.msg_tools_invoke_ban,
+            "SingleAdmin",
+            "Full",
+            &vis.default_vis,
+            None,
+            true,
+            "NoPromotion",
+        ),
+        "GatedBroadcast" => make(
+            "Broadcast",
+            &caps.msg_tools,
+            "SingleAdmin",
+            "Full",
+            &vis.member_count_hidden,
+            gated_proj(),
+            true,
+            "NoPromotion",
+        ),
+        "scp:template/tool-interface" | "ToolInterfaceTemplate" => make(
+            "Encrypted",
+            &caps.msg_tools_ban,
+            "SingleAdmin",
+            "Full",
+            &vis.default_vis,
+            None,
+            false,
+            "NoPromotion",
+        ),
+        "scp:template/paid-service" | "PaidService" => make(
+            "Encrypted",
+            &caps.msg_tools_ban,
+            "SingleAdmin",
+            "Full",
+            &vis.member_count_hidden,
+            None,
+            false,
+            "NoPromotion",
+        ),
+        "scp:template/paid-broadcast" | "PaidBroadcast" => make(
+            "Broadcast",
+            &caps.msg_only,
+            "SingleAdmin",
+            "Full",
+            &vis.member_count_hidden,
+            gated_proj(),
+            true,
+            "NoPromotion",
+        ),
+        _ => {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "unknown template ID: {template_id:?} -- valid values: BilateralEphemeral, \
+                     BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
+                     GatedBroadcast, scp:template/tool-interface, \
+                     scp:template/paid-service, scp:template/paid-broadcast, \
+                     scp:template/discovery-context"
+                ),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js());
+        }
+    };
+
+    // Set template_id on every template
+    let Some(obj) = params.as_object_mut() else {
+        return Ok(params);
+    };
+    // F5: Map variant names to canonical scp:template/ URIs where applicable
+    let tid_value = match template_id {
+        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+            serde_json::json!("scp:template/tool-interface")
+        }
+        "scp:template/paid-service" | "PaidService" => {
+            serde_json::json!("scp:template/paid-service")
+        }
+        "scp:template/paid-broadcast" | "PaidBroadcast" => {
+            serde_json::json!("scp:template/paid-broadcast")
+        }
+        "scp:template/discovery-context" | "DiscoveryContext" => {
+            serde_json::json!("scp:template/discovery-context")
+        }
+        other => serde_json::Value::String(other.to_owned()),
+    };
+    obj.insert("template_id".to_owned(), tid_value);
+
+    Ok(params)
+}
+
+/// Visibility policy presets for WASM template definitions.
+struct VisibilityPolicies {
+    private_encrypted: serde_json::Value,
+    group_discussion: serde_json::Value,
+    default_vis: serde_json::Value,
+    member_count_hidden: serde_json::Value,
+}
+
+/// Capability set presets for WASM template definitions.
+#[allow(clippy::struct_field_names)] // clarity over prefix-stripping
+struct CapabilitySets {
+    msg_ban: serde_json::Value,
+    msg_only: serde_json::Value,
+    msg_tools_invoke_ban: serde_json::Value,
+    msg_tools: serde_json::Value,
+    msg_tools_ban: serde_json::Value,
+    msg_invite_ban: serde_json::Value,
+}
+
+fn wasm_visibility_policies() -> VisibilityPolicies {
+    VisibilityPolicies {
+        private_encrypted: serde_json::json!({
+            "member_count": "MemberOnly", "context_age": "MemberOnly",
+            "creator_identity": "MemberOnly", "name": "PreJoin",
+            "description": "MemberOnly", "economic_policy": "MemberOnly",
+            "tool_interface_count": "MemberOnly", "child_context_info": "MemberOnly"
+        }),
+        group_discussion: serde_json::json!({
+            "member_count": "PreJoin", "context_age": "MemberOnly",
+            "creator_identity": "PreJoin", "name": "PreJoin",
+            "description": "PreJoin", "economic_policy": "MemberOnly",
+            "tool_interface_count": "MemberOnly", "child_context_info": "MemberOnly"
+        }),
+        default_vis: serde_json::json!({
+            "member_count": "PreJoin", "context_age": "PreJoin",
+            "creator_identity": "PreJoin", "name": "PreJoin",
+            "description": "PreJoin", "economic_policy": "PreJoin",
+            "tool_interface_count": "PreJoin", "child_context_info": "PreJoin"
+        }),
+        member_count_hidden: serde_json::json!({
+            "member_count": "MemberOnly", "context_age": "PreJoin",
+            "creator_identity": "PreJoin", "name": "PreJoin",
+            "description": "PreJoin", "economic_policy": "PreJoin",
+            "tool_interface_count": "PreJoin", "child_context_info": "PreJoin"
         }),
     }
 }
@@ -1780,6 +2229,231 @@ fn check_auto_accept(
     Ok(None)
 }
 
+fn wasm_capability_sets() -> CapabilitySets {
+    CapabilitySets {
+        msg_ban: serde_json::json!(["messages:read", "messages:write", "member:ban"]),
+        msg_only: serde_json::json!(["messages:read", "messages:write"]),
+        msg_tools_invoke_ban: serde_json::json!([
+            "messages:read",
+            "messages:write",
+            "tool:invoke:*",
+            "member:ban"
+        ]),
+        msg_tools: serde_json::json!([
+            "messages:read",
+            "messages:write",
+            "tool:invoke:*",
+            "tool:register"
+        ]),
+        msg_tools_ban: serde_json::json!([
+            "messages:read",
+            "messages:write",
+            "tool:invoke:*",
+            "tool:register",
+            "member:ban"
+        ]),
+        msg_invite_ban: serde_json::json!([
+            "messages:read",
+            "messages:write",
+            "member:invite",
+            "member:ban"
+        ]),
+    }
+}
+
+/// Returns the canonical `ContextParams` for a given template ID as JSON.
+///
+/// WASM re-implementation per ADR-034.
+///
+/// # Errors
+///
+/// Returns `JsError` if the template ID is not recognized or serialization fails.
+#[wasm_bindgen(js_name = "templateGetParams")]
+pub fn template_get_params(template_id: String) -> Result<String, JsError> {
+    let params = wasm_template_params(&template_id)?;
+    serde_json::to_string(&params).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("failed to serialize template params: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })
+}
+
+/// Validates that a `ContextParams` JSON matches its template definition.
+///
+/// Returns `null` on success, or a string error message on validation failure.
+/// WASM re-implementation per ADR-034.
+///
+/// # Errors
+///
+/// Returns `JsError` if the JSON is malformed.
+#[wasm_bindgen(js_name = "validateAgainstTemplate")]
+pub fn validate_against_template(params_json: String) -> Result<Option<String>, JsError> {
+    let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid ContextParams JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    let template_id = match params.get("template_id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => return Ok(None),
+        Some(other) => {
+            return Ok(Some(format!("template_id must be a string, got: {other}")));
+        }
+    };
+
+    let Ok(expected) = wasm_template_params(&template_id) else {
+        return Ok(Some(format!("unknown template ID: {template_id}")));
+    };
+
+    // Compare key fields (skip ttl since caller provides it)
+    let fields_to_check = [
+        "mode",
+        "ceiling_policy",
+        "promotion_policy",
+        "memory_scope",
+        "governance",
+        "roles",
+        "tools",
+        "metadata_visibility",
+        "projection_policy",
+        "discoverable",
+    ];
+
+    for field in &fields_to_check {
+        let actual = params.get(*field);
+        let exp = expected.get(*field);
+        if actual != exp {
+            return Ok(Some(format!(
+                "template mismatch for {template_id:?}: {field} — \
+                 expected {exp:?}, got {actual:?}"
+            )));
+        }
+    }
+
+    // Check ceiling (order-independent)
+    let actual_ceiling = params
+        .get("ceiling")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let expected_ceiling = expected
+        .get("ceiling")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut actual_sorted: Vec<String> = actual_ceiling
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    actual_sorted.sort();
+
+    let mut expected_sorted: Vec<String> = expected_ceiling
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    expected_sorted.sort();
+
+    if actual_sorted != expected_sorted {
+        return Ok(Some(format!(
+            "template mismatch for {template_id:?}: ceiling — \
+             expected {expected_sorted:?}, got {actual_sorted:?}"
+        )));
+    }
+
+    // F3: TTL policy + economic policy enforcement
+    Ok(validate_ttl_and_economic_policy(&params, &template_id))
+}
+
+/// Validates TTL policy and economic policy requirements for a template.
+///
+/// Extracted from `validate_against_template` to keep line counts manageable.
+/// Returns `Some(error_message)` on failure, `None` on success.
+fn validate_ttl_and_economic_policy(
+    params: &serde_json::Value,
+    template_id: &str,
+) -> Option<String> {
+    let has_ttl = params.get("ttl").is_some_and(|v| !v.is_null());
+    let canonical = canonical_template_name(template_id);
+
+    // TTL policy enforcement — matches scp-core validate_against_template
+    match canonical {
+        "BilateralEphemeral" | "Coordination" => {
+            if !has_ttl {
+                return Some(format!(
+                    "template {template_id:?} requires a TTL, but none was provided"
+                ));
+            }
+        }
+        "BilateralPersistent" => {
+            if has_ttl {
+                return Some(format!(
+                    "template {template_id:?} forbids a TTL, but one was provided"
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    // Economic policy validation for paid templates
+    match canonical {
+        "PaidService" => {
+            let ep = params.get("economic_policy");
+            if ep.is_none() || ep.is_some_and(serde_json::Value::is_null) {
+                return Some(format!(
+                    "template {template_id:?} requires an economic_policy, but none was provided"
+                ));
+            }
+            let cost = ep
+                .and_then(|v| v.get("cost_schedule"))
+                .and_then(|v| v.get("per_tool_invoke"));
+            if cost.is_none() || cost.is_some_and(serde_json::Value::is_null) {
+                return Some(format!(
+                    "template {template_id:?} requires per_tool_invoke to be set \
+                     in economic_policy.cost_schedule"
+                ));
+            }
+        }
+        "PaidBroadcast" => {
+            let ep = params.get("economic_policy");
+            if ep.is_none() || ep.is_some_and(serde_json::Value::is_null) {
+                return Some(format!(
+                    "template {template_id:?} requires an economic_policy, but none was provided"
+                ));
+            }
+            let cost = ep
+                .and_then(|v| v.get("cost_schedule"))
+                .and_then(|v| v.get("per_period"));
+            if cost.is_none() || cost.is_some_and(serde_json::Value::is_null) {
+                return Some(format!(
+                    "template {template_id:?} requires per_period to be set \
+                     in economic_policy.cost_schedule"
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    None
+}
+
+/// Maps URI-style template IDs back to their canonical enum variant name
+/// for TTL/economic policy matching.
+fn canonical_template_name(template_id: &str) -> &str {
+    match template_id {
+        "scp:template/tool-interface" | "ToolInterfaceTemplate" => "ToolInterfaceTemplate",
+        "scp:template/paid-service" | "PaidService" => "PaidService",
+        "scp:template/paid-broadcast" | "PaidBroadcast" => "PaidBroadcast",
+        "scp:template/discovery-context" | "DiscoveryContext" => "DiscoveryContext",
+        other => other,
+    }
+}
+
 /// Evaluates a context invitation through the sequential pipeline.
 ///
 /// WASM-local re-implementation of the 4-step pipeline from `scp-core`.
@@ -1807,7 +2481,7 @@ pub fn evaluate_invitation(
         })?;
 
         // Step 1: Template validation (B2 — all template types).
-        validate_against_template(&params).map_err(ScpWasmError::into_js)?;
+        validate_invitation_template(&params).map_err(ScpWasmError::into_js)?;
 
         // Step 2: Economic policy check (B3 — adapter/balance checks).
         if params_require_payment(&params) {
@@ -1831,6 +2505,43 @@ pub fn evaluate_invitation(
         // Step 4: Prompt agent (fallthrough).
         Ok(JsValue::from_str(r#"{"decision":"prompt_agent"}"#))
     })
+}
+
+/// Validates cross-field invariants for `ContextParams` regardless of template.
+///
+/// Returns `null` on success, or a string error message on validation failure.
+/// WASM re-implementation per ADR-034.
+///
+/// # Errors
+///
+/// Returns `JsError` if the JSON is malformed.
+#[wasm_bindgen(js_name = "validateContextParams")]
+pub fn validate_context_params(params_json: String) -> Result<Option<String>, JsError> {
+    let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid ContextParams JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    let mode = params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Encrypted");
+
+    let has_projection = params
+        .get("projection_policy")
+        .is_some_and(|v| !v.is_null());
+
+    if mode == "Encrypted" && has_projection {
+        return Ok(Some(
+            "projection_policy is only valid for Broadcast contexts, but mode is Encrypted"
+                .to_owned(),
+        ));
+    }
+
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

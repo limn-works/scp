@@ -1227,4 +1227,133 @@ export async function evaluateInvitation(
   } catch (error) {
     throw mapBridgeError(error);
   }
+// MetadataRecord inspection (§5.7.2, #615)
+// ---------------------------------------------------------------------------
+
+/** Structural metadata fields -- always visible before joining. */
+export interface StructuralMetadata {
+  template_id: string | null;
+  ceiling: string[];
+  ceiling_policy: string;
+  roles: unknown[];
+  governance: string;
+  ttl: number | null;
+  promotion_policy: string;
+  memory_scope: string;
+  mode: string;
+  visibility_policy: Record<string, string>;
+}
+
+/** Operational metadata fields -- visibility governed by policy. */
+export interface OperationalMetadata {
+  member_count: number | null;
+  context_age_secs: number | null;
+  creator_did: string | null;
+  name: string | null;
+  description: string | null;
+  economic_policy: string | null;
+  tool_count: number | null;
+  child_contexts: string[] | null;
+}
+
+/** A signed context metadata record published for pre-join inspection (§5.7.2). */
+export interface MetadataRecord {
+  context_id: string;
+  sequence: number;
+  signer_did: string;
+  timestamp: number;
+  structural: StructuralMetadata;
+  operational: OperationalMetadata;
+  signature: number[];
+}
+
+/**
+ * Serializes a MetadataRecord to a JSON string (spec §5.7.2).
+ *
+ * @param contextId - The context this metadata describes.
+ * @param sequence - Monotonically increasing sequence number (starts at 1).
+ * @param signerDid - DID of the admin who signed this record.
+ * @param timestamp - Unix timestamp in milliseconds.
+ * @param structural - Structural metadata object.
+ * @param operational - Operational metadata object.
+ * @param signatureHex - Ed25519 signature as hex string (128 hex chars).
+ * @returns JSON string of the MetadataRecord.
+ */
+export function metadataRecordToJson(
+  contextId: string,
+  sequence: number,
+  signerDid: string,
+  timestamp: number,
+  structural: StructuralMetadata,
+  operational: OperationalMetadata,
+  signatureHex: string,
+): string {
+  const bridge = getBridgeSync();
+  return bridge.metadataRecordToJson(
+    contextId,
+    sequence,
+    signerDid,
+    timestamp,
+    JSON.stringify(structural),
+    JSON.stringify(operational),
+    signatureHex,
+  );
+}
+
+/**
+ * Deserializes a MetadataRecord from a JSON string (spec §5.7.2).
+ *
+ * @param jsonStr - JSON string of a MetadataRecord.
+ * @returns Parsed MetadataRecord object.
+ */
+export function metadataRecordFromJson(jsonStr: string): MetadataRecord {
+  const bridge = getBridgeSync();
+  const validated = bridge.metadataRecordFromJson(jsonStr);
+  return JSON.parse(validated) as MetadataRecord;
+}
+
+// ---------------------------------------------------------------------------
+// Context template inspection (§5.14, #615)
+// ---------------------------------------------------------------------------
+
+/**
+ * Gets the canonical ContextParams for a well-known template (spec §5.12.1).
+ *
+ * @param templateId - One of: `BilateralEphemeral`, `BilateralPersistent`,
+ *   `Coordination`, `GroupDiscussion`, `PublicBroadcast`, `GatedBroadcast`,
+ *   `scp:template/tool-interface`, `PaidService`, `PaidBroadcast`,
+ *   `DiscoveryContext`.
+ * @returns ContextParams object.
+ */
+export function templateGetParams(templateId: string): ContextParams {
+  const bridge = getBridgeSync();
+  const result = bridge.templateGetParams(templateId);
+  return JSON.parse(result) as ContextParams;
+}
+
+/**
+ * Validates that ContextParams match their template definition.
+ *
+ * When `params` contains a `template_id`, every field is compared
+ * against the canonical template definition.
+ *
+ * @param params - ContextParams to validate.
+ * @returns `null` on success, or a string error message on failure.
+ */
+export function validateAgainstTemplate(params: ContextParams): string | null {
+  const bridge = getBridgeSync();
+  return bridge.validateAgainstTemplate(JSON.stringify(params));
+}
+
+/**
+ * Validates cross-field invariants for ContextParams regardless of template.
+ *
+ * Currently enforces: `projection_policy` must be `null` for `Encrypted` contexts.
+ *
+ * @param params - ContextParams to validate.
+ * @returns `null` on success, or a string error message on failure.
+ */
+export function validateContextParams(params: ContextParams): string | null {
+  const bridge = getBridgeSync();
+  return bridge.validateContextParams(JSON.stringify(params));
 }

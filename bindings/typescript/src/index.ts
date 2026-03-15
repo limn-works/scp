@@ -46,8 +46,24 @@ export { Identity } from "./identity";
 // Context
 // ---------------------------------------------------------------------------
 
-export type { DeclarationValidationResult, InvitationEvaluationResult } from "./context";
-export { Context, ScopedHandle, evaluateInvitation, validateCapabilityDeclaration } from "./context";
+export type {
+  DeclarationValidationResult,
+  InvitationEvaluationResult,
+  MetadataRecord,
+  OperationalMetadata,
+  StructuralMetadata,
+} from "./context";
+export {
+  Context,
+  ScopedHandle,
+  evaluateInvitation,
+  metadataRecordFromJson,
+  metadataRecordToJson,
+  templateGetParams,
+  validateAgainstTemplate,
+  validateCapabilityDeclaration,
+  validateContextParams,
+} from "./context";
 
 // ---------------------------------------------------------------------------
 // Tools

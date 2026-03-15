@@ -1000,6 +1000,7 @@ data class ExtendedBindings(
     val identityAdvanced: IdentityAdvancedBindings? = null,
     val scpId: ScpIdBindings? = null,
     val trust: TrustBindings? = null,
+    val metadata: MetadataBindings? = null,
 )
 
 /**
@@ -1094,6 +1095,12 @@ class CoroutineBridge(
     val scpId: ScpIdBridge? =
         extendedBindings?.scpId?.let {
             ScpIdBridge(it, this)
+        }
+
+    /** Metadata and template operations — FFI on IO. Null if bindings not provided. */
+    val metadata: MetadataBridge? =
+        extendedBindings?.metadata?.let {
+            MetadataBridge(it, this)
         }
 
     /**
