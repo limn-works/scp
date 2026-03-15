@@ -455,4 +455,135 @@ struct IdentityTests {
     // (identityMigrate). The "default throws" test has been removed —
     // the injected-mock roundtrip and error propagation tests above
     // cover SDK logic.
+
+    // MARK: - Execute Custody Migration
+
+    @Test("executeCustodyMigration calls bridge and returns JSON result")
+    func executeCustodyMigrationRoundtrip() async throws {
+        var receivedDid: String?
+        var receivedTarget: String?
+        var receivedContextIds: [String]?
+
+        let mockMigrate: IdentityBridge.ExecuteCustodyMigrationFn = { did, target, contextIds in
+            receivedDid = did
+            receivedTarget = target
+            receivedContextIds = contextIds
+            return """
+            {"did":"\(did)","target":"\(target)","key_generated":true,"authorized":true}
+            """
+        }
+
+        let result = try await executeCustodyMigration(
+            did: "did:dht:z6MkMigrate",
+            target: "hardware",
+            contextIds: ["ctx-1", "ctx-2"],
+            executeCustodyMigrationFn: mockMigrate
+        )
+        #expect(result.contains("\"key_generated\":true"))
+        #expect(result.contains("\"target\":\"hardware\""))
+        #expect(receivedDid == "did:dht:z6MkMigrate")
+        #expect(receivedTarget == "hardware")
+        #expect(receivedContextIds == ["ctx-1", "ctx-2"])
+    }
+
+    @Test("executeCustodyMigration propagates bridge errors")
+    func executeCustodyMigrationPropagatesErrors() async throws {
+        let mockMigrate: IdentityBridge.ExecuteCustodyMigrationFn = { _, _, _ in
+            throw ScpError.Identity(
+                msg: "custody migration backend not configured",
+                code: "SCP-IDENT-1025"
+            )
+        }
+
+        do {
+            _ = try await executeCustodyMigration(
+                did: "did:dht:z6MkFail",
+                target: "hardware",
+                executeCustodyMigrationFn: mockMigrate
+            )
+            Issue.record("Expected executeCustodyMigration to throw")
+        } catch let error as ScpError {
+            if case let .Identity(message, code) = error {
+                #expect(code == "SCP-IDENT-1025")
+                #expect(message.contains("custody migration backend not configured"))
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("executeCustodyMigration with empty context IDs")
+    func executeCustodyMigrationEmptyContextIds() async throws {
+        var receivedContextIds: [String]?
+
+        let mockMigrate: IdentityBridge.ExecuteCustodyMigrationFn = { did, target, contextIds in
+            receivedContextIds = contextIds
+            return "{\"did\":\"\(did)\",\"target\":\"\(target)\"}"
+        }
+
+        _ = try await executeCustodyMigration(
+            did: "did:dht:z6MkTest",
+            target: "software",
+            executeCustodyMigrationFn: mockMigrate
+        )
+        #expect(receivedContextIds == [])
+    }
+
+    // MARK: - Execute Recovery
+
+    @Test("executeRecovery calls bridge and returns JSON result")
+    func executeRecoveryRoundtrip() async throws {
+        var receivedDid: String?
+        var receivedTier: String?
+        var receivedContextIds: [String]?
+
+        let mockRecovery: IdentityBridge.ExecuteRecoveryFn = { did, tier, contextIds in
+            receivedDid = did
+            receivedTier = tier
+            receivedContextIds = contextIds
+            return """
+            {"did":"\(did)","tier":"\(tier)","key_rotation_completed":true}
+            """
+        }
+
+        let result = try await executeRecovery(
+            did: "did:dht:z6MkRecover",
+            tier: "agent",
+            contextIds: ["ctx-1"],
+            executeRecoveryFn: mockRecovery
+        )
+        #expect(result.contains("\"key_rotation_completed\":true"))
+        #expect(receivedDid == "did:dht:z6MkRecover")
+        #expect(receivedTier == "agent")
+        #expect(receivedContextIds == ["ctx-1"])
+    }
+
+    @Test("executeRecovery propagates bridge errors")
+    func executeRecoveryPropagatesErrors() async throws {
+        let mockRecovery: IdentityBridge.ExecuteRecoveryFn = { _, _, _ in
+            throw ScpError.Identity(
+                msg: "recovery failed: identity not found",
+                code: "SCP-IDENT-1030"
+            )
+        }
+
+        do {
+            _ = try await executeRecovery(
+                did: "did:dht:z6MkFail",
+                tier: "identity_key",
+                executeRecoveryFn: mockRecovery
+            )
+            Issue.record("Expected executeRecovery to throw")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1030")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end IdentityTests

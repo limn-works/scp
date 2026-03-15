@@ -1447,32 +1447,54 @@ export function createMockBridge(): Bridge & {
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return { did: handle.did, custodyType: handle.custodyType };
+      const newDid = generateDid();
+      identities.delete(handle.did);
+      identities.set(newDid, { did: newDid, custodyType: handle.custodyType });
+      return { did: newDid, custodyType: handle.custodyType };
     },
 
     async identityAttestDevice(_did: string): Promise<string> {
       return JSON.stringify({ attestation_token: "mock-token" });
     },
 
-    async identityVerifyDeviceAttestation(_did: string, _tokenBase64: string): Promise<boolean> {
-      return true;
+    async identityVerifyDeviceAttestation(_did: string, tokenBase64: string): Promise<boolean> {
+      // Mock: valid tokens contain "mock-token", invalid ones don't
+      return tokenBase64.includes("mock-token");
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)
     async identityExecuteRecovery(
-      _did: string,
-      _tier: string,
+      did: string,
+      tier: string,
       _contextIds: string[],
     ): Promise<string> {
-      return JSON.stringify({ status: "recovered" });
+      return JSON.stringify({
+        did,
+        tier,
+        completed_contexts: [],
+        failed_contexts: [],
+        key_rotation_completed: true,
+      });
     },
 
     async identityExecuteCustodyMigration(
-      _did: string,
-      _target: string,
+      did: string,
+      target: string,
       _contextIds: string[],
     ): Promise<string> {
-      return JSON.stringify({ status: "migrated" });
+      const validTargets = ["platform_managed", "hardware", "software", "in_memory"];
+      if (!validTargets.includes(target)) {
+        throw new Error(`invalid custody migration target: ${target}`);
+      }
+      return JSON.stringify({
+        did,
+        target,
+        key_generated: true,
+        authorized: true,
+        did_document_rotated: true,
+        ucans_reissued: true,
+        old_key_destroyed: true,
+      });
     },
 
     // App Sandboxing (#595, spec §8.4.1, §8.4.2)
