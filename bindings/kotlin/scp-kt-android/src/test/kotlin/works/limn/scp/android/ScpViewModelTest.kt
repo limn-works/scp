@@ -249,16 +249,6 @@ private class TestNativeBindings : NativeBindings {
     ): String = "{}"
     override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
     override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
-    override fun toolInvokeCrossContext(
-        sourceContextHandle: Long,
-        targetContextHandle: Long,
-        toolId: String,
-        inputJson: String,
-        identityHandle: Long,
-        ucanToken: String,
-        chainDepth: Int,
-        proofTokens: List<String>?,
-    ): String = "{}"
     override fun toolSessionCreate(
         contextHandle: Long,
         toolId: String,
