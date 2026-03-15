@@ -840,9 +840,10 @@ pub async fn bridge_auth_middleware_dyn(
 ///
 /// # Replay protection
 ///
-/// Per spec §12.10.2, the signed payload is `{timestamp}.{body}` where
-/// `timestamp` is the value of the `X-SCP-Timestamp` header. The timestamp
-/// must be within [`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`] of the current time.
+/// Per spec §12.10.2, the signed payload is `timestamp_bytes || body_bytes`
+/// where `timestamp` is the value of the `X-SCP-Timestamp` header. The
+/// timestamp must be within [`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`] of the
+/// current time.
 pub fn verify_webhook_signature(
     signature_header: &str,
     key_id: &str,
@@ -892,10 +893,9 @@ pub fn verify_webhook_signature(
     })?;
     let signature = Signature::from_bytes(&sig_array);
 
-    // Build the signed payload: "{timestamp}.{body}" per spec §12.10.2.
-    let mut signed_payload = Vec::with_capacity(timestamp_str.len() + 1 + body.len());
+    // Build the signed payload: timestamp_bytes || body_bytes per spec §12.10.2.
+    let mut signed_payload = Vec::with_capacity(timestamp_str.len() + body.len());
     signed_payload.extend_from_slice(timestamp_str.as_bytes());
-    signed_payload.push(b'.');
     signed_payload.extend_from_slice(body);
 
     verifying_key
@@ -941,11 +941,16 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
         }
     };
 
-    let timestamp_header = req
+    let timestamp_header = match req
         .headers()
         .get("x-scp-timestamp")
         .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
+    {
+        Some(t) => t.to_owned(),
+        None => {
+            return bridge_not_authorized("missing X-SCP-Timestamp header").into_response();
+        }
+    };
 
     // We need to read the body for signature verification, then reconstruct
     // the request for downstream handlers.
@@ -962,7 +967,7 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
     if let Err(msg) = verify_webhook_signature(
         &signature_header,
         &key_id,
-        timestamp_header.as_deref(),
+        Some(&timestamp_header),
         &body_bytes,
         lookup.as_ref(),
     ) {
@@ -1008,11 +1013,16 @@ pub async fn webhook_auth_middleware_dyn(
         }
     };
 
-    let timestamp_header = req
+    let timestamp_header = match req
         .headers()
         .get("x-scp-timestamp")
         .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
+    {
+        Some(t) => t.to_owned(),
+        None => {
+            return bridge_not_authorized("missing X-SCP-Timestamp header").into_response();
+        }
+    };
 
     // Read the body for signature verification, then reconstruct.
     let (parts, body) = req.into_parts();
@@ -1028,7 +1038,7 @@ pub async fn webhook_auth_middleware_dyn(
     if let Err(msg) = verify_webhook_signature(
         &signature_header,
         &key_id,
-        timestamp_header.as_deref(),
+        Some(&timestamp_header),
         &body_bytes,
         lookup.as_ref(),
     ) {
@@ -1620,11 +1630,10 @@ mod tests {
     // Webhook signature tests
     // -----------------------------------------------------------------------
 
-    /// Helper: build the signed payload `{timestamp}.{body}` per §12.10.2.
+    /// Helper: build the signed payload `timestamp_bytes || body_bytes` per §12.10.2.
     fn webhook_signed_payload(timestamp: &str, body: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(timestamp.len() + 1 + body.len());
+        let mut payload = Vec::with_capacity(timestamp.len() + body.len());
         payload.extend_from_slice(timestamp.as_bytes());
-        payload.push(b'.');
         payload.extend_from_slice(body);
         payload
     }
