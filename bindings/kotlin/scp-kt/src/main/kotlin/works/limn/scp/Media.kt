@@ -16,6 +16,7 @@ import works.limn.scp.bridge.CoroutineBridge
  * All methods are blocking JNA calls into Rust and must be dispatched
  * on [kotlinx.coroutines.Dispatchers.IO].
  */
+@Suppress("TooManyFunctions")
 interface MediaBindings {
     /**
      * Checks that a media capability is present in the context ceiling.
@@ -152,6 +153,7 @@ interface MediaBindings {
  * Signaling messages (SDP offers/answers, ICE candidates) flow as
  * standard SCP encrypted governed messages. See ADR-024.
  */
+@Suppress("TooManyFunctions")
 class MediaBridge internal constructor(
     private val bindings: MediaBindings,
     private val bridge: CoroutineBridge,
