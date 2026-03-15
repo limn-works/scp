@@ -1980,18 +1980,18 @@ pub fn evaluate_invitation(
     };
     use scp_core::context::policy::AutoAcceptPolicy;
 
-    if inviter_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "inviter DID must not be empty".to_owned(),
+    validate_did(&inviter_did).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: e.message,
             code: "SCP-VALID-7010".to_owned(),
-        }));
-    }
-    if identity_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "identity DID must not be empty".to_owned(),
+        })
+    })?;
+    validate_did(&identity_did).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: e.message,
             code: "SCP-VALID-7010".to_owned(),
-        }));
-    }
+        })
+    })?;
 
     let params: scp_core::context::ContextParams =
         serde_json::from_str(&params_json).map_err(|e| {
