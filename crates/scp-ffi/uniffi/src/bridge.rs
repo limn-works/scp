@@ -2396,6 +2396,9 @@ pub async fn context_create(
                 economic_policy: std::sync::Mutex::new(None),
                 core_context_params: retained_core_params,
             });
+            // Register in the global context handle registry so the MCP
+            // bridge provider can look up per-context state by context ID.
+            register_context_handle(&handle);
             increment_handle_count();
             Ok(handle)
         })
@@ -2526,6 +2529,9 @@ pub async fn context_leave(
                 .await
                 .map_err(ScpError::from)?;
 
+            // Deregister the context handle from the MCP lookup registry.
+            deregister_context_handle(&handle.context_id);
+
             Ok(())
         })
         .await
@@ -2651,6 +2657,9 @@ pub async fn context_close(
             // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
             // to prevent unbounded memory growth in long-running processes.
             remove_bridge_state(&handle.context_id);
+
+            // Deregister the context handle from the MCP lookup registry.
+            deregister_context_handle(&handle.context_id);
 
             *state = ContextState::Closed;
             drop(state);
@@ -4052,6 +4061,14 @@ pub struct McpServerConfig {
     pub context_ids: Vec<String>,
     /// Transport mode: `"stdio"` or `"sse"`.
     pub transport: String,
+    /// Optional JWT-encoded UCAN token for tool invocation authorization.
+    ///
+    /// When present, `validate_capability` runs the full 11-step ADR-016
+    /// validation pipeline. When absent, capability validation rejects
+    /// immediately (UCAN is required for tool invocation per §6.2).
+    pub ucan_token: Option<String>,
+    /// Optional proof tokens for UCAN delegation chain verification.
+    pub proof_tokens: Option<Vec<String>>,
 }
 
 /// Tool definition from an external MCP server.
@@ -4089,6 +4106,45 @@ pub struct McpAllowlistState {
     pub allowed: Vec<String>,
     /// Whether the allowlist is bypassed entirely (unrestricted mode).
     pub unrestricted: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Context handle registry — maps context_id → Arc<ContextHandle>
+//
+// The MCP bridge provider needs to look up per-context state (tool registry,
+// tool handlers, event log) by context ID, but UniFFI passes handles as
+// opaque Arc<ContextHandle> objects. This registry bridges the gap by
+// storing a weak reference to each active context handle, registered during
+// context_create and deregistered during context_close/leave.
+// ---------------------------------------------------------------------------
+
+/// Global registry mapping context IDs to their `ContextHandle` instances.
+///
+/// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
+/// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
+/// alive as long as it is in the registry (the caller also holds an Arc).
+fn context_handle_registry() -> &'static dashmap::DashMap<String, Arc<ContextHandle>> {
+    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, Arc<ContextHandle>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Registers a context handle in the global registry.
+///
+/// Called from `context_create` after the handle is constructed. If a handle
+/// with the same context ID is already registered, the old one is replaced
+/// (last-writer-wins — should not happen in practice since context IDs are
+/// UUIDs).
+fn register_context_handle(handle: &Arc<ContextHandle>) {
+    context_handle_registry().insert(handle.context_id.clone(), Arc::clone(handle));
+}
+
+/// Removes a context handle from the global registry.
+///
+/// Called from `context_close` and `context_leave`. No-op if the context ID
+/// is not registered.
+fn deregister_context_handle(context_id: &str) {
+    context_handle_registry().remove(context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -4328,11 +4384,29 @@ impl scp_mcp::client::McpTransport for McpSseTransport {
 // MCP FFI bridge context provider
 // ---------------------------------------------------------------------------
 
+/// Default tool handler timeout in milliseconds (30 seconds).
+const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+
 /// FFI bridge provider for the MCP server. Implements `ContextProvider` by
-/// delegating to the context manager for tool and state queries.
+/// reading tool registrations, role state, and event log data from the
+/// context handle registry and `ContextManager`.
+///
+/// This mirrors the `PyO3` bridge's `FfiBridgeProvider` architecture:
+/// - `context_tools()` reads from the per-context `ToolRegistry`
+/// - `agent_role()` reads from `ContextManager::get_role_state()`
+/// - `validate_capability()` runs UCAN validation + role-state capability check
+/// - `invoke_tool()` dispatches to registered handlers with schema validation
+/// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
+/// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
     agent_did: String,
     context_ids: Vec<String>,
+    /// Maximum time (in milliseconds) to wait for a tool handler to complete.
+    tool_timeout_ms: u64,
+    /// JWT-encoded UCAN token for tool invocation authorization.
+    agent_ucan_token: Option<String>,
+    /// Optional proof tokens for UCAN delegation chain verification.
+    agent_proof_tokens: Option<Vec<String>>,
 }
 
 impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
@@ -4340,60 +4414,373 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         self.context_ids.clone()
     }
 
-    fn agent_role(&self, _context_id: &str) -> Option<String> {
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-        WARN_ONCE.call_once(|| {
-            tracing::warn!(
-                "McpUniFfiBridgeProvider::agent_role returns None — \
-                 wire a production ContextProvider that resolves real roles \
-                 from ContextManager before exposing MCP in production."
-            );
-        });
-        None
+    fn agent_role(&self, context_id: &str) -> Option<String> {
+        // Read the agent's role assignment from the ContextManager's role state.
+        let manager = crate::runtime::context_manager().ok()?;
+        let role_state = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
+        })?;
+        role_state
+            .assignments
+            .get(&self.agent_did)
+            .map(|assignment| assignment.role_name.clone())
     }
 
     fn agent_did(&self) -> &str {
         &self.agent_did
     }
 
-    fn context_tools(&self, _context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
-        Vec::new()
+    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+        // Look up the ContextHandle from the global registry and read its
+        // tool_registry.
+        let registry = context_handle_registry();
+        let Some(handle) = registry.get(context_id) else {
+            return Vec::new();
+        };
+        let tool_registry = handle.tool_registry.blocking_lock();
+        tool_registry
+            .registrations()
+            .map(|t| scp_mcp::server::ContextToolInfo {
+                name: t.name.clone(),
+                description: Some(t.description.clone()),
+                input_schema: t.schema.input_schema.clone(),
+                output_schema: Some(t.schema.output_schema.clone()),
+                admin_only: false,
+            })
+            .collect()
     }
 
-    fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
-        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-        WARN_ONCE.call_once(|| {
+    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Primary check: UCAN token validation via the full 11-step ADR-016
+        // pipeline. Verifies the token grants tool_invoke:{tool_name} or
+        // tool_invoke:* for this context.
+        if let Some(ref token) = self.agent_ucan_token {
+            // Build proof resolver from optional proof tokens.
+            let mut proofs = std::collections::HashMap::new();
+            if let Some(ref tokens) = self.agent_proof_tokens {
+                for encoded in tokens {
+                    let proof_token = scp_core::crypto::ucan::validate::parse_ucan(encoded)
+                        .map_err(|e| format!("malformed proof token: {e}"))?;
+                    let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
+                    proofs.insert(cid, proof_token);
+                }
+            }
+            let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+
+            // Ensure UCAN state is registered for this context.
+            // Scope the DashMap Ref so the shard lock is released before
+            // entering with_ucan_state (which uses a different DashMap).
+            {
+                let handle = context_handle_registry().get(context_id).ok_or_else(|| {
+                    format!("context '{context_id}' not found in handle registry")
+                })?;
+                crate::runtime::ensure_ucan_registered(
+                    context_id,
+                    &handle.creator_did,
+                    &handle.ceiling_strings,
+                );
+            }
+
+            let agent_did = self.agent_did.clone();
+            crate::runtime::with_ucan_state(context_id, |ucan_state| {
+                let production_resolver = crate::runtime::did_resolver();
+                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+                    production_resolver.map(std::convert::AsRef::as_ref),
+                );
+                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                    revocation_list: &ucan_state.revocation_list,
+                };
+                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                    inner: &mut ucan_state.nonce_tracker,
+                };
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &ucan_state.ceiling_strings,
+                    context_creator_did: &ucan_state.creator_did,
+                    presenting_agent_did: &agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                };
+
+                scp_core::context::tools::validate_tool_invocation_ucan(
+                    token, context_id, tool_name, &mut ctx,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        agent = %agent_did,
+                        tool = %tool_name,
+                        context = %context_id,
+                        error = %e,
+                        "UCAN validation failed for tool invocation"
+                    );
+                    format!("UCAN authorization failed for tool '{tool_name}': {e}")
+                })
+            })
+            .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
+        } else {
             tracing::warn!(
-                "McpUniFfiBridgeProvider::validate_capability returns error — \
-                 wire a production ContextProvider that checks UCAN capabilities \
-                 against the context's role state before exposing MCP in production."
+                agent = %self.agent_did,
+                tool = %tool_name,
+                context = %context_id,
+                "no UCAN token provided for tool invocation — authorization bypass risk"
             );
-        });
-        Err("capability validation not implemented — wire a production ContextProvider".to_owned())
+            return Err("UCAN token required for tool invocation — no token provided".to_owned());
+        }
+
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
+        let manager = crate::runtime::context_manager()
+            .map_err(|e| format!("ContextManager not initialized: {e}"))?;
+        let role_state = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
+        })
+        .ok_or_else(|| {
+            format!("context '{context_id}' not found in ContextManager for capability check")
+        })?;
+
+        if scp_core::context::tools::invoke::has_tool_invoke_capability(
+            &role_state,
+            &self.agent_did,
+            tool_name,
+        ) {
+            Ok(())
+        } else {
+            tracing::warn!(
+                agent = %self.agent_did,
+                tool = %tool_name,
+                context = %context_id,
+                "capability check failed: agent lacks ToolInvoke capability"
+            );
+            Err("insufficient permissions to invoke tool".to_owned())
+        }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn invoke_tool(
         &self,
-        _context_id: &str,
-        _tool_name: &str,
-        _arguments: serde_json::Value,
+        context_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        Err(
-            "tool invocation through MCP server requires ContextManager tool registry integration"
-                .to_owned(),
-        )
+        let start = std::time::Instant::now();
+        let agent_did = self.agent_did.clone();
+        let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
+
+        // Phase 1: Validate input and extract handler + output schema under
+        // the ContextHandle's tool_registry lock. The lock is released before
+        // handler execution to avoid blocking concurrent context operations.
+        // The DashMap Ref (shard lock) is scoped to this block.
+        let (dispatch, input_hash) = {
+            let handle = context_handle_registry()
+                .get(context_id)
+                .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
+
+            let tool_registry = handle.tool_registry.blocking_lock();
+            let registration = tool_registry
+                .get(tool_name)
+                .ok_or_else(|| format!("tool '{tool_name}' not found in context '{context_id}'"))?;
+
+            // Validate input against the tool's input schema.
+            scp_core::context::tools::schema::validate_value_against_schema(
+                &arguments,
+                &registration.schema.input_schema,
+            )
+            .map_err(|msg| format!("input validation failed for tool '{tool_name}': {msg}"))?;
+
+            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+
+            let handler_dispatch = {
+                let tool_handlers = handle.tool_handlers.blocking_lock();
+                tool_handlers
+                    .get(tool_name)
+                    .map(|handler| (handler.clone(), registration.schema.output_schema.clone()))
+            };
+
+            (handler_dispatch, input_hash)
+        };
+
+        // Phase 2: Execute handler OUTSIDE the locks so that concurrent
+        // same-context operations are not blocked. Handler execution is
+        // bounded by `tool_timeout_ms` (matching PyO3 pattern, issue #123).
+        let output = match dispatch {
+            Some((handler, output_schema)) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = handler(arguments);
+                    let _ = tx.send(result);
+                });
+
+                let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+                    format!(
+                        "tool handler for '{tool_name}' timed out after {}ms",
+                        timeout.as_millis()
+                    )
+                })?;
+
+                let output = handler_result
+                    .map_err(|e| format!("tool handler for '{tool_name}' failed: {e}"))?;
+
+                // Validate output against the tool's output schema (defense-in-depth).
+                scp_core::context::tools::schema::validate_value_against_schema(
+                    &output,
+                    &output_schema,
+                )
+                .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
+
+                output
+            }
+            None => {
+                // No handler registered — fall back to echo mode.
+                serde_json::json!({
+                    "tool": tool_name,
+                    "context": context_id,
+                    "status": "validated",
+                    "input_valid": true,
+                    "validated_input": arguments,
+                })
+            }
+        };
+
+        // Phase 3: Append ToolInvokedEvent to the event log (ADR-010
+        // criterion 3). Uses append_unsigned_event because ContextProvider
+        // is sync (same as PyO3 bridge).
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = {
+            let millis = start.elapsed().as_millis();
+            if millis > u128::from(u64::MAX) {
+                u64::MAX
+            } else {
+                millis as u64
+            }
+        };
+
+        let tool_event = scp_core::context::tools::ToolInvokedEvent {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            tool_id: tool_name.to_owned(),
+            invoker_did: agent_did.clone().into(),
+            status: scp_core::context::tools::ToolStatus::Success,
+            execution_time_ms: elapsed_ms,
+            input_hash,
+            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            cost: None,
+        };
+
+        let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        // Ensure UCAN state is registered before appending the event.
+        if let Some(handle) = context_handle_registry().get(context_id) {
+            crate::runtime::ensure_ucan_registered(
+                context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+        }
+
+        let append_result = crate::runtime::with_ucan_state(context_id, |ucan_state| {
+            let sequence = scp_event_log::tree::event_count(&ucan_state.event_log);
+            let prev_hash = if ucan_state.event_log.leaves().is_empty() {
+                scp_event_log::tree::GENESIS_PREV_HASH
+            } else {
+                let leaves = ucan_state.event_log.leaves();
+                leaves[leaves.len() - 1]
+            };
+
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::ToolInvoked,
+                actor_did: agent_did.into(),
+                timestamp,
+                sequence,
+                payload: scp_event_log::EventPayload { data: payload_data },
+                prev_hash,
+                signature: Vec::new(),
+            };
+
+            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
+                .map_err(|e| e.to_string())
+        });
+
+        match append_result {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    context = %context_id,
+                    error = %e,
+                    "failed to append ToolInvokedEvent to event log"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    context = %context_id,
+                    "UCAN state not found — could not append ToolInvokedEvent"
+                );
+            }
+        }
+
+        Ok(output)
     }
 
-    fn context_members(&self, _context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
-        Vec::new()
+    fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
+        // Read member list and role assignments from the ContextManager.
+        let Ok(manager) = crate::runtime::context_manager() else {
+            return Vec::new();
+        };
+
+        let (member_dids, role_state) = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let dids = handle.block_on(manager.member_dids(context_id));
+            let roles = handle.block_on(manager.get_role_state(context_id));
+            (dids, roles)
+        });
+
+        member_dids
+            .into_iter()
+            .map(|did| {
+                let role = role_state
+                    .as_ref()
+                    .and_then(|rs| rs.assignments.get(&did))
+                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone());
+                scp_mcp::server::MemberInfo { did, role }
+            })
+            .collect()
     }
 
-    fn context_events(&self, _context_id: &str) -> serde_json::Value {
-        serde_json::Value::Array(Vec::new())
+    fn context_events(&self, context_id: &str) -> serde_json::Value {
+        // The EventLog stores Merkle tree hashes, not event payloads.
+        // Return the event count and Merkle root as metadata (matching PyO3).
+        if let Some(handle) = context_handle_registry().get(context_id) {
+            crate::runtime::ensure_ucan_registered(
+                context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+        }
+
+        crate::runtime::with_ucan_state(context_id, |ucan_state| {
+            let leaf_count = ucan_state.event_log.leaves().len();
+            let root = scp_event_log::tree::root(&ucan_state.event_log);
+            serde_json::json!({
+                "event_count": leaf_count,
+                "merkle_root": hex::encode(root),
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-        Err("resource subscriptions require full relay integration".to_owned())
+        // Resource subscriptions are not yet wired to the transport layer.
+        // Accept the subscription silently (matching PyO3 behavior).
+        Ok(())
     }
 }
 
@@ -4533,6 +4920,9 @@ pub async fn mcp_server_create(config: McpServerConfig) -> Result<String, ScpErr
     let provider = McpUniFfiBridgeProvider {
         agent_did: config.identity_did.clone(),
         context_ids: config.context_ids.clone(),
+        tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+        agent_ucan_token: config.ucan_token.clone(),
+        agent_proof_tokens: config.proof_tokens.clone(),
     };
     let server = scp_mcp::server::McpServer::new(provider);
     let server = Arc::new(std::sync::Mutex::new(server));
@@ -4540,9 +4930,11 @@ pub async fn mcp_server_create(config: McpServerConfig) -> Result<String, ScpErr
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server_clone = Arc::clone(&server);
-    let transport_mode = config.transport.clone();
+    let transport_mode = config.transport;
     let sse_identity_did = config.identity_did;
     let sse_context_ids = config.context_ids;
+    let sse_ucan_token = config.ucan_token;
+    let sse_proof_tokens = config.proof_tokens;
 
     let task_handle = runtime().spawn(async move {
         match transport_mode.as_str() {
@@ -4553,6 +4945,9 @@ pub async fn mcp_server_create(config: McpServerConfig) -> Result<String, ScpErr
                 let provider = McpUniFfiBridgeProvider {
                     agent_did: sse_identity_did,
                     context_ids: sse_context_ids,
+                    tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+                    agent_ucan_token: sse_ucan_token,
+                    agent_proof_tokens: sse_proof_tokens,
                 };
                 let sse_server = scp_mcp::server::McpServer::new(provider);
                 let sse_config =
@@ -11882,6 +12277,7 @@ mod tests {
 
         assert_eq!(auth.did, identity.did);
         assert_eq!(auth.signing_key_id, scp_identity::SigningKeyId::Active);
+    }
 
     // MCP bridge tests (issue #591)
     // -----------------------------------------------------------------------
@@ -11893,6 +12289,8 @@ mod tests {
             identity_did: "did:dht:z6MkTestUser".to_owned(),
             context_ids: vec![],
             transport: "stdio".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
         };
 
         let result = mcp_server_create(config).await;
@@ -11912,6 +12310,8 @@ mod tests {
             identity_did: "did:dht:z6MkTestUser".to_owned(),
             context_ids: vec!["ctx-1".to_owned()],
             transport: "websocket".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
         };
 
         let result = mcp_server_create(config).await;
