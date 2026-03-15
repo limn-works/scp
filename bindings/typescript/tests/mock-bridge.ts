@@ -716,6 +716,10 @@ export function createMockBridge(): Bridge & {
           state: ctx.state,
           members: [...ctx.members],
           event_count: ctx.eventLog.length,
+          mode: ctx.mode,
+          broadcast_subscribers: [...ctx.broadcastSubscribers],
+          broadcast_blocked_subscribers: [...ctx.broadcastBlockedSubscribers],
+          broadcast_admission: ctx.broadcastAdmission,
         },
       };
       return new TextEncoder().encode(JSON.stringify(exportData));
@@ -723,7 +727,17 @@ export function createMockBridge(): Bridge & {
 
     async contextImport(data: Uint8Array): Promise<string> {
       const json = new TextDecoder().decode(data);
-      let parsed: { snapshot?: { context_id?: string; creator_did?: string; members?: string[] } };
+      let parsed: {
+        snapshot?: {
+          context_id?: string;
+          creator_did?: string;
+          members?: string[];
+          mode?: string;
+          broadcast_subscribers?: string[];
+          broadcast_blocked_subscribers?: string[];
+          broadcast_admission?: BroadcastAdmissionPolicy | null;
+        };
+      };
       try {
         parsed = JSON.parse(json) as typeof parsed;
       } catch {
@@ -736,6 +750,7 @@ export function createMockBridge(): Bridge & {
       const contextId = snapshot.context_id;
       const creatorDid = snapshot.creator_did ?? "did:dht:unknown";
       const members = snapshot.members ?? [creatorDid];
+      const mode = snapshot.mode ?? "Encrypted";
       const ctx: MockContext = {
         contextId,
         state: "active",
@@ -749,10 +764,10 @@ export function createMockBridge(): Bridge & {
         revokedTokens: new Set(),
         economicPolicy: null,
         ttlSecs: null,
-        mode: "Encrypted",
-        broadcastSubscribers: new Set(),
-        broadcastBlockedSubscribers: new Set(),
-        broadcastAdmission: null,
+        mode,
+        broadcastSubscribers: new Set(snapshot.broadcast_subscribers ?? []),
+        broadcastBlockedSubscribers: new Set(snapshot.broadcast_blocked_subscribers ?? []),
+        broadcastAdmission: snapshot.broadcast_admission ?? (mode === "Broadcast" ? "Open" : null),
       };
       const importedEvent: Event = {
         eventType: "ContextImported",

@@ -985,6 +985,62 @@ describe("Context export/import (mock bridge)", () => {
       mockBridge.contextImport(new TextEncoder().encode(JSON.stringify({}))),
     ).rejects.toThrow(/SCP-CTX-2032/);
   });
+
+  it("round-trips broadcast context with subscribers and blocked list", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Broadcast" }));
+
+    // Add subscribers and block one
+    const sub1 = await mockBridge.identityCreate("in_memory");
+    const sub2 = await mockBridge.identityCreate("in_memory");
+    const blocked = await mockBridge.identityCreate("in_memory");
+
+    await mockBridge.broadcastSubscribe(ctx, sub1.did);
+    await mockBridge.broadcastSubscribe(ctx, sub2.did);
+    await mockBridge.broadcastSubscribe(ctx, blocked.did);
+    await mockBridge.broadcastBlockSubscriber(ctx, blocked.did, identity.did);
+
+    // Verify pre-export state
+    const original = mockBridge._contexts.get(ctx.contextId);
+    expect(original?.mode).toBe("Broadcast");
+    expect(original?.broadcastSubscribers.size).toBe(2);
+    expect(original?.broadcastBlockedSubscribers.has(blocked.did)).toBe(true);
+    expect(original?.broadcastAdmission).toBe("Open");
+
+    // Export and re-import
+    const exported = await mockBridge.contextExport(ctx);
+    // Remove the original so import creates a fresh entry
+    mockBridge._contexts.delete(ctx.contextId);
+
+    const importedId = await mockBridge.contextImport(exported);
+    expect(importedId).toBe(ctx.contextId);
+
+    const imported = mockBridge._contexts.get(importedId);
+    expect(imported?.mode).toBe("Broadcast");
+    expect(imported?.broadcastSubscribers.size).toBe(2);
+    expect(imported?.broadcastSubscribers.has(sub1.did)).toBe(true);
+    expect(imported?.broadcastSubscribers.has(sub2.did)).toBe(true);
+    expect(imported?.broadcastBlockedSubscribers.has(blocked.did)).toBe(true);
+    expect(imported?.broadcastAdmission).toBe("Open");
+  });
+
+  it("round-trips encrypted context preserving mode", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({ ceiling: ["messages:read"] }),
+    );
+
+    const exported = await mockBridge.contextExport(ctx);
+    mockBridge._contexts.delete(ctx.contextId);
+
+    const importedId = await mockBridge.contextImport(exported);
+    const imported = mockBridge._contexts.get(importedId);
+    expect(imported?.mode).toBe("Encrypted");
+    expect(imported?.broadcastSubscribers.size).toBe(0);
+    expect(imported?.broadcastBlockedSubscribers.size).toBe(0);
+    expect(imported?.broadcastAdmission).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
