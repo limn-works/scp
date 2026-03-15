@@ -611,7 +611,7 @@ pub async fn ucan_delegate(
 ///
 /// - Rejects with `SCP-CTX-2023` if the context runtime is not initialized.
 /// - Rejects with `SCP-PERM-3001` if the token cannot be parsed.
-/// - Rejects with `SCP-PERM-3008` if the revoker is unauthorized.
+/// - Rejects with `SCP-PERM-3001` if the revoker is unauthorized.
 ///
 /// Closes #499.
 #[napi]
