@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use scp_identity::cache::{DidCache, SystemClock};
+use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
-use scp_identity::{DidDocument, DidMethod, ScpIdentity};
+use scp_identity::{DidDocument, ScpIdentity};
 use scp_node::tls;
 use scp_node::{
     ApplicationNodeBuilder, HasDomain, HasIdentity, HasNoDomain, NatStrategy, NodeError,
@@ -38,10 +38,7 @@ pub type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 /// The signing function is derived from the provided custody, enabling
 /// `create()` and `publish()` operations in tests.
 pub fn make_test_dht(custody: &Arc<InMemoryKeyCustody>) -> TestDidDht {
-    let dht_client = Arc::new(InMemoryDhtClient::new());
-    let cache = Arc::new(DidCache::new());
-    let sign_fn = TestDidDht::make_sign_fn(Arc::clone(custody));
-    DidDht::with_client_and_signer(dht_client, cache, sign_fn)
+    DidDht::with_in_memory_custody(Arc::clone(custody))
 }
 
 /// Mock TLS provider that succeeds with a self-signed certificate.
@@ -168,8 +165,6 @@ pub fn test_no_domain_builder(
 /// in-memory backends).
 pub async fn create_test_identity()
 -> Result<(ScpIdentity, DidDocument, Arc<InMemoryKeyCustody>), Box<dyn std::error::Error>> {
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let did_dht = make_test_dht(&custody);
-    let (identity, document) = did_dht.create(&*custody).await?;
+    let (identity, document, custody, _did_dht) = DidDht::create_in_memory().await?;
     Ok((identity, document, custody))
 }

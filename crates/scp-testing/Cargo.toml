@@ -17,7 +17,7 @@ combined = ["scp-transport/combined"]
 
 [dependencies]
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
-scp-identity = { path = "../scp-identity" }
+scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-primitives = { path = "../scp-primitives" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
