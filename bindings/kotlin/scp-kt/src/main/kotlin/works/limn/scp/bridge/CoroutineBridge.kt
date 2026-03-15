@@ -32,6 +32,8 @@ import works.limn.scp.ProvenanceBindings
 import works.limn.scp.ProvenanceBridge
 import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
+import works.limn.scp.auth.ScpIdBindings
+import works.limn.scp.auth.ScpIdBridge
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -942,6 +944,7 @@ interface NativeBindings :
  * @property discovery Address parsing, query creation, and normalization bindings.
  * @property bridgeConnector Bridge connector trust, registration, and shadow bindings.
  * @property identityAdvanced Agent key, migration, and device attestation bindings.
+ * @property scpId SCPID DID authentication bindings (spec section 3.11).
  */
 data class ExtendedBindings(
     val provenance: ProvenanceBindings? = null,
@@ -949,6 +952,7 @@ data class ExtendedBindings(
     val discovery: DiscoveryBindings? = null,
     val bridgeConnector: BridgeConnectorBindings? = null,
     val identityAdvanced: IdentityAdvancedBindings? = null,
+    val scpId: ScpIdBindings? = null,
 )
 
 /**
@@ -1037,6 +1041,12 @@ class CoroutineBridge(
     val identityAdvanced: IdentityAdvancedBridge? =
         extendedBindings?.identityAdvanced?.let {
             IdentityAdvancedBridge(it, this)
+        }
+
+    /** SCPID authentication operations — FFI on IO. Null if bindings not provided. */
+    val scpId: ScpIdBridge? =
+        extendedBindings?.scpId?.let {
+            ScpIdBridge(it, this)
         }
 
     /**
