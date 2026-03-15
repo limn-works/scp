@@ -527,12 +527,14 @@ mod tests {
             "event_count": count,
             "merkle_root": root,
         });
+        #[allow(clippy::cast_precision_loss)]
+        let sequence_f64 = count.saturating_sub(1) as f64;
         serde_json::json!({
             "eventType": "LogSummary",
             "actorDid": "",
             "timestamp": timestamp,
             "payloadJson": serde_json::to_string(&payload).unwrap(),
-            "sequence": count.saturating_sub(1) as f64,
+            "sequence": sequence_f64,
         })
     }
 
