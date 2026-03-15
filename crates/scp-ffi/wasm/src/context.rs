@@ -1451,8 +1451,7 @@ impl WasmRateLimitTracker {
     fn is_allowed(&mut self, max_count: u32, window_secs: f64) -> bool {
         let now_ms = js_sys::Date::now();
         let window_ms = window_secs * 1000.0;
-        self.accepts_ms
-            .retain(|&t| (now_ms - t) < window_ms);
+        self.accepts_ms.retain(|&t| (now_ms - t) < window_ms);
         self.accepts_ms.len() < max_count as usize
     }
 }
@@ -1500,7 +1499,9 @@ fn validate_against_template(params: &serde_json::Value) -> Result<(), ScpWasmEr
     // Mode strings match serde serialization of ContextMode.
     let (expected_mode, expected_ceiling_policy, allows_tool_caps) = match tid {
         "BilateralEphemeral" | "BilateralPersistent" => ("Encrypted", "Immutable", false),
-        "Coordination" | "scp:template/tool-interface" | "scp:template/paid-service"
+        "Coordination"
+        | "scp:template/tool-interface"
+        | "scp:template/paid-service"
         | "scp:template/discovery" => ("Encrypted", "Immutable", true),
         "GroupDiscussion" => ("Encrypted", "Governed", false),
         "PublicBroadcast" | "GatedBroadcast" | "scp:template/paid-broadcast" => {
@@ -1542,9 +1543,7 @@ fn validate_against_template(params: &serde_json::Value) -> Result<(), ScpWasmEr
     // the ceiling contains them, reject.
     if !allows_tool_caps && ceiling_has_tool_caps(params.get("ceiling")) {
         return Err(ScpWasmError::Context {
-            message: format!(
-                "template spoofing detected: tool capabilities in {tid} template"
-            ),
+            message: format!("template spoofing detected: tool capabilities in {tid} template"),
             code: "SCP-CTX-2060".to_owned(),
         });
     }
@@ -1766,9 +1765,7 @@ fn check_auto_accept(
     ) {
         (Some(max_count), Some(window_secs)) => {
             let max = u32::try_from(max_count).unwrap_or(u32::MAX);
-            with_rate_limit_tracker(identity_did, |tracker| {
-                tracker.is_allowed(max, window_secs)
-            })
+            with_rate_limit_tracker(identity_did, |tracker| tracker.is_allowed(max, window_secs))
         }
         _ => true,
     };
@@ -1826,7 +1823,9 @@ pub fn evaluate_invitation(
             &identity_did,
             trusted_dids_json.as_ref(),
         )? {
-            return Ok(JsValue::from_str(&format!(r#"{{"decision":"{decision}"}}"#)));
+            return Ok(JsValue::from_str(&format!(
+                r#"{{"decision":"{decision}"}}"#
+            )));
         }
 
         // Step 4: Prompt agent (fallthrough).

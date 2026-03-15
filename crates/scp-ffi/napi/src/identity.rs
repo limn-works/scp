@@ -1217,8 +1217,10 @@ pub fn identity_execute_recovery(
         RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
         agent_key_rotation_outcome,
     };
+    use scp_ffi_common::validate::validate_did;
     use scp_identity::DID;
 
+    validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let did_val = DID::from(did.as_str());
 
     let compromise_tier = match tier.as_str() {
@@ -1296,7 +1298,7 @@ pub fn identity_execute_recovery(
     let handle = tokio::runtime::Handle::try_current().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("tokio runtime not available: {e}"),
-            code: "SCP-IDENT-1021".to_owned(),
+            code: "SCP-IDENT-1027".to_owned(),
         })
     })?;
 
@@ -1342,8 +1344,10 @@ pub fn identity_execute_custody_migration(
         CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
         CustodyMigrationTarget,
     };
+    use scp_ffi_common::validate::validate_did;
     use scp_identity::DID;
 
+    validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let did_val = DID::from(did.as_str());
 
     let migration_target = match target.as_str() {
@@ -1413,7 +1417,7 @@ pub fn identity_execute_custody_migration(
     let handle = tokio::runtime::Handle::try_current().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("tokio runtime not available: {e}"),
-            code: "SCP-IDENT-1024".to_owned(),
+            code: "SCP-IDENT-1028".to_owned(),
         })
     })?;
 

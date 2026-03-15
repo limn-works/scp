@@ -8744,6 +8744,7 @@ pub fn identity_execute_recovery(
     };
     use scp_identity::DID;
 
+    validate_did(&did)?;
     let did_val = DID::from(did.as_str());
 
     let compromise_tier = match tier.as_str() {
@@ -8858,6 +8859,7 @@ pub fn identity_execute_custody_migration(
     };
     use scp_identity::DID;
 
+    validate_did(&did)?;
     let did_val = DID::from(did.as_str());
 
     let migration_target = match target.as_str() {
@@ -10392,24 +10394,17 @@ mod tests {
 
     #[test]
     fn media_check_capability_missing() {
-        let result =
-            media_check_capability(vec!["messages:read".to_owned()], "voice".to_owned());
+        let result = media_check_capability(vec!["messages:read".to_owned()], "voice".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn media_verify_sender_attribution_match() {
-        let (_, msg) = scp_media::signaling::create_offer(
-            "s1",
-            "v=0\r\n".into(),
-            "did:dht:zAlice".into(),
-        );
-        let json = String::from_utf8(
-            scp_media::signaling::serialize_signaling(&msg).unwrap(),
-        )
-        .unwrap();
-        let result =
-            media_verify_sender_attribution(json, "did:dht:zAlice".to_owned());
+        let (_, msg) =
+            scp_media::signaling::create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
+        let json =
+            String::from_utf8(scp_media::signaling::serialize_signaling(&msg).unwrap()).unwrap();
+        let result = media_verify_sender_attribution(json, "did:dht:zAlice".to_owned());
         assert!(result.is_ok());
         assert!(result.unwrap());
     }
@@ -10560,17 +10555,11 @@ mod tests {
 
     #[test]
     fn media_verify_sender_attribution_mismatch() {
-        let (_, msg) = scp_media::signaling::create_offer(
-            "s1",
-            "v=0\r\n".into(),
-            "did:dht:zAlice".into(),
-        );
-        let json = String::from_utf8(
-            scp_media::signaling::serialize_signaling(&msg).unwrap(),
-        )
-        .unwrap();
-        let result =
-            media_verify_sender_attribution(json, "did:dht:zEve".to_owned());
+        let (_, msg) =
+            scp_media::signaling::create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
+        let json =
+            String::from_utf8(scp_media::signaling::serialize_signaling(&msg).unwrap()).unwrap();
+        let result = media_verify_sender_attribution(json, "did:dht:zEve".to_owned());
         assert!(result.is_err());
     }
 
