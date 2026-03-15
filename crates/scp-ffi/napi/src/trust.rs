@@ -12,6 +12,8 @@
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
+use std::sync::Arc;
+
 use napi_derive::napi;
 use scp_core::trust::aggregate::TrustProtocolRepository;
 use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
@@ -236,11 +238,68 @@ pub fn verify_participation_requirements(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
+/// Populates a trust store and runs the aggregation pipeline. Generic over
+/// the store implementation to support both persistent and ephemeral stores.
+#[allow(clippy::too_many_arguments)]
+fn populate_and_aggregate<S: TrustProtocolRepository>(
+    store: S,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+    challenge_results: &[scp_core::trust::ChallengeVerification],
+    events: &[scp_event_log::Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &[scp_core::trust::ConsequenceRule],
+    threshold_requirements: &std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    >,
+) -> napi::Result<String> {
+    for ca in cached_attestations {
+        store
+            .cache_attestation(context_id, ca)
+            .map_err(|e| validation_error(&format!("failed to cache attestation: {e}")))?;
+    }
+    for cr in challenge_results {
+        store
+            .store_challenge_result(context_id, cr)
+            .map_err(|e| validation_error(&format!("failed to store challenge result: {e}")))?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id,
+        subject_did,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx)
+        .map_err(|e| validation_error(&format!("trust aggregation failed: {e}")))?;
+
+    serde_json::to_string(&trust_input)
+        .map_err(|e| validation_error(&format!("failed to serialize TrustInput: {e}")))
+}
+
 /// Aggregates all trust engine layers into a single `TrustInput` for
 /// agent-level evaluation.
 ///
-/// Accepts all complex inputs as JSON strings. Returns the aggregated
-/// `TrustInput` as a JSON string.
+/// Uses the global `ProtocolRepository` for persistent trust data when
+/// initialized (trust data survives across calls); falls back to an
+/// ephemeral in-memory store otherwise. See issue #502.
 ///
 /// See ADR-017 acceptance criterion 9, spec §7.3.
 #[napi]
@@ -303,40 +362,37 @@ pub fn aggregate_trust_input(
             validation_error(&format!("failed to parse challenge_results JSON: {e}"))
         })?;
 
-    let store = InMemoryFfiTrustStore::new();
-    for ca in cached_attestations {
-        store
-            .cache_attestation(&context_id, ca)
-            .map_err(|e| validation_error(&format!("failed to cache attestation: {e}")))?;
+    // Use persistent storage if the global ProtocolRepository is initialized,
+    // otherwise fall back to an ephemeral in-memory store. See issue #502.
+    if let Some(repo) = crate::runtime::protocol_repository() {
+        let handle = crate::runtime().handle().clone();
+        let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+        populate_and_aggregate(
+            bridge,
+            &context_id,
+            &subject_did,
+            cached_attestations,
+            &challenge_results,
+            &events,
+            merkle_root,
+            &consequence_rules,
+            &threshold_requirements,
+            &attestor_sets,
+        )
+    } else {
+        populate_and_aggregate(
+            InMemoryFfiTrustStore::new(),
+            &context_id,
+            &subject_did,
+            cached_attestations,
+            &challenge_results,
+            &events,
+            merkle_root,
+            &consequence_rules,
+            &threshold_requirements,
+            &attestor_sets,
+        )
     }
-    for cr in &challenge_results {
-        store
-            .store_challenge_result(&context_id, cr)
-            .map_err(|e| validation_error(&format!("failed to store challenge result: {e}")))?;
-    }
-
-    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
-
-    let ctx = scp_core::trust::aggregate::AggregationContext {
-        context_id: &context_id,
-        subject_did: &subject_did,
-        events: &events,
-        merkle_root,
-        consequence_rules: &consequence_rules,
-        threshold_requirements: &threshold_requirements,
-        attestor_sets: &attestor_sets,
-        cache: &cache,
-        resolver: &resolver,
-        clock: &clock,
-    };
-
-    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx)
-        .map_err(|e| validation_error(&format!("trust aggregation failed: {e}")))?;
-
-    serde_json::to_string(&trust_input)
-        .map_err(|e| validation_error(&format!("failed to serialize TrustInput: {e}")))
 }
 
 // ---------------------------------------------------------------------------

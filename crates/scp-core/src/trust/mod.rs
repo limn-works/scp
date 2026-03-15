@@ -103,6 +103,7 @@ pub use capability_uri::{CapabilityUri, CapabilityUriError};
 // ParticipationRecord, compute_participation_record, and the admission
 // types are re-exported here. The testing feature gate additionally
 // re-exports compute_participation_record for integration tests.
+pub use crate::store::trust::ProtocolRepositoryTrustBridge;
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     VerificationMethod, issue_challenge, verify_challenge_response,
@@ -303,6 +304,13 @@ pub enum TrustError {
     NotOptedIn {
         /// The DID that has not opted in.
         did: String,
+    },
+
+    /// The trust store is unavailable or a storage operation failed.
+    #[error("store error: {reason}")]
+    StoreError {
+        /// Human-readable description of the storage failure.
+        reason: String,
     },
 }
 

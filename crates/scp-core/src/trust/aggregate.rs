@@ -48,7 +48,8 @@ use super::{AttestationType, TrustError, TrustInput};
 /// See ADR-017 acceptance criterion 10.
 pub trait TrustProtocolRepository {
     /// Retrieves cached verified attestations for a subject DID within a
-    /// context. Returns only attestations whose cache entry has not expired.
+    /// context. Returns all cached entries including expired ones —
+    /// callers (e.g., `AttestationCache`) handle expiry and re-verification.
     ///
     /// # Errors
     ///

@@ -20,6 +20,8 @@
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scp_core::trust::aggregate::TrustProtocolRepository;
@@ -300,39 +302,75 @@ pub fn py_verify_participation_requirements(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
+/// Populates a trust store with caller-provided data and runs the full
+/// aggregation pipeline. Generic over the store implementation so it works
+/// with both the persistent `ProtocolRepositoryTrustBridge` and the
+/// ephemeral `InMemoryFfiTrustStore`.
+#[allow(clippy::too_many_arguments)]
+fn populate_and_aggregate<S: TrustProtocolRepository>(
+    store: S,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+    challenge_results: &[scp_core::trust::ChallengeVerification],
+    events: &[scp_event_log::Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &[scp_core::trust::ConsequenceRule],
+    threshold_requirements: &std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    >,
+) -> PyResult<String> {
+    for ca in cached_attestations {
+        store.cache_attestation(context_id, ca).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to cache attestation: {e}"))
+        })?;
+    }
+    for cr in challenge_results {
+        store.store_challenge_result(context_id, cr).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to store challenge result: {e}"
+            ))
+        })?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    let ctx = scp_core::trust::aggregate::AggregationContext {
+        context_id,
+        subject_did,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+        cache: &cache,
+        resolver: &resolver,
+        clock: &clock,
+    };
+
+    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("trust aggregation failed: {e}"))
+    })?;
+
+    serde_json::to_string(&trust_input).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to serialize TrustInput: {e}"))
+    })
+}
+
 /// Aggregates all trust engine layers into a single `TrustInput` for
 /// agent-level evaluation.
 ///
 /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
-/// as a JSON string. This is the FFI-concrete wrapper around
-/// `scp_core::trust::aggregate::aggregate_trust_input`, which is generic over
-/// three trait bounds (`TrustProtocolRepository`, `DidPublicKeyResolver`,
-/// `Clock`). The bridge provides concrete implementations:
-///
-/// - `InMemoryTrustStore` for `TrustProtocolRepository` (populated with
-///   provided cached attestations and challenge results).
-/// - `IdentityDidPublicKeyResolver` for `DidPublicKeyResolver`.
-/// - `SystemClock` for `Clock`.
-///
-/// # Arguments
-///
-/// - `context_id` — The context to aggregate trust inputs for.
-/// - `subject_did` — The DID of the subject to evaluate.
-/// - `events_json` — JSON array of `Event` objects (event log entries).
-/// - `merkle_root_json` — JSON array of 32 u8 values (Merkle root bytes).
-/// - `consequence_rules_json` — JSON array of `ConsequenceRule` objects.
-/// - `threshold_requirements_json` — JSON object mapping `AttestationType`
-///   variant names to `ThresholdRequirement` objects.
-/// - `attestor_sets_json` — JSON object mapping `AttestationType` variant
-///   names to arrays of `AttestorInfo` objects.
-/// - `cached_attestations_json` — JSON array of `CachedAttestation` objects
-///   to pre-populate the in-memory trust store.
-/// - `challenge_results_json` — JSON array of `ChallengeVerification` objects
-///   to pre-populate the in-memory trust store.
-///
-/// # Returns
-///
-/// A JSON string containing the serialized `TrustInput`.
+/// as a JSON string. Uses the global `STORAGE_PROVIDER` for persistent trust
+/// data when initialized (trust data survives across calls and restarts);
+/// falls back to an ephemeral in-memory store otherwise. See issue #502.
 ///
 /// # Errors
 ///
@@ -408,45 +446,43 @@ pub fn py_aggregate_trust_input(
             ))
         })?;
 
-    // Build an in-memory trust store and populate it.
-    let store = InMemoryFfiTrustStore::new();
-    for ca in cached_attestations {
-        store.cache_attestation(context_id, ca).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to cache attestation: {e}"))
-        })?;
+    // Use persistent storage if the global STORAGE_PROVIDER is initialized,
+    // otherwise fall back to an ephemeral in-memory store. With persistent
+    // storage, previously cached attestations, revocation states, and challenge
+    // results are retained across calls — this is the correct production
+    // behavior (trust data survives restarts). See issue #502.
+    if let Ok(storage) = crate::runtime::get_storage() {
+        let handle = crate::runtime()?.handle().clone();
+        let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
+            storage,
+        )));
+        let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+        populate_and_aggregate(
+            bridge,
+            context_id,
+            subject_did,
+            cached_attestations,
+            &challenge_results,
+            &events,
+            merkle_root,
+            &consequence_rules,
+            &threshold_requirements,
+            &attestor_sets,
+        )
+    } else {
+        populate_and_aggregate(
+            InMemoryFfiTrustStore::new(),
+            context_id,
+            subject_did,
+            cached_attestations,
+            &challenge_results,
+            &events,
+            merkle_root,
+            &consequence_rules,
+            &threshold_requirements,
+            &attestor_sets,
+        )
     }
-    for cr in &challenge_results {
-        store.store_challenge_result(context_id, cr).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to store challenge result: {e}"
-            ))
-        })?;
-    }
-
-    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
-
-    let ctx = scp_core::trust::aggregate::AggregationContext {
-        context_id,
-        subject_did,
-        events: &events,
-        merkle_root,
-        consequence_rules: &consequence_rules,
-        threshold_requirements: &threshold_requirements,
-        attestor_sets: &attestor_sets,
-        cache: &cache,
-        resolver: &resolver,
-        clock: &clock,
-    };
-
-    let trust_input = scp_core::trust::aggregate::aggregate_trust_input(&ctx).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("trust aggregation failed: {e}"))
-    })?;
-
-    serde_json::to_string(&trust_input).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to serialize TrustInput: {e}"))
-    })
 }
 
 // ---------------------------------------------------------------------------
