@@ -383,6 +383,80 @@ export function createNativeBridge(): Bridge {
       )(handle, actionJson, proposerDid);
     },
 
+    // Governance lifecycle (#559)
+    async contextApplyPendingCeilingModification(
+      handle: BridgeContextHandle,
+      currentTimestamp: number,
+    ): Promise<boolean> {
+      return await (
+        addon.contextApplyPendingCeilingModification as (
+          h: BridgeContextHandle,
+          t: number,
+        ) => Promise<boolean>
+      )(handle, currentTimestamp);
+    },
+
+    async contextFinalizeClose(handle: BridgeContextHandle): Promise<void> {
+      await (addon.contextFinalizeClose as (h: BridgeContextHandle) => Promise<void>)(handle);
+    },
+
+    async contextCreateGovernanceCheckpoint(
+      handle: BridgeContextHandle,
+      checkpointSeq: number,
+      merkleRootHex: string,
+      eventCount: number,
+      lastEventHashHex: string,
+      stateSnapshotHashHex: string,
+      creatorDid: string,
+      creatorSignatureHex: string,
+    ): Promise<string> {
+      return await (
+        addon.contextCreateGovernanceCheckpoint as (
+          h: BridgeContextHandle,
+          seq: number,
+          root: string,
+          count: number,
+          lastHash: string,
+          stateHash: string,
+          creator: string,
+          sig: string,
+        ) => Promise<string>
+      )(
+        handle,
+        checkpointSeq,
+        merkleRootHex,
+        eventCount,
+        lastEventHashHex,
+        stateSnapshotHashHex,
+        creatorDid,
+        creatorSignatureHex,
+      );
+    },
+
+    async contextAddCheckpointCosignature(
+      handle: BridgeContextHandle,
+      checkpointJson: string,
+      signerDid: string,
+      signatureHex: string,
+    ): Promise<string> {
+      return await (
+        addon.contextAddCheckpointCosignature as (
+          h: BridgeContextHandle,
+          c: string,
+          s: string,
+          sig: string,
+        ) => Promise<string>
+      )(handle, checkpointJson, signerDid, signatureHex);
+    },
+
+    async contextRestore(contextId: string): Promise<void> {
+      await (addon.contextRestore as (id: string) => Promise<void>)(contextId);
+    },
+
+    async contextRestoreAll(): Promise<string> {
+      return await (addon.contextRestoreAll as () => Promise<string>)();
+    },
+
     // Governance proposal lifecycle (#621)
     async contextGovernancePropose(
       handle: BridgeContextHandle,

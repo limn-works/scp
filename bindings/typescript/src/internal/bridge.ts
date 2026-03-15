@@ -123,6 +123,31 @@ export interface Bridge {
     proposerDid: string,
   ): Promise<string>;
 
+  // Governance lifecycle (#559)
+  contextApplyPendingCeilingModification(
+    handle: BridgeContextHandle,
+    currentTimestamp: number,
+  ): Promise<boolean>;
+  contextFinalizeClose(handle: BridgeContextHandle): Promise<void>;
+  contextCreateGovernanceCheckpoint(
+    handle: BridgeContextHandle,
+    checkpointSeq: number,
+    merkleRootHex: string,
+    eventCount: number,
+    lastEventHashHex: string,
+    stateSnapshotHashHex: string,
+    creatorDid: string,
+    creatorSignatureHex: string,
+  ): Promise<string>;
+  contextAddCheckpointCosignature(
+    handle: BridgeContextHandle,
+    checkpointJson: string,
+    signerDid: string,
+    signatureHex: string,
+  ): Promise<string>;
+  contextRestore(contextId: string): Promise<void>;
+  contextRestoreAll(): Promise<string>;
+
   // Governance proposal lifecycle (#621)
   contextGovernancePropose(
     handle: BridgeContextHandle,

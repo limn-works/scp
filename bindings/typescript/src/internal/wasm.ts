@@ -280,6 +280,30 @@ interface WasmModule {
     did: string;
     custodyType: string;
   };
+  // Governance lifecycle (#559)
+  context_apply_pending_ceiling_modification: (
+    handle: BridgeContextHandle,
+    currentTimestamp: number,
+  ) => Promise<boolean>;
+  context_finalize_close: (handle: BridgeContextHandle) => Promise<void>;
+  context_create_governance_checkpoint: (
+    handle: BridgeContextHandle,
+    checkpointSeq: number,
+    merkleRootHex: string,
+    eventCount: number,
+    lastEventHashHex: string,
+    stateSnapshotHashHex: string,
+    creatorDid: string,
+    creatorSignatureHex: string,
+  ) => Promise<string>;
+  context_add_checkpoint_cosignature: (
+    handle: BridgeContextHandle,
+    checkpointJson: string,
+    signerDid: string,
+    signatureHex: string,
+  ) => Promise<string>;
+  context_restore: (contextId: string) => Promise<void>;
+  context_restore_all: () => Promise<string>;
   // Governance
   context_execute_governance: (
     handle: BridgeContextHandle,
@@ -799,6 +823,68 @@ export function createWasmBridge(): Bridge {
       const admission = wasm.broadcast_admission(handle);
       if (admission == null) return null;
       return admission as BroadcastAdmissionPolicy;
+    },
+
+    // Governance lifecycle (#559) — delegate to WASM runtime
+    async contextApplyPendingCeilingModification(
+      handle: BridgeContextHandle,
+      currentTimestamp: number,
+    ): Promise<boolean> {
+      const wasm = getWasm();
+      return await wasm.context_apply_pending_ceiling_modification(handle, currentTimestamp);
+    },
+
+    async contextFinalizeClose(handle: BridgeContextHandle): Promise<void> {
+      const wasm = getWasm();
+      await wasm.context_finalize_close(handle);
+    },
+
+    async contextCreateGovernanceCheckpoint(
+      handle: BridgeContextHandle,
+      checkpointSeq: number,
+      merkleRootHex: string,
+      eventCount: number,
+      lastEventHashHex: string,
+      stateSnapshotHashHex: string,
+      creatorDid: string,
+      creatorSignatureHex: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_create_governance_checkpoint(
+        handle,
+        checkpointSeq,
+        merkleRootHex,
+        eventCount,
+        lastEventHashHex,
+        stateSnapshotHashHex,
+        creatorDid,
+        creatorSignatureHex,
+      );
+    },
+
+    async contextAddCheckpointCosignature(
+      handle: BridgeContextHandle,
+      checkpointJson: string,
+      signerDid: string,
+      signatureHex: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_add_checkpoint_cosignature(
+        handle,
+        checkpointJson,
+        signerDid,
+        signatureHex,
+      );
+    },
+
+    async contextRestore(contextId: string): Promise<void> {
+      const wasm = getWasm();
+      await wasm.context_restore(contextId);
+    },
+
+    async contextRestoreAll(): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_restore_all();
     },
 
     // Governance — delegate to WASM runtime
