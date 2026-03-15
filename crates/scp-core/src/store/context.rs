@@ -343,6 +343,10 @@ impl<S: Storage> ProtocolRepository<S> {
         let ctx = super::sanitize_key_component(context_id)?;
         let mls_prefix = format!("mls/{ctx}/");
         deleted += self.storage.delete_prefix(&mls_prefix).await?;
+        // Also delete trust engine state (attestation cache, revocation state,
+        // challenge results) which lives under the trust/ namespace (#502).
+        let trust_prefix = format!("trust/{ctx}/");
+        deleted += self.storage.delete_prefix(&trust_prefix).await?;
         Ok(deleted)
     }
 
