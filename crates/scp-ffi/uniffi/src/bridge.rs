@@ -2618,6 +2618,10 @@ pub async fn context_close(
             // Clean up per-context UCAN state.
             crate::runtime::remove_ucan_state(&handle.context_id);
 
+            // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
+            // to prevent unbounded memory growth in long-running processes.
+            remove_bridge_state(&handle.context_id);
+
             *state = ContextState::Closed;
             drop(state);
 
@@ -8215,6 +8219,12 @@ static BRIDGE_STATE: OnceLock<dashmap::DashMap<String, BridgeContextState>> = On
 /// Returns a reference to the bridge state registry, initializing on first access.
 fn bridge_state_registry() -> &'static dashmap::DashMap<String, BridgeContextState> {
     BRIDGE_STATE.get_or_init(dashmap::DashMap::new)
+}
+
+/// Removes per-context bridge state on context close, preventing unbounded
+/// memory growth in long-running processes. Called from `context_close`.
+fn remove_bridge_state(context_id: &str) {
+    bridge_state_registry().remove(context_id);
 }
 
 /// Bridge registration result record.

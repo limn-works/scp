@@ -54,6 +54,12 @@ fn bridge_state_registry() -> &'static DashMap<String, BridgeContextState> {
     BRIDGE_STATE.get_or_init(DashMap::new)
 }
 
+/// Removes per-context bridge state on context close, preventing unbounded
+/// memory growth in long-running processes. Called from `context_close`.
+pub(crate) fn remove_bridge_state(context_id: &str) {
+    bridge_state_registry().remove(context_id);
+}
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
