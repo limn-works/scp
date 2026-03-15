@@ -590,6 +590,41 @@ export function createNativeBridge(): Bridge {
       return result;
     },
 
+    // Bidirectional consent protocol (§6.2.0.1)
+    async toolInterfaceExpose(
+      handle: BridgeContextHandle,
+      toolId: string,
+      targetContextId: string,
+      rateLimitJson?: string,
+    ): Promise<string> {
+      return await (
+        addon.toolInterfaceExpose as (
+          h: BridgeContextHandle,
+          t: string,
+          tc: string,
+          rl?: string,
+        ) => Promise<string>
+      )(handle, toolId, targetContextId, rateLimitJson);
+    },
+
+    async toolInterfaceAccept(
+      handle: BridgeContextHandle,
+      interfaceJson: string,
+    ): Promise<string> {
+      return await (
+        addon.toolInterfaceAccept as (h: BridgeContextHandle, ij: string) => Promise<string>
+      )(handle, interfaceJson);
+    },
+
+    async toolInterfaceRevoke(
+      handle: BridgeContextHandle,
+      interfaceIdHex: string,
+    ): Promise<string> {
+      return await (
+        addon.toolInterfaceRevoke as (h: BridgeContextHandle, id: string) => Promise<string>
+      )(handle, interfaceIdHex);
+    },
+
     // Transport
     async transportConnect(relayUrl: string): Promise<BridgeTransportHandle> {
       const handle = await (

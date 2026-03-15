@@ -342,9 +342,155 @@ async def session_close(context_id: str, session_id: str) -> None:
         raise _translate_bridge_error(exc) from exc
 
 
+
+# ---------------------------------------------------------------------------
+# Bidirectional consent protocol (spec section 6.2.0.1)
+# ---------------------------------------------------------------------------
+
+
+async def interface_expose(
+    context_id: str,
+    tool_id: str,
+    target_context_id: str,
+    rate_limit_json: str | None = None,
+) -> dict[str, Any]:
+    """Expose a tool interface for cross-context sharing (step 1).
+
+    The caller (admin of the source context) proposes sharing a specific
+    tool with a target context.  The returned interface has
+    ``approved_by_source = True`` and ``approved_by_target = False``.
+    The target context must call :func:`interface_accept` to complete
+    the handshake.
+
+    Args:
+        context_id: The source context ID.
+        tool_id: The ID of the tool to expose.
+        target_context_id: The target context to expose the tool to.
+        rate_limit_json: Optional per-interface rate limit as a JSON
+            string with ``max_calls`` and ``window_seconds`` fields.
+
+    Returns:
+        The ``ToolInterface`` as a JSON-compatible dict.
+
+    Raises:
+        ContextError: If the caller is not an admin or the tool is
+            not found.
+        ValidationError: If ``rate_limit_json`` is malformed.
+    """
+    if _scp_core is None:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        )
+
+    try:
+        result_json = await asyncio.to_thread(
+            _scp_core.tool_interface_expose,
+            context_id,
+            tool_id,
+            target_context_id,
+            rate_limit_json,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
+
+    import json
+
+    return json.loads(result_json)
+
+
+async def interface_accept(
+    context_id: str,
+    interface_json: str,
+) -> dict[str, Any]:
+    """Accept a cross-context tool interface (step 4).
+
+    Sets ``approved_by_target = True`` on the interface.  Both
+    ``approved_by_source`` and ``approved_by_target`` must be ``True``
+    before calls are permitted.
+
+    Args:
+        context_id: The target context ID (the one accepting).
+        interface_json: The ``ToolInterface`` JSON string to accept
+            (as received from the source context's
+            :func:`interface_expose` call).
+
+    Returns:
+        The updated ``ToolInterface`` as a JSON-compatible dict.
+
+    Raises:
+        ContextError: If the caller is not an admin or the interface's
+            target context does not match ``context_id``.
+        ValidationError: If ``interface_json`` is malformed.
+    """
+    if _scp_core is None:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        )
+
+    try:
+        result_json = await asyncio.to_thread(
+            _scp_core.tool_interface_accept,
+            context_id,
+            interface_json,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
+
+    import json
+
+    return json.loads(result_json)
+
+
+async def interface_revoke(
+    context_id: str,
+    interface_id_hex: str,
+) -> dict[str, Any]:
+    """Revoke a cross-context tool interface (step 5).
+
+    Either context may revoke unilaterally.  Returns an
+    ``InterfaceRevoked`` event for recording in the revoking context's
+    event log.
+
+    Args:
+        context_id: The revoking context ID.
+        interface_id_hex: The 32-byte interface/offer ID as a hex
+            string (64 hex characters).
+
+    Returns:
+        The ``InterfaceRevoked`` event as a JSON-compatible dict.
+
+    Raises:
+        ValidationError: If ``interface_id_hex`` is not valid hex or
+            not 32 bytes.
+    """
+    if _scp_core is None:
+        raise ContextError(
+            "failed to import _scp_core -- is the Rust extension built?",
+            code="SCP-CTX-2001",
+        )
+
+    try:
+        result_json = await asyncio.to_thread(
+            _scp_core.tool_interface_revoke,
+            context_id,
+            interface_id_hex,
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
+
+    import json
+
+    return json.loads(result_json)
+
+
 __all__ = [
     "TestVector",
     "ToolDefinition",
+    "interface_accept",
+    "interface_expose",
+    "interface_revoke",
     "invoke_cross_context",
     "session_close",
     "session_create",

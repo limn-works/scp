@@ -210,6 +210,23 @@ class ConformanceStubBindings : NativeBindings {
         return toolVerifyResult
     }
 
+    override fun toolInterfaceExpose(
+        contextHandle: Long,
+        toolId: String,
+        targetContextId: String,
+        rateLimitJson: String?,
+    ): String = """{"source_context":"ctx-src","target_context":"$targetContextId","tool_id":"$toolId","approved_by_source":true,"approved_by_target":false}"""
+
+    override fun toolInterfaceAccept(
+        contextHandle: Long,
+        interfaceJson: String,
+    ): String = interfaceJson.replace("\"approved_by_target\":false", "\"approved_by_target\":true")
+
+    override fun toolInterfaceRevoke(
+        contextHandle: Long,
+        interfaceIdHex: String,
+    ): String = """{"interface_id":"$interfaceIdHex","revoking_context":"ctx-revoker","revoked_at":1700000000000}"""
+
     override fun ucanValidate(
         contextHandle: Long,
         token: String,

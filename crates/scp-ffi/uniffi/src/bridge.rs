@@ -3604,6 +3604,257 @@ pub async fn tool_session_close(
 }
 
 // ---------------------------------------------------------------------------
+// Free functions — bidirectional consent protocol (spec §6.2.0.1)
+// ---------------------------------------------------------------------------
+
+/// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+///
+/// The caller (admin of the source context) proposes sharing a specific tool
+/// with a target context. Returns the `ToolInterface` as a JSON string with
+/// `approved_by_source = true` and `approved_by_target = false`.
+///
+/// # Arguments
+///
+/// * `handle` — The source context handle.
+/// * `tool_id` — The ID of the tool to expose.
+/// * `target_context_id` — The target context to expose the tool to.
+/// * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
+///
+/// # Returns
+///
+/// A JSON string of the created `ToolInterface`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Tool` if the caller is not an admin or the tool is not found.
+#[uniffi::export]
+pub async fn tool_interface_expose(
+    handle: Arc<ContextHandle>,
+    tool_id: String,
+    target_context_id: String,
+    rate_limit_json: Option<String>,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            validate_tool_id(&tool_id)?;
+
+            let state = handle.state.lock().await;
+            if !matches!(*state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    msg: format!(
+                        "cannot expose tool interface in context in {:?} state — context must be active",
+                        *state
+                    ),
+                    code: "SCP-TOOL-6030".to_owned(),
+                });
+            }
+            drop(state);
+
+            let rate_limit = match rate_limit_json {
+                Some(ref json) => {
+                    let parsed: scp_core::context::tools::interface::RateLimit =
+                        serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                            msg: format!("invalid rate_limit_json: {e}"),
+                            code: "SCP-VALID-7040".to_owned(),
+                        })?;
+                    Some(parsed)
+                }
+                None => None,
+            };
+
+            let ceiling = scp_core::context::roles::default_ceiling();
+            let role_state = scp_core::context::roles::ContextRoleState::new(
+                &handle.context_id,
+                &handle.creator_did,
+                ceiling,
+                vec![],
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("failed to create role state: {e}"),
+                code: "SCP-TOOL-6030".to_owned(),
+            })?;
+
+            let context_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+
+            let registry = handle.tool_registry.lock().await;
+
+            let interface = scp_core::context::tools::interface::expose_tool(
+                &context_handle,
+                &tool_id,
+                &target_context_id,
+                &role_state,
+                &handle.creator_did,
+                &registry,
+                rate_limit,
+                None,
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("expose_tool failed: {e}"),
+                code: "SCP-TOOL-6030".to_owned(),
+            })?;
+
+            serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
+                msg: format!("failed to serialize ToolInterface: {e}"),
+                code: "SCP-TOOL-6031".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during tool_interface_expose: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
+        })?
+}
+
+/// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+///
+/// Sets `approved_by_target = true` on the interface. Both approvals must be
+/// `true` before calls are permitted.
+///
+/// # Arguments
+///
+/// * `handle` — The target context handle (the one accepting).
+/// * `interface_json` — The `ToolInterface` JSON string to accept.
+///
+/// # Returns
+///
+/// The updated `ToolInterface` JSON string with `approved_by_target = true`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Tool` if the caller is not an admin or the target context
+/// does not match.
+#[uniffi::export]
+pub async fn tool_interface_accept(
+    handle: Arc<ContextHandle>,
+    interface_json: String,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let state = handle.state.lock().await;
+            if !matches!(*state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    msg: format!(
+                        "cannot accept tool interface in context in {:?} state — context must be active",
+                        *state
+                    ),
+                    code: "SCP-TOOL-6032".to_owned(),
+                });
+            }
+            drop(state);
+
+            let mut interface: scp_core::context::tools::interface::ToolInterface =
+                serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
+                    msg: format!("invalid interface_json: {e}"),
+                    code: "SCP-VALID-7041".to_owned(),
+                })?;
+
+            let ceiling = scp_core::context::roles::default_ceiling();
+            let role_state = scp_core::context::roles::ContextRoleState::new(
+                &handle.context_id,
+                &handle.creator_did,
+                ceiling,
+                vec![],
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("failed to create role state: {e}"),
+                code: "SCP-TOOL-6032".to_owned(),
+            })?;
+
+            let context_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+
+            scp_core::context::tools::interface::accept_tool_interface(
+                &context_handle,
+                &mut interface,
+                &role_state,
+                &handle.creator_did,
+                None,
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("accept_tool_interface failed: {e}"),
+                code: "SCP-TOOL-6032".to_owned(),
+            })?;
+
+            serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
+                msg: format!("failed to serialize ToolInterface: {e}"),
+                code: "SCP-TOOL-6033".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during tool_interface_accept: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
+        })?
+}
+
+/// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+///
+/// Either context may revoke unilaterally. Returns an `InterfaceRevoked` event
+/// as a JSON string.
+///
+/// # Arguments
+///
+/// * `handle` — The revoking context handle.
+/// * `interface_id_hex` — The 32-byte interface/offer ID as a hex string.
+///
+/// # Returns
+///
+/// A JSON string of the `InterfaceRevoked` event.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if `interface_id_hex` is not valid hex or
+/// not 32 bytes.
+#[uniffi::export]
+pub async fn tool_interface_revoke(
+    handle: Arc<ContextHandle>,
+    interface_id_hex: String,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let interface_id_bytes =
+                hex::decode(&interface_id_hex).map_err(|e| ScpError::Validation {
+                    msg: format!("invalid interface_id_hex: not valid hex: {e}"),
+                    code: "SCP-VALID-7042".to_owned(),
+                })?;
+            let interface_id: [u8; 32] = <[u8; 32]>::try_from(interface_id_bytes.as_slice())
+                .map_err(|_| ScpError::Validation {
+                    msg: format!(
+                        "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
+                        interface_id_bytes.len()
+                    ),
+                    code: "SCP-VALID-7042".to_owned(),
+                })?;
+
+            let now_ms = scp_core::time::now_millis().map_err(|e| ScpError::Tool {
+                msg: format!("clock error: {e}"),
+                code: "SCP-TOOL-6034".to_owned(),
+            })?;
+
+            let event = scp_core::context::tools::interface::revoke_tool_interface(
+                interface_id,
+                &handle.context_id,
+                now_ms,
+            );
+
+            serde_json::to_string(&event).map_err(|e| ScpError::Tool {
+                msg: format!("failed to serialize InterfaceRevoked: {e}"),
+                code: "SCP-TOOL-6035".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during tool_interface_revoke: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
 // Free functions — transport operations
 //
 // See ADR-021 acceptance criterion 5.

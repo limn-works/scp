@@ -776,6 +776,70 @@ def tool_session_close(context_id: str, session_id: str) -> None:
     ...
 
 # ---------------------------------------------------------------------------
+# Bidirectional consent protocol (crates/scp-ffi/src/tools.rs, §6.2.0.1)
+# ---------------------------------------------------------------------------
+
+def tool_interface_expose(
+    context_id: str,
+    tool_id: str,
+    target_context_id: str,
+    rate_limit_json: str | None = None,
+) -> str:
+    """Expose a tool interface for cross-context sharing (step 1).
+
+    Args:
+        context_id: The source context ID.
+        tool_id: The ID of the tool to expose.
+        target_context_id: The target context to expose the tool to.
+        rate_limit_json: Optional per-interface rate limit as JSON.
+
+    Returns:
+        The ToolInterface as a JSON string.
+
+    Raises:
+        ToolError: If the caller is not an admin or the tool is not found.
+        ValidationError: If rate_limit_json is malformed.
+    """
+    ...
+
+def tool_interface_accept(
+    context_id: str,
+    interface_json: str,
+) -> str:
+    """Accept a cross-context tool interface (step 4).
+
+    Args:
+        context_id: The target context ID.
+        interface_json: The ToolInterface JSON string to accept.
+
+    Returns:
+        The updated ToolInterface JSON string.
+
+    Raises:
+        ToolError: If the caller is not an admin or context mismatch.
+        ValidationError: If interface_json is malformed.
+    """
+    ...
+
+def tool_interface_revoke(
+    context_id: str,
+    interface_id_hex: str,
+) -> str:
+    """Revoke a cross-context tool interface (step 5).
+
+    Args:
+        context_id: The revoking context ID.
+        interface_id_hex: The 32-byte interface/offer ID as hex.
+
+    Returns:
+        The InterfaceRevoked event as a JSON string.
+
+    Raises:
+        ValidationError: If interface_id_hex is invalid.
+    """
+    ...
+
+# ---------------------------------------------------------------------------
 # Transport bridge functions (crates/scp-ffi/src/transport.rs)
 # ---------------------------------------------------------------------------
 

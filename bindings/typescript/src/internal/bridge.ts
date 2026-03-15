@@ -180,6 +180,16 @@ export interface Bridge {
   ): Promise<string>;
   toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult>;
 
+  // Bidirectional consent protocol (§6.2.0.1)
+  toolInterfaceExpose(
+    handle: BridgeContextHandle,
+    toolId: string,
+    targetContextId: string,
+    rateLimitJson?: string,
+  ): Promise<string>;
+  toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
+  toolInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
+
   // Transport
   transportConnect(relayUrl: string): Promise<BridgeTransportHandle>;
   transportStatus(handle: BridgeTransportHandle): Promise<TransportStatus>;

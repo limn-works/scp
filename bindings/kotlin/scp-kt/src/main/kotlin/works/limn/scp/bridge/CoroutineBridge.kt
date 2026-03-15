@@ -684,6 +684,51 @@ interface ToolBindings {
         contextHandle: Long,
         toolId: String,
     ): String
+
+    /**
+     * Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+     *
+     * @param contextHandle Opaque handle for the source context.
+     * @param toolId The ID of the tool to expose.
+     * @param targetContextId The target context to expose the tool to.
+     * @param rateLimitJson Optional per-interface rate limit as JSON.
+     * @return JSON-encoded ToolInterface with `approved_by_source = true`.
+     * @throws BridgeException with `SCP-TOOL-6030` if the caller is not
+     *   an admin or the tool is not found.
+     */
+    fun toolInterfaceExpose(
+        contextHandle: Long,
+        toolId: String,
+        targetContextId: String,
+        rateLimitJson: String?,
+    ): String
+
+    /**
+     * Accepts a cross-context tool interface (§6.2.0.1 step 4).
+     *
+     * @param contextHandle Opaque handle for the target context.
+     * @param interfaceJson The ToolInterface JSON string to accept.
+     * @return JSON-encoded updated ToolInterface with `approved_by_target = true`.
+     * @throws BridgeException with `SCP-TOOL-6032` if the caller is not
+     *   an admin or context mismatch.
+     */
+    fun toolInterfaceAccept(
+        contextHandle: Long,
+        interfaceJson: String,
+    ): String
+
+    /**
+     * Revokes a cross-context tool interface (§6.2.0.1 step 5).
+     *
+     * @param contextHandle Opaque handle for the revoking context.
+     * @param interfaceIdHex The 32-byte interface/offer ID as hex.
+     * @return JSON-encoded InterfaceRevoked event.
+     * @throws BridgeException with `SCP-VALID-7042` if hex is invalid.
+     */
+    fun toolInterfaceRevoke(
+        contextHandle: Long,
+        interfaceIdHex: String,
+    ): String
 }
 
 /**
@@ -1359,6 +1404,52 @@ class ToolBridge internal constructor(
         contextHandle: Long,
         toolId: String,
     ): String = bridge.ffiCall { bindings.toolVerify(contextHandle, toolId) }
+
+    /**
+     * Expose a tool interface for cross-context sharing (§6.2.0.1 step 1).
+     *
+     * @param contextHandle Handle for the source context.
+     * @param toolId The ID of the tool to expose.
+     * @param targetContextId The target context to expose the tool to.
+     * @param rateLimitJson Optional per-interface rate limit as JSON.
+     * @return JSON-encoded ToolInterface.
+     */
+    suspend fun interfaceExpose(
+        contextHandle: Long,
+        toolId: String,
+        targetContextId: String,
+        rateLimitJson: String? = null,
+    ): String = bridge.ffiCall {
+        bindings.toolInterfaceExpose(contextHandle, toolId, targetContextId, rateLimitJson)
+    }
+
+    /**
+     * Accept a cross-context tool interface (§6.2.0.1 step 4).
+     *
+     * @param contextHandle Handle for the target context.
+     * @param interfaceJson The ToolInterface JSON string to accept.
+     * @return JSON-encoded updated ToolInterface.
+     */
+    suspend fun interfaceAccept(
+        contextHandle: Long,
+        interfaceJson: String,
+    ): String = bridge.ffiCall {
+        bindings.toolInterfaceAccept(contextHandle, interfaceJson)
+    }
+
+    /**
+     * Revoke a cross-context tool interface (§6.2.0.1 step 5).
+     *
+     * @param contextHandle Handle for the revoking context.
+     * @param interfaceIdHex The 32-byte interface/offer ID as hex.
+     * @return JSON-encoded InterfaceRevoked event.
+     */
+    suspend fun interfaceRevoke(
+        contextHandle: Long,
+        interfaceIdHex: String,
+    ): String = bridge.ffiCall {
+        bindings.toolInterfaceRevoke(contextHandle, interfaceIdHex)
+    }
 }
 
 /**
