@@ -193,3 +193,26 @@ class ScopedHandle internal constructor(
     override fun toString(): String =
         "ScopedHandle(contextId=$contextId, appDid=$appDid, capabilities=${grantedCapabilities.size})"
 }
+
+// ---------------------------------------------------------------------------
+// TestVector (spec §7.3.3, ADR-010)
+// ---------------------------------------------------------------------------
+
+/**
+ * A known input-output pair for tool conformance testing.
+ *
+ * Mirrors `scp_core::context::tools::TestVector`. Any agent can invoke a
+ * tool with test vector inputs and verify the output matches the expected
+ * result.
+ *
+ * Provenance: spec §7.3.3, ADR-010 (phase-2)
+ *
+ * @property description Human-readable description of what this test vector validates.
+ * @property input The serialized input value (JSON string).
+ * @property expectedOutput The expected serialized output value (JSON string).
+ */
+data class TestVector(
+    val description: String,
+    val input: String,
+    val expectedOutput: String,
+)
