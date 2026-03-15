@@ -1,9 +1,10 @@
 import Foundation
 
-// ToolDefinition and ToolVerificationResult are now defined by UniFFI in ScpBindings.swift.
+// ToolDefinition, ToolCostDefinition, and ToolVerificationResult are now defined by UniFFI in ScpBindings.swift.
 //
 // UniFFI ToolDefinition fields: name, description, inputSchemaJson, outputSchemaJson,
-//     operatorDid, testVectorsJson, implementationHash
+//     operatorDid, testVectorsJson, implementationHash, cost
+// UniFFI ToolCostDefinition fields: amount, currency, payee, costFormula
 // UniFFI ToolVerificationResult fields: toolId, passed, failures
 //
 // ToolInvocationResult is a pure Swift type (not in UniFFI) and is kept here.

@@ -255,6 +255,7 @@ export type {
   ResolutionLayer,
   ResolutionPath,
   TestVector,
+  ToolCost,
   ToolDefinition,
   ToolVerificationResult,
   TransportConfig,

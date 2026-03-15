@@ -13236,7 +13236,7 @@ mod tests {
                 description: "noop".to_owned(),
             }],
             operator_did: "did:key:test-operator".into(),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         }
@@ -14259,7 +14259,7 @@ mod tests {
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: "did:key:op".into(),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         };
@@ -14303,7 +14303,7 @@ mod tests {
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: "did:key:op".into(),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         };

@@ -207,6 +207,20 @@ export interface ToolDefinition {
   readonly testVectors?: readonly TestVector[];
   /** SHA-256 hash of the implementation binary. */
   readonly implementationHash?: Uint8Array;
+  /** Optional per-invocation cost metadata (spec section 5.4.1). */
+  readonly cost?: ToolCost;
+}
+
+/** Per-invocation cost metadata for a tool (spec section 5.4.1). */
+export interface ToolCost {
+  /** Cost per invocation in the smallest currency unit. */
+  readonly amount: number;
+  /** ISO 4217 or protocol-defined currency code. */
+  readonly currency: string;
+  /** DID of the payment recipient. May differ from the tool operator. */
+  readonly payee: string;
+  /** Optional pricing formula identifier for dynamic pricing (spec section 19.4). */
+  readonly costFormula?: string;
 }
 
 /** A test vector for tool verification. */

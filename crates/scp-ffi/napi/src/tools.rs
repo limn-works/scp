@@ -66,7 +66,7 @@ fn validate_ucan_for_tool(
 
 /// Tool definition for registration in a context.
 ///
-/// See ADR-010 (Tool Registry) and spec section 6 (Tools).
+/// See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
 #[napi(object)]
 pub struct NapiToolDefinition {
     /// Human-readable tool name.
@@ -83,6 +83,21 @@ pub struct NapiToolDefinition {
     pub test_vectors_json: Option<String>,
     /// SHA-256 hash of the implementation binary (32 bytes).
     pub implementation_hash: Option<Vec<u8>>,
+    /// Optional per-invocation cost metadata (spec §5.4.1).
+    pub cost: Option<NapiToolCost>,
+}
+
+/// Per-invocation cost metadata for a tool (spec §5.4.1).
+#[napi(object)]
+pub struct NapiToolCost {
+    /// Cost per invocation in the smallest currency unit.
+    pub amount: i64,
+    /// ISO 4217 or protocol-defined currency code.
+    pub currency: String,
+    /// DID of the payment recipient. May differ from `operator_did`.
+    pub payee: String,
+    /// Optional pricing formula identifier for dynamic pricing (§19.4).
+    pub cost_formula: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +237,13 @@ pub async fn tool_register(
     let implementation_hash =
         validate_implementation_hash(definition.implementation_hash.as_deref())?;
 
+    let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
+        amount: c.amount.max(0).cast_unsigned(),
+        currency: c.currency,
+        payee: c.payee.into(),
+        cost_formula: c.cost_formula,
+    });
+
     let core_registration = scp_core::context::tools::ToolRegistration {
         tool_id,
         name: definition.name,
@@ -233,7 +255,7 @@ pub async fn tool_register(
         implementation_hash,
         test_vectors,
         operator_did: definition.operator_did.into(),
-        economic_metadata: None,
+        cost,
         registered_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1267,6 +1289,7 @@ mod tests {
             test_vectors_json: None,
             implementation_hash: None,
             operator_did: creator_did.to_owned(),
+            cost: None,
         };
 
         let tool_id = tool_register(&handle, definition)

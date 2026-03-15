@@ -362,12 +362,7 @@ export class Context implements AsyncDisposable {
     this.assertActive();
     try {
       const bridge = await getBridge();
-      return await bridge.toolInterfaceExpose(
-        this._handle,
-        toolId,
-        targetContextId,
-        rateLimitJson,
-      );
+      return await bridge.toolInterfaceExpose(this._handle, toolId, targetContextId, rateLimitJson);
     } catch (error) {
       throw mapBridgeError(error);
     }

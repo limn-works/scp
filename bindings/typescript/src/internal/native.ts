@@ -556,6 +556,14 @@ export function createNativeBridge(): Bridge {
         implementationHash: definition.implementationHash
           ? Array.from(definition.implementationHash)
           : undefined,
+        cost: definition.cost
+          ? {
+              amount: definition.cost.amount,
+              currency: definition.cost.currency,
+              payee: definition.cost.payee,
+              costFormula: definition.cost.costFormula,
+            }
+          : undefined,
       };
       const toolId = await (
         addon.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
@@ -607,10 +615,7 @@ export function createNativeBridge(): Bridge {
       )(handle, toolId, targetContextId, rateLimitJson);
     },
 
-    async toolInterfaceAccept(
-      handle: BridgeContextHandle,
-      interfaceJson: string,
-    ): Promise<string> {
+    async toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string> {
       return await (
         addon.toolInterfaceAccept as (h: BridgeContextHandle, ij: string) => Promise<string>
       )(handle, interfaceJson);

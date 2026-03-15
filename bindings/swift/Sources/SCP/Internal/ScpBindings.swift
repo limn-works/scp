@@ -3314,6 +3314,119 @@ public func FfiConverterTypeSyncPolicyResult_lower(_ value: SyncPolicyResult) ->
 
 
 /**
+ * Per-invocation cost metadata for a tool (spec §5.4.1).
+ */
+public struct ToolCostDefinition {
+    /**
+     * Cost per invocation in the smallest currency unit.
+     */
+    public var amount: UInt64
+    /**
+     * ISO 4217 or protocol-defined currency code.
+     */
+    public var currency: String
+    /**
+     * DID of the payment recipient. May differ from `operatorDid`.
+     */
+    public var payee: String
+    /**
+     * Optional pricing formula identifier for dynamic pricing (§19.4).
+     */
+    public var costFormula: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Cost per invocation in the smallest currency unit.
+         */amount: UInt64,
+        /**
+         * ISO 4217 or protocol-defined currency code.
+         */currency: String,
+        /**
+         * DID of the payment recipient. May differ from `operatorDid`.
+         */payee: String,
+        /**
+         * Optional pricing formula identifier for dynamic pricing (§19.4).
+         */costFormula: String?) {
+        self.amount = amount
+        self.currency = currency
+        self.payee = payee
+        self.costFormula = costFormula
+    }
+}
+
+#if compiler(>=6)
+extension ToolCostDefinition: Sendable {}
+#endif
+
+
+extension ToolCostDefinition: Equatable, Hashable {
+    public static func ==(lhs: ToolCostDefinition, rhs: ToolCostDefinition) -> Bool {
+        if lhs.amount != rhs.amount {
+            return false
+        }
+        if lhs.currency != rhs.currency {
+            return false
+        }
+        if lhs.payee != rhs.payee {
+            return false
+        }
+        if lhs.costFormula != rhs.costFormula {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(amount)
+        hasher.combine(currency)
+        hasher.combine(payee)
+        hasher.combine(costFormula)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolCostDefinition: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolCostDefinition {
+        return
+            try ToolCostDefinition(
+                amount: FfiConverterUInt64.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                payee: FfiConverterString.read(from: &buf),
+                costFormula: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ToolCostDefinition, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.amount, into: &buf)
+        FfiConverterString.write(value.currency, into: &buf)
+        FfiConverterString.write(value.payee, into: &buf)
+        FfiConverterOptionString.write(value.costFormula, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolCostDefinition_lift(_ buf: RustBuffer) throws -> ToolCostDefinition {
+    return try FfiConverterTypeToolCostDefinition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolCostDefinition_lower(_ value: ToolCostDefinition) -> RustBuffer {
+    return FfiConverterTypeToolCostDefinition.lower(value)
+}
+
+
+/**
  * Tool definition for registration in a context.
  *
  * See ADR-010 (Tool Registry) and spec §6 (Tools).
@@ -3347,31 +3460,38 @@ public struct ToolDefinition {
      * SHA-256 hash of the implementation binary (32 bytes).
      */
     public var implementationHash: Data?
+    /**
+     * Optional per-invocation cost metadata (spec §5.4.1).
+     */
+    public var cost: ToolCostDefinition?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
          * Human-readable tool name.
-         */name: String, 
+         */name: String,
         /**
          * Tool description.
-         */description: String, 
+         */description: String,
         /**
          * JSON Schema for tool input (as a JSON string).
-         */inputSchemaJson: String, 
+         */inputSchemaJson: String,
         /**
          * JSON Schema for tool output (as a JSON string).
-         */outputSchemaJson: String, 
+         */outputSchemaJson: String,
         /**
          * DID of the tool operator (responsible party).
-         */operatorDid: String, 
+         */operatorDid: String,
         /**
          * Test vectors for integrity verification (serialized as JSON string).
-         */testVectorsJson: String?, 
+         */testVectorsJson: String?,
         /**
          * SHA-256 hash of the implementation binary (32 bytes).
-         */implementationHash: Data?) {
+         */implementationHash: Data?,
+        /**
+         * Optional per-invocation cost metadata (spec §5.4.1).
+         */cost: ToolCostDefinition? = nil) {
         self.name = name
         self.description = description
         self.inputSchemaJson = inputSchemaJson
@@ -3379,6 +3499,7 @@ public struct ToolDefinition {
         self.operatorDid = operatorDid
         self.testVectorsJson = testVectorsJson
         self.implementationHash = implementationHash
+        self.cost = cost
     }
 }
 
@@ -3410,6 +3531,9 @@ extension ToolDefinition: Equatable, Hashable {
         if lhs.implementationHash != rhs.implementationHash {
             return false
         }
+        if lhs.cost != rhs.cost {
+            return false
+        }
         return true
     }
 
@@ -3421,6 +3545,7 @@ extension ToolDefinition: Equatable, Hashable {
         hasher.combine(operatorDid)
         hasher.combine(testVectorsJson)
         hasher.combine(implementationHash)
+        hasher.combine(cost)
     }
 }
 
@@ -3433,13 +3558,14 @@ public struct FfiConverterTypeToolDefinition: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolDefinition {
         return
             try ToolDefinition(
-                name: FfiConverterString.read(from: &buf), 
-                description: FfiConverterString.read(from: &buf), 
-                inputSchemaJson: FfiConverterString.read(from: &buf), 
-                outputSchemaJson: FfiConverterString.read(from: &buf), 
-                operatorDid: FfiConverterString.read(from: &buf), 
-                testVectorsJson: FfiConverterOptionString.read(from: &buf), 
-                implementationHash: FfiConverterOptionData.read(from: &buf)
+                name: FfiConverterString.read(from: &buf),
+                description: FfiConverterString.read(from: &buf),
+                inputSchemaJson: FfiConverterString.read(from: &buf),
+                outputSchemaJson: FfiConverterString.read(from: &buf),
+                operatorDid: FfiConverterString.read(from: &buf),
+                testVectorsJson: FfiConverterOptionString.read(from: &buf),
+                implementationHash: FfiConverterOptionData.read(from: &buf),
+                cost: FfiConverterOptionTypeToolCostDefinition.read(from: &buf)
         )
     }
 
@@ -3451,6 +3577,7 @@ public struct FfiConverterTypeToolDefinition: FfiConverterRustBuffer {
         FfiConverterString.write(value.operatorDid, into: &buf)
         FfiConverterOptionString.write(value.testVectorsJson, into: &buf)
         FfiConverterOptionData.write(value.implementationHash, into: &buf)
+        FfiConverterOptionTypeToolCostDefinition.write(value.cost, into: &buf)
     }
 }
 
@@ -6491,6 +6618,30 @@ fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeDataProvenance.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeToolCostDefinition: FfiConverterRustBuffer {
+    typealias SwiftType = ToolCostDefinition?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeToolCostDefinition.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeToolCostDefinition.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

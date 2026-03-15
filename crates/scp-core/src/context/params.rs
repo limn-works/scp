@@ -54,7 +54,7 @@ pub use super::roles::RoleDefinition;
 /// Previously a name-only placeholder. Now re-exports the full type from
 /// `tools/registry.rs` which includes `tool_id`, `name`, `description`,
 /// `schema`, `implementation_hash`, `test_vectors`, `operator_did`, and
-/// `economic_metadata`. See ADR-010 in `.docs/adrs/phase-2.md`.
+/// `cost`. See ADR-010 in `.docs/adrs/phase-2.md`.
 pub use super::tools::ToolRegistration;
 
 // ---------------------------------------------------------------------------
@@ -969,7 +969,7 @@ mod tests {
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
                 operator_did: "did:dht:z6MkTestOperator".into(),
-                economic_metadata: None,
+                cost: None,
                 registered_at: 0,
                 signature: Vec::new(),
             }],
@@ -1031,7 +1031,7 @@ mod tests {
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
-            economic_metadata: None,
+            cost: None,
             registered_at: 0,
             signature: Vec::new(),
         };

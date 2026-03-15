@@ -10,7 +10,7 @@
  */
 
 import { ValidationError } from "./errors";
-import type { TestVector, ToolDefinition } from "./types";
+import type { TestVector, ToolCost, ToolDefinition } from "./types";
 
 // ---------------------------------------------------------------------------
 // Tool definition builder
@@ -34,6 +34,7 @@ export function defineToolDefinition(params: {
   readonly operator: string;
   readonly testVectors?: readonly TestVector[];
   readonly implementationHash?: Uint8Array;
+  readonly cost?: ToolCost;
 }): ToolDefinition {
   if (params.name.length === 0) {
     throw new ValidationError("Tool name must not be empty", "SCP-VALID-7010");
@@ -61,6 +62,10 @@ export function defineToolDefinition(params: {
 
   if (params.implementationHash !== undefined) {
     (result as { implementationHash: Uint8Array }).implementationHash = params.implementationHash;
+  }
+
+  if (params.cost !== undefined) {
+    (result as { cost: ToolCost }).cost = params.cost;
   }
 
   return result;

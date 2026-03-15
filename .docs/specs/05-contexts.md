@@ -125,7 +125,7 @@ Tool registrations include:
 - **Implementation hash.** Content-addressable reference to the tool's implementation. Any change to the implementation produces a new hash.
 - **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the tool with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
 - **Operator DID.** The identity accountable for the tool. Tool misbehavior traces to this DID.
-- **Cost metadata (optional).** Per-invocation cost declared by the tool, additive with context-level costs (§19.3). Fields: `cost: Option<Amount>`, `cost_currency: Option<CurrencyCode>`, `cost_payee: Option<DID>`. A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
+- **Cost metadata (optional).** Per-invocation cost declared by the tool via a `ToolCost` struct (§5.4.1), additive with context-level costs (§19.3). A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
 
 Tool mutations (implementation hash change, schema modification, test vector update) are recorded in the context's verifiable event log (§7.3.1). Silent tool modification is not possible — any change is visible to all context members.
 
@@ -161,6 +161,7 @@ ToolCost {
   amount:           Amount,          // Cost per invocation in smallest currency unit.
   currency:         CurrencyCode,    // ISO 4217 or protocol-defined.
   payee:            DID,             // Who receives payment. May differ from operator_did.
+  cost_formula:     Option<String>,  // Optional pricing formula identifier for dynamic pricing (§19.4).
 }
 ```
 
