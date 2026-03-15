@@ -14,7 +14,6 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import type { BridgeMode } from "../src/bridge";
-import type { MemberRole } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
@@ -302,8 +301,8 @@ if (bridge === null) {
         JSON.stringify({ ceiling: ["messages:read"] }),
       );
       const role = await napi.contextMemberRole(ctx, identity.did);
-      // NAPI bridge returns lowercase role names.
-      expect(role).toBe("admin" as MemberRole);
+      // NAPI bridge returns lowercase — tracked in #1236
+      expect(role as string).toBe("admin");
     });
   });
 
