@@ -177,8 +177,8 @@ struct UcanTests {
     @Test("validateUcanToken calls bridge successfully")
     func validateRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        var receivedToken: String?
-        var receivedCapability: String?
+        nonisolated(unsafe) var receivedToken: String?
+        nonisolated(unsafe) var receivedCapability: String?
         let mockValidate: UcanBridge.ValidateFn = { _, token, capability, _, _ in
             receivedToken = token
             receivedCapability = capability
@@ -228,10 +228,10 @@ struct UcanTests {
     @Test("revokeUcanToken calls bridge successfully")
     func revokeRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        var revokedToken: String?
-        let mockRevoke: UcanBridge.RevokeFn = { _, token in revokedToken = token }
+        nonisolated(unsafe) var revokedToken: String?
+        let mockRevoke: UcanBridge.RevokeFn = { _, token, _ in revokedToken = token }
         try await revokeUcanToken(
-            handle: handle, token: "header.payload.signature", revokeFn: mockRevoke
+            handle: handle, token: "header.payload.signature", revokerDid: "did:dht:z6MkRevoker", revokeFn: mockRevoke
         )
         #expect(revokedToken == "header.payload.signature")
     }
@@ -241,8 +241,8 @@ struct UcanTests {
     @Test("legacy validate passes capability and presenterDid in correct arg positions")
     func legacyValidateArgOrder() async throws {
         let handle = ContextHandle(noPointer: .init())
-        var capArg = ""
-        var didArg: String?
+        nonisolated(unsafe) var capArg = ""
+        nonisolated(unsafe) var didArg: String?
         let mock: UcanBridge.ValidateFn = { _, _, cap, did, _ in capArg = cap; didArg = did }
         let res = try await validate(
             encoded: "tok", handle: handle, contextId: "ctx",
@@ -281,8 +281,8 @@ struct UcanTests {
     @Test("legacy revoke delegates to bridge")
     func legacyRevokeRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        var revoked = false
-        let mockRevoke: UcanBridge.RevokeFn = { _, _ in revoked = true }
+        nonisolated(unsafe) var revoked = false
+        let mockRevoke: UcanBridge.RevokeFn = { _, _, _ in revoked = true }
 
         try await revoke(
             handle: handle,
@@ -307,10 +307,10 @@ struct UcanTests {
             capabilities: ["scp:ctx:abc/messages:read"]
         )
 
-        var receivedDelegatorDid: String?
-        var receivedDelegateeDid: String?
-        var receivedParentToken: String?
-        var receivedCapabilities: [String]?
+        nonisolated(unsafe) var receivedDelegatorDid: String?
+        nonisolated(unsafe) var receivedDelegateeDid: String?
+        nonisolated(unsafe) var receivedParentToken: String?
+        nonisolated(unsafe) var receivedCapabilities: [String]?
 
         let mockDelegate: UcanBridge.DelegateFn = { _, delegatorDid, delegateeDid, parentToken, capabilities in
             receivedDelegatorDid = delegatorDid
@@ -378,7 +378,8 @@ struct UcanTests {
         // XCFramework; this test confirms the typealias and default are
         // properly wired by verifying the injectable bridge pattern still
         // works with mocks.
-        let defaultDelegateFn = UcanBridge.defaultDelegate
-        #expect(defaultDelegateFn is UcanBridge.DelegateFn)
+        // Verify the default delegate static property is accessible and correctly typed.
+        // Assigning to a typed binding confirms the typealias wiring at compile time.
+        let _: UcanBridge.DelegateFn = UcanBridge.defaultDelegate
     }
 } // end UcanTests

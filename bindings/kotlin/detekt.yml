@@ -10,6 +10,8 @@ complexity:
     threshold: 60
   TooManyFunctions:
     thresholdInFiles: 30
+    thresholdInClasses: 15
+    thresholdInInterfaces: 15
   ComplexCondition:
     threshold: 4
 

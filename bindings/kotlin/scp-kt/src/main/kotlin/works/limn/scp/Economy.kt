@@ -1,16 +1,83 @@
+// Economy.kt — Kotlin SDK economic governance wrappers (#613)
+//
+// Wraps economy-related UniFFI bridge functions as suspend functions with
+// proper dispatcher assignment per ADR-028. All monetary values are in the
+// smallest currency unit (e.g., cents for USD, satoshis for BTC).
+//
+// Provenance: spec §19 (Economic Governance), ADR-033
+
 package works.limn.scp
 
+import works.limn.scp.bridge.CoroutineBridge
+
 /**
- * Economic governance operations for SCP contexts.
+ * Native binding functions for economic governance operations.
  *
- * Provides cost estimation, budget tracking, antispam velocity checking,
- * and pricing policy evaluation. All monetary values are in the smallest
- * currency unit (e.g., cents for USD, satoshis for BTC).
- *
- * See spec section 19 (Economic Governance) and ADR-033.
+ * All methods are blocking JNA calls into Rust and must be dispatched
+ * on [kotlinx.coroutines.Dispatchers.IO].
  */
 @Suppress("TooManyFunctions")
-object Economy {
+interface EconomyBindings {
+    /** Estimates the cost for an action given a policy and metrics. */
+    fun economyEstimateCost(policyJson: String, actionType: String, metricsJson: String): ULong?
+
+    /** Checks whether an economic policy requires payment. */
+    fun economyPolicyRequiresPayment(policyJson: String): Boolean
+
+    /** Checks whether auto-accept is blocked by the economic policy. */
+    fun economyAutoAcceptBlocked(policyJson: String): Boolean
+
+    /** Checks whether an economic policy is locked (immutable). */
+    fun economyCheckPolicyLock(policyJson: String): Boolean
+
+    /** Validates a proposed economic policy change. */
+    fun economyValidatePolicyChange(currentJson: String, proposedJson: String): Boolean
+
+    /** Evaluates a pricing formula against observable metrics. */
+    fun economyEvaluateFormula(formulaJson: String, metricsJson: String): ULong?
+
+    /** Computes an EIP-1559-style relay price adjustment. */
+    fun economyAdjustRelayPrice(configJson: String, utilizationPct: ULong): String
+
+    /** Queries the remaining budget for a member. */
+    fun economyBudgetRemaining(contextId: String, did: String): ULong
+
+    /** Grants spending budget to a member. */
+    fun economyBudgetGrant(contextId: String, did: String, amount: ULong)
+
+    /** Records a spend against a member's budget. */
+    fun economyBudgetRecordSpend(contextId: String, did: String, amount: ULong)
+
+    /** Records a message for antispam velocity tracking. */
+    fun economyAntispamRecord(contextId: String, senderDid: String, timestamp: ULong)
+
+    /** Queries the sender's message velocity. */
+    fun economyAntispamVelocity(contextId: String, senderDid: String, now: ULong): ULong
+
+    /** Computes the escalated cost for a sender. */
+    @Suppress("LongParameterList")
+    fun economyAntispamEscalatedCost(
+        contextId: String,
+        senderDid: String,
+        now: ULong,
+        baseCost: ULong,
+        thresholdsJson: String,
+        floor: ULong?,
+        cap: ULong?,
+    ): ULong
+}
+
+/**
+ * Kotlin SDK wrapper for economic governance operations.
+ *
+ * All operations delegate through the coroutine bridge to UniFFI-generated
+ * Rust functions. See spec §19 (Economic Governance) and ADR-033.
+ */
+@Suppress("TooManyFunctions")
+class EconomyBridge internal constructor(
+    private val bindings: EconomyBindings,
+    private val bridge: CoroutineBridge,
+) {
     // -----------------------------------------------------------------------
     // Cost estimation
     // -----------------------------------------------------------------------
@@ -28,7 +95,9 @@ object Economy {
         policyJson: String,
         actionType: String,
         metricsJson: String = "{}",
-    ): ULong? = economyEstimateCost(policyJson, actionType, metricsJson)
+    ): ULong? = bridge.ffiCall {
+        bindings.economyEstimateCost(policyJson, actionType, metricsJson)
+    }
 
     /**
      * Checks whether an economic policy requires payment.
@@ -36,8 +105,9 @@ object Economy {
      * @param policyJson Economic policy JSON string.
      * @return `true` if payment is required.
      */
-    suspend fun policyRequiresPayment(policyJson: String): Boolean =
-        economyPolicyRequiresPayment(policyJson)
+    suspend fun policyRequiresPayment(policyJson: String): Boolean = bridge.ffiCall {
+        bindings.economyPolicyRequiresPayment(policyJson)
+    }
 
     /**
      * Checks whether auto-accept is blocked by the economic policy.
@@ -45,8 +115,9 @@ object Economy {
      * @param policyJson Economic policy JSON string.
      * @return `true` if auto-accept is blocked.
      */
-    suspend fun autoAcceptBlocked(policyJson: String): Boolean =
-        economyAutoAcceptBlocked(policyJson)
+    suspend fun autoAcceptBlocked(policyJson: String): Boolean = bridge.ffiCall {
+        bindings.economyAutoAcceptBlocked(policyJson)
+    }
 
     /**
      * Checks whether an economic policy is locked (immutable).
@@ -54,8 +125,9 @@ object Economy {
      * @param policyJson Economic policy JSON string.
      * @return `true` if the policy is locked.
      */
-    suspend fun checkPolicyLock(policyJson: String): Boolean =
-        economyCheckPolicyLock(policyJson)
+    suspend fun checkPolicyLock(policyJson: String): Boolean = bridge.ffiCall {
+        bindings.economyCheckPolicyLock(policyJson)
+    }
 
     /**
      * Validates a proposed economic policy change.
@@ -65,7 +137,9 @@ object Economy {
      * @return `true` if the change is valid.
      */
     suspend fun validatePolicyChange(currentJson: String, proposedJson: String): Boolean =
-        economyValidatePolicyChange(currentJson, proposedJson)
+        bridge.ffiCall {
+            bindings.economyValidatePolicyChange(currentJson, proposedJson)
+        }
 
     /**
      * Evaluates a pricing formula against observable metrics.
@@ -75,7 +149,9 @@ object Economy {
      * @return Computed cost, or null on overflow.
      */
     suspend fun evaluateFormula(formulaJson: String, metricsJson: String = "{}"): ULong? =
-        economyEvaluateFormula(formulaJson, metricsJson)
+        bridge.ffiCall {
+            bindings.economyEvaluateFormula(formulaJson, metricsJson)
+        }
 
     /**
      * Computes an EIP-1559-style relay price adjustment.
@@ -85,7 +161,9 @@ object Economy {
      * @return JSON string with new_base_price, previous_base_price, direction.
      */
     suspend fun adjustRelayPrice(configJson: String, utilizationPct: ULong): String =
-        economyAdjustRelayPrice(configJson, utilizationPct)
+        bridge.ffiCall {
+            bindings.economyAdjustRelayPrice(configJson, utilizationPct)
+        }
 
     // -----------------------------------------------------------------------
     // Budget tracking
@@ -98,8 +176,9 @@ object Economy {
      * @param did The member's DID.
      * @return Remaining budget (smallest currency unit).
      */
-    suspend fun budgetRemaining(contextId: String, did: String): ULong =
-        economyBudgetRemaining(contextId, did)
+    suspend fun budgetRemaining(contextId: String, did: String): ULong = bridge.ffiCall {
+        bindings.economyBudgetRemaining(contextId, did)
+    }
 
     /**
      * Grants spending budget to a member.
@@ -108,8 +187,9 @@ object Economy {
      * @param did The member's DID.
      * @param amount Budget to grant.
      */
-    suspend fun budgetGrant(contextId: String, did: String, amount: ULong) =
-        economyBudgetGrant(contextId, did, amount)
+    suspend fun budgetGrant(contextId: String, did: String, amount: ULong) = bridge.ffiCall {
+        bindings.economyBudgetGrant(contextId, did, amount)
+    }
 
     /**
      * Records a spend against a member's budget.
@@ -118,8 +198,9 @@ object Economy {
      * @param did The member's DID.
      * @param amount Amount spent.
      */
-    suspend fun budgetRecordSpend(contextId: String, did: String, amount: ULong) =
-        economyBudgetRecordSpend(contextId, did, amount)
+    suspend fun budgetRecordSpend(contextId: String, did: String, amount: ULong) = bridge.ffiCall {
+        bindings.economyBudgetRecordSpend(contextId, did, amount)
+    }
 
     // -----------------------------------------------------------------------
     // Antispam
@@ -133,7 +214,9 @@ object Economy {
      * @param timestamp Unix timestamp in seconds.
      */
     suspend fun antispamRecord(contextId: String, senderDid: String, timestamp: ULong) =
-        economyAntispamRecord(contextId, senderDid, timestamp)
+        bridge.ffiCall {
+            bindings.economyAntispamRecord(contextId, senderDid, timestamp)
+        }
 
     /**
      * Queries the sender's message velocity.
@@ -144,7 +227,9 @@ object Economy {
      * @return Number of messages within the sliding window.
      */
     suspend fun antispamVelocity(contextId: String, senderDid: String, now: ULong): ULong =
-        economyAntispamVelocity(contextId, senderDid, now)
+        bridge.ffiCall {
+            bindings.economyAntispamVelocity(contextId, senderDid, now)
+        }
 
     /**
      * Computes the escalated cost for a sender.
@@ -167,8 +252,8 @@ object Economy {
         thresholdsJson: String,
         floor: ULong? = null,
         cap: ULong? = null,
-    ): ULong =
-        economyAntispamEscalatedCost(
+    ): ULong = bridge.ffiCall {
+        bindings.economyAntispamEscalatedCost(
             contextId,
             senderDid,
             now,
@@ -177,4 +262,5 @@ object Economy {
             floor,
             cap,
         )
+    }
 }

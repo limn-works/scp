@@ -26,12 +26,18 @@ import works.limn.scp.BridgeConnectorBindings
 import works.limn.scp.BridgeConnectorBridge
 import works.limn.scp.DiscoveryBindings
 import works.limn.scp.DiscoveryBridge
+import works.limn.scp.EconomyBindings
+import works.limn.scp.EconomyBridge
 import works.limn.scp.IdentityAdvancedBindings
+import works.limn.scp.InvitationBindings
 import works.limn.scp.IdentityAdvancedBridge
+import works.limn.scp.MetadataBindings
+import works.limn.scp.MetadataBridge
 import works.limn.scp.ProvenanceBindings
 import works.limn.scp.ProvenanceBridge
 import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
+import works.limn.scp.TrustBindings
 import works.limn.scp.auth.ScpIdBindings
 import works.limn.scp.auth.ScpIdBridge
 import kotlinx.coroutines.CoroutineDispatcher
@@ -1066,6 +1072,8 @@ interface NativeBindings :
  * @property identityAdvanced Agent key, migration, and device attestation bindings.
  * @property scpId SCPID DID authentication bindings (spec section 3.11).
  * @property trust Trust aggregation bindings.
+ * @property economy Economic governance bindings.
+ * @property invitation Invitation evaluation bindings.
  */
 data class ExtendedBindings(
     val provenance: ProvenanceBindings? = null,
@@ -1076,6 +1084,8 @@ data class ExtendedBindings(
     val scpId: ScpIdBindings? = null,
     val trust: TrustBindings? = null,
     val metadata: MetadataBindings? = null,
+    val economy: EconomyBindings? = null,
+    val invitation: InvitationBindings? = null,
 )
 
 /**
@@ -1118,6 +1128,8 @@ class CoroutineBridge(
     internal val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
     extendedBindings: ExtendedBindings? = null,
 ) {
+    /** Raw extended bindings for direct access by domain wrappers. */
+    internal val extended: ExtendedBindings = extendedBindings ?: ExtendedBindings()
     /** Identity operations — all FFI, dispatched on IO. */
     val identity = IdentityBridge(nativeBindings, this)
 
@@ -1176,6 +1188,12 @@ class CoroutineBridge(
     val metadata: MetadataBridge? =
         extendedBindings?.metadata?.let {
             MetadataBridge(it, this)
+        }
+
+    /** Economy governance operations — FFI on IO. Null if bindings not provided. */
+    val economy: EconomyBridge? =
+        extendedBindings?.economy?.let {
+            EconomyBridge(it, this)
         }
 
     /**

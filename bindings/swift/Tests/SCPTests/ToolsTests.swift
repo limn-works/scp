@@ -53,7 +53,8 @@ struct ToolsTests {
             outputSchemaJson: #"{"type": "object"}"#,
             operatorDid: "did:dht:z6MkOperator",
             testVectorsJson: #"[{"input": {"x": 1}, "expected_output": {"result": 2}}]"#,
-            implementationHash: Data([0x01, 0x02, 0x03])
+            implementationHash: Data([0x01, 0x02, 0x03]),
+            cost: nil
         )
 
         #expect(definition.name == "calculator")
@@ -74,7 +75,8 @@ struct ToolsTests {
             outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
 
         #expect(definition.testVectorsJson == nil)
@@ -90,7 +92,8 @@ struct ToolsTests {
             outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
         #expect(definition is ToolDefinition)
     }
@@ -253,7 +256,8 @@ struct ToolsTests {
             outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
         let toolId = try await context.registerTool(definition, registerFn: mockRegister)
         #expect(toolId == "tool-abc-123")
@@ -271,7 +275,8 @@ struct ToolsTests {
             outputSchemaJson: "{}",
             operatorDid: "did:dht:z6MkOp",
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
         do {
             _ = try await context.registerTool(definition)
@@ -350,7 +355,8 @@ struct ToolsTests {
             outputSchemaJson: #"{"type": "object", "properties": {"sum": {"type": "number"}}}"#,
             operatorDid: "did:dht:z6MkMath",
             testVectorsJson: vectorsJson,
-            implementationHash: Data([0xAA, 0xBB, 0xCC])
+            implementationHash: Data([0xAA, 0xBB, 0xCC]),
+            cost: nil
         )
 
         #expect(definition.testVectorsJson != nil)

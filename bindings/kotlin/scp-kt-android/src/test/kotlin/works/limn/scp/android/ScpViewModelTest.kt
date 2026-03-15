@@ -212,6 +212,11 @@ private class TestNativeBindings : NativeBindings {
     ): String = ""
     override fun toolVerify(contextHandle: Long, toolId: String): String =
         """{"tool_id":"$toolId","passed":false,"failures":[]}"""
+    override fun toolInterfaceExpose(
+        contextHandle: Long, toolId: String, targetContextId: String, rateLimitJson: String?,
+    ): String = "{}"
+    override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
+    override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
     override fun ucanValidate(
         contextHandle: Long,
         token: String,
@@ -236,6 +241,29 @@ private class TestNativeBindings : NativeBindings {
     override fun transportConnect(configJson: String, cancellationHandle: CancellationHandle?): Long = 0L
     override fun transportStatus(transportHandle: Long): String = ""
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
+
+    // GovernanceBindings — lifecycle (#559)
+    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
+    override fun finalizeClose(contextHandle: Long) { /* no-op */ }
+    @Suppress("LongParameterList")
+    override fun createGovernanceCheckpoint(
+        contextHandle: Long,
+        checkpointSeq: Long,
+        merkleRootHex: String,
+        eventCount: Long,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String = "{}"
+    override fun addCheckpointCosignature(
+        contextHandle: Long,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String = "{}"
+    override fun restoreContext(contextId: String) { /* no-op */ }
+    override fun restoreAllContexts(): String = "[]"
 }
 
 /**

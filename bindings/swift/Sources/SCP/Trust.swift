@@ -401,7 +401,7 @@ public nonisolated struct AggregatedTrustInput: Sendable {
     public let thresholdCounts: [String: [Int]]
 }
 
-/// Aggregates all trust engine layers into a single `TrustInput` for
+/// Aggregates all trust engine layers into a single input for
 /// agent-level evaluation.
 ///
 /// Combines participation records, attestation verification, challenge
@@ -427,7 +427,7 @@ public nonisolated struct AggregatedTrustInput: Sendable {
 ///
 /// - ADR-017 acceptance criterion 9
 /// - Spec section 7.3
-public func aggregateTrustInput(
+public func aggregateTrust(
     contextId: String,
     subjectDid: String,
     eventsJson: String,
@@ -438,7 +438,7 @@ public func aggregateTrustInput(
     cachedAttestationsJson: String = "[]",
     challengeResultsJson: String = "[]"
 ) throws -> AggregatedTrustInput {
-    let resultJson = try SCP.aggregateTrustInput(
+    let resultJson = try aggregateTrustInput(
         contextId: contextId,
         subjectDid: subjectDid,
         eventsJson: eventsJson,

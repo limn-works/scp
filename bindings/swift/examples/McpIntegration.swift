@@ -30,7 +30,8 @@ struct McpIntegration {
             outputSchemaJson: #"{"type":"object","properties":{"summary":{"type":"string"}}}"#,
             operatorDid: identity.did(),
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
         _ = try await toolRegister(handle: handle, definition: tool)
 

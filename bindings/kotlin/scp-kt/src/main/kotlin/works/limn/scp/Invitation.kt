@@ -9,8 +9,37 @@
 
 package works.limn.scp
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import works.limn.scp.bridge.CoroutineBridge
+
+/**
+ * Native binding functions for invitation evaluation operations.
+ *
+ * All methods are blocking JNA calls into Rust and must be dispatched
+ * on [kotlinx.coroutines.Dispatchers.IO].
+ */
+interface InvitationBindings {
+    /**
+     * Evaluates a context invitation through the sequential pipeline.
+     *
+     * @param paramsJson JSON-serialized `ContextParams` from the invitation.
+     * @param inviterDid DID string of the identity sending the invitation.
+     * @param identityDid DID string of the local identity receiving the invitation.
+     * @param policyJson Optional JSON-serialized `AutoAcceptPolicy`.
+     * @param spendingJson Optional JSON-serialized `SpendingContext`.
+     * @param trustedDids List of trusted DID strings for trust requirement evaluation.
+     * @return Pipeline decision string: `"auto_accept"` or `"prompt_agent"`.
+     * @throws BridgeException if evaluation fails.
+     */
+    @Suppress("LongParameterList")
+    fun evaluateInvitation(
+        paramsJson: String,
+        inviterDid: String,
+        identityDid: String,
+        policyJson: String?,
+        spendingJson: String?,
+        trustedDids: List<String>,
+    ): String
+}
 
 /**
  * Result of evaluating a context invitation through the pipeline.
@@ -31,6 +60,7 @@ data class InvitationEvaluationResult(val decision: String) {
  * 3. **Auto-accept check** — evaluates trust, TTL cap, and rate limit.
  * 4. **Agent prompt** — falls through if no auto-accept matches.
  *
+ * @param bridge The coroutine bridge with invitation bindings.
  * @param paramsJson JSON-serialized `ContextParams` from the invitation.
  * @param inviterDid DID string of the identity sending the invitation.
  * @param identityDid DID string of the local identity receiving the invitation.
@@ -39,19 +69,22 @@ data class InvitationEvaluationResult(val decision: String) {
  * @param trustedDids List of trusted DID strings for trust requirement evaluation.
  * @return An [InvitationEvaluationResult] with the pipeline decision.
  * @throws works.limn.scp.bridge.BridgeException if evaluation fails.
+ * @throws IllegalStateException if invitation bindings are not configured.
  */
 @Suppress("LongParameterList")
 suspend fun evaluateContextInvitation(
+    bridge: CoroutineBridge,
     paramsJson: String,
     inviterDid: String,
     identityDid: String,
     policyJson: String? = null,
     spendingJson: String? = null,
     trustedDids: List<String> = emptyList(),
-): InvitationEvaluationResult = withContext(Dispatchers.IO) {
-    @Suppress("TooGenericExceptionCaught")
-    try {
-        val decision = evaluateInvitation(
+): InvitationEvaluationResult {
+    val invitationBindings = bridge.extended.invitation
+        ?: error("Invitation bindings not configured — provide InvitationBindings in ExtendedBindings")
+    return bridge.ffiCall {
+        val decision = invitationBindings.evaluateInvitation(
             paramsJson = paramsJson,
             inviterDid = inviterDid,
             identityDid = identityDid,
@@ -60,11 +93,5 @@ suspend fun evaluateContextInvitation(
             trustedDids = trustedDids,
         )
         InvitationEvaluationResult(decision)
-    } catch (e: Exception) {
-        throw works.limn.scp.bridge.BridgeException(
-            message = e.message ?: "invitation evaluation failed",
-            code = "SCP-CTX-2060",
-            cause = e,
-        )
     }
 }
