@@ -97,16 +97,25 @@ public nonisolated struct Capability: Sendable {
 
 /// An input/output pair used for tool conformance testing.
 ///
+/// Mirrors `scp_core::context::tools::TestVector`. Each vector carries a
+/// human-readable description of what it validates, plus the input and
+/// expected output as JSON strings.
+///
 /// This type is a pure Swift convenience type. It does not conflict with any
 /// UniFFI-generated type.
+///
+/// Provenance: spec §7.3.3, ADR-010 (phase-2)
 public nonisolated struct TestVector: Sendable {
+    /// Human-readable description of what this test vector validates.
+    public let description: String
     /// The serialized input value (JSON).
     public let input: String
     /// The expected serialized output value (JSON).
     public let expectedOutput: String
 
     /// Memberwise initializer.
-    public init(input: String, expectedOutput: String) {
+    public init(description: String, input: String, expectedOutput: String) {
+        self.description = description
         self.input = input
         self.expectedOutput = expectedOutput
     }

@@ -97,19 +97,25 @@ struct ToolsTests {
 
     // MARK: - TestVector type shape (hand-written, not UniFFI)
 
-    @Test("TestVector stores input and expected output")
+    @Test("TestVector stores description, input, and expected output")
     func vectorFields() {
         let vector = TestVector(
+            description: "addition of two operands",
             input: #"{"operands": [2, 3]}"#,
             expectedOutput: #"{"sum": 5}"#
         )
+        #expect(vector.description == "addition of two operands")
         #expect(vector.input == #"{"operands": [2, 3]}"#)
         #expect(vector.expectedOutput == #"{"sum": 5}"#)
     }
 
     @Test("TestVector is Sendable")
     func vectorIsSendable() {
-        let vector: any Sendable = TestVector(input: "{}", expectedOutput: "{}")
+        let vector: any Sendable = TestVector(
+            description: "smoke",
+            input: "{}",
+            expectedOutput: "{}"
+        )
         #expect(vector is TestVector)
     }
 
