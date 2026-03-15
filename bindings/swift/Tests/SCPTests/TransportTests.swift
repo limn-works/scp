@@ -211,7 +211,7 @@ struct TransportTests {
 
     @Test("Context send delegates payload to bridge function")
     func contextSendDelegatesPayload() async throws {
-        let handle = MockTransportContextHandle(id: "transport-ctx", state: "active")
+        let handle = ContextHandle(noPointer: .init())
         var sentPayload: Data?
 
         let sendFn: ContextBridge.SendFn = { _, _, payload in
@@ -224,6 +224,8 @@ struct TransportTests {
         let context = Context(
             handle: handle,
             identity: Identity(noPointer: .init()),
+            contextId: "transport-ctx",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -241,7 +243,7 @@ struct TransportTests {
     @Test("Context messages stream subscribes via bridge function")
     func contextMessagesSubscribes() async throws {
         var subscribed = false
-        let handle = MockTransportContextHandle(id: "subscribe-ctx", state: "active")
+        let handle = ContextHandle(noPointer: .init())
 
         let sendFn: ContextBridge.SendFn = { _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, listener in
@@ -254,6 +256,8 @@ struct TransportTests {
         let context = Context(
             handle: handle,
             identity: Identity(noPointer: .init()),
+            contextId: "subscribe-ctx",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -266,29 +270,3 @@ struct TransportTests {
         #expect(subscribed)
     }
 } // end TransportTests
-
-// MARK: - Mock ContextHandle for Transport Tests
-
-private final class MockTransportContextHandle: ContextHandleProtocol, @unchecked Sendable {
-    let id: String
-    let creator: String
-    let initialState: String
-
-    init(id: String, creator: String = "did:dht:z6MkCreator", state: String = "active") {
-        self.id = id
-        self.creator = creator
-        initialState = state
-    }
-
-    func contextId() -> String {
-        id
-    }
-
-    func creatorDid() -> String {
-        creator
-    }
-
-    func state() throws -> String {
-        initialState
-    }
-}
