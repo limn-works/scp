@@ -21,11 +21,15 @@ struct ToolsTests {
     // MARK: - Helpers
 
     /// Creates a mock ``Context`` with injectable bridge functions for testing.
+    ///
+    /// Uses `ContextHandle(noPointer:)` with explicit overrides for contextId
+    /// and initialState, avoiding protocol-type mock handles.
     private func makeTestContext(
         contextId: String = "tool-test-ctx",
-        state: String = "active"
+        creatorDid: String = "did:dht:z6MkTest",
+        initialState: ContextState = .active
     ) -> Context {
-        let handle = MockToolContextHandle(id: contextId, state: state)
+        let handle = ContextHandle(noPointer: .init())
 
         let sendFn: ContextBridge.SendFn = { _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
@@ -35,6 +39,9 @@ struct ToolsTests {
         return Context(
             handle: handle,
             identity: Identity(noPointer: .init()),
+            contextId: contextId,
+            creatorDid: creatorDid,
+            initialState: initialState,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -592,30 +599,3 @@ struct ToolsTests {
         }
     }
 } // end ToolsTests
-
-// MARK: - Mock ContextHandle for Tool Tests
-
-/// Mock implementation of ``ContextHandleProtocol`` for tool testing.
-private final class MockToolContextHandle: ContextHandleProtocol, @unchecked Sendable {
-    let id: String
-    let creator: String
-    let initialState: String
-
-    init(id: String = "tool-test-ctx", creator: String = "did:dht:z6MkCreator", state: String = "active") {
-        self.id = id
-        self.creator = creator
-        initialState = state
-    }
-
-    func contextId() -> String {
-        id
-    }
-
-    func creatorDid() -> String {
-        creator
-    }
-
-    func state() throws -> String {
-        initialState
-    }
-}

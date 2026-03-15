@@ -31,26 +31,26 @@ public enum ContextBridge {
 
     /// The closure type for sending a message. Injected for testability.
     public typealias SendFn = @Sendable (
-        _ handle: any ContextHandleProtocol,
+        _ handle: ContextHandle,
         _ identity: Identity,
         _ payload: Data
     ) async throws -> Void
 
     /// The closure type for subscribing to messages. Injected for testability.
     public typealias SubscribeFn = @Sendable (
-        _ handle: any ContextHandleProtocol,
+        _ handle: ContextHandle,
         _ listener: any MessageListener
     ) -> Void
 
     /// The closure type for leaving a context. Injected for testability.
     public typealias LeaveFn = @Sendable (
-        _ handle: any ContextHandleProtocol,
+        _ handle: ContextHandle,
         _ identity: Identity
     ) async throws -> Void
 
     /// The closure type for closing a context. Injected for testability.
     public typealias CloseFn = @Sendable (
-        _ handle: any ContextHandleProtocol,
+        _ handle: ContextHandle,
         _ identity: Identity
     ) async throws -> Void
 
@@ -67,68 +67,38 @@ public enum ContextBridge {
 
     /// Default send function — delegates to UniFFI ``contextSend``.
     public static let defaultSend: SendFn = { handle, identity, payload in
-        guard let ctxHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "invalid handle type for contextSend",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await contextSend(handle: ctxHandle, identity: identity, payload: payload)
+        try await contextSend(handle: handle, identity: identity, payload: payload)
     }
 
     /// Default leave function — delegates to UniFFI ``contextLeave``.
     public static let defaultLeave: LeaveFn = { handle, identity in
-        guard let ctxHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "invalid handle type for contextLeave",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await contextLeave(handle: ctxHandle, identity: identity)
+        try await contextLeave(handle: handle, identity: identity)
     }
 
     /// Default close function — delegates to UniFFI ``contextClose``.
     public static let defaultClose: CloseFn = { handle, identity in
-        guard let ctxHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "invalid handle type for contextClose",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await contextClose(handle: ctxHandle, identity: identity)
+        try await contextClose(handle: handle, identity: identity)
     }
 
     /// The closure type for setting economic policy. Injected for testability.
     public typealias SetEconomicPolicyFn = @Sendable (
-        _ handle: any ContextHandleProtocol,
+        _ handle: ContextHandle,
         _ policyJson: String
     ) throws -> Void
 
     /// The closure type for getting economic policy. Injected for testability.
     public typealias GetEconomicPolicyFn = @Sendable (
-        _ handle: any ContextHandleProtocol
+        _ handle: ContextHandle
     ) throws -> String?
 
     /// Default set economic policy function — delegates to UniFFI ``setEconomicPolicy``.
     public static let defaultSetEconomicPolicy: SetEconomicPolicyFn = { handle, policyJson in
-        guard let ctxHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "invalid handle type for setEconomicPolicy",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try setEconomicPolicy(handle: ctxHandle, policyJson: policyJson)
+        try setEconomicPolicy(handle: handle, policyJson: policyJson)
     }
 
     /// Default get economic policy function — delegates to UniFFI ``getEconomicPolicy``.
     public static let defaultGetEconomicPolicy: GetEconomicPolicyFn = { handle in
-        guard let ctxHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "invalid handle type for getEconomicPolicy",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try getEconomicPolicy(handle: ctxHandle)
+        try getEconomicPolicy(handle: handle)
     }
 }
 
@@ -228,8 +198,8 @@ public actor Context {
     /// The opaque UniFFI handle to the Rust context.
     ///
     /// Internal visibility so that extensions in other files (Tools.swift,
-    /// etc.) can cast to ``ContextHandle`` for UniFFI bridge calls.
-    let handle: any ContextHandleProtocol
+    /// etc.) can access the handle for UniFFI bridge calls.
+    let handle: ContextHandle
 
     /// The continuation for the active message stream, if any.
     /// Retained so that ``close()`` and ``leave()`` can finish the stream.
@@ -272,7 +242,7 @@ public actor Context {
     ///   - leaveFn: Bridge function for leaving the context.
     ///   - closeFn: Bridge function for closing the context.
     init(
-        handle: any ContextHandleProtocol,
+        handle: ContextHandle,
         identity: Identity,
         contextId: String? = nil,
         creatorDid: String? = nil,
@@ -368,12 +338,24 @@ public actor Context {
         setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
             = ContextBridge.defaultSetEconomicPolicy,
         getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
-            = ContextBridge.defaultGetEconomicPolicy
+            = ContextBridge.defaultGetEconomicPolicy,
+        contextId: String? = nil,
+        creatorDid: String? = nil,
+        initialState: ContextState? = nil
     ) async throws -> Context {
-        let handle = try await createFn(identity, params)
+        let rawHandle = try await createFn(identity, params)
+        guard let handle = rawHandle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "createFn returned a non-concrete ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
         return Context(
             handle: handle,
             identity: identity,
+            contextId: contextId,
+            creatorDid: creatorDid,
+            initialState: initialState,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,

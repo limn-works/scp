@@ -408,7 +408,8 @@ public nonisolated struct AggregatedTrustInput: Sendable {
 /// results, consequence structure, and threshold counts. The returned
 /// object contains verifiable facts -- agents apply their own criteria.
 ///
-/// Delegates to the UniFFI ``aggregateTrustInput`` bridge function.
+/// Delegates to the UniFFI `aggregateTrustInput` bridge function and
+/// parses the JSON result into a typed ``AggregatedTrustInput``.
 ///
 /// - Parameters:
 ///   - contextId: The context to aggregate trust inputs for.

@@ -263,19 +263,13 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
                 msg: "Tool input is not valid UTF-8",
                 code: "SCP-TOOL-6001"
             )
         }
-        let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity, ucanToken, proofTokens)
+        let outputJson = try await invokeFn(handle, tool, inputJson, identity, ucanToken, proofTokens)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
             invokerDid: invokerDid ?? identity.did(),
@@ -309,13 +303,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await registerFn(contextHandle, definition)
+        return try await registerFn(handle, definition)
     }
 
     /// Verifies a tool against its registered test vectors.
@@ -344,13 +332,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await verifyFn(contextHandle, tool)
+        return try await verifyFn(handle, tool)
     }
 
     /// Invokes a tool registered in a different context (cross-context).
@@ -394,26 +376,15 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let sourceHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Source context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        guard let targetHandle = targetContext.handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Target context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
                 msg: "Tool input is not valid UTF-8",
                 code: "SCP-TOOL-6001"
             )
         }
+        let targetHandle = await targetContext.handle
         let outputJson = try await invokeCrossContextFn(
-            sourceHandle, targetHandle, tool, inputJson, identity, ucanToken, chainDepth, proofTokens
+            handle, targetHandle, tool, inputJson, identity, ucanToken, chainDepth, proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -454,14 +425,8 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
         let sessionId = try await sessionCreateFn(
-            contextHandle, toolId, sourceContextId, ttlSeconds
+            handle, toolId, sourceContextId, ttlSeconds
         )
         return ToolSessionResult(sessionId: sessionId)
     }
@@ -501,12 +466,6 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
                 msg: "Tool input is not valid UTF-8",
@@ -514,7 +473,7 @@ public extension Context {
             )
         }
         let outputJson = try await sessionInvokeFn(
-            contextHandle, sessionId, inputJson, identity, ucanToken, proofTokens
+            handle, sessionId, inputJson, identity, ucanToken, proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -550,13 +509,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        try await sessionCloseFn(contextHandle, sessionId)
+        try await sessionCloseFn(handle, sessionId)
     }
 
     // MARK: - Bidirectional Consent Protocol (§6.2.0.1)
@@ -586,13 +539,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await interfaceExposeFn(contextHandle, toolId, targetContextId, rateLimitJson)
+        return try await interfaceExposeFn(handle, toolId, targetContextId, rateLimitJson)
     }
 
     /// Accepts a cross-context tool interface (step 4).
@@ -615,13 +562,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await interfaceAcceptFn(contextHandle, interfaceJson)
+        return try await interfaceAcceptFn(handle, interfaceJson)
     }
 
     /// Revokes a cross-context tool interface (step 5).
@@ -643,12 +584,6 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        guard let contextHandle = handle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "Context handle is not a UniFFI ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
-        return try await interfaceRevokeFn(contextHandle, interfaceIdHex)
+        return try await interfaceRevokeFn(handle, interfaceIdHex)
     }
 }

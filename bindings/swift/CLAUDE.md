@@ -33,10 +33,10 @@ Trust and MCP do not have Rust bridge function exports yet. Their `*Bridge` defa
 
 ## Gotchas
 
-- **Context.handle is `internal`** -- Extensions in other files (Tools.swift, etc.) need to cast `handle` to `ContextHandle` for UniFFI bridge calls. `private` would make this impossible.
-- **ContextHandle casting** -- UniFFI bridge functions require the concrete `ContextHandle` class, but `Context` stores `any ContextHandleProtocol`. Guard-cast with `handle as? ContextHandle`.
+- **Context.handle is `internal`** -- Extensions in other files (Tools.swift, etc.) access `handle` directly for UniFFI bridge calls. `private` would make this impossible.
+- **Context.handle is concrete `ContextHandle`** -- All bridge function typealiases (except `CreateFn`, which returns `any ContextHandleProtocol`) and the actor property use the concrete `ContextHandle` type, not `any ContextHandleProtocol`. No guard-casts needed.
 - **No `withCheckedThrowingContinuation`** -- UniFFI async functions are already `async throws` in Swift. Direct `try await` is correct. The old callback-based stubs used continuations; those are gone.
-- **`ContextHandle(noPointer: .init())`** -- Use this in tests to create a fake handle that passes the `as? ContextHandle` cast. Mock protocol conformers will fail the cast.
+- **`ContextHandle(noPointer: .init())`** -- Use this in tests to create a fake handle. Pass `contextId`, `creatorDid`, and `initialState` overrides to `Context.init` to avoid calling handle methods on a null pointer.
 - **Error code namespacing** -- Tool extensions use `SCP-CTX-2001` (not `SCP-CTX-001`) to avoid collision with Context.swift. EventLog uses `SCP-CTX-2030/2031`. Transport uses `SCP-TRANS-5001`. MCP stubs use `SCP-MCP-10001`-`10004`.
 - **Concurrency** -- Use actors, not locks. Target is macOS 14 / iOS 17 (Swift Concurrency without `Synchronization.Mutex`).
 - **ScpBindings.swift is large** (~5700 lines). Read in chunks or use grep to find specific sections.
