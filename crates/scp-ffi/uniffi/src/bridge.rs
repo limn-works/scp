@@ -1616,6 +1616,9 @@ pub struct ContextHandle {
     pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
     /// Optional economic policy as a JSON string (§19.3, ADR-033).
     pub(crate) economic_policy: std::sync::Mutex<Option<String>>,
+    /// Core context parameters, retained for `finalize_close` (`memory_scope`
+    /// governs key destruction) and `restore_context`.
+    pub(crate) core_context_params: scp_core::context::ContextParams,
 }
 
 impl std::fmt::Debug for ContextHandle {
@@ -2308,6 +2311,9 @@ pub async fn context_create(
 
             // Convert bridge ContextParams to scp-core ContextParams.
             let core_params = bridge_params_to_core(&params);
+            // Retain a clone for the FFI handle — finalize_close needs the real
+            // memory_scope to decide key destruction behavior.
+            let retained_core_params = core_params.clone();
 
             // Initialize the ContextManager if not already done (first context_create call).
             crate::runtime::init_context_manager();
@@ -2387,6 +2393,7 @@ pub async fn context_create(
                     scp_core::context::tools::SessionStore::new(),
                 ),
                 economic_policy: std::sync::Mutex::new(None),
+                core_context_params: retained_core_params,
             });
             increment_handle_count();
             Ok(handle)
@@ -5523,6 +5530,284 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
             msg: format!("tokio task join error during list proposals: {e}"),
             code: "SCP-CTX-2046".to_owned(),
         })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — ceiling modification, close, checkpoint, restore (#559)
+// ---------------------------------------------------------------------------
+
+/// Applies a pending ceiling modification if the notification period has elapsed.
+///
+/// Returns `true` if applied, `false` if no pending modification or not yet effective.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2060) if the operation fails.
+#[uniffi::export]
+pub async fn apply_pending_ceiling_modification(
+    handle: Arc<ContextHandle>,
+    current_timestamp: u64,
+) -> Result<bool, ScpError> {
+    let context_id = handle.context_id.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            manager
+                .apply_pending_ceiling_modification(&context_id, current_timestamp)
+                .await
+                .map_err(ScpError::from)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during apply_pending_ceiling_modification: {e}"),
+            code: "SCP-CTX-2060".to_owned(),
+        })?
+}
+
+/// Finalizes the cooperative close flow for a context in `Closing` state.
+///
+/// Transitions to `Closed`, destroys keys per memory scope, records
+/// `ContextClosed` event, and deletes persisted state.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2061) if the context is not
+/// in `Closing` state or finalization fails.
+#[uniffi::export]
+pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    let context_id = handle.context_id.clone();
+    let handle_ref = handle.clone();
+
+    // Use the handle's stored core_context_params (which carries correct
+    // memory_scope) instead of ContextParams::default(). memory_scope
+    // governs key destruction behavior in finalize_close — Ephemeral scope
+    // destroys keys, Full scope retains them.
+    let core_params = handle.core_context_params.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Closing)
+                .await;
+
+            manager
+                .finalize_close(&core_handle)
+                .await
+                .map_err(ScpError::from)?;
+
+            // Update FFI handle state to Closed.
+            *handle_ref.state.lock().await = ContextState::Closed;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during finalize_close: {e}"),
+            code: "SCP-CTX-2061".to_owned(),
+        })?
+}
+
+/// Creates a governance checkpoint for a context (ADR-031 §9).
+///
+/// # Returns
+///
+/// JSON string with the full `ContextCheckpoint` object.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2062) if checkpoint creation fails.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_governance_checkpoint(
+    handle: Arc<ContextHandle>,
+    checkpoint_seq: u64,
+    merkle_root_hex: String,
+    event_count: u64,
+    last_event_hash_hex: String,
+    state_snapshot_hash_hex: String,
+    creator_did: String,
+    creator_signature_hex: String,
+) -> Result<String, ScpError> {
+    let context_id = handle.context_id.clone();
+
+    let merkle_root = parse_uniffi_hex_32(&merkle_root_hex, "merkle_root")?;
+    let last_event_hash = parse_uniffi_hex_32(&last_event_hash_hex, "last_event_hash")?;
+    let state_snapshot_hash = parse_uniffi_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
+    let creator_signature =
+        hex::decode(&creator_signature_hex).map_err(|e| ScpError::Validation {
+            msg: format!("invalid creator_signature hex: {e}"),
+            code: "SCP-CTX-2062".to_owned(),
+        })?;
+    let did = scp_identity::DID(creator_did);
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let checkpoint = manager
+                .create_governance_checkpoint(
+                    &context_id,
+                    checkpoint_seq,
+                    merkle_root,
+                    event_count,
+                    last_event_hash,
+                    state_snapshot_hash,
+                    &did,
+                    creator_signature,
+                )
+                .await
+                .map_err(ScpError::from)?;
+
+            serde_json::to_string(&checkpoint).map_err(|e| ScpError::Context {
+                msg: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2062".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during create_governance_checkpoint: {e}"),
+            code: "SCP-CTX-2062".to_owned(),
+        })?
+}
+
+/// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
+///
+/// # Returns
+///
+/// JSON string with `{ "attestation_status": string, "checkpoint": object }`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2063) if cosignature validation fails.
+#[uniffi::export]
+pub async fn add_checkpoint_cosignature(
+    handle: Arc<ContextHandle>,
+    checkpoint_json: String,
+    signer_did: String,
+    signature_hex: String,
+) -> Result<String, ScpError> {
+    let context_id = handle.context_id.clone();
+
+    let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+        serde_json::from_str(&checkpoint_json).map_err(|e| ScpError::Validation {
+            msg: format!("invalid checkpoint JSON: {e}"),
+            code: "SCP-CTX-2063".to_owned(),
+        })?;
+
+    let signature = hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
+        msg: format!("invalid signature hex: {e}"),
+        code: "SCP-CTX-2063".to_owned(),
+    })?;
+
+    let cosignature = scp_core::context::governance::CosignedCheckpoint {
+        signer_did: scp_identity::DID(signer_did),
+        signature,
+    };
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let status = manager
+                .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+                .await
+                .map_err(ScpError::from)?;
+
+            let response = serde_json::json!({
+                "attestation_status": format!("{status:?}"),
+                "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+            });
+            Ok(response.to_string())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during add_checkpoint_cosignature: {e}"),
+            code: "SCP-CTX-2063".to_owned(),
+        })?
+}
+
+/// Restores a single persisted context from storage.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2064) if restoration fails.
+#[uniffi::export]
+pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
+    let ctx_id = context_id.clone();
+
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            // Load the persisted snapshot to obtain the correct ContextParams
+            // (including memory_scope). Using ContextParams::default() would
+            // give Ephemeral scope, causing incorrect key destruction on
+            // subsequent finalize_close.
+            let (snapshot, _broadcast) = manager
+                .load_persisted_context_state(&ctx_id)
+                .map_err(ScpError::from)?;
+
+            let core_handle = scp_core::context::ContextHandle::new(
+                ctx_id.clone(),
+                snapshot.context_params.clone(),
+            );
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            manager
+                .restore_context(&ctx_id, &core_handle)
+                .await
+                .map_err(ScpError::from)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during restore_context: {e}"),
+            code: "SCP-CTX-2064".to_owned(),
+        })?
+}
+
+/// Restores all persisted contexts from storage.
+///
+/// Returns a JSON array of restored context ID strings.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (SCP-CTX-2065) if restoration fails.
+#[uniffi::export]
+pub async fn restore_all_contexts() -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let restored = manager
+                .restore_all_contexts()
+                .await
+                .map_err(ScpError::from)?;
+
+            serde_json::to_string(&restored).map_err(|e| ScpError::Context {
+                msg: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2065".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during restore_all_contexts: {e}"),
+            code: "SCP-CTX-2065".to_owned(),
+        })?
+}
+
+/// Parses a hex string into a 32-byte array for the `UniFFI` bridge.
+fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpError> {
+    let bytes = hex::decode(hex_str).map_err(|e| ScpError::Validation {
+        msg: format!("invalid {field_name} hex: {e}"),
+        code: "SCP-CTX-2062".to_owned(),
+    })?;
+    bytes.try_into().map_err(|v: Vec<u8>| ScpError::Validation {
+        msg: format!("{field_name} must be 32 bytes, got {}", v.len()),
+        code: "SCP-CTX-2062".to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -9802,6 +10087,7 @@ mod tests {
             tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
         })
     }
 

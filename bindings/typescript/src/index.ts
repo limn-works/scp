@@ -59,6 +59,8 @@ export {
   evaluateInvitation,
   metadataRecordFromJson,
   metadataRecordToJson,
+  restoreAllContexts,
+  restoreContext,
   templateGetParams,
   validateAgainstTemplate,
   validateCapabilityDeclaration,

@@ -792,6 +792,217 @@ pub fn context_governance_list_proposals(handle: &WasmContextHandle) -> Promise 
 }
 
 // ---------------------------------------------------------------------------
+// Ceiling modification, close, checkpoint, restore (#559)
+// ---------------------------------------------------------------------------
+
+/// Applies a pending ceiling modification if the notification period has elapsed.
+///
+/// Returns `true` if applied, `false` otherwise.
+#[wasm_bindgen]
+pub fn context_apply_pending_ceiling_modification(
+    handle: &WasmContextHandle,
+    current_timestamp: f64,
+) -> Promise {
+    let context_id = handle.context_id();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ts = current_timestamp as u64;
+
+    future_to_promise(async move {
+        let applied = with_manager(|mgr| mgr.apply_pending_ceiling_modification(&context_id, ts))
+            .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::from_bool(applied))
+    })
+}
+
+/// Finalizes the cooperative close flow for a context in `Closing` state.
+///
+/// Transitions from `closing` to `closed` and records a `ContextClosed` event.
+#[wasm_bindgen]
+pub fn context_finalize_close(handle: &WasmContextHandle) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.finalize_close(&context_id)).map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::undefined())
+    })
+}
+
+/// Creates a governance checkpoint for a context (ADR-031 §9).
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with the checkpoint object.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn context_create_governance_checkpoint(
+    handle: &WasmContextHandle,
+    checkpoint_seq: f64,
+    merkle_root_hex: String,
+    event_count: f64,
+    last_event_hash_hex: String,
+    state_snapshot_hash_hex: String,
+    creator_did: String,
+    creator_signature_hex: String,
+) -> Promise {
+    if let Err(e) = validate_did(&creator_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let merkle_root = parse_wasm_hex_32(&merkle_root_hex, "merkle_root")?;
+        let last_event_hash = parse_wasm_hex_32(&last_event_hash_hex, "last_event_hash")?;
+        let state_snapshot_hash =
+            parse_wasm_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
+        let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid creator_signature hex: {e}"),
+                code: "SCP-CTX-2062".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let seq = checkpoint_seq as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = event_count as u64;
+
+        let checkpoint = with_manager(|mgr| {
+            mgr.create_governance_checkpoint(
+                &context_id,
+                seq,
+                &merkle_root,
+                count,
+                &last_event_hash,
+                &state_snapshot_hash,
+                &creator_did,
+                &creator_signature,
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&checkpoint).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2062".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
+///
+/// # Returns
+///
+/// `Promise<string>` — JSON with `{ "attestation_status": string, "checkpoint": object }`.
+#[wasm_bindgen]
+pub fn context_add_checkpoint_cosignature(
+    handle: &WasmContextHandle,
+    checkpoint_json: String,
+    signer_did: String,
+    signature_hex: String,
+) -> Promise {
+    if let Err(e) = validate_did(&signer_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let mut checkpoint: serde_json::Value =
+            serde_json::from_str(&checkpoint_json).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid checkpoint JSON: {e}"),
+                    code: "SCP-CTX-2063".to_owned(),
+                }
+                .into_js()
+            })?;
+
+        let signature = hex::decode(&signature_hex).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid signature hex: {e}"),
+                code: "SCP-CTX-2063".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let status = with_manager(|mgr| {
+            mgr.add_checkpoint_cosignature(&context_id, &mut checkpoint, &signer_did, &signature)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let response = serde_json::json!({
+            "attestation_status": status,
+            "checkpoint": checkpoint,
+        });
+        let json_str = serde_json::to_string(&response).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2063".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Restores a single persisted context from storage.
+///
+/// WASM contexts are ephemeral (ADR-034), so this always returns an error.
+#[wasm_bindgen]
+pub fn context_restore(context_id: String) -> Promise {
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.restore_context(&context_id)).map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::undefined())
+    })
+}
+
+/// Restores all persisted contexts from storage.
+///
+/// WASM contexts are ephemeral (ADR-034), so this always returns an error.
+#[wasm_bindgen]
+pub fn context_restore_all() -> Promise {
+    future_to_promise(async move {
+        let restored =
+            with_manager(|mgr| mgr.restore_all_contexts()).map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&restored).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("serialization failed: {e}"),
+                code: "SCP-CTX-2065".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Parses a hex string into a 32-byte array for WASM bridge.
+fn parse_wasm_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], JsValue> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid {field_name} hex: {e}"),
+            code: "SCP-CTX-2062".to_owned(),
+        }
+        .into_js()
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        ScpWasmError::Validation {
+            message: format!("{field_name} must be 32 bytes, got {}", v.len()),
+            code: "SCP-CTX-2062".to_owned(),
+        }
+        .into_js()
+    })?;
+    Ok(arr)
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast bridge functions
 // ---------------------------------------------------------------------------
 

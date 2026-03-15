@@ -457,6 +457,80 @@ interface GovernanceBindings {
      * @return JSON array of proposal objects.
      */
     fun governanceListProposals(contextHandle: Long): String
+
+    /**
+     * Applies a pending ceiling modification if the notification period has elapsed (#559).
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param currentTimestamp Current Unix timestamp in seconds.
+     * @return `true` if the modification was applied, `false` otherwise.
+     */
+    fun applyPendingCeilingModification(
+        contextHandle: Long,
+        currentTimestamp: Long,
+    ): Boolean
+
+    /**
+     * Finalizes the cooperative close flow for a context in Closing state (#559).
+     *
+     * @param contextHandle Opaque handle from context create.
+     */
+    fun finalizeClose(contextHandle: Long)
+
+    /**
+     * Creates a governance checkpoint (ADR-031 section 9, #559).
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param checkpointSeq Sequence number.
+     * @param merkleRootHex Hex-encoded 32-byte Merkle root.
+     * @param eventCount Number of events.
+     * @param lastEventHashHex Hex-encoded 32-byte hash.
+     * @param stateSnapshotHashHex Hex-encoded 32-byte hash.
+     * @param creatorDid DID of the creator.
+     * @param creatorSignatureHex Hex-encoded Ed25519 signature.
+     * @return JSON string with the checkpoint object.
+     */
+    @Suppress("LongParameterList")
+    fun createGovernanceCheckpoint(
+        contextHandle: Long,
+        checkpointSeq: Long,
+        merkleRootHex: String,
+        eventCount: Long,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String
+
+    /**
+     * Adds a cosignature to an existing checkpoint (ADR-031 section 9, #559).
+     *
+     * @param contextHandle Opaque handle from context create.
+     * @param checkpointJson JSON-serialized checkpoint.
+     * @param signerDid DID of the cosigner.
+     * @param signatureHex Hex-encoded Ed25519 signature.
+     * @return JSON string with attestation status and updated checkpoint.
+     */
+    fun addCheckpointCosignature(
+        contextHandle: Long,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String
+
+    /**
+     * Restores a single persisted context from storage (#559).
+     *
+     * @param contextId The context ID to restore.
+     */
+    fun restoreContext(contextId: String)
+
+    /**
+     * Restores all persisted contexts from storage (#559).
+     *
+     * @return JSON array of restored context ID strings.
+     */
+    fun restoreAllContexts(): String
 }
 
 /**
@@ -1709,6 +1783,95 @@ class GovernanceBridgeOps internal constructor(
      */
     suspend fun listProposals(contextHandle: Long): String = bridge.ffiCall {
         bindings.governanceListProposals(contextHandle)
+    }
+
+    /**
+     * Apply a pending ceiling modification (#559).
+     *
+     * @param contextHandle Handle from context create.
+     * @param currentTimestamp Current Unix timestamp in seconds.
+     * @return `true` if applied, `false` otherwise.
+     */
+    suspend fun applyPendingCeilingModification(
+        contextHandle: Long,
+        currentTimestamp: Long,
+    ): Boolean = bridge.ffiCall {
+        bindings.applyPendingCeilingModification(contextHandle, currentTimestamp)
+    }
+
+    /**
+     * Finalize the cooperative close flow (#559).
+     *
+     * @param contextHandle Handle from context create.
+     */
+    suspend fun finalizeClose(contextHandle: Long): Unit = bridge.ffiCall {
+        bindings.finalizeClose(contextHandle)
+    }
+
+    /**
+     * Create a governance checkpoint (ADR-031 section 9, #559).
+     *
+     * @param contextHandle Handle from context create.
+     * @param checkpointSeq Sequence number.
+     * @param merkleRootHex Hex-encoded 32-byte Merkle root.
+     * @param eventCount Number of events.
+     * @param lastEventHashHex Hex-encoded 32-byte hash.
+     * @param stateSnapshotHashHex Hex-encoded 32-byte hash.
+     * @param creatorDid DID of the creator.
+     * @param creatorSignatureHex Hex-encoded Ed25519 signature.
+     * @return JSON string with the checkpoint object.
+     */
+    @Suppress("LongParameterList")
+    suspend fun createGovernanceCheckpoint(
+        contextHandle: Long,
+        checkpointSeq: Long,
+        merkleRootHex: String,
+        eventCount: Long,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String = bridge.ffiCall {
+        bindings.createGovernanceCheckpoint(
+            contextHandle, checkpointSeq, merkleRootHex, eventCount,
+            lastEventHashHex, stateSnapshotHashHex, creatorDid, creatorSignatureHex,
+        )
+    }
+
+    /**
+     * Add a cosignature to an existing checkpoint (ADR-031 section 9, #559).
+     *
+     * @param contextHandle Handle from context create.
+     * @param checkpointJson JSON-serialized checkpoint.
+     * @param signerDid DID of the cosigner.
+     * @param signatureHex Hex-encoded Ed25519 signature.
+     * @return JSON string with attestation status and updated checkpoint.
+     */
+    suspend fun addCheckpointCosignature(
+        contextHandle: Long,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String = bridge.ffiCall {
+        bindings.addCheckpointCosignature(contextHandle, checkpointJson, signerDid, signatureHex)
+    }
+
+    /**
+     * Restore a single persisted context (#559).
+     *
+     * @param contextId The context ID to restore.
+     */
+    suspend fun restoreContext(contextId: String): Unit = bridge.ffiCall {
+        bindings.restoreContext(contextId)
+    }
+
+    /**
+     * Restore all persisted contexts (#559).
+     *
+     * @return JSON array of restored context ID strings.
+     */
+    suspend fun restoreAllContexts(): String = bridge.ffiCall {
+        bindings.restoreAllContexts()
     }
 }
 

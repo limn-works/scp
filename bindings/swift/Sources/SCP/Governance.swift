@@ -263,6 +263,97 @@ public enum GovernanceBridge {
     public static let defaultListProposals: ListProposalsFn = { handle in
         try await governanceListProposals(handle: handle)
     }
+
+    /// Apply a pending ceiling modification (#559).
+    public typealias ApplyPendingCeilingModificationFn = @Sendable (
+        _ handle: ContextHandle,
+        _ currentTimestamp: UInt64
+    ) async throws -> Bool
+
+    /// Finalize the cooperative close flow (#559).
+    public typealias FinalizeCloseFn = @Sendable (
+        _ handle: ContextHandle
+    ) async throws -> Void
+
+    /// Create a governance checkpoint (#559).
+    public typealias CreateGovernanceCheckpointFn = @Sendable (
+        _ handle: ContextHandle,
+        _ checkpointSeq: UInt64,
+        _ merkleRootHex: String,
+        _ eventCount: UInt64,
+        _ lastEventHashHex: String,
+        _ stateSnapshotHashHex: String,
+        _ creatorDid: String,
+        _ creatorSignatureHex: String
+    ) async throws -> String
+
+    /// Add a cosignature to a checkpoint (#559).
+    public typealias AddCheckpointCosignatureFn = @Sendable (
+        _ handle: ContextHandle,
+        _ checkpointJson: String,
+        _ signerDid: String,
+        _ signatureHex: String
+    ) async throws -> String
+
+    /// Restore a single persisted context (#559).
+    public typealias RestoreContextFn = @Sendable (
+        _ contextId: String
+    ) async throws -> Void
+
+    /// Restore all persisted contexts (#559).
+    public typealias RestoreAllContextsFn = @Sendable () async throws -> String
+
+    /// Default apply pending ceiling modification function.
+    public static let defaultApplyPendingCeilingModification:
+        ApplyPendingCeilingModificationFn = { handle, currentTimestamp in
+            try await applyPendingCeilingModification(
+                handle: handle, currentTimestamp: currentTimestamp
+            )
+        }
+
+    /// Default finalize close function.
+    public static let defaultFinalizeClose: FinalizeCloseFn = { handle in
+        try await finalizeClose(handle: handle)
+    }
+
+    /// Default create governance checkpoint function.
+    public static let defaultCreateGovernanceCheckpoint:
+        CreateGovernanceCheckpointFn = {
+            handle, checkpointSeq, merkleRootHex, eventCount,
+            lastEventHashHex, stateSnapshotHashHex, creatorDid,
+            creatorSignatureHex in
+            try await createGovernanceCheckpoint(
+                handle: handle,
+                checkpointSeq: checkpointSeq,
+                merkleRootHex: merkleRootHex,
+                eventCount: eventCount,
+                lastEventHashHex: lastEventHashHex,
+                stateSnapshotHashHex: stateSnapshotHashHex,
+                creatorDid: creatorDid,
+                creatorSignatureHex: creatorSignatureHex
+            )
+        }
+
+    /// Default add checkpoint cosignature function.
+    public static let defaultAddCheckpointCosignature:
+        AddCheckpointCosignatureFn = { handle, checkpointJson, signerDid, signatureHex in
+            try await addCheckpointCosignature(
+                handle: handle,
+                checkpointJson: checkpointJson,
+                signerDid: signerDid,
+                signatureHex: signatureHex
+            )
+        }
+
+    /// Default restore context function.
+    public static let defaultRestoreContext: RestoreContextFn = { contextId in
+        try await restoreContext(contextId: contextId)
+    }
+
+    /// Default restore all contexts function.
+    public static let defaultRestoreAllContexts: RestoreAllContextsFn = {
+        try await restoreAllContexts()
+    }
 }
 
 // MARK: - MembershipBridge
@@ -1119,6 +1210,166 @@ public func isLocalDid(
         ContextLifecycleBridge.defaultIsLocalDid
 ) async throws -> Bool {
     try await isLocalDidFn(did)
+}
+
+// MARK: - Ceiling Modification, Close, Checkpoint (#559)
+
+public extension Context {
+    /// Applies a pending ceiling modification if the notification period has elapsed.
+    ///
+    /// - Parameters:
+    ///   - currentTimestamp: Current Unix timestamp in seconds.
+    ///   - applyFn: Bridge function override for testing.
+    /// - Returns: `true` if the modification was applied, `false` otherwise.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
+    func applyPendingCeilingModification(
+        currentTimestamp: UInt64,
+        applyFn: GovernanceBridge.ApplyPendingCeilingModificationFn =
+            GovernanceBridge.defaultApplyPendingCeilingModification
+    ) async throws -> Bool {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2060"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await applyFn(contextHandle, currentTimestamp)
+    }
+
+    /// Finalizes the cooperative close flow for a context in ``Closing`` state.
+    ///
+    /// - Parameters:
+    ///   - finalizeFn: Bridge function override for testing.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if not in Closing state.
+    func finalizeClose(
+        finalizeFn: GovernanceBridge.FinalizeCloseFn =
+            GovernanceBridge.defaultFinalizeClose
+    ) async throws {
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        try await finalizeFn(contextHandle)
+    }
+
+    /// Creates a governance checkpoint (ADR-031 section 9).
+    ///
+    /// - Parameters:
+    ///   - checkpointSeq: Sequence number in the event log.
+    ///   - merkleRootHex: Hex-encoded 32-byte Merkle root.
+    ///   - eventCount: Number of events included.
+    ///   - lastEventHashHex: Hex-encoded 32-byte hash.
+    ///   - stateSnapshotHashHex: Hex-encoded 32-byte hash.
+    ///   - creatorDid: DID of the creator.
+    ///   - creatorSignatureHex: Hex-encoded Ed25519 signature.
+    ///   - createFn: Bridge function override for testing.
+    /// - Returns: JSON string with the ``ContextCheckpoint`` object.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if creation fails.
+    func createGovernanceCheckpoint(
+        checkpointSeq: UInt64,
+        merkleRootHex: String,
+        eventCount: UInt64,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+        createFn: GovernanceBridge.CreateGovernanceCheckpointFn =
+            GovernanceBridge.defaultCreateGovernanceCheckpoint
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2062"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await createFn(
+            contextHandle, checkpointSeq, merkleRootHex, eventCount,
+            lastEventHashHex, stateSnapshotHashHex, creatorDid,
+            creatorSignatureHex
+        )
+    }
+
+    /// Adds a cosignature to an existing governance checkpoint (ADR-031 section 9).
+    ///
+    /// - Parameters:
+    ///   - checkpointJson: JSON-serialized checkpoint.
+    ///   - signerDid: DID of the cosigner.
+    ///   - signatureHex: Hex-encoded Ed25519 signature.
+    ///   - addFn: Bridge function override for testing.
+    /// - Returns: JSON string with `attestation_status` and updated `checkpoint`.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if cosignature fails.
+    func addCheckpointCosignature(
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+        addFn: GovernanceBridge.AddCheckpointCosignatureFn =
+            GovernanceBridge.defaultAddCheckpointCosignature
+    ) async throws -> String {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2063"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                msg: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await addFn(contextHandle, checkpointJson, signerDid, signatureHex)
+    }
+}
+
+/// Restores a single persisted context from storage.
+///
+/// - Parameters:
+///   - contextId: The context ID to restore.
+///   - restoreFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Context(msg:code:)`` if restoration fails.
+///
+/// ## Provenance
+///
+/// - Issue #559 (context lifecycle methods)
+public func restoreContext(
+    contextId: String,
+    restoreFn: GovernanceBridge.RestoreContextFn =
+        GovernanceBridge.defaultRestoreContext
+) async throws {
+    try await restoreFn(contextId)
+}
+
+/// Restores all persisted contexts from storage.
+///
+/// Only contexts in ``Active`` state are restored.
+///
+/// - Parameters:
+///   - restoreAllFn: Bridge function override for testing.
+/// - Returns: JSON array of restored context ID strings.
+/// - Throws: ``ScpError/Context(msg:code:)`` if restoration fails.
+///
+/// ## Provenance
+///
+/// - Issue #559 (context lifecycle methods)
+public func restoreAllContexts(
+    restoreAllFn: GovernanceBridge.RestoreAllContextsFn =
+        GovernanceBridge.defaultRestoreAllContexts
+) async throws -> String {
+    try await restoreAllFn()
 }
 
 // MARK: - Participation Requirements (Bridge)

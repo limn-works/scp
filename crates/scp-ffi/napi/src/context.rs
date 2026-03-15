@@ -1621,6 +1621,287 @@ pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> na
 }
 
 // ---------------------------------------------------------------------------
+// Bridge functions — ceiling modification, close, checkpoint, restore (#559)
+// ---------------------------------------------------------------------------
+
+/// Applies a pending ceiling modification if the notification period has elapsed.
+///
+/// Returns `true` if the modification was applied, `false` otherwise.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2060` if the operation fails.
+#[napi(js_name = "contextApplyPendingCeilingModification")]
+pub async fn context_apply_pending_ceiling_modification(
+    handle: &NapiContextHandle,
+    current_timestamp: f64,
+) -> napi::Result<bool> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ts = current_timestamp as u64;
+
+    manager
+        .apply_pending_ceiling_modification(&context_id, ts)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("apply_pending_ceiling_modification failed: {e}"),
+                code: "SCP-CTX-2060".to_owned(),
+            })
+        })
+}
+
+/// Finalizes the cooperative close flow for a context in `Closing` state.
+///
+/// Transitions the context from `Closing` to `Closed`, destroys keys per
+/// memory scope, and records a `ContextClosed` event.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2061` if the context is not in `Closing` state.
+#[napi(js_name = "contextFinalizeClose")]
+pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<()> {
+    let manager = context_manager()?;
+
+    // Use the handle's actual core_handle (which carries correct ContextParams
+    // including memory_scope) instead of constructing one with default params.
+    // memory_scope governs key destruction behavior in finalize_close — using
+    // default (Ephemeral) would incorrectly destroy keys for Full-scope contexts.
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    // Ensure the core handle is in Closing state. If close_context already
+    // transitioned it, the transition_to call fails harmlessly (self-transition
+    // or invalid source state) and we ignore the error.
+    let _ = core_handle.transition_to(&ContextState::Closing).await;
+
+    manager.finalize_close(core_handle).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("finalize_close failed: {e}"),
+            code: "SCP-CTX-2061".to_owned(),
+        })
+    })?;
+
+    // Update FFI handle state to Closed.
+    if let Ok(mut s) = handle.state.lock() {
+        *s = ContextState::Closed;
+    }
+
+    Ok(())
+}
+
+/// Creates a governance checkpoint for a context (ADR-031 §9).
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `checkpoint_seq` — Sequence number.
+/// * `merkle_root_hex` — Hex-encoded 32-byte Merkle root.
+/// * `event_count` — Number of events.
+/// * `last_event_hash_hex` — Hex-encoded 32-byte hash.
+/// * `state_snapshot_hash_hex` — Hex-encoded 32-byte hash.
+/// * `creator_did` — DID of the checkpoint creator.
+/// * `creator_signature_hex` — Hex-encoded Ed25519 signature.
+///
+/// # Returns
+///
+/// JSON string with the `ContextCheckpoint` object.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2062` if checkpoint creation fails.
+#[napi(js_name = "contextCreateGovernanceCheckpoint")]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub async fn context_create_governance_checkpoint(
+    handle: &NapiContextHandle,
+    checkpoint_seq: f64,
+    merkle_root_hex: String,
+    event_count: f64,
+    last_event_hash_hex: String,
+    state_snapshot_hash_hex: String,
+    creator_did: String,
+    creator_signature_hex: String,
+) -> napi::Result<String> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    let merkle_root = parse_napi_hex_32(&merkle_root_hex, "merkle_root")?;
+    let last_event_hash = parse_napi_hex_32(&last_event_hash_hex, "last_event_hash")?;
+    let state_snapshot_hash = parse_napi_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
+    let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid creator_signature hex: {e}"),
+            code: "SCP-CTX-2062".to_owned(),
+        })
+    })?;
+    let did = DID(creator_did);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let seq = checkpoint_seq as u64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let count = event_count as u64;
+
+    let checkpoint = manager
+        .create_governance_checkpoint(
+            &context_id,
+            seq,
+            merkle_root,
+            count,
+            last_event_hash,
+            state_snapshot_hash,
+            &did,
+            creator_signature,
+        )
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("create_governance_checkpoint failed: {e}"),
+                code: "SCP-CTX-2062".to_owned(),
+            })
+        })?;
+
+    serde_json::to_string(&checkpoint).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2062".to_owned(),
+        })
+    })
+}
+
+/// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2063` if cosignature validation fails.
+#[napi(js_name = "contextAddCheckpointCosignature")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_add_checkpoint_cosignature(
+    handle: &NapiContextHandle,
+    checkpoint_json: String,
+    signer_did: String,
+    signature_hex: String,
+) -> napi::Result<String> {
+    let context_id = handle.context_id.clone();
+    let manager = context_manager()?;
+
+    let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+        serde_json::from_str(&checkpoint_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid checkpoint JSON: {e}"),
+                code: "SCP-CTX-2063".to_owned(),
+            })
+        })?;
+
+    let signature = hex::decode(&signature_hex).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid signature hex: {e}"),
+            code: "SCP-CTX-2063".to_owned(),
+        })
+    })?;
+
+    let cosignature = scp_core::context::governance::CosignedCheckpoint {
+        signer_did: DID(signer_did),
+        signature,
+    };
+
+    let status = manager
+        .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("add_checkpoint_cosignature failed: {e}"),
+                code: "SCP-CTX-2063".to_owned(),
+            })
+        })?;
+
+    let response = serde_json::json!({
+        "attestation_status": format!("{status:?}"),
+        "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+    });
+    Ok(response.to_string())
+}
+
+/// Restores a single persisted context from storage.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2064` if restoration fails.
+#[napi(js_name = "contextRestore")]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn context_restore(context_id: String) -> napi::Result<()> {
+    let manager = context_manager()?;
+
+    // Load the persisted snapshot to obtain the correct ContextParams (including
+    // memory_scope). Using ContextParams::default() would give Ephemeral scope,
+    // which would cause incorrect key destruction on subsequent finalize_close.
+    let (snapshot, _broadcast) =
+        manager
+            .load_persisted_context_state(&context_id)
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("restore_context: failed to load persisted state: {e}"),
+                    code: "SCP-CTX-2064".to_owned(),
+                })
+            })?;
+
+    let core_handle = ContextHandle::new(context_id.clone(), snapshot.context_params.clone());
+    let _ = core_handle.transition_to(&ContextState::Active).await;
+
+    manager
+        .restore_context(&context_id, &core_handle)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("restore_context failed: {e}"),
+                code: "SCP-CTX-2064".to_owned(),
+            })
+        })
+}
+
+/// Restores all persisted contexts from storage.
+///
+/// Returns a JSON array of restored context ID strings.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2065` if restoration fails.
+#[napi(js_name = "contextRestoreAll")]
+pub async fn context_restore_all() -> napi::Result<String> {
+    let manager = context_manager()?;
+
+    let restored = manager.restore_all_contexts().await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("restore_all_contexts failed: {e}"),
+            code: "SCP-CTX-2065".to_owned(),
+        })
+    })?;
+
+    serde_json::to_string(&restored).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialization failed: {e}"),
+            code: "SCP-CTX-2065".to_owned(),
+        })
+    })
+}
+
+/// Parses a hex string into a 32-byte array for NAPI bridge.
+fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid {field_name} hex: {e}"),
+            code: "SCP-CTX-2062".to_owned(),
+        })
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("{field_name} must be 32 bytes, got {}", v.len()),
+            code: "SCP-CTX-2062".to_owned(),
+        })
+    })?;
+    Ok(arr)
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions — context migration (§5.11A, #580)
 // ---------------------------------------------------------------------------
 
