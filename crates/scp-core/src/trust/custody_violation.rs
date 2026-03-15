@@ -90,6 +90,26 @@ const CATEGORY_A_RESOURCES: &[&str] = &[
     "key_management",
 ];
 
+/// Returns the closed set of Category A resource types.
+///
+/// These are the UCAN capability resource types that modify the DID document
+/// and therefore require human (`#active`) signing. Exposed for conformance
+/// testing against mirror implementations (e.g. WASM).
+///
+/// # Examples
+///
+/// ```
+/// use scp_core::trust::custody_violation::category_a_resources;
+///
+/// let resources = category_a_resources();
+/// assert!(resources.contains(&"did_document"));
+/// assert!(!resources.contains(&"messages"));
+/// ```
+#[must_use]
+pub const fn category_a_resources() -> &'static [&'static str] {
+    CATEGORY_A_RESOURCES
+}
+
 /// Classifies an action by its UCAN capability resource type.
 ///
 /// Returns [`ActionCategory::CategoryA`] if the resource type modifies the

@@ -113,7 +113,8 @@ pub use consequence::{
 };
 pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationResult,
-    CustodyViolationType, ScpCustodyViolationAttestation, classify_action, enforce_category_a,
+    CustodyViolationType, ScpCustodyViolationAttestation, category_a_resources, classify_action,
+    enforce_category_a,
 };
 #[cfg(feature = "testing")]
 pub use participation::compute_participation_record;
