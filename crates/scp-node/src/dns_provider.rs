@@ -17,10 +17,12 @@
 //! certificate — the protocol still works (relays are untrusted dumb pipes;
 //! MLS provides real confidentiality).
 //!
-//! **Trust model:** Limn sees the node's public IP and node ID (minimal
-//! metadata). Limn cannot read messages (MLS/sender keys). DNS hijack risk
-//! is mitigated by MLS — the relay is untrusted by design. The service is
-//! optional; nodes can use their own domain via `.domain()`.
+//! **Trust model:** Limn sees the node's public IP, node ID, and DID
+//! (minimal metadata). The DID is sent so the API can bind the subdomain
+//! to a specific identity and verify ownership on re-registration. Limn
+//! cannot read messages (MLS/sender keys). DNS hijack risk is mitigated
+//! by MLS — the relay is untrusted by design. The service is optional;
+//! nodes can use their own domain via `.domain()`.
 //!
 //! See issue #642 and spec section 18.6.3.
 
@@ -61,6 +63,10 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 struct RegisterRequest<'a> {
     /// Deterministic node ID derived from the DID (first 8 hex chars of SHA-256).
     node_id: &'a str,
+    /// The node's full DID string. The DNS API uses this to verify ownership
+    /// of the derived node ID (the node ID alone is a truncated hash — the
+    /// full DID is needed for the API to bind the subdomain to this identity).
+    did: &'a str,
     /// Node's public IP address.
     ip: IpAddr,
     /// Port the node listens on for HTTPS.
@@ -283,6 +289,7 @@ impl ScpDnsProvider {
 
         let request_body = RegisterRequest {
             node_id: &node_id,
+            did: &self.did,
             ip: self.public_ip,
             port: self.port,
         };

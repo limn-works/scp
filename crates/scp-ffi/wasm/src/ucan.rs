@@ -969,97 +969,22 @@ pub fn ucan_validate(
 
 /// Mints a new UCAN token for a context member.
 ///
-/// Validates capability URIs and returns an error since UCAN minting
-/// requires key custody (`WebCrypto`), which is managed by the TypeScript SDK.
-/// The bridge validates inputs; the TS wrapper signs.
+/// UCAN minting requires key custody (`WebCrypto`) which is only available
+/// on the JS side. Always returns `SCP-PERM-3000` — use the TypeScript SDK
+/// wrapper's `mintUcan()` method which signs via `SubtleCrypto`.
 ///
 /// # Errors
 ///
-/// Returns `SCP-VALID-7000` if `member_did` fails [`validate_did`]
-/// (empty, malformed `did:{method}:{id}` format, or control characters),
-/// or if `capabilities_json` is not a valid JSON array of capability URI
-/// strings.
+/// Always returns `SCP-PERM-3000` since UCAN minting requires JS-side key custody.
 ///
-/// Returns `SCP-CTX-2001` if the context is not found.
-///
-/// Returns `SCP-PERM-3000` since UCAN minting requires JS-side key custody.
+/// See ADR-016 criterion 3.
 #[wasm_bindgen]
 pub fn ucan_mint(
-    context: &WasmContextHandle,
-    member_did: String,
-    capabilities_json: String,
+    _context: &WasmContextHandle,
+    _member_did: String,
+    _capabilities_json: String,
 ) -> Promise {
-    if let Err(e) = validate_did(&member_did) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
-    }
-    let context_id = context.context_id();
-    future_to_promise(async move {
-        let caps: serde_json::Value = serde_json::from_str(&capabilities_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("capabilities_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            }
-            .into_js()
-        })?;
-
-        if !caps.is_array() {
-            return Err(ScpWasmError::Validation {
-                message: "capabilities_json must be a JSON array of capability URI strings"
-                    .to_owned(),
-                code: "SCP-VALID-7000".to_owned(),
-            }
-            .into_js()
-            .into());
-        }
-
-        let cap_strings: Vec<String> = caps
-            .as_array()
-            .ok_or_else(|| {
-                ScpWasmError::Validation {
-                    message: "capabilities_json must be a JSON array".to_owned(),
-                    code: "SCP-VALID-7000".to_owned(),
-                }
-                .into_js()
-            })?
-            .iter()
-            .map(|v: &serde_json::Value| {
-                v.as_str().map(str::to_owned).ok_or_else(|| {
-                    ScpWasmError::Validation {
-                        message: format!("invalid capability: expected string, got {v}"),
-                        code: "SCP-VALID-7000".to_owned(),
-                    }
-                    .into_js()
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for cap in &cap_strings {
-            CapabilityUri::parse(cap).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("invalid capability URI '{cap}': {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
-                }
-                .into_js()
-            })?;
-        }
-
-        // Verify context exists and member is valid.
-        with_manager(|mgr| {
-            if !mgr.has_context(&context_id) {
-                return Err(ScpWasmError::Context {
-                    message: format!("context '{context_id}' not found"),
-                    code: "SCP-CTX-2001".to_owned(),
-                });
-            }
-            Ok(())
-        })
-        .map_err(ScpWasmError::into_js)?;
-
-        let _ = member_did;
-
-        // UCAN minting requires key custody (WebCrypto), which is managed by
-        // the TypeScript SDK wrapper. The bridge validates inputs; the TS
-        // wrapper signs the token using SubtleCrypto.
+    future_to_promise(async {
         Err(ScpWasmError::Permission {
             message: "UCAN minting requires JS-side key custody (WebCrypto) — use the TypeScript \
                       SDK wrapper's mintUcan() method which signs via SubtleCrypto"
