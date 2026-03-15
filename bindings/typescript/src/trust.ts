@@ -11,7 +11,7 @@
 
 import type { Context } from "./context";
 import { mapBridgeError } from "./errors";
-import { getBridge } from "./internal/bridge";
+import { getBridge, getBridgeSync } from "./internal/bridge";
 import type {
   AttestationSummary,
   BehavioralRecord,
@@ -170,40 +170,74 @@ export async function aggregateTrustInput(input: AggregationInput): Promise<Aggr
 }
 
 // ---------------------------------------------------------------------------
-// Participation verification (spec section 9.3, SCP-BA-004)
+// Participation verification (spec §7.3.2.1, SCP-BA-004)
 // ---------------------------------------------------------------------------
 
 /**
- * Verifies whether a participant meets participation requirements.
+ * Converts a `ParticipationProfile` to the snake_case JSON representation
+ * expected by the Rust bridge (matching `scp-core`'s serde format).
+ */
+function profileToBridgeJson(profile: ParticipationProfile): Record<string, unknown> {
+  return {
+    subject_did: profile.subjectDid,
+    participation_duration_secs: profile.participationDurationSecs,
+    governance_actions_against: profile.governanceActionsAgainst,
+    governance_actions_by: profile.governanceActionsBy,
+    tool_invocation_count: profile.toolInvocationCount,
+    context_creation_count: profile.contextCreationCount,
+    role_progression_count: profile.roleProgressionCount,
+    attestation_count: profile.attestationCount,
+    updated_at: profile.updatedAt,
+    event_log_root: profile.eventLogRoot,
+    signer_public_key: profile.signerPublicKey,
+    signature: profile.signature,
+  };
+}
+
+/**
+ * Converts a `RequireParticipation` to the JSON representation expected by
+ * the Rust bridge (matching `scp-core`'s serde format).
+ */
+function requirementToBridgeJson(requirement: RequireParticipation): Record<string, unknown> {
+  return {
+    fact: requirement.fact,
+    threshold: requirement.threshold,
+    max_age_secs: requirement.maxAgeSecs,
+    min_contexts: requirement.minContexts,
+  };
+}
+
+/**
+ * Verifies participation profiles against admission requirements.
  *
- * Evaluates the participant's profile against the requirement's thresholds.
- * This is a pure function — no bridge call needed.
+ * Delegates to the Rust bridge (`scp-core` via NAPI, or the WASM local
+ * re-implementation), which performs the full verification including:
  *
- * @param requirement - The participation requirement to verify against.
- * @param profile - The participant's participation profile.
- * @returns `true` if requirements are met, `false` otherwise.
+ * 1. Freshness/staleness checking (`maxAgeSecs`).
+ * 2. Distinct signer counting (`minContexts`).
+ * 3. Threshold operator semantics (`ParticipationThreshold`).
+ * 4. Signature verification (NAPI only; WASM defers to WebCrypto).
+ *
+ * Success is indicated by returning without exception. Verification
+ * failures throw an error with diagnostic details.
+ *
+ * @param requirements - The participation requirements to verify against.
+ * @param profiles - The participation profiles to evaluate.
+ * @throws {ValidationError} If verification fails (with diagnostic details).
+ * @throws {ScpError} If the bridge module is not available.
  */
 export function verifyParticipationRequirements(
-  requirement: RequireParticipation,
-  profile: ParticipationProfile,
-): boolean {
-  if (requirement.thresholds.length === 0) {
-    return true;
+  requirements: readonly RequireParticipation[],
+  profiles: readonly ParticipationProfile[],
+): void {
+  const bridge = getBridgeSync();
+
+  const profileJson = JSON.stringify(profiles.map(profileToBridgeJson));
+  const requirementsJson = JSON.stringify(requirements.map(requirementToBridgeJson));
+
+  try {
+    bridge.verifyParticipationRequirements(profileJson, requirementsJson);
+  } catch (error) {
+    throw mapBridgeError(error);
   }
-
-  const results: boolean[] = [];
-  for (const threshold of requirement.thresholds) {
-    const matchingFacts = profile.facts.filter((f) => f.factType === threshold.factType);
-    if (matchingFacts.length === 0) {
-      results.push(false);
-      continue;
-    }
-
-    const totalValue = matchingFacts.reduce((sum, f) => sum + f.value, 0);
-    const meetsMin = totalValue >= threshold.minimum;
-    const meetsMax = threshold.maximum === undefined || totalValue <= threshold.maximum;
-    results.push(meetsMin && meetsMax);
-  }
-
-  return requirement.requireAll ? results.every(Boolean) : results.some(Boolean);
 }

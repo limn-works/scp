@@ -1225,6 +1225,14 @@ export function createNativeBridge(): Bridge {
       return (addon.scpidVerify as (r: string, c: string) => string)(responseJson, challengeJson);
     },
 
+    // Trust — participation verification (SCP-BA-004, §7.3.2.1)
+    verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
+      return (addon.verifyParticipationRequirements as (p: string, r: string) => boolean)(
+        profileJson,
+        requirementsJson,
+      );
+    },
+
     // Lifecycle
     version(): string {
       return (addon.scpVersion as () => string)();

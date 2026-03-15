@@ -723,6 +723,108 @@ describe("Trust evaluation runtime (mock bridge)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 8b. Participation verification (SCP-BA-004, §7.3.2.1)
+// ---------------------------------------------------------------------------
+
+describe("Participation verification (mock bridge)", () => {
+  it("verifyParticipationRequirements delegates to bridge", () => {
+    _setBridge(mockBridge);
+    // Import is deferred so the bridge is set before use.
+    const { verifyParticipationRequirements } =
+      require("../src/trust") as typeof import("../src/trust");
+
+    // Mock bridge always returns true — verify no exception thrown.
+    verifyParticipationRequirements(
+      [
+        {
+          fact: "ParticipationDuration",
+          threshold: { AtLeast: 0 },
+          maxAgeSecs: 3600,
+          minContexts: 1,
+        },
+      ],
+      [
+        {
+          subjectDid: "did:dht:z6MkAlice",
+          participationDurationSecs: 3600,
+          governanceActionsAgainst: 0,
+          governanceActionsBy: 0,
+          toolInvocationCount: 0,
+          contextCreationCount: 0,
+          roleProgressionCount: 0,
+          attestationCount: 0,
+          updatedAt: Math.floor(Date.now() / 1000),
+          eventLogRoot: new Array(32).fill(0),
+          signerPublicKey: new Array(32).fill(1),
+          signature: new Array(64).fill(2),
+        },
+      ],
+    );
+    // If we reach here without throwing, the test passes.
+  });
+
+  it("constructs correct bridge JSON for ParticipationProfile", () => {
+    _setBridge(mockBridge);
+
+    // Override mock to capture the JSON arguments.
+    let capturedProfileJson = "";
+    let capturedRequirementsJson = "";
+    (mockBridge as Record<string, unknown>).verifyParticipationRequirements = (
+      profileJson: string,
+      requirementsJson: string,
+    ): boolean => {
+      capturedProfileJson = profileJson;
+      capturedRequirementsJson = requirementsJson;
+      return true;
+    };
+
+    const { verifyParticipationRequirements } =
+      require("../src/trust") as typeof import("../src/trust");
+
+    verifyParticipationRequirements(
+      [
+        {
+          fact: "ToolInvocationCount",
+          threshold: { GreaterThan: 50 },
+          maxAgeSecs: 7200,
+          minContexts: 3,
+        },
+      ],
+      [
+        {
+          subjectDid: "did:dht:z6MkBob",
+          participationDurationSecs: 100,
+          governanceActionsAgainst: 1,
+          governanceActionsBy: 2,
+          toolInvocationCount: 55,
+          contextCreationCount: 0,
+          roleProgressionCount: 0,
+          attestationCount: 0,
+          updatedAt: 1700000000,
+          eventLogRoot: new Array(32).fill(0),
+          signerPublicKey: new Array(32).fill(1),
+          signature: new Array(64).fill(2),
+        },
+      ],
+    );
+
+    // Verify the JSON matches the Rust serde format (snake_case).
+    const profiles = JSON.parse(capturedProfileJson) as Record<string, unknown>[];
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0].subject_did).toBe("did:dht:z6MkBob");
+    expect(profiles[0].participation_duration_secs).toBe(100);
+    expect(profiles[0].tool_invocation_count).toBe(55);
+
+    const requirements = JSON.parse(capturedRequirementsJson) as Record<string, unknown>[];
+    expect(requirements).toHaveLength(1);
+    expect(requirements[0].fact).toBe("ToolInvocationCount");
+    expect(requirements[0].threshold).toEqual({ GreaterThan: 50 });
+    expect(requirements[0].max_age_secs).toBe(7200);
+    expect(requirements[0].min_contexts).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 9. End-to-end scenario: full context lifecycle
 // ---------------------------------------------------------------------------
 
