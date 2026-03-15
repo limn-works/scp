@@ -533,6 +533,9 @@ pub fn py_bridge_claim_shadow(
 /// * `sequence` -- The per-sender monotonic sequence number (AAD binding).
 /// * `platform_message_id` -- Optional platform message ID for correlation.
 /// * `platform_timestamp` -- Optional platform-reported timestamp.
+/// * `attributed_role` -- Optional role for the shadow (defaults to `"observer"`).
+/// * `provenance_status` -- Optional provenance status: `"shadow"` or
+///   `"claimed"`. Defaults to `"shadow"` (#1166).
 ///
 /// # Returns
 ///
@@ -558,7 +561,8 @@ pub fn py_bridge_claim_shadow(
     sequence,
     platform_message_id=None,
     platform_timestamp=None,
-    attributed_role=None
+    attributed_role=None,
+    provenance_status=None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn py_bridge_seal_shadow_envelope(
@@ -576,6 +580,7 @@ pub fn py_bridge_seal_shadow_envelope(
     platform_message_id: Option<String>,
     platform_timestamp: Option<u64>,
     attributed_role: Option<String>,
+    provenance_status: Option<String>,
 ) -> PyResult<String> {
     crate::validate::validate_context_id(context_id)?;
     crate::validate::validate_did(operator_did)?;
@@ -598,12 +603,17 @@ pub fn py_bridge_seal_shadow_envelope(
     );
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
+    let status = match provenance_status.as_deref() {
+        Some(s) => parse_shadow_status(s)?,
+        None => ShadowProvenanceStatus::Shadow,
+    };
+
     let shadow = ShadowIdentity {
         shadow_id: shadow_id.to_string(),
         platform_handle: platform_handle.to_string(),
         bridge_id: bridge_id.to_string(),
         attributed_role: attributed_role.unwrap_or_else(|| "observer".to_string()),
-        provenance_status: ShadowProvenanceStatus::Shadow,
+        provenance_status: status,
         created_at: 0,
     };
 
@@ -1824,7 +1834,8 @@ mod tests {
             1,
             Some("msg-001".to_owned()),
             Some(1_700_000_000),
-            None,
+            None, // attributed_role — defaults to "observer"
+            None, // provenance_status — defaults to "shadow"
         )
         .unwrap();
 
@@ -1865,6 +1876,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1893,6 +1905,7 @@ mod tests {
             "ctx-test",
             0,
             1,
+            None,
             None,
             None,
             None,

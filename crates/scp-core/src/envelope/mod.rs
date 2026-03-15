@@ -81,12 +81,22 @@ pub enum VersionCompatibility {
 
 impl VersionCompatibility {
     /// Returns `true` if this result indicates degraded mode (§13.6).
+    ///
+    /// NOTE: This helper has no production callers yet. The envelope receive
+    /// path in each FFI bridge must call this (and [`report_degraded_mode`] on
+    /// `ContextManager`) after deserializing an incoming envelope. Tracked by
+    /// issue #1077 (FFI exposure of version-compatibility helpers).
+    ///
+    /// [`report_degraded_mode`]: crate::context::ContextManager::report_degraded_mode
     #[must_use]
     pub const fn is_degraded(&self) -> bool {
         matches!(self, Self::DegradedMode { .. })
     }
 
     /// Returns `true` if this result indicates exact version match.
+    ///
+    /// NOTE: No production callers yet — see [`is_degraded`](Self::is_degraded)
+    /// and issue #1077.
     #[must_use]
     pub const fn is_exact(&self) -> bool {
         matches!(self, Self::Exact)
@@ -94,6 +104,9 @@ impl VersionCompatibility {
 
     /// Returns the local and remote minor versions if degraded, or `None` if
     /// the versions match exactly.
+    ///
+    /// NOTE: No production callers yet — see [`is_degraded`](Self::is_degraded)
+    /// and issue #1077.
     #[must_use]
     pub const fn degraded_versions(&self) -> Option<(u8, u8)> {
         match self {

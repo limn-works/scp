@@ -3038,6 +3038,10 @@ impl ContextManager {
     /// event is emitted). If the context is not registered, this is also a
     /// no-op.
     ///
+    /// NOTE: No production callers yet. Each FFI bridge's envelope receive path
+    /// must call this after `check_version_compatibility` returns `DegradedMode`.
+    /// Tracked by issue #1077 (FFI exposure of version-compatibility helpers).
+    ///
     /// # Arguments
     ///
     /// * `context_id` — The context where the envelope was received.
