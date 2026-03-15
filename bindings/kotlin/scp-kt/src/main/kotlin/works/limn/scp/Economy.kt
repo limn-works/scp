@@ -9,6 +9,7 @@ package works.limn.scp
  *
  * See spec section 19 (Economic Governance) and ADR-033.
  */
+@Suppress("TooManyFunctions")
 object Economy {
     // -----------------------------------------------------------------------
     // Cost estimation
@@ -157,6 +158,7 @@ object Economy {
      * @param cap Optional maximum cost.
      * @return Escalated cost.
      */
+    @Suppress("LongParameterList")
     suspend fun antispamEscalatedCost(
         contextId: String,
         senderDid: String,

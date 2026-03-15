@@ -1943,4 +1943,5 @@ class InfraBridge internal constructor(
 class BridgeException(
     message: String,
     val code: String,
-) : Exception(message)
+    cause: Throwable? = null,
+) : Exception(message, cause)

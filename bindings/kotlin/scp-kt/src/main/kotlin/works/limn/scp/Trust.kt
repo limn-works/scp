@@ -7,6 +7,8 @@
 //
 // Provenance: §7.3 (Trust Aggregation), ADR-017
 
+@file:Suppress("MatchingDeclarationName")
+
 package works.limn.scp
 
 import works.limn.scp.bridge.CoroutineBridge
@@ -33,6 +35,7 @@ interface TrustBindings {
      * @return JSON string containing the serialized TrustInput.
      * @throws BridgeException if inputs are malformed or aggregation fails.
      */
+    @Suppress("LongParameterList")
     fun aggregateTrustInput(
         contextId: String,
         subjectDid: String,

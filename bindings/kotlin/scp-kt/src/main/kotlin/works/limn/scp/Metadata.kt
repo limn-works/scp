@@ -29,6 +29,7 @@ interface MetadataBindings {
      * @return JSON string of the MetadataRecord.
      * @throws BridgeException if any input is malformed.
      */
+    @Suppress("LongParameterList")
     fun metadataRecordToJson(
         contextId: String,
         sequence: ULong,
@@ -92,6 +93,7 @@ class MetadataBridge internal constructor(
      *
      * @see MetadataBindings.metadataRecordToJson
      */
+    @Suppress("LongParameterList")
     suspend fun metadataRecordToJson(
         contextId: String,
         sequence: ULong,

@@ -215,7 +215,8 @@ class ConformanceStubBindings : NativeBindings {
         toolId: String,
         targetContextId: String,
         rateLimitJson: String?,
-    ): String = """{"source_context":"ctx-src","target_context":"$targetContextId","tool_id":"$toolId","approved_by_source":true,"approved_by_target":false}"""
+    ): String = """{"source_context":"ctx-src","target_context":"$targetContextId",""" +
+        """"tool_id":"$toolId","approved_by_source":true,"approved_by_target":false}"""
 
     override fun toolInterfaceAccept(
         contextHandle: Long,

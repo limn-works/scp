@@ -5,6 +5,8 @@
 //
 // Provenance: §5.7 (Context Invitation), `.docs/standards/sdk-common.md`
 
+@file:Suppress("MatchingDeclarationName")
+
 package works.limn.scp
 
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +40,7 @@ data class InvitationEvaluationResult(val decision: String) {
  * @return An [InvitationEvaluationResult] with the pipeline decision.
  * @throws works.limn.scp.bridge.BridgeException if evaluation fails.
  */
+@Suppress("LongParameterList")
 suspend fun evaluateContextInvitation(
     paramsJson: String,
     inviterDid: String,
@@ -61,6 +64,7 @@ suspend fun evaluateContextInvitation(
         throw works.limn.scp.bridge.BridgeException(
             message = e.message ?: "invitation evaluation failed",
             code = "SCP-CTX-2060",
+            cause = e,
         )
     }
 }
