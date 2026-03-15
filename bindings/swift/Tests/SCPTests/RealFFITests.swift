@@ -975,7 +975,8 @@ struct RealFFIIdentityAndContextTests {
             """,
             operatorDid: identity.did(),
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
 
         let toolId = try await toolRegister(handle: handle, definition: definition)
@@ -1019,7 +1020,8 @@ struct RealFFIIdentityAndContextTests {
             """,
             operatorDid: identity.did(),
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
 
         let toolId = try await toolRegister(handle: handle, definition: definition)
@@ -1052,7 +1054,8 @@ struct RealFFIIdentityAndContextTests {
             """,
             operatorDid: identity.did(),
             testVectorsJson: nil,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
 
         let toolId = try await toolRegister(handle: handle, definition: definition)
@@ -1168,7 +1171,7 @@ struct RealFFIUcanAndGovernanceTests {
         try await ucanRevoke(
             handle: handle,
             token: testToken,
-            revokerDid: identity.did
+            revokerDid: identity.did()
         )
     }
 
@@ -1590,7 +1593,8 @@ struct RealFFITypeShapeTests {
             outputSchemaJson: "{\"type\":\"object\"}",
             operatorDid: "did:dht:z6MkOperator",
             testVectorsJson: "[{\"input\":\"{}\",\"output\":\"{}\"}]",
-            implementationHash: Data(repeating: 0xFF, count: 32)
+            implementationHash: Data(repeating: 0xFF, count: 32),
+            cost: nil
         )
         #expect(def.name == "test-tool")
         #expect(def.operatorDid == "did:dht:z6MkOperator")
