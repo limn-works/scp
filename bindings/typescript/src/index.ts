@@ -162,6 +162,27 @@ export {
 } from "./provenance";
 
 // ---------------------------------------------------------------------------
+// Economy
+// ---------------------------------------------------------------------------
+
+export type { ObservableMetrics, PaidActionType, RelayPriceAdjustment } from "./economy";
+export {
+  adjustRelayPrice,
+  antispamEscalatedCost,
+  antispamRecord,
+  antispamVelocity,
+  autoAcceptBlocked,
+  budgetGrant,
+  budgetRecordSpend,
+  budgetRemaining,
+  checkPolicyLock,
+  estimateCost,
+  evaluateFormula,
+  policyRequiresPayment,
+  validatePolicyChange,
+} from "./economy";
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
