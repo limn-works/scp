@@ -252,4 +252,14 @@ mod tests {
         decrement_handle_count();
         assert_eq!(HANDLE_COUNT.load(Ordering::SeqCst), baseline);
     }
+
+    #[test]
+    fn handle_count_saturates_at_zero() {
+        let baseline = HANDLE_COUNT.load(Ordering::SeqCst);
+        // Extra decrement when already at baseline should not underflow
+        decrement_handle_count();
+        let after = HANDLE_COUNT.load(Ordering::SeqCst);
+        // Should be at most baseline (saturated, not wrapped to usize::MAX)
+        assert!(after <= baseline, "expected saturated at {baseline}, got {after}");
+    }
 }
