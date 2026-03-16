@@ -3,40 +3,44 @@
 import asyncio
 
 from scp_sdk import Context, Identity
+from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 
 async def main() -> None:
-    # Create two identities
-    alice = await Identity.create(custody="platform")
-    bob = await Identity.create(custody="platform")
+    # Create two identities (in_memory custody for examples)
+    alice = await Identity.create(custody=CustodyType.IN_MEMORY)
+    bob = await Identity.create(custody=CustodyType.IN_MEMORY)
     print(f"Alice DID: {alice.did}")
     print(f"Bob DID: {bob.did}")
 
     # Alice creates a context
-    ctx_alice = await Context.create(
-        identity=alice,
-        params={
-            "ceiling": ["msg:send", "msg:receive"],
-            "ttl": 3600,
-            "governance": "single_admin",
-        },
-    )
-    print(f"Context ID: {ctx_alice.context_id}")
+    async with await Context.create(
+        creator=alice,
+        ceiling=[Capability.MESSAGES_READ, Capability.MESSAGES_WRITE, Capability.MEMBER_INVITE],
+        memory_scope=MemoryScope.EPHEMERAL,
+        governance="single_admin",
+        ttl=3600.0,
+    ) as ctx:
+        print(f"Context ID: {ctx.context_id}")
 
-    # Bob joins the context
-    ctx_bob = await Context.join(identity=bob, context_id=ctx_alice.context_id)
+        # Bob joins the context (admin adds bob via the context instance)
+        membership = await ctx.join(bob)
+        print(f"Bob joined as: {membership.role}")
 
-    # Alice sends a message
-    await ctx_alice.send(b"Hello Bob, this is Alice")
+        # Alice sends a message
+        await ctx.send(b"Hello Bob, this is Alice")
 
-    # Bob receives it
-    async for msg in ctx_bob.receive():
-        print(f"Bob received from {msg.sender_did}: {msg.content.decode()}")
-        break
+        # Bob receives it
+        receiver = await ctx.receive()
+        async for msg in receiver:
+            print(f"Bob received from {msg.sender_did}: {msg.content!r}")
+            break
 
-    # Cleanup
-    await ctx_bob.leave()
-    await ctx_alice.close()
+        # Bob leaves
+        await ctx.leave(bob)
+
+        # Alice closes the context
+        await ctx.close(alice)
 
 
 if __name__ == "__main__":

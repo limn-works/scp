@@ -3,39 +3,51 @@
 import asyncio
 
 from scp_sdk import Context, Identity
+from scp_sdk.types import Capability, CustodyType, MemoryScope
 from scp_sdk.ucan import mint
 
 
 async def run_agent(name: str, identity: Identity, ctx: Context) -> None:
     """Agent loop: join context, listen for messages, respond."""
-    _membership = await ctx.join(identity)
-    print(f"[{name}] Joined context {ctx.context_id}")
+    membership = await ctx.join(identity)
+    print(f"[{name}] Joined context {ctx.context_id} as {membership.role}")
 
-    await ctx.send(f"[{name}] reporting in".encode())
+    await ctx.send(f"[{name}] reporting in".encode(), identity=identity)
 
     count = 0
-    async for msg in ctx.receive():
+    receiver = await ctx.receive()
+    async for msg in receiver:
         sender = msg.sender_did[:16]
-        print(f"[{name}] Received from {sender}...: {msg.content.decode()}")
+        print(f"[{name}] Received from {sender}...: {msg.content!r}")
         count += 1
         if count >= 2:
             break
 
-    await ctx.leave()
+    await ctx.leave(identity)
     print(f"[{name}] Left context")
 
 
 async def main() -> None:
     # Create identities for coordinator and two agents
-    coordinator = await Identity.create(custody="platform")
-    agent_a = await Identity.create(custody="platform")
-    agent_b = await Identity.create(custody="platform")
+    coordinator = await Identity.create(custody=CustodyType.IN_MEMORY)
+    agent_a = await Identity.create(custody=CustodyType.IN_MEMORY)
+    agent_b = await Identity.create(custody=CustodyType.IN_MEMORY)
 
-    # Coordinator creates the context with agent capabilities
+    # Coordinator creates the context with broad capabilities so agents can
+    # be invited and participate.  single_admin governance means the
+    # coordinator (creator) must add members via ctx.join().
     ctx = await Context.create(
         creator=coordinator,
-        ceiling=["messages:write", "messages:read", "tool:invoke:*"],
+        ceiling=[
+            Capability.MESSAGES_READ,
+            Capability.MESSAGES_WRITE,
+            Capability.TOOL_INVOKE_ALL,
+            Capability.MEMBER_INVITE,
+            Capability.MEMBER_REMOVE,
+            Capability.ROLE_ASSIGN,
+        ],
         roles={"agent": ["messages:write", "messages:read", "tool:invoke:*"]},
+        memory_scope=MemoryScope.EPHEMERAL,
         governance="single_admin",
     )
     print(f"Context created: {ctx.context_id}")
@@ -58,7 +70,7 @@ async def main() -> None:
         run_agent("Agent-B", agent_b, ctx),
     )
 
-    await ctx.close()
+    await ctx.close(coordinator)
 
 
 if __name__ == "__main__":
