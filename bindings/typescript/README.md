@@ -72,6 +72,23 @@ See [`examples/`](./examples/) for runnable scripts:
 | `tool-invocation.ts` | Register and invoke a tool with test vectors |
 | `mcp-integration.ts` | Expose SCP tools via MCP JSON-RPC server |
 | `multi-agent.ts` | Coordinate multiple agents in a shared context |
+| `node-demo.ts` | End-to-end NAPI demo: identity, context, messaging, membership |
+
+### Quick Start (Node.js/Bun)
+
+```bash
+# Build the native addon
+cargo build -p scp-ffi-napi --release --features allow_in_memory_custody
+
+# Wire into node_modules (macOS arm64 — adjust for your platform)
+PKG_DIR="node_modules/@limn-works/scp-ts-napi-darwin-arm64"
+mkdir -p "$PKG_DIR"
+cp ../../target/release/libscp_ffi_napi.dylib "$PKG_DIR/index.node"
+echo '{"name":"@limn-works/scp-ts-napi-darwin-arm64","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
+
+# Run the demo
+bun run examples/node-demo.ts
+```
 
 ## Error Handling
 
