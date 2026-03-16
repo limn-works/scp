@@ -2319,7 +2319,7 @@ mod tests {
     fn setup_test_context(creator_did: &str, with_tool: bool) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
-        crate::runtime::register_context(&ctx_id, creator_did).unwrap();
+        crate::runtime::register_context(&ctx_id, creator_did, &[]).unwrap();
 
         if with_tool {
             crate::runtime::with_context(&ctx_id, |rt| {

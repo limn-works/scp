@@ -4838,7 +4838,7 @@ mod wasm_role_broadcast_mirror {
                 "messages:read",
                 "messages:write",
                 "tool:register",
-                "tool:invoke:*",
+                "tool_invoke:*",
                 "role:assign",
                 "member:invite",
                 "member:remove",
@@ -4876,7 +4876,7 @@ mod wasm_role_broadcast_mirror {
                         capability,
                         "messages:read"
                             | "messages:write"
-                            | "tool:invoke:*"
+                            | "tool_invoke:*"
                             | "member:remove"
                             | "governance:propose"
                     );
@@ -4885,14 +4885,14 @@ mod wasm_role_broadcast_mirror {
                 "author" => {
                     let role_grants = matches!(
                         capability,
-                        "messages:write" | "messages:read" | "tool:invoke:*"
+                        "messages:write" | "messages:read" | "tool_invoke:*"
                     );
                     role_grants && in_ceiling(capability)
                 }
                 "member" => {
                     let role_grants = matches!(
                         capability,
-                        "messages:read" | "messages:write" | "tool:invoke:*"
+                        "messages:read" | "messages:write" | "tool_invoke:*"
                     );
                     role_grants && in_ceiling(capability)
                 }
@@ -5102,7 +5102,7 @@ fn moderator_has_governance_propose_capability() {
     // And the standard messaging + tool capabilities.
     assert!(ctx.member_has_capability(did, "messages:read"));
     assert!(ctx.member_has_capability(did, "messages:write"));
-    assert!(ctx.member_has_capability(did, "tool:invoke:*"));
+    assert!(ctx.member_has_capability(did, "tool_invoke:*"));
     // But NOT admin-only capabilities.
     assert!(
         !ctx.member_has_capability(did, "context:close"),
@@ -5133,15 +5133,15 @@ fn subscriber_has_messages_read_only() {
         !ctx.member_has_capability(did, "messages:write"),
         "subscriber should NOT have messages:write"
     );
-    // And NOT tool:invoke:*.
+    // And NOT tool_invoke:*.
     assert!(
-        !ctx.member_has_capability(did, "tool:invoke:*"),
-        "subscriber should NOT have tool:invoke:*"
+        !ctx.member_has_capability(did, "tool_invoke:*"),
+        "subscriber should NOT have tool_invoke:*"
     );
 }
 
 // ===========================================================================
-// Test: member role includes tool:invoke:* (intersected with ceiling)
+// Test: member role includes tool_invoke:* (intersected with ceiling)
 // ===========================================================================
 
 #[test]
@@ -5156,8 +5156,8 @@ fn member_has_tool_invoke_all_capability() {
     assert!(ctx.member_has_capability(did, "messages:read"));
     assert!(ctx.member_has_capability(did, "messages:write"));
     assert!(
-        ctx.member_has_capability(did, "tool:invoke:*"),
-        "member should have tool:invoke:* capability"
+        ctx.member_has_capability(did, "tool_invoke:*"),
+        "member should have tool_invoke:* capability"
     );
     // But NOT governance:propose (that's moderator+).
     assert!(
@@ -5167,8 +5167,8 @@ fn member_has_tool_invoke_all_capability() {
 }
 
 // ===========================================================================
-// Test: member role respects ceiling — removing tool:invoke:* from ceiling
-// should deny tool:invoke:*
+// Test: member role respects ceiling — removing tool_invoke:* from ceiling
+// should deny tool_invoke:*
 // ===========================================================================
 
 #[test]
@@ -5178,18 +5178,18 @@ fn member_capability_ceiling_intersection() {
     let mut ctx = PerContextState::new_with_default_ceiling(None);
     let did = "did:key:member-002";
 
-    // Remove tool:invoke:* from ceiling.
-    ctx.ceiling_strings.remove("tool:invoke:*");
+    // Remove tool_invoke:* from ceiling.
+    ctx.ceiling_strings.remove("tool_invoke:*");
 
     ctx.add_member(did, "member");
 
     // messages:read/write should still work.
     assert!(ctx.member_has_capability(did, "messages:read"));
     assert!(ctx.member_has_capability(did, "messages:write"));
-    // tool:invoke:* should be denied (not in ceiling).
+    // tool_invoke:* should be denied (not in ceiling).
     assert!(
-        !ctx.member_has_capability(did, "tool:invoke:*"),
-        "member should NOT have tool:invoke:* when tool:invoke:* is removed from ceiling"
+        !ctx.member_has_capability(did, "tool_invoke:*"),
+        "member should NOT have tool_invoke:* when tool_invoke:* is removed from ceiling"
     );
 }
 

@@ -440,7 +440,10 @@ pub async fn context_create(
         state: std::sync::Mutex::new(ContextState::Active),
         creator_did,
         mode: mode_str,
-        ceiling,
+        ceiling: ceiling
+            .iter()
+            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+            .collect(),
         ceiling_policy,
         ttl_seconds,
         promotion_policy,

@@ -349,19 +349,26 @@ impl Default for UcanHeader {
 /// A single capability grant within a UCAN token.
 ///
 /// Each attenuation specifies a resource URI and an action. The resource URI
-/// follows the SCP capability URI format: `scp:ctx:{context_id}/{capability}`.
-/// The action is one of `"invoke"`, `"read"`, or `"write"`.
+/// follows the SCP capability URI format: `scp:ctx:{context_id}/{resource}:{action}`,
+/// where compound resources use underscores (e.g. `tool_invoke`, `context_child`).
 ///
-/// See ADR-016 acceptance criterion 4.
+/// The `can` field holds the action portion (e.g. `"*"`, `"calculator"`,
+/// `"write"`, `"propose"`). See [`CapabilityUri`](capability::CapabilityUri)
+/// for the full URI format and [`Capability::ucan_resource_action`](crate::context::roles::Capability::ucan_resource_action)
+/// for the mapping from canonical colon-format to UCAN format.
+///
+/// See ADR-016 acceptance criterion 4 and #1293.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attenuation {
-    /// Resource URI: `scp:ctx:{context_id}/{capability}`.
+    /// Resource URI: `scp:ctx:{context_id}/{resource}:{action}`.
     ///
     /// Examples:
     /// - `"scp:ctx:abc123/messages:write"`
+    /// - `"scp:ctx:abc123/tool_invoke:*"`
     /// - `"scp:ctx:*/messages:write"` (wildcard — all contexts)
     pub with: String,
-    /// Action: `"invoke"`, `"read"`, or `"write"`.
+    /// Action on the resource (e.g. `"*"`, `"write"`, `"calculator"`,
+    /// `"propose"`). This is the action portion extracted from the `with` URI.
     pub can: String,
 }
 

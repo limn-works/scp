@@ -379,10 +379,13 @@ pub fn ensure_ucan_registered(context_id: &str, creator_did: &str, ceiling: &[St
         scp_core::context::roles::default_ceiling()
             .capabilities
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(scp_core::context::roles::Capability::ucan_capability_name)
             .collect::<HashSet<String>>()
     } else {
-        ceiling.iter().cloned().collect::<HashSet<String>>()
+        ceiling
+            .iter()
+            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+            .collect::<HashSet<String>>()
     };
 
     let event_log = EventLog::new(context_id.to_owned());

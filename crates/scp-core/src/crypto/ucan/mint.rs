@@ -262,20 +262,28 @@ pub async fn mint_ucan(
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
     }
 
+    // Convert capability strings to UCAN resource/action pairs. This bridges
+    // the canonical user-facing colon format (e.g. "tool:invoke:*") to the
+    // UCAN underscore format (e.g. resource="tool_invoke", action="*") by
+    // parsing through the Capability enum. See #1293.
+    let parsed_caps: Vec<(String, String)> = params
+        .capabilities
+        .iter()
+        .map(|cap| {
+            let capability = crate::context::roles::Capability::new(cap);
+            let (resource, action) = capability.ucan_resource_action();
+            (resource.into_owned(), action.into_owned())
+        })
+        .collect();
+
     // Enforce ceiling compliance before doing any work (§5.3, #339).
     if let Some(ref ceiling) = params.ceiling {
-        let cap_uris: Vec<CapabilityUri> = params
-            .capabilities
+        let cap_uris: Vec<CapabilityUri> = parsed_caps
             .iter()
-            .map(|cap| {
-                let (resource, action) = cap.split_once(':').ok_or_else(|| {
-                    UcanError::MalformedToken(format!(
-                        "capability must be in 'resource:action' format, got: {cap}"
-                    ))
-                })?;
-                Ok(CapabilityUri::new(params.context_id, resource, action))
+            .map(|(resource, action)| {
+                CapabilityUri::new(params.context_id, resource.as_str(), action.as_str())
             })
-            .collect::<Result<Vec<_>, UcanError>>()?;
+            .collect();
         verify_ceiling_compliance(&cap_uris, ceiling)?;
     }
 
@@ -283,22 +291,17 @@ pub async fn mint_ucan(
     let exp = now + params.lifetime_secs;
 
     // Build attestations from capabilities, scoped to the context.
-    // Validate capability format: must be "resource:action".
-    let att: Vec<Attenuation> = params
-        .capabilities
+    // Uses UCAN resource/action format for correct URI construction (#1293).
+    let att: Vec<Attenuation> = parsed_caps
         .iter()
-        .map(|cap| {
-            let (_resource, action) = cap.split_once(':').ok_or_else(|| {
-                UcanError::MalformedToken(format!(
-                    "capability must be in 'resource:action' format, got: {cap}"
-                ))
-            })?;
-            Ok(Attenuation {
-                with: format!("scp:ctx:{}/{cap}", params.context_id),
-                can: action.to_owned(),
-            })
+        .map(|(resource, action)| {
+            let ucan_cap = format!("{resource}:{action}");
+            Attenuation {
+                with: format!("scp:ctx:{}/{ucan_cap}", params.context_id),
+                can: action.clone(),
+            }
         })
-        .collect::<Result<Vec<_>, UcanError>>()?;
+        .collect();
 
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence over key_scope for the kid
@@ -2844,6 +2847,190 @@ mod tests {
         assert!(
             delegate_ucan(&delegate_params, &bob_custody).await.is_ok(),
             "delegation narrowing within ceiling must succeed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1293 — UCAN capability URI resource/action split
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mint_ucan_tool_invoke_produces_underscore_resource() {
+        // Minting with the colon-format name "tool:invoke:*" must produce
+        // a UCAN URI with resource "tool_invoke", not "tool".
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["tool:invoke:*".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1293",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // The attestation URI must use underscore format.
+        assert_eq!(
+            token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:*",
+            "tool:invoke:* must produce tool_invoke:* in UCAN URI"
+        );
+        assert_eq!(token.payload.att[0].can, "*");
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_tool_invoke_specific_produces_underscore_resource() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["tool:invoke:calculator".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1293",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        assert_eq!(
+            token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:calculator",
+            "tool:invoke:calculator must produce tool_invoke:calculator in UCAN URI"
+        );
+        assert_eq!(token.payload.att[0].can, "calculator");
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_child_context_create_produces_underscore_resource() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["context:child:create".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1293",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        assert_eq!(
+            token.payload.att[0].with, "scp:ctx:ctx-1293/context_child:create",
+            "context:child:create must produce context_child:create in UCAN URI"
+        );
+        assert_eq!(token.payload.att[0].can, "create");
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_simple_cap_unchanged() {
+        // Capabilities without multi-segment resources should be unchanged.
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1293",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        assert_eq!(
+            token.payload.att[0].with, "scp:ctx:ctx-1293/messages:write",
+            "simple capabilities must pass through unchanged"
+        );
+        assert_eq!(token.payload.att[0].can, "write");
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_tool_invoke_passes_ceiling_check() {
+        // A ceiling with UCAN-format entries must accept tool:invoke:* capabilities.
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["tool:invoke:*".to_owned()];
+
+        let mut ceiling = HashSet::new();
+        ceiling.insert("tool_invoke:*".to_owned());
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1293",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+        };
+
+        assert!(
+            mint_ucan(&params, &custody).await.is_ok(),
+            "tool:invoke:* must pass ceiling check with tool_invoke:* in ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_tool_invoke_rejected_when_not_in_ceiling() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["tool:invoke:*".to_owned()];
+
+        let mut ceiling = HashSet::new();
+        ceiling.insert("messages:write".to_owned());
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1293",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+        };
+
+        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityOutsideCeiling(_)),
+            "tool:invoke:* must be rejected when not in ceiling: {err:?}"
         );
     }
 }

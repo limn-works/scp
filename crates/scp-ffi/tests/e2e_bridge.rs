@@ -98,7 +98,7 @@ fn create_test_identity() -> String {
 fn create_test_context(creator_did: &str) -> String {
     setup();
     let context_id = random_context_id();
-    runtime::register_context(&context_id, creator_did).unwrap();
+    runtime::register_context(&context_id, creator_did, &[]).unwrap();
 
     let rt = test_runtime();
     let mgr = runtime::context_manager().unwrap().clone();

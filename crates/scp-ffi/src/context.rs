@@ -758,7 +758,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
     // in the global FFI state registry so that tools/UCAN/event_log bridge functions
     // can look them up by context ID. Also initializes the shared ContextManager.
-    crate::runtime::register_context(&context_id, identity_did)
+    crate::runtime::register_context(&context_id, identity_did, &parsed.ceiling)
         .map_err(|e| PyRuntimeError::new_err(format!("failed to register context state: {e}")))?;
 
     // Delegate context creation to the shared ContextManager for lifecycle tracking.
@@ -3669,7 +3669,7 @@ mod tests {
     async fn deliver_message_via_runtime() {
         let context_id = "ctx-deliver-test";
 
-        crate::runtime::register_context(context_id, "did:test:creator").unwrap();
+        crate::runtime::register_context(context_id, "did:test:creator", &[]).unwrap();
 
         let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -3702,7 +3702,7 @@ mod tests {
         let context_id = "ctx-overflow-deliver";
         let capacity = RECEIVE_BUFFER_CAPACITY;
 
-        crate::runtime::register_context(context_id, "did:test:creator").unwrap();
+        crate::runtime::register_context(context_id, "did:test:creator", &[]).unwrap();
 
         let (tx, rx) = mpsc::channel::<PyMessage>(capacity);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -3756,7 +3756,7 @@ mod tests {
         crate::init_runtime().ok();
         let context_id = "ctx-leave-close";
 
-        crate::runtime::register_context(context_id, "did:test:creator").unwrap();
+        crate::runtime::register_context(context_id, "did:test:creator", &[]).unwrap();
 
         let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -4073,7 +4073,7 @@ mod tests {
         crate::init_runtime().ok();
         let ctx_id = format!("sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync1";
-        crate::runtime::register_context(&ctx_id, creator).unwrap();
+        crate::runtime::register_context(&ctx_id, creator, &[]).unwrap();
         let mgr = crate::runtime::context_manager().unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
@@ -4132,7 +4132,7 @@ mod tests {
         crate::init_runtime().ok();
         let ctx_id = format!("sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync2";
-        crate::runtime::register_context(&ctx_id, creator).unwrap();
+        crate::runtime::register_context(&ctx_id, creator, &[]).unwrap();
         let mgr = crate::runtime::context_manager().unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
@@ -4184,7 +4184,7 @@ mod tests {
         let ctx_id = format!("sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync3";
         let target = "did:key:z6MkRemoveTarget";
-        crate::runtime::register_context(&ctx_id, creator).unwrap();
+        crate::runtime::register_context(&ctx_id, creator, &[]).unwrap();
         let mgr = crate::runtime::context_manager().unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {

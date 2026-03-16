@@ -516,15 +516,18 @@ impl PerContextState {
     /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
     /// default role system (see `builtin_*` functions in scp-core roles.rs):
     /// - "admin" — all capabilities in the ceiling.
-    /// - "moderator" — messages:read, messages:write, `tool:invoke:*`,
+    /// - "moderator" — messages:read, messages:write, `tool_invoke:*`,
     ///   member:remove, governance:propose (§5.9 elected moderators pattern).
-    /// - "member" — messages:read, messages:write, `tool:invoke:*`.
-    /// - "author" — messages:write, messages:read, `tool:invoke:*`.
+    /// - "member" — messages:read, messages:write, `tool_invoke:*`.
+    /// - "author" — messages:write, messages:read, `tool_invoke:*`.
     /// - "observer" — messages:read only.
     /// - "subscriber" — messages:read only (broadcast contexts).
     ///
-    /// Capability strings use the format `"{resource}:{action}"` (e.g.
-    /// `"context:close"`, `"messages:write"`).
+    /// Capability strings use the UCAN `{resource}:{action}` format where
+    /// compound resources use underscores (e.g. `"tool_invoke:*"`,
+    /// `"context:close"`, `"messages:write"`). This matches scp-core's
+    /// `Capability::ucan_capability_name()` output and the ceiling string
+    /// format, ensuring cross-platform UCAN token exchange works correctly.
     fn member_has_capability(&self, member_did: &str, capability: &str) -> bool {
         let Some(member) = self.members.get(member_did) else {
             return false;
@@ -549,7 +552,7 @@ impl PerContextState {
                     capability,
                     "messages:read"
                         | "messages:write"
-                        | "tool:invoke:*"
+                        | "tool_invoke:*"
                         | "member:remove"
                         | "governance:propose"
                 );
@@ -559,16 +562,16 @@ impl PerContextState {
                 // Authors: messages r/w, tool invoke — intersected with ceiling.
                 let role_grants = matches!(
                     capability,
-                    "messages:write" | "messages:read" | "tool:invoke:*"
+                    "messages:write" | "messages:read" | "tool_invoke:*"
                 );
                 role_grants && in_ceiling(capability)
             }
             "member" => {
                 // Default member capabilities: messages:read, messages:write,
-                // tool:invoke:* — intersected with ceiling.
+                // tool_invoke:* — intersected with ceiling.
                 let role_grants = matches!(
                     capability,
-                    "messages:read" | "messages:write" | "tool:invoke:*"
+                    "messages:read" | "messages:write" | "tool_invoke:*"
                 );
                 role_grants && in_ceiling(capability)
             }
@@ -2008,8 +2011,7 @@ impl WasmContextManager {
     /// Returns the required capability string for a governance action.
     ///
     /// Maps each `WasmGovernanceAction` variant to the capability that
-    /// the initiator must hold. Uses the WASM ceiling format
-    /// Uses scp-core `Capability::Display` format (`"{resource}:{action}"`),
+    /// the initiator must hold. Uses the UCAN `{resource}:{action}` format,
     /// matching `member_has_capability` and the ceiling strings.
     fn required_capability_for_action(action: &WasmGovernanceAction) -> &'static str {
         match action {
@@ -2196,7 +2198,7 @@ impl WasmContextManager {
                         code: "SCP-PERM-3000".to_owned(),
                     });
                 }
-                ctx.ceiling_strings = new_ceiling.iter().cloned().collect();
+                ctx.ceiling_strings = new_ceiling.iter().map(|s| Self::capability_to_ucan_format(s)).collect();
                 Ok(serde_json::json!({"action": "ModifyCeiling"}))
             }
             WasmGovernanceAction::CloseContext { .. } => {
@@ -3912,15 +3914,50 @@ impl WasmContextManager {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Converts a capability string from the canonical user-facing colon
+    /// format (e.g. `"tool:invoke:*"`) to the UCAN `{resource}:{action}`
+    /// format (e.g. `"tool_invoke:*"`).
+    ///
+    /// The rule: if a capability has more than one colon (compound resource),
+    /// join all segments except the last with underscores to form the resource,
+    /// and the last segment becomes the action. Simple capabilities with
+    /// exactly one colon (e.g. `"messages:write"`) pass through unchanged.
+    ///
+    /// This mirrors `Capability::ucan_resource_action` in scp-core (see #1293).
+    fn capability_to_ucan_format(cap: &str) -> String {
+        if let Some((resource_part, action)) = cap.rsplit_once(':') {
+            if resource_part.contains(':') {
+                // 3+ segments: join all-but-last with underscores.
+                // "a:b:c:d" → "a_b_c:d" (matches scp-core rsplit_once behavior)
+                format!("{}:{}", resource_part.replace(':', "_"), action)
+            } else {
+                // 2 parts: "messages:write" — already in UCAN format
+                cap.to_owned()
+            }
+        } else {
+            // 1 part: "bridging" — no colon at all → pass through unchanged
+            cap.to_owned()
+        }
+    }
+
     /// Builds the capability ceiling string set from explicit ceiling entries
-    /// or defaults matching scp-core's `Capability::Display` format (H5).
+    /// or defaults matching scp-core's UCAN `{resource}:{action}` format.
+    ///
+    /// Default capabilities use underscore-format for compound resources
+    /// (e.g. `"tool_invoke:*"`, `"tool:register"`) to match scp-core's
+    /// `Capability::ucan_capability_name()` output. This ensures UCAN ceiling
+    /// checks (step 8 of validation) pass when tokens minted by scp-core are
+    /// validated in the WASM bridge.
+    ///
+    /// User-provided ceiling strings are converted from colon-format to
+    /// UCAN format via [`capability_to_ucan_format`].
     fn build_ceiling_strings(ceiling: &[String]) -> HashSet<String> {
         if ceiling.is_empty() {
             [
                 "messages:read",
                 "messages:write",
                 "tool:register",
-                "tool:invoke:*",
+                "tool_invoke:*",
                 "role:assign",
                 "member:invite",
                 "member:remove",
@@ -3932,7 +3969,10 @@ impl WasmContextManager {
             .map(|s| (*s).to_owned())
             .collect()
         } else {
-            ceiling.iter().cloned().collect()
+            ceiling
+                .iter()
+                .map(|s| Self::capability_to_ucan_format(s))
+                .collect()
         }
     }
 
