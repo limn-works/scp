@@ -262,9 +262,14 @@ export function createNativeBridge(): Bridge {
     },
 
     async contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null> {
-      return await (
-        addon.contextMemberRole as (h: BridgeContextHandle, d: string) => Promise<MemberRole | null>
+      const raw = await (
+        addon.contextMemberRole as (h: BridgeContextHandle, d: string) => Promise<string | null>
       )(handle, did);
+      if (raw === null) return null;
+      // The NAPI bridge returns lowercase ("admin", "member") but the Bridge
+      // interface expects PascalCase ("Admin", "Member"). Normalize here.
+      // Closes #1236.
+      return (raw.charAt(0).toUpperCase() + raw.slice(1)) as MemberRole;
     },
 
     // Broadcast operations
@@ -965,19 +970,20 @@ export function createNativeBridge(): Bridge {
       identityDid: string,
       epoch: number,
     ): Promise<Checkpoint> {
-      // The NAPI Rust function requires (handle, identity, epoch).
-      // identity is passed as an object matching the NapiIdentity shape.
+      // Use eventLogCheckpointByDid which accepts a DID string and looks up
+      // the identity from the global registry. This avoids the need to pass
+      // the NapiIdentity JS object through the event log API. See #1144 (C4).
       const raw = await (
-        addon.eventLogCheckpoint as (
+        addon.eventLogCheckpointByDid as (
           h: BridgeContextHandle,
-          identity: { did: string; custodyType: string },
+          did: string,
           epoch: number,
         ) => Promise<{
           merkleRoot: string;
           eventCount: number;
           timestamp: number;
         }>
-      )(handle, { did: identityDid, custodyType: "in_memory" }, epoch);
+      )(handle, identityDid, epoch);
       return {
         root: raw.merkleRoot,
         eventCount: raw.eventCount,

@@ -284,6 +284,7 @@ impl NapiIdentity {
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
+                    document: new_document.clone(),
                 },
             );
 
@@ -344,6 +345,7 @@ impl NapiIdentity {
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
+                    document: new_document.clone(),
                 },
             );
 
@@ -404,6 +406,7 @@ impl NapiIdentity {
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
+                    document: new_document.clone(),
                 },
             );
 
@@ -464,6 +467,7 @@ impl NapiIdentity {
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
+                    document: new_document.clone(),
                 },
             );
 
@@ -569,6 +573,7 @@ impl NapiIdentity {
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
+                    document: new_document.clone(),
                 },
             );
 
@@ -795,6 +800,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                 crate::runtime::NapiIdentityEntry {
                     identity: scp_identity.clone(),
                     custody: Arc::clone(&key_custody),
+                    document: document.clone(),
                 },
             );
 
@@ -881,6 +887,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                 crate::runtime::NapiIdentityEntry {
                     identity: scp_identity.clone(),
                     custody: Arc::clone(&key_custody),
+                    document: document.clone(),
                 },
             );
 
@@ -927,14 +934,10 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
 
 /// Loads an existing identity from a DID string.
 ///
-/// Validates the DID format, resolves the DID document from the DHT, and
-/// returns an identity handle with the document retained. The retained
-/// document is needed for `hasAgentKey` and `agentPublicKey` to return
-/// correct values.
-///
-/// Key operations (signing, key rotation) require a wired
-/// `KeyCustodyProvider` callback — loaded identities do not have retained
-/// key material.
+/// First checks the local identity registry (populated by `identity_create`).
+/// If found, returns a handle backed by the registry's retained key material
+/// and DID document. Falls back to DHT resolution when the DID is not in
+/// the local registry.
 ///
 /// # Arguments
 ///
@@ -942,14 +945,15 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
 ///
 /// # Returns
 ///
-/// A `Promise<NapiIdentity>` resolving to the identity handle with the
-/// resolved DID document retained.
+/// A `Promise<NapiIdentity>` resolving to the identity handle.
 ///
 /// # Errors
 ///
 /// - Rejects with `SCP-IDENT-1004` if the DID method is not `"did:dht:"`.
-/// - Rejects with `SCP-IDENT-1001` if the DID cannot be resolved from the
-///   DHT (network error, not found, verification failure).
+/// - Rejects with `SCP-IDENT-1001` if the DID is not in the local registry
+///   AND cannot be resolved from the DHT.
+///
+/// See #1144 (C6).
 #[napi]
 pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
     if !did.starts_with("did:dht:") {
@@ -960,8 +964,34 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
         .into());
     }
 
-    // Resolve the DID document from the DHT so that `hasAgentKey` and
-    // `agentPublicKey` return meaningful values for loaded identities.
+    // Try the local identity registry first (populated by identity_create).
+    // This avoids a DHT round-trip for identities created in this process.
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let local_result = crate::runtime::with_identity(&did, |entry| {
+            Ok((
+                entry.identity.clone(),
+                std::sync::Arc::clone(&entry.custody),
+                entry.document.clone(),
+            ))
+        });
+
+        if let Ok((identity, custody, document)) = local_result {
+            let handle = NapiIdentity {
+                inner: Arc::new(NapiIdentityInner {
+                    did,
+                    custody_type: "in_memory".to_owned(),
+                    scp_identity: Some(identity),
+                    in_memory_custody: Some(custody),
+                    document: Some(document),
+                }),
+            };
+            increment_handle_count();
+            return Ok(handle);
+        }
+    }
+
+    // Fall back to DHT resolution for identities not in the local registry.
     let dht = DidDht::new();
     let document = dht
         .resolve(&did)
@@ -984,8 +1014,8 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
 
 /// Resolves a DID to its DID Document.
 ///
-/// Queries the DHT for the DID document associated with `did`. This requires
-/// network connectivity to the pkarr DHT gateway.
+/// First checks the local identity registry for a cached document. Falls back
+/// to DHT resolution when the DID is not in the local registry.
 ///
 /// # Arguments
 ///
@@ -998,8 +1028,10 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
 /// # Errors
 ///
 /// - Rejects with `SCP-IDENT-1004` if the DID format is invalid.
-/// - Rejects with `SCP-IDENT-1001` if the DID cannot be resolved (not found
-///   on DHT, verification failure, network error).
+/// - Rejects with `SCP-IDENT-1001` if the DID is not in the local registry
+///   AND cannot be resolved from the DHT.
+///
+/// See #1144 (C6).
 #[napi]
 pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
     if !did.starts_with("did:dht:") {
@@ -1010,11 +1042,20 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
         .into());
     }
 
-    let dht = DidDht::new();
-    let document = dht
-        .resolve(&did)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // Try the local identity registry first (populated by identity_create).
+    #[cfg(feature = "allow_in_memory_custody")]
+    let local_doc = crate::runtime::with_identity(&did, |entry| Ok(entry.document.clone())).ok();
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    let local_doc: Option<DidDocument> = None;
+
+    let document = if let Some(doc) = local_doc {
+        doc
+    } else {
+        let dht = DidDht::new();
+        dht.resolve(&did)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
+    };
 
     let has_agent_key = document.has_agent_key();
     let agent_public_key = document
@@ -1872,6 +1913,7 @@ mod tests {
                     .as_ref()
                     .expect("custody")
                     .clone(),
+                document: identity.inner.document.clone().expect("document"),
             },
         );
 
