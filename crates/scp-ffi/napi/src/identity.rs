@@ -41,8 +41,8 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, IdentityError, InMemoryDhtClient,
-    NoOpRelayQuerier, ScpIdentity,
+    DhtClient, DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, IdentityError,
+    InMemoryDhtClient, NoOpRelayQuerier, ScpIdentity,
 };
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
@@ -53,28 +53,109 @@ use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
 
 /// Ensures the global production DID resolver is initialized (idempotent). #311
+///
+/// The `InMemoryDhtClient` created here is stored in a shared global so that
+/// `identity_create` can publish newly created DID documents to it. This
+/// allows UCAN validation (which resolves the issuer DID) to find the
+/// document without a real network DHT (#1144).
+///
+/// Uses `std::sync::Once` to guard the entire initialization block atomically.
+/// Without this, two separate `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
+/// `DID_RESOLVER`) could race under concurrent access: thread A creates
+/// `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B creates
+/// `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set to X),
+/// but builds a `DualLayerResolver` around Y and sets `DID_RESOLVER` — the
+/// resolver and the shared DHT client would reference different instances.
 fn ensure_did_resolver_initialized() {
-    if crate::runtime::did_resolver().is_some() {
-        return;
-    }
+    static INIT: std::sync::Once = std::sync::Once::new();
 
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return; // No runtime available; skip initialization.
+    INIT.call_once(|| {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return; // No runtime available; skip initialization.
+        };
+
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        // Store the DHT client so identity_create can publish documents to it.
+        crate::runtime::init_shared_dht_client(Arc::clone(&dht_client));
+
+        let relay_querier = Arc::new(NoOpRelayQuerier);
+        let cache = Arc::new(DidCache::new());
+        let bootstrap_relays = Vec::new();
+
+        let resolver = Arc::new(DualLayerResolver::new(
+            relay_querier,
+            dht_client,
+            cache,
+            bootstrap_relays,
+        ));
+
+        crate::runtime::init_did_resolver(resolver, handle);
+    });
+}
+
+/// Publishes a newly created DID document to the shared `InMemoryDhtClient`.
+///
+/// After `identity_create`, the DID document must be discoverable by the
+/// `DualLayerResolver` (used by UCAN validation). Since the default
+/// `DidDht::new()` creates its own `InMemoryDhtClient` that is NOT shared
+/// with the resolver, we must explicitly publish to the shared instance.
+///
+/// Constructs a BEP44 signed mutable item (public key, signature, document
+/// JSON, sequence number 1) and calls `DhtClient::publish`. Best-effort:
+/// errors are logged but do not fail identity creation.
+///
+/// See issue #1144.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn publish_to_shared_dht(
+    identity: &ScpIdentity,
+    document: &DidDocument,
+    custody: &OpaqueInMemoryKeyCustody,
+) {
+    let Some(dht_client) = crate::runtime::shared_dht_client() else {
+        return; // Resolver not initialized; nothing to seed.
     };
 
-    let dht_client = Arc::new(InMemoryDhtClient::new());
-    let relay_querier = Arc::new(NoOpRelayQuerier);
-    let cache = Arc::new(DidCache::new());
-    let bootstrap_relays = Vec::new();
+    // Serialize document to JSON.
+    let doc_json = match document.to_json() {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("publish_to_shared_dht: failed to serialize document: {e}");
+            return;
+        }
+    };
+    let value = doc_json.as_bytes();
 
-    let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
-        dht_client,
-        cache,
-        bootstrap_relays,
-    ));
+    // Extract the 32-byte public key from the DID string.
+    let public_key = match scp_identity::extract_public_key(&identity.did) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!("publish_to_shared_dht: failed to extract public key: {e}");
+            return;
+        }
+    };
 
-    crate::runtime::init_did_resolver(resolver, handle);
+    // Build BEP44 signable payload and sign with the identity key.
+    let seq: u64 = 1;
+    let signable = scp_identity::dht::bep44_signable(value, seq);
+    let sig_bytes = match custody.0.sign(&identity.identity_key, &signable).await {
+        Ok(sig) => sig.into_bytes(),
+        Err(e) => {
+            tracing::warn!("publish_to_shared_dht: signing failed: {e}");
+            return;
+        }
+    };
+    let Ok(signature): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        tracing::warn!("publish_to_shared_dht: signature is not 64 bytes");
+        return;
+    };
+
+    // Publish to the shared in-memory DHT client.
+    if let Err(e) = dht_client
+        .publish(&public_key, &signature, value, seq)
+        .await
+    {
+        tracing::warn!("publish_to_shared_dht: DHT publish failed: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +885,11 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                 },
             );
 
+            // Publish the DID document to the shared InMemoryDhtClient so
+            // that the DualLayerResolver can find it during UCAN validation.
+            // Best-effort: errors are logged, not propagated (#1144).
+            publish_to_shared_dht(&scp_identity, &document, &key_custody).await;
+
             let handle = NapiIdentity {
                 inner: Arc::new(NapiIdentityInner {
                     did: scp_identity.did.clone(),
@@ -871,6 +957,9 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
 pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
 
+    // Ensure the global DID resolver is initialized (idempotent). #311
+    ensure_did_resolver_initialized();
+
     match custody.as_str() {
         #[cfg(feature = "allow_in_memory_custody")]
         "in_memory" => {
@@ -890,6 +979,9 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                     document: document.clone(),
                 },
             );
+
+            // Publish the DID document to the shared InMemoryDhtClient (#1144).
+            publish_to_shared_dht(&scp_identity, &document, &key_custody).await;
 
             let handle = NapiIdentity {
                 inner: Arc::new(NapiIdentityInner {
