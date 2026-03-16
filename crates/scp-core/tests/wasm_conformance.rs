@@ -5923,3 +5923,399 @@ fn wasm_verify_signature_rejects_agent_kid() {
         "error must mention conformance mirror limitation, got: {err}"
     );
 }
+
+// ===========================================================================
+// Group 5: Cross-Bridge Wire Format Conformance — BroadcastContent (SCP-290)
+//
+// The WASM bridge re-implements serialize_broadcast_content, validate_content_path,
+// and validate_mime_type locally per ADR-034. These tests embed the WASM
+// algorithms verbatim and cross-validate against scp-core.
+// ===========================================================================
+
+mod wasm_broadcast_mirror {
+    use unicode_normalization::UnicodeNormalization;
+
+    /// WASM-local constants matching scp-core's `broadcast_content` module.
+    pub const BROADCAST_CONTENT_MAGIC: [u8; 3] = [0x53, 0x43, 0x50];
+    pub const BROADCAST_CONTENT_VERSION: u8 = 1;
+    const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+    /// WASM-local `ContentMetadata` matching `scp_core::context::ContentMetadata`.
+    #[derive(serde::Serialize)]
+    pub struct WasmContentMetadata<'a> {
+        pub path: Option<&'a str>,
+        pub content_type: Option<&'a str>,
+        pub deploy_id: Option<&'a str>,
+        pub etag: Option<&'a str>,
+        #[serde(default)]
+        pub immutable: bool,
+    }
+
+    /// WASM-local `BroadcastContent` matching `scp_core::context::BroadcastContent`.
+    #[derive(serde::Serialize)]
+    pub struct WasmBroadcastContent<'a> {
+        pub version: u8,
+        pub metadata: WasmContentMetadata<'a>,
+        #[serde(with = "serde_bytes")]
+        pub body: &'a [u8],
+    }
+
+    /// Verbatim from `crates/scp-ffi/wasm/src/manager.rs`.
+    pub fn serialize_broadcast_content_wasm(
+        path: &str,
+        content_type: &str,
+        deploy_id: Option<&str>,
+        etag: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if body.len() > MAX_BODY_BYTES {
+            return Err(format!(
+                "body too large: {} bytes (max {MAX_BODY_BYTES})",
+                body.len()
+            ));
+        }
+
+        let content = WasmBroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: WasmContentMetadata {
+                path: Some(path),
+                content_type: Some(content_type),
+                deploy_id,
+                etag: Some(etag),
+                immutable: false,
+            },
+            body,
+        };
+
+        let msgpack = rmp_serde::to_vec_named(&content)
+            .map_err(|e| format!("MessagePack serialization failed: {e}"))?;
+
+        let mut buf = Vec::with_capacity(4 + msgpack.len());
+        buf.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
+        buf.push(BROADCAST_CONTENT_VERSION);
+        buf.extend_from_slice(&msgpack);
+        Ok(buf)
+    }
+
+    /// Returns `true` for Unicode formatting/invisible characters.
+    /// Verbatim from `crates/scp-ffi/wasm/src/manager.rs`.
+    fn is_unicode_formatting_wasm(ch: char) -> bool {
+        let cp = u32::from(ch);
+        matches!(
+            cp,
+            0x200B..=0x200F
+            | 0x2028..=0x2029
+            | 0x202A..=0x202E
+            | 0x205F
+            | 0x2060..=0x206F
+            | 0x3000
+            | 0xFEFF
+            | 0xFFFE..=0xFFFF
+        )
+    }
+
+    /// Verbatim from `crates/scp-ffi/wasm/src/manager.rs`.
+    fn validate_content_path_wasm_inner(path: &str) -> Result<(), String> {
+        if !path.starts_with('/') {
+            return Err("path must start with '/'".to_owned());
+        }
+        if path.len() > 1024 {
+            return Err(format!("path too long: {} bytes (max 1024)", path.len()));
+        }
+        if path.contains('\\') {
+            return Err("backslashes not allowed".to_owned());
+        }
+        if path.contains('%') {
+            return Err("percent-encoded bytes not allowed".to_owned());
+        }
+        if path.contains('?') {
+            return Err("query strings not allowed".to_owned());
+        }
+        if path.contains('#') {
+            return Err("fragments not allowed".to_owned());
+        }
+        for ch in path.chars() {
+            if ch == '\0' {
+                return Err("path must not contain null bytes".to_owned());
+            }
+            if ('\u{0000}'..='\u{001F}').contains(&ch) {
+                return Err(format!(
+                    "control character U+{:04X} not allowed",
+                    u32::from(ch),
+                ));
+            }
+            if ch == '\u{007F}' {
+                return Err("DEL (U+007F) not allowed".to_owned());
+            }
+        }
+        for ch in path.chars() {
+            if !ch.is_ascii()
+                && (ch.is_whitespace() || ch.is_control() || is_unicode_formatting_wasm(ch))
+            {
+                return Err(format!(
+                    "non-ASCII whitespace/formatting U+{:04X} not allowed",
+                    u32::from(ch),
+                ));
+            }
+        }
+        if path.contains("//") {
+            return Err("double slashes not allowed".to_owned());
+        }
+        if path.len() > 1 && path.ends_with('/') {
+            return Err("path must not end with '/' (except root)".to_owned());
+        }
+        for segment in path.split('/').skip(1) {
+            if segment == "." {
+                return Err("'.' segments not allowed".to_owned());
+            }
+            if segment == ".." {
+                return Err("'..' segments not allowed (path traversal)".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Verbatim from `crates/scp-ffi/wasm/src/manager.rs`.
+    pub fn validate_content_path_wasm(path: &str) -> Result<String, String> {
+        let normalized: String = path.nfc().collect();
+        validate_content_path_wasm_inner(&normalized)?;
+        Ok(normalized)
+    }
+
+    /// Verbatim from `crates/scp-ffi/wasm/src/manager.rs`.
+    pub fn validate_mime_type_wasm(value: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("MIME type must not be empty".to_owned());
+        }
+        for ch in value.chars() {
+            if ch.is_control() {
+                return Err(format!(
+                    "control character U+{:04X} not allowed",
+                    u32::from(ch),
+                ));
+            }
+        }
+        if value.contains(';') {
+            return Err("MIME type parameters (';') not allowed".to_owned());
+        }
+        let slash_count = value.chars().filter(|&c| c == '/').count();
+        if slash_count != 1 {
+            return Err("MIME type must be 'type/subtype' (exactly one '/')".to_owned());
+        }
+        let (type_part, subtype_part) = value
+            .split_once('/')
+            .ok_or_else(|| "MIME type must be 'type/subtype'".to_owned())?;
+        if type_part.is_empty() || subtype_part.is_empty() {
+            return Err("MIME type and subtype must both be non-empty".to_owned());
+        }
+        let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$&'*+-.^_`|~".contains(c);
+        if !type_part.chars().all(is_token_char) {
+            return Err("MIME type part contains invalid characters".to_owned());
+        }
+        if !subtype_part.chars().all(is_token_char) {
+            return Err("MIME subtype part contains invalid characters".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Cross-validates scp-core and WASM mirror serialization of `BroadcastContent`.
+#[test]
+fn broadcast_content_wire_format_matches_wasm() {
+    use scp_core::context::broadcast_content::{
+        BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, ContentPath, MimeType,
+        deserialize_broadcast_content, serialize_broadcast_content,
+    };
+
+    struct TestCase {
+        path: &'static str,
+        content_type: &'static str,
+        deploy_id: Option<&'static str>,
+        body: &'static [u8],
+        desc: &'static str,
+    }
+
+    let test_cases = [
+        TestCase {
+            path: "/empty.txt",
+            content_type: "text/plain",
+            deploy_id: Some("d1"),
+            body: b"",
+            desc: "empty body",
+        },
+        TestCase {
+            path: "/index.html",
+            content_type: "text/html",
+            deploy_id: Some("deploy-abc"),
+            body: b"<h1>Hello</h1>",
+            desc: "HTML asset",
+        },
+        TestCase {
+            path: "/image.png",
+            content_type: "image/png",
+            deploy_id: Some("deploy-bin"),
+            body: &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            desc: "binary asset",
+        },
+        TestCase {
+            path: "/caf\u{00E9}.html",
+            content_type: "text/html",
+            deploy_id: Some("deploy-nfc"),
+            body: b"cafe",
+            desc: "Unicode NFC path",
+        },
+    ];
+
+    for tc in &test_cases {
+        // Compute etag as SHA-256 hex of body (matches compute_etag).
+        let etag = scp_core::context::broadcast_content::compute_etag(tc.body);
+
+        // Serialize via scp-core.
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new(tc.path).unwrap()),
+                content_type: Some(MimeType::new(tc.content_type).unwrap()),
+                deploy_id: tc.deploy_id.map(str::to_owned),
+                etag: Some(etag.clone()),
+                immutable: false,
+            },
+            body: tc.body.to_vec(),
+        };
+        let core_bytes = serialize_broadcast_content(&content).unwrap();
+
+        // Serialize via WASM mirror.
+        let wasm_bytes = wasm_broadcast_mirror::serialize_broadcast_content_wasm(
+            tc.path,
+            tc.content_type,
+            tc.deploy_id,
+            &etag,
+            tc.body,
+        )
+        .unwrap();
+
+        // Assert byte-identical output.
+        assert_eq!(
+            core_bytes,
+            wasm_bytes,
+            "wire format mismatch for {}: core ({} bytes) != wasm ({} bytes)",
+            tc.desc,
+            core_bytes.len(),
+            wasm_bytes.len()
+        );
+
+        // Assert round-trip: deserialize_broadcast_content(wasm_bytes) matches input.
+        let deserialized = deserialize_broadcast_content(&wasm_bytes)
+            .unwrap_or_else(|e| panic!("failed to deserialize WASM bytes for {}: {e}", tc.desc));
+        assert_eq!(
+            deserialized.body, tc.body,
+            "round-trip body mismatch for {}",
+            tc.desc
+        );
+        assert_eq!(
+            deserialized.metadata.path.as_ref().unwrap().as_str(),
+            tc.path,
+            "round-trip path mismatch for {}",
+            tc.desc
+        );
+        assert_eq!(
+            deserialized
+                .metadata
+                .content_type
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            tc.content_type,
+            "round-trip content_type mismatch for {}",
+            tc.desc
+        );
+    }
+}
+
+/// Cross-validates scp-core and WASM mirror content path validation.
+#[test]
+fn broadcast_content_path_validation_matches_wasm() {
+    use scp_core::context::broadcast_content::ContentPath;
+
+    // Valid paths: both must accept.
+    let valid_paths = [
+        "/index.html",
+        "/assets/style.css",
+        "/a/b/c/d.js",
+        "/caf\u{00E9}.html",
+    ];
+    for path in &valid_paths {
+        let core_result = ContentPath::new(*path);
+        let wasm_result = wasm_broadcast_mirror::validate_content_path_wasm(path);
+        assert!(
+            core_result.is_ok(),
+            "scp-core rejected valid path {path:?}: {:?}",
+            core_result.err()
+        );
+        assert!(
+            wasm_result.is_ok(),
+            "WASM rejected valid path {path:?}: {:?}",
+            wasm_result.err()
+        );
+    }
+
+    // Invalid paths: both must reject.
+    let invalid_paths = [
+        "no-leading-slash",
+        "/path/../traversal",
+        "/double//slash",
+        "/path?query",
+        "/path#fragment",
+        "/back\\slash",
+        "/percent%20encoded",
+    ];
+    for path in &invalid_paths {
+        let core_result = ContentPath::new(*path);
+        let wasm_result = wasm_broadcast_mirror::validate_content_path_wasm(path);
+        assert!(
+            core_result.is_err(),
+            "scp-core accepted invalid path {path:?}"
+        );
+        assert!(wasm_result.is_err(), "WASM accepted invalid path {path:?}");
+    }
+}
+
+/// Cross-validates scp-core and WASM mirror MIME type validation.
+#[test]
+fn broadcast_mime_type_validation_matches_wasm() {
+    use scp_core::context::broadcast_content::MimeType;
+
+    // Valid MIME types.
+    let valid_types = [
+        "text/html",
+        "text/css",
+        "application/javascript",
+        "image/png",
+    ];
+    for mime in &valid_types {
+        let core_result = MimeType::new(*mime);
+        let wasm_result = wasm_broadcast_mirror::validate_mime_type_wasm(mime);
+        assert!(
+            core_result.is_ok(),
+            "scp-core rejected valid MIME {mime:?}: {:?}",
+            core_result.err()
+        );
+        assert!(
+            wasm_result.is_ok(),
+            "WASM rejected valid MIME {mime:?}: {:?}",
+            wasm_result.err()
+        );
+    }
+
+    // Invalid MIME types.
+    let invalid_types = ["", "noslash", "two/slash/here", "type/sub;param=value"];
+    for mime in &invalid_types {
+        let core_result = MimeType::new(*mime);
+        let wasm_result = wasm_broadcast_mirror::validate_mime_type_wasm(mime);
+        assert!(
+            core_result.is_err(),
+            "scp-core accepted invalid MIME {mime:?}"
+        );
+        assert!(wasm_result.is_err(), "WASM accepted invalid MIME {mime:?}");
+    }
+}
