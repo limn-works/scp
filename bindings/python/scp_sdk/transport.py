@@ -11,6 +11,7 @@ for conventions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -95,7 +96,7 @@ class TransportConfig:
         """
         logger.debug("Connecting to relay %s", self.relay_url)
         bridge = _bridge()
-        bridge.transport_connect(self.relay_url)
+        await asyncio.to_thread(bridge.transport_connect, self.relay_url)
         logger.info("Connected to relay %s", self.relay_url)
 
     async def status(self) -> TransportStatus:
@@ -109,7 +110,7 @@ class TransportConfig:
             TransportError: If querying transport status fails.
         """
         bridge = _bridge()
-        raw = bridge.transport_status()
+        raw = await asyncio.to_thread(bridge.transport_status)
         return TransportStatus(
             connected=raw.connected,
             relay_url=raw.relay_url,
@@ -154,7 +155,7 @@ async def relay_status() -> TransportStatus:
         TransportError: If querying transport status fails.
     """
     bridge = _bridge()
-    raw = bridge.transport_status()
+    raw = await asyncio.to_thread(bridge.transport_status)
     return TransportStatus(
         connected=raw.connected,
         relay_url=raw.relay_url,

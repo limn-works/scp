@@ -11,6 +11,7 @@ functions.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -157,7 +158,7 @@ class Identity:
         import _scp_core
 
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
-        handle = _scp_core.py_identity_create(custody_str)
+        handle = await asyncio.to_thread(_scp_core.py_identity_create, custody_str)
         return cls(handle)
 
     @classmethod
@@ -176,7 +177,7 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_load(did)
+        handle = await asyncio.to_thread(_scp_core.py_identity_load, did)
         return cls(handle)
 
     # -- Sync convenience wrappers -------------------------------------------
@@ -227,7 +228,7 @@ class Identity:
         import _scp_core
 
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
-        handle = _scp_core.py_identity_create_with_agent_key(custody_str)
+        handle = await asyncio.to_thread(_scp_core.py_identity_create_with_agent_key, custody_str)
         return cls(handle)
 
     async def add_agent_key(self) -> Identity:
@@ -245,7 +246,7 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_add_agent_key(self._handle)
+        handle = await asyncio.to_thread(_scp_core.py_identity_add_agent_key, self._handle)
         return Identity(handle)
 
     async def rotate_agent_key(self) -> Identity:
@@ -263,7 +264,7 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_rotate_agent_key(self._handle)
+        handle = await asyncio.to_thread(_scp_core.py_identity_rotate_agent_key, self._handle)
         return Identity(handle)
 
     async def remove_agent_key(self) -> Identity:
@@ -280,7 +281,7 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_remove_agent_key(self._handle)
+        handle = await asyncio.to_thread(_scp_core.py_identity_remove_agent_key, self._handle)
         return Identity(handle)
 
     async def migrate(self) -> Identity:
@@ -299,7 +300,7 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_migrate(self._handle)
+        handle = await asyncio.to_thread(_scp_core.py_identity_migrate, self._handle)
         return Identity(handle)
 
     async def attest_device(self) -> str:
@@ -319,7 +320,7 @@ class Identity:
                 "Device attestation requires the 'allow_in_memory_custody' feature",
                 "SCP-IDENT-1050",
             )
-        return _scp_core.py_identity_attest_device(self.did)
+        return await asyncio.to_thread(_scp_core.py_identity_attest_device, self.did)
 
     async def verify_device_attestation(self, token_base64: str) -> bool:
         """Verify a device attestation token.
@@ -341,7 +342,9 @@ class Identity:
                 "Device attestation verification requires the 'allow_in_memory_custody' feature",
                 "SCP-IDENT-1051",
             )
-        return _scp_core.py_identity_verify_device_attestation(self.did, token_base64)
+        return await asyncio.to_thread(
+            _scp_core.py_identity_verify_device_attestation, self.did, token_base64
+        )
 
     async def rotate_key(self) -> Identity:
         """Rotate this identity's active signing key.
@@ -372,7 +375,7 @@ class Identity:
         )
         import _scp_core
 
-        handle = _scp_core.py_identity_rotate_key(self._handle)
+        handle = await asyncio.to_thread(_scp_core.py_identity_rotate_key, self._handle)
         return Identity(handle)
 
     async def resolve(self, did: str) -> DIDDocument:
@@ -389,7 +392,7 @@ class Identity:
         """
         import _scp_core
 
-        bridge_doc = _scp_core.py_identity_resolve(did)
+        bridge_doc = await asyncio.to_thread(_scp_core.py_identity_resolve, did)
         return _bridge_doc_to_dataclass(bridge_doc)
 
     # -- Recovery and custody migration ---------------------------------------
@@ -423,7 +426,8 @@ class Identity:
 
         import _scp_core
 
-        result_json = _scp_core.identity_execute_recovery(
+        result_json = await asyncio.to_thread(
+            _scp_core.identity_execute_recovery,
             self.did,
             tier,
             context_ids or [],
@@ -461,7 +465,8 @@ class Identity:
 
         import _scp_core
 
-        result_json = _scp_core.identity_execute_custody_migration(
+        result_json = await asyncio.to_thread(
+            _scp_core.identity_execute_custody_migration,
             self.did,
             target,
             context_ids or [],

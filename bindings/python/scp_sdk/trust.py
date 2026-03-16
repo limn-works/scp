@@ -19,6 +19,7 @@ See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -472,7 +473,7 @@ async def evaluate_trust(
         # single invalid token is sufficient to fail the capability check.
         for token in capability_tokens:
             try:
-                bridge.ucan_validate(context_id, token, "*")
+                await asyncio.to_thread(bridge.ucan_validate, context_id, token, "*")
             except bridge.UcanError as exc:
                 error_msg = str(exc)
                 failed_category = _classify_ucan_error(error_msg)
@@ -492,7 +493,8 @@ async def evaluate_trust(
     # Layer 2: Query behavioral record from event log.
     behavioral: BehavioralRecord | None = None
     try:
-        events = bridge.event_log_query(
+        events = await asyncio.to_thread(
+            bridge.event_log_query,
             context_id,
             {"actor_did": subject_did},
         )

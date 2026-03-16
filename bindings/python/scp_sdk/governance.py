@@ -9,6 +9,7 @@ See ``.docs/specs/05-contexts.md`` section 5.9 and ADR-031.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 from typing import TYPE_CHECKING
 
@@ -105,7 +106,7 @@ async def execute_governance_action(
             code="SCP-CTX-2001",
         ) from exc
 
-    raw = _scp_core.py_governance_execute(context._handle, proposal_json)
+    raw = await asyncio.to_thread(_scp_core.py_governance_execute, context._handle, proposal_json)
     return GovernanceActionResult.from_bridge(raw)
 
 
@@ -221,7 +222,9 @@ async def propose_governance_action(
         ) from exc
 
     did = identity_did or context._creator_did
-    return _scp_core.py_governance_propose(context._handle, did, action_json)
+    return await asyncio.to_thread(
+        _scp_core.py_governance_propose, context._handle, did, action_json
+    )
 
 
 async def approve_governance_proposal(
@@ -257,7 +260,9 @@ async def approve_governance_proposal(
         ) from exc
 
     did = identity_did or context._creator_did
-    return _scp_core.py_governance_approve(context._handle, did, proposal_id_hex)
+    return await asyncio.to_thread(
+        _scp_core.py_governance_approve, context._handle, did, proposal_id_hex
+    )
 
 
 async def reject_governance_proposal(
@@ -291,7 +296,9 @@ async def reject_governance_proposal(
         ) from exc
 
     did = identity_did or context._creator_did
-    return _scp_core.py_governance_reject(context._handle, did, proposal_id_hex)
+    return await asyncio.to_thread(
+        _scp_core.py_governance_reject, context._handle, did, proposal_id_hex
+    )
 
 
 async def withdraw_governance_vote(
@@ -328,7 +335,9 @@ async def withdraw_governance_vote(
         ) from exc
 
     did = identity_did or context._creator_did
-    return _scp_core.py_governance_withdraw(context._handle, did, proposal_id_hex)
+    return await asyncio.to_thread(
+        _scp_core.py_governance_withdraw, context._handle, did, proposal_id_hex
+    )
 
 
 async def get_governance_proposal(
@@ -358,7 +367,9 @@ async def get_governance_proposal(
             code="SCP-CTX-2001",
         ) from exc
 
-    return _scp_core.py_governance_get_proposal(context._handle, proposal_id_hex)
+    return await asyncio.to_thread(
+        _scp_core.py_governance_get_proposal, context._handle, proposal_id_hex
+    )
 
 
 async def list_governance_proposals(context: Context) -> str:
@@ -384,7 +395,7 @@ async def list_governance_proposals(context: Context) -> str:
             code="SCP-CTX-2001",
         ) from exc
 
-    return _scp_core.py_governance_list_proposals(context._handle)
+    return await asyncio.to_thread(_scp_core.py_governance_list_proposals, context._handle)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +430,9 @@ async def apply_pending_ceiling_modification(
             code="SCP-CTX-2001",
         ) from exc
 
-    return _scp_core.py_apply_pending_ceiling_modification(context._handle, current_timestamp)
+    return await asyncio.to_thread(
+        _scp_core.py_apply_pending_ceiling_modification, context._handle, current_timestamp
+    )
 
 
 async def finalize_close(context: Context) -> None:
@@ -446,7 +459,7 @@ async def finalize_close(context: Context) -> None:
             code="SCP-CTX-2001",
         ) from exc
 
-    _scp_core.py_finalize_close(context._handle)
+    await asyncio.to_thread(_scp_core.py_finalize_close, context._handle)
 
 
 async def create_governance_checkpoint(
@@ -490,7 +503,8 @@ async def create_governance_checkpoint(
         ) from exc
 
     did = creator_did or context._creator_did
-    return _scp_core.py_create_governance_checkpoint(
+    return await asyncio.to_thread(
+        _scp_core.py_create_governance_checkpoint,
         context._handle,
         checkpoint_seq,
         merkle_root_hex,
@@ -534,8 +548,12 @@ async def add_checkpoint_cosignature(
             code="SCP-CTX-2001",
         ) from exc
 
-    return _scp_core.py_add_checkpoint_cosignature(
-        context._handle, checkpoint_json, signer_did, signature_hex
+    return await asyncio.to_thread(
+        _scp_core.py_add_checkpoint_cosignature,
+        context._handle,
+        checkpoint_json,
+        signer_did,
+        signature_hex,
     )
 
 
@@ -559,7 +577,7 @@ async def restore_context(context_id: str) -> None:
             code="SCP-CTX-2001",
         ) from exc
 
-    _scp_core.py_restore_context(context_id)
+    await asyncio.to_thread(_scp_core.py_restore_context, context_id)
 
 
 async def restore_all_contexts() -> str:
@@ -582,7 +600,7 @@ async def restore_all_contexts() -> str:
             code="SCP-CTX-2001",
         ) from exc
 
-    return _scp_core.py_restore_all_contexts()
+    return await asyncio.to_thread(_scp_core.py_restore_all_contexts)
 
 
 __all__ = [
