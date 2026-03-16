@@ -324,15 +324,18 @@ impl Storage for BridgeInMemoryStorage {
 
 /// Retained identity state for a single DID in the NAPI bridge.
 ///
-/// Stores the `ScpIdentity` (key handles) and `InMemoryKeyCustody` (key
-/// material) so that bridge functions can look up any registered identity
-/// by DID.
+/// Stores the `ScpIdentity` (key handles), `InMemoryKeyCustody` (key
+/// material), and `DidDocument` so that bridge functions can look up any
+/// registered identity by DID — including `identity_load` and
+/// `identity_resolve` which need the document without DHT access (#1144 C6).
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) struct NapiIdentityEntry {
     /// The scp-core identity handle (DID string, key handles).
     pub(crate) identity: scp_identity::ScpIdentity,
     /// The key custody provider holding the actual key material.
     pub(crate) custody: Arc<OpaqueInMemoryKeyCustody>,
+    /// The DID document at the time of creation (or last key rotation).
+    pub(crate) document: scp_identity::DidDocument,
 }
 
 /// Global registry of identity state, keyed by DID string.

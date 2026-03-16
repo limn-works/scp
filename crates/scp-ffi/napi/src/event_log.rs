@@ -454,6 +454,100 @@ pub fn event_log_checkpoint(
     }
 }
 
+/// Generates a signed consistency checkpoint using a DID string to look up
+/// the identity from the global registry.
+///
+/// This variant accepts a DID string instead of a `NapiIdentity` reference,
+/// looking up the identity's key material from the global identity registry.
+/// This makes it callable from JavaScript without requiring the caller to
+/// pass the `NapiIdentity` JS object through the event log API.
+///
+/// # Arguments
+///
+/// * `handle` — The context whose event log to checkpoint.
+/// * `did` — The DID string of the identity generating the checkpoint.
+/// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
+///
+/// # Returns
+///
+/// A `NapiCheckpoint` containing the signed checkpoint data.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-PERM-3023` if the DID is not in the identity registry.
+/// - Rejects with `SCP-CTX-2023` if the context is not found.
+///
+/// See #1144 (C4).
+#[napi(js_name = "eventLogCheckpointByDid")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
+pub fn event_log_checkpoint_by_did(
+    handle: &NapiContextHandle,
+    did: String,
+    epoch: f64,
+) -> napi::Result<NapiCheckpoint> {
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (&handle, &did, &epoch);
+        return Err(napi::Error::from(ScpNapiError::Permission {
+            message: "event log checkpoint requires key custody -- the in_memory custody path \
+                       is not available in this build. Enable allow_in_memory_custody \
+                       for dev/desktop use."
+                .to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
+        }));
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+
+        let (scp_id, custody) = crate::runtime::with_identity(&did, |entry| {
+            Ok((
+                entry.identity.clone(),
+                std::sync::Arc::clone(&entry.custody),
+            ))
+        })
+        .map_err(napi::Error::from)?;
+
+        let context_id = handle.context_id();
+        let sender_did = scp_identity::DID(did);
+        let epoch_u64 = validate_non_negative_epoch(epoch)?;
+
+        let checkpoint = crate::runtime::with_context(&context_id, |rt| {
+            let signer = scp_core::event_log::KeyCustodySigner {
+                custody: &custody.0,
+                key: &scp_id.active_signing_key,
+            };
+
+            crate::runtime().block_on(async {
+                scp_event_log::checkpoint::generate_checkpoint(
+                    &rt.event_log,
+                    &sender_did,
+                    epoch_u64,
+                    &signer,
+                )
+                .await
+                .map_err(|e| ScpNapiError::Context {
+                    message: format!("checkpoint generation failed: {e}"),
+                    code: "SCP-CTX-2023".to_owned(),
+                })
+            })
+        })
+        .map_err(napi::Error::from)?;
+
+        #[allow(clippy::cast_precision_loss)]
+        Ok(NapiCheckpoint {
+            context_id: checkpoint.context_id,
+            sender_did: checkpoint.sender_did.0,
+            event_count: checkpoint.event_count as f64,
+            merkle_root: hex::encode(checkpoint.merkle_root),
+            epoch: checkpoint.epoch.map(|e| e as f64),
+            timestamp: checkpoint.timestamp as f64,
+            signature: hex::encode(checkpoint.signature),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
