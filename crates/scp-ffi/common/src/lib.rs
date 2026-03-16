@@ -47,3 +47,8 @@ pub mod petname_helpers;
 // Shared test helpers for FFI bridge tests (behind the `testing` feature).
 #[cfg(feature = "testing")]
 pub mod test_helpers;
+
+// Shared relay/node startup code for FFI bridges that need to spawn servers.
+// Requires scp-transport, scp-node, scp-platform, tokio. Not available for WASM (ADR-034).
+#[cfg(feature = "server")]
+pub mod server;
