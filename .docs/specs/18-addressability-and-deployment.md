@@ -776,7 +776,7 @@ Conditional GET: if the client sends `If-None-Match: "<blob_id>"`, the server re
 - **400 Bad Request** — invalid hex in `routing_id` or `blob_id` path segment.
 - **404 Not Found** — unknown routing ID (no projected context registered) or unknown blob ID (not in storage or routing ID mismatch).
 - **410 Gone** — the message's key epoch has been purged from the projection registry after a `Full`-scope governance ban (§5.14.8). The content is permanently unavailable through projection. Clients should not retry. Body: `{"error": "content revoked", "code": "GONE"}`.
-- **500 Internal Server Error** — decryption failure (corrupt envelope or AEAD open failure).
+- **404 Not Found** — decryption failure (corrupt envelope or AEAD open failure). Returns the same `NOT_FOUND` response body as an unknown blob to prevent a decryption oracle — attackers cannot distinguish "blob exists but decryption failed" from "blob does not exist." Decryption failures are logged server-side at `WARN` level for operator diagnostics.
 
 The feed endpoint (§18.11.3) silently omits messages whose epoch keys have been purged — they simply disappear from the feed rather than producing errors. This is consistent with the feed's role as a "latest content" view: revoked historical content is no longer latest.
 

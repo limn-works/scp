@@ -881,7 +881,10 @@ pub async fn feed_handler(
 ///   unknown blob ID (not in storage or routing ID mismatch).
 /// - **410** — Content revoked (epoch key purged after a `Full`-scope
 ///   governance ban).
-/// - **500** — Decryption failure (corrupt envelope or AEAD open failure).
+/// - **404** — Decryption failure (corrupt envelope or AEAD open failure).
+///   Returns the same `NOT_FOUND` response as an unknown blob to prevent
+///   a decryption oracle (attacker cannot distinguish "exists but corrupt"
+///   from "does not exist").
 ///
 /// See spec section 18.11.4.
 #[allow(clippy::too_many_lines)]
@@ -970,12 +973,14 @@ pub async fn message_handler(
     let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&stored.blob) {
         Ok(env) => env,
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 error = %e,
                 blob_id = blob_id_hex,
                 "failed to deserialize BroadcastEnvelope"
             );
-            return ApiError::internal_error("decryption failure").into_response();
+            // Return 404 (not 500) to prevent a decryption oracle — the
+            // response must be indistinguishable from "blob not found".
+            return ApiError::not_found("unknown blob_id").into_response();
         }
     };
 
@@ -1010,13 +1015,15 @@ pub async fn message_handler(
     let plaintext = match open_broadcast_trusted(key, &envelope) {
         Ok(pt) => pt,
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 error = %e,
                 blob_id = blob_id_hex,
                 epoch = envelope.key_epoch,
                 "decryption failed"
             );
-            return ApiError::internal_error("decryption failure").into_response();
+            // Return 404 (not 500) to prevent a decryption oracle — the
+            // response must be indistinguishable from "blob not found".
+            return ApiError::not_found("unknown blob_id").into_response();
         }
     };
 
@@ -2287,11 +2294,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test D: Tampered ciphertext (AEAD authentication failure)
+    // Test D: Tampered ciphertext returns 404 (decryption oracle prevention)
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn message_tampered_ciphertext_returns_500() {
+    async fn message_tampered_ciphertext_returns_404() {
         let key = generate_broadcast_key("did:dht:alice");
         let context_id = "tamper_ctx";
         let projected =
@@ -2337,7 +2344,8 @@ mod tests {
 
         let state = test_state_with(projected_map, storage);
 
-        // Per-message endpoint for tampered blob → 500 "decryption failure".
+        // Per-message endpoint for tampered blob → 404 to prevent decryption
+        // oracle (indistinguishable from "blob not found").
         let router = broadcast_projection_router(Arc::clone(&state));
         let routing_hex = hex_encode(&routing_id);
         let blob_hex = hex_encode(&blob_id);
@@ -2347,11 +2355,12 @@ mod tests {
             .unwrap();
 
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), HttpStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "decryption failure");
+        assert_eq!(json["code"], "NOT_FOUND");
+        assert_eq!(json["error"], "unknown blob_id");
 
         // Feed endpoint → tampered message should be silently skipped,
         // valid message still returned.
@@ -2376,6 +2385,58 @@ mod tests {
         let content_b64 = messages[0]["content"].as_str().unwrap();
         let decoded = BASE64.decode(content_b64).unwrap();
         assert_eq!(decoded, b"valid message");
+    }
+
+    // -------------------------------------------------------------------
+    // Test D1b: Corrupt MessagePack returns 404 (same as not-found)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn message_corrupt_msgpack_returns_404_not_500() {
+        // A blob that cannot be deserialized as BroadcastEnvelope must
+        // return the same 404 response as "blob not found" to prevent a
+        // decryption oracle.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "corrupt_msgpack_ctx";
+        let projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Store garbage bytes as a blob.
+        let blob_bytes = vec![0xFF, 0xFE, 0xFD];
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+        let routing_hex = hex_encode(&routing_id);
+        let blob_hex = hex_encode(&blob_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/messages/{blob_hex}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Must be identical to the genuine "blob not found" response.
+        assert_eq!(json["code"], "NOT_FOUND");
+        assert_eq!(json["error"], "unknown blob_id");
     }
 
     // -------------------------------------------------------------------
