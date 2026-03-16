@@ -3,10 +3,8 @@
 
 package works.limn.scp.stream
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.ContextBindings
-import works.limn.scp.bridge.InfraBindings
-import works.limn.scp.bridge.MessageCallback
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
@@ -21,8 +19,13 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.ContextBindings
+import works.limn.scp.bridge.InfraBindings
+import works.limn.scp.bridge.MessageCallback
 
 /**
  * Callback interface for real-time context events from the Rust engine.
@@ -255,7 +258,15 @@ class HotStreamFactory(
                         code: String,
                         message: String,
                     ) {
-                        sharedFlow.tryEmit("""{"_error":true,"code":"$code","message":"$message"}""")
+                        sharedFlow.tryEmit(
+                            Json.encodeToString(
+                                buildJsonObject {
+                                    put("_error", true)
+                                    put("code", code)
+                                    put("message", message)
+                                },
+                            ),
+                        )
                     }
 
                     override fun onComplete() {
@@ -312,7 +323,15 @@ class HotStreamFactory(
                         code: String,
                         message: String,
                     ) {
-                        sharedFlow.tryEmit("""{"_error":true,"code":"$code","message":"$message"}""")
+                        sharedFlow.tryEmit(
+                            Json.encodeToString(
+                                buildJsonObject {
+                                    put("_error", true)
+                                    put("code", code)
+                                    put("message", message)
+                                },
+                            ),
+                        )
                     }
 
                     override fun onComplete() {

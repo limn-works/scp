@@ -32,6 +32,8 @@
 //!
 //! See ADR-030 in `.docs/adrs/phase-6.md`.
 
+use subtle::ConstantTimeEq;
+
 use super::proof::{self, InclusionProof};
 use super::{EventLog, EventLogError};
 use crate::tree;
@@ -230,7 +232,7 @@ impl ColdTierProvider for RelayBlobColdProvider {
         &self,
         context_id: &str,
         leaf_index: u64,
-        _leaf_hash: [u8; 32],
+        leaf_hash: [u8; 32],
     ) -> Result<InclusionProof, TieredStorageError> {
         let blob_bytes = (self.fetch_fn)(context_id, leaf_index).map_err(|e| {
             TieredStorageError::ColdFetchFailed(format!(
@@ -238,11 +240,23 @@ impl ColdTierProvider for RelayBlobColdProvider {
             ))
         })?;
 
-        deserialize_cold_proof(&blob_bytes).map_err(|e| {
+        let proof = deserialize_cold_proof(&blob_bytes).map_err(|e| {
             TieredStorageError::ColdFetchFailed(format!(
                 "deserialization failed for context {context_id}, leaf {leaf_index}: {e}"
             ))
-        })
+        })?;
+
+        // Constant-time comparison: reject relay swap attacks where the relay
+        // returns a valid proof for a DIFFERENT event than requested.
+        if !bool::from(proof.leaf_hash.ct_eq(&leaf_hash)) {
+            return Err(TieredStorageError::LeafHashMismatch {
+                leaf_index,
+                expected: hex::encode(leaf_hash),
+                actual: hex::encode(proof.leaf_hash),
+            });
+        }
+
+        Ok(proof)
     }
 }
 
@@ -325,6 +339,17 @@ pub enum TieredStorageError {
     ColdProofVerificationFailed {
         /// The leaf index of the event whose proof failed.
         leaf_index: u64,
+    },
+
+    /// Inclusion proof leaf hash does not match expected -- relay swap attack detected.
+    #[error("leaf hash mismatch for leaf index {leaf_index}: expected {expected}, got {actual}")]
+    LeafHashMismatch {
+        /// The leaf index whose hash did not match.
+        leaf_index: u64,
+        /// Hex-encoded expected leaf hash.
+        expected: String,
+        /// Hex-encoded actual leaf hash from the proof.
+        actual: String,
     },
 
     /// The requested event is not in the cold tier.
@@ -689,6 +714,17 @@ impl TieredEventLog {
             entry.sequence,
             entry.leaf_hash,
         )?;
+
+        // Defense-in-depth: verify the returned proof's leaf hash matches
+        // our locally stored leaf hash, even if the provider already checked.
+        // A custom or compromised provider might skip this check.
+        if !bool::from(proof.leaf_hash.ct_eq(&entry.leaf_hash)) {
+            return Err(TieredStorageError::LeafHashMismatch {
+                leaf_index: entry.sequence,
+                expected: hex::encode(entry.leaf_hash),
+                actual: hex::encode(proof.leaf_hash),
+            });
+        }
 
         // The proof must verify against our locally stored checkpoint root.
         // Override the proof's stated root with our checkpoint root for
@@ -1809,6 +1845,127 @@ mod tests {
             RelayBlobColdProvider::new(Box::new(|_, _| Err("not implemented".to_owned())));
         let debug_str = format!("{provider:?}");
         assert!(debug_str.contains("RelayBlobColdProvider"));
+    }
+
+    // -------------------------------------------------------------------
+    // Leaf hash mismatch detection (relay swap attack — issue #1222)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn relay_blob_provider_rejects_leaf_hash_mismatch() {
+        // Build a proof blob whose leaf_hash differs from the requested one.
+        let wrong_leaf_hash = [0xBB; 32];
+        let proof = InclusionProof {
+            leaf_index: 3,
+            leaf_hash: wrong_leaf_hash,
+            path: vec![ProofStep {
+                sibling_hash: [0xCC; 32],
+                direction: Direction::Right,
+            }],
+            root: [0xDD; 32],
+        };
+        let blob = serialize_cold_proof(&proof).unwrap();
+
+        let provider = RelayBlobColdProvider::new(Box::new(move |_, _| Ok(blob.clone())));
+
+        let requested_hash = [0xAA; 32];
+        let result = provider.fetch_inclusion_proof("ctx-swap", 3, requested_hash);
+
+        match result {
+            Err(TieredStorageError::LeafHashMismatch {
+                leaf_index,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(leaf_index, 3);
+                assert_eq!(expected, hex::encode(requested_hash));
+                assert_eq!(actual, hex::encode(wrong_leaf_hash));
+            }
+            other => panic!("expected LeafHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_blob_provider_accepts_matching_leaf_hash() {
+        let matching_hash = [0xAA; 32];
+        let proof = InclusionProof {
+            leaf_index: 5,
+            leaf_hash: matching_hash,
+            path: vec![ProofStep {
+                sibling_hash: [0xBB; 32],
+                direction: Direction::Right,
+            }],
+            root: [0xCC; 32],
+        };
+        let blob = serialize_cold_proof(&proof).unwrap();
+
+        let provider = RelayBlobColdProvider::new(Box::new(move |_, _| Ok(blob.clone())));
+
+        let result = provider.fetch_inclusion_proof("ctx-match", 5, matching_hash);
+        assert!(result.is_ok());
+        let fetched = result.unwrap();
+        assert_eq!(fetched.leaf_hash, matching_hash);
+        assert_eq!(fetched.leaf_index, 5);
+    }
+
+    #[test]
+    fn fetch_cold_proof_rejects_provider_returning_wrong_leaf_hash() {
+        // A custom provider that ignores the leaf_hash parameter and returns
+        // a proof for a different event (simulates a compromised provider).
+        struct SwapAttackProvider {
+            wrong_hash: [u8; 32],
+        }
+
+        impl ColdTierProvider for SwapAttackProvider {
+            fn fetch_inclusion_proof(
+                &self,
+                _context_id: &str,
+                leaf_index: u64,
+                _leaf_hash: [u8; 32],
+            ) -> Result<InclusionProof, TieredStorageError> {
+                // Return a proof with a DIFFERENT leaf hash than requested.
+                Ok(InclusionProof {
+                    leaf_index,
+                    leaf_hash: self.wrong_hash,
+                    path: vec![ProofStep {
+                        sibling_hash: [0xFF; 32],
+                        direction: Direction::Right,
+                    }],
+                    root: [0xEE; 32],
+                })
+            }
+        }
+
+        let config = TierConfig {
+            age_threshold_secs: None,
+            max_hot_events: Some(3),
+            max_hot_bytes: None,
+        };
+
+        let (mut tiered, _) = build_tiered_log(6, config, 1_000_000, 60);
+
+        // Migrate first 3 events.
+        tiered.migrate_to_cold(1_000_000).unwrap();
+
+        let swap_provider = SwapAttackProvider {
+            wrong_hash: [0xDE; 32],
+        };
+        let result = tiered.fetch_cold_proof(0, &swap_provider);
+
+        match result {
+            Err(TieredStorageError::LeafHashMismatch {
+                leaf_index,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(leaf_index, 0);
+                // The expected hash should be the real leaf hash from the cold entry.
+                let real_hash = tiered.cold_entries()[0].leaf_hash;
+                assert_eq!(expected, hex::encode(real_hash));
+                assert_eq!(actual, hex::encode([0xDE; 32]));
+            }
+            other => panic!("expected LeafHashMismatch, got {other:?}"),
+        }
     }
 
     /// Integration test: build a tiered log, migrate events to cold, store

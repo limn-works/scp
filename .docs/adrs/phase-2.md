@@ -1422,3 +1422,97 @@ Key design choices:
 - S3 backend can stream multi-GB blobs without memory pressure.
 - Future backends (e.g., PostgreSQL large objects) can override defaults when ready.
 - Current wire protocol delivers blobs as single MessagePack-framed messages (already materialized in memory), so streaming call sites provide no benefit until chunked wire delivery exists. The streaming storage API is complete — it serves developers building chunked delivery.
+
+---
+
+## ADR-042: Broadcast Content Delivery
+
+**Status:** Decided
+
+### Context
+
+Broadcast projection (§18.11, ADR-035) serves decrypted broadcast messages over HTTP as JSON. This enables CDN distribution and feed consumption, but stops short of serving structured web content. A simple text+image website cannot be served from a broadcast context today because:
+
+1. **No content metadata on messages** — `BroadcastEnvelope` has no `content_type` or `path` field. Content is opaque `Vec<u8>`.
+2. **No path-based routing** — projection endpoints are blob-ID-addressed only (`/messages/<blob_id>`), not path-addressed (`/about`, `/styles.css`).
+3. **No MIME-aware serving** — projection always returns `application/json` regardless of content type.
+4. **No atomic deploys** — no concept of a versioned set of assets that can be swapped atomically.
+5. **No SDK convenience** — no `broadcastPublishAssets(dir)` or asset-level publish methods.
+
+### Decision
+
+Extend broadcast projection into a full content delivery layer by defining `BroadcastContent` as the canonical structured inner payload (inside `encrypted_content`, after decryption). The relay wire format (`BroadcastEnvelope`) is unchanged — relays continue to see opaque ciphertext.
+
+Key design choices:
+
+- **Magic byte prefix for version detection.** ASCII `"SCP"` + `version_u8` prefix on the decrypted inner payload. After AES-256-GCM decryption, check first 3 bytes for `BROADCAST_CONTENT_MAGIC`. If matched, read 4th byte as version and deserialize remaining bytes as MessagePack `BroadcastContent`. Legacy payloads (no magic prefix) are treated as raw bytes. False-positive probability is approximately 1/2^24 for uniformly random legacy payloads. Since this is a pre-launch breaking change, all existing broadcast content should be re-published under the new format.
+- **Typed `AssetEntry` for SDK publish.** `AssetEntry { path: ContentPath, content_type: MimeType, body: Vec<u8> }` — typed parameter prevents positional transposition. `broadcastPublishAsset` (single) and `broadcastPublishAssets` (batch + commit) across all FFI bridges.
+- **Deploy manifest blob for persistence.** A special broadcast message containing the complete `path -> blob_id` mapping for a deploy. Loaded on `enable_broadcast_projection()` to rebuild path index on node restart. Solves persistence, recovery, and dedup in one mechanism.
+- **`ArcSwap` per-context for lock-free concurrent reads.** `Arc<ArcSwap<PathIndex>>` per `ProjectedContext` — NOT on the shared `projected_contexts` registry lock. HTTP handlers read the current deploy via `ArcSwap::load()`. Index is built at commit time only (not during per-asset publish). Per-asset publish requires no write locks on the registry.
+- **Node-local `SiteConfig`.** Site configuration (hostname, index path, resource limits, CSP override) is passed to `enable_broadcast_projection()`. NOT part of governance-governed `ProjectionPolicy` — deployment concerns stay out of governance.
+- **Required security headers.** All site responses include `X-Content-Type-Options: nosniff`, `Content-Security-Policy`, `X-Frame-Options: DENY`, `Strict-Transport-Security`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`, `Referrer-Policy: same-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()`. Each projected context MUST have its own hostname/subdomain for origin isolation.
+- **Cache behavior via `immutable` flag.** `ContentMetadata.immutable: true` assets get immutable 1-year cache. `immutable: false` (default) assets get `max-age=0, must-revalidate` with ETag for CDN revalidation. 404 responses get `Cache-Control: no-store`. No heuristic content-hash detection.
+
+### Rationale
+
+- **Structured inner payload:** The relay stays dumb — content structure is a post-decryption concern. Putting metadata in the outer `BroadcastEnvelope` would violate the relay capability ceiling (§9.9.1).
+- **Magic byte prefix over heuristic detection:** MessagePack markers have a ~10% collision rate on arbitrary payloads and create a parsing oracle. A 3-byte ASCII prefix ("SCP") has approximately 1/2^24 false-positive probability for uniformly random legacy payloads. Since this is a pre-launch breaking change, all existing content should be re-published.
+- **Deploy manifest blob:** Solves persistence, recovery, and dedup in one mechanism. Without it, the path index is lost on node restart and must be reconstructed by scanning all blobs — expensive and fragile.
+- **`ArcSwap` per-context:** Eliminates registry lock contention during batch publish. HTTP read handlers are completely lock-free; publish operations only touch per-context state.
+- **Node-local `SiteConfig`:** Hostname binding, index path, and resource limits are deployment concerns that vary per node. Including them in governance-governed `ProjectionPolicy` would require governance actions to change a DNS mapping — inappropriate coupling.
+
+### Rejected Alternatives
+
+1. **Cleartext metadata on `BroadcastEnvelope`.** Would expose content paths and MIME types to relays, violating the relay capability ceiling (§9.9.1). Relays must not learn content structure.
+2. **Heuristic version detection via MessagePack markers.** First-byte heuristics on MessagePack payloads have a ~10% collision rate and create a parsing oracle (attacker-controlled payloads could trigger version misparsing). Magic byte prefix is unambiguous.
+3. **In-memory-only path index without manifest.** Path index is lost on node restart. Reconstructing from a blob scan is expensive (enumerate all blobs, decrypt each, extract metadata) and fragile (relies on blob TTL not having expired). The manifest blob makes restart recovery O(1).
+4. **SPA fallback.** Excluded — introduces security edge cases (CDN 404 caching, information disclosure profile change) and is a deployment convenience, not a protocol concern. Reverse proxies handle this transparently.
+5. **`ContentEncoding` enum.** Excluded — pre-compressed content delivery introduces complexity (gzip bomb validation, encoding trust) without proportional value. tower-http handles compression on the fly.
+6. **Staged deploy API with typestate.** A `DeployBuilder` with typestate transitions (`Publishing` → `Committing` → `Live`) adds API complexity without safety benefit — the batch publish pattern (publish all assets, then commit) is simpler and already atomic at the commit boundary.
+
+### Dependencies
+
+- **ADR-035 (Local HTTP Control API and Broadcast Projection):** `ProjectedContext` type, projection endpoint composition, `NodeState` extensions, `Arc<dyn BlobStorage>` sharing.
+- **§5.14 (Broadcast Contexts):** `BroadcastEnvelope`, `BroadcastKey`, `BroadcastAdmission`, per-author AES-256 keys, `routing_id` derivation.
+- **§18.11 (HTTP Broadcast Projection):** Feed endpoint, per-message endpoint, decryption architecture, security properties, SDK surface.
+
+### Acceptance Criteria
+
+1. **`BroadcastContent` struct** with `version: u8`, `metadata: ContentMetadata`, `body: Vec<u8>`. Wire format: `BROADCAST_CONTENT_MAGIC ++ version_u8 ++ MessagePack(BroadcastContent)`.
+2. **`ContentMetadata` struct** with `path: Option<ContentPath>`, `content_type: Option<MimeType>`, `deploy_id: Option<String>`, `etag: Option<String>`, `immutable: bool` (default `false`). Cache behavior is determined by the `immutable` flag, not by heuristic content-hash detection.
+3. **`ContentPath` newtype** rejects `..`, `//`, `./`, `\`, null bytes, control chars, non-UTF-8, percent-encoded traversals, query strings, fragments. Enforces leading `/`, max 1024 bytes, no trailing slash (except root `/`). Case-sensitive.
+4. **`MimeType` newtype** matches `type/subtype` grammar (RFC 7231 §3.1.1.1). Rejects CRLF and control characters.
+5. **`deserialize_broadcast_content()`** implements version detection algorithm: check magic prefix, read version byte, deserialize MessagePack. Legacy payloads (no magic prefix) returned as raw bytes.
+6. **Path-based projection endpoint** at `/scp/broadcast/<routing_id>/site/<path>` resolves path to blob in current deploy, returns raw body with declared `Content-Type`.
+7. **Virtual host routing** via `SiteConfig.hostname` — requests to the configured hostname resolve directly to the context's path index.
+8. **Security headers** on all site responses: `X-Content-Type-Options: nosniff`, `Content-Security-Policy`, `X-Frame-Options: DENY`, `Strict-Transport-Security: max-age=63072000; includeSubDomains`, `Cross-Origin-Opener-Policy: same-origin`, `Referrer-Policy: same-origin`.
+9. **Atomic deploy commit** builds immutable `PathIndex`, stores deploy manifest blob, swaps `current_deploy_id` via `ArcSwap`.
+10. **Deploy retention** keeps current + previous indexes in memory. Configurable retention count (default 2).
+11. **Deploy manifest blob** persists `path -> blob_id` mapping. Loaded on `enable_broadcast_projection()` for restart recovery.
+12. **`SiteConfig` struct** with `hostname`, `index_path`, `max_assets_per_deploy`, `max_deploy_size_bytes`, `deploy_retention_count`, `csp_override`. Validated on assignment.
+13. **`broadcastPublishAsset` and `broadcastPublishAssets`** SDK methods across all FFI bridges. Typed `AssetEntry` parameter (`{ path: ContentPath, content_type: MimeType, body: Vec<u8> }`). Returns `{ blobId, etag }`. Content-hash dedup.
+14. **Resource limits enforced:** max 10,000 assets per deploy, max 512 MiB total deploy size, max 8 deploys retained per projected context.
+
+### Scope
+
+**New files:**
+
+| File | Purpose |
+|------|---------|
+| `crates/scp-core/src/context/broadcast_content.rs` | `BroadcastContent`, `ContentMetadata`, `ContentPath`, `MimeType`, magic byte prefix, `deserialize_broadcast_content()` |
+
+**Modified files:**
+
+| File | Change |
+|------|--------|
+| `crates/scp-node/src/projection.rs` | Path index (`ArcSwap`), `/site/<path>` endpoint, MIME-aware serving, deploy manifest, security headers |
+| `crates/scp-node/src/http.rs` | Wire `/site/` route, virtual host routing |
+| `crates/scp-node/src/lib.rs` | `SiteConfig`, deploy management, manifest persistence |
+| `crates/scp-ffi/src/context.rs` | PyO3 bridge exports for `broadcastPublishAsset`, `broadcastPublishAssets` |
+| `crates/scp-ffi/napi/src/context.rs` | NAPI bridge exports |
+| `crates/scp-ffi/uniffi/src/bridge.rs` | UniFFI bridge exports |
+| `crates/scp-ffi/wasm/src/context.rs` | WASM bridge exports (`ContentPath`/`MimeType` validation reimplemented locally per ADR-034) |
+| `bindings/typescript/src/context.ts` | `broadcastPublishAsset`, `broadcastPublishAssets` |
+| `bindings/python/scp_sdk/context.py` | `broadcast_publish_asset`, `broadcast_publish_assets` |
+
+**Estimated functions:** ~20-25 public functions, ~15-20 internal helpers across all files.
