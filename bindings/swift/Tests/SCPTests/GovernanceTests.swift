@@ -872,6 +872,122 @@ struct GovernanceTests {
         }
     }
 
+    // MARK: - Broadcast Publish Asset tests (SCP-290)
+
+    @Test("broadcastPublishAsset calls bridge with correct args and returns result")
+    func broadcastPublishAssetRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        var receivedAsset: AssetEntry?
+        var receivedDeployId: String?
+        let mockPublishAsset: BroadcastBridge.PublishAssetFn = { _, _, asset, deployId in
+            receivedAsset = asset
+            receivedDeployId = deployId
+            return PublishResult(blobId: "abc123", etag: "def456")
+        }
+
+        let asset = AssetEntry(
+            path: "/index.html",
+            contentType: "text/html",
+            body: Data("<h1>Hello</h1>".utf8)
+        )
+        let result = try await context.broadcastPublishAsset(
+            asset: asset,
+            identity: Identity(noPointer: .init()),
+            deployId: "deploy-1",
+            publishAssetFn: mockPublishAsset
+        )
+        #expect(result.blobId == "abc123")
+        #expect(result.etag == "def456")
+        #expect(receivedAsset == asset)
+        #expect(receivedDeployId == "deploy-1")
+    }
+
+    @Test("broadcastPublishAsset throws SCP-CTX-2001 when context is closed")
+    func broadcastPublishAssetThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        let asset = AssetEntry(
+            path: "/index.html",
+            contentType: "text/html",
+            body: Data("<h1>Hello</h1>".utf8)
+        )
+
+        do {
+            _ = try await context.broadcastPublishAsset(
+                asset: asset,
+                identity: Identity(noPointer: .init())
+            )
+            Issue.record("Expected broadcastPublishAsset to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("broadcastPublishAssets batch returns multiple results")
+    func broadcastPublishAssetsBatchRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        var receivedAssets: [AssetEntry]?
+        var receivedDeployId: String?
+        let mockPublishAssets: BroadcastBridge.PublishAssetsFn = { _, _, assets, deployId in
+            receivedAssets = assets
+            receivedDeployId = deployId
+            return assets.indices.map { idx in
+                PublishResult(blobId: "blob-\(idx)", etag: "etag-\(idx)")
+            }
+        }
+
+        let assets = [
+            AssetEntry(path: "/index.html", contentType: "text/html", body: Data("<h1>Hi</h1>".utf8)),
+            AssetEntry(path: "/style.css", contentType: "text/css", body: Data("body{}".utf8))
+        ]
+        let results = try await context.broadcastPublishAssets(
+            assets: assets,
+            identity: Identity(noPointer: .init()),
+            deployId: "deploy-batch",
+            publishAssetsFn: mockPublishAssets
+        )
+        #expect(results.count == 2)
+        #expect(results[0].blobId == "blob-0")
+        #expect(results[1].blobId == "blob-1")
+        #expect(results[0].etag == "etag-0")
+        #expect(results[1].etag == "etag-1")
+        #expect(receivedAssets == assets)
+        #expect(receivedDeployId == "deploy-batch")
+    }
+
+    @Test("broadcastPublishAssets throws SCP-CTX-2001 when context is closed")
+    func broadcastPublishAssetsThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        let assets = [
+            AssetEntry(path: "/index.html", contentType: "text/html", body: Data("hi".utf8))
+        ]
+
+        do {
+            _ = try await context.broadcastPublishAssets(
+                assets: assets,
+                identity: Identity(noPointer: .init())
+            )
+            Issue.record("Expected broadcastPublishAssets to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
     // MARK: - Bridge error propagation tests
 
     @Test("memberCount propagates bridge errors")

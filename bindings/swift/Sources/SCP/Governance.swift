@@ -448,6 +448,22 @@ public enum BroadcastBridge {
         _ handle: ContextHandle
     ) async throws -> String?
 
+    /// Publish a single asset to a broadcast context (SCP-290).
+    public typealias PublishAssetFn = @Sendable (
+        _ handle: ContextHandle,
+        _ identity: Identity,
+        _ asset: AssetEntry,
+        _ deployId: String?
+    ) async throws -> PublishResult
+
+    /// Publish multiple assets to a broadcast context (SCP-290).
+    public typealias PublishAssetsFn = @Sendable (
+        _ handle: ContextHandle,
+        _ identity: Identity,
+        _ assets: [AssetEntry],
+        _ deployId: String?
+    ) async throws -> [PublishResult]
+
     public static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
         try await broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
     }
@@ -490,6 +506,22 @@ public enum BroadcastBridge {
 
     public static let defaultAdmission: AdmissionFn = { handle in
         try await broadcastAdmission(handle: handle)
+    }
+
+    /// Default publish asset function — delegates to UniFFI
+    /// ``broadcastPublishAsset(handle:identity:asset:deployId:)``.
+    public static let defaultPublishAsset: PublishAssetFn = { handle, identity, asset, deployId in
+        try await broadcastPublishAsset(
+            handle: handle, identity: identity, asset: asset, deployId: deployId
+        )
+    }
+
+    /// Default publish assets function — delegates to UniFFI
+    /// ``broadcastPublishAssets(handle:identity:assets:deployId:)``.
+    public static let defaultPublishAssets: PublishAssetsFn = { handle, identity, assets, deployId in
+        try await broadcastPublishAssets(
+            handle: handle, identity: identity, assets: assets, deployId: deployId
+        )
     }
 }
 
@@ -909,6 +941,58 @@ public extension Context {
         }
 
         return try await admissionFn(handle)
+    }
+
+    /// Publishes a single asset to this broadcast context as structured content (SCP-290).
+    ///
+    /// Constructs a `BroadcastContent` from the asset entry, computes an `ETag`,
+    /// and publishes via the broadcast content delivery layer.
+    ///
+    /// - Parameters:
+    ///   - asset: The asset to publish (path, content type, body).
+    ///   - identity: The identity of the author publishing the asset.
+    ///   - deployId: Optional deploy ID to group assets into atomic deploys.
+    ///   - publishAssetFn: Bridge function override for testing.
+    /// - Returns: A ``PublishResult`` with `blobId` and `etag`.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
+    ///   active or publishing fails.
+    func broadcastPublishAsset(
+        asset: AssetEntry,
+        identity: Identity,
+        deployId: String? = nil,
+        publishAssetFn: BroadcastBridge.PublishAssetFn = BroadcastBridge.defaultPublishAsset
+    ) async throws -> PublishResult {
+        guard state == .active else {
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
+        }
+
+        return try await publishAssetFn(handle, identity, asset, deployId)
+    }
+
+    /// Publishes multiple assets to this broadcast context as structured content (SCP-290).
+    ///
+    /// All assets are published with the same deploy ID (auto-generated if not
+    /// provided). Returns a list of ``PublishResult`` values.
+    ///
+    /// - Parameters:
+    ///   - assets: The assets to publish.
+    ///   - identity: The identity of the author publishing the assets.
+    ///   - deployId: Optional deploy ID to group assets into atomic deploys.
+    ///   - publishAssetsFn: Bridge function override for testing.
+    /// - Returns: An array of ``PublishResult`` values, one per asset.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
+    ///   active or publishing fails.
+    func broadcastPublishAssets(
+        assets: [AssetEntry],
+        identity: Identity,
+        deployId: String? = nil,
+        publishAssetsFn: BroadcastBridge.PublishAssetsFn = BroadcastBridge.defaultPublishAssets
+    ) async throws -> [PublishResult] {
+        guard state == .active else {
+            throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
+        }
+
+        return try await publishAssetsFn(handle, identity, assets, deployId)
     }
 }
 

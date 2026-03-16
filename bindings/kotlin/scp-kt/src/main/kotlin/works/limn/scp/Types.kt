@@ -285,6 +285,58 @@ class ScopedHandle internal constructor(
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast Asset Publishing (SCP-290, ADR-035)
+// ---------------------------------------------------------------------------
+
+/**
+ * An asset to publish to a broadcast context (SCP-290).
+ *
+ * Typed data class matching the Rust `AssetEntry` UniFFI record. Prevents
+ * positional transposition of path/content_type/body.
+ *
+ * Custom [equals] and [hashCode] are required because [body] is a [ByteArray],
+ * which does not implement structural equality by default in Kotlin.
+ *
+ * @property path Validated URL path (e.g., `/index.html`, `/styles.css`).
+ * @property contentType Validated MIME type (e.g., `text/html`, `text/css`).
+ * @property body Raw content bytes.
+ */
+class AssetEntry(
+    val path: String,
+    val contentType: String,
+    val body: ByteArray,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is AssetEntry) return false
+        return path == other.path &&
+            contentType == other.contentType &&
+            body.contentEquals(other.body)
+    }
+
+    override fun hashCode(): Int {
+        var result = path.hashCode()
+        result = 31 * result + contentType.hashCode()
+        result = 31 * result + body.contentHashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "AssetEntry(path=$path, contentType=$contentType, bodySize=${body.size})"
+}
+
+/**
+ * Result of publishing an asset to a broadcast context (SCP-290).
+ *
+ * @property blobId Hex-encoded SHA-256 of the serialized broadcast envelope.
+ * @property etag Hex-encoded SHA-256 of the asset body.
+ */
+data class PublishResult(
+    val blobId: String,
+    val etag: String,
+)
+
+// ---------------------------------------------------------------------------
 // TestVector (spec §7.3.3, ADR-010)
 // ---------------------------------------------------------------------------
 
