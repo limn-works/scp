@@ -11276,6 +11276,8 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<Str
 }
 
 /// Parses an SCPID signing key ID string (`"#active"` or `"#agent"`).
+// Called from `#[uniffi::export]` `scpid_sign` which the dead_code lint cannot trace.
+#[allow(dead_code)]
 fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, ScpError> {
     match s {
         "#active" => Ok(scp_identity::SigningKeyId::Active),

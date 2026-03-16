@@ -441,7 +441,7 @@ impl DidPublicKeyResolver for IdentityBackedDidResolver {
 /// (which requires the async identity-layer resolver trait, not the sync UCAN
 /// validation trait).
 ///
-/// Delegates to the type-erased [`AsyncResolveFn`] stored during construction.
+/// Delegates to the type-erased `AsyncResolveFn` stored during construction.
 impl scp_identity::resolver::DidResolver for IdentityBackedDidResolver {
     fn resolve(
         &self,
@@ -566,7 +566,7 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
 // BridgeRevocationAuthorizer (issue #499)
 // ---------------------------------------------------------------------------
 
-/// Bridge [`RevocationAuthorizer`] that checks the revoker DID against the
+/// Bridge `RevocationAuthorizer` that checks the revoker DID against the
 /// token's issuer DID and the context creator DID.
 ///
 /// The authorizer is constructed with the issuer DID extracted from the parsed
@@ -605,7 +605,7 @@ impl scp_core::crypto::ucan::revoke::RevocationAuthorizer for BridgeRevocationAu
 // BridgeRevocationDistributor (issue #499)
 // ---------------------------------------------------------------------------
 
-/// No-op [`RevocationDistributor`] for FFI bridges.
+/// No-op `RevocationDistributor` for FFI bridges.
 ///
 /// FFI bridges do not have direct access to MLS group state for distributing
 /// revocations to context members. In the full runtime, revocations would be
@@ -635,7 +635,7 @@ impl scp_core::crypto::ucan::revoke::RevocationDistributor for BridgeRevocationD
 // BridgeRevocationEventLogger (issue #499)
 // ---------------------------------------------------------------------------
 
-/// Bridge [`RevocationEventLogger`] that appends unsigned `TokenRevoked`
+/// Bridge `RevocationEventLogger` that appends unsigned `TokenRevoked`
 /// events to the context's Merkle event log.
 ///
 /// Uses `append_unsigned_event` because `KeyCustody::sign()` is async and

@@ -230,10 +230,10 @@ pub fn py_ucan_validate(
 ///
 /// # Errors
 ///
-/// Raises `ValidationError` if `member_did` fails [`validate_did`]
+/// Raises `ValidationError` if `member_did` fails `validate_did`
 /// (empty, malformed `did:{method}:{id}` format, or control characters),
-/// if any capability URI fails [`validate_capability_uri`], or if any
-/// proof token fails [`validate_ucan_token`].
+/// if any capability URI fails `validate_capability_uri`, or if any
+/// proof token fails `validate_ucan_token`.
 ///
 /// Raises `UcanError` if minting fails: capabilities outside the context
 /// ceiling, issuer not authorized, signing fails, etc.
@@ -331,9 +331,9 @@ pub fn py_ucan_mint(
 /// # Errors
 ///
 /// Raises `ValidationError` if `delegator_did` or `delegatee_did` fails
-/// [`validate_did`] (empty, malformed `did:{method}:{id}` format, or
-/// control characters), if `parent_token` fails [`validate_ucan_token`],
-/// or if any capability URI fails [`validate_capability_uri`].
+/// `validate_did` (empty, malformed `did:{method}:{id}` format, or
+/// control characters), if `parent_token` fails `validate_ucan_token`,
+/// or if any capability URI fails `validate_capability_uri`.
 ///
 /// Raises `UcanError` if delegation fails: delegator not matching parent
 /// audience, capabilities wider than parent, signing failure, etc.
@@ -426,9 +426,9 @@ pub fn py_ucan_delegate(
 /// Performs the complete UCAN revocation flow from ADR-016:
 ///
 /// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
-///    context creator via [`BridgeRevocationAuthorizer`].
+///    context creator via `BridgeRevocationAuthorizer`.
 /// 2. **Local revocation** -- Adds the token CID to the context's
-///    [`RevocationList`] (fail-closed via `RevocationPending` state).
+///    `RevocationList` (fail-closed via `RevocationPending` state).
 /// 3. **Distribution** -- Logs the revocation for transport-layer broadcast
 ///    (MLS distribution deferred to transport connection).
 /// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's

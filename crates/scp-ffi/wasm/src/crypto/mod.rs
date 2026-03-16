@@ -6,12 +6,12 @@
 //!
 //! # Architecture
 //!
-//! - [`credential`] — `WasmScpCredential` (MessagePack-serialized identity payload).
-//! - [`error`] — `WasmCryptoError` error type.
-//! - [`group`] — `WasmMlsGroup` wrapping `OpenMLS` `MlsGroup`.
-//! - [`encrypt`] — Higher-level MLS encrypt/decrypt with TLS serialization.
-//! - [`sender_key`] — AES-256-GCM sender-side key layer.
-//! - [`state`] — `WasmCryptoState` orchestrating both layers.
+//! - `credential` — `WasmScpCredential` (MessagePack-serialized identity payload).
+//! - `error` — `WasmCryptoError` error type.
+//! - `group` — `WasmMlsGroup` wrapping `OpenMLS` `MlsGroup`.
+//! - `encrypt` — Higher-level MLS encrypt/decrypt with TLS serialization.
+//! - `sender_key` — AES-256-GCM sender-side key layer.
+//! - `state` — `WasmCryptoState` orchestrating both layers.
 //!
 //! See ADR-001 for the MLS wrapper design and ADR-007 for the sender key layer.
 

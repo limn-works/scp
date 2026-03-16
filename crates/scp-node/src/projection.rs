@@ -105,7 +105,7 @@ pub struct DeployManifestEntry {
 
 /// Node-local site configuration for broadcast projection (§18.11.12).
 ///
-/// Passed to [`ApplicationNode::enable_broadcast_projection`] to configure
+/// Passed to `ApplicationNode::enable_broadcast_projection` to configure
 /// path-based serving. NOT part of governance — deployment concern only.
 #[derive(Debug, Clone)]
 pub struct SiteConfig {

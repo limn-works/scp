@@ -172,8 +172,8 @@ pub fn init_context_manager_with(
     });
 }
 
-/// Test variant of [`init_context_manager`] that uses [`LocalTransportProvider`]
-/// instead of [`NotConfiguredTransportProvider`].
+/// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
+/// instead of `NotConfiguredTransportProvider`.
 ///
 /// Production code uses `NotConfiguredTransportProvider` to surface descriptive
 /// errors when transport operations (publish, send) are attempted without a

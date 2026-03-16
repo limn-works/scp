@@ -122,9 +122,9 @@ impl VersionCompatibility {
 /// Checks whether a wire version is compatible with the local protocol version.
 ///
 /// Per spec §13.5, same-major envelopes are always accepted:
-/// - Exact match → [`VersionCompatibility::Exact`]
-/// - Same major, different minor → [`VersionCompatibility::DegradedMode`]
-/// - Different major → [`Err(EnvelopeError::UnsupportedVersion)`]
+/// - Exact match → `VersionCompatibility::Exact`
+/// - Same major, different minor → `VersionCompatibility::DegradedMode`
+/// - Different major → `Err(EnvelopeError::UnsupportedVersion)`
 ///
 /// This replaces the previous exact-match-only check that would reject any
 /// version other than `SCP_PROTOCOL_VERSION` (issue #628).

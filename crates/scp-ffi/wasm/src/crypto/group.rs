@@ -180,7 +180,7 @@ impl WasmMlsGroup {
     ///
     /// The `welcome_bytes` must be TLS-serialized `MlsMessageOut` bytes
     /// containing a Welcome. The `holder` must be the `WasmMlsGroup` returned
-    /// by [`generate_key_package`] — it contains the provider and signer
+    /// by `generate_key_package` — it contains the provider and signer
     /// that hold the private key material matching the `KeyPackage` that was
     /// sent to the adder.
     ///
@@ -226,7 +226,7 @@ impl WasmMlsGroup {
     /// Returns `(key_package_bytes, WasmMlsGroup)` where `key_package_bytes`
     /// is TLS-serialized and the `WasmMlsGroup` holds the private key material
     /// needed to later join via Welcome. Pass the returned `WasmMlsGroup` to
-    /// [`join_from_welcome`] when the Welcome message arrives.
+    /// `join_from_welcome` when the Welcome message arrives.
     ///
     /// # Errors
     ///

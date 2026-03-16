@@ -323,7 +323,7 @@ pub trait CustodyMigrationBackend {
 ///
 /// - Step 1 or 2 failure: No state change. Abort cleanly.
 /// - Step 3 failure (partial publication): Safe — peers with old document
-///   continue to work. The [`RepublishManager`] converges on retry.
+///   continue to work. The `RepublishManager` converges on retry.
 /// - Step 4 failure: The SDK queues failed operations for retry.
 /// - Step 5 failure: Non-fatal — old key is orphaned but harmless.
 ///
