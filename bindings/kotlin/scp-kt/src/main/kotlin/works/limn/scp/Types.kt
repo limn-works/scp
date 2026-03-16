@@ -8,6 +8,10 @@
 
 package works.limn.scp
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import works.limn.scp.bridge.BridgeException
 
 /**
@@ -124,7 +128,11 @@ data class ToolCost(
     val currency: String,
     val payee: String,
     val costFormula: String? = null,
-)
+) {
+    init {
+        require(amount >= 0) { "ToolCost amount must be non-negative, got $amount" }
+    }
+}
 
 /**
  * Definition of a tool that can be registered in an SCP context.
@@ -155,32 +163,35 @@ data class ToolDefinition(
 ) {
     /**
      * Serializes this definition to a JSON string suitable for the FFI bridge.
+     *
+     * Uses [buildJsonObject] from kotlinx.serialization to produce structurally
+     * valid JSON, preventing injection via untrusted string fields.
      */
-    fun toJson(): String = buildString {
-        append("{")
-        append("\"name\":\""); append(name); append("\",")
-        append("\"description\":\""); append(description); append("\",")
-        append("\"input_schema_json\":"); append(inputSchemaJson); append(",")
-        append("\"output_schema_json\":"); append(outputSchemaJson); append(",")
-        append("\"operator_did\":\""); append(operatorDid); append("\"")
-        if (testVectorsJson != null) {
-            append(",\"test_vectors_json\":"); append(testVectorsJson)
-        }
-        if (implementationHashHex != null) {
-            append(",\"implementation_hash\":\""); append(implementationHashHex); append("\"")
-        }
-        if (cost != null) {
-            append(",\"cost\":{")
-            append("\"amount\":"); append(cost.amount); append(",")
-            append("\"currency\":\""); append(cost.currency); append("\",")
-            append("\"payee\":\""); append(cost.payee); append("\"")
-            if (cost.costFormula != null) {
-                append(",\"cost_formula\":\""); append(cost.costFormula); append("\"")
+    fun toJson(): String = Json.encodeToString(
+        buildJsonObject {
+            put("name", name)
+            put("description", description)
+            put("input_schema_json", Json.parseToJsonElement(inputSchemaJson))
+            put("output_schema_json", Json.parseToJsonElement(outputSchemaJson))
+            put("operator_did", operatorDid)
+            if (testVectorsJson != null) {
+                put("test_vectors_json", Json.parseToJsonElement(testVectorsJson))
             }
-            append("}")
-        }
-        append("}")
-    }
+            if (implementationHashHex != null) {
+                put("implementation_hash", implementationHashHex)
+            }
+            if (cost != null) {
+                putJsonObject("cost") {
+                    put("amount", cost.amount)
+                    put("currency", cost.currency)
+                    put("payee", cost.payee)
+                    if (cost.costFormula != null) {
+                        put("cost_formula", cost.costFormula)
+                    }
+                }
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

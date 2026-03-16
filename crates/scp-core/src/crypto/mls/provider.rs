@@ -783,6 +783,28 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
+    fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        let wrapping_pk = {
+            let guard = self
+                .wrapping_public_key
+                .lock()
+                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+            *guard
+        };
+        self.with_context(context_id, |state| {
+            // The Commit message is intentionally discarded here. In the recovery
+            // flow (§9.12), the caller distributes the epoch change to other members
+            // via `recovery_send_notification`, not by distributing the raw MLS Commit.
+            // This is consistent with governance epoch advances.
+            let _commit = super::ratchet::propose_update_with_wrapping_key(
+                &mut state.mls_group,
+                &wrapping_pk,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         let contexts = self
             .contexts
