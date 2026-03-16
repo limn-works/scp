@@ -292,7 +292,8 @@ struct RealFFIStatelessTests {
             sourceType: "persistent",
             memoryScope: "full",
             members: ["did:dht:z6MkAlice", "did:dht:z6MkBob"],
-            targetContextId: "ctx-target-002"
+            targetContextId: "ctx-target-002",
+            actorDid: "did:dht:z6MkActor"
         )
         // Returns JSON string with provenance record
         #expect(record.contains("ctx-source-001"))
@@ -308,6 +309,7 @@ struct RealFFIStatelessTests {
             memoryScope: "full",
             members: ["did:dht:z6MkAlice"],
             targetContextId: "ctx-target-002",
+            actorDid: "did:dht:z6MkActor",
             existingChainDepth: 2
         )
         #expect(!record.isEmpty)
@@ -323,7 +325,8 @@ struct RealFFIStatelessTests {
                 sourceType: "persistent",
                 memoryScope: "invalid_scope",
                 members: [],
-                targetContextId: "ctx-target"
+                targetContextId: "ctx-target",
+                actorDid: "did:dht:z6MkActor"
             )
             Issue.record("Expected provenanceAttach to throw for invalid memory scope")
         } catch {

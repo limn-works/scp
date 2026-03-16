@@ -455,6 +455,9 @@ pub fn wasm_event_type_tag(event_type: &str) -> u16 {
         "GovernanceConflictResolved" => 30,
         "GovernanceDeadlockRecovery" => 31,
         "GovernanceActionExecuted" | "GovernanceExecuted" => 32,
+        // Provenance event types (issue #586)
+        "ProvenanceAttached" => 34,
+        "ProvenanceReceived" => 35,
         _ => 0xFFFF, // Unknown event type — uses max u16 as sentinel.
     }
 }

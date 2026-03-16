@@ -422,6 +422,9 @@ pub(crate) const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::GovernanceConflictResolved => 30,
         EventType::GovernanceDeadlockRecovery => 31,
         EventType::GovernanceActionExecuted => 32,
+        // Provenance event types (issue #586)
+        EventType::ProvenanceAttached => 34,
+        EventType::ProvenanceReceived => 35,
     }
 }
 
@@ -1254,5 +1257,74 @@ mod tests {
             r, GENESIS_PREV_HASH,
             "empty root and genesis prev_hash must be distinct values"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Provenance event type tags (issue #586)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provenance_event_type_tags_are_correct() {
+        assert_eq!(event_type_tag(&EventType::ProvenanceAttached), 34);
+        assert_eq!(event_type_tag(&EventType::ProvenanceReceived), 35);
+    }
+
+    #[test]
+    fn provenance_events_append_unsigned() {
+        use crate::DID;
+
+        let mut log = EventLog::new("ctx-prov-test".to_owned());
+
+        // Append a ProvenanceAttached event.
+        let event_attached = Event {
+            event_type: EventType::ProvenanceAttached,
+            actor_did: DID::from(
+                "did:key:aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd"
+                    .to_owned(),
+            ),
+            timestamp: 1_000_000,
+            sequence: 0,
+            payload: EventPayload {
+                data: vec![0xAA; 32], // Simulated SHA-256 hash of provenance record
+            },
+            prev_hash: GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+        let idx = append_unsigned_event(&mut log, &event_attached).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(event_count(&log), 1);
+
+        // Append a ProvenanceReceived event.
+        let prev = log.leaves()[0];
+        let event_received = Event {
+            event_type: EventType::ProvenanceReceived,
+            actor_did: DID::from(
+                "did:key:aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd"
+                    .to_owned(),
+            ),
+            timestamp: 1_000_001,
+            sequence: 1,
+            payload: EventPayload {
+                data: vec![0xBB; 32],
+            },
+            prev_hash: prev,
+            signature: Vec::new(),
+        };
+        let idx = append_unsigned_event(&mut log, &event_received).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(event_count(&log), 2);
+
+        // Verify events are retrievable.
+        let retrieved_0 = log.get_event(0).unwrap();
+        assert!(matches!(
+            retrieved_0.event_type,
+            EventType::ProvenanceAttached
+        ));
+
+        let retrieved_1 = log.get_event(1).unwrap();
+        assert!(matches!(
+            retrieved_1.event_type,
+            EventType::ProvenanceReceived
+        ));
     }
 }

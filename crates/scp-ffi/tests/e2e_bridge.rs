@@ -658,6 +658,7 @@ fn provenance_attach_returns_dict() {
             "full",
             vec!["did:key:alice".to_owned()],
             "ctx-target".to_owned(),
+            "did:key:actor".to_owned(),
             None,
         )
         .unwrap();
@@ -689,6 +690,7 @@ fn provenance_attach_increments_chain_depth() {
             "full",
             vec![],
             "ctx-t2".to_owned(),
+            "did:key:actor".to_owned(),
             Some(2),
         )
         .unwrap();
@@ -736,6 +738,7 @@ fn provenance_attach_rejects_invalid_memory_scope() {
             "invalid_scope",
             vec![],
             "ctx-t".to_owned(),
+            "did:key:actor".to_owned(),
             None,
         );
         assert!(r.is_err());

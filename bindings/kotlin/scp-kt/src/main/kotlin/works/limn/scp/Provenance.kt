@@ -18,6 +18,7 @@ import works.limn.scp.bridge.CoroutineBridge
  * @property memoryScope One of "full", "summary", or "ephemeral".
  * @property members List of member DID strings from the source context.
  * @property targetContextId Target context ID.
+ * @property actorDid DID of the actor performing the attachment.
  * @property existingChainDepth Existing chain depth, or null for first hop.
  */
 data class ProvenanceAttachParams(
@@ -26,6 +27,7 @@ data class ProvenanceAttachParams(
     val memoryScope: String,
     val members: List<String>,
     val targetContextId: String,
+    val actorDid: String,
     val existingChainDepth: UByte? = null,
 )
 

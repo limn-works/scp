@@ -368,6 +368,9 @@ fn signed_event(
         EventType::GovernanceConflictResolved => 30,
         EventType::GovernanceDeadlockRecovery => 31,
         EventType::GovernanceActionExecuted => 32,
+        // Provenance event types (issue #586)
+        EventType::ProvenanceAttached => 34,
+        EventType::ProvenanceReceived => 35,
     };
 
     let mut hasher = Sha256::new();

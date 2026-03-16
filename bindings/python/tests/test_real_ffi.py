@@ -469,7 +469,13 @@ class TestProvenance:
 
     async def test_attach(self):
         result = _scp_core.provenance_attach(
-            "source-ctx", "persistent", "full", ["did:dht:z6MkTest"], "target-ctx", None
+            "source-ctx",
+            "persistent",
+            "full",
+            ["did:dht:z6MkTest"],
+            "target-ctx",
+            "did:dht:z6MkActor",
+            None,
         )
         assert isinstance(result, dict)
 

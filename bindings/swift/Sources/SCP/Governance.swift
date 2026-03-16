@@ -1120,7 +1120,6 @@ public extension Context {
         try await finalizeFn(handle)
     }
 
-    // swiftlint:disable function_parameter_count
     /// Creates a governance checkpoint (ADR-031 section 9).
     ///
     /// - Parameters:
@@ -1157,8 +1156,6 @@ public extension Context {
             creatorSignatureHex
         )
     }
-
-    // swiftlint:enable function_parameter_count
 
     /// Adds a cosignature to an existing governance checkpoint (ADR-031 section 9).
     ///

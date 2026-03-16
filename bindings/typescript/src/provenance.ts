@@ -103,6 +103,7 @@ export async function provenanceAttach(
   memoryScope: string,
   members: string[],
   targetContextId: string,
+  actorDid: string,
   options?: {
     existingChainDepth?: number;
     discoveryMethod?: string;
@@ -118,6 +119,7 @@ export async function provenanceAttach(
       memoryScope,
       members,
       targetContextId,
+      actorDid,
       options?.existingChainDepth,
       options?.discoveryMethod,
       options?.purpose,

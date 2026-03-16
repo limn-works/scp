@@ -897,6 +897,9 @@ mod tests {
             EventType::GovernanceConflictResolved => 30,
             EventType::GovernanceDeadlockRecovery => 31,
             EventType::GovernanceActionExecuted => 32,
+            // Provenance event types (issue #586)
+            EventType::ProvenanceAttached => 34,
+            EventType::ProvenanceReceived => 35,
         }
     }
 

@@ -24,6 +24,7 @@ public enum ProvenanceBridge {
         _ memoryScope: String,
         _ members: [String],
         _ targetContextId: String,
+        _ actorDid: String,
         _ existingChainDepth: UInt8?
     ) throws -> String
 
@@ -46,13 +47,14 @@ public enum ProvenanceBridge {
 
     /// Default attach function — delegates to UniFFI
     /// ``provenanceAttach``.
-    public static let defaultAttach: AttachFn = { sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth in
+    public static let defaultAttach: AttachFn = { sourceContextId, sourceType, memoryScope, members, targetContextId, actorDid, existingChainDepth in
         try provenanceAttach(
             sourceContextId: sourceContextId,
             sourceType: sourceType,
             memoryScopeStr: memoryScope,
             members: members,
             targetContextId: targetContextId,
+            actorDid: actorDid,
             existingChainDepth: existingChainDepth
         )
     }
@@ -121,12 +123,13 @@ public func attachProvenance(
     memoryScope: String,
     members: [String],
     targetContextId: String,
+    actorDid: String,
     existingChainDepth: UInt8? = nil,
     attachFn: ProvenanceBridge.AttachFn = ProvenanceBridge.defaultAttach
 ) throws -> String {
     try attachFn(
         sourceContextId, sourceType, memoryScope, members,
-        targetContextId, existingChainDepth
+        targetContextId, actorDid, existingChainDepth
     )
 }
 

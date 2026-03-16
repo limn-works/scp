@@ -375,6 +375,7 @@ export interface Bridge {
     memoryScope: string,
     members: string[],
     targetContextId: string,
+    actorDid: string,
     existingChainDepth: number | undefined,
     discoveryMethod: string | undefined,
     purpose: string | undefined,

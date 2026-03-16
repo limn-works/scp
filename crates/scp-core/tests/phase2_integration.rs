@@ -133,6 +133,9 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::GovernanceConflictResolved => 30,
         EventType::GovernanceDeadlockRecovery => 31,
         EventType::GovernanceActionExecuted => 32,
+        // Provenance event types (issue #586)
+        EventType::ProvenanceAttached => 34,
+        EventType::ProvenanceReceived => 35,
     }
 }
 

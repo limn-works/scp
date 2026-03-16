@@ -74,10 +74,14 @@ def attach(
     memory_scope: str,
     members: list[str],
     target_context_id: str,
+    actor_did: str,
     *,
     existing_chain_depth: int | None = None,
 ) -> dict[str, Any]:
     """Attach provenance metadata when data crosses a context boundary.
+
+    Records dual events in the event log: ``ProvenanceAttached`` in the
+    source context and ``ProvenanceReceived`` in the target context.
 
     Returns a dict with the provenance record fields: ``source_context``,
     ``source_type``, ``chain_depth``, ``counterparties``, ``age_secs``,
@@ -89,6 +93,7 @@ def attach(
         memory_scope: ``"full"``, ``"summary"``, or ``"ephemeral"``.
         members: List of member DID strings from the source context.
         target_context_id: ID of the target context.
+        actor_did: DID of the actor performing the attachment.
         existing_chain_depth: Chain depth of existing provenance (if any).
 
     Returns:
@@ -105,6 +110,7 @@ def attach(
             memory_scope,
             members,
             target_context_id,
+            actor_did,
             existing_chain_depth,
         )
     )

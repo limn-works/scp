@@ -783,7 +783,6 @@ public func evaluateContextInvitation(
 
 // MARK: - MetadataRecord Inspection (§5.7.2, #615)
 
-// swiftlint:disable function_parameter_count
 /// Serializes a MetadataRecord to a JSON string (spec §5.7.2).
 ///
 /// Delegates to UniFFI ``metadataRecordToJson``.
@@ -817,8 +816,6 @@ public func serializeMetadataRecord(
         signatureHex: signatureHex
     )
 }
-
-// swiftlint:enable function_parameter_count
 
 /// Deserializes a MetadataRecord from a JSON string (spec §5.7.2).
 ///

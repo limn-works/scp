@@ -1533,6 +1533,7 @@ export function createMockBridge(): Bridge & {
       _memoryScope: string,
       _members: string[],
       targetContextId: string,
+      _actorDid: string,
       _existingChainDepth: number | undefined,
       _discoveryMethod: string | undefined,
       _purpose: string | undefined,

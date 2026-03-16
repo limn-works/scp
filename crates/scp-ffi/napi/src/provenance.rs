@@ -17,6 +17,7 @@
 //! See spec section 24 (Provenance System) and ADR-019.
 
 use napi_derive::napi;
+use sha2::{Digest, Sha256};
 
 use scp_core::context::MemoryScope;
 use scp_core::provenance::attach::{
@@ -73,6 +74,9 @@ pub async fn evaluate_provenance_quality(
 
 /// Attaches provenance metadata when data crosses a context boundary.
 ///
+/// Records dual events in the event log: `ProvenanceAttached` in the source
+/// context and `ProvenanceReceived` in the target context (issue #586).
+///
 /// Returns a JSON string with the attached provenance record.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
@@ -83,6 +87,7 @@ pub fn provenance_attach(
     memory_scope: String,
     members: Vec<String>,
     target_context_id: String,
+    actor_did: String,
     existing_chain_depth: Option<u32>,
     discovery_method: Option<String>,
     purpose: Option<String>,
@@ -94,7 +99,7 @@ pub fn provenance_attach(
     let cp = parse_counterparty_policy(counterparty_policy.as_deref())?;
 
     let source_info = SourceContextInfo {
-        context_id: source_context_id,
+        context_id: source_context_id.clone(),
         source_type: st,
         memory_scope: ms,
         members: members.into_iter().map(scp_identity::DID::from).collect(),
@@ -127,6 +132,45 @@ pub fn provenance_attach(
         None,
         None,
     );
+
+    // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
+    let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("failed to serialize provenance for hashing: {e}"),
+            code: "SCP-VALID-7053".to_owned(),
+        })
+    })?;
+    let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
+
+    // Record ProvenanceAttached in the source context event log.
+    // Best-effort: log warning if context not found (provenance_attach
+    // can be called without a runtime context, e.g. in unit tests).
+    if let Err(e) = append_provenance_event(
+        &source_context_id,
+        &actor_did,
+        scp_event_log::EventType::ProvenanceAttached,
+        &prov_hash,
+    ) {
+        tracing::warn!(
+            context = %source_context_id,
+            error = %e,
+            "failed to append ProvenanceAttached event to source context event log"
+        );
+    }
+
+    // Record ProvenanceReceived in the target context event log.
+    if let Err(e) = append_provenance_event(
+        &target_context_id,
+        &actor_did,
+        scp_event_log::EventType::ProvenanceReceived,
+        &prov_hash,
+    ) {
+        tracing::warn!(
+            context = %target_context_id,
+            error = %e,
+            "failed to append ProvenanceReceived event to target context event log"
+        );
+    }
 
     let discovery_method_str = match &prov.discovery_method {
         DiscoveryMethod::SharedContext(ctx_id) => {
@@ -280,6 +324,54 @@ pub fn provenance_update_source_type(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
+/// to the event log for the given context.
+///
+/// Follows the unsigned-event pattern used by `ToolInvoked` in the MCP bridge.
+fn append_provenance_event(
+    context_id: &str,
+    actor_did: &str,
+    event_type: scp_event_log::EventType,
+    provenance_hash: &[u8; 32],
+) -> napi::Result<()> {
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    crate::runtime::with_context(context_id, |state| {
+        let sequence = scp_event_log::tree::event_count(&state.event_log);
+        let prev_hash = if state.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            state.event_log.leaves()[state.event_log.leaves().len() - 1]
+        };
+
+        let event = scp_event_log::Event {
+            event_type,
+            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence,
+            payload: scp_event_log::EventPayload {
+                data: provenance_hash.to_vec(),
+            },
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        scp_event_log::tree::append_unsigned_event(&mut state.event_log, &event).map_err(|e| {
+            ScpNapiError::Context {
+                message: format!("failed to append provenance event: {e}"),
+                code: "SCP-CTX-2060".to_owned(),
+            }
+        })?;
+
+        Ok(())
+    })?;
+
+    Ok(())
+}
 
 fn parse_source_type(s: &str) -> napi::Result<SourceType> {
     match s {

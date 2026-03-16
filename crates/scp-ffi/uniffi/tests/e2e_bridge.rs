@@ -599,6 +599,7 @@ async fn provenance_attach_produces_json() {
         "full".to_owned(),
         vec!["did:dht:z6MkAlice".to_owned(), "did:dht:z6MkBob".to_owned()],
         "ctx-target".to_owned(),
+        "did:dht:z6MkActor".to_owned(),
         None,
     )
     .unwrap();
@@ -616,6 +617,7 @@ async fn provenance_attach_increments_chain_depth() {
         "full".to_owned(),
         vec!["did:dht:z6MkAlice".to_owned()],
         "ctx-target".to_owned(),
+        "did:dht:z6MkActor".to_owned(),
         Some(2),
     )
     .unwrap();

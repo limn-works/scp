@@ -84,7 +84,7 @@ struct ProvenanceTests {
         var receivedSourceContextId: String?
         var receivedTargetContextId: String?
 
-        let mockAttach: ProvenanceBridge.AttachFn = { sourceContextId, _, _, _, targetContextId, _ in
+        let mockAttach: ProvenanceBridge.AttachFn = { sourceContextId, _, _, _, targetContextId, _, _ in
             receivedSourceContextId = sourceContextId
             receivedTargetContextId = targetContextId
             return #"{"source_context":"\#(sourceContextId)","target_context":"\#(targetContextId)","chain_depth":0}"#
@@ -96,6 +96,7 @@ struct ProvenanceTests {
             memoryScope: "full",
             members: ["did:dht:z6MkAlice"],
             targetContextId: "ctx-target",
+            actorDid: "did:dht:z6MkActor",
             attachFn: mockAttach
         )
 
