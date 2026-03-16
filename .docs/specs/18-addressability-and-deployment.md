@@ -833,3 +833,146 @@ This allows URI consumers to choose between the native SCP path (relay + broadca
 - `ApplicationNode::disable_broadcast_projection(context_id)` — deactivates HTTP projection for the specified context. Removes it from the registry. Existing CDN caches may continue serving stale content per their cache headers.
 - `ApplicationNode::propagate_ban_keys(context_id, ban_result)` — updates the projection key registry after a governance-level subscriber ban. Inserts post-rotation keys for each rotated author. For `Full`-scope bans, purges all pre-ban epoch keys so historical content is no longer served (§18.11.5). No-op if the context is not projected. Must be called after `execute_governance_action` returns `GovernanceActionResult::SubscriberBanned`.
 - `ApplicationNode::broadcast_projection_router() -> axum::Router` — returns the projection router for composition. Served on the public HTTPS port alongside `.well-known/scp` and `/scp/v1`.
+
+### 18.11.9 Structured Broadcast Content
+
+`BroadcastContent` is the canonical inner payload format for broadcast messages. It replaces opaque `Vec<u8>` payloads with a versioned, structured format that carries content metadata alongside the body. This is what `encrypted_content` decrypts to — the outer `BroadcastEnvelope` wire format is unchanged. Relays see the same opaque ciphertext blob they always have; the relay capability ceiling (§9.9.1) is preserved.
+
+```rust
+/// Magic byte prefix: ASCII "SCP" + version byte. Inside AEAD ciphertext.
+/// Relay never sees this. Zero false-positive rate for legacy detection.
+pub const BROADCAST_CONTENT_MAGIC: [u8; 3] = [0x53, 0x43, 0x50]; // "SCP"
+
+/// Canonical inner payload of a broadcast message.
+/// Wire format: BROADCAST_CONTENT_MAGIC ++ version_u8 ++ MessagePack(BroadcastContent)
+/// Then AES-256-GCM encrypted into BroadcastEnvelope.encrypted_content.
+pub struct BroadcastContent {
+    pub version: u8,                          // inner content format version (1)
+    pub metadata: ContentMetadata,
+    pub body: Vec<u8>,                        // raw content bytes
+}
+
+pub struct ContentMetadata {
+    pub path: Option<ContentPath>,            // validated URL path newtype
+    pub content_type: Option<MimeType>,       // validated MIME type newtype
+    pub deploy_id: Option<String>,            // groups assets into atomic deploys
+    pub etag: Option<String>,                 // SHA-256(body), hex-encoded
+}
+
+/// Validated URL path. Rejects: `..`, `//`, `./`, `\`, null bytes, control chars,
+/// non-UTF-8, percent-encoded traversals, query strings, fragments.
+/// Enforces: leading `/`, max 1024 bytes, no trailing slash (except root `/`).
+/// Case-sensitive. Backslashes rejected (not silently normalized).
+pub struct ContentPath(String);
+
+/// Validated MIME type. Must match `type/subtype` grammar (RFC 7231 §3.1.1.1).
+/// Rejects CRLF and control characters (prevents HTTP response splitting).
+pub struct MimeType(String);
+```
+
+**Design choice:** Structured inner payload, NOT a `BroadcastEnvelope` wire format change. The outer envelope (`encrypted_content: Vec<u8>`) is unchanged — relays see the same opaque ciphertext blob they always have. The relay capability ceiling is preserved.
+
+**Breaking change (pre-launch, acceptable):** SDK code that currently treats decrypted bytes as raw application data must now deserialize `BroadcastContent` first.
+
+**Version detection algorithm:** After AES-256-GCM decryption, check first 3 bytes for `BROADCAST_CONTENT_MAGIC` ("SCP"). If matched, read 4th byte as version. If `version >= 1`, deserialize remaining bytes as MessagePack `BroadcastContent`. Otherwise, treat entire payload as legacy raw bytes. Zero false-positive rate — legacy encrypted payloads will not start with "SCP" unless deliberately crafted.
+
+**Backward compatibility:** Legacy messages (no magic prefix) are served via existing JSON feed endpoints only, not path-based endpoints.
+
+**Dual version relationship:** Outer `BroadcastEnvelope.version: u16` = protocol wire format (SCP/1.0 = 0x0100). Inner `BroadcastContent.version: u8` = content format (independent lifecycle).
+
+**ETag algorithm:** `SHA-256(body)` hex-encoded. Consistent across all SDKs.
+
+**`ContentEncoding` deferred to v2** — tower-http handles compression on the fly for v1. No need to pre-compress.
+
+**Resource limits:**
+
+- Max 10,000 assets per deploy.
+- Max 512 MiB total deploy size (sum of all bodies).
+- Max 8 deploys retained per projected context (configurable).
+
+### 18.11.10 Path-Based Projection Endpoints
+
+Each projected context can be bound to a hostname via `SiteConfig` (§18.11.12). The node performs virtual host routing — requests to that hostname resolve directly to the context's path index. Visitors see clean URLs:
+
+```
+GET https://mysite.example.com/about        →  path index lookup for "/about"
+GET https://mysite.example.com/styles.css   →  path index lookup for "/styles.css"
+GET https://mysite.example.com/             →  index_path (default "/index.html")
+```
+
+An internal canonical path (`/scp/broadcast/<routing_id>/site/<path>`) is also available for programmatic access and debugging, but is never user-facing.
+
+Path resolution:
+
+- Resolves `path` to the blob in the current deploy with matching `ContentMetadata.path`.
+- Returns the raw body (not JSON-wrapped) with the declared `Content-Type` header.
+- **No Accept negotiation** — site endpoints always serve raw content. JSON envelopes remain available at `/messages/<blob_id>`.
+- Unknown paths: 404 with `Cache-Control: no-store`.
+- Path collision resolution: highest `sequence` number within current `deploy_id`.
+
+**Required security headers on all site responses:**
+
+- `X-Content-Type-Options: nosniff`
+- `Content-Security-Policy: default-src 'self'` (configurable per-context via `SiteConfig`, validated: no `unsafe-eval`, no `*`)
+- `X-Frame-Options: DENY`
+- `Strict-Transport-Security: max-age=63072000; includeSubDomains`
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Referrer-Policy: same-origin`
+- **MUST:** each projected context on its own hostname/subdomain for origin isolation (prevents cross-context XSS).
+
+**Cache behavior:**
+
+- Content-hashed paths (e.g., `/assets/style.a1b2c3.css`): `Cache-Control: public, immutable, max-age=31536000`.
+- Non-hashed paths (e.g., `/index.html`): `Cache-Control: public, max-age=0, must-revalidate` with `ETag: "<deploy_id>:<content_hash>"` — forces CDN revalidation on every request (304 when unchanged, 200 on deploy swap).
+- 404 responses: `Cache-Control: no-store`.
+- Retains existing public/private distinction based on `ProjectionRule` (§18.11.2.1).
+
+### 18.11.11 Atomic Deploys
+
+A deploy is a set of content-addressed messages published under a shared `deploy_id`. The node maintains a `current_deploy_id` pointer per projected context.
+
+**Implementation model (addresses concurrency, lock contention, partial failure):**
+
+1. **Publish phase:** Assets are published as individual broadcast messages with `deploy_id` set. They go to blob storage only. The path index is NOT updated during publish.
+
+2. **Commit phase:** On `broadcastPublishAssets` completion (or explicit commit), the node:
+   - Scans all blobs matching the `deploy_id`.
+   - Builds an immutable `PathIndex` (`HashMap<ContentPath, BlobId>`).
+   - Stores the deploy manifest as a special blob (enables recovery on restart).
+   - Atomically swaps the `current_deploy_id` pointer via `ArcSwap`.
+
+3. **Concurrent reads:** HTTP handlers read `current_deploy_id` via `ArcSwap::load()` — lock-free. No contention with publish or commit operations.
+
+4. **Deploy retention:** Double-buffer — current + previous deploy indexes kept in memory. Previous available for in-flight request draining. Configurable retention count (default 2) for multi-version rollback. Rollback only works within blob TTL window.
+
+5. **Partial failure:** If publish crashes mid-batch, orphaned blobs expire via TTL. Path index was never built. Retry re-uploads all assets (new nonces, new blob_ids — clean slate).
+
+6. **Deploy manifest blob:** A special broadcast message containing the complete `path -> blob_id` mapping for a deploy. Loaded on `enable_broadcast_projection()` to rebuild path index on node restart. Solves persistence.
+
+7. **Key rotation during deploy:** If broadcast key rotates mid-publish (governance ban), mixed-epoch blobs are cryptographically sound (projection holds all epoch keys). The deploy commit proceeds normally.
+
+**Per-context path index:** `Arc<ArcSwap<PathIndex>>` per `ProjectedContext` — NOT on the shared `projected_contexts` registry lock. Per-asset publish requires NO write locks on the registry.
+
+### 18.11.12 Site Configuration
+
+Node-local config passed to `enable_broadcast_projection()`. NOT part of governance-governed `ProjectionPolicy` — site configuration is a deployment concern, not a protocol concern:
+
+```rust
+/// Node-local projection site config.
+pub struct SiteConfig {
+    pub hostname: String,                            // e.g., "mysite.example.com" — virtual host routing
+    pub index_path: ContentPath,                    // default: "/index.html"
+    pub max_assets_per_deploy: usize,               // default: 10_000
+    pub max_deploy_size_bytes: u64,                  // default: 512 MiB
+    pub deploy_retention_count: usize,               // default: 2
+    pub csp_override: Option<String>,                // validated CSP string
+}
+```
+
+`hostname` determines virtual host routing (§18.11.10). Each projected context MUST have a unique hostname — duplicate hostnames across contexts are rejected by `enable_broadcast_projection()`.
+
+`index_path` is the `ContentPath` served for the root path (`/`). Default: `/index.html`.
+
+`csp_override` replaces the default `Content-Security-Policy: default-src 'self'` header. Validated on assignment: must not contain `unsafe-eval` or wildcard `*` source expressions. Invalid CSP strings are rejected.
+
+**SPA fallback deferred to v2** — it introduces security edge cases (CDN 404 caching, information disclosure) and is a deployment convenience, not a protocol concern. Users who need SPA routing put a reverse proxy in front. Can be added later without breaking changes.

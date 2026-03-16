@@ -25,6 +25,18 @@
         "SCP-248",
         "SCP-249"
       ]
+    },
+    {
+      "id": "gate-http-3",
+      "name": "Broadcast Content Delivery",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-287",
+        "SCP-288",
+        "SCP-289",
+        "SCP-290"
+      ]
     }
   ],
   "stories": [
@@ -454,6 +466,297 @@
       "details": {
         "phase": 2,
         "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-287",
+      "title": "Define BroadcastContent, ContentMetadata, ContentPath, MimeType types with magic byte prefix and deserialize_broadcast_content()",
+      "gate": "gate-http-3",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/broadcast_content.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "Define the structured inner payload types for broadcast content delivery per §18.11.9. BroadcastContent is the canonical inner payload format — what encrypted_content decrypts to. Wire format: BROADCAST_CONTENT_MAGIC (ASCII \"SCP\") ++ version_u8 ++ MessagePack(BroadcastContent). ContentPath is a validated URL path newtype that rejects traversal attacks, backslashes, null bytes, control chars, percent-encoded traversals, query strings, and fragments. MimeType is a validated MIME type newtype that rejects CRLF and control characters to prevent HTTP response splitting. deserialize_broadcast_content() implements the version detection algorithm: check magic prefix, read version byte, deserialize MessagePack; legacy payloads (no magic prefix) returned as raw bytes. ETag is SHA-256(body) hex-encoded.",
+      "acceptanceCriteria": [
+        "BroadcastContent struct has version: u8, metadata: ContentMetadata, body: Vec<u8> fields",
+        "ContentMetadata struct has path: Option<ContentPath>, content_type: Option<MimeType>, deploy_id: Option<String>, etag: Option<String> fields",
+        "BROADCAST_CONTENT_MAGIC constant is [0x53, 0x43, 0x50] (ASCII \"SCP\")",
+        "BroadcastContent wire format is BROADCAST_CONTENT_MAGIC ++ version_u8 ++ MessagePack(BroadcastContent)",
+        "ContentPath rejects paths containing '..'",
+        "ContentPath rejects paths containing '//'",
+        "ContentPath rejects paths containing './'",
+        "ContentPath rejects paths containing backslashes",
+        "ContentPath rejects paths containing null bytes",
+        "ContentPath rejects paths containing control characters",
+        "ContentPath rejects paths containing percent-encoded traversals (%2e%2e)",
+        "ContentPath rejects paths containing query strings ('?')",
+        "ContentPath rejects paths containing fragments ('#')",
+        "ContentPath enforces leading '/'",
+        "ContentPath enforces max 1024 bytes",
+        "ContentPath rejects trailing slash except for root '/'",
+        "ContentPath is case-sensitive (no normalization)",
+        "MimeType matches type/subtype grammar per RFC 7231 §3.1.1.1",
+        "MimeType rejects CRLF characters",
+        "MimeType rejects control characters",
+        "deserialize_broadcast_content() checks first 3 bytes for BROADCAST_CONTENT_MAGIC",
+        "deserialize_broadcast_content() reads 4th byte as version when magic matches",
+        "deserialize_broadcast_content() deserializes remaining bytes as MessagePack BroadcastContent when version >= 1",
+        "deserialize_broadcast_content() returns legacy raw bytes when magic prefix absent",
+        "ETag computed as SHA-256(body) hex-encoded",
+        "Unit test: BroadcastContent serialization round-trip with magic prefix",
+        "Unit test: legacy raw bytes (no magic prefix) handled gracefully by deserialize_broadcast_content()",
+        "Unit test: ContentPath rejects all invalid patterns (traversal, backslash, null, query, fragment, trailing slash, over-length)",
+        "Unit test: ContentPath accepts valid paths including root '/'",
+        "Unit test: MimeType rejects CRLF and control chars",
+        "Unit test: MimeType accepts valid types like 'text/html', 'application/json'",
+        "broadcast_content module declared in context/mod.rs",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Create crates/scp-core/src/context/broadcast_content.rs",
+        "Define BROADCAST_CONTENT_MAGIC constant",
+        "Implement BroadcastContent struct with Serialize/Deserialize",
+        "Implement ContentMetadata struct with Serialize/Deserialize",
+        "Implement ContentPath newtype with TryFrom<String> validation",
+        "Implement MimeType newtype with TryFrom<String> validation",
+        "Implement serialize_broadcast_content() producing magic ++ version ++ MessagePack bytes",
+        "Implement deserialize_broadcast_content() with version detection algorithm",
+        "Implement ETag computation as SHA-256(body) hex-encoded",
+        "Add pub mod broadcast_content to context/mod.rs with re-exports",
+        "Add comprehensive unit tests for all validation rules and round-trip serialization"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.9 Structured Broadcast Content"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-core"
+      }
+    },
+    {
+      "id": "SCP-288",
+      "title": "Implement path-indexed projection endpoint with SiteConfig, virtual host routing, MIME-aware serving, and security headers",
+      "gate": "gate-http-3",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Implement path-based projection endpoints per §18.11.10 and §18.11.12. Each projected context is bound to a hostname via SiteConfig (node-local config, not governance-governed). The node performs virtual host routing — requests to that hostname resolve directly to the context's path index. The internal canonical path /scp/broadcast/<routing_id>/site/<path> is also available. Path resolution looks up the blob in the current deploy matching ContentMetadata.path, returns the raw body with declared Content-Type. Security headers are mandatory on all site responses: X-Content-Type-Options: nosniff, Content-Security-Policy (default 'self', configurable via SiteConfig.csp_override with no unsafe-eval/no * validation), X-Frame-Options: DENY, Strict-Transport-Security, Cross-Origin-Opener-Policy: same-origin, Referrer-Policy: same-origin. Cache behavior: content-hashed paths get immutable 1-year cache, non-hashed paths get max-age=0 must-revalidate with ETag, 404s get no-store. SiteConfig struct with hostname, index_path, max_assets_per_deploy, max_deploy_size_bytes, deploy_retention_count, csp_override. Duplicate hostnames across contexts rejected.",
+      "acceptanceCriteria": [
+        "SiteConfig struct has hostname, index_path, max_assets_per_deploy, max_deploy_size_bytes, deploy_retention_count, csp_override fields",
+        "SiteConfig.index_path defaults to ContentPath('/index.html')",
+        "SiteConfig.max_assets_per_deploy defaults to 10_000",
+        "SiteConfig.max_deploy_size_bytes defaults to 536_870_912 (512 MiB)",
+        "SiteConfig.deploy_retention_count defaults to 2",
+        "SiteConfig.csp_override rejects strings containing 'unsafe-eval'",
+        "SiteConfig.csp_override rejects strings containing wildcard '*' source expressions",
+        "enable_broadcast_projection() accepts optional SiteConfig parameter",
+        "Duplicate hostnames across projected contexts rejected by enable_broadcast_projection()",
+        "Virtual host routing resolves requests by hostname to the matching projected context",
+        "GET /scp/broadcast/<routing_id>/site/<path> resolves path to blob in current deploy",
+        "GET / on virtual host serves SiteConfig.index_path content",
+        "Site endpoint returns raw body (not JSON-wrapped) with declared Content-Type header",
+        "Unknown paths return 404 with Cache-Control: no-store",
+        "Path collision resolution uses highest sequence number within current deploy_id",
+        "X-Content-Type-Options: nosniff header present on all site responses",
+        "Content-Security-Policy header present on all site responses (default: default-src 'self')",
+        "Content-Security-Policy header uses SiteConfig.csp_override when set",
+        "X-Frame-Options: DENY header present on all site responses",
+        "Strict-Transport-Security: max-age=63072000; includeSubDomains header present on all site responses",
+        "Cross-Origin-Opener-Policy: same-origin header present on all site responses",
+        "Referrer-Policy: same-origin header present on all site responses",
+        "Content-hashed paths return Cache-Control: public, immutable, max-age=31536000",
+        "Non-hashed paths return Cache-Control: public, max-age=0, must-revalidate with ETag",
+        "ETag format is <deploy_id>:<content_hash> for non-hashed paths",
+        "Integration test: publish asset then GET /site/<path> returns correct Content-Type and raw body",
+        "Integration test: security headers present on all /site/ responses",
+        "Integration test: 404 returns Cache-Control: no-store",
+        "Integration test: legacy messages served via JSON feed only, not path-based endpoints",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Define SiteConfig struct with defaults in crates/scp-node/src/lib.rs",
+        "Add SiteConfig validation (csp_override rejects unsafe-eval and wildcard *)",
+        "Extend enable_broadcast_projection() to accept optional SiteConfig",
+        "Add hostname uniqueness check across projected contexts",
+        "Implement virtual host routing middleware in http.rs",
+        "Implement site_handler at /scp/broadcast/<routing_id>/site/<path>",
+        "Implement path resolution against current deploy PathIndex",
+        "Implement index_path fallback for root path requests",
+        "Add security headers middleware for all site responses",
+        "Implement cache behavior (immutable for hashed, must-revalidate for non-hashed, no-store for 404)",
+        "Wire site routes into broadcast_projection_router()",
+        "Add integration tests for path resolution, security headers, and cache behavior"
+      ],
+      "blockedBy": [
+        "SCP-287"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.10 Path-Based Projection Endpoints"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.12 Site Configuration"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-289",
+      "title": "Implement atomic deploys with deploy_id grouping, manifest blob, commit-time index build, and double-buffer retention",
+      "gate": "gate-http-3",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Implement atomic deploy mechanics per §18.11.11. Assets are published as individual broadcast messages with deploy_id set during the publish phase — blob storage only, path index NOT updated. On commit, the node scans all blobs matching deploy_id, builds an immutable PathIndex (HashMap<ContentPath, BlobId>), stores a deploy manifest blob, and atomically swaps current_deploy_id via ArcSwap. HTTP handlers read current_deploy_id via ArcSwap::load() — lock-free, no contention. Double-buffer retention: current + previous deploy indexes in memory for in-flight request draining. Configurable retention count (default 2). Partial failure: orphaned blobs expire via TTL, path index never built, retry is clean slate. Deploy manifest blob persists path->blob_id mapping for restart recovery — loaded on enable_broadcast_projection(). Key rotation during deploy: mixed-epoch blobs are cryptographically sound. Per-context path index: Arc<ArcSwap<PathIndex>> per ProjectedContext. Resource limits: max 10,000 assets per deploy, max 512 MiB total deploy size, max 8 deploys retained.",
+      "acceptanceCriteria": [
+        "Assets published with deploy_id go to blob storage only — path index NOT updated during publish",
+        "Commit phase scans all blobs matching deploy_id",
+        "Commit phase builds immutable PathIndex (HashMap<ContentPath, BlobId>)",
+        "Commit phase stores deploy manifest blob containing path->blob_id mapping",
+        "Commit phase atomically swaps current_deploy_id via ArcSwap",
+        "HTTP handlers read current_deploy_id via ArcSwap::load() (lock-free)",
+        "Double-buffer retention: current + previous deploy indexes kept in memory",
+        "Configurable retention count (default 2) via SiteConfig.deploy_retention_count",
+        "Partial failure: orphaned blobs from crashed publish expire via TTL",
+        "Partial failure: path index never built for incomplete publishes",
+        "Deploy manifest blob loaded on enable_broadcast_projection() for restart recovery",
+        "Per-context path index stored as Arc<ArcSwap<PathIndex>> per ProjectedContext",
+        "Per-asset publish requires NO write locks on the projected_contexts registry",
+        "Key rotation during deploy: mixed-epoch blobs handled correctly",
+        "Max 10,000 assets per deploy enforced (returns error when exceeded)",
+        "Max 512 MiB total deploy size enforced (returns error when exceeded)",
+        "Max 8 deploys retained per projected context (oldest beyond limit garbage-collected)",
+        "Integration test: atomic deploy — path resolution switches atomically on commit",
+        "Integration test: concurrent reads during publish see old deploy (not partial new deploy)",
+        "Integration test: node restart then manifest reload then paths still resolve",
+        "Integration test: partial publish (no commit) leaves path index unchanged",
+        "All public items have rustdoc"
+      ],
+      "actionItems": [
+        "Add PathIndex type alias (HashMap<ContentPath, BlobId>) to projection.rs",
+        "Add Arc<ArcSwap<PathIndex>> field to ProjectedContext",
+        "Implement publish_asset() that writes to blob storage with deploy_id, no index update",
+        "Implement commit_deploy() that scans blobs, builds PathIndex, stores manifest, swaps ArcSwap",
+        "Implement deploy manifest blob serialization/deserialization",
+        "Implement manifest loading on enable_broadcast_projection() for restart recovery",
+        "Implement double-buffer retention with configurable count",
+        "Implement resource limit enforcement (max assets, max size, max deploys)",
+        "Add arc-swap dependency to scp-node Cargo.toml",
+        "Add integration tests for atomic swap, concurrent reads, restart recovery, partial failure"
+      ],
+      "blockedBy": [
+        "SCP-288"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.11 Atomic Deploys"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node"
+      }
+    },
+    {
+      "id": "SCP-290",
+      "title": "Add broadcastPublishAsset and broadcastPublishAssets to all FFI bridges and SDK bindings",
+      "gate": "gate-http-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/wasm/src/context.rs",
+        "bindings/typescript/src/context.ts",
+        "bindings/python/scp_sdk/context.py"
+      ],
+      "description": "Add broadcastPublishAsset (single asset) and broadcastPublishAssets (batch) convenience methods to all FFI bridges and SDK bindings per §18.11.8 (amended) and ADR-042. Each method accepts a typed AssetEntry parameter (path: ContentPath, content_type: MimeType, body: bytes, deploy_id: String) — typed parameter prevents positional transposition. Returns { blobId, etag } where etag is SHA-256(body) hex-encoded. broadcastPublishAssets accepts a Vec<AssetEntry>, publishes all assets, then commits the deploy atomically. Content-hash dedup: if a blob with the same SHA-256(body) already exists in the current deploy_id, skip re-upload and return existing blobId. PyO3 bridge is the reference implementation; NAPI, UniFFI, and WASM bridges follow. WASM bridge reimplements ContentPath/MimeType validation locally per ADR-034. TypeScript and Python SDK wrappers provide idiomatic APIs over their respective bridges.",
+      "acceptanceCriteria": [
+        "AssetEntry type defined with path: ContentPath, content_type: MimeType, body: Vec<u8>, deploy_id: String fields",
+        "broadcastPublishAsset() accepts AssetEntry, returns { blob_id: String, etag: String }",
+        "broadcastPublishAssets() accepts Vec<AssetEntry>, publishes all then commits deploy, returns Vec<{ blob_id, etag }>",
+        "Content-hash dedup: duplicate SHA-256(body) within same deploy_id skips re-upload",
+        "PyO3 bridge exports broadcast_publish_asset and broadcast_publish_assets",
+        "NAPI bridge exports broadcastPublishAsset and broadcastPublishAssets",
+        "UniFFI bridge exports broadcast_publish_asset and broadcast_publish_assets",
+        "WASM bridge exports broadcastPublishAsset and broadcastPublishAssets with local ContentPath/MimeType validation per ADR-034",
+        "Python SDK wraps PyO3 bridge with broadcast_publish_asset() and broadcast_publish_assets() methods",
+        "TypeScript SDK wraps NAPI bridge with broadcastPublishAsset() and broadcastPublishAssets() methods",
+        "All bridge methods propagate errors (invalid path, invalid MIME type, resource limit exceeded) as typed errors",
+        "Unit test: single asset publish round-trip via each bridge",
+        "Unit test: batch publish with dedup via each bridge",
+        "All public items have rustdoc (Rust) or doc comments (TypeScript/Python)"
+      ],
+      "actionItems": [
+        "Define AssetEntry struct in scp-core with ContentPath, MimeType, body, deploy_id",
+        "Add broadcastPublishAsset and broadcastPublishAssets to ApplicationNode",
+        "Export broadcast_publish_asset and broadcast_publish_assets from PyO3 bridge (reference)",
+        "Export broadcastPublishAsset and broadcastPublishAssets from NAPI bridge",
+        "Export broadcast_publish_asset and broadcast_publish_assets from UniFFI bridge",
+        "Export broadcastPublishAsset and broadcastPublishAssets from WASM bridge with local validation",
+        "Add broadcast_publish_asset() and broadcast_publish_assets() to Python SDK context.py",
+        "Add broadcastPublishAsset() and broadcastPublishAssets() to TypeScript SDK context.ts",
+        "Implement content-hash dedup logic (check existing blob_id by SHA-256 within deploy_id)",
+        "Add unit tests for all bridges and SDK wrappers"
+      ],
+      "blockedBy": [
+        "SCP-287",
+        "SCP-289"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.9 Structured Broadcast Content"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi", "scp-ffi-wasm"],
+        "bindings": ["typescript", "python"]
       }
     }
   ]
