@@ -43,7 +43,10 @@ import { safeJsonParse } from "./json-utils";
 
 /** The shape of the wasm-bindgen generated module. */
 interface WasmModule {
-  default: () => Promise<void>;
+  // Bundler target: `default` is an init function that loads the WASM binary.
+  // Node.js target: `default` is a re-exported module object (not callable).
+  // The initWasm() function handles both cases.
+  default: (() => Promise<void>) | Record<string, unknown>;
   scp_init: () => void;
   scp_version: () => string;
   identity_create: (custody: string) => Promise<{ did: string; custodyType: string }>;
@@ -525,12 +528,17 @@ export async function initWasm(): Promise<void> {
   _initPromise = (async () => {
     try {
       // Dynamic import of the wasm-bindgen generated package.
-      // This package is produced by `wasm-pack build --target bundler`
-      // and may not be installed in all environments.
+      // This package is produced by `wasm-pack build` with either
+      // `--target bundler` (browser) or `--target nodejs` (Node.js/Bun).
+      // It may not be installed in all environments.
       const mod = (await import(
         /* webpackIgnore: true */ "@limn-works/scp-ts-wasm"
       )) as unknown as WasmModule;
-      await mod.default();
+      // Bundler target exports `default` as an async init function.
+      // Node.js target auto-initializes on import — `default` is the module object.
+      if (typeof mod.default === "function") {
+        await mod.default();
+      }
       mod.scp_init();
       _wasmModule = mod;
     } catch (err) {
