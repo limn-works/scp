@@ -748,6 +748,7 @@ fn validate_projection_ucan(
 /// decisions in mixed-auth feeds).
 ///
 /// Performs: parse, temporal checks, and capability matching.
+#[cfg(test)]
 fn validate_projection_ucan_structural(
     token: &str,
     context_id: &str,
@@ -880,7 +881,16 @@ fn check_projection_auth(
                         .into_response(),
                     ))
                 }
-                None => validate_projection_ucan_structural(token, context_id),
+                None => {
+                    // Unreachable: all callers pass Some(validation_state).
+                    // Hard reject as defense-in-depth — never fall to structural-only.
+                    Err(Box::new(
+                        ApiError::unauthorized_with(
+                            "missing validation state for UCAN verification",
+                        )
+                        .into_response(),
+                    ))
+                }
             }
         }
     }
