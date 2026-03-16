@@ -1,8 +1,8 @@
 // Basic messaging: create identity, create context, send and receive messages.
 //
-// Demonstrates the actual SCP Swift SDK API surface. Identity creation uses
-// the UniFFI `identityCreate` free function, context creation uses
-// `contextCreate`, and the `Context` actor wraps the handle for send/receive.
+// Demonstrates the SCP Swift SDK wrapper API: `createIdentity()` for identity
+// creation, `contextCreate()` for context creation, `contextSend()` for
+// messaging, and the `MessageListener` callback pattern for receiving.
 
 import Foundation
 import SCP
@@ -10,13 +10,13 @@ import SCP
 @main
 struct BasicMessaging {
     static func main() async throws {
-        // Create two identities via the UniFFI bridge function (in_memory custody for examples)
-        let alice = try await identityCreate(custody: "in_memory")
-        let bob = try await identityCreate(custody: "in_memory")
+        // Create two identities via the SDK wrapper function (in_memory custody for examples)
+        let alice = try await createIdentity(custody: "in_memory")
+        let bob = try await createIdentity(custody: "in_memory")
         print("Alice DID: \(alice.did())")
         print("Bob DID: \(bob.did())")
 
-        // Alice creates a context via the UniFFI bridge function.
+        // Alice creates a context.
         // ContextParams requires: ceiling, governance, memoryScope, ttlSeconds, promotable, minProtocolVersion
         let params = ContextParams(
             ceiling: ["messages:read", "messages:write", "member:invite"],
@@ -26,24 +26,21 @@ struct BasicMessaging {
             promotable: false,
             minProtocolVersion: 0
         )
-        let aliceHandle = try await contextCreate(identity: alice, params: params)
-        print("Context ID: \(aliceHandle.contextId())")
+        let handle = try await contextCreate(identity: alice, params: params)
+        print("Context ID: \(handle.contextId())")
 
-        // Bob joins the context using the existing handle
-        try await contextJoin(handle: aliceHandle, identity: bob)
+        // Bob joins the context
+        try await contextJoin(handle: handle, identity: bob)
 
         // Send a message via the UniFFI bridge function
         try await contextSend(
-            handle: aliceHandle,
+            handle: handle,
             identity: alice,
             payload: Data("Hello Bob, this is Alice".utf8)
         )
 
-        // Subscribe to messages via the UniFFI bridge and AsyncStream adapter.
-        // In production, the Context actor wraps this pattern:
-        //   let stream = try await context.messages
-        //   for await msg in stream { ... }
-        //
+        // Subscribe to messages via the MessageListener callback pattern.
+        // The SDK's Context actor wraps this into an AsyncStream via `context.messages`.
         // Here we use the bridge directly for illustration:
         let (stream, continuation) = AsyncStream<Message>.makeStream()
         final class Listener: MessageListener, @unchecked Sendable {
@@ -64,7 +61,7 @@ struct BasicMessaging {
                 continuation.finish()
             }
         }
-        try await contextSubscribe(handle: aliceHandle, listener: Listener(continuation))
+        try await contextSubscribe(handle: handle, listener: Listener(continuation))
 
         for await msg in stream {
             // swiftlint:disable:next optional_data_string_conversion
@@ -74,7 +71,7 @@ struct BasicMessaging {
         }
 
         // Cleanup
-        try await contextLeave(handle: aliceHandle, identity: bob)
-        try await contextClose(handle: aliceHandle, identity: alice)
+        try await contextLeave(handle: handle, identity: bob)
+        try await contextClose(handle: handle, identity: alice)
     }
 }

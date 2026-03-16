@@ -26,7 +26,7 @@ struct ToolsExample {
                 "messages:read",
                 "messages:write",
                 "tool:register",
-                "tool:invoke_all",
+                "tool:invoke:*",
             ],
             governance: .singleAdmin,
             memoryScope: .full,
@@ -74,7 +74,8 @@ struct ToolsExample {
                 {"input": {"a": 7, "b": 3, "op": "mul"}, "expected_output": {"result": 21}}
             ]
             """,
-            implementationHash: nil
+            implementationHash: nil,
+            cost: nil
         )
 
         print("\nTool defined: \(definition.name)")

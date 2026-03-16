@@ -1,7 +1,9 @@
 // MCP integration: expose SCP tools via MCP and consume external MCP servers.
 //
-// Demonstrates the McpServerConfig (UniFFI-generated), McpClient, and serveMcp
-// APIs using the actual SCP Swift SDK surface.
+// Demonstrates tool registration using the SDK wrapper API and the
+// ToolDefinition UniFFI type. MCP server/client bridge functions are not
+// yet wired -- this example shows the tool registration pattern and
+// documents the planned MCP surface.
 
 import Foundation
 import SCP
@@ -9,7 +11,7 @@ import SCP
 @main
 struct McpIntegration {
     static func main() async throws {
-        let identity = try await identityCreate(custody: "in_memory")
+        let identity = try await createIdentity(custody: "in_memory")
 
         // Create a context with tool capabilities
         let params = ContextParams(
@@ -22,7 +24,7 @@ struct McpIntegration {
         )
         let handle = try await contextCreate(identity: identity, params: params)
 
-        // Register a tool in the context
+        // Register a tool in the context using the UniFFI ToolDefinition type
         let tool = ToolDefinition(
             name: "summarize",
             description: "Summarize text content",
@@ -35,43 +37,24 @@ struct McpIntegration {
         )
         _ = try await toolRegister(handle: handle, definition: tool)
 
-        // Start an MCP server exposing context tools on stdio.
-        // Note: serveMcp takes an McpServerConfig, not a Context.
-        // The bridge function is not yet wired -- this will throw SCP-MCP-10001.
-        let serverConfig = McpServerConfig(
-            identityDid: identity.did(),
-            contextIds: [handle.contextId()],
-            transport: "stdio",
-            ucanToken: nil,
-            proofTokens: nil
-        )
-        do {
-            try await serveMcp(config: serverConfig)
-        } catch {
-            print("MCP server not yet available: \(error)")
-        }
-
-        // Connect as an MCP client to a remote server.
-        // McpClient.connect takes an McpClientConfig enum.
-        // The bridge function is not yet wired -- this will throw SCP-MCP-10002.
-        do {
-            let client = try await McpClient.connect(
-                config: .sse(url: "http://localhost:8080/mcp")
-            )
-            let tools = try await client.listTools()
-            print("Remote server offers \(tools.count) tool(s)")
-
-            let result = try await client.invoke(
-                tool: "summarize",
-                input: Data(#"{"text":"SCP is a protocol for..."}"#.utf8),
-                contextId: handle.contextId(),
-                invokerDid: identity.did()
-            )
-            // swiftlint:disable:next optional_data_string_conversion
-            print("Result: \(String(decoding: result.content, as: UTF8.self))")
-        } catch {
-            print("MCP client not yet available: \(error)")
-        }
+        // MCP server/client bridge functions are not yet wired.
+        // When available, the pattern will be:
+        //
+        //   let serverConfig = McpServerConfig(
+        //       identityDid: identity.did(),
+        //       contextIds: [handle.contextId()],
+        //       transport: "stdio",
+        //       ucanToken: nil,
+        //       proofTokens: nil
+        //   )
+        //   try await serveMcp(config: serverConfig)
+        //
+        //   let client = try await McpClient.connect(
+        //       config: .sse(url: "http://localhost:8080/mcp")
+        //   )
+        //   let tools = try await client.listTools()
+        //
+        print("(MCP server/client not yet available via FFI bridge)")
 
         try await contextClose(handle: handle, identity: identity)
     }

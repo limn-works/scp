@@ -1,41 +1,67 @@
-/** Basic messaging: create identity, create context, send and receive messages. */
+/**
+ * Basic messaging: create identity, create context, send and receive messages.
+ *
+ * Demonstrates the actual Kotlin SDK API surface. All FFI calls are dispatched
+ * through the CoroutineBridge, which wraps blocking JNA calls on Dispatchers.IO.
+ *
+ * Prerequisites:
+ *   implementation("works.limn:scp-kt:0.1.0")
+ *
+ * Usage:
+ *   ./gradlew run --args="basic-messaging"
+ */
 
 package works.limn.scp.examples
 
-import works.limn.scp.CustodyType
-import works.limn.scp.Identity
-import works.limn.scp.Context
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.putJsonArray
+import works.limn.scp.CustodyType
+import works.limn.scp.bridge.CoroutineBridge
 
-fun main() = runBlocking {
+fun basicMessagingExample(bridge: CoroutineBridge) = runBlocking {
     // Create two identities (in_memory custody for examples)
-    val alice = Identity.create(custody = CustodyType.IN_MEMORY)
-    val bob = Identity.create(custody = CustodyType.IN_MEMORY)
-    println("Alice DID: ${alice.did}")
-    println("Bob DID: ${bob.did}")
+    val aliceHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val bobHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    println("Alice identity handle: $aliceHandle")
+    println("Bob identity handle: $bobHandle")
 
-    // Alice creates a context
-    val ctx = Context.create(
-        identity = alice,
-        ceiling = listOf("messages:read", "messages:write"),
-        memoryScope = "ephemeral",
-        governance = "single_admin",
-        ttl = 3600,
-    )
-    println("Context ID: ${ctx.contextId}")
+    // Alice creates a context with messaging capabilities
+    val paramsJson = buildJsonObject {
+        putJsonArray("ceiling") {
+            add(JsonPrimitive("messages:read"))
+            add(JsonPrimitive("messages:write"))
+            add(JsonPrimitive("member:invite"))
+        }
+        put("governance", kotlinx.serialization.json.JsonPrimitive("single_admin"))
+        put("memory_scope", kotlinx.serialization.json.JsonPrimitive("ephemeral"))
+    }.toString()
+
+    val contextHandle = bridge.context.create(aliceHandle, paramsJson)
+    println("Context handle: $contextHandle")
 
     // Bob joins the context
-    ctx.join(identity = bob)
+    bridge.context.join(contextHandle, bobHandle)
+    println("Bob joined the context.")
 
     // Alice sends a message
-    ctx.send("Hello Bob, this is Alice".toByteArray())
+    bridge.context.send(contextHandle, aliceHandle, "Hello Bob, this is Alice".toByteArray())
+    println("Alice: Hello Bob, this is Alice")
 
-    // Bob receives it
-    val msg = ctx.receiveFlow().first()
-    println("Bob received from ${msg.senderDid}: ${String(msg.content)}")
+    // Subscribe to incoming messages via Flow
+    val subscription = bridge.context.subscribe(contextHandle)
+    val collectorJob = launch {
+        subscription.take(1).collect { messageJson ->
+            println("Received: $messageJson")
+        }
+    }
+    collectorJob.join()
 
     // Cleanup
-    ctx.leave(identity = bob)
-    ctx.close(identity = alice)
+    bridge.context.leave(contextHandle, bobHandle)
+    bridge.context.close(contextHandle, aliceHandle)
+    println("Context closed.")
 }
