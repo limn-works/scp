@@ -29,6 +29,7 @@
 
 pub mod app_sandbox;
 pub mod broadcast;
+pub mod broadcast_content;
 pub mod builder;
 pub mod close;
 pub mod export_import;
@@ -160,6 +161,13 @@ pub use governance::{
     GovernanceReconfigAction, ProposalId, ProposalStatus, RejectionReason, RevocationScope,
     SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
     multisig::ThresholdEngine, sign_vote, unanimity::UnanimityEngine, verify_vote,
+};
+
+// Re-export broadcast content delivery types (SCP-287, spec section 18.11.9).
+pub use broadcast_content::{
+    BROADCAST_CONTENT_MAGIC, BROADCAST_CONTENT_VERSION, BroadcastContent, BroadcastContentError,
+    ContentMetadata, ContentPath, MimeType, compute_etag, deserialize_broadcast_content,
+    serialize_broadcast_content, validate_deploy_id, verify_etag,
 };
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).
