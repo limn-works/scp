@@ -69,6 +69,11 @@ use std::time::Duration;
 pub mod bridge;
 pub(crate) mod runtime;
 
+// Server startup (relay + application node) — behind the `server` feature on
+// scp-ffi-common. Not available for WASM (ADR-034).
+#[cfg(feature = "server")]
+pub mod server;
+
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
     ContextHandle,
@@ -198,6 +203,13 @@ pub use bridge::scpid_sign;
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 
+// Server startup re-exports — only available with the `server` feature.
+#[cfg(feature = "server")]
+pub use server::{
+    NodeHandle, RelayHandle, node_start_in_memory, node_start_local, relay_start_in_memory,
+    relay_start_local,
+};
+
 // Include the minimal UDL-generated scaffolding. The UDL file contains only
 // the namespace anchor. All types and functions are defined via proc-macros.
 uniffi::include_scaffolding!("scp");
@@ -248,13 +260,18 @@ pub(crate) fn increment_handle_count() {
     HANDLE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Decrements the live handle count.
+/// Decrements the live handle count (saturating at zero).
 ///
 /// Called from each opaque type's `Drop` impl immediately before the handle
-/// is freed.
+/// is freed. Uses `fetch_update` with a saturating decrement to prevent
+/// wrapping to `usize::MAX` if the count is already zero.
 #[inline]
 pub(crate) fn decrement_handle_count() {
-    HANDLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    HANDLE_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+            Some(if val > 0 { val - 1 } else { 0 })
+        })
+        .ok();
 }
 
 /// Waits for all outstanding FFI handles to be released, then shuts down.

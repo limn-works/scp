@@ -16,13 +16,15 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [features]
-default = []
+default = ["server"]
 # Enables the `"in_memory"` custody path in `identity_create`, which uses
 # `InMemoryKeyCustody` from `scp-platform/testing`. This stores private key
 # material in unprotected heap memory — suitable for testing, CLI, and desktop
 # contexts but NOT for production mobile builds (iOS/Android). Mobile CI MUST
 # NOT enable this feature. See GitHub issue #88 and ADR-006.
 allow_in_memory_custody = ["scp-platform/testing"]
+# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+server = ["scp-ffi-common/server", "dep:scp-node"]
 
 [dependencies]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
@@ -34,6 +36,7 @@ scp-media = { path = "../../scp-media" }
 scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
+scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
@@ -45,7 +48,7 @@ rmp-serde = { workspace = true }
 # a local `BridgeInMemoryStorage` for the event log backing store.
 # The `allow_in_memory_custody` feature above adds `scp-platform/testing`
 # for dev/test/desktop builds only.
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting"] }
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "filesystem"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 ed25519-dalek = { workspace = true }

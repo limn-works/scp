@@ -73,6 +73,11 @@ pub mod types;
 pub mod ucan;
 pub mod validate;
 
+// Server startup (relay + application node) — behind the `server` feature on
+// scp-ffi-common. Not available for WASM (ADR-034).
+#[cfg(feature = "server")]
+pub mod server;
+
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -238,6 +243,10 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     sync::register_sync(m)?;
     scpid::register_scpid(m)?;
     media::register_media(m)?;
+
+    // Server startup (relay + application node) — feature-gated.
+    #[cfg(feature = "server")]
+    server::register_server(m)?;
 
     Ok(())
 }
