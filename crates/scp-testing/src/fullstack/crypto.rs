@@ -28,7 +28,7 @@ use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
 use scp_core::crypto::mls::group::{
     ScpMlsGroup, add_member, create_group, destroy_group, generate_key_package, join_group,
 };
-use scp_core::crypto::mls::ratchet::{process_commit, serialize_commit};
+use scp_core::crypto::mls::ratchet::{process_commit, propose_update, serialize_commit};
 use scp_core::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore, generate_sender_key};
 use scp_identity::SigningKeyId;
@@ -574,5 +574,18 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         serialize_ciphertext(&ciphertext).map_err(|e| ContextError::CryptoFailed(e.to_string()))
+    }
+
+    fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let group = groups
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+        let _commit =
+            propose_update(group).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        Ok(())
     }
 }

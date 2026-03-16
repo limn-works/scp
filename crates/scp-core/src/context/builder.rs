@@ -291,6 +291,24 @@ pub trait ContextCryptoProvider: Send + Sync {
         sequence: u64,
     ) -> Result<Vec<u8>, ContextError>;
 
+    // -- Recovery operations (§9.12) -----------------------------------------
+
+    /// Advances the MLS epoch for post-compromise security (§9.12 step 2).
+    ///
+    /// Issues an MLS Update proposal + self-Commit, ratcheting the group to
+    /// a new epoch with fresh key material. After this call, the compromised
+    /// old epoch key is useless for future messages.
+    ///
+    /// The default implementation is a no-op (`Ok(())`) so that mock and
+    /// test providers compile without changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS update/commit fails.
+    fn advance_epoch(&self, _context_id: &[u8; 32]) -> Result<(), ContextError> {
+        Ok(())
+    }
+
     // -- Persistence operations (§23.11, #645) ------------------------------
 
     /// Exports the per-context cryptographic state as an opaque byte blob
