@@ -62,10 +62,37 @@ static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 /// Global production DID resolver (#311).
 static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
 
+/// Global shared `InMemoryDhtClient` used by the DID resolver.
+///
+/// Stored here so that `identity_create` can publish newly created DID
+/// documents to the same DHT client that the resolver reads from. Without
+/// this, UCAN validation fails because `IdentityBackedDidResolver` cannot
+/// find the issuer's DID document.
+///
+/// See issue #1144 (UCAN validation tests require shared DHT state).
+static SHARED_DHT_CLIENT: OnceLock<Arc<scp_identity::InMemoryDhtClient>> = OnceLock::new();
+
 /// Returns the global production DID resolver, if initialized.
 #[must_use]
 pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
     DID_RESOLVER.get()
+}
+
+/// Returns the shared `InMemoryDhtClient`, if initialized.
+///
+/// Used by `identity_create` to publish DID documents so that the resolver
+/// can later find them during UCAN validation (#1144).
+#[must_use]
+pub fn shared_dht_client() -> Option<&'static Arc<scp_identity::InMemoryDhtClient>> {
+    SHARED_DHT_CLIENT.get()
+}
+
+/// Stores the shared `InMemoryDhtClient` for the DID resolver.
+///
+/// Called by `ensure_did_resolver_initialized` in `identity.rs`. Subsequent
+/// calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn init_shared_dht_client(client: Arc<scp_identity::InMemoryDhtClient>) {
+    let _ = SHARED_DHT_CLIENT.set(client);
 }
 
 /// Initializes the global production DID resolver.

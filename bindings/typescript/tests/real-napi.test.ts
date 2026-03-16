@@ -335,11 +335,17 @@ if (bridge === null) {
       expect(toolId.length).toBeGreaterThan(0);
     });
 
-    // toolInvoke requires UCAN authorization but the NAPI bridge's
-    // validate_tool_invocation_ucan uses a different capability URI format
-    // (tool_invoke:{id}) than what ucanMint produces (tool:invoke:*).
-    // Skip until the Rust UCAN capability URI format is unified. See #1144.
-    test.skip("invokes a registered tool (UCAN capability URI format mismatch)", async () => {
+    // toolInvoke requires UCAN authorization. Three naming mismatches exist:
+    // 1. mint_ucan splits "tool:invoke:*" → resource="tool", action="invoke:*".
+    //    validate_tool_invocation_ucan creates resource="tool_invoke", action=toolId.
+    // 2. The CapabilityUri.matches() check requires exact resource+action match,
+    //    so "tool"/"invoke:*" never matches "tool_invoke"/toolId.
+    // 3. Ceiling uses Capability::to_string() → "tool:invoke:*" but CapabilityUri
+    //    ceiling check uses capability_name() → "tool_invoke:*". Different strings.
+    // Root cause: Capability enum (roles.rs) and CapabilityUri (capability.rs) use
+    // incompatible naming conventions. Needs a coordinated fix across both systems.
+    // See #1144.
+    test.skip("invokes a registered tool (Capability/CapabilityUri naming mismatch)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -414,10 +420,9 @@ if (bridge === null) {
       expect(token.capabilities.some((c: string) => c.endsWith("/messages:read"))).toBe(true);
     });
 
-    // ucanValidate requires DHT resolution of the issuer DID (signature
-    // verification needs the public key from the DID document). In-memory
-    // identities aren't published to DHT. Skip until #1144 addresses DHT.
-    test.skip("validates a minted token for a granted capability (requires shared DID resolver)", async () => {
+    // identity_create now publishes to the shared InMemoryDhtClient so that
+    // the DualLayerResolver can find the issuer's DID document (#1144).
+    test("validates a minted token for a granted capability", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
@@ -895,8 +900,8 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E UCAN lifecycle (real NAPI)", () => {
-    // ucanValidate requires DHT resolution of the issuer DID. Skip until #1144.
-    test.skip("mint -> validate -> revoke -> validation fails (requires shared DID resolver)", async () => {
+    // identity_create now publishes to the shared InMemoryDhtClient (#1144).
+    test("mint -> validate -> revoke lifecycle", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -904,25 +909,36 @@ if (bridge === null) {
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
 
-      // Mint.
-      const token = await napi.ucanMint(ctx, member.did, ["messages:read", "messages:write"]);
-      expect(token.capabilities.length).toBe(2);
+      // Mint separate tokens for each capability. UCAN nonce replay
+      // prevention (ADR-016 step 9) rejects the same token presented
+      // twice, so each validation needs its own token.
+      const readToken = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      expect(readToken.capabilities.length).toBe(1);
+      const readCap = readToken.capabilities[0] as string;
+      expect(readCap).toBeDefined();
 
-      // NAPI bridge requires full capability URI (scp:ctx:{id}/...) for validation.
-      const readCap = token.capabilities.find((c: string) => c.endsWith("/messages:read")) ?? "";
-      const writeCap = token.capabilities.find((c: string) => c.endsWith("/messages:write")) ?? "";
-      expect(readCap.length).toBeGreaterThan(0);
-      expect(writeCap.length).toBeGreaterThan(0);
+      const writeToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
+      expect(writeToken.capabilities.length).toBe(1);
+      const writeCap = writeToken.capabilities[0] as string;
+      expect(writeCap).toBeDefined();
 
-      // Validate both capabilities.
-      await napi.ucanValidate(ctx, token.encoded, readCap);
-      await napi.ucanValidate(ctx, token.encoded, writeCap);
+      // Validate both capabilities (separate tokens, separate nonces).
+      await napi.ucanValidate(ctx, readToken.encoded, readCap);
+      await napi.ucanValidate(ctx, writeToken.encoded, writeCap);
 
-      // Revoke (revoker is the admin/context creator).
-      await napi.ucanRevoke(ctx, token.encoded, admin.did);
+      // Revoke the read token (revoker is the admin/context creator).
+      await napi.ucanRevoke(ctx, readToken.encoded, admin.did);
 
-      // Validation should now fail.
-      await expect(napi.ucanValidate(ctx, token.encoded, readCap)).rejects.toThrow();
+      // Verify the revoked token is rejected.
+      await expect(napi.ucanValidate(ctx, readToken.encoded, readCap)).rejects.toThrow();
+
+      // Mint a fresh write token to verify non-revoked capabilities still work.
+      // The original writeToken's nonce was already consumed at line 927, so
+      // re-validating it would fail on nonce replay (ADR-016 step 9) before
+      // the revocation check is reached.
+      const freshWriteToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
+      const freshWriteCap = freshWriteToken.capabilities[0] as string;
+      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap);
     });
   });
 
@@ -931,10 +947,11 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E tool lifecycle (real NAPI)", () => {
-    // toolInvoke UCAN validation uses a different capability URI format
-    // (tool_invoke:{id}) than what ucanMint produces (tool:invoke:*).
-    // Skip until the Rust UCAN capability URI format is unified. See #1144.
-    test.skip("register -> invoke -> verify (UCAN capability URI format mismatch)", async () => {
+    // Capability enum (roles.rs) uses "tool:invoke:*" but CapabilityUri
+    // (capability.rs) expects "tool_invoke" as a single resource token.
+    // Three-way naming mismatch between mint, validate, and ceiling.
+    // See detailed comment in "invokes a registered tool" test and #1144.
+    test.skip("register -> invoke -> verify (Capability/CapabilityUri naming mismatch)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -1122,10 +1139,11 @@ if (bridge === null) {
       await napi.broadcastPublish(ctx, identity.did, payload);
     });
 
-    // block_broadcast_subscriber does not remove the subscriber from the
-    // subscriber set in the current Rust implementation. The block list is
-    // maintained separately but isSubscriber still returns true. See #1144.
-    test.skip("block subscriber removes and blocks a subscriber (Rust block list is separate from subscriber set)", async () => {
+    // Per §5.14.8: per-author blocking does NOT remove from the context-wide
+    // subscriber roster. The subscriber loses access to the blocking author's
+    // content only, not to other authors'. Only governance_ban_subscriber
+    // removes from the roster.
+    test("block subscriber adds to block list without removing from roster", async () => {
       const identity = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1140,11 +1158,15 @@ if (bridge === null) {
       await napi.broadcastSubscribe(ctx, subscriber.did);
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
 
+      // Block does not throw.
       await napi.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
-      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+      // Per §5.14.8: subscriber stays in the roster after per-author block.
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
+      // Subscriber count unchanged (still in roster).
+      expect(await napi.broadcastSubscriberCount(ctx)).toBe(1);
     });
 
-    test.skip("unblock restores subscriber after block (Rust block list is separate from subscriber set)", async () => {
+    test("unblock after block does not throw and subscriber remains in roster", async () => {
       const identity = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1160,9 +1182,12 @@ if (bridge === null) {
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
 
       await napi.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
-      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+      // Subscriber stays in roster after block (§5.14.8).
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
 
+      // Unblock does not throw.
       await napi.broadcastUnblockSubscriber(ctx, subscriber.did, identity.did);
+      // Subscriber still in roster after unblock.
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
     });
 
