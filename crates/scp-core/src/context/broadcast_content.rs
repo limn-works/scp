@@ -51,6 +51,9 @@ const MAX_PATH_BYTES: usize = 1024;
 /// Maximum deploy ID length in bytes.
 const MAX_DEPLOY_ID_BYTES: usize = 128;
 
+/// Maximum body size in bytes (10 MiB).
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // BroadcastContentError
 // ---------------------------------------------------------------------------
@@ -82,6 +85,14 @@ pub enum BroadcastContentError {
     /// A `deploy_id` value failed validation.
     #[error("invalid deploy ID: {0}")]
     InvalidDeployId(String),
+
+    /// Body exceeds [`MAX_BODY_BYTES`].
+    #[error("body too large: {0} bytes (max {MAX_BODY_BYTES})")]
+    BodyTooLarge(usize),
+
+    /// An `ETag` value has an invalid format (must be 64 lowercase hex chars).
+    #[error("invalid etag format: {0}")]
+    InvalidEtag(String),
 
     /// `ETag` verification failed: computed hash does not match declared `ETag`.
     #[error("etag mismatch: expected {expected}, actual {actual}")]
@@ -243,6 +254,7 @@ impl AsRef<str> for MimeType {
 /// metadata is valid (equivalent to legacy opaque bytes with structured
 /// framing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentMetadata {
     /// Validated URL path for path-based projection routing.
     pub path: Option<ContentPath>,
@@ -271,6 +283,7 @@ pub struct ContentMetadata {
 /// The `version` field is the inner content format version (independent of the
 /// outer `BroadcastEnvelope.version` protocol wire format version).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BroadcastContent {
     /// Inner content format version (currently 1). Independent lifecycle from
     /// the outer `BroadcastEnvelope.version` (protocol wire format).
@@ -378,8 +391,11 @@ pub fn serialize_broadcast_content(
         validate_deploy_id(id)?;
     }
 
-    let msgpack = rmp_serde::to_vec(content)
-        .map_err(|e| BroadcastContentError::DeserializationFailed(e.to_string()))?;
+    let msgpack = rmp_serde::to_vec_named(content).map_err(|_| {
+        BroadcastContentError::DeserializationFailed(
+            "broadcast content serialization failed".to_owned(),
+        )
+    })?;
     let mut buf = Vec::with_capacity(4 + msgpack.len());
     buf.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
     buf.push(content.version);
@@ -417,19 +433,84 @@ pub fn deserialize_broadcast_content(
     if bytes[0..3] != BROADCAST_CONTENT_MAGIC {
         return Err(BroadcastContentError::InvalidMagic);
     }
-    let version = bytes[3];
-    if version == 0 {
+    let header_version = bytes[3];
+    if header_version == 0 {
         return Err(BroadcastContentError::UnsupportedVersion(0));
     }
-    let content: BroadcastContent = rmp_serde::from_slice(&bytes[4..])
-        .map_err(|e| BroadcastContentError::DeserializationFailed(e.to_string()))?;
+    let mut content: BroadcastContent = rmp_serde::from_slice(&bytes[4..]).map_err(|_| {
+        BroadcastContentError::DeserializationFailed("malformed broadcast content".to_owned())
+    })?;
+
+    // Fix #1: Override inner version with header version to prevent divergence
+    // where header says v2 but body says v1.
+    content.version = header_version;
+
+    // Fix #3: Body size limit.
+    if content.body.len() > MAX_BODY_BYTES {
+        return Err(BroadcastContentError::BodyTooLarge(content.body.len()));
+    }
 
     // Post-deserialization validation: deploy_id may have been crafted.
     if let Some(ref id) = content.metadata.deploy_id {
         validate_deploy_id(id)?;
     }
 
+    // Fix #6: Validate etag format if present.
+    if let Some(ref etag) = content.metadata.etag {
+        validate_etag_format(etag)?;
+    }
+
     Ok(content)
+}
+
+// ---------------------------------------------------------------------------
+// ETag format validation
+// ---------------------------------------------------------------------------
+
+/// Validates that an etag string is exactly 64 lowercase hex digits (SHA-256 hex).
+fn validate_etag_format(etag: &str) -> Result<(), BroadcastContentError> {
+    if etag.len() != 64 {
+        return Err(BroadcastContentError::InvalidEtag(format!(
+            "etag must be exactly 64 hex chars, got {}",
+            etag.len()
+        )));
+    }
+    if !etag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(BroadcastContentError::InvalidEtag(
+            "etag must contain only lowercase hex digits [0-9a-f]".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unicode formatting character detection
+// ---------------------------------------------------------------------------
+
+/// Returns `true` for Unicode formatting and invisible characters that should
+/// be rejected in content paths. Covers zero-width chars, bidi controls,
+/// word joiners, invisible operators, BOM, and non-characters.
+fn is_unicode_formatting(ch: char) -> bool {
+    let cp = u32::from(ch);
+    matches!(
+        cp,
+        // Zero-width chars (U+200B-U+200F): ZWSP, ZWNJ, ZWJ, LRM, RLM
+        0x200B..=0x200F
+        // Line/paragraph separators
+        | 0x2028..=0x2029
+        // Bidi embedding controls (LRE, RLE, PDF, LRO, RLO)
+        | 0x202A..=0x202E
+        // Medium mathematical space
+        | 0x205F
+        // Word joiner and invisible operators (U+2060-U+206F)
+        | 0x2060..=0x206F
+        // Ideographic space
+        | 0x3000
+        // BOM / ZWNBSP
+        | 0xFEFF
+        // Non-characters
+        | 0xFFFE..=0xFFFF
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -489,13 +570,17 @@ fn validate_content_path(path: &str) -> Result<(), BroadcastContentError> {
         }
     }
 
-    // Reject non-ASCII whitespace (U+00A0, U+2000-U+200F, U+FEFF)
+    // Reject non-ASCII whitespace, control, and formatting characters.
+    // Covers: NBSP (U+00A0), general punctuation spaces (U+2000-U+200F),
+    // line/paragraph separators (U+2028-U+2029), bidi embedding controls
+    // (U+202A-U+202E), medium mathematical space (U+205F), word joiner and
+    // invisible operators (U+2060-U+206F), ideographic space (U+3000),
+    // BOM/ZWNBSP (U+FEFF), and non-characters (U+FFFE, U+FFFF).
     for ch in path.chars() {
-        let cp = u32::from(ch);
-        let reject = ch == '\u{00A0}' || (0x2000..=0x200F).contains(&cp) || ch == '\u{FEFF}';
-        if reject {
+        if !ch.is_ascii() && (ch.is_whitespace() || ch.is_control() || is_unicode_formatting(ch)) {
             return Err(err(&format!(
-                "path must not contain non-ASCII whitespace U+{cp:04X}",
+                "path must not contain non-ASCII whitespace/formatting U+{:04X}",
+                u32::from(ch),
             )));
         }
     }
@@ -532,7 +617,8 @@ fn validate_content_path(path: &str) -> Result<(), BroadcastContentError> {
 /// Validates a MIME type string: `type/subtype`, no parameters, no control chars.
 ///
 /// Token characters per RFC 7230 §3.2.6: ALPHA, DIGIT, `!`, `#`, `$`, `&`,
-/// `-`, `^`, `_`, `.`, `+`.
+/// `'`, `*`, `+`, `-`, `.`, `^`, `_`, `` ` ``, `|`, `~`.
+/// `%` intentionally excluded (not a tchar).
 fn validate_mime_type(value: &str) -> Result<(), BroadcastContentError> {
     let err = |msg: &str| BroadcastContentError::InvalidMimeType(msg.to_owned());
 
@@ -572,7 +658,11 @@ fn validate_mime_type(value: &str) -> Result<(), BroadcastContentError> {
         return Err(err("MIME type and subtype must both be non-empty"));
     }
 
-    let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$&-^_.+".contains(c);
+    // RFC 7230 §3.2.6 tchar set: ALPHA / DIGIT / "!" / "#" / "$" / "&" /
+    // "'" / "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+    // Note: "%" is intentionally excluded — it is not a tchar per RFC 7230,
+    // and allowing it would enable encoded-character injection.
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$&'*+-.^_`|~".contains(c);
 
     if !type_part.chars().all(is_token_char) {
         return Err(err("MIME type part contains invalid characters"));
@@ -728,15 +818,16 @@ mod tests {
     }
 
     #[test]
-    fn future_version_accepted() {
-        // Build a valid v1 payload, then change the version byte to 2.
+    fn future_version_accepted_and_header_overrides_inner() {
+        // Build a valid v1 payload, then change the header version byte to 2.
         // The MessagePack payload is still v1-shaped, so deserialization
-        // succeeds (forward-compatible framing).
+        // succeeds (forward-compatible framing). The inner version field must
+        // be overridden by the header version (fix #1: version reconciliation).
         let content = sample_content();
         let mut bytes = serialize_broadcast_content(&content).unwrap();
         bytes[3] = 2;
-        let result = deserialize_broadcast_content(&bytes);
-        assert!(result.is_ok());
+        let result = deserialize_broadcast_content(&bytes).unwrap();
+        assert_eq!(result.version, 2, "inner version must match header version");
     }
 
     // -----------------------------------------------------------------------
@@ -1110,7 +1201,7 @@ mod tests {
             },
             body: vec![],
         };
-        let msgpack = rmp_serde::to_vec(&content).unwrap();
+        let msgpack = rmp_serde::to_vec_named(&content).unwrap();
         let mut bytes = Vec::with_capacity(4 + msgpack.len());
         bytes.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
         bytes.push(BROADCAST_CONTENT_VERSION);
@@ -1199,6 +1290,191 @@ mod tests {
             body: b"test body".to_vec(),
         };
         assert!(verify_etag(&content).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Body too large
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deserialize_rejects_body_too_large() {
+        // Build a payload with a body exceeding MAX_BODY_BYTES (10 MiB).
+        let big_body = vec![0xAA; MAX_BODY_BYTES + 1];
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: None,
+                content_type: None,
+                deploy_id: None,
+                etag: None,
+                immutable: false,
+            },
+            body: big_body,
+        };
+        // Bypass serialize_broadcast_content (it doesn't check body size)
+        // and build the wire format directly.
+        let msgpack = rmp_serde::to_vec_named(&content).unwrap();
+        let mut bytes = Vec::with_capacity(4 + msgpack.len());
+        bytes.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
+        bytes.push(BROADCAST_CONTENT_VERSION);
+        bytes.extend_from_slice(&msgpack);
+
+        let result = deserialize_broadcast_content(&bytes);
+        assert!(
+            matches!(result, Err(BroadcastContentError::BodyTooLarge(sz)) if sz == MAX_BODY_BYTES + 1)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ETag format validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn etag_valid_64_hex() {
+        // A valid SHA-256 hex string.
+        let valid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(validate_etag_format(valid).is_ok());
+    }
+
+    #[test]
+    fn etag_rejects_wrong_length() {
+        assert!(matches!(
+            validate_etag_format("abcd"),
+            Err(BroadcastContentError::InvalidEtag(_))
+        ));
+        // 63 chars
+        assert!(matches!(
+            validate_etag_format(&"a".repeat(63)),
+            Err(BroadcastContentError::InvalidEtag(_))
+        ));
+        // 65 chars
+        assert!(matches!(
+            validate_etag_format(&"a".repeat(65)),
+            Err(BroadcastContentError::InvalidEtag(_))
+        ));
+    }
+
+    #[test]
+    fn etag_rejects_uppercase() {
+        let upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+        assert!(matches!(
+            validate_etag_format(upper),
+            Err(BroadcastContentError::InvalidEtag(_))
+        ));
+    }
+
+    #[test]
+    fn etag_rejects_non_hex() {
+        // 64 chars but contains 'g'
+        let bad = format!("{}g", "a".repeat(63));
+        assert!(matches!(
+            validate_etag_format(&bad),
+            Err(BroadcastContentError::InvalidEtag(_))
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_etag_format() {
+        // Build a payload with an etag that is not 64 lowercase hex.
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: None,
+                content_type: None,
+                deploy_id: None,
+                etag: Some("not-a-valid-etag".to_owned()),
+                immutable: false,
+            },
+            body: vec![],
+        };
+        // Bypass serialize and build wire format directly so the bad etag
+        // is embedded in the msgpack payload.
+        let msgpack = rmp_serde::to_vec_named(&content).unwrap();
+        let mut bytes = Vec::with_capacity(4 + msgpack.len());
+        bytes.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
+        bytes.push(BROADCAST_CONTENT_VERSION);
+        bytes.extend_from_slice(&msgpack);
+
+        let result = deserialize_broadcast_content(&bytes);
+        assert!(matches!(result, Err(BroadcastContentError::InvalidEtag(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Named encoding round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn named_encoding_round_trip() {
+        // Verify that to_vec_named encoding round-trips correctly.
+        let content = sample_content();
+        let bytes = serialize_broadcast_content(&content).unwrap();
+        let deserialized = deserialize_broadcast_content(&bytes).unwrap();
+        assert_eq!(content.body, deserialized.body);
+        assert_eq!(content.metadata, deserialized.metadata);
+        assert_eq!(content.version, deserialized.version);
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended non-ASCII whitespace rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_path_rejects_extended_unicode_formatting() {
+        // U+2028 LINE SEPARATOR
+        assert!(ContentPath::new("/foo\u{2028}bar").is_err());
+        // U+2029 PARAGRAPH SEPARATOR
+        assert!(ContentPath::new("/foo\u{2029}bar").is_err());
+        // U+202A LEFT-TO-RIGHT EMBEDDING (bidi control)
+        assert!(ContentPath::new("/foo\u{202A}bar").is_err());
+        // U+202E RIGHT-TO-LEFT OVERRIDE (bidi control)
+        assert!(ContentPath::new("/foo\u{202E}bar").is_err());
+        // U+205F MEDIUM MATHEMATICAL SPACE
+        assert!(ContentPath::new("/foo\u{205F}bar").is_err());
+        // U+2060 WORD JOINER
+        assert!(ContentPath::new("/foo\u{2060}bar").is_err());
+        // U+3000 IDEOGRAPHIC SPACE
+        assert!(ContentPath::new("/foo\u{3000}bar").is_err());
+        // U+FFFE non-character
+        assert!(ContentPath::new("/foo\u{FFFE}bar").is_err());
+        // U+FFFF non-character
+        assert!(ContentPath::new("/foo\u{FFFF}bar").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // MimeType extended tchar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_type_accepts_full_tchar_set() {
+        // Type and subtype with all RFC 7230 tchar specials.
+        assert!(MimeType::new("application/vnd.x-test+foo").is_ok());
+        assert!(MimeType::new("x-type!/sub*type").is_ok());
+        assert!(MimeType::new("x/y~z").is_ok());
+        assert!(MimeType::new("x/y|z").is_ok());
+        assert!(MimeType::new("x/y`z").is_ok());
+        assert!(MimeType::new("x/y'z").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Error string sanitization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deserialization_error_does_not_leak_internals() {
+        // Feed invalid msgpack after a valid header. The error message
+        // must be generic, not the raw rmp_serde error.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
+        bytes.push(BROADCAST_CONTENT_VERSION);
+        bytes.extend_from_slice(b"not valid msgpack");
+
+        let result = deserialize_broadcast_content(&bytes);
+        match result {
+            Err(BroadcastContentError::DeserializationFailed(msg)) => {
+                assert_eq!(msg, "malformed broadcast content");
+            }
+            other => panic!("expected DeserializationFailed, got: {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
