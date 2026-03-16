@@ -5,8 +5,8 @@
 //! see ADR-034). The algorithms are pure crypto (SHA-256, Ed25519) with no
 //! network I/O, so they translate directly to WASM.
 //!
-//! - [`scpid_challenge`] — Generate an SCPID challenge for a relying party.
-//! - [`scpid_sign`] — Sign an SCPID challenge with a registered identity's key.
+//! - `scpid_challenge` — Generate an SCPID challenge for a relying party.
+//! - `scpid_sign` — Sign an SCPID challenge with a registered identity's key.
 //!
 //! **`scpid_verify` is NOT exposed in the WASM bridge.** Verification requires
 //! a network-capable `DidResolver` to resolve the signer's DID document from

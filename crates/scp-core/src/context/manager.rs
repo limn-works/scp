@@ -3031,11 +3031,11 @@ impl ContextManager {
     /// context.
     ///
     /// Called by the SDK/FFI layer after processing a received envelope whose
-    /// [`VersionCompatibility`] is [`DegradedMode`]. This pushes a
+    /// `VersionCompatibility` is `DegradedMode`. This pushes a
     /// [`ContextEvent::DegradedMode`] to the context's receive buffer so the
     /// application layer can observe the degraded state via [`drain_events`].
     ///
-    /// If `compat` is [`VersionCompatibility::Exact`], this is a no-op (no
+    /// If `compat` is `VersionCompatibility::Exact`, this is a no-op (no
     /// event is emitted). If the context is not registered, this is also a
     /// no-op.
     ///
@@ -3373,7 +3373,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
     /// - [`ContextError::PermissionDenied`] if the sender is not an author.
-    /// - [`ContextError::InvalidInput`] if serialization fails.
+    /// - `ContextError::InvalidInput` if serialization fails.
     pub async fn publish_broadcast_content(
         &self,
         context_id: &str,

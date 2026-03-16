@@ -686,7 +686,7 @@ pub enum CatchUpStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncOutcome {
     /// Sync has not yet executed. Returned by planning methods; replaced by
-    /// a concrete outcome after [`ReconnectionCoordinator::execute`] runs.
+    /// a concrete outcome after `ReconnectionCoordinator::execute` runs.
     Pending,
     /// All epochs and events caught up via sequential processing.
     FullyCaughtUp,

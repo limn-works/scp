@@ -842,7 +842,7 @@ pub async fn bridge_auth_middleware_dyn(
 ///
 /// Per spec §12.10.2, the signed payload is `timestamp_bytes || body_bytes`
 /// where `timestamp` is the value of the `X-SCP-Timestamp` header. The
-/// timestamp must be within [`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`] of the
+/// timestamp must be within `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` of the
 /// current time.
 pub fn verify_webhook_signature(
     signature_header: &str,

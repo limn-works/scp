@@ -526,7 +526,7 @@ pub async fn delete_context_handler(
 /// Prevents unbounded memory allocation from oversized POST bodies.
 const DEV_API_MAX_BODY_SIZE: usize = 64 * 1024;
 
-/// Returns an axum [`Router`] serving the dev API endpoints under
+/// Returns an axum `Router` serving the dev API endpoints under
 /// `/scp/dev/v1`.
 ///
 /// All routes are protected by bearer token authentication. The `token`

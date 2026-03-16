@@ -476,7 +476,7 @@ pub fn enforce_inner_envelope_category_a(
 /// Validates that an inner envelope's version field is compatible (§13.5).
 ///
 /// Accepts envelopes with the same major version. Returns
-/// [`VersionCompatibility`] so the caller can decide whether and how to log
+/// `VersionCompatibility` so the caller can decide whether and how to log
 /// degraded-mode situations. This function intentionally does **not** emit
 /// `tracing::warn!` itself, because [`verify_inner_signature`] also calls
 /// [`check_version_compatibility`](super::check_version_compatibility) and

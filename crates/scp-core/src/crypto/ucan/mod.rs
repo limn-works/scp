@@ -353,7 +353,7 @@ impl Default for UcanHeader {
 /// where compound resources use underscores (e.g. `tool_invoke`, `context_child`).
 ///
 /// The `can` field holds the action portion (e.g. `"*"`, `"calculator"`,
-/// `"write"`, `"propose"`). See [`CapabilityUri`](capability::CapabilityUri)
+/// `"write"`, `"propose"`). See [`CapabilityUri`]
 /// for the full URI format and [`Capability::ucan_resource_action`](crate::context::roles::Capability::ucan_resource_action)
 /// for the mapping from canonical colon-format to UCAN format.
 ///

@@ -2,7 +2,7 @@
 //!
 //! Implements persistent storage for trust engine data: cached attestations,
 //! revocation state, and challenge results. These methods back the
-//! [`TrustProtocolRepository`](crate::trust::aggregate::TrustProtocolRepository)
+//! [`TrustProtocolRepository`]
 //! trait via the synchronous [`ProtocolRepositoryTrustBridge`] adapter.
 //!
 //! # Key convention

@@ -143,11 +143,11 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
 
 /// Initializes the global [`ContextManager`] with production providers.
 ///
-/// Uses [`MlsCryptoProvider`] (real MLS encryption, #1294),
+/// Uses `MlsCryptoProvider` (real MLS encryption, #1294),
 /// `NotConfiguredTransportProvider`, `MerkleEventLogProvider` (persistent,
 /// #484), and `NapiBridgePersistence`.
 ///
-/// The `local_did` is passed to [`MlsCryptoProvider::new`] which uses it as
+/// The `local_did` is passed to `MlsCryptoProvider::new` which uses it as
 /// the MLS credential identity for group operations and sender key generation.
 ///
 /// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`

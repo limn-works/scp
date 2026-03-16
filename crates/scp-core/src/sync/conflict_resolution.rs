@@ -476,8 +476,8 @@ pub fn resolve_governance_conflict(
 /// resolved pair.
 ///
 /// **Freeze triggers are unchanged:** if ANY pair is a
-/// [`ConflictPairKind::SimultaneousCommit`] or
-/// [`ConflictPairKind::MutualRemoval`], the function returns a single
+/// `ConflictPairKind::SimultaneousCommit` or
+/// `ConflictPairKind::MutualRemoval`, the function returns a single
 /// [`ConflictResolutionStrategy::GovernanceFreeze`] containing all
 /// conflicting proposal IDs (same behavior as
 /// `resolve_governance_conflict`).

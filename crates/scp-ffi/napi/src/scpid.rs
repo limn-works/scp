@@ -2,8 +2,8 @@
 //!
 //! Exposes SCPID challenge generation, signing, and verification to Node.js/Bun:
 //!
-//! - [`scpid_challenge`] — Generate an SCPID challenge for a relying party.
-//! - [`scpid_sign`] — Sign an SCPID challenge with a registered identity's key.
+//! - `scpid_challenge` — Generate an SCPID challenge for a relying party.
+//! - `scpid_sign` — Sign an SCPID challenge with a registered identity's key.
 //! - [`scpid_verify`] — Verify a signed SCPID response (relying-party side).
 //!
 //! See spec §3.11 and the `scp-core` `scpid` module.

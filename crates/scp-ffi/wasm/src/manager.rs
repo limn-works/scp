@@ -1466,7 +1466,7 @@ impl WasmContextManager {
     ///
     /// Returns the TLS-serialized key package bytes. The private key material
     /// is stored in `pending_key_packages` keyed by `(context_id, member_did)`
-    /// for later use by [`join_context_encrypted`].
+    /// for later use by `join_context_encrypted`.
     ///
     /// # Errors
     ///
@@ -1505,7 +1505,7 @@ impl WasmContextManager {
     ///
     /// The joiner processes the MLS Welcome message to reconstruct the group.
     /// A key package must have been previously generated via
-    /// [`generate_key_package_for_join`] for the same `(context_id, member_did)`.
+    /// `generate_key_package_for_join` for the same `(context_id, member_did)`.
     ///
     /// # Errors
     ///

@@ -86,7 +86,7 @@ pub enum BroadcastContentError {
     #[error("invalid deploy ID: {0}")]
     InvalidDeployId(String),
 
-    /// Body exceeds [`MAX_BODY_BYTES`].
+    /// Body exceeds `MAX_BODY_BYTES`.
     #[error("body too large: {0} bytes (max {MAX_BODY_BYTES})")]
     BodyTooLarge(usize),
 

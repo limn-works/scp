@@ -539,7 +539,7 @@ pub fn py_bridge_claim_shadow(
 ///
 /// # Returns
 ///
-/// JSON string of the sealed [`SenderKeyEnvelope`].
+/// JSON string of the sealed `SenderKeyEnvelope`.
 ///
 /// # Errors
 ///
@@ -675,7 +675,7 @@ pub fn py_bridge_seal_shadow_envelope(
 ///
 /// # Arguments
 ///
-/// * `envelope_json` -- JSON-serialized [`SenderKeyEnvelope`].
+/// * `envelope_json` -- JSON-serialized `SenderKeyEnvelope`.
 /// * `sender_key_bytes` -- The shadow's 32-byte AES-256-GCM sender key.
 /// * `context_id` -- The SCP context identifier (AAD binding).
 /// * `sender_did` -- The shadow DID (AAD binding).
