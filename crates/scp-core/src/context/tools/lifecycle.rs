@@ -295,18 +295,19 @@ pub struct ToolInvokedEvent {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Computes a SHA-256 hash of a JSON value's canonical representation.
+/// Computes a SHA-256 hash of a JSON value's RFC 8785 (JCS) canonical
+/// representation.
 ///
-/// The value is serialized to a compact JSON string (no whitespace), then
-/// hashed with SHA-256. Returns the hash as a lowercase hex string.
+/// The value is serialized to a JCS-canonical JSON string, then hashed with
+/// SHA-256. Returns the hash as a lowercase hex string.
 #[must_use]
 pub fn sha256_json(value: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
 
-    // serde_json::to_string produces compact JSON (no extra whitespace).
-    // If serialization fails (should not happen for valid JSON), hash the
-    // empty string.
-    let bytes = serde_json::to_string(value).unwrap_or_default();
+    // RFC 8785 JCS canonical serialization for cross-implementation
+    // deterministic hashing. Falls back to empty string on error (should
+    // not happen for valid JSON).
+    let bytes = crate::jcs::to_string(value).unwrap_or_default();
     let hash = Sha256::digest(bytes.as_bytes());
     hex::encode(hash)
 }

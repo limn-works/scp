@@ -99,13 +99,13 @@ pub type ProposalId = [u8; 32];
 /// fields. Fixed-width fields (timestamp) need no prefix.
 ///
 /// **Canonicalization:** The `action_bytes` parameter MUST be produced by
-/// `serde_json::to_vec` (compact JSON, no whitespace). JSON is used — not
+/// RFC 8785 JCS (via `crate::jcs::to_vec`). JCS is used — not
 /// `MessagePack` — because `GovernanceAction` is a complex enum whose
 /// serialized form must be deterministic across all SDK implementations
 /// (Rust, Python, TypeScript, Kotlin, Swift). `MessagePack` has no canonical
-/// form standard; JSON has RFC 8785 (JCS). This is consistent with all
-/// other cross-implementation canonical hashing in the protocol: handle
-/// tool signing (§22), app declarations (§8), DID documents (§18), and
+/// form standard. This is consistent with all other cross-implementation
+/// canonical hashing in the protocol: handle tool signing (§22), app
+/// declarations (§8), DID documents (§18), and
 /// `ParentGovernanceConfig::content_hash()` in nesting.rs. See §9.5.2.
 pub(crate) fn compute_proposal_id(
     context_id: &str,
@@ -166,12 +166,11 @@ fn compute_vote_hash(
     vote: &VoteType,
     timestamp: u64,
 ) -> Result<Vec<u8>, GovernanceError> {
-    // Canonical JSON serialization for cross-implementation deterministic
-    // vote hashing (§9.5.2). Both vote_type and action_bytes (in
-    // compute_proposal_id) use JSON — not MessagePack — for canonical
+    // RFC 8785 JCS canonical serialization for cross-implementation
+    // deterministic vote hashing (§9.5.2). Both vote_type and action_bytes
+    // (in compute_proposal_id) use JCS — not MessagePack — for canonical
     // hashing. See compute_proposal_id() doc comment for full rationale.
-    let vote_type_bytes = serde_json::to_vec(vote)
-        .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
+    let vote_type_bytes = crate::jcs::to_vec(vote).map_err(GovernanceError::SerializationFailed)?;
 
     let voter_did_bytes = voter_did.as_bytes();
 
@@ -1496,12 +1495,13 @@ impl GovernanceEngine for SingleAdminEngine {
             return Err(GovernanceError::NotAdmin);
         }
 
-        // Canonical JSON serialization for cross-implementation deterministic
-        // proposal ID computation (§9.5.2). JSON (not MessagePack) because
-        // GovernanceAction is a complex enum that must hash identically across
-        // all SDK languages. See compute_proposal_id() doc comment.
-        let action_bytes = serde_json::to_vec(&action)
-            .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
+        // RFC 8785 JCS canonical serialization for cross-implementation
+        // deterministic proposal ID computation (§9.5.2). JCS (not
+        // MessagePack) because GovernanceAction is a complex enum that must
+        // hash identically across all SDK languages. See
+        // compute_proposal_id() doc comment.
+        let action_bytes =
+            crate::jcs::to_vec(&action).map_err(GovernanceError::SerializationFailed)?;
 
         let proposal_id =
             compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);

@@ -257,12 +257,9 @@ mod hex_bytes {
 impl CapabilityDeclaration {
     /// Computes the canonical bytes for signature verification.
     ///
-    /// Returns the JCS-canonical JSON serialization of the declaration with
-    /// the `signature` field excluded, as required by spec 8.4.1.
-    ///
-    /// Uses `serde_json::to_vec` with sorted keys for deterministic output.
-    /// The codebase uses JSON (not `MessagePack`) for all canonical hash inputs
-    /// per the established pattern in governance module.
+    /// Returns the RFC 8785 JCS-canonical JSON serialization of the
+    /// declaration with the `signature` field excluded, as required by
+    /// spec 8.4.1.
     ///
     /// # Errors
     ///
@@ -279,10 +276,8 @@ impl CapabilityDeclaration {
             map.remove("signature");
         }
 
-        // Serialize with sorted keys for deterministic output (JCS-like).
-        // serde_json serializes BTreeMap keys in sorted order; serde_json::Value::Object
-        // uses a BTreeMap when the "preserve_order" feature is NOT enabled.
-        // We explicitly sort to be safe regardless of features.
+        // RFC 8785 JCS canonical serialization for cross-implementation
+        // deterministic hashing.
         canonical_json_bytes(&value)
     }
 
@@ -881,36 +876,12 @@ pub fn format_unbind_event(event: &AppUnbindEvent) -> String {
 // Helper: canonical JSON serialization
 // ---------------------------------------------------------------------------
 
-/// Produces canonical JSON bytes from a `serde_json::Value`.
+/// Produces RFC 8785 (JCS) canonical JSON bytes from a `serde_json::Value`.
 ///
-/// Recursively sorts all object keys to produce deterministic output,
-/// matching the RFC 8785 (JCS) requirement for canonical JSON.
+/// Delegates to [`crate::jcs::to_vec`] which uses `serde_json_canonicalizer`
+/// for true RFC 8785 compliance (key sorting, number formatting, escaping).
 fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, SandboxError> {
-    let sorted = sort_json_value(value);
-    serde_json::to_vec(&sorted).map_err(|e| SandboxError::SerializationFailed(e.to_string()))
-}
-
-/// Recursively sorts all object keys in a JSON value.
-///
-/// Uses an intermediate `BTreeMap` to guarantee lexicographic key ordering
-/// regardless of whether `serde_json` is compiled with the `preserve_order`
-/// feature (which backs `Map` with `IndexMap` instead of `BTreeMap`).
-fn sort_json_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let sorted_btree: std::collections::BTreeMap<String, serde_json::Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), sort_json_value(v)))
-                .collect();
-            let sorted: serde_json::Map<String, serde_json::Value> =
-                sorted_btree.into_iter().collect();
-            serde_json::Value::Object(sorted)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(sort_json_value).collect())
-        }
-        other => other.clone(),
-    }
+    crate::jcs::to_vec(value).map_err(SandboxError::SerializationFailed)
 }
 
 // ---------------------------------------------------------------------------
