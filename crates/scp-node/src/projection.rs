@@ -1981,9 +1981,14 @@ fn site_security_headers(csp: &str) -> axum::http::HeaderMap {
 ///
 /// # Cache Behavior
 ///
+/// For public contexts:
 /// - `immutable=true`: `Cache-Control: public, immutable, max-age=31536000`
 /// - `immutable=false`: `Cache-Control: public, max-age=0, must-revalidate`
-///   with `ETag: "<deploy_id>:<content_hash>"`
+///
+/// For gated/author-choice contexts:
+/// - `immutable=true`: `Cache-Control: private, immutable, max-age=31536000`
+/// - `immutable=false`: `Cache-Control: private, max-age=0, must-revalidate`
+///
 /// - 404: `Cache-Control: no-store`
 ///
 /// See spec §18.11.10.
@@ -6061,6 +6066,78 @@ mod tests {
             .unwrap();
         // Gated admission => private cache.
         assert_eq!(cc, "private, immutable, max-age=31536000");
+    }
+
+    #[tokio::test]
+    async fn site_gated_non_immutable_uses_private_cache() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_gated_non_immutable_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let mut projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        projected.set_site_config(SiteConfig {
+            hostname: "gated-non-immutable.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("gated-d2".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<html>gated mutable</html>".to_vec(),
+        };
+
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, blob_id);
+        projected.commit_deploy("gated-d2".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let ucan_token = build_signed_test_ucan(context_id, &signing_key);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header("Authorization", format!("Bearer {ucan_token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Gated admission + non-immutable => private, must-revalidate.
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
     }
 
     #[tokio::test]

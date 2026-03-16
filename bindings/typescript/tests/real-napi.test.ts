@@ -1543,7 +1543,9 @@ if (bridge === null) {
       } catch (e: unknown) {
         const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
         const isTransportError = msg.includes("transport") || msg.includes("not configured");
-        expect(isTransportError).toBe(true);
+        if (!isTransportError) {
+            throw new Error(`expected transport error, got: ${msg}`);
+        }
       }
     });
 
@@ -1586,7 +1588,9 @@ if (bridge === null) {
       } catch (e: unknown) {
         const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
         const isTransportError = msg.includes("transport") || msg.includes("not configured");
-        expect(isTransportError).toBe(true);
+        if (!isTransportError) {
+            throw new Error(`expected transport error, got: ${msg}`);
+        }
       }
     });
   });
