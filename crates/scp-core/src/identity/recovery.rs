@@ -652,6 +652,62 @@ pub fn identity_key_rotation_outcome(
 }
 
 // ---------------------------------------------------------------------------
+// PSK wrapping helper
+// ---------------------------------------------------------------------------
+
+/// Wraps a 32-byte PSK for a single device using X25519 ECDH + HKDF + AES-256-GCM.
+///
+/// Returns `Some(wrapped)` on success where `wrapped` is
+/// `[32 bytes ephemeral_pubkey || 12 bytes nonce || ciphertext+tag]`,
+/// or `None` if any crypto operation fails.
+fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::Aead as _;
+    use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
+    use rand::RngCore as _;
+    use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
+    use zeroize::Zeroize as _;
+
+    let device_public = X25519Pub::from(*device_pk);
+
+    // 1. Generate ephemeral X25519 keypair.
+    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    let ephemeral_public = X25519Pub::from(&ephemeral_secret);
+
+    // 2. ECDH: shared_secret = ephemeral_secret * device_public.
+    let shared_secret = ephemeral_secret.diffie_hellman(&device_public);
+
+    // 3. HKDF-SHA256 to derive a 32-byte AES-256-GCM key.
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(b"scp-psk-wrap-v1"), shared_secret.as_bytes());
+    let mut wrapping_key = [0u8; 32];
+    if hk.expand(b"psk-wrapping", &mut wrapping_key).is_err() {
+        return None;
+    }
+
+    // 4. AES-256-GCM encrypt the PSK with a random nonce.
+    let cipher = Aes256Gcm::new((&wrapping_key).into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let Ok(ciphertext) = cipher.encrypt(nonce, psk.as_ref()) else {
+        wrapping_key.zeroize();
+        return None;
+    };
+
+    // Zeroize the wrapping key after use.
+    wrapping_key.zeroize();
+
+    // 5. Prepend ephemeral public key and nonce so the recipient can
+    // perform the reverse ECDH + decrypt.
+    // Format: [32 bytes ephemeral_pubkey || 12 bytes nonce || ciphertext+tag]
+    let mut wrapped = Vec::with_capacity(32 + 12 + ciphertext.len());
+    wrapped.extend_from_slice(ephemeral_public.as_bytes());
+    wrapped.extend_from_slice(&nonce_bytes);
+    wrapped.extend_from_slice(&ciphertext);
+    Some(wrapped)
+}
+
+// ---------------------------------------------------------------------------
 // ProductionRecoveryBackend — real implementation of RecoveryBackend
 // ---------------------------------------------------------------------------
 
@@ -970,11 +1026,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Base, matching the sender key wrapping pattern in §9.16.2).
         // The wrapped PSKs are distributed as a recovery notification.
 
-        use aes_gcm::aead::Aead as _;
-        use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
         use rand::RngCore as _;
-        use sha2::Digest as _;
-        use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
         use zeroize::Zeroize as _;
 
         // Filter out the compromised device, if any.
@@ -997,13 +1049,13 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Generate a fresh PSK (32 bytes of random data).
         let mut new_psk = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut new_psk);
+        rand::rngs::OsRng.fill_bytes(&mut new_psk);
 
         // For each eligible device, wrap the PSK using X25519 ECDH:
         // 1. Generate ephemeral X25519 keypair
         // 2. ECDH with device's public key to get shared secret
         // 3. HKDF-SHA256 to derive AES-256-GCM wrapping key
-        // 4. AES-256-GCM encrypt the PSK
+        // 4. AES-256-GCM encrypt the PSK (random nonce)
         // 5. Output: ephemeral_pubkey || nonce || ciphertext || tag
         //
         // This ensures only the holder of the device's X25519 private key
@@ -1016,45 +1068,10 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             }
             let mut pk_bytes = [0u8; 32];
             pk_bytes.copy_from_slice(device_pk);
-            let device_public = X25519Pub::from(pk_bytes);
-
-            // 1. Generate ephemeral X25519 keypair.
-            let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-            let ephemeral_public = X25519Pub::from(&ephemeral_secret);
-
-            // 2. ECDH: shared_secret = ephemeral_secret * device_public.
-            let shared_secret = ephemeral_secret.diffie_hellman(&device_public);
-
-            // 3. HKDF-SHA256 to derive a 32-byte AES-256-GCM key.
-            let hk =
-                hkdf::Hkdf::<sha2::Sha256>::new(Some(b"scp-psk-wrap-v1"), shared_secret.as_bytes());
-            let mut wrapping_key = [0u8; 32];
-            if hk.expand(b"psk-wrapping", &mut wrapping_key).is_err() {
-                return false;
+            match wrap_psk_for_device(&new_psk, &pk_bytes) {
+                Some(wrapped) => wrapped_psks.push(wrapped),
+                None => return false,
             }
-
-            // 4. AES-256-GCM encrypt the PSK.
-            let cipher = Aes256Gcm::new((&wrapping_key).into());
-            let nonce_bytes = sha2::Sha256::digest(new_psk);
-            let nonce = Nonce::from_slice(&nonce_bytes[..12]);
-
-            match cipher.encrypt(nonce, new_psk.as_ref()) {
-                Ok(ciphertext) => {
-                    // 5. Prepend ephemeral public key and nonce so the
-                    // recipient can perform the reverse ECDH + decrypt.
-                    // Format:
-                    // [32 bytes ephemeral_pubkey || 12 bytes nonce || ciphertext+tag]
-                    let mut wrapped = Vec::with_capacity(32 + 12 + ciphertext.len());
-                    wrapped.extend_from_slice(ephemeral_public.as_bytes());
-                    wrapped.extend_from_slice(&nonce_bytes[..12]);
-                    wrapped.extend_from_slice(&ciphertext);
-                    wrapped_psks.push(wrapped);
-                }
-                Err(_) => return false,
-            }
-
-            // Zeroize the wrapping key after use.
-            wrapping_key.zeroize();
         }
 
         // Zeroize the plaintext PSK now that all devices have wrapped copies.
@@ -2229,5 +2246,67 @@ mod tests {
         assert_eq!(result.failed_contexts.len(), 1);
         assert_eq!(result.failed_contexts[0].0, "ctx-nonexistent");
         assert_eq!(result.failed_contexts[0].1.step, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // wrap_psk_for_device unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn psk_wrapping_nonce_is_random_not_deterministic() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let device_public = X25519Pub::from(&device_secret);
+        let psk = [0xABu8; 32];
+
+        let wrapped1 =
+            super::wrap_psk_for_device(&psk, device_public.as_bytes()).expect("wrap 1 failed");
+        let wrapped2 =
+            super::wrap_psk_for_device(&psk, device_public.as_bytes()).expect("wrap 2 failed");
+
+        // Nonce lives at bytes 32..44. Two wrappings of the same PSK for the
+        // same device must produce different nonces (random, not derived).
+        let nonce1 = &wrapped1[32..44];
+        let nonce2 = &wrapped2[32..44];
+        assert_ne!(nonce1, nonce2, "nonce must be random, not deterministic");
+    }
+
+    #[test]
+    fn psk_wrapping_roundtrip_with_random_nonce() {
+        use aes_gcm::aead::Aead as _;
+        use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let device_public = X25519Pub::from(&device_secret);
+        let psk = [0x42u8; 32];
+
+        let wrapped =
+            super::wrap_psk_for_device(&psk, device_public.as_bytes()).expect("wrap failed");
+
+        // Parse the wire format: [32 ephemeral_pk || 12 nonce || ciphertext+tag]
+        assert!(wrapped.len() > 44, "wrapped output too short");
+        let ephemeral_pk = X25519Pub::from({
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&wrapped[..32]);
+            buf
+        });
+        let nonce = Nonce::from_slice(&wrapped[32..44]);
+        let ciphertext = &wrapped[44..];
+
+        // Reverse: ECDH with device_secret * ephemeral_pk → HKDF → decrypt.
+        let shared_secret = device_secret.diffie_hellman(&ephemeral_pk);
+        let hk =
+            hkdf::Hkdf::<sha2::Sha256>::new(Some(b"scp-psk-wrap-v1"), shared_secret.as_bytes());
+        let mut wrapping_key = [0u8; 32];
+        hk.expand(b"psk-wrapping", &mut wrapping_key)
+            .expect("hkdf expand failed");
+
+        let cipher = Aes256Gcm::new((&wrapping_key).into());
+        let recovered = cipher
+            .decrypt(nonce, ciphertext)
+            .expect("decryption failed");
+        assert_eq!(recovered.as_slice(), &psk, "roundtrip mismatch");
     }
 }
