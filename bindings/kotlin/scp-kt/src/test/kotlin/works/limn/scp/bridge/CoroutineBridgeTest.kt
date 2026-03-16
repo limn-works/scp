@@ -569,6 +569,70 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
+    // Broadcast publish asset tests (SCP-290)
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class BroadcastPublishAssetTests {
+        @Test
+        fun `publishAsset dispatches correctly and parses result`() =
+            runTest(ioDispatcher) {
+                val asset = works.limn.scp.AssetEntry("/index.html", "text/html", "hello".toByteArray())
+                val result = bridge.broadcast.publishAsset(1L, 42L, asset, "deploy-1")
+                assertEquals("abc123", result.blobId)
+                assertEquals("def456", result.etag)
+                assertTrue(stubBindings.broadcastPublishAssetCalled)
+                assertEquals("deploy-1", stubBindings.lastPublishAssetDeployId)
+                assertEquals(42L, stubBindings.lastPublishAssetIdentityHandle)
+            }
+
+        @Test
+        fun `publishAsset propagates errors`() =
+            runTest(ioDispatcher) {
+                stubBindings.broadcastPublishAssetThrows =
+                    BridgeException("not authorized", "SCP-PERM-3002")
+
+                val asset = works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray())
+                val exception = assertFailsWith<BridgeException> {
+                    bridge.broadcast.publishAsset(1L, 42L, asset)
+                }
+                assertEquals("SCP-PERM-3002", exception.code)
+            }
+
+        @Test
+        fun `publishAssets batch dispatches and parses results`() =
+            runTest(ioDispatcher) {
+                val assets = listOf(
+                    works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
+                    works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
+                )
+                val results = bridge.broadcast.publishAssets(1L, 42L, assets, "deploy-batch")
+                assertEquals(2, results.size)
+                assertEquals("blob-0", results[0].blobId)
+                assertEquals("etag-0", results[0].etag)
+                assertEquals("blob-1", results[1].blobId)
+                assertEquals("etag-1", results[1].etag)
+                assertTrue(stubBindings.broadcastPublishAssetsCalled)
+                assertEquals("deploy-batch", stubBindings.lastPublishAssetsDeployId)
+            }
+
+        @Test
+        fun `publishAssets propagates errors`() =
+            runTest(ioDispatcher) {
+                stubBindings.broadcastPublishAssetsThrows =
+                    BridgeException("batch too large", "SCP-CTX-2036")
+
+                val assets = listOf(
+                    works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray()),
+                )
+                val exception = assertFailsWith<BridgeException> {
+                    bridge.broadcast.publishAssets(1L, 42L, assets)
+                }
+                assertEquals("SCP-CTX-2036", exception.code)
+            }
+    }
+
+    // -------------------------------------------------------------------
     // Economic policy roundtrip tests (#592)
     // -------------------------------------------------------------------
 
@@ -814,6 +878,48 @@ class StubNativeBindings : NativeBindings {
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
     override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
     override fun broadcastAdmission(contextHandle: Long): String? = "Open"
+
+    // Broadcast publish asset
+    var broadcastPublishAssetCalled = false
+    var lastPublishAssetJson: String? = null
+    var lastPublishAssetDeployId: String? = null
+    var lastPublishAssetIdentityHandle: Long? = null
+    var broadcastPublishAssetResult = """{"blob_id":"abc123","etag":"def456"}"""
+    var broadcastPublishAssetThrows: Exception? = null
+    override fun broadcastPublishAsset(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetJson: String,
+        deployId: String?,
+    ): String {
+        broadcastPublishAssetCalled = true
+        lastPublishAssetJson = assetJson
+        lastPublishAssetDeployId = deployId
+        lastPublishAssetIdentityHandle = identityHandle
+        broadcastPublishAssetThrows?.let { throw it }
+        return broadcastPublishAssetResult
+    }
+
+    var broadcastPublishAssetsCalled = false
+    var lastPublishAssetsJson: String? = null
+    var lastPublishAssetsDeployId: String? = null
+    var lastPublishAssetsIdentityHandle: Long? = null
+    @Suppress("MaxLineLength")
+    var broadcastPublishAssetsResult = """[{"blob_id":"blob-0","etag":"etag-0"},{"blob_id":"blob-1","etag":"etag-1"}]"""
+    var broadcastPublishAssetsThrows: Exception? = null
+    override fun broadcastPublishAssets(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetsJson: String,
+        deployId: String?,
+    ): String {
+        broadcastPublishAssetsCalled = true
+        lastPublishAssetsJson = assetsJson
+        lastPublishAssetsDeployId = deployId
+        lastPublishAssetsIdentityHandle = identityHandle
+        broadcastPublishAssetsThrows?.let { throw it }
+        return broadcastPublishAssetsResult
+    }
 
     // Tool session argument captures
     var lastCrossContextSourceHandle: Long? = null

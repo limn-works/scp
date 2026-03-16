@@ -22,6 +22,7 @@
 
 package works.limn.scp.bridge
 
+import works.limn.scp.AssetEntry
 import works.limn.scp.BridgeConnectorBindings
 import works.limn.scp.BridgeConnectorBridge
 import works.limn.scp.DiscoveryBindings
@@ -35,12 +36,20 @@ import works.limn.scp.MetadataBindings
 import works.limn.scp.MetadataBridge
 import works.limn.scp.ProvenanceBindings
 import works.limn.scp.ProvenanceBridge
+import works.limn.scp.PublishResult
 import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
 import works.limn.scp.TrustBindings
 import works.limn.scp.auth.ScpIdBindings
 import works.limn.scp.auth.ScpIdBridge
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.ensureActive
@@ -683,6 +692,46 @@ interface BroadcastBindings {
      *   `null` if this is not a broadcast context.
      */
     fun broadcastAdmission(contextHandle: Long): String?
+
+    /**
+     * Publishes a single asset to a broadcast context as structured content (SCP-290).
+     *
+     * Constructs a `BroadcastContent` from the asset entry, computes an `ETag`,
+     * and publishes via the broadcast content delivery layer.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param identityHandle Opaque handle for the publishing author.
+     * @param assetJson JSON-encoded asset entry (`path`, `content_type`, `body`).
+     * @param deployId Optional deploy ID to group assets into atomic deploys.
+     * @return JSON-encoded publish result (`blob_id`, `etag`).
+     * @throws BridgeException if validation or publish fails.
+     */
+    fun broadcastPublishAsset(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetJson: String,
+        deployId: String?,
+    ): String
+
+    /**
+     * Publishes multiple assets to a broadcast context as structured content (SCP-290).
+     *
+     * All assets are published with the same deploy ID (auto-generated if not
+     * provided). Returns a JSON array of publish results.
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param identityHandle Opaque handle for the publishing author.
+     * @param assetsJson JSON-encoded array of asset entries.
+     * @param deployId Optional deploy ID to group assets into atomic deploys.
+     * @return JSON-encoded array of publish results.
+     * @throws BridgeException if any asset fails validation or publish.
+     */
+    fun broadcastPublishAssets(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetsJson: String,
+        deployId: String?,
+    ): String
 }
 
 /**
@@ -2209,6 +2258,122 @@ class BroadcastBridgeOps internal constructor(
      */
     suspend fun admission(contextHandle: Long): String? =
         bridge.ffiCall { bindings.broadcastAdmission(contextHandle) }
+
+    /**
+     * Publish a single asset to a broadcast context as structured content (SCP-290).
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param identityHandle Handle from identity create or load for the publishing author.
+     * @param asset The asset to publish (path, content type, body).
+     * @param deployId Optional deploy ID to group assets into atomic deploys.
+     * @return A [PublishResult] with blob ID and ETag.
+     */
+    suspend fun publishAsset(
+        contextHandle: Long,
+        identityHandle: Long,
+        asset: AssetEntry,
+        deployId: String? = null,
+    ): PublishResult {
+        val assetJson = serializeAsset(asset)
+        val resultJson = bridge.ffiCall {
+            bindings.broadcastPublishAsset(contextHandle, identityHandle, assetJson, deployId)
+        }
+        return parsePublishResult(resultJson)
+    }
+
+    /**
+     * Publish multiple assets to a broadcast context as structured content (SCP-290).
+     *
+     * All assets are published with the same deploy ID (auto-generated if not
+     * provided).
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param identityHandle Handle from identity create or load for the publishing author.
+     * @param assets The assets to publish.
+     * @param deployId Optional deploy ID to group assets into atomic deploys.
+     * @return A list of [PublishResult] values, one per asset.
+     */
+    suspend fun publishAssets(
+        contextHandle: Long,
+        identityHandle: Long,
+        assets: List<AssetEntry>,
+        deployId: String? = null,
+    ): List<PublishResult> {
+        val assetsJson = serializeAssets(assets)
+        val resultJson = bridge.ffiCall {
+            bindings.broadcastPublishAssets(contextHandle, identityHandle, assetsJson, deployId)
+        }
+        return parsePublishResults(resultJson)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast asset JSON helpers (SCP-290)
+// ---------------------------------------------------------------------------
+
+/**
+ * Serializes an [AssetEntry] to a JSON string for the FFI bridge.
+ *
+ * Uses [kotlinx.serialization.json.buildJsonObject] to produce structurally
+ * valid JSON, preventing injection via untrusted string fields. The body
+ * is encoded as a Base64 string for safe JSON transport.
+ */
+internal fun serializeAsset(asset: AssetEntry): String = Json.encodeToString(
+    buildJsonObject {
+        put("path", asset.path)
+        put("content_type", asset.contentType)
+        put("body", java.util.Base64.getEncoder().encodeToString(asset.body))
+    },
+)
+
+/**
+ * Serializes a list of [AssetEntry] values to a JSON array string.
+ */
+internal fun serializeAssets(assets: List<AssetEntry>): String = Json.encodeToString(
+    kotlinx.serialization.json.buildJsonArray {
+        for (asset in assets) {
+            add(
+                buildJsonObject {
+                    put("path", asset.path)
+                    put("content_type", asset.contentType)
+                    put("body", java.util.Base64.getEncoder().encodeToString(asset.body))
+                },
+            )
+        }
+    },
+)
+
+/**
+ * Parses a JSON publish result string into a [PublishResult].
+ *
+ * Expected format: `{"blob_id":"...","etag":"..."}`.
+ *
+ * @throws BridgeException if the JSON is malformed or missing required fields.
+ */
+internal fun parsePublishResult(json: String): PublishResult {
+    val obj = Json.parseToJsonElement(json).jsonObject
+    val blobId = obj["blob_id"]?.jsonPrimitive?.content
+        ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
+    val etag = obj["etag"]?.jsonPrimitive?.content
+        ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
+    return PublishResult(blobId = blobId, etag = etag)
+}
+
+/**
+ * Parses a JSON array of publish results into a list of [PublishResult].
+ *
+ * @throws BridgeException if the JSON is malformed.
+ */
+internal fun parsePublishResults(json: String): List<PublishResult> {
+    val array = Json.parseToJsonElement(json).jsonArray
+    return array.map { element ->
+        val obj = element.jsonObject
+        val blobId = obj["blob_id"]?.jsonPrimitive?.content
+            ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
+        val etag = obj["etag"]?.jsonPrimitive?.content
+            ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
+        PublishResult(blobId = blobId, etag = etag)
+    }
 }
 
 /**

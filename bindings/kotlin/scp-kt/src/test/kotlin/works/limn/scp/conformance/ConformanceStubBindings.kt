@@ -215,6 +215,18 @@ class ConformanceStubBindings : NativeBindings {
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
     override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
     override fun broadcastAdmission(contextHandle: Long): String? = "Open"
+    override fun broadcastPublishAsset(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetJson: String,
+        deployId: String?,
+    ): String = """{"blob_id":"stub-blob","etag":"stub-etag"}"""
+    override fun broadcastPublishAssets(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetsJson: String,
+        deployId: String?,
+    ): String = """[{"blob_id":"stub-blob","etag":"stub-etag"}]"""
 
     override fun toolRegister(
         contextHandle: Long,
