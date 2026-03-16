@@ -1105,6 +1105,35 @@ impl WasmContextManager {
             .map(|ctx| ctx.event_log.leaf_count())
     }
 
+    /// Appends a provenance event to the event log for the given context.
+    ///
+    /// Used by `provenance_attach` to record `ProvenanceAttached` and
+    /// `ProvenanceReceived` events (issue #586).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScpWasmError::Context`] if the context is not registered.
+    pub fn append_provenance_event(
+        &mut self,
+        context_id: &str,
+        actor_did: &str,
+        event_type_tag: u16,
+        prov_hash: &[u8],
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self
+            .contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context '{context_id}' not found"),
+                code: "SCP-CTX-2060".to_owned(),
+            })?;
+
+        ctx.event_log
+            .append_event(event_type_tag, actor_did, prov_hash);
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------------

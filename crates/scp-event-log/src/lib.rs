@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 33 event type variants.
+//! - [`EventType`] -- The 35 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -89,7 +89,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 33 event type variants for SCP context event logs.
+/// The 35 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -199,6 +199,18 @@ pub enum EventType {
     /// Payload fields: `proposal_id`, `action`, `executor_did`,
     /// `resulting_epoch`.
     GovernanceActionExecuted,
+
+    // -------------------------------------------------------------------
+    // Provenance event types (issue #586)
+    // -------------------------------------------------------------------
+    /// Provenance metadata was attached to data leaving a source context.
+    ///
+    /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
+    ProvenanceAttached,
+    /// Provenance metadata was received in a target context.
+    ///
+    /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
+    ProvenanceReceived,
 }
 
 // ---------------------------------------------------------------------------
@@ -491,12 +503,15 @@ mod tests {
             EventType::GovernanceConflictResolved,
             EventType::GovernanceDeadlockRecovery,
             EventType::GovernanceActionExecuted,
+            // Provenance event types (issue #586)
+            EventType::ProvenanceAttached,
+            EventType::ProvenanceReceived,
         ];
 
-        // Verify all 34 variants are covered.
+        // Verify all 36 variants are covered.
         assert_eq!(
             event_types.len(),
-            34,
+            36,
             "all EventType variants must be tested"
         );
 

@@ -19,6 +19,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use sha2::{Digest, Sha256};
 
 use scp_core::context::MemoryScope;
 use scp_core::provenance::attach::{
@@ -79,14 +80,19 @@ pub fn py_evaluate_provenance_quality(
 
 /// Attaches provenance metadata when data crosses a context boundary.
 ///
+/// Records dual events in the event log: `ProvenanceAttached` in the source
+/// context and `ProvenanceReceived` in the target context (issue #586).
+///
 /// See ADR-019 acceptance criteria 2-3, 6.
 ///
 /// # Errors
 ///
 /// Raises `ValidationError` if `source_type` or `memory_scope` are invalid.
+/// Raises `ContextError` if either context is not found in the runtime.
 #[pyfunction]
 #[pyo3(name = "provenance_attach")]
-#[pyo3(signature = (source_context_id, source_type, memory_scope, members, target_context_id, existing_chain_depth=None))]
+#[pyo3(signature = (source_context_id, source_type, memory_scope, members, target_context_id, actor_did, existing_chain_depth=None))]
+#[allow(clippy::too_many_arguments)] // FFI bridge requires explicit params
 pub fn py_provenance_attach<'py>(
     py: Python<'py>,
     source_context_id: String,
@@ -94,13 +100,14 @@ pub fn py_provenance_attach<'py>(
     memory_scope: &str,
     members: Vec<String>,
     target_context_id: String,
+    actor_did: String,
     existing_chain_depth: Option<u8>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let st = parse_source_type(source_type)?;
     let ms = parse_memory_scope(memory_scope)?;
 
     let source_info = SourceContextInfo {
-        context_id: source_context_id,
+        context_id: source_context_id.clone(),
         source_type: st,
         memory_scope: ms,
         members: members.into_iter().map(scp_identity::DID::from).collect(),
@@ -132,6 +139,43 @@ pub fn py_provenance_attach<'py>(
         None,
         None,
     );
+
+    // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
+    let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
+        message: format!("failed to serialize provenance for hashing: {e}"),
+        code: "SCP-VALID-7053".to_string(),
+    })?;
+    let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
+
+    // Record ProvenanceAttached in the source context event log.
+    // Best-effort: log warning if context not found (provenance_attach
+    // can be called without a runtime context, e.g. in unit tests).
+    if let Err(e) = append_provenance_event(
+        &source_context_id,
+        &actor_did,
+        scp_event_log::EventType::ProvenanceAttached,
+        &prov_hash,
+    ) {
+        tracing::warn!(
+            context = %source_context_id,
+            error = %e,
+            "failed to append ProvenanceAttached event to source context event log"
+        );
+    }
+
+    // Record ProvenanceReceived in the target context event log.
+    if let Err(e) = append_provenance_event(
+        &target_context_id,
+        &actor_did,
+        scp_event_log::EventType::ProvenanceReceived,
+        &prov_hash,
+    ) {
+        tracing::warn!(
+            context = %target_context_id,
+            error = %e,
+            "failed to append ProvenanceReceived event to target context event log"
+        );
+    }
 
     provenance_to_dict(py, &prov)
 }
@@ -271,6 +315,50 @@ pub fn py_provenance_update_source_type(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
+/// to the event log for the given context.
+///
+/// Follows the unsigned-event pattern used by `ToolInvoked` in `mcp.rs`.
+fn append_provenance_event(
+    context_id: &str,
+    actor_did: &str,
+    event_type: scp_event_log::EventType,
+    provenance_hash: &[u8; 32],
+) -> PyResult<()> {
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    crate::runtime::with_context(context_id, |rt| {
+        let sequence = scp_event_log::tree::event_count(&rt.event_log);
+        let prev_hash = if rt.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            rt.event_log.leaves()[rt.event_log.leaves().len() - 1]
+        };
+
+        let event = scp_event_log::Event {
+            event_type,
+            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence,
+            payload: scp_event_log::EventPayload {
+                data: provenance_hash.to_vec(),
+            },
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
+            .map_err(|e| ScpPyError::context(e.to_string()))?;
+
+        Ok(())
+    })?;
+
+    Ok(())
+}
 
 fn parse_memory_scope(s: &str) -> PyResult<MemoryScope> {
     match s {

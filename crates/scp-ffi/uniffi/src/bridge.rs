@@ -27,6 +27,8 @@
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use sha2::Digest;
+
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
 #[cfg(any(test, feature = "allow_in_memory_custody"))]
@@ -8416,16 +8418,21 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
 
 /// Attaches provenance metadata when data crosses a context boundary.
 ///
+/// Records dual events in the event log: `ProvenanceAttached` in the source
+/// context and `ProvenanceReceived` in the target context (issue #586).
+///
 /// Returns a JSON string with the attached provenance record.
 ///
 /// See ADR-019 acceptance criteria 2-3, 6.
 #[uniffi::export]
+#[allow(clippy::too_many_arguments)] // UniFFI requires explicit params
 pub fn provenance_attach(
     source_context_id: String,
     source_type: String,
     memory_scope_str: String,
     members: Vec<String>,
     target_context_id: String,
+    actor_did: String,
     existing_chain_depth: Option<u8>,
 ) -> Result<String, ScpError> {
     let st = match source_type.as_str() {
@@ -8452,7 +8459,7 @@ pub fn provenance_attach(
     };
 
     let source_info = scp_core::provenance::attach::SourceContextInfo {
-        context_id: source_context_id,
+        context_id: source_context_id.clone(),
         source_type: st,
         memory_scope: ms,
         members: members.into_iter().map(scp_identity::DID::from).collect(),
@@ -8485,6 +8492,43 @@ pub fn provenance_attach(
         None,
     );
 
+    // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
+    let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize provenance for hashing: {e}"),
+        code: "SCP-VALID-7053".to_owned(),
+    })?;
+    let prov_hash: [u8; 32] = sha2::Sha256::digest(&prov_json_bytes).into();
+
+    // Record ProvenanceAttached in the source context event log.
+    // Best-effort: log warning if context not found (provenance_attach
+    // can be called without a runtime context, e.g. in unit tests).
+    if let Err(e) = uniffi_append_provenance_event(
+        &source_context_id,
+        &actor_did,
+        scp_event_log::EventType::ProvenanceAttached,
+        &prov_hash,
+    ) {
+        tracing::warn!(
+            context = %source_context_id,
+            error = %e,
+            "failed to append ProvenanceAttached event to source context event log"
+        );
+    }
+
+    // Record ProvenanceReceived in the target context event log.
+    if let Err(e) = uniffi_append_provenance_event(
+        &target_context_id,
+        &actor_did,
+        scp_event_log::EventType::ProvenanceReceived,
+        &prov_hash,
+    ) {
+        tracing::warn!(
+            context = %target_context_id,
+            error = %e,
+            "failed to append ProvenanceReceived event to target context event log"
+        );
+    }
+
     let result = serde_json::json!({
         "source_context": prov.source_context,
         "source_type": format!("{:?}", prov.source_type),
@@ -8499,6 +8543,56 @@ pub fn provenance_attach(
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize provenance: {e}"),
         code: "SCP-VALID-7042".to_owned(),
+    })
+}
+
+/// Appends a provenance event to the event log for the given context.
+///
+/// Uses the UCAN state registry's per-context event log, following the
+/// unsigned-event pattern used by `ToolInvoked` in other bridges.
+fn uniffi_append_provenance_event(
+    context_id: &str,
+    actor_did: &str,
+    event_type: scp_event_log::EventType,
+    provenance_hash: &[u8; 32],
+) -> Result<(), ScpError> {
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    crate::runtime::with_ucan_state(context_id, |state| {
+        let sequence = scp_event_log::tree::event_count(&state.event_log);
+        let prev_hash = if state.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            state.event_log.leaves()[state.event_log.leaves().len() - 1]
+        };
+
+        let event = scp_event_log::Event {
+            event_type,
+            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence,
+            payload: scp_event_log::EventPayload {
+                data: provenance_hash.to_vec(),
+            },
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        scp_event_log::tree::append_unsigned_event(&mut state.event_log, &event)
+            .map(|_| ())
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to append provenance event: {e}"),
+                code: "SCP-CTX-2060".to_owned(),
+            })
+    })
+    .unwrap_or_else(|| {
+        Err(ScpError::Context {
+            msg: format!("context '{context_id}' not found in UCAN state registry"),
+            code: "SCP-CTX-2061".to_owned(),
+        })
     })
 }
 

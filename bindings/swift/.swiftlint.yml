@@ -25,6 +25,14 @@ type_body_length:
   warning: 300
   error: 500
 
+# FFI bridge wrappers mirror Rust function signatures that require explicit
+# parameters (matching clippy::too_many_arguments exemption on FFI functions).
+# Allow up to 8 non-default parameters.
+function_parameter_count:
+  warning: 8
+  error: 10
+  ignores_default_parameters: true
+
 # Force cast and force try are already enabled by default
 # force_cast: error
 # force_try: error

@@ -19,6 +19,7 @@
 //!
 //! See ADR-019 in `.docs/adrs/phase-4.md`.
 
+use sha2::Digest;
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -259,6 +260,9 @@ pub fn evaluate_provenance_quality(
 
 /// Attaches provenance metadata for a cross-context data flow.
 ///
+/// Records dual events in the event log: `ProvenanceAttached` in the source
+/// context and `ProvenanceReceived` in the target context (issue #586).
+///
 /// Returns a JSON string representing the provenance record.
 ///
 /// # Arguments
@@ -268,6 +272,7 @@ pub fn evaluate_provenance_quality(
 /// - `memory_scope` — One of `"full"`, `"summary"`, `"ephemeral"`.
 /// - `counterparties_json` — JSON array of DID strings.
 /// - `target_context_id` — ID of the target context.
+/// - `actor_did` — DID of the actor performing the provenance attachment.
 /// - `existing_chain_depth` — Chain depth from existing provenance, or `undefined`/`null` for first hop.
 /// - `existing_chain_path_json` — JSON array of context IDs from existing provenance, or empty.
 /// - `discovery_method` — Optional: `"OutOfBand"`, `"out_of_band"`, `"shared_context:<id>"`, or `"registry:<id>"`. `"none"`/`"None"` accepted for backward compat.
@@ -293,8 +298,8 @@ pub fn evaluate_provenance_quality(
 /// ```js
 /// const prov = provenance_attach(
 ///   "ctx-source", "persistent", "full",
-///   '["did:key:alice"]', "ctx-target", undefined, "[]",
-///   "OutOfBand", null
+///   '["did:key:alice"]', "ctx-target", "did:key:actor",
+///   undefined, "[]", "OutOfBand", null
 /// );
 /// ```
 #[wasm_bindgen]
@@ -305,6 +310,7 @@ pub fn provenance_attach(
     memory_scope: String,
     counterparties_json: String,
     target_context_id: String,
+    actor_did: String,
     existing_chain_depth: Option<u32>,
     existing_chain_path_json: String,
     discovery_method: Option<String>,
@@ -381,6 +387,46 @@ pub fn provenance_attach(
         "payment_amount": serde_json::Value::Null,
         "payment_adapter": serde_json::Value::Null,
         "payment_receipt_id": serde_json::Value::Null,
+    });
+
+    // Compute provenance hash: SHA-256 of serde_json::to_vec of a canonical
+    // JSON value matching the DataProvenance struct serialization. This MUST
+    // produce the same hash as the PyO3/NAPI/UniFFI bridges, which hash
+    // serde_json::to_vec(&DataProvenance{...}). The display-facing `result`
+    // uses different field names (e.g. "age_secs" vs "age") and is NOT used
+    // for hashing.
+    let canonical_bytes = build_canonical_provenance_bytes(
+        &source_context_id,
+        &st,
+        &counterparties,
+        &ms,
+        chain_depth,
+        &chain_path,
+        &dm,
+        purpose.as_ref(),
+    );
+    let prov_hash = sha2::Sha256::digest(&canonical_bytes);
+
+    // Record ProvenanceAttached in the source context event log.
+    // Best-effort: if the context is not registered, skip silently
+    // (provenance_attach can be called before context creation in WASM).
+    let _ = crate::manager::with_manager(|mgr| {
+        mgr.append_provenance_event(
+            &source_context_id,
+            &actor_did,
+            crate::runtime::wasm_event_type_tag("ProvenanceAttached"),
+            &prov_hash,
+        )
+    });
+
+    // Record ProvenanceReceived in the target context event log.
+    let _ = crate::manager::with_manager(|mgr| {
+        mgr.append_provenance_event(
+            &target_context_id,
+            &actor_did,
+            crate::runtime::wasm_event_type_tag("ProvenanceReceived"),
+            &prov_hash,
+        )
     });
 
     Ok(result.to_string())
@@ -590,6 +636,68 @@ fn parse_wasm_discovery_method(s: Option<&str>) -> Result<serde_json::Value, JsE
              'out_of_band', 'shared_context:<context_id>', or 'registry:<context_id>'"
         ))),
     }
+}
+
+/// Canonical provenance struct for hashing, mirroring `scp_core::provenance::DataProvenance`.
+///
+/// Field names and order MUST match `DataProvenance` in scp-core exactly —
+/// `serde_json::to_vec` serializes struct fields in declaration order, and
+/// the hash MUST be identical across all four bridges (`PyO3`, NAPI, `UniFFI`, WASM).
+///
+/// `serde_json::json!` uses `BTreeMap` which sorts keys alphabetically,
+/// producing different byte output than struct serialization. This struct
+/// avoids that problem by using `#[derive(Serialize)]` with matching field order.
+#[derive(serde::Serialize)]
+struct CanonicalProvenance<'a> {
+    source_context: &'a str,
+    source_type: &'a str,
+    counterparties: &'a [String],
+    purpose: Option<&'a String>,
+    discovery_method: &'a serde_json::Value,
+    age: CanonicalDuration,
+    memory_scope: &'a str,
+    chain_depth: u32,
+    chain_path: &'a serde_json::Value,
+    payment_amount: Option<u64>,
+    payment_adapter: Option<&'a str>,
+    payment_receipt_id: Option<&'a [u8; 32]>,
+}
+
+/// Mirrors `std::time::Duration` serde representation: `{"secs": N, "nanos": N}`.
+#[derive(serde::Serialize)]
+struct CanonicalDuration {
+    secs: u64,
+    nanos: u32,
+}
+
+/// Builds a canonical provenance struct for hashing that produces the same
+/// `serde_json::to_vec` output as `DataProvenance` in scp-core.
+#[allow(clippy::too_many_arguments)] // mirrors DataProvenance field count
+fn build_canonical_provenance_bytes(
+    source_context: &str,
+    source_type: &SourceType,
+    counterparties: &[String],
+    memory_scope: &MemoryScope,
+    chain_depth: u32,
+    chain_path: &serde_json::Value,
+    discovery_method: &serde_json::Value,
+    purpose: Option<&String>,
+) -> Vec<u8> {
+    let canonical = CanonicalProvenance {
+        source_context,
+        source_type: &source_type.to_string(),
+        counterparties,
+        purpose,
+        discovery_method,
+        age: CanonicalDuration { secs: 0, nanos: 0 },
+        memory_scope: &memory_scope.to_string(),
+        chain_depth,
+        chain_path,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+    serde_json::to_vec(&canonical).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
