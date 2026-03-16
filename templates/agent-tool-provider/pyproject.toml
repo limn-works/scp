@@ -1,0 +1,10 @@
+[project]
+name = "scp-agent-tool-provider"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "scp-python",
+]
+
+[project.scripts]
+scp-tool-agent = "agent:cli"
