@@ -1541,11 +1541,9 @@ if (bridge === null) {
         expect(typeof result.blobId).toBe("string");
         expect(result.blobId.length).toBe(64);
       } catch (e: unknown) {
-        // If it fails due to transport (no relay), verify it is a transport
-        // error, not a content validation error.
-        const msg = e instanceof Error ? e.message : String(e);
-        expect(msg).not.toContain("invalid path");
-        expect(msg).not.toContain("invalid content_type");
+        const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+        const isTransportError = msg.includes("transport") || msg.includes("not configured");
+        expect(isTransportError).toBe(true);
       }
     });
 
@@ -1586,10 +1584,9 @@ if (bridge === null) {
           expect(r).toHaveProperty("etag");
         }
       } catch (e: unknown) {
-        // Transport error is acceptable (no relay configured).
-        const msg = e instanceof Error ? e.message : String(e);
-        expect(msg).not.toContain("invalid path");
-        expect(msg).not.toContain("invalid content_type");
+        const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+        const isTransportError = msg.includes("transport") || msg.includes("not configured");
+        expect(isTransportError).toBe(true);
       }
     });
   });
