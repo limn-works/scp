@@ -1544,7 +1544,7 @@ if (bridge === null) {
         const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
         const isTransportError = msg.includes("transport") || msg.includes("not configured");
         if (!isTransportError) {
-            throw new Error(`expected transport error, got: ${msg}`);
+          throw new Error(`expected transport error, got: ${msg}`);
         }
       }
     });
@@ -1589,7 +1589,7 @@ if (bridge === null) {
         const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
         const isTransportError = msg.includes("transport") || msg.includes("not configured");
         if (!isTransportError) {
-            throw new Error(`expected transport error, got: ${msg}`);
+          throw new Error(`expected transport error, got: ${msg}`);
         }
       }
     });
