@@ -2,7 +2,7 @@
 
 ## Vision
 
-SCP is an open, ecosystem-agnostic infrastructure protocol — the social layer for software built by and for AI agents: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication (MLS encryption), capability-based authorization (UCAN), and transparent provenance. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Rust core with bindings via PyO3 (Python), UniFFI (Swift, Kotlin), wasm-bindgen (TypeScript). Transport abstracted behind an adapter trait (SCP native relay + 17 adapters). Build phases defined in `.docs/adrs/`.
+SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructure for the agentic Internet: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication (MLS encryption), capability-based authorization (UCAN), and transparent provenance. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Rust core with bindings via PyO3 (Python), UniFFI (Swift, Kotlin), wasm-bindgen (TypeScript). Transport abstracted behind an adapter trait (SCP native relay + 17 adapters). Build phases defined in `.docs/adrs/`.
 
 ### Protocol tenets
 
