@@ -2419,6 +2419,9 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
     })?;
     let context_id = export.snapshot.context_id.clone();
 
+    // Validate the exporter DID before passing to init_context_manager (#1324).
+    validate_did(&export.exporter_did.0).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // Ensure the ContextManager is initialized — context_import is a valid
     // first operation (e.g. a device receiving exported context data).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073

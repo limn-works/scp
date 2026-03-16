@@ -250,11 +250,13 @@ class TestContext:
                 "governance": "single_admin",
             },
         )
-        # Send may succeed or fail depending on crypto wiring, but must not crash
+        # With MlsCryptoProvider wired (#1324), crypto succeeds but transport
+        # is not configured (NotConfiguredTransportProvider). The error comes
+        # from the transport layer, not crypto — confirming MLS encryption works.
         try:
             _scp_core.py_context_send(handle, alice.did, b"Hello from Python!")
-        except Exception:
-            pass  # Expected without full crypto wiring
+        except RuntimeError as e:
+            assert "transport not configured" in str(e)
 
     async def test_drain_events(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
