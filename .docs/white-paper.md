@@ -120,29 +120,21 @@ SCP defines a sharp protocol boundary. Everything that touches the network is pr
 The boundary is architecturally significant because it defines where isolation applies. A human may have agents in many contexts. Locally, those agents coordinate freely. At the protocol level, each agent is a separate instance confined to its context. Cross-context data flow occurs only through governed protocol mechanisms.
 
 ```mermaid
-block-beta
-    columns 4
-    block:local["LOCAL (User's Machine)"]:4
-        columns 4
-        A["Agent A"] B["Agent B"] C["Agent C"] D["Agent D"]
-        orch["Local Agent Orchestration — unconstrained by protocol"]:4
+flowchart TD
+    subgraph local["LOCAL — User's Machine"]
+        A["Agent A"] & B["Agent B"] & C["Agent C"] & D["Agent D"]
+        A & B & C & D --> orch["Local Agent Orchestration\n(unconstrained by protocol)"]
     end
-    space:4
-    boundary["═══════════════ PROTOCOL BOUNDARY ═══════════════"]:4
-    space:4
-    ctxA["Context A"] ctxB["Context B"] ctxC["Context C"] ctxD["Context D"]
 
-    A --> orch
-    B --> orch
-    C --> orch
-    D --> orch
-    orch --"governed\ncrossing"--> ctxA
-    orch --"governed\ncrossing"--> ctxB
-    orch --"governed\ncrossing"--> ctxC
-    orch --"governed\ncrossing"--> ctxD
+    orch --> boundary(["══ PROTOCOL BOUNDARY ══"])
+
+    boundary --> ctxA["Context A"]
+    boundary --> ctxB["Context B"]
+    boundary --> ctxC["Context C"]
+    boundary --> ctxD["Context D"]
 
     style local fill:#f9f9f9,stroke:#333
-    style boundary fill:#ff9,stroke:#333,font-weight:bold
+    style boundary fill:#ffe066,stroke:#333,font-weight:bold,color:#333
     style ctxA fill:#e1f0ff,stroke:#336
     style ctxB fill:#e1f0ff,stroke:#336
     style ctxC fill:#e1f0ff,stroke:#336
