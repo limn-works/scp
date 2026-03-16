@@ -239,6 +239,7 @@ export {
 
 export type {
   AddressResolution,
+  AssetEntry,
   AttestationSummary,
   BehavioralRecord,
   BroadcastAdmissionPolicy,
@@ -260,6 +261,7 @@ export type {
   ParticipationThreshold,
   Proof,
   Provenance,
+  PublishResult,
   RequireParticipation,
   ResolutionLayer,
   ResolutionPath,

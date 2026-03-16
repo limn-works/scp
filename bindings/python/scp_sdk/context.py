@@ -77,6 +77,43 @@ class Membership:
 
 
 # ---------------------------------------------------------------------------
+# AssetEntry and PublishResult — broadcast content delivery (SCP-290)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AssetEntry:
+    """An asset to publish to a broadcast context (SCP-290, spec §18.11.8).
+
+    Typed struct to prevent positional transposition of path/content_type/body.
+    """
+
+    #: Validated URL path (e.g., ``/index.html``, ``/styles.css``).
+    path: str
+
+    #: Validated MIME type (e.g., ``text/html``, ``text/css``).
+    content_type: str
+
+    #: Raw content bytes.
+    body: bytes
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    """Result of publishing an asset to a broadcast context (SCP-290).
+
+    Returned by :meth:`Context.broadcast_publish_asset` and
+    :meth:`Context.broadcast_publish_assets`.
+    """
+
+    #: Hex-encoded SHA-256 of the serialized broadcast envelope.
+    blob_id: str
+
+    #: Hex-encoded SHA-256 of the asset body.
+    etag: str
+
+
+# ---------------------------------------------------------------------------
 # _ReceiveIterator -- AsyncIterator with buffer semantics
 # ---------------------------------------------------------------------------
 
@@ -675,6 +712,89 @@ class Context:
 
         author_did = identity.did if identity is not None else self._creator_did
         _scp_core.py_broadcast_publish(self._handle, author_did, payload)
+
+    async def broadcast_publish_asset(
+        self,
+        asset: AssetEntry,
+        identity: Identity | None = None,
+        deploy_id: str | None = None,
+    ) -> PublishResult:
+        """Publish a single asset to this broadcast context (SCP-290).
+
+        Constructs a BroadcastContent from the asset entry, computes an ETag,
+        and publishes via the structured content path.
+
+        Args:
+            asset: The asset entry containing path, content_type, and body.
+            identity: The publishing identity. Defaults to the context
+                creator if not specified.
+            deploy_id: Optional deploy ID to group assets into atomic deploys.
+
+        Returns:
+            A PublishResult with blob_id and etag.
+
+        Raises:
+            ContextError: If the context is not active or not broadcast.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        author_did = identity.did if identity is not None else self._creator_did
+        result = _scp_core.py_broadcast_publish_asset(
+            self._handle,
+            author_did,
+            asset.path,
+            asset.content_type,
+            asset.body,
+            deploy_id,
+        )
+        return PublishResult(blob_id=result["blob_id"], etag=result["etag"])
+
+    async def broadcast_publish_assets(
+        self,
+        assets: list[AssetEntry],
+        identity: Identity | None = None,
+        deploy_id: str | None = None,
+    ) -> list[PublishResult]:
+        """Publish multiple assets to this broadcast context (SCP-290).
+
+        All assets are published with the same deploy_id (auto-generated if
+        not provided).
+
+        Args:
+            assets: List of AssetEntry objects to publish.
+            identity: The publishing identity. Defaults to the context
+                creator if not specified.
+            deploy_id: Optional deploy ID to group assets into atomic deploys.
+
+        Returns:
+            A list of PublishResult objects with blob_id and etag.
+
+        Raises:
+            ContextError: If any asset fails validation or publish.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        author_did = identity.did if identity is not None else self._creator_did
+        asset_tuples = [(a.path, a.content_type, a.body) for a in assets]
+        results = _scp_core.py_broadcast_publish_assets(
+            self._handle,
+            author_did,
+            asset_tuples,
+            deploy_id,
+        )
+        return [PublishResult(blob_id=r["blob_id"], etag=r["etag"]) for r in results]
 
     async def broadcast_block_subscriber(
         self,

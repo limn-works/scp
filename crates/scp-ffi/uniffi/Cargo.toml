@@ -36,6 +36,7 @@ scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
 hex = { workspace = true }
 sha2 = { workspace = true }
+rmp-serde = { workspace = true }
 # Only `software_platform` and `encrypting` are enabled by default —
 # `software_platform` provides crypto primitives (Ed25519, X25519);
 # `encrypting` provides `EncryptingAdapter` for event log persistence (#484).

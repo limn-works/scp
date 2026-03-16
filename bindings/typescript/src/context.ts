@@ -17,11 +17,13 @@ import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge, getBridgeSync } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
+  AssetEntry,
   BroadcastAdmissionPolicy,
   ContextParams,
   GovernanceActionResult,
   MemberRole,
   Message,
+  PublishResult,
   ToolDefinition,
   ToolVerificationResult,
 } from "./types";
@@ -527,6 +529,79 @@ export class Context implements AsyncDisposable {
     try {
       const bridge = await getBridge();
       await bridge.broadcastPublish(this._handle, authorDid ?? this._identityDid, payload);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Publishes a single asset to this broadcast context as structured content (SCP-290).
+   *
+   * Constructs a BroadcastContent from the asset entry, computes an ETag,
+   * and publishes via the structured content path.
+   *
+   * @param asset - The asset entry containing path, contentType, and body.
+   * @param authorDid - The DID of the author publishing the asset.
+   *   Defaults to the identity that created/joined the context.
+   * @param deployId - Optional deploy ID to group assets into atomic deploys.
+   * @returns A PublishResult with blobId and etag.
+   * @throws {ContextError} If the context is not active or not broadcast.
+   */
+  async broadcastPublishAsset(
+    asset: AssetEntry,
+    authorDid?: string,
+    deployId?: string,
+  ): Promise<PublishResult> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      const result = await bridge.broadcastPublishAsset(
+        this._handle,
+        authorDid ?? this._identityDid,
+        { path: asset.path, contentType: asset.contentType, body: Array.from(asset.body) },
+        deployId ?? null,
+      );
+      return { blobId: result.blobId, etag: result.etag };
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Publishes multiple assets to this broadcast context as structured content (SCP-290).
+   *
+   * All assets are published with the same deployId (auto-generated if not provided).
+   *
+   * @param assets - The asset entries to publish.
+   * @param authorDid - The DID of the author publishing the assets.
+   *   Defaults to the identity that created/joined the context.
+   * @param deployId - Optional deploy ID to group assets into atomic deploys.
+   * @returns A list of PublishResult objects with blobId and etag.
+   * @throws {ContextError} If any asset fails validation or publish.
+   */
+  async broadcastPublishAssets(
+    assets: AssetEntry[],
+    authorDid?: string,
+    deployId?: string,
+  ): Promise<PublishResult[]> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      const napiAssets = assets.map((a) => ({
+        path: a.path,
+        contentType: a.contentType,
+        body: Array.from(a.body),
+      }));
+      const results = await bridge.broadcastPublishAssets(
+        this._handle,
+        authorDid ?? this._identityDid,
+        napiAssets,
+        deployId ?? null,
+      );
+      return results.map((r: { blobId: string; etag: string }) => ({
+        blobId: r.blobId,
+        etag: r.etag,
+      }));
     } catch (error) {
       throw mapBridgeError(error);
     }

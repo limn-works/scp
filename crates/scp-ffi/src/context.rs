@@ -2636,6 +2636,215 @@ fn py_broadcast_publish(
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
 }
 
+/// Publishes a single asset to a broadcast context as structured content (SCP-290).
+///
+/// Constructs a [`BroadcastContent`] from the asset entry fields, computes an
+/// `ETag` from the body, serializes with the magic prefix, and publishes via
+/// [`ContextManager::publish_broadcast_content`].
+///
+/// Returns a dict with `blob_id` (hex-encoded SHA-256 of the serialized
+/// envelope) and `etag` (hex-encoded SHA-256 of the body).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active, not broadcast,
+/// the sender is not an author, or the asset fields are invalid.
+#[pyfunction]
+#[pyo3(signature = (handle, author_did, path, content_type, body, deploy_id = None))]
+fn py_broadcast_publish_asset(
+    handle: &PyContextHandle,
+    author_did: &str,
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    deploy_id: Option<&str>,
+) -> PyResult<HashMap<String, String>> {
+    validate::validate_did(author_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let author_did_owned = author_did.to_owned();
+    let path_owned = path.to_owned();
+    let content_type_owned = content_type.to_owned();
+    let deploy_id_owned = deploy_id.map(str::to_owned);
+
+    crate::runtime::with_identity(&author_did_owned, |entry| {
+        let custody = entry.custody.clone();
+        let signing_key_handle = entry.identity.active_signing_key;
+        let did: scp_identity::DID = author_did_owned.clone().into();
+
+        // Validate and construct BroadcastContent.
+        let content_path = scp_core::context::ContentPath::new(path_owned)
+            .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
+        let mime_type = scp_core::context::MimeType::new(content_type_owned)
+            .map_err(|e| crate::error::ScpPyError::context(format!("invalid content_type: {e}")))?;
+        if let Some(ref did_str) = deploy_id_owned {
+            scp_core::context::validate_deploy_id(did_str).map_err(|e| {
+                crate::error::ScpPyError::context(format!("invalid deploy_id: {e}"))
+            })?;
+        }
+
+        let etag = scp_core::context::compute_etag(&body);
+        let content = scp_core::context::BroadcastContent {
+            version: scp_core::context::BROADCAST_CONTENT_VERSION,
+            metadata: scp_core::context::ContentMetadata {
+                path: Some(content_path),
+                content_type: Some(mime_type),
+                deploy_id: deploy_id_owned.clone(),
+                etag: Some(etag.clone()),
+                immutable: false,
+            },
+            body,
+        };
+
+        rt.block_on(async move {
+            let envelope = mgr
+                .publish_broadcast_content(
+                    &context_id,
+                    &did,
+                    content,
+                    custody.as_ref(),
+                    &signing_key_handle,
+                )
+                .await
+                .map_err(|e| {
+                    crate::error::ScpPyError::context(format!(
+                        "broadcast publish asset failed: {e}"
+                    ))
+                })?;
+
+            // Compute blob_id as SHA-256 of the serialized envelope.
+            let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                crate::error::ScpPyError::context(format!(
+                    "failed to serialize envelope for blob_id: {e}"
+                ))
+            })?;
+            let blob_id = {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&envelope_bytes))
+            };
+
+            let mut result = HashMap::new();
+            result.insert("blob_id".to_owned(), blob_id);
+            result.insert("etag".to_owned(), etag);
+            Ok(result)
+        })
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
+}
+
+/// Publishes multiple assets to a broadcast context as structured content (SCP-290).
+///
+/// Each asset is an `(path, content_type, body)` tuple. All assets are published
+/// with the same `deploy_id` (generated if not provided).
+///
+/// Returns a list of dicts, each with `blob_id` and `etag`.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if any asset fails validation or publish.
+#[pyfunction]
+#[pyo3(signature = (handle, author_did, assets, deploy_id = None))]
+fn py_broadcast_publish_assets(
+    handle: &PyContextHandle,
+    author_did: &str,
+    assets: Vec<(String, String, Vec<u8>)>,
+    deploy_id: Option<&str>,
+) -> PyResult<Vec<HashMap<String, String>>> {
+    validate::validate_did(author_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let author_did_owned = author_did.to_owned();
+
+    // Generate deploy_id if not provided.
+    let deploy_id_owned = deploy_id.map_or_else(
+        || {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(context_id.as_bytes());
+            hasher.update(author_did_owned.as_bytes());
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            hasher.update(ts.to_le_bytes());
+            hex::encode(&Sha256::digest(hasher.finalize())[..16])
+        },
+        str::to_owned,
+    );
+
+    if let Err(e) = scp_core::context::validate_deploy_id(&deploy_id_owned) {
+        return Err(PyRuntimeError::new_err(format!("invalid deploy_id: {e}")));
+    }
+
+    crate::runtime::with_identity(&author_did_owned, |entry| {
+        let custody = entry.custody.clone();
+        let signing_key_handle = entry.identity.active_signing_key;
+        let did: scp_identity::DID = author_did_owned.clone().into();
+
+        rt.block_on(async move {
+            let mut results = Vec::with_capacity(assets.len());
+            for (path, content_type, body) in assets {
+                let content_path = scp_core::context::ContentPath::new(path)
+                    .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
+                let mime_type = scp_core::context::MimeType::new(content_type).map_err(|e| {
+                    crate::error::ScpPyError::context(format!("invalid content_type: {e}"))
+                })?;
+
+                let etag = scp_core::context::compute_etag(&body);
+                let content = scp_core::context::BroadcastContent {
+                    version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                    metadata: scp_core::context::ContentMetadata {
+                        path: Some(content_path),
+                        content_type: Some(mime_type),
+                        deploy_id: Some(deploy_id_owned.clone()),
+                        etag: Some(etag.clone()),
+                        immutable: false,
+                    },
+                    body,
+                };
+
+                let envelope = mgr
+                    .publish_broadcast_content(
+                        &context_id,
+                        &did,
+                        content,
+                        custody.as_ref(),
+                        &signing_key_handle,
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::error::ScpPyError::context(format!(
+                            "broadcast publish asset failed: {e}"
+                        ))
+                    })?;
+
+                let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                    crate::error::ScpPyError::context(format!(
+                        "failed to serialize envelope for blob_id: {e}"
+                    ))
+                })?;
+                let blob_id = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&envelope_bytes))
+                };
+
+                let mut result = HashMap::new();
+                result.insert("blob_id".to_owned(), blob_id);
+                result.insert("etag".to_owned(), etag);
+                results.push(result);
+            }
+            Ok(results)
+        })
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
+}
+
 /// Blocks a subscriber's read access in a broadcast context.
 ///
 /// # Errors
@@ -3476,6 +3685,8 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_broadcast_subscribe, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_publish, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_publish_asset, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_publish_assets, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_block_subscriber, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_unblock_subscriber, m)?)?;
     m.add_function(wrap_pyfunction!(py_broadcast_handle_key_request, m)?)?;

@@ -1041,6 +1041,266 @@ pub async fn broadcast_publish(
     Ok(())
 }
 
+/// An asset to publish to a broadcast context (SCP-290).
+///
+/// Typed struct to prevent positional transposition of path/`content_type`/body.
+#[napi(object)]
+pub struct NapiAssetEntry {
+    /// Validated URL path (e.g., `/index.html`, `/styles.css`).
+    pub path: String,
+    /// Validated MIME type (e.g., `text/html`, `text/css`).
+    pub content_type: String,
+    /// Raw content bytes.
+    pub body: Vec<u8>,
+}
+
+/// Result of publishing an asset to a broadcast context (SCP-290).
+#[napi(object)]
+pub struct NapiPublishResult {
+    /// Hex-encoded SHA-256 of the serialized broadcast envelope.
+    pub blob_id: String,
+    /// Hex-encoded SHA-256 of the asset body.
+    pub etag: String,
+}
+
+/// Publishes a single asset to a broadcast context as structured content (SCP-290).
+///
+/// Constructs a `BroadcastContent` from the asset entry, computes an `ETag`,
+/// and publishes via `ContextManager::publish_broadcast_content`.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the context is not active, not broadcast,
+///   or the sender is not an author.
+/// - Rejects with `SCP-PERM-3020` if the context has no custody provider.
+#[napi(js_name = "broadcastPublishAsset")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_publish_asset(
+    handle: &NapiContextHandle,
+    author_did: String,
+    asset: NapiAssetEntry,
+    deploy_id: Option<String>,
+) -> napi::Result<NapiPublishResult> {
+    validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager()?;
+    let context_id = handle.context_id.clone();
+    let author_did_val = DID(author_did);
+
+    // Validate fields.
+    let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("invalid path: {e}"),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+    let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("invalid content_type: {e}"),
+            code: "SCP-CTX-2041".to_owned(),
+        })
+    })?;
+    if let Some(ref did_str) = deploy_id {
+        scp_core::context::validate_deploy_id(did_str).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("invalid deploy_id: {e}"),
+                code: "SCP-CTX-2042".to_owned(),
+            })
+        })?;
+    }
+
+    let etag = scp_core::context::compute_etag(&asset.body);
+    let content = scp_core::context::BroadcastContent {
+        version: scp_core::context::BROADCAST_CONTENT_VERSION,
+        metadata: scp_core::context::ContentMetadata {
+            path: Some(content_path),
+            content_type: Some(mime_type),
+            deploy_id,
+            etag: Some(etag.clone()),
+            immutable: false,
+        },
+        body: asset.body,
+    };
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+            NapiError::from(ScpNapiError::Permission {
+                message: "broadcast publish asset requires key custody — create the identity with \
+                          identityCreate(\"in_memory\")"
+                    .to_owned(),
+                code: "SCP-PERM-3020".to_owned(),
+            })
+        })?;
+        let signing_key = handle.signing_key.ok_or_else(|| {
+            NapiError::from(ScpNapiError::Permission {
+                message: "broadcast publish asset requires a signing key — identity has no active \
+                          signing key handle"
+                    .to_owned(),
+                code: "SCP-PERM-3021".to_owned(),
+            })
+        })?;
+
+        let envelope = manager
+            .publish_broadcast_content(
+                &context_id,
+                &author_did_val,
+                content,
+                &custody.0,
+                &signing_key,
+            )
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+        let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("failed to serialize envelope for blob_id: {e}"),
+                code: "SCP-CTX-2043".to_owned(),
+            })
+        })?;
+        let blob_id = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&envelope_bytes))
+        };
+
+        Ok(NapiPublishResult { blob_id, etag })
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (manager, context_id, author_did_val, content);
+        Err(NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish asset requires key custody — in_memory custody feature is \
+                      not enabled"
+                .to_owned(),
+            code: "SCP-PERM-3022".to_owned(),
+        }))
+    }
+}
+
+/// Publishes multiple assets to a broadcast context as structured content (SCP-290).
+///
+/// All assets are published with the same `deploy_id` (auto-generated if not
+/// provided). Returns a list of `{ blob_id, etag }` results.
+///
+/// # Errors
+///
+/// - Rejects if any asset fails validation or publish.
+#[napi(js_name = "broadcastPublishAssets")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_publish_assets(
+    handle: &NapiContextHandle,
+    author_did: String,
+    assets: Vec<NapiAssetEntry>,
+    deploy_id: Option<String>,
+) -> napi::Result<Vec<NapiPublishResult>> {
+    validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager()?;
+    let context_id = handle.context_id.clone();
+    let author_did_val = DID(author_did.clone());
+
+    // Generate deploy_id if not provided.
+    let deploy_id_val = deploy_id.unwrap_or_else(|| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(context_id.as_bytes());
+        hasher.update(author_did.as_bytes());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        hasher.update(ts.to_le_bytes());
+        hex::encode(&Sha256::digest(hasher.finalize())[..16])
+    });
+
+    scp_core::context::validate_deploy_id(&deploy_id_val).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("invalid deploy_id: {e}"),
+            code: "SCP-CTX-2042".to_owned(),
+        })
+    })?;
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+            NapiError::from(ScpNapiError::Permission {
+                message: "broadcast publish assets requires key custody".to_owned(),
+                code: "SCP-PERM-3020".to_owned(),
+            })
+        })?;
+        let signing_key = handle.signing_key.ok_or_else(|| {
+            NapiError::from(ScpNapiError::Permission {
+                message: "broadcast publish assets requires a signing key".to_owned(),
+                code: "SCP-PERM-3021".to_owned(),
+            })
+        })?;
+
+        let mut results = Vec::with_capacity(assets.len());
+        for asset in assets {
+            let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("invalid path: {e}"),
+                    code: "SCP-CTX-2040".to_owned(),
+                })
+            })?;
+            let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("invalid content_type: {e}"),
+                    code: "SCP-CTX-2041".to_owned(),
+                })
+            })?;
+
+            let etag = scp_core::context::compute_etag(&asset.body);
+            let content = scp_core::context::BroadcastContent {
+                version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                metadata: scp_core::context::ContentMetadata {
+                    path: Some(content_path),
+                    content_type: Some(mime_type),
+                    deploy_id: Some(deploy_id_val.clone()),
+                    etag: Some(etag.clone()),
+                    immutable: false,
+                },
+                body: asset.body,
+            };
+
+            let envelope = manager
+                .publish_broadcast_content(
+                    &context_id,
+                    &author_did_val,
+                    content,
+                    &custody.0,
+                    &signing_key,
+                )
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("failed to serialize envelope for blob_id: {e}"),
+                    code: "SCP-CTX-2043".to_owned(),
+                })
+            })?;
+            let blob_id = {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&envelope_bytes))
+            };
+
+            results.push(NapiPublishResult { blob_id, etag });
+        }
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (manager, context_id, author_did_val, deploy_id_val, assets);
+        Err(NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish assets requires key custody — in_memory custody feature \
+                      is not enabled"
+                .to_owned(),
+            code: "SCP-PERM-3022".to_owned(),
+        }))
+    }
+}
+
 /// Blocks a subscriber's read access in a broadcast context.
 ///
 /// The subscriber is removed from the registry and added to all authors'

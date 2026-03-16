@@ -7387,6 +7387,308 @@ pub async fn broadcast_publish(
         })?
 }
 
+/// An asset to publish to a broadcast context (SCP-290).
+///
+/// Typed struct to prevent positional transposition of path/`content_type`/body.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AssetEntry {
+    /// Validated URL path (e.g., `/index.html`, `/styles.css`).
+    pub path: String,
+    /// Validated MIME type (e.g., `text/html`, `text/css`).
+    pub content_type: String,
+    /// Raw content bytes.
+    pub body: Vec<u8>,
+}
+
+/// Result of publishing an asset to a broadcast context (SCP-290).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PublishResult {
+    /// Hex-encoded SHA-256 of the serialized broadcast envelope.
+    pub blob_id: String,
+    /// Hex-encoded SHA-256 of the asset body.
+    pub etag: String,
+}
+
+/// Publishes a single asset to a broadcast context as structured content (SCP-290).
+///
+/// Constructs a `BroadcastContent` from the asset entry, computes an `ETag`,
+/// and publishes via `ContextManager::publish_broadcast_content`.
+///
+/// # Arguments
+///
+/// * `handle` — The context to publish to.
+/// * `identity` — The identity of the author publishing the asset.
+/// * `asset` — The asset entry containing path, `content_type`, and body.
+/// * `deploy_id` — Optional deploy ID to group assets into atomic deploys.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if validation or publish fails.
+/// Returns `ScpError::Permission` if no custody provider is available.
+#[uniffi::export]
+pub async fn broadcast_publish_asset(
+    handle: Arc<ContextHandle>,
+    identity: Arc<Identity>,
+    asset: AssetEntry,
+    deploy_id: Option<String>,
+) -> Result<PublishResult, ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let did: scp_identity::DID = identity.did.clone().into();
+
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Permission {
+                    msg:
+                        "broadcast publish asset requires a fully created identity with key handles"
+                            .to_owned(),
+                    code: "SCP-PERM-3020".to_owned(),
+                })?;
+            let signing_key_handle = &core_id.active_signing_key;
+
+            // Validate fields.
+            let content_path =
+                scp_core::context::ContentPath::new(asset.path).map_err(|e| ScpError::Context {
+                    msg: format!("invalid path: {e}"),
+                    code: "SCP-CTX-2040".to_owned(),
+                })?;
+            let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+                ScpError::Context {
+                    msg: format!("invalid content_type: {e}"),
+                    code: "SCP-CTX-2041".to_owned(),
+                }
+            })?;
+            if let Some(ref did_str) = deploy_id {
+                scp_core::context::validate_deploy_id(did_str).map_err(|e| ScpError::Context {
+                    msg: format!("invalid deploy_id: {e}"),
+                    code: "SCP-CTX-2042".to_owned(),
+                })?;
+            }
+
+            let etag = scp_core::context::compute_etag(&asset.body);
+            let content = scp_core::context::BroadcastContent {
+                version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                metadata: scp_core::context::ContentMetadata {
+                    path: Some(content_path),
+                    content_type: Some(mime_type),
+                    deploy_id,
+                    etag: Some(etag.clone()),
+                    immutable: false,
+                },
+                body: asset.body,
+            };
+
+            // Dispatch to the correct custody path (callback > in-memory).
+            let envelope = if let Some(ref cb) = identity.callback_custody {
+                manager
+                    .publish_broadcast_content(
+                        &handle.context_id,
+                        &did,
+                        content,
+                        cb.as_ref(),
+                        signing_key_handle,
+                    )
+                    .await
+                    .map_err(ScpError::from)?
+            } else {
+                #[cfg(feature = "allow_in_memory_custody")]
+                {
+                    let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                        ScpError::Permission {
+                            msg: "broadcast publish asset requires key custody — create the \
+                                  identity with identity_create(\"in_memory\") or \
+                                  identity_create_with_custody()"
+                                .to_owned(),
+                            code: "SCP-PERM-3021".to_owned(),
+                        }
+                    })?;
+                    manager
+                        .publish_broadcast_content(
+                            &handle.context_id,
+                            &did,
+                            content,
+                            &imc.0,
+                            signing_key_handle,
+                        )
+                        .await
+                        .map_err(ScpError::from)?
+                }
+                #[cfg(not(feature = "allow_in_memory_custody"))]
+                {
+                    return Err(ScpError::Permission {
+                        msg: "broadcast publish asset requires key custody — use \
+                              identity_create_with_custody() to inject a platform \
+                              custody provider"
+                            .to_owned(),
+                        code: "SCP-PERM-3022".to_owned(),
+                    });
+                }
+            };
+
+            let envelope_bytes =
+                rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
+                    msg: format!("failed to serialize envelope for blob_id: {e}"),
+                    code: "SCP-CTX-2043".to_owned(),
+                })?;
+            let blob_id = {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&envelope_bytes))
+            };
+
+            Ok(PublishResult { blob_id, etag })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during broadcast publish asset: {e}"),
+            code: "SCP-CTX-2035".to_owned(),
+        })?
+}
+
+/// Publishes multiple assets to a broadcast context as structured content (SCP-290).
+///
+/// All assets are published with the same `deploy_id` (auto-generated if not
+/// provided). Returns a list of `{ blob_id, etag }` results.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if any asset fails validation or publish.
+/// Returns `ScpError::Permission` if no custody provider is available.
+#[uniffi::export]
+pub async fn broadcast_publish_assets(
+    handle: Arc<ContextHandle>,
+    identity: Arc<Identity>,
+    assets: Vec<AssetEntry>,
+    deploy_id: Option<String>,
+) -> Result<Vec<PublishResult>, ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager()?;
+            let did: scp_identity::DID = identity.did.clone().into();
+
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Permission {
+                    msg: "broadcast publish assets requires a fully created identity".to_owned(),
+                    code: "SCP-PERM-3020".to_owned(),
+                })?;
+            let signing_key_handle = &core_id.active_signing_key;
+
+            // Generate deploy_id if not provided.
+            let deploy_id_val = deploy_id.unwrap_or_else(|| {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(handle.context_id.as_bytes());
+                hasher.update(identity.did.as_bytes());
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                hasher.update(ts.to_le_bytes());
+                hex::encode(&Sha256::digest(hasher.finalize())[..16])
+            });
+
+            scp_core::context::validate_deploy_id(&deploy_id_val).map_err(|e| {
+                ScpError::Context {
+                    msg: format!("invalid deploy_id: {e}"),
+                    code: "SCP-CTX-2042".to_owned(),
+                }
+            })?;
+
+            let mut results = Vec::with_capacity(assets.len());
+            for asset in assets {
+                let content_path =
+                    scp_core::context::ContentPath::new(asset.path).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid path: {e}"),
+                            code: "SCP-CTX-2040".to_owned(),
+                        }
+                    })?;
+                let mime_type =
+                    scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid content_type: {e}"),
+                            code: "SCP-CTX-2041".to_owned(),
+                        }
+                    })?;
+
+                let etag = scp_core::context::compute_etag(&asset.body);
+                let content = scp_core::context::BroadcastContent {
+                    version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                    metadata: scp_core::context::ContentMetadata {
+                        path: Some(content_path),
+                        content_type: Some(mime_type),
+                        deploy_id: Some(deploy_id_val.clone()),
+                        etag: Some(etag.clone()),
+                        immutable: false,
+                    },
+                    body: asset.body,
+                };
+
+                let envelope = if let Some(ref cb) = identity.callback_custody {
+                    manager
+                        .publish_broadcast_content(
+                            &handle.context_id,
+                            &did,
+                            content,
+                            cb.as_ref(),
+                            signing_key_handle,
+                        )
+                        .await
+                        .map_err(ScpError::from)?
+                } else {
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                            ScpError::Permission {
+                                msg: "broadcast publish assets requires key custody".to_owned(),
+                                code: "SCP-PERM-3021".to_owned(),
+                            }
+                        })?;
+                        manager
+                            .publish_broadcast_content(
+                                &handle.context_id,
+                                &did,
+                                content,
+                                &imc.0,
+                                signing_key_handle,
+                            )
+                            .await
+                            .map_err(ScpError::from)?
+                    }
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        return Err(ScpError::Permission {
+                            msg: "broadcast publish assets requires key custody".to_owned(),
+                            code: "SCP-PERM-3022".to_owned(),
+                        });
+                    }
+                };
+
+                let envelope_bytes =
+                    rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
+                        msg: format!("failed to serialize envelope for blob_id: {e}"),
+                        code: "SCP-CTX-2043".to_owned(),
+                    })?;
+                let blob_id = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&envelope_bytes))
+                };
+
+                results.push(PublishResult { blob_id, etag });
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during broadcast publish assets: {e}"),
+            code: "SCP-CTX-2035".to_owned(),
+        })?
+}
+
 /// Blocks a subscriber's read access in a broadcast context.
 ///
 /// The subscriber is removed from the registry and added to all authors'

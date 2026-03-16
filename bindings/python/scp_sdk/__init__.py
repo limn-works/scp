@@ -48,7 +48,7 @@ from scp_sdk.bridge import (
 from scp_sdk.bridge import (
     register as bridge_register,
 )
-from scp_sdk.context import Context, Membership
+from scp_sdk.context import AssetEntry, Context, Membership, PublishResult
 from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
 from scp_sdk.economy import (
     RelayPriceAdjustment,
@@ -208,6 +208,7 @@ __all__ = [
     "BRIDGE_ERROR_MAP",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "AssetEntry",
     "Attestation",
     "BehavioralRecord",
     "BridgeMode",
@@ -245,6 +246,7 @@ __all__ = [
     "Proof",
     "Provenance",
     "ProvenanceQuality",
+    "PublishResult",
     "RelayPriceAdjustment",
     "RequireParticipation",
     "ScpError",

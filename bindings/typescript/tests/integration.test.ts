@@ -1680,4 +1680,65 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
     expect(result.tier).toBe("agent");
     expect(result.key_rotation_completed).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // broadcastPublishAsset / broadcastPublishAssets (SCP-290)
+  // ---------------------------------------------------------------------------
+
+  it("broadcastPublishAsset returns blob_id and etag", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read", "messages:write"],
+      mode: "Broadcast",
+    });
+    const result = await ctx.broadcastPublishAsset({
+      path: "/index.html",
+      contentType: "text/html",
+      body: new TextEncoder().encode("<h1>hello</h1>"),
+    });
+    expect(result).toBeDefined();
+    expect(typeof result.blobId).toBe("string");
+    expect(typeof result.etag).toBe("string");
+    expect(result.blobId.length).toBeGreaterThan(0);
+    expect(result.etag.length).toBeGreaterThan(0);
+  });
+
+  it("broadcastPublishAssets returns list of results", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read", "messages:write"],
+      mode: "Broadcast",
+    });
+    const results = await ctx.broadcastPublishAssets([
+      {
+        path: "/index.html",
+        contentType: "text/html",
+        body: new TextEncoder().encode("<h1>hello</h1>"),
+      },
+      {
+        path: "/styles.css",
+        contentType: "text/css",
+        body: new TextEncoder().encode("body { color: red; }"),
+      },
+    ]);
+    expect(results).toHaveLength(2);
+    for (const r of results) {
+      expect(typeof r.blobId).toBe("string");
+      expect(typeof r.etag).toBe("string");
+    }
+  });
+
+  it("broadcastPublishAsset rejects on non-broadcast context", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read", "messages:write"],
+    });
+    await expect(
+      ctx.broadcastPublishAsset({
+        path: "/index.html",
+        contentType: "text/html",
+        body: new TextEncoder().encode("<h1>hello</h1>"),
+      }),
+    ).rejects.toThrow(/SCP-CTX-2001/);
+  });
 });
