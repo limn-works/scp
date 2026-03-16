@@ -6341,4 +6341,644 @@ mod tests {
         // Legacy messages should return 404 on site endpoint.
         assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
     }
+
+    // -----------------------------------------------------------------------
+    // Group 1: E2E Deploy Lifecycle — publish, commit, serve (§18.11.10)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_e2e_deploy_lifecycle_publish_commit_serve() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "e2e_deploy_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "e2e.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Serialize BroadcastContent with test payload.
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("deploy-e2e".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>E2E</h1>".to_vec(),
+        };
+
+        // Encrypt with seal_broadcast (via helper), store blob.
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        // Commit deploy.
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, blob_id);
+        projected.commit_deploy("deploy-e2e".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        // GET /site/index.html via oneshot.
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+
+        // Assert 200.
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        // Assert Content-Type: text/html.
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html");
+
+        // Assert Cache-Control has must-revalidate (non-immutable content).
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cc.contains("must-revalidate"), "Cache-Control: {cc}");
+
+        // Assert ETag present.
+        assert!(
+            resp.headers().get(axum::http::header::ETAG).is_some(),
+            "ETag header must be present"
+        );
+
+        // Assert all 8 security headers.
+        let h = resp.headers();
+        assert_eq!(
+            h.get("x-content-type-options").unwrap().to_str().unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            h.get("content-security-policy").unwrap().to_str().unwrap(),
+            "default-src 'self'"
+        );
+        assert_eq!(h.get("x-frame-options").unwrap().to_str().unwrap(), "DENY");
+        assert!(
+            h.get("strict-transport-security")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("max-age=63072000")
+        );
+        assert_eq!(
+            h.get("cross-origin-opener-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            h.get("cross-origin-embedder-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "require-corp"
+        );
+        assert!(h.get("permissions-policy").is_some());
+        assert_eq!(
+            h.get("referrer-policy").unwrap().to_str().unwrap(),
+            "same-origin"
+        );
+
+        // Assert body.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<h1>E2E</h1>");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 2: Atomic Deploy Switch (§18.11.11)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_atomic_deploy_serves_correct_version() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "atomic_version_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "atomic-v.example.com".into(),
+            deploy_retention_count: 3,
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Deploy v1: /index.html->"v1", /style.css->"v1-css"
+        let v1_html = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("v1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"v1".to_vec(),
+        };
+        let v1_css = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/style.css").unwrap()),
+                content_type: Some(MimeType::new("text/css").unwrap()),
+                deploy_id: Some("v1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"v1-css".to_vec(),
+        };
+        let blob_v1_html = store_content_blob(&storage, routing_id, &key, &v1_html).await;
+        let blob_v1_css = store_content_blob(&storage, routing_id, &key, &v1_css).await;
+
+        let path_html = ContentPath::new("/index.html").unwrap();
+        let path_css = ContentPath::new("/style.css").unwrap();
+        let mut entries1 = HashMap::new();
+        entries1.insert(path_html.clone(), blob_v1_html);
+        entries1.insert(path_css.clone(), blob_v1_css);
+        projected.commit_deploy("v1".into(), entries1);
+
+        // Deploy v2: /index.html->"v2", /style.css->"v2-css"
+        let v2_html = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("v2".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"v2".to_vec(),
+        };
+        let v2_css = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/style.css").unwrap()),
+                content_type: Some(MimeType::new("text/css").unwrap()),
+                deploy_id: Some("v2".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"v2-css".to_vec(),
+        };
+        let blob_v2_html = store_content_blob(&storage, routing_id, &key, &v2_html).await;
+        let blob_v2_css = store_content_blob(&storage, routing_id, &key, &v2_css).await;
+
+        let mut entries2 = HashMap::new();
+        entries2.insert(path_html, blob_v2_html);
+        entries2.insert(path_css, blob_v2_css);
+        projected.commit_deploy("v2".into(), entries2);
+
+        // Verify both serve v2 (no mixed state) after atomic deploy switch.
+        let mut pm = HashMap::new();
+        pm.insert(routing_id, projected);
+        let state = test_state_with(pm, storage);
+        let routing_hex = hex_encode(&routing_id);
+
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"v2");
+
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/style.css"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"v2-css");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 3: Deploy Rollback E2E (§18.11.11)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_rollback_serves_previous_via_http() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "rollback_http_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "rollback.example.com".into(),
+            deploy_retention_count: 3,
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Deploy v1.
+        let v1_content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("v1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"rollback-v1".to_vec(),
+        };
+        let blob_v1 = store_content_blob(&storage, routing_id, &key, &v1_content).await;
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries1 = HashMap::new();
+        entries1.insert(path.clone(), blob_v1);
+        projected.commit_deploy("v1".into(), entries1);
+
+        // Deploy v2.
+        let v2_content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("v2".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"rollback-v2".to_vec(),
+        };
+        let blob_v2 = store_content_blob(&storage, routing_id, &key, &v2_content).await;
+
+        let mut entries2 = HashMap::new();
+        entries2.insert(path, blob_v2);
+        projected.commit_deploy("v2".into(), entries2);
+
+        // Verify v2 is the current deploy.
+        {
+            let guard = projected.path_index.load();
+            assert_eq!(guard.as_ref().as_ref().unwrap().deploy_id, "v2");
+        }
+
+        // Rollback to v1.
+        assert!(projected.rollback_deploy("v1"));
+
+        // Verify v1 content served via HTTP after rollback.
+        let routing_hex = hex_encode(&routing_id);
+        let mut pm = HashMap::new();
+        pm.insert(routing_id, projected);
+        let state = test_state_with(pm, storage);
+
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"rollback-v1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 4: Gated Site Auth (§18.11.10 + §18.11.5)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_gated_rejects_without_ucan() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_gated_reject_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let mut projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        projected.set_site_config(SiteConfig {
+            hostname: "gated-site.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("gated-d1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"gated content".to_vec(),
+        };
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, blob_id);
+        projected.commit_deploy("gated-d1".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        // Request without auth -> 401.
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn site_gated_accepts_valid_signed_ucan() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_gated_accept_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let mut projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        projected.set_site_config(SiteConfig {
+            hostname: "gated-accept.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("gated-d2".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"gated accepted".to_vec(),
+        };
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, blob_id);
+        projected.commit_deploy("gated-d2".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        // Request with valid signed UCAN -> 200.
+        let ucan_token = build_signed_test_ucan(context_id, &signing_key);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header("Authorization", format!("Bearer {ucan_token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"gated accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 8: Manifest Reload (§18.11.10)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_manifest_reload_serves_after_restart() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "manifest_reload_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "manifest.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Commit deploy with 2 assets.
+        let html_content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("mfst-d1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>Manifest</h1>".to_vec(),
+        };
+        let css_content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/style.css").unwrap()),
+                content_type: Some(MimeType::new("text/css").unwrap()),
+                deploy_id: Some("mfst-d1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"body { margin: 0 }".to_vec(),
+        };
+
+        let blob_html = store_content_blob(&storage, routing_id, &key, &html_content).await;
+        let blob_css = store_content_blob(&storage, routing_id, &key, &css_content).await;
+
+        let path_html = ContentPath::new("/index.html").unwrap();
+        let path_css = ContentPath::new("/style.css").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path_html, blob_html);
+        entries.insert(path_css, blob_css);
+        projected.commit_deploy("mfst-d1".into(), entries);
+
+        // Extract the deploy manifest.
+        let manifest = DeployManifest {
+            deploy_id: "mfst-d1".into(),
+            entries: vec![
+                DeployManifestEntry {
+                    path: "/index.html".into(),
+                    blob_id: hex_encode(&blob_html),
+                },
+                DeployManifestEntry {
+                    path: "/style.css".into(),
+                    blob_id: hex_encode(&blob_css),
+                },
+            ],
+        };
+
+        // Create a NEW projected context (simulating restart).
+        let mut reloaded = ProjectedContext::new(context_id, key, BroadcastAdmission::Open, None);
+        reloaded.set_site_config(SiteConfig {
+            hostname: "manifest.example.com".into(),
+            ..SiteConfig::default()
+        });
+        assert_eq!(reloaded.routing_id, routing_id);
+
+        // Load manifest to rebuild the path index.
+        reloaded.load_manifest(&manifest).unwrap();
+
+        // Verify HTTP serving works from the reloaded manifest.
+        let mut pm = HashMap::new();
+        pm.insert(routing_id, reloaded);
+        let state = test_state_with(pm, storage);
+
+        let routing_hex = hex_encode(&routing_id);
+
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<h1>Manifest</h1>");
+
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/style.css"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"body { margin: 0 }");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 9+10: 404 with Security Headers (§18.11.10)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_404_includes_all_security_headers() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_404_sec_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "sec404.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        // Commit an empty deploy so the site is "active" but the path doesn't exist.
+        projected.commit_deploy("empty-deploy".into(), HashMap::new());
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, InMemoryBlobStorage::new());
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_hex}/site/nonexistent.html"
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+
+        // Assert 404.
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+
+        // Assert no-store cache control.
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "no-store");
+
+        // Assert all 8 security headers present.
+        let h = resp.headers();
+        assert_eq!(
+            h.get("x-content-type-options").unwrap().to_str().unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            h.get("content-security-policy").unwrap().to_str().unwrap(),
+            "default-src 'self'"
+        );
+        assert_eq!(h.get("x-frame-options").unwrap().to_str().unwrap(), "DENY");
+        assert!(
+            h.get("strict-transport-security")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("max-age=63072000")
+        );
+        assert_eq!(
+            h.get("cross-origin-opener-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            h.get("cross-origin-embedder-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "require-corp"
+        );
+        assert!(h.get("permissions-policy").is_some());
+        assert_eq!(
+            h.get("referrer-policy").unwrap().to_str().unwrap(),
+            "same-origin"
+        );
+    }
 }

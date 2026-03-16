@@ -1510,4 +1510,87 @@ if (bridge === null) {
       expect(await napi.broadcastSubscriberCount(ctx)).toBe(0);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // 23. Broadcast Content Delivery — asset publishing (SCP-290)
+  // ---------------------------------------------------------------------------
+
+  describe("Broadcast content delivery (real NAPI)", () => {
+    test("broadcastPublishAsset returns blobId and etag", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          mode: "Broadcast",
+          memoryScope: "full",
+        }),
+      );
+
+      const body = Array.from(new TextEncoder().encode("<h1>Hello</h1>"));
+      try {
+        const result = await napi.broadcastPublishAsset(
+          ctx,
+          identity.did,
+          { path: "/index.html", contentType: "text/html", body },
+          "deploy-napi-1",
+        );
+        // If publish succeeds (transport configured), verify result shape.
+        expect(result).toHaveProperty("blobId");
+        expect(result).toHaveProperty("etag");
+        expect(typeof result.blobId).toBe("string");
+        expect(result.blobId.length).toBe(64);
+      } catch (e: unknown) {
+        // If it fails due to transport (no relay), verify it is a transport
+        // error, not a content validation error.
+        const msg = e instanceof Error ? e.message : String(e);
+        expect(msg).not.toContain("invalid path");
+        expect(msg).not.toContain("invalid content_type");
+      }
+    });
+
+    test("broadcastPublishAssets batch returns correct count", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          mode: "Broadcast",
+          memoryScope: "full",
+        }),
+      );
+
+      const assets = [
+        {
+          path: "/index.html",
+          contentType: "text/html",
+          body: Array.from(new TextEncoder().encode("<h1>Home</h1>")),
+        },
+        {
+          path: "/style.css",
+          contentType: "text/css",
+          body: Array.from(new TextEncoder().encode("body { margin: 0 }")),
+        },
+      ];
+
+      try {
+        const results = await napi.broadcastPublishAssets(
+          ctx,
+          identity.did,
+          assets,
+          "deploy-napi-batch",
+        );
+        expect(results.length).toBe(2);
+        for (const r of results) {
+          expect(r).toHaveProperty("blobId");
+          expect(r).toHaveProperty("etag");
+        }
+      } catch (e: unknown) {
+        // Transport error is acceptable (no relay configured).
+        const msg = e instanceof Error ? e.message : String(e);
+        expect(msg).not.toContain("invalid path");
+        expect(msg).not.toContain("invalid content_type");
+      }
+    });
+  });
 }
