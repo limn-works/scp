@@ -12,9 +12,14 @@ The system has four layers, from hardest (pure validation) to softest (pure judg
 ┌─────────────────────────────────────────────────────────────┐
 │  LAYER 1: PROTOCOL ENFORCEMENT (zero-trust, mandatory)       │
 │                                                               │
-│  Capability tokens verified on every action. Signatures      │
-│  checked. UCAN chains validated. Revocations honored.        │
-│  Capability ceilings enforced. Role permissions enforced.    │
+│  Two-tier capability validation:                             │
+│  Tier 1 — Full UCAN chain validation at token presentation  │
+│    boundaries (role assignment, cross-context tool           │
+│    invocation, broadcast admission).                         │
+│  Tier 2 — Capability cache check at intra-context operation │
+│    time (derived from validated UCAN tokens, updated        │
+│    atomically on role change).                               │
+│  Revocations honored. Capability ceilings enforced.         │
 │                                                               │
 │  100% validation. 0% trust. No exceptions.                   │
 ├─────────────────────────────────────────────────────────────┤
@@ -53,19 +58,61 @@ The critical property: **the trust surface shrinks over time.** New identities s
 
 ## 7.2 Layer 1: Protocol Enforcement
 
-Every protocol action is zero-trust. An agent presents a UCAN capability token with every action. The protocol validates mechanically:
+Every protocol action is zero-trust. Capability enforcement uses a two-tier validation design:
 
-- Signature chain is valid (cryptographic verification)
-- Capability matches the action being performed
-- Context capability ceiling permits the action
-- Agent's role includes the required permission
-- Token hasn't been revoked
-- Token hasn't expired
-- For paid actions: spending UCAN is present and covers the cost (§19.5). Action UCAN + spending UCAN are AND-composed — both required
+### 7.2.1 Tier 1: Full UCAN Chain Validation
 
-No action proceeds on reputation or identity alone. A trusted DID with an expired token is denied. An unknown DID with a valid token is permitted. This layer is mandatory and non-negotiable.
+Full 11-step UCAN validation (ADR-016 criterion 2) runs at **token presentation boundaries** — the points where a UCAN token is first introduced or must be re-verified:
+
+- **Role assignment:** When a member is assigned a role, the assigner's `RoleAssign` capability is checked via cache, and `mint_role_tokens()` creates structurally correct tokens for each capability in the role definition. The minted tokens are validated against the context's capability ceiling at construction time, and the resulting capabilities are inserted directly into the `member_capabilities` cache. Note: tokens are currently unsigned structural tokens (Phase 2 stub — tokens are structurally correct but not cryptographically signed); the full 11-step pipeline is not required here because these are locally-minted tokens, not externally-presented ones. See `assign_role()` in `context/roles.rs`.
+- **Cross-context tool invocation:** When one context invokes a tool exposed by another context, the invoker presents a UCAN that is fully validated against the target context's ceiling and the invoker's delegation chain.
+- **Broadcast admission:** Gated broadcast contexts (§5.14.4) require a valid `messages:read` UCAN from subscribers. The full validation pipeline runs on the presented token. See `register_subscriber()` in `context/broadcast.rs`.
+
+The 11 validation steps are:
+
+1. Parse the JWT-format UCAN token
+2. Verify Ed25519 signature (resolving `kid` from DID document per ADR-039)
+3. Verify delegation chain integrity (`prf` chain, each parent's `aud` matches child's `iss`)
+4. Verify root issuer is the context creator's DID
+5. Verify audience matches the presenting agent's DID (self-delegation valid with `fct.scp_key_scope`)
+6. Verify capability match against required capability (with wildcard support)
+7. Verify attenuation (each delegation narrows or preserves, never widens)
+8. Verify capability is within context's immutable capability ceiling
+9. Validate nonce format, freshness, and uniqueness (replay prevention, §9.5)
+10. Check token CID against per-context revocation list
+11. Verify expiry (`exp > now`) and not-before (`nbf <= now`)
+
+### 7.2.2 Tier 2: Capability Cache Check
+
+At **intra-context operation time**, the protocol uses a derived capability cache (`member_capabilities` in `ContextRoleState`) rather than re-running the full 11-step pipeline on every action. This cache is:
+
+- **Derived from ceiling-validated UCAN tokens:** The cache is populated exclusively from tokens minted by `mint_role_tokens()` during role assignment, which are validated against the context's capability ceiling at construction time. It is never populated from unvalidated sources.
+- **Updated atomically on role change:** When `assign_role()` succeeds, the member's cached capabilities are replaced with the new role's capability set in the same operation. There is no window where stale capabilities are served.
+- **Checked on every operation:** Every context operation — `send()`, `invoke_tool()`, `close_context()`, governance actions — checks the cache via `member_has_capability()` before proceeding. A member without the required capability in cache is denied.
+
+Operations that check the cache include:
+- Message send: requires `MessagesWrite`
+- Tool invocation: requires `ToolInvoke(tool_id)` or `ToolInvokeAll`
+- Context close: requires `ContextClose`
+- Role assignment: requires `RoleAssign`
+- Member operations: requires `MemberInvite`, `MemberRemove`, etc.
+- Governance: requires `GovernancePropose`, `GovernanceVote`
+
+**Cache risk — cross-context revocation:** The capability cache is local to each context's `ContextRoleState`. If a future protocol extension adds cross-context UCAN revocation (revoking a token from outside the context where it was issued), the local cache would not reflect the revocation until the next role reassignment or cache refresh. Current revocation (§9.12 step 3, `revoke.rs`) is intra-context only — revocations are distributed as MLS application messages within the context and checked at Tier 1 boundaries. This is architecturally sound for the current design but would need a cache invalidation mechanism if cross-context revocation is added.
+
+### 7.2.3 Security Properties
+
+No action proceeds on reputation or identity alone. A trusted DID whose cached capabilities do not include the required permission is denied. An unknown DID whose role assignment granted the required capability (via validated UCAN) is permitted.
+
+- For paid actions: spending UCAN is present and covers the cost (§19.5). Action UCAN + spending UCAN are AND-composed — both required.
+- Tier 1 provides cryptographic proof of authorization at trust boundaries.
+- Tier 2 provides O(1) capability lookup for the hot path of every intra-context operation.
+
+This two-tier design is not a relaxation of security. Tier 2 checks are derived from Tier 1 validation — they are a performance optimization that preserves the security invariant. Every capability in the cache traces back to a fully validated UCAN chain.
 
 **Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). Under the shared-DID model (ADR-039), intra-DID delegation uses self-delegation UCANs where `iss == aud` (same DID), the issuing key is `#active`, and `fct.scp_key_scope: "#agent"` scopes the delegation to the agent verification method. Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
+
+**`Custom(String)` capabilities** extend the fixed capability set. Custom capabilities use the same `{resource}:{action}` format and are subject to the same ceiling enforcement — a custom capability must be in the context's capability ceiling to be exercised. Delegation and attenuation of custom capabilities follow the standard UCAN URI structure (`scp:ctx:{context_id}/{resource}:{action}`), so custom capabilities compose with the delegation chain exactly like built-in capabilities.
 
 ## 7.3 Layer 2: Participation Validation
 
