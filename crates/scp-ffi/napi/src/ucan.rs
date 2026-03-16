@@ -1159,8 +1159,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let (identity_a, _doc_a) = rt.block_on(dht_a.create(&custody_a.0)).unwrap();
-        let (identity_b, _doc_b) = rt.block_on(dht_b.create(&custody_b.0)).unwrap();
+        let (identity_a, doc_a) = rt.block_on(dht_a.create(&custody_a.0)).unwrap();
+        let (identity_b, doc_b) = rt.block_on(dht_b.create(&custody_b.0)).unwrap();
 
         // Verify different DIDs were generated.
         assert_ne!(
@@ -1177,6 +1177,7 @@ mod tests {
             runtime::NapiIdentityEntry {
                 identity: identity_a,
                 custody: Arc::clone(&custody_a),
+                document: doc_a,
             },
         );
         runtime::register_identity(
@@ -1184,6 +1185,7 @@ mod tests {
             runtime::NapiIdentityEntry {
                 identity: identity_b,
                 custody: Arc::clone(&custody_b),
+                document: doc_b,
             },
         );
 
@@ -1244,7 +1246,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (identity, _doc) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
         // Register the identity.
@@ -1253,6 +1255,7 @@ mod tests {
             runtime::NapiIdentityEntry {
                 identity,
                 custody: Arc::clone(&custody),
+                document: doc,
             },
         );
 
@@ -1290,7 +1293,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (identity, _doc) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
         // Register the identity.
@@ -1299,6 +1302,7 @@ mod tests {
             runtime::NapiIdentityEntry {
                 identity,
                 custody: Arc::clone(&custody),
+                document: doc,
             },
         );
 
