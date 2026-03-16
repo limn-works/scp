@@ -306,6 +306,38 @@ export function createNativeBridge(): Bridge {
       )(handle, authorDid, payloadArray);
     },
 
+    async broadcastPublishAsset(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      asset: { path: string; contentType: string; body: number[] },
+      deployId: string | null,
+    ): Promise<{ blobId: string; etag: string }> {
+      return await (
+        addon.broadcastPublishAsset as (
+          h: BridgeContextHandle,
+          d: string,
+          a: { path: string; contentType: string; body: number[] },
+          did: string | null,
+        ) => Promise<{ blobId: string; etag: string }>
+      )(handle, authorDid, asset, deployId);
+    },
+
+    async broadcastPublishAssets(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      assets: { path: string; contentType: string; body: number[] }[],
+      deployId: string | null,
+    ): Promise<{ blobId: string; etag: string }[]> {
+      return await (
+        addon.broadcastPublishAssets as (
+          h: BridgeContextHandle,
+          d: string,
+          a: { path: string; contentType: string; body: number[] }[],
+          did: string | null,
+        ) => Promise<{ blobId: string; etag: string }[]>
+      )(handle, authorDid, assets, deployId);
+    },
+
     async broadcastBlockSubscriber(
       handle: BridgeContextHandle,
       subscriberDid: string,

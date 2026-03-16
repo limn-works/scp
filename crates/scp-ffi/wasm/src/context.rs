@@ -6,6 +6,7 @@
 //!
 //! See ADR-034 in `.docs/adrs/phase-4.md` and issue #389.
 
+use base64::Engine as _;
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -1138,6 +1139,176 @@ pub fn broadcast_publish(
         with_manager(|mgr| mgr.publish_broadcast(&context_id, &author_did, &payload_base64))
             .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
+    })
+}
+
+/// Publishes a single asset to a broadcast context as structured content (SCP-290).
+///
+/// Returns a JS object with `blobId` and `etag` string properties.
+///
+/// Delegates to `WasmContextManager::publish_broadcast_asset`.
+#[wasm_bindgen(js_name = "broadcastPublishAsset")]
+pub fn broadcast_publish_asset(
+    handle: &WasmContextHandle,
+    author_did: String,
+    path: String,
+    content_type: String,
+    body_base64: String,
+    deploy_id: Option<String>,
+) -> Promise {
+    if let Err(e) = validate_did(&author_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(&body_base64)
+            .map_err(|e| {
+                ScpWasmError::Context {
+                    message: format!("invalid base64 body: {e}"),
+                    code: "SCP-CTX-2044".to_owned(),
+                }
+                .into_js()
+            })?;
+
+        let (blob_id, etag) = with_manager(|mgr| {
+            mgr.publish_broadcast_asset(
+                &context_id,
+                &author_did,
+                &path,
+                &content_type,
+                &body,
+                deploy_id.as_deref(),
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let result = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("blobId"),
+            &JsValue::from_str(&blob_id),
+        )
+        .map_err(|_| JsValue::from_str("failed to set blobId"))?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("etag"),
+            &JsValue::from_str(&etag),
+        )
+        .map_err(|_| JsValue::from_str("failed to set etag"))?;
+
+        Ok(result.into())
+    })
+}
+
+/// Publishes multiple assets to a broadcast context as structured content (SCP-290).
+///
+/// Takes an array of `{ path, contentType, bodyBase64 }` objects and an optional
+/// `deployId`. Returns an array of `{ blobId, etag }` objects.
+///
+/// Delegates to `WasmContextManager::publish_broadcast_assets`.
+#[wasm_bindgen(js_name = "broadcastPublishAssets")]
+pub fn broadcast_publish_assets(
+    handle: &WasmContextHandle,
+    author_did: String,
+    assets_json: String,
+    deploy_id: Option<String>,
+) -> Promise {
+    if let Err(e) = validate_did(&author_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        // Parse the assets JSON array.
+        let assets_value: serde_json::Value = serde_json::from_str(&assets_json).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("invalid assets JSON: {e}"),
+                code: "SCP-CTX-2044".to_owned(),
+            }
+            .into_js()
+        })?;
+        let assets_arr = assets_value.as_array().ok_or_else(|| {
+            ScpWasmError::Context {
+                message: "assets must be a JSON array".to_owned(),
+                code: "SCP-CTX-2044".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let mut parsed_assets: Vec<(String, String, Vec<u8>)> =
+            Vec::with_capacity(assets_arr.len());
+        for item in assets_arr {
+            let path = item
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpWasmError::Context {
+                        message: "each asset must have a 'path' string field".to_owned(),
+                        code: "SCP-CTX-2044".to_owned(),
+                    }
+                    .into_js()
+                })?
+                .to_owned();
+            let ct = item
+                .get("contentType")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpWasmError::Context {
+                        message: "each asset must have a 'contentType' string field".to_owned(),
+                        code: "SCP-CTX-2044".to_owned(),
+                    }
+                    .into_js()
+                })?
+                .to_owned();
+            let body_b64 = item
+                .get("bodyBase64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ScpWasmError::Context {
+                        message: "each asset must have a 'bodyBase64' string field".to_owned(),
+                        code: "SCP-CTX-2044".to_owned(),
+                    }
+                    .into_js()
+                })?;
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(body_b64)
+                .map_err(|e| {
+                    ScpWasmError::Context {
+                        message: format!("invalid base64 body: {e}"),
+                        code: "SCP-CTX-2044".to_owned(),
+                    }
+                    .into_js()
+                })?;
+            parsed_assets.push((path, ct, body));
+        }
+
+        let results = with_manager(|mgr| {
+            mgr.publish_broadcast_assets(
+                &context_id,
+                &author_did,
+                &parsed_assets,
+                deploy_id.as_deref(),
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let js_results = js_sys::Array::new();
+        for (blob_id, etag) in results {
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("blobId"),
+                &JsValue::from_str(&blob_id),
+            )
+            .map_err(|_| JsValue::from_str("failed to set blobId"))?;
+            js_sys::Reflect::set(&obj, &JsValue::from_str("etag"), &JsValue::from_str(&etag))
+                .map_err(|_| JsValue::from_str("failed to set etag"))?;
+            js_results.push(&obj);
+        }
+
+        Ok(js_results.into())
     })
 }
 

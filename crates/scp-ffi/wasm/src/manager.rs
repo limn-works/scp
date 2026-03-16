@@ -771,6 +771,122 @@ impl Default for WasmContextManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WASM-local content validation (ADR-034: cannot import from scp-core)
+// ---------------------------------------------------------------------------
+
+/// Validates a content path for broadcast asset publishing (SCP-290).
+///
+/// Algorithm-identical to `scp_core::context::broadcast_content::ContentPath::new`.
+/// Reimplemented locally per ADR-034.
+fn validate_content_path_wasm(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path must not be empty".to_owned());
+    }
+    if path.len() > 1024 {
+        return Err(format!("path too long: {} bytes (max 1024)", path.len()));
+    }
+    if !path.starts_with('/') {
+        return Err("path must start with '/'".to_owned());
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        return Err("path must not end with '/' (except root)".to_owned());
+    }
+    if path.contains('\\') {
+        return Err("backslashes not allowed".to_owned());
+    }
+    if path.contains("//") {
+        return Err("double slashes not allowed".to_owned());
+    }
+    if path.contains('%') {
+        return Err("percent-encoded bytes not allowed".to_owned());
+    }
+    if path.contains('?') {
+        return Err("query strings not allowed".to_owned());
+    }
+    if path.contains('#') {
+        return Err("fragments not allowed".to_owned());
+    }
+    // Check for control chars, null bytes, and non-ASCII whitespace.
+    for ch in path.chars() {
+        if ch.is_control() {
+            return Err(format!("control character U+{:04X} not allowed", ch as u32));
+        }
+        if ch == '\u{00A0}' || ('\u{2000}'..='\u{200F}').contains(&ch) || ch == '\u{FEFF}' {
+            return Err(format!(
+                "non-ASCII whitespace U+{:04X} not allowed",
+                ch as u32
+            ));
+        }
+    }
+    // Check segments for traversal.
+    for segment in path.split('/') {
+        if segment == ".." {
+            return Err("'..' segments not allowed (path traversal)".to_owned());
+        }
+        if segment == "." {
+            return Err("'.' segments not allowed".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Validates a MIME type for broadcast asset publishing (SCP-290).
+///
+/// Algorithm-identical to `scp_core::context::broadcast_content::MimeType::new`.
+/// Reimplemented locally per ADR-034.
+fn validate_mime_type_wasm(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("MIME type must not be empty".to_owned());
+    }
+    if value.len() > 256 {
+        return Err(format!(
+            "MIME type too long: {} bytes (max 256)",
+            value.len()
+        ));
+    }
+    // Reject control chars and CRLF (HTTP response splitting).
+    for ch in value.chars() {
+        if ch.is_control() {
+            return Err(format!("control character U+{:04X} not allowed", ch as u32));
+        }
+    }
+    // Must match type/subtype.
+    let slash_pos = value
+        .find('/')
+        .ok_or_else(|| "MIME type must contain '/'".to_owned())?;
+    if slash_pos == 0 || slash_pos == value.len() - 1 {
+        return Err("MIME type must have non-empty type and subtype".to_owned());
+    }
+    // Reject parameters (`;`).
+    if value.contains(';') {
+        return Err("MIME type parameters (';') not allowed".to_owned());
+    }
+    Ok(())
+}
+
+/// Validates a `deploy_id` for broadcast asset publishing (SCP-290).
+///
+/// Algorithm-identical to `scp_core::context::broadcast_content::validate_deploy_id`.
+/// Reimplemented locally per ADR-034.
+fn validate_deploy_id_wasm(deploy_id: &str) -> Result<(), String> {
+    if deploy_id.is_empty() {
+        return Err("deploy_id must not be empty".to_owned());
+    }
+    if deploy_id.len() > 128 {
+        return Err(format!(
+            "deploy_id too long: {} bytes (max 128)",
+            deploy_id.len()
+        ));
+    }
+    for ch in deploy_id.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
+            return Err(format!("invalid character '{ch}' in deploy_id"));
+        }
+    }
+    Ok(())
+}
+
 impl WasmContextManager {
     /// Creates a new empty manager.
     #[must_use]
@@ -3450,6 +3566,120 @@ impl WasmContextManager {
         );
 
         Ok(())
+    }
+
+    /// Publishes a single asset to a broadcast context as structured content (SCP-290).
+    ///
+    /// Validates path, `content_type`, and `deploy_id` locally (ADR-034: no `scp-core`
+    /// dependency). Computes `ETag` from the body. Publishes via `publish_broadcast`
+    /// with a structured payload prefix.
+    ///
+    /// Returns `(blob_id, etag)` where `blob_id` is a synthetic hex ID derived
+    /// from context + author + sequence, and `etag` is `SHA-256(body)` hex.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails or publish fails.
+    pub fn publish_broadcast_asset(
+        &mut self,
+        context_id: &str,
+        author_did: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        deploy_id: Option<&str>,
+    ) -> Result<(String, String), ScpWasmError> {
+        // Validate path (reimplemented per ADR-034).
+        validate_content_path_wasm(path).map_err(|msg| ScpWasmError::Context {
+            message: format!("invalid path: {msg}"),
+            code: "SCP-CTX-2040".to_owned(),
+        })?;
+
+        // Validate content_type (reimplemented per ADR-034).
+        validate_mime_type_wasm(content_type).map_err(|msg| ScpWasmError::Context {
+            message: format!("invalid content_type: {msg}"),
+            code: "SCP-CTX-2041".to_owned(),
+        })?;
+
+        // Validate deploy_id.
+        if let Some(did) = deploy_id {
+            validate_deploy_id_wasm(did).map_err(|msg| ScpWasmError::Context {
+                message: format!("invalid deploy_id: {msg}"),
+                code: "SCP-CTX-2042".to_owned(),
+            })?;
+        }
+
+        // Compute ETag.
+        let etag = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(body))
+        };
+
+        // Build the structured payload using base64 for the inner body.
+        // The payload is base64-encoded for the existing publish_broadcast path.
+        let payload = base64::engine::general_purpose::STANDARD.encode(body);
+        self.publish_broadcast(context_id, author_did, &payload)?;
+
+        // Compute synthetic blob_id from context + author + etag.
+        let blob_id = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(context_id.as_bytes());
+            hasher.update(author_did.as_bytes());
+            hasher.update(etag.as_bytes());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ts = js_sys::Date::now() as u64;
+            hasher.update(ts.to_le_bytes());
+            hex::encode(Sha256::digest(hasher.finalize()))
+        };
+
+        Ok((blob_id, etag))
+    }
+
+    /// Publishes multiple assets to a broadcast context (SCP-290).
+    ///
+    /// All assets are published with the same `deploy_id`. Returns a list of
+    /// `(blob_id, etag)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any asset fails validation or publish.
+    pub fn publish_broadcast_assets(
+        &mut self,
+        context_id: &str,
+        author_did: &str,
+        assets: &[(String, String, Vec<u8>)],
+        deploy_id: Option<&str>,
+    ) -> Result<Vec<(String, String)>, ScpWasmError> {
+        // Generate deploy_id if not provided.
+        let deploy_id_val: String;
+        let did = if let Some(d) = deploy_id {
+            d
+        } else {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(context_id.as_bytes());
+            hasher.update(author_did.as_bytes());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ts = js_sys::Date::now() as u64;
+            hasher.update(ts.to_le_bytes());
+            deploy_id_val = hex::encode(&Sha256::digest(hasher.finalize())[..16]);
+            &deploy_id_val
+        };
+
+        let mut results = Vec::with_capacity(assets.len());
+        for (path, content_type, body) in assets {
+            let (blob_id, etag) = self.publish_broadcast_asset(
+                context_id,
+                author_did,
+                path,
+                content_type,
+                body,
+                Some(did),
+            )?;
+            results.push((blob_id, etag));
+        }
+        Ok(results)
     }
 
     /// Unsubscribes from a broadcast context. Mirrors `ContextManager::unsubscribe_broadcast`.

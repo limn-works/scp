@@ -64,6 +64,32 @@ export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom
  */
 export type BroadcastAdmissionPolicy = "Open" | "Gated";
 
+/**
+ * An asset to publish to a broadcast context (SCP-290, spec section 18.11.8).
+ *
+ * Typed interface to prevent positional transposition of path/contentType/body.
+ */
+export interface AssetEntry {
+  /** Validated URL path (e.g., `/index.html`, `/styles.css`). */
+  readonly path: string;
+  /** Validated MIME type (e.g., `text/html`, `text/css`). */
+  readonly contentType: string;
+  /** Raw content bytes. */
+  readonly body: Uint8Array;
+}
+
+/**
+ * Result of publishing an asset to a broadcast context (SCP-290).
+ *
+ * Returned by `broadcastPublishAsset` and `broadcastPublishAssets`.
+ */
+export interface PublishResult {
+  /** Hex-encoded SHA-256 of the serialized broadcast envelope. */
+  readonly blobId: string;
+  /** Hex-encoded SHA-256 of the asset body. */
+  readonly etag: string;
+}
+
 // ---------------------------------------------------------------------------
 // Governance
 // ---------------------------------------------------------------------------

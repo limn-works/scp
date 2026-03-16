@@ -19,6 +19,7 @@ use super::broadcast::{
     AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
+use super::broadcast_content::{BroadcastContent, serialize_broadcast_content};
 use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
@@ -3359,6 +3360,39 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MessageSent")?;
 
         Ok(envelope)
+    }
+
+    /// Publishes a [`BroadcastContent`] to a broadcast context.
+    ///
+    /// This is the structured-content publish path. It serializes the
+    /// `BroadcastContent` with the magic prefix and delegates to
+    /// [`publish_broadcast`](Self::publish_broadcast).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
+    /// - [`ContextError::PermissionDenied`] if the sender is not an author.
+    /// - [`ContextError::InvalidInput`] if serialization fails.
+    pub async fn publish_broadcast_content(
+        &self,
+        context_id: &str,
+        author_did: &DID,
+        content: BroadcastContent,
+        custody: &impl scp_platform::KeyCustody,
+        signing_key_handle: &scp_platform::KeyHandle,
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        let payload = serialize_broadcast_content(&content).map_err(|e| {
+            ContextError::CryptoFailed(format!("content serialization failed: {e}"))
+        })?;
+        self.publish_broadcast(
+            context_id,
+            author_did,
+            &payload,
+            custody,
+            signing_key_handle,
+        )
+        .await
     }
 
     /// Blocks a subscriber from receiving future broadcast keys from a

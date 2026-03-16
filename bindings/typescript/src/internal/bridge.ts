@@ -97,6 +97,18 @@ export interface Bridge {
     authorDid: string,
     payload: Uint8Array,
   ): Promise<void>;
+  broadcastPublishAsset(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    asset: { path: string; contentType: string; body: number[] },
+    deployId: string | null,
+  ): Promise<{ blobId: string; etag: string }>;
+  broadcastPublishAssets(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    assets: { path: string; contentType: string; body: number[] }[],
+    deployId: string | null,
+  ): Promise<{ blobId: string; etag: string }[]>;
   broadcastBlockSubscriber(
     handle: BridgeContextHandle,
     subscriberDid: string,

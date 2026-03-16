@@ -258,6 +258,20 @@ interface WasmModule {
     authorDid: string,
     payloadBase64: string,
   ) => Promise<void>;
+  broadcastPublishAsset: (
+    handle: BridgeContextHandle,
+    authorDid: string,
+    path: string,
+    contentType: string,
+    bodyBase64: string,
+    deployId?: string,
+  ) => Promise<unknown>;
+  broadcastPublishAssets: (
+    handle: BridgeContextHandle,
+    authorDid: string,
+    assetsJson: string,
+    deployId?: string,
+  ) => Promise<unknown>;
   broadcast_block: (
     handle: BridgeContextHandle,
     subscriberDid: string,
@@ -777,6 +791,46 @@ export function createWasmBridge(): Bridge {
       const wasm = getWasm();
       const payloadBase64 = uint8ToBase64(payload);
       await wasm.broadcast_publish(handle, authorDid, payloadBase64);
+    },
+
+    async broadcastPublishAsset(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      asset: { path: string; contentType: string; body: number[] },
+      deployId: string | null,
+    ): Promise<{ blobId: string; etag: string }> {
+      const wasm = getWasm();
+      const bodyBase64 = uint8ToBase64(new Uint8Array(asset.body));
+      return (await wasm.broadcastPublishAsset(
+        handle,
+        authorDid,
+        asset.path,
+        asset.contentType,
+        bodyBase64,
+        deployId ?? undefined,
+      )) as { blobId: string; etag: string };
+    },
+
+    async broadcastPublishAssets(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      assets: { path: string; contentType: string; body: number[] }[],
+      deployId: string | null,
+    ): Promise<{ blobId: string; etag: string }[]> {
+      const wasm = getWasm();
+      const assetsJson = JSON.stringify(
+        assets.map((a) => ({
+          path: a.path,
+          contentType: a.contentType,
+          bodyBase64: uint8ToBase64(new Uint8Array(a.body)),
+        })),
+      );
+      return (await wasm.broadcastPublishAssets(
+        handle,
+        authorDid,
+        assetsJson,
+        deployId ?? undefined,
+      )) as { blobId: string; etag: string }[];
     },
 
     async broadcastBlockSubscriber(

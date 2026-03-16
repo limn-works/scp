@@ -1048,6 +1048,33 @@ export function createMockBridge(): Bridge & {
       ctx.eventLog.push(publishedEvent);
     },
 
+    async broadcastPublishAsset(
+      handle: BridgeContextHandle,
+      _authorDid: string,
+      _asset: { path: string; contentType: string; body: number[] },
+      _deployId: string | null,
+    ): Promise<{ blobId: string; etag: string }> {
+      const ctx = getContext(handle);
+      if (ctx.mode !== "Broadcast") {
+        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
+      }
+      return { blobId: `mock-blob-id-${ctx.eventLog.length}`, etag: "mock-etag" };
+    },
+
+    async broadcastPublishAssets(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      assets: { path: string; contentType: string; body: number[] }[],
+      deployId: string | null,
+    ): Promise<{ blobId: string; etag: string }[]> {
+      const results: { blobId: string; etag: string }[] = [];
+      for (const asset of assets) {
+        const result = await this.broadcastPublishAsset(handle, authorDid, asset, deployId);
+        results.push(result);
+      }
+      return results;
+    },
+
     async broadcastBlockSubscriber(
       handle: BridgeContextHandle,
       subscriberDid: string,
