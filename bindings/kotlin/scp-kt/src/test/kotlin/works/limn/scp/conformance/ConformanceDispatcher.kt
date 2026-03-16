@@ -10,6 +10,9 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.TestDispatcher
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 /**
  * Maps conformance operation strings to Kotlin SDK bridge calls.
@@ -221,7 +224,7 @@ class ConformanceDispatcher(
         input: Map<String, String>,
     ): Map<String, String> = catchBridge {
         val relayUrl = input["relay_url"] ?: ""
-        val config = """{"url":"$relayUrl"}"""
+        val config = Json.encodeToString(buildJsonObject { put("url", relayUrl) })
         val handle = bridge.infra.transportConnect(config)
         mapOf("handle" to handle.toString(), "status" to "connected")
     }
