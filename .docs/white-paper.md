@@ -23,7 +23,7 @@ Key properties: no operator dependency (the protocol functions if its creators d
 
 We observe what appears to be a phase transition in software generation. Frontier language models produce functional applications from brief natural-language specifications. Agent frameworks compose sophisticated workflows from modular tools. The cost of producing a working application — from concept to execution — is falling rapidly.
 
-If this trajectory continues, it leads to personal, disposable, generated-on-demand software. A user describes what they need; an agent builds it. The application serves its purpose. It may be discarded, it may evolve, or it may transition into something entirely different. Software ceases to be a durable artifact and becomes a fluid means to an end.
+If this trajectory continues, it leads to personal, disposable, generated-on-demand software. A user describes what they need; an agent builds it. The application serves its purpose. It may be discarded, it may evolve, or it may transition into something entirely different. Software ceases to be a durable artifact and becomes an infinitely malleable substrate onto which data, experiences, and interactions are projected.
 
 What this trajectory does *not* make trivial is the connective tissue between applications: identity that belongs to the user rather than to the application that created it, trust that is earned through interaction and portable across contexts, relationships that persist when the software that introduced them is discarded, and transport that works regardless of which application generated the endpoints. Building software is becoming trivial; connecting it is not. When every person and every agent generates their own software, all of those applications are islands.
 
