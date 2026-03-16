@@ -10,7 +10,7 @@ import SCP
 @main
 struct ToolInvocation {
     static func main() async throws {
-        let identity = try await identityCreate(custody: "platform")
+        let identity = try await identityCreate(custody: "in_memory")
 
         // ToolDefinition uses UniFFI field names: inputSchemaJson, outputSchemaJson,
         // testVectorsJson (optional JSON string), implementationHash (optional Data)
@@ -27,11 +27,12 @@ struct ToolInvocation {
 
         // Create a context and register the tool
         let params = ContextParams(
-            ceiling: ["msg:send", "msg:receive", "tool:invoke"],
+            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
-            promotable: false
+            promotable: false,
+            minProtocolVersion: 0
         )
         let handle = try await contextCreate(identity: identity, params: params)
 

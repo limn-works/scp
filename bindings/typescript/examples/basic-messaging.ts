@@ -5,36 +5,37 @@
 import { Context, Identity } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
-  // Create two identities
-  const alice = await Identity.create({ custody: "platform" });
-  const bob = await Identity.create({ custody: "platform" });
+  // Create two identities (in_memory custody for examples)
+  const alice = await Identity.create({ custody: "in_memory" });
+  const bob = await Identity.create({ custody: "in_memory" });
   console.log(`Alice DID: ${alice.did}`);
   console.log(`Bob DID: ${bob.did}`);
 
   // Alice creates a context
-  const ctxAlice = await Context.create(alice, {
-    ceiling: ["msg:send", "msg:receive"],
-    ttl: 3600,
+  const ctx = await Context.create(alice, {
+    ceiling: ["messages:read", "messages:write"],
+    memoryScope: "ephemeral",
     governance: "single_admin",
+    ttl: 3600,
   });
-  console.log(`Context ID: ${ctxAlice.contextId}`);
+  console.log(`Context ID: ${ctx.contextId}`);
 
-  // Bob joins the context
-  const ctxBob = await Context.join(bob, ctxAlice.contextId);
+  // Bob joins the context (admin adds bob via the context instance)
+  await ctx.join(bob);
 
   // Alice sends a message
-  await ctxAlice.send(new TextEncoder().encode("Hello Bob, this is Alice"));
+  await ctx.send(new TextEncoder().encode("Hello Bob, this is Alice"));
 
   // Bob receives it
-  for await (const msg of ctxBob.receive()) {
+  for await (const msg of ctx.receive()) {
     const text = new TextDecoder().decode(msg.content as Uint8Array);
     console.log(`Bob received from ${msg.senderDid}: ${text}`);
     break;
   }
 
   // Cleanup
-  await ctxBob.leave();
-  await ctxAlice.close();
+  await ctx.leave();
+  await ctx.close();
 }
 
 main().catch(console.error);

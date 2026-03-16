@@ -3,6 +3,7 @@
 package works.limn.scp.examples
 
 import works.limn.scp.Context
+import works.limn.scp.CustodyType
 import works.limn.scp.Identity
 import works.limn.scp.Ucan
 import kotlinx.coroutines.async
@@ -10,11 +11,11 @@ import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.runBlocking
 
-suspend fun runAgent(name: String, identity: Identity, contextId: String) {
-    val ctx = Context.join(identity = identity, contextId = contextId)
-    println("[$name] Joined context $contextId")
+suspend fun runAgent(name: String, identity: Identity, ctx: Context) {
+    ctx.join(identity = identity)
+    println("[$name] Joined context ${ctx.contextId}")
 
-    ctx.send("[$name] reporting in".toByteArray())
+    ctx.send("[$name] reporting in".toByteArray(), identity = identity)
 
     var count = 0
     ctx.receiveFlow().collect { msg ->
@@ -24,24 +25,30 @@ suspend fun runAgent(name: String, identity: Identity, contextId: String) {
         if (count >= 2) return@collect
     }
 
-    ctx.leave()
+    ctx.leave(identity = identity)
     println("[$name] Left context")
 }
 
 fun main() = runBlocking {
     // Create identities for coordinator and two agents
-    val coordinator = Identity.create(custody = "platform")
-    val agentA = Identity.create(custody = "platform")
-    val agentB = Identity.create(custody = "platform")
+    val coordinator = Identity.create(custody = CustodyType.IN_MEMORY)
+    val agentA = Identity.create(custody = CustodyType.IN_MEMORY)
+    val agentB = Identity.create(custody = CustodyType.IN_MEMORY)
 
     // Coordinator creates the context
     val ctx = Context.create(
         identity = coordinator,
-        params = mapOf(
-            "ceiling" to listOf("msg:send", "msg:receive", "tool:invoke"),
-            "roles" to mapOf("agent" to listOf("msg:send", "msg:receive", "tool:invoke")),
-            "governance" to "single_admin",
+        ceiling = listOf(
+            "messages:read",
+            "messages:write",
+            "tool:invoke:*",
+            "member:invite",
+            "member:remove",
+            "role:assign",
         ),
+        roles = mapOf("agent" to listOf("messages:write", "messages:read", "tool:invoke:*")),
+        memoryScope = "ephemeral",
+        governance = "single_admin",
     )
     println("Context created: ${ctx.contextId}")
 
@@ -49,21 +56,21 @@ fun main() = runBlocking {
     Ucan.mint(
         issuer = coordinator,
         audience = agentA.did,
-        capabilities = listOf("msg:send", "msg:receive"),
+        capabilities = listOf("messages:write", "messages:read"),
         contextId = ctx.contextId,
     )
     Ucan.mint(
         issuer = coordinator,
         audience = agentB.did,
-        capabilities = listOf("msg:send", "msg:receive"),
+        capabilities = listOf("messages:write", "messages:read"),
         contextId = ctx.contextId,
     )
 
     // Run agents concurrently
-    val taskA = async { runAgent("Agent-A", agentA, ctx.contextId) }
-    val taskB = async { runAgent("Agent-B", agentB, ctx.contextId) }
+    val taskA = async { runAgent("Agent-A", agentA, ctx) }
+    val taskB = async { runAgent("Agent-B", agentB, ctx) }
     taskA.await()
     taskB.await()
 
-    ctx.close()
+    ctx.close(identity = coordinator)
 }

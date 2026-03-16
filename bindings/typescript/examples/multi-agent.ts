@@ -7,10 +7,10 @@ import { Context, Identity, mintUcan } from "@limn-works/scp-ts";
 async function runAgent(
   name: string,
   identity: Identity,
-  contextId: string,
+  ctx: Context,
 ): Promise<void> {
-  const ctx = await Context.join(identity, contextId);
-  console.log(`[${name}] Joined context ${contextId}`);
+  await ctx.join(identity);
+  console.log(`[${name}] Joined context ${ctx.contextId}`);
 
   await ctx.send(new TextEncoder().encode(`[${name}] reporting in`));
 
@@ -28,28 +28,36 @@ async function runAgent(
 
 async function main(): Promise<void> {
   // Create identities for coordinator and two agents
-  const coordinator = await Identity.create({ custody: "platform" });
-  const agentA = await Identity.create({ custody: "platform" });
-  const agentB = await Identity.create({ custody: "platform" });
+  const coordinator = await Identity.create({ custody: "in_memory" });
+  const agentA = await Identity.create({ custody: "in_memory" });
+  const agentB = await Identity.create({ custody: "in_memory" });
 
   // Coordinator creates the context with agent capabilities
   const ctx = await Context.create(coordinator, {
-    ceiling: ["msg:send", "msg:receive", "tool:invoke"],
+    ceiling: [
+      "messages:read",
+      "messages:write",
+      "tool:invoke:*",
+      "member:invite",
+      "member:remove",
+      "role:assign",
+    ],
     roles: {
-      agent: ["msg:send", "msg:receive", "tool:invoke"],
+      agent: ["messages:write", "messages:read", "tool:invoke:*"],
     },
+    memoryScope: "ephemeral",
     governance: "single_admin",
   });
   console.log(`Context created: ${ctx.contextId}`);
 
   // Mint UCANs for each agent (capability delegation)
-  await mintUcan(ctx, agentA.did, ["msg:send", "msg:receive"]);
-  await mintUcan(ctx, agentB.did, ["msg:send", "msg:receive"]);
+  await mintUcan(ctx, agentA.did, ["messages:write", "messages:read"]);
+  await mintUcan(ctx, agentB.did, ["messages:write", "messages:read"]);
 
   // Run agents concurrently
   await Promise.all([
-    runAgent("Agent-A", agentA, ctx.contextId),
-    runAgent("Agent-B", agentB, ctx.contextId),
+    runAgent("Agent-A", agentA, ctx),
+    runAgent("Agent-B", agentB, ctx),
   ]);
 
   await ctx.close();

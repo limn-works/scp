@@ -2,40 +2,40 @@
 
 package works.limn.scp.examples
 
-import works.limn.scp.Context
+import works.limn.scp.CustodyType
 import works.limn.scp.Identity
+import works.limn.scp.Context
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 
 fun main() = runBlocking {
-    // Create two identities
-    val alice = Identity.create(custody = "platform")
-    val bob = Identity.create(custody = "platform")
+    // Create two identities (in_memory custody for examples)
+    val alice = Identity.create(custody = CustodyType.IN_MEMORY)
+    val bob = Identity.create(custody = CustodyType.IN_MEMORY)
     println("Alice DID: ${alice.did}")
     println("Bob DID: ${bob.did}")
 
     // Alice creates a context
-    val ctxAlice = Context.create(
+    val ctx = Context.create(
         identity = alice,
-        params = mapOf(
-            "ceiling" to listOf("msg:send", "msg:receive"),
-            "ttl" to 3600,
-            "governance" to "single_admin",
-        ),
+        ceiling = listOf("messages:read", "messages:write"),
+        memoryScope = "ephemeral",
+        governance = "single_admin",
+        ttl = 3600,
     )
-    println("Context ID: ${ctxAlice.contextId}")
+    println("Context ID: ${ctx.contextId}")
 
     // Bob joins the context
-    val ctxBob = Context.join(identity = bob, contextId = ctxAlice.contextId)
+    ctx.join(identity = bob)
 
     // Alice sends a message
-    ctxAlice.send("Hello Bob, this is Alice".toByteArray())
+    ctx.send("Hello Bob, this is Alice".toByteArray())
 
     // Bob receives it
-    val msg = ctxBob.receiveFlow().first()
+    val msg = ctx.receiveFlow().first()
     println("Bob received from ${msg.senderDid}: ${String(msg.content)}")
 
     // Cleanup
-    ctxBob.leave()
-    ctxAlice.close()
+    ctx.leave(identity = bob)
+    ctx.close(identity = alice)
 }
