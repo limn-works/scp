@@ -7460,6 +7460,19 @@ pub async fn broadcast_publish_asset(
                     code: "SCP-CTX-2041".to_owned(),
                 }
             })?;
+            // Auto-generate deploy_id when None, matching batch behavior.
+            let deploy_id = Some(deploy_id.unwrap_or_else(|| {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(handle.context_id.as_bytes());
+                hasher.update(identity.did.as_bytes());
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                hasher.update(ts.to_le_bytes());
+                hex::encode(&Sha256::digest(hasher.finalize())[..16])
+            }));
             if let Some(ref did_str) = deploy_id {
                 scp_core::context::validate_deploy_id(did_str).map_err(|e| ScpError::Context {
                     msg: format!("invalid deploy_id: {e}"),
@@ -7562,6 +7575,17 @@ pub async fn broadcast_publish_assets(
     assets: Vec<AssetEntry>,
     deploy_id: Option<String>,
 ) -> Result<Vec<PublishResult>, ScpError> {
+    const MAX_BATCH_ASSETS: usize = 10_000;
+    if assets.len() > MAX_BATCH_ASSETS {
+        return Err(ScpError::Context {
+            msg: format!(
+                "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
+                assets.len()
+            ),
+            code: "SCP-CTX-2074".to_owned(),
+        });
+    }
+
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
