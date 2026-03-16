@@ -158,7 +158,7 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 pub fn init_context_manager(local_did: &str) {
     if CONTEXT_MANAGER.get().is_some() {
-        tracing::debug!(
+        tracing::warn!(
             requested_did = %local_did,
             "init_context_manager already initialized — MLS crypto uses the original DID"
         );
