@@ -346,6 +346,7 @@ impl ConsistencyCheckpoint {
 /// Evidence of relay equivocation: two conflicting consistency checkpoints
 /// from different members that should agree but don't. See spec §9.9.3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EquivocationEvidence {
     /// The checkpoint from the local (detecting) member.
     pub local_checkpoint: ConsistencyCheckpoint,
@@ -367,6 +368,7 @@ pub struct EquivocationEvidence {
 ///
 /// See spec §9.9.3, §23.7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EquivocationAlert {
     /// The context where equivocation was detected.
     pub context_id: ContextId,
@@ -719,6 +721,14 @@ pub enum SyncOutcome {
 /// Returns `Ok(None)` if context IDs differ (cross-context comparison is
 /// meaningless), if event counts differ (one member is behind), or if
 /// Merkle roots match (consistent). See spec §9.9.3, §23.12.
+///
+/// # Parameters
+///
+/// * `now` - Current timestamp (seconds since epoch). Used only to
+///   stamp the output `EquivocationAlert`. No freshness validation is
+///   performed on the remote checkpoint's timestamp -- replay
+///   protection relies on event-count divergence detection, not
+///   temporal freshness.
 ///
 /// # Errors
 ///
