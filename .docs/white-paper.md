@@ -21,9 +21,9 @@ Key properties: no operator dependency (the protocol functions if its creators d
 
 ### 1.1 The Ephemeral Software Thesis
 
-Software generation is undergoing a phase transition. Frontier language models produce functional applications from brief natural-language specifications. Agent frameworks compose sophisticated workflows from modular tools. The cost of producing a working application — from concept to execution — is collapsing toward zero.
+We observe what appears to be a phase transition in software generation. Frontier language models produce functional applications from brief natural-language specifications. Agent frameworks compose sophisticated workflows from modular tools. The cost of producing a working application — from concept to execution — is falling rapidly.
 
-The trajectory is clear: personal, disposable, generated-on-demand software. A user describes what they need; an agent builds it. The application serves its purpose and may never be used again. Software ceases to be a durable artifact and becomes an ephemeral means to an end.
+If this trajectory continues, it leads to personal, disposable, generated-on-demand software. A user describes what they need; an agent builds it. The application serves its purpose and may never be used again. Software ceases to be a durable artifact and becomes an ephemeral means to an end.
 
 What this trajectory does *not* make trivial is the connective tissue between applications: identity that belongs to the user rather than to the application that created it, trust that is earned through interaction and portable across contexts, relationships that persist when the software that introduced them is discarded, and transport that works regardless of which application generated the endpoints. Building software is becoming trivial; connecting it is not. When every person and every agent generates their own software, all of those applications are islands.
 
@@ -69,7 +69,7 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 SCP provides a complete protocol specification, a reference SDK (Rust core with language bindings), and conformance infrastructure. It does not provide content moderation policy, specific transport implementations beyond the reference relay, or application-level logic. The protocol is the infrastructure; applications are built on top.
 
-The novel contributions are: context isolation as the security boundary for agent interaction; human accountability chains for all autonomous agents via shared-DID binding; provenance as a core protocol principle with automatic attachment; encryption-as-access-control where MLS keys constitute membership; a multi-key identity architecture with pre-rotation commitments and agent signing keys; dual-layer DID resolution with protocol-level self-healing; and verifiable behavioral records that replace reputation scores with evidence.
+The primary contributions are architectural, not cryptographic — SCP composes established primitives (MLS, DIDs, UCANs, Merkle trees) into a system designed specifically for autonomous agent interaction. Three contributions are novel to SCP: (1) the shared-DID model for human-agent accountability, where human and agent share one identity with distinct signing keys and structural action provenance on every message; (2) context isolation as the primary security boundary, with all cross-context data flow mediated by governed protocol mechanisms; and (3) the sender-side key layer that decouples content access from MLS group membership, enabling per-sender blocking without group disruption. The remaining design choices — the multi-key identity architecture (extending KERI's [25] pre-rotation approach), the provenance model (applying W3C PROV [26] concepts to cross-context agent communication), dual-layer DID resolution, and encryption-as-access-control — are novel applications of known techniques to the agent-native case, not claimed as independent contributions.
 
 The remainder of this paper is organized as follows: Section 2 analyzes the problem space. Section 3 presents the architecture overview. Sections 4–8 detail the core protocol components: identity, contexts, encryption, capabilities, and provenance. Section 9 covers transport. Section 10 addresses discovery. Section 11 provides the security analysis. Section 12 compares with related work. Section 13 discusses implementation status and Section 14 addresses limitations and future work.
 
@@ -389,7 +389,7 @@ Economic policy can be locked via governance action, making it immutable once th
 
 ### 8.1 Automatic Provenance Attachment
 
-Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required. The provenance data model is designed for the cross-context agent communication case specifically, complementing general-purpose provenance frameworks such as W3C PROV [26].
+Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required. The provenance data model is designed for the cross-context agent communication case specifically, complementing general-purpose provenance frameworks such as W3C PROV [26] and media-focused provenance systems such as C2PA [27].
 
 A provenance record contains: source context, source type (persistent, ephemeral, or summary — reflecting current verifiability), counterparties present in the source interaction, purpose, discovery method, age, memory scope, chain depth (number of context boundaries crossed), chain path (ordered list of intermediary contexts), and optional economic provenance (what the data cost to produce).
 
@@ -570,14 +570,22 @@ SCP builds on established standards rather than inventing from scratch where goo
 
 The relay model is informed by Nostr's simplicity [17]. Federation lessons are informed by Matrix's experience [15]. The append-only log primitive draws from the same well-understood lineage as Hypercore [19]. DHT-integrated hole punching as a reachability concept is validated by Hyperswarm [18]. Keet [23] provides existence proof that zero-server encrypted group messaging works at production scale.
 
-### 12.3 What Is Novel
+### 12.3 Contributions
 
-- **Context isolation as the security boundary** for agent interaction — cryptographic isolation between interaction spaces with governed boundary crossing.
-- **Human accountability chains** for all autonomous agents via shared-DID binding with structural action provenance (`signing_key_id` on every message).
-- **Provenance as a core protocol principle** — automatic attachment at context boundaries with ordered quality tiers, not a per-application feature.
-- **Multi-key identity architecture** with pre-rotation commitments, agent signing keys, and graduated permission categories — a stronger model than any existing DID method.
-- **Dual-layer DID resolution** with protocol-level self-healing across SCP relays and Mainline DHT.
-- **Sender-side key layer** enabling per-sender blocking without MLS group disruption — the mechanism that decouples content access from group membership.
+SCP's contributions are architectural — the composition of established primitives into a system designed for autonomous agent interaction — rather than novel cryptographic constructions. We distinguish three categories:
+
+**Novel to SCP:**
+
+- **The shared-DID model for human-agent accountability.** Human and agent share one DID with distinct signing keys (`#active`, `#agent`). The `signing_key_id` field on every signed message provides structural action provenance — verifiers distinguish human from agent authorship cryptographically, not by self-report. No existing protocol binds agents to human accountability chains through shared identity with per-key attribution.
+- **Context isolation as the primary security boundary** for multi-agent interaction. While group key isolation exists in other protocols (Matrix rooms use separate Megolm sessions, for example), SCP makes isolation the *organizing principle*: all cross-context data flow is mediated by governed protocol mechanisms with provenance, chain depth limits, and bilateral governance consent. The contribution is the design philosophy and its systematic enforcement, not the underlying group key separation.
+- **The sender-side key layer** enabling per-sender blocking without MLS group disruption. Double encryption (sender key then MLS group key) with a pull-based key distribution model decouples content access from group membership — a practical construction not present in MLS, Megolm, or Signal Groups.
+
+**Novel applications of known techniques:**
+
+- **Multi-key identity architecture** extending KERI's [25] pre-rotation approach with agent signing keys and graduated permission categories (A/B/C) within a DID document.
+- **Cross-context provenance model** applying W3C PROV [26] concepts to the agent communication case: automatic attachment at context boundaries, ordered quality tiers, and chain depth enforcement.
+- **Dual-layer DID resolution** providing multi-homed resolution across SCP relays and Mainline DHT with protocol-level self-healing (re-publishing fresher documents to stale backends).
+- **Encryption-as-access-control** where MLS group keys constitute the membership boundary and relays are structurally untrusted.
 
 ### 12.4 Hypercore Comparison
 
@@ -816,3 +824,5 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 [25] S. Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143, 2019. Pre-rotation key commitment mechanism.
 
 [26] L. Moreau and P. Missier, Eds., "PROV-DM: The PROV Data Model," W3C Recommendation, April 2013.
+
+[27] Coalition for Content Provenance and Authenticity (C2PA), "C2PA Technical Specification," c2pa.org, 2024.
