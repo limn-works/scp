@@ -221,6 +221,18 @@ private class TestNativeBindings : NativeBindings {
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
     override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
     override fun broadcastAdmission(contextHandle: Long): String? = null
+    override fun broadcastPublishAsset(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetJson: String,
+        deployId: String?,
+    ): String = """{"blob_id":"stub","etag":"stub"}"""
+    override fun broadcastPublishAssets(
+        contextHandle: Long,
+        identityHandle: Long,
+        assetsJson: String,
+        deployId: String?,
+    ): String = """[{"blob_id":"stub","etag":"stub"}]"""
 
     override fun toolRegister(contextHandle: Long, definitionJson: String): String = ""
     override fun toolInvoke(

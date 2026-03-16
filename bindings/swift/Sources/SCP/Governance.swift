@@ -396,50 +396,6 @@ public enum MembershipBridge {
     }
 }
 
-// MARK: - AssetEntry
-
-/// An asset to publish to a broadcast context (SCP-290).
-///
-/// Typed struct matching the Rust `AssetEntry` UniFFI record. Prevents
-/// positional transposition of path/content_type/body.
-///
-/// When UniFFI bindings are regenerated this will be replaced by the
-/// auto-generated type in `ScpBindings.swift`.
-public struct AssetEntry: Sendable, Equatable {
-    /// Validated URL path (e.g., `/index.html`, `/styles.css`).
-    public let path: String
-    /// Validated MIME type (e.g., `text/html`, `text/css`).
-    public let contentType: String
-    /// Raw content bytes.
-    public let body: Data
-
-    public init(path: String, contentType: String, body: Data) {
-        self.path = path
-        self.contentType = contentType
-        self.body = body
-    }
-}
-
-// MARK: - PublishResult
-
-/// Result of publishing an asset to a broadcast context (SCP-290).
-///
-/// Typed struct matching the Rust `PublishResult` UniFFI record.
-///
-/// When UniFFI bindings are regenerated this will be replaced by the
-/// auto-generated type in `ScpBindings.swift`.
-public struct PublishResult: Sendable, Equatable {
-    /// Hex-encoded SHA-256 of the serialized broadcast envelope.
-    public let blobId: String
-    /// Hex-encoded SHA-256 of the asset body.
-    public let etag: String
-
-    public init(blobId: String, etag: String) {
-        self.blobId = blobId
-        self.etag = etag
-    }
-}
-
 // MARK: - BroadcastBridge
 
 /// Namespace for UniFFI bridge function references used by broadcast operations.
