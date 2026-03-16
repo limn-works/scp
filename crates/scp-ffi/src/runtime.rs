@@ -503,11 +503,20 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// [`RevocationList`] for the context. The creator DID is assigned admin
 /// capabilities (all capabilities in the ceiling).
 ///
+/// `user_ceiling` contains user-provided ceiling strings in colon format
+/// (e.g. `"tool:invoke:*"`). These are converted to UCAN underscore format
+/// (e.g. `"tool_invoke:*"`) via `Capability::new` + `ucan_capability_name`.
+/// Pass an empty slice to use the default ceiling.
+///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
 /// or if role state creation fails.
-pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
+pub fn register_ffi_state(
+    context_id: &str,
+    creator_did: &str,
+    user_ceiling: &[String],
+) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
     let map = ffi_state_registry();
@@ -522,11 +531,18 @@ pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), Scp
             let tool_registry = ToolRegistry::new();
             let event_log = EventLog::new(context_id.to_owned());
             let ceiling = default_ceiling();
-            let ceiling_strings = ceiling
-                .capabilities
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<HashSet<String>>();
+            let ceiling_strings = if user_ceiling.is_empty() {
+                ceiling
+                    .capabilities
+                    .iter()
+                    .map(scp_core::context::roles::Capability::ucan_capability_name)
+                    .collect::<HashSet<String>>()
+            } else {
+                user_ceiling
+                    .iter()
+                    .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                    .collect::<HashSet<String>>()
+            };
             let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
                 .map_err(|e| ScpPyError::context(format!("failed to create role state: {e}")))?;
             let revocation_list = RevocationList::new(context_id.to_owned());
@@ -1146,7 +1162,11 @@ pub fn clear_relay_connection() -> Result<(), ScpPyError> {
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if registration fails.
-pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
+pub fn register_context(
+    context_id: &str,
+    creator_did: &str,
+    user_ceiling: &[String],
+) -> Result<(), ScpPyError> {
     // Ensure the ContextManager is initialized.
     // Tests use LocalTransportProvider so publish_context succeeds silently.
     // Production uses NotConfiguredTransportProvider — publish_context
@@ -1158,7 +1178,7 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
     init_context_manager();
 
     // Register FFI-specific state.
-    register_ffi_state(context_id, creator_did)
+    register_ffi_state(context_id, creator_did, user_ceiling)
 }
 
 /// Backward-compatible alias for [`with_ffi_state`].
@@ -1385,7 +1405,7 @@ mod tests {
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
-        register_context(&ctx_id, creator).unwrap();
+        register_context(&ctx_id, creator, &[]).unwrap();
         let stats = registry_stats().unwrap();
 
         // Verify that stats reports at least 1 context (our registered one).
@@ -1537,7 +1557,7 @@ mod tests {
     fn with_ffi_state_finds_registered_context() {
         let ctx_id = unique_ctx_id("ffi-find");
         let creator = "did:dht:z6MkFfiFind";
-        register_context(&ctx_id, creator).unwrap();
+        register_context(&ctx_id, creator, &[]).unwrap();
 
         let creator_did = with_ffi_state(&ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
         assert_eq!(creator_did, creator);
@@ -1549,5 +1569,83 @@ mod tests {
     fn with_ffi_state_errors_on_missing_context() {
         let result = with_ffi_state("nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)
+    /// must be converted to UCAN underscore format (e.g. `"tool_invoke:*"`)
+    /// when stored in `FfiBridgeState.ceiling_strings`. Without this conversion,
+    /// `mint_ucan` ceiling checks fail because the minted capability name
+    /// (underscore format) doesn't match the stored raw string.
+    ///
+    /// Regression test for PR #1293 review finding.
+    #[test]
+    fn user_ceiling_strings_converted_to_ucan_format() {
+        let ctx_id = unique_ctx_id("ceiling-conv");
+        let creator = "did:dht:z6MkCeilingConv";
+
+        let user_ceiling = vec![
+            "tool:invoke:*".to_owned(),
+            "messages:write".to_owned(),
+            "context:child:create".to_owned(),
+            "tool:invoke:calculator".to_owned(),
+        ];
+
+        register_context(&ctx_id, creator, &user_ceiling).unwrap();
+
+        let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+
+        // Compound resources must have underscores joining their segments.
+        assert!(
+            ceiling.contains("tool_invoke:*"),
+            "expected 'tool_invoke:*' but got: {ceiling:?}"
+        );
+        assert!(
+            ceiling.contains("context_child:create"),
+            "expected 'context_child:create' but got: {ceiling:?}"
+        );
+        assert!(
+            ceiling.contains("tool_invoke:calculator"),
+            "expected 'tool_invoke:calculator' but got: {ceiling:?}"
+        );
+        // Simple two-segment capabilities should pass through unchanged.
+        assert!(
+            ceiling.contains("messages:write"),
+            "expected 'messages:write' but got: {ceiling:?}"
+        );
+        // Raw colon-format strings must NOT be present.
+        assert!(
+            !ceiling.contains("tool:invoke:*"),
+            "raw 'tool:invoke:*' should not be in ceiling: {ceiling:?}"
+        );
+        assert!(
+            !ceiling.contains("context:child:create"),
+            "raw 'context:child:create' should not be in ceiling: {ceiling:?}"
+        );
+
+        remove_context(&ctx_id);
+    }
+
+    /// When no user ceiling is provided (empty slice), the default ceiling
+    /// should be used with proper UCAN underscore format.
+    #[test]
+    fn empty_user_ceiling_uses_default_in_ucan_format() {
+        let ctx_id = unique_ctx_id("ceiling-default");
+        let creator = "did:dht:z6MkCeilingDefault";
+
+        register_context(&ctx_id, creator, &[]).unwrap();
+
+        let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+
+        // Default ceiling must include tool_invoke:* (not tool:invoke:*).
+        assert!(
+            ceiling.contains("tool_invoke:*"),
+            "default ceiling should contain 'tool_invoke:*' but got: {ceiling:?}"
+        );
+        assert!(
+            !ceiling.contains("tool:invoke:*"),
+            "default ceiling should not contain raw 'tool:invoke:*': {ceiling:?}"
+        );
+
+        remove_context(&ctx_id);
     }
 }

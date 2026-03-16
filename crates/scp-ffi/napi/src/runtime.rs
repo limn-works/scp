@@ -483,10 +483,13 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
         scp_core::context::roles::default_ceiling()
             .capabilities
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(scp_core::context::roles::Capability::ucan_capability_name)
             .collect::<HashSet<String>>()
     } else {
-        handle_ceiling.into_iter().collect::<HashSet<String>>()
+        handle_ceiling
+            .into_iter()
+            .map(|s| scp_core::context::roles::Capability::new(&s).ucan_capability_name())
+            .collect::<HashSet<String>>()
     };
 
     let event_log = EventLog::new(context_id.clone());
@@ -672,7 +675,7 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
     let ceiling_strings = scp_core::context::roles::default_ceiling()
         .capabilities
         .iter()
-        .map(std::string::ToString::to_string)
+        .map(scp_core::context::roles::Capability::ucan_capability_name)
         .collect::<HashSet<String>>();
 
     // Default ceiling + no custom roles: infallible in practice.

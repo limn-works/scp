@@ -1468,7 +1468,7 @@ pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u3
 fn map_capability_names(category: &str, action: &str, is_tool: bool) -> Vec<String> {
     match (category, action, is_tool) {
         // ToolInvoke(specific) -- resource ends with tools/{tool_name}
-        (_, "invoke", true) => vec![format!("tool:invoke:{category}")],
+        (_, "invoke", true) => vec![format!("tool_invoke:{category}")],
         // MessagesRead -- core accepts ("messaging"|"members", "read")
         ("messaging" | "members", "read", _) => vec!["messages:read".to_owned()],
         // MessagesWrite -- core accepts ("messaging", "write") only
@@ -1476,7 +1476,7 @@ fn map_capability_names(category: &str, action: &str, is_tool: bool) -> Vec<Stri
         // MemberInvite -- core accepts ("members", "write"|"admin")
         ("members", "write" | "admin", _) => vec!["member:invite".to_owned()],
         // ToolInvokeAll
-        ("tools", "invoke", _) => vec!["tool:invoke:*".to_owned()],
+        ("tools", "invoke", _) => vec!["tool_invoke:*".to_owned()],
         // ToolRegister -- core accepts ("tools", "register"|"admin")
         ("tools", "register" | "admin", _) => vec!["tool:register".to_owned()],
         // GovernancePropose -- core accepts ("governance", "write")
@@ -1606,9 +1606,9 @@ pub fn sandbox_validate_declaration(
 
     for cap in &requested {
         let in_ceiling = ceiling_set.contains(cap.as_str())
-            || (cap.starts_with("tool:invoke:") && ceiling_set.contains("tool:invoke:*"));
+            || (cap.starts_with("tool_invoke:") && ceiling_set.contains("tool_invoke:*"));
         let in_role = role_set.contains(cap.as_str())
-            || (cap.starts_with("tool:invoke:") && role_set.contains("tool:invoke:*"));
+            || (cap.starts_with("tool_invoke:") && role_set.contains("tool_invoke:*"));
         if !in_ceiling || !in_role {
             return sandbox_err(&app_did, &format!("capability denied: {cap}"));
         }
@@ -1638,9 +1638,9 @@ pub fn sandbox_check_capability(
         return true;
     }
     // ToolInvokeAll covers any specific ToolInvoke.
-    if required_capability.starts_with("tool:invoke:")
-        && required_capability != "tool:invoke:*"
-        && granted.contains("tool:invoke:*")
+    if required_capability.starts_with("tool_invoke:")
+        && required_capability != "tool_invoke:*"
+        && granted.contains("tool_invoke:*")
     {
         return true;
     }
@@ -2548,19 +2548,19 @@ fn wasm_capability_sets() -> CapabilitySets {
         msg_tools_invoke_ban: serde_json::json!([
             "messages:read",
             "messages:write",
-            "tool:invoke:*",
+            "tool_invoke:*",
             "member:ban"
         ]),
         msg_tools: serde_json::json!([
             "messages:read",
             "messages:write",
-            "tool:invoke:*",
+            "tool_invoke:*",
             "tool:register"
         ]),
         msg_tools_ban: serde_json::json!([
             "messages:read",
             "messages:write",
-            "tool:invoke:*",
+            "tool_invoke:*",
             "tool:register",
             "member:ban"
         ]),

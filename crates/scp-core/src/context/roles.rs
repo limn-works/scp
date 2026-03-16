@@ -187,6 +187,146 @@ impl Capability {
             Self::Custom(name) => std::borrow::Cow::Borrowed(name.as_str()),
         }
     }
+
+    /// Returns the `(resource, action)` pair for UCAN capability URIs.
+    ///
+    /// The canonical user-facing format uses colons (e.g., `"tool:invoke:*"`),
+    /// but UCAN URIs use `{resource}:{action}` where `resource` is a single
+    /// underscore-joined token. This method bridges the two formats:
+    ///
+    /// - `tool:invoke:*`         -> `("tool_invoke", "*")`
+    /// - `tool:invoke:calculator` -> `("tool_invoke", "calculator")`
+    /// - `context:child:create`  -> `("context_child", "create")`
+    /// - `messages:write`        -> `("messages", "write")`
+    /// - `context:close`         -> `("context", "close")`
+    /// - `role:assign`           -> `("role", "assign")`
+    /// - `bridging`              -> `("bridging", "*")`
+    ///
+    /// The returned strings are suitable for constructing
+    /// [`CapabilityUri`](crate::crypto::ucan::capability::CapabilityUri) values
+    /// and for building ceiling string sets (`{resource}:{action}`).
+    ///
+    /// See issue #1293 for the mismatch this method resolves.
+    #[must_use]
+    pub fn ucan_resource_action(&self) -> (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>) {
+        match self {
+            Self::MessagesRead => (
+                std::borrow::Cow::Borrowed("messages"),
+                std::borrow::Cow::Borrowed("read"),
+            ),
+            Self::MessagesWrite => (
+                std::borrow::Cow::Borrowed("messages"),
+                std::borrow::Cow::Borrowed("write"),
+            ),
+            Self::ToolInvoke(id) => (
+                std::borrow::Cow::Borrowed("tool_invoke"),
+                std::borrow::Cow::Borrowed(id.as_str()),
+            ),
+            Self::ToolInvokeAll => (
+                std::borrow::Cow::Borrowed("tool_invoke"),
+                std::borrow::Cow::Borrowed("*"),
+            ),
+            Self::ToolRegister => (
+                std::borrow::Cow::Borrowed("tool"),
+                std::borrow::Cow::Borrowed("register"),
+            ),
+            Self::MemberInvite => (
+                std::borrow::Cow::Borrowed("member"),
+                std::borrow::Cow::Borrowed("invite"),
+            ),
+            Self::MemberRemove => (
+                std::borrow::Cow::Borrowed("member"),
+                std::borrow::Cow::Borrowed("remove"),
+            ),
+            Self::RoleAssign => (
+                std::borrow::Cow::Borrowed("role"),
+                std::borrow::Cow::Borrowed("assign"),
+            ),
+            Self::GovernancePropose => (
+                std::borrow::Cow::Borrowed("governance"),
+                std::borrow::Cow::Borrowed("propose"),
+            ),
+            Self::GovernanceVote => (
+                std::borrow::Cow::Borrowed("governance"),
+                std::borrow::Cow::Borrowed("vote"),
+            ),
+            Self::ContextClose => (
+                std::borrow::Cow::Borrowed("context"),
+                std::borrow::Cow::Borrowed("close"),
+            ),
+            Self::ChildContextCreate => (
+                std::borrow::Cow::Borrowed("context_child"),
+                std::borrow::Cow::Borrowed("create"),
+            ),
+            Self::ToolInterface => (
+                std::borrow::Cow::Borrowed("tool"),
+                std::borrow::Cow::Borrowed("interface"),
+            ),
+            Self::Bridging => (
+                std::borrow::Cow::Borrowed("bridging"),
+                std::borrow::Cow::Borrowed("*"),
+            ),
+            Self::MediaVoice => (
+                std::borrow::Cow::Borrowed("media"),
+                std::borrow::Cow::Borrowed("voice"),
+            ),
+            Self::MediaVideo => (
+                std::borrow::Cow::Borrowed("media"),
+                std::borrow::Cow::Borrowed("video"),
+            ),
+            Self::MediaScreenShare => (
+                std::borrow::Cow::Borrowed("media"),
+                std::borrow::Cow::Borrowed("screen_share"),
+            ),
+            Self::MemberBan => (
+                std::borrow::Cow::Borrowed("member"),
+                std::borrow::Cow::Borrowed("ban"),
+            ),
+            Self::MetadataEdit => (
+                std::borrow::Cow::Borrowed("metadata"),
+                std::borrow::Cow::Borrowed("edit"),
+            ),
+            Self::Custom(name) => {
+                // Custom capabilities may use either colon or underscore format.
+                // Split on the last colon to separate resource from action.
+                if let Some((resource, action)) = name.rsplit_once(':') {
+                    (
+                        std::borrow::Cow::Owned(resource.replace(':', "_")),
+                        std::borrow::Cow::Borrowed(action),
+                    )
+                } else {
+                    // No colon — treat entire name as resource with wildcard action.
+                    (
+                        std::borrow::Cow::Borrowed(name.as_str()),
+                        std::borrow::Cow::Borrowed("*"),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Returns the UCAN capability name string in `{resource}:{action}` format.
+    ///
+    /// This is the format used in capability ceiling sets and
+    /// [`CapabilityUri::capability_name()`](crate::crypto::ucan::capability::CapabilityUri::capability_name).
+    /// Unlike [`name()`](Self::name) which returns the canonical user-facing
+    /// colon format, this returns the UCAN-internal format with underscores
+    /// for multi-segment resources.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use scp_core::context::roles::Capability;
+    ///
+    /// assert_eq!(Capability::ToolInvokeAll.ucan_capability_name(), "tool_invoke:*");
+    /// assert_eq!(Capability::MessagesWrite.ucan_capability_name(), "messages:write");
+    /// assert_eq!(Capability::ChildContextCreate.ucan_capability_name(), "context_child:create");
+    /// ```
+    #[must_use]
+    pub fn ucan_capability_name(&self) -> String {
+        let (resource, action) = self.ucan_resource_action();
+        format!("{resource}:{action}")
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -972,9 +1112,10 @@ fn mint_role_tokens(
     role.capabilities
         .iter()
         .map(|cap| {
+            let (resource, action) = cap.ucan_resource_action();
             let att = UcanAttestation {
-                with: format!("scp:ctx:{context_id}/{cap}"),
-                can: "invoke".to_owned(),
+                with: format!("scp:ctx:{context_id}/{resource}:{action}"),
+                can: action.into_owned(),
             };
             Ok(UcanToken {
                 iss: creator_did.to_owned(),
@@ -1665,7 +1806,7 @@ mod tests {
         assert_eq!(token.aud, "did:dht:alice");
         assert_eq!(token.att.len(), 1);
         assert_eq!(token.att[0].with, "scp:ctx:ctx-1/messages:read");
-        assert_eq!(token.att[0].can, "invoke");
+        assert_eq!(token.att[0].can, "read");
         assert!(!token.nnc.is_empty());
         // Verify nonce format: {millis}-{hex}.
         assert!(token.nnc.contains('-'));
@@ -2038,5 +2179,165 @@ mod tests {
             matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
             "expected reserved name error, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ucan_resource_action (#1293)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ucan_resource_action_tool_invoke_all() {
+        let (resource, action) = Capability::ToolInvokeAll.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(action.as_ref(), "*");
+    }
+
+    #[test]
+    fn ucan_resource_action_tool_invoke_specific() {
+        let cap = Capability::ToolInvoke("calculator".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(action.as_ref(), "calculator");
+    }
+
+    #[test]
+    fn ucan_resource_action_messages() {
+        let (resource, action) = Capability::MessagesRead.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "messages");
+        assert_eq!(action.as_ref(), "read");
+
+        let (resource, action) = Capability::MessagesWrite.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "messages");
+        assert_eq!(action.as_ref(), "write");
+    }
+
+    #[test]
+    fn ucan_resource_action_context_close() {
+        let (resource, action) = Capability::ContextClose.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "context");
+        assert_eq!(action.as_ref(), "close");
+    }
+
+    #[test]
+    fn ucan_resource_action_child_context_create() {
+        let (resource, action) = Capability::ChildContextCreate.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "context_child");
+        assert_eq!(action.as_ref(), "create");
+    }
+
+    #[test]
+    fn ucan_resource_action_role_assign() {
+        let (resource, action) = Capability::RoleAssign.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "role");
+        assert_eq!(action.as_ref(), "assign");
+    }
+
+    #[test]
+    fn ucan_resource_action_bridging() {
+        let (resource, action) = Capability::Bridging.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "bridging");
+        assert_eq!(action.as_ref(), "*");
+    }
+
+    #[test]
+    fn ucan_resource_action_from_name_string() {
+        // Parsing from the canonical colon name produces the correct UCAN pair.
+        let cap = Capability::new("tool:invoke:*");
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(action.as_ref(), "*");
+    }
+
+    #[test]
+    fn ucan_resource_action_tool_invoke_specific_from_name() {
+        let cap = Capability::new("tool:invoke:calculator");
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(action.as_ref(), "calculator");
+    }
+
+    #[test]
+    fn ucan_capability_name_format() {
+        assert_eq!(
+            Capability::ToolInvokeAll.ucan_capability_name(),
+            "tool_invoke:*"
+        );
+        assert_eq!(
+            Capability::MessagesWrite.ucan_capability_name(),
+            "messages:write"
+        );
+        assert_eq!(
+            Capability::ChildContextCreate.ucan_capability_name(),
+            "context_child:create"
+        );
+        assert_eq!(
+            Capability::ToolInvoke("calc".to_owned()).ucan_capability_name(),
+            "tool_invoke:calc"
+        );
+        assert_eq!(Capability::Bridging.ucan_capability_name(), "bridging:*");
+        assert_eq!(
+            Capability::ToolRegister.ucan_capability_name(),
+            "tool:register"
+        );
+    }
+
+    #[test]
+    fn ucan_resource_action_custom_with_colons() {
+        let cap = Capability::Custom("some:nested:name".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "some_nested");
+        assert_eq!(action.as_ref(), "name");
+    }
+
+    #[test]
+    fn ucan_resource_action_custom_no_colons() {
+        let cap = Capability::Custom("single".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "single");
+        assert_eq!(action.as_ref(), "*");
+    }
+
+    #[test]
+    fn ucan_resource_action_custom_simple_colon() {
+        let cap = Capability::Custom("foo:bar".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "foo");
+        assert_eq!(action.as_ref(), "bar");
+    }
+
+    #[test]
+    fn ucan_resource_action_all_standard_variants() {
+        // Every standard variant must produce a non-empty resource and action.
+        let caps = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvoke("test".to_owned()),
+            Capability::ToolInvokeAll,
+            Capability::ToolRegister,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::RoleAssign,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::ChildContextCreate,
+            Capability::ToolInterface,
+            Capability::Bridging,
+            Capability::MediaVoice,
+            Capability::MediaVideo,
+            Capability::MediaScreenShare,
+            Capability::MemberBan,
+            Capability::MetadataEdit,
+        ];
+        for cap in &caps {
+            let (resource, action) = cap.ucan_resource_action();
+            assert!(!resource.is_empty(), "empty resource for {cap:?}");
+            assert!(!action.is_empty(), "empty action for {cap:?}");
+            // Resource must not contain colons (UCAN uses underscores).
+            assert!(
+                !resource.contains(':'),
+                "resource for {cap:?} contains colon: {resource}"
+            );
+        }
     }
 }

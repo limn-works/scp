@@ -1717,7 +1717,7 @@ mod tests {
         let creator_did = "did:dht:z6MkTestTimestamp";
 
         // Register FFI state so the context exists in the runtime registry.
-        crate::runtime::register_ffi_state(&ctx_id, creator_did).unwrap();
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {

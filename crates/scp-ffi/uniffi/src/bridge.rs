@@ -2426,7 +2426,11 @@ pub async fn context_create(
                 in_memory_custody,
                 callback_custody,
                 signing_key,
-                ceiling_strings: params.ceiling.clone(),
+                ceiling_strings: params
+                    .ceiling
+                    .iter()
+                    .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                    .collect(),
                 tool_registry: tokio::sync::Mutex::new(
                     scp_core::context::tools::ToolRegistry::new(),
                 ),
