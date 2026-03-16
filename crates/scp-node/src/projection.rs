@@ -1984,10 +1984,12 @@ fn site_security_headers(csp: &str) -> axum::http::HeaderMap {
 /// For public contexts:
 /// - `immutable=true`: `Cache-Control: public, immutable, max-age=31536000`
 /// - `immutable=false`: `Cache-Control: public, max-age=0, must-revalidate`
+///   with `ETag: "<deploy_id>:<content_hash>"`
 ///
 /// For gated/author-choice contexts:
 /// - `immutable=true`: `Cache-Control: private, immutable, max-age=31536000`
 /// - `immutable=false`: `Cache-Control: private, max-age=0, must-revalidate`
+///   with `ETag: "<deploy_id>:<content_hash>"`
 ///
 /// - 404: `Cache-Control: no-store`
 ///
