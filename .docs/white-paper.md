@@ -119,21 +119,37 @@ SCP defines a sharp protocol boundary. Everything that touches the network is pr
 
 The boundary is architecturally significant because it defines where isolation applies. A human may have agents in many contexts. Locally, those agents coordinate freely. At the protocol level, each agent is a separate instance confined to its context. Cross-context data flow occurs only through governed protocol mechanisms.
 
+```mermaid
+block-beta
+    columns 4
+    block:local["LOCAL (User's Machine)"]:4
+        columns 4
+        A["Agent A"] B["Agent B"] C["Agent C"] D["Agent D"]
+        orch["Local Agent Orchestration — unconstrained by protocol"]:4
+    end
+    space:4
+    boundary["═══════════════ PROTOCOL BOUNDARY ═══════════════"]:4
+    space:4
+    ctxA["Context A"] ctxB["Context B"] ctxC["Context C"] ctxD["Context D"]
+
+    A --> orch
+    B --> orch
+    C --> orch
+    D --> orch
+    orch --"governed\ncrossing"--> ctxA
+    orch --"governed\ncrossing"--> ctxB
+    orch --"governed\ncrossing"--> ctxC
+    orch --"governed\ncrossing"--> ctxD
+
+    style local fill:#f9f9f9,stroke:#333
+    style boundary fill:#ff9,stroke:#333,font-weight:bold
+    style ctxA fill:#e1f0ff,stroke:#336
+    style ctxB fill:#e1f0ff,stroke:#336
+    style ctxC fill:#e1f0ff,stroke:#336
+    style ctxD fill:#e1f0ff,stroke:#336
 ```
-┌──────────────────────────────────────────────────────────┐
-│                   LOCAL (User's Machine)                  │
-│                                                          │
-│  Agent·A    Agent·B    Agent·C    Agent·D                │
-│     │          │          │          │                    │
-│  ┌──┴──────────┴──────────┴──────────┴──┐                │
-│  │     Local Agent Orchestration         │                │
-│  │     (Unconstrained by protocol)       │                │
-│  └──┬──────────┬──────────┬──────────┬──┘                │
-└─────┼──────────┼──────────┼──────────┼───────────────────┘
-══════╪══════════╪══════════╪══════════╪══════ PROTOCOL BOUNDARY
-      │          │          │          │
-  Context A  Context B  Context C  Context D
-```
+
+*Figure 1: Protocol boundary. Above the line, agents coordinate freely on the user's machine. Below the line, each agent is a separate instance confined to its context. Cross-context data flow occurs only through governed protocol mechanisms.*
 
 ### 3.2 Layer Model
 
@@ -176,7 +192,43 @@ Messages in SCP pass through a layered security pipeline:
 
 6. **Transport.** The outer envelope is delivered via the transport layer (relay store-and-forward or direct connection).
 
-At each layer, specific security properties are enforced: MLS provides forward secrecy and post-compromise security; sender-side keys enable per-sender blocking without group disruption; signatures provide non-repudiation and signing key attribution; Merkle log append provides tamper-evident history.
+```mermaid
+flowchart LR
+    subgraph construction["1. Construction"]
+        IE["Inner Envelope\ncontext_id, sender_did,\nsigning_key_id, epoch,\nsequence, payload_hash,\npadded payload, provenance"]
+    end
+
+    subgraph signing["2. Signing"]
+        SIG["Ed25519 Signature\n(commits to payload hash\n+ signing_key_id)"]
+    end
+
+    subgraph sender["3. Sender-Side Encryption"]
+        SK["AES-256-GCM\n(per-sender key)"]
+    end
+
+    subgraph mls["4. MLS Encryption"]
+        MLS["MLS Group Key\n(current epoch)"]
+    end
+
+    subgraph outer["5. Outer Envelope"]
+        OE["routing_id + TTL\n+ encrypted blob\n(bucket-padded)"]
+    end
+
+    subgraph transport["6. Transport"]
+        TX["Relay / Direct"]
+    end
+
+    IE --> SIG --> SK --> MLS --> OE --> TX
+
+    style construction fill:#f0f7ff,stroke:#336
+    style signing fill:#fff0f0,stroke:#633
+    style sender fill:#f0fff0,stroke:#363
+    style mls fill:#fff8f0,stroke:#963
+    style outer fill:#f8f0ff,stroke:#639
+    style transport fill:#f0f0f0,stroke:#333
+```
+
+*Figure 2: Message lifecycle. Each layer enforces distinct security properties: signatures provide non-repudiation and key attribution; sender-side keys enable per-sender blocking; MLS provides forward secrecy and post-compromise security; outer envelopes provide metadata privacy via pseudonymous routing IDs and bucket padding.*
 
 ### 3.5 Trust Model
 
@@ -233,6 +285,47 @@ All protocol messages carry a `signing_key_id` field identifying which verificat
 The pre-rotation mechanism draws on KERI's [25] key pre-commitment approach, applied here within the multi-key DID architecture.
 
 This separation provides three security improvements over single-key DID methods: (a) recovery from key compromise without changing the DID, via the pre-rotation commitment; (b) custody separation between human and agent operations; (c) graduated permission categories based on signing key type.
+
+```mermaid
+flowchart TB
+    subgraph did["DID Document (did:dht:z6Mk...)"]
+        direction TB
+        id["#0 Identity Key\n(Ed25519, hardware-backed)\nCategory A: DID doc modifications only"]
+        active["#active Human Signing Key\n(Ed25519, hardware-backed)\nCategory B: protocol operations"]
+        prerot["Pre-Rotation Key\n(hash commitment to next #active)"]
+        agent["#agent Agent Signing Key\n(Ed25519, software-held)\nCategory B: delegated via UCAN"]
+    end
+
+    id -- "authorizes" --> active
+    id -- "authorizes" --> prerot
+    active -- "self-delegation UCAN\n(iss == aud, fct.scp_key_scope: #agent)" --> agent
+
+    subgraph catA["Category A"]
+        a_ops["DID doc modifications\nKey rotation"]
+    end
+    subgraph catB["Category B"]
+        b_ops["Messaging, tool invocation\nGovernance votes, MLS ops"]
+    end
+    subgraph catC["Category C"]
+        c_ops["Context-configurable\nrestrictions per key type"]
+    end
+
+    id --> catA
+    active --> catB
+    agent -.-> catB
+    catB --> catC
+
+    style did fill:#f0f7ff,stroke:#336
+    style id fill:#ffe0e0,stroke:#933
+    style active fill:#e0ffe0,stroke:#393
+    style prerot fill:#fff0d0,stroke:#963
+    style agent fill:#e0e0ff,stroke:#339
+    style catA fill:#ffe0e0,stroke:#933
+    style catB fill:#e0ffe0,stroke:#393
+    style catC fill:#f0f0f0,stroke:#666
+```
+
+*Figure 3: Multi-key identity architecture. The identity key (`#0`) is the root of trust, used only for DID document modifications. The human signing key (`#active`) handles day-to-day operations. The agent signing key (`#agent`) is authorized via self-delegation UCAN and independently revocable. Pre-rotation provides safe key recovery under compromise. Permission categories (A/B/C) govern which keys can perform which actions.*
 
 ### 4.3 Dual-Layer Resolution
 
