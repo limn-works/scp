@@ -242,11 +242,6 @@ impl ProjectionUcanCache {
         self.prune_expired_revocations_if_needed();
     }
 
-    /// Removes a specific entry (e.g., on revocation).
-    pub fn remove(&mut self, token_cid: &str) {
-        self.entries.remove(token_cid);
-    }
-
     /// Clears all cached entries and increments the generation counter.
     ///
     /// Called when member keys change (key rotation). The generation bump
@@ -557,11 +552,6 @@ struct UcanValidationState {
     ///
     /// The expected audience is `"scp:projection:<routing_id_hex>"`.
     routing_id_hex: String,
-    /// Admission mode of the context. Used by `check_projection_auth` to
-    /// distinguish between a gated context with misconfigured (empty)
-    /// member keys (reject) and an open context with per-author gated
-    /// overrides (structural fallback is acceptable).
-    admission: BroadcastAdmission,
 }
 
 /// Validates a bearer token as a UCAN with full cryptographic verification
@@ -648,7 +638,7 @@ fn validate_projection_ucan(
     let has_capability = ucan.payload.att.iter().any(|att| {
         att.with
             .parse::<CapabilityUri>()
-            .is_ok_and(|cap| cap.matches(&required))
+            .is_ok_and(|cap| cap.matches(&required) && cap.context_id().is_some())
     });
 
     if !has_capability {
@@ -800,7 +790,7 @@ fn validate_projection_ucan_structural(
     let has_capability = ucan.payload.att.iter().any(|att| {
         att.with
             .parse::<CapabilityUri>()
-            .is_ok_and(|cap| cap.matches(&required))
+            .is_ok_and(|cap| cap.matches(&required) && cap.context_id().is_some())
     });
 
     if !has_capability {
@@ -878,24 +868,19 @@ fn check_projection_auth(
                 Some(vs) if !vs.member_keys.is_empty() => {
                     validate_projection_ucan(token, context_id, vs, cache)
                 }
-                Some(vs)
-                    if vs.member_keys.is_empty() && vs.admission == BroadcastAdmission::Gated =>
-                {
-                    // A gated context without member keys is misconfigured.
-                    // Reject rather than falling back to structural-only
-                    // validation, which would bypass signature verification.
-                    tracing::warn!(
-                        context_id = context_id,
-                        "gated projection context has no member keys configured — rejecting"
-                    );
+                Some(_) => {
+                    // Empty member keys — reject for any gated rule,
+                    // regardless of admission mode. The catch-all for
+                    // structural fallback is reserved for None (no
+                    // validation state at all).
                     Err(Box::new(
                         ApiError::unauthorized_with(
-                            "gated context has no member keys configured for UCAN verification",
+                            "no member keys configured for UCAN verification",
                         )
                         .into_response(),
                     ))
                 }
-                _ => validate_projection_ucan_structural(token, context_id),
+                None => validate_projection_ucan_structural(token, context_id),
             }
         }
     }
@@ -1162,7 +1147,6 @@ pub async fn feed_handler(
         member_keys: projected.member_keys.clone(),
         revoked_tokens: projected.revoked_tokens.keys().cloned().collect(),
         routing_id_hex: routing_id_hex.clone(),
-        admission,
     };
     drop(projected_contexts);
 
@@ -1307,8 +1291,8 @@ pub async fn feed_handler(
                 effective_projection_rule(admission, Some(policy), Some(&msg.author_did));
             match author_rule {
                 ProjectionRule::Public => auth_public,
-                ProjectionRule::Gated => auth_gated.unwrap_or(true),
-                ProjectionRule::AuthorChoice => auth_author_choice.unwrap_or(true),
+                ProjectionRule::Gated => auth_gated.unwrap_or(false),
+                ProjectionRule::AuthorChoice => auth_author_choice.unwrap_or(false),
             }
         });
     }
@@ -1427,7 +1411,6 @@ pub async fn message_handler(
         member_keys: projected.member_keys.clone(),
         revoked_tokens: projected.revoked_tokens.keys().cloned().collect(),
         routing_id_hex: routing_id_hex.clone(),
-        admission,
     };
     drop(projected_contexts);
 
@@ -3561,6 +3544,11 @@ mod tests {
             }],
         };
 
+        // Register member keys for UCAN crypto verification.
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
         let mut projected = ProjectedContext::new(
             context_id,
             alice_key.clone(),
@@ -3568,6 +3556,7 @@ mod tests {
             Some(policy),
         );
         projected.keys.insert(bob_key.epoch(), bob_key.clone());
+        projected.member_keys.insert(issuer_did, pk);
         let routing_id = projected.routing_id;
 
         let mut projected_map = HashMap::new();
@@ -3637,8 +3626,8 @@ mod tests {
         );
         assert_eq!(messages[0]["author_did"], "did:dht:bob");
 
-        // Request feed WITH valid UCAN — should include both messages.
-        let ucan_token = build_test_ucan(context_id);
+        // Request feed WITH a signed UCAN — should include both messages.
+        let ucan_token = build_signed_test_ucan(context_id, &signing_key);
         let router = broadcast_projection_router(state);
         let req = Request::builder()
             .uri(format!("/scp/broadcast/{routing_hex}/feed"))
@@ -3765,6 +3754,11 @@ mod tests {
             }],
         };
 
+        // Register member keys for UCAN crypto verification.
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
         let mut projected = ProjectedContext::new(
             context_id,
             alice_key.clone(),
@@ -3773,6 +3767,7 @@ mod tests {
         );
         // Insert bob's key (epoch 1) so messages from both authors can be decrypted.
         projected.keys.insert(bob_key.epoch(), bob_key.clone());
+        projected.member_keys.insert(issuer_did, pk);
         let routing_id = projected.routing_id;
 
         let mut projected_map = HashMap::new();
@@ -3843,8 +3838,8 @@ mod tests {
             "bob's content should be public (no per-author override)"
         );
 
-        // Request alice's message with a valid UCAN → should succeed (200).
-        let ucan_token = build_test_ucan(context_id);
+        // Request alice's message with a signed UCAN → should succeed (200).
+        let ucan_token = build_signed_test_ucan(context_id, &signing_key);
         let router = broadcast_projection_router(state);
         let req = Request::builder()
             .uri(format!("/scp/broadcast/{routing_hex}/messages/{alice_hex}"))
@@ -4006,7 +4001,6 @@ mod tests {
             member_keys,
             revoked_tokens: HashSet::new(),
             routing_id_hex: hex_encode(&compute_routing_id(context_id)),
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4035,7 +4029,6 @@ mod tests {
             member_keys,
             revoked_tokens: HashSet::new(),
             routing_id_hex: hex_encode(&compute_routing_id(context_id)),
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4055,7 +4048,6 @@ mod tests {
             member_keys: HashMap::new(),
             revoked_tokens: HashSet::new(),
             routing_id_hex: hex_encode(&compute_routing_id(context_id)),
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4122,7 +4114,6 @@ mod tests {
             member_keys,
             revoked_tokens: HashSet::new(),
             routing_id_hex: hex_encode(&compute_routing_id("wrong_cap_ctx")),
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4155,7 +4146,6 @@ mod tests {
             member_keys,
             revoked_tokens,
             routing_id_hex: hex_encode(&compute_routing_id(context_id)),
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4180,7 +4170,6 @@ mod tests {
             member_keys,
             revoked_tokens: HashSet::new(),
             routing_id_hex: routing_id_hex.clone(),
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4207,7 +4196,6 @@ mod tests {
             member_keys: HashMap::new(),
             revoked_tokens: HashSet::new(),
             routing_id_hex,
-            admission: BroadcastAdmission::Gated,
         };
         let result = validate_projection_ucan(&token, context_id, &empty_state, &cache);
         assert!(result.is_ok(), "second validation should succeed via cache");
@@ -4569,7 +4557,6 @@ mod tests {
             member_keys,
             revoked_tokens: HashSet::new(),
             routing_id_hex,
-            admission: BroadcastAdmission::Gated,
         };
         let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
 
@@ -4630,6 +4617,205 @@ mod tests {
         assert!(
             cache.is_valid("fresh_cid", now),
             "current generation should allow caching"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 2: open context + per-author gated override + empty
+    // member_keys -> 401 (not structural fallback)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn open_context_per_author_gated_empty_member_keys_rejects() {
+        // An open context with a per-author Gated override but no member keys
+        // should return 401 for the gated author, not structurally validate.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "open_gated_empty_keys_ctx";
+
+        let policy = ProjectionPolicy {
+            default_rule: ProjectionRule::Public,
+            overrides: vec![ProjectionOverride {
+                did: DID::from("did:dht:alice"),
+                rule: ProjectionRule::Gated,
+            }],
+        };
+
+        let projected = ProjectedContext::new(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Open,
+            Some(policy),
+        );
+        // member_keys is empty — no keys configured.
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+        let envelope = test_seal(&key, b"alice content");
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let routing_hex = hex_encode(&routing_id);
+
+        // Provide a structurally valid UCAN — should still get 401 because
+        // member_keys is empty and the per-author override is Gated.
+        let ucan_token = build_test_ucan(context_id);
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .header("Authorization", format!("Bearer {ucan_token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // The feed default rule is Public (so the feed endpoint itself passes),
+        // but per-author filtering should reject alice's messages.
+        // Since the default rule is Public, the handler returns 200
+        // but alice's messages should be filtered out.
+        assert_eq!(
+            resp.status(),
+            HttpStatus::OK,
+            "open context default rule is Public, so 200 is returned"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert!(
+            messages.is_empty(),
+            "alice's messages should be filtered out — empty member_keys means gated auth fails"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 2: wildcard capability rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn structural_validation_rejects_wildcard_capability() {
+        // A UCAN with scp:ctx:*/messages:read should be rejected even though
+        // it structurally matches via cap.matches(&required).
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+
+        let context_id = "wildcard_cap_ctx";
+
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let payload = UcanPayload {
+            iss: "did:dht:test_issuer".to_owned(),
+            aud: "scp:projection:unused".to_owned(),
+            exp: u64::MAX,
+            nbf: None,
+            nnc: "test-nonce-wildcard".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:*/messages:read".to_owned(),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let signature = vec![0u8; 64];
+
+        let token = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(&header_json),
+            URL_SAFE_NO_PAD.encode(&payload_json),
+            URL_SAFE_NO_PAD.encode(&signature),
+        );
+
+        let result = validate_projection_ucan_structural(&token, context_id);
+        assert!(
+            result.is_err(),
+            "wildcard capability (scp:ctx:*/messages:read) should be rejected"
+        );
+    }
+
+    #[test]
+    fn full_validation_rejects_wildcard_capability() {
+        // A properly signed UCAN with scp:ctx:*/messages:read should be
+        // rejected by validate_projection_ucan.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::Signer;
+        use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
+        let context_id = "wildcard_full_ctx";
+        let routing_id = compute_routing_id(context_id);
+        let routing_id_hex = hex_encode(&routing_id);
+
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = UcanPayload {
+            iss: issuer_did.clone(),
+            aud: format!("scp:projection:{routing_id_hex}"),
+            exp: now + 3600,
+            nbf: None,
+            nnc: "test-nonce-wildcard-full".to_owned(),
+            att: vec![Attenuation {
+                // Wildcard context — should be rejected
+                with: "scp:ctx:*/messages:read".to_owned(),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&header_json),
+            URL_SAFE_NO_PAD.encode(&payload_json),
+        );
+        let sig = signing_key.sign(signing_input.as_bytes());
+
+        let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()),);
+
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let validation_state = UcanValidationState {
+            member_keys,
+            revoked_tokens: HashSet::new(),
+            routing_id_hex,
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        let result = validate_projection_ucan(&token, context_id, &validation_state, &cache);
+        assert!(
+            result.is_err(),
+            "wildcard capability (scp:ctx:*/messages:read) should be rejected in full validation"
         );
     }
 }

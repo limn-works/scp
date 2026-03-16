@@ -496,9 +496,13 @@ impl<S: Storage> ApplicationNode<S> {
         }
         // Clear the validation cache and bump the generation counter so
         // in-flight validations started before the rotation are discarded.
-        if let Ok(mut cache) = self.state.projection_ucan_cache.write() {
-            cache.clear_and_bump_generation();
-        }
+        // Use unwrap_or_else to propagate through poisoned locks — key
+        // rotations must always reach the cache.
+        self.state
+            .projection_ucan_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear_and_bump_generation();
     }
 
     /// Adds a token CID to the projected context's revocation set.
@@ -524,9 +528,13 @@ impl<S: Storage> ApplicationNode<S> {
         }
         // Add to the cache's revocation set AND remove from cached entries.
         // This prevents re-caching of the revoked token (TOCTOU defense).
-        if let Ok(mut cache) = self.state.projection_ucan_cache.write() {
-            cache.revoke(token_cid, token_exp);
-        }
+        // Use unwrap_or_else to propagate through poisoned locks — revocations
+        // must always reach the cache.
+        self.state
+            .projection_ucan_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revoke(token_cid, token_exp);
     }
 
     /// Propagates rotated broadcast keys to the projection registry after a
