@@ -16,6 +16,7 @@ design and ``.docs/standards/python.md`` for coding conventions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -310,7 +311,8 @@ class EventLog:
         )
 
         bridge = _bridge()
-        raw_events = bridge.event_log_query(
+        raw_events = await asyncio.to_thread(
+            bridge.event_log_query,
             self._context_id,
             filter_dict if filter_dict else None,
         )
@@ -352,7 +354,7 @@ class EventLog:
         )
 
         bridge = _bridge()
-        raw_proof = bridge.event_log_verify(self._context_id, claim)
+        raw_proof = await asyncio.to_thread(bridge.event_log_verify, self._context_id, claim)
 
         return Proof(
             verified=raw_proof.verified,
@@ -385,7 +387,7 @@ class EventLog:
         )
 
         bridge = _bridge()
-        events = bridge.event_log_query(self._context_id, None)
+        events = await asyncio.to_thread(bridge.event_log_query, self._context_id, None)
 
         if not events:
             return Checkpoint(
@@ -441,7 +443,8 @@ class EventLog:
         )
 
         bridge = _bridge()
-        raw = bridge.event_log_checkpoint(
+        raw = await asyncio.to_thread(
+            bridge.event_log_checkpoint,
             self._context_id,
             identity_did,
             epoch,

@@ -17,6 +17,7 @@ canonical design.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import deque
@@ -307,7 +308,7 @@ class Context:
             "economic_policy": economic_policy,
         }
 
-        handle = _scp_core.py_context_create(creator.did, params)
+        handle = await asyncio.to_thread(_scp_core.py_context_create, creator.did, params)
         return cls(handle=handle, creator_did=creator.did, buffer_size=buffer_size)
 
     # -- Lifecycle ----------------------------------------------------------
@@ -332,7 +333,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        _scp_core.py_context_join(self._handle, identity.did)
+        await asyncio.to_thread(_scp_core.py_context_join, self._handle, identity.did)
         return Membership(
             did=identity.did,
             role="member",
@@ -356,7 +357,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        _scp_core.py_context_leave(self._handle, identity.did)
+        await asyncio.to_thread(_scp_core.py_context_leave, self._handle, identity.did)
 
     async def close(self, identity: Identity) -> None:
         """Close this context.
@@ -377,7 +378,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        _scp_core.py_context_close(self._handle, identity.did)
+        await asyncio.to_thread(_scp_core.py_context_close, self._handle, identity.did)
 
     # -- Messaging ----------------------------------------------------------
 
@@ -405,7 +406,7 @@ class Context:
             ) from exc
 
         sender_did = identity.did if identity is not None else self._creator_did
-        _scp_core.py_context_send(self._handle, sender_did, message)
+        await asyncio.to_thread(_scp_core.py_context_send, self._handle, sender_did, message)
 
     async def receive(self) -> AsyncIterator[Message]:
         """Return an async iterator of incoming messages.
@@ -430,7 +431,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        bridge_receiver = _scp_core.py_context_receive(self._handle)
+        bridge_receiver = await asyncio.to_thread(_scp_core.py_context_receive, self._handle)
         return _ReceiveIterator(bridge_receiver, self._buffer_size)
 
     # -- Tool invocation ----------------------------------------------------
@@ -491,7 +492,8 @@ class Context:
             ) from exc
 
         invoker_did = identity.did if identity is not None else self._creator_did
-        result = _scp_core.tool_invoke(
+        result = await asyncio.to_thread(
+            _scp_core.tool_invoke,
             self.context_id,
             tool,
             input,
@@ -520,7 +522,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        result = _scp_core.py_context_member_count(self._handle)
+        result = await asyncio.to_thread(_scp_core.py_context_member_count, self._handle)
         return int(result) if result is not None else None
 
     async def is_member(self, did: str) -> bool:
@@ -543,7 +545,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        return _scp_core.py_context_is_member(self._handle, did)
+        return await asyncio.to_thread(_scp_core.py_context_is_member, self._handle, did)
 
     async def member_dids(self) -> list[str]:
         """Return all member DIDs in this context.
@@ -562,7 +564,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        return _scp_core.py_context_member_dids(self._handle)
+        return await asyncio.to_thread(_scp_core.py_context_member_dids, self._handle)
 
     async def member_role(self, did: str) -> MemberRole | None:
         """Return the role of a member in this context.
@@ -585,7 +587,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        raw = _scp_core.py_context_member_role(self._handle, did)
+        raw = await asyncio.to_thread(_scp_core.py_context_member_role, self._handle, did)
         if raw is None:
             return None
         return MemberRole.from_bridge(raw)
@@ -614,7 +616,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        _scp_core.py_set_economic_policy(self._handle, policy_json)
+        await asyncio.to_thread(_scp_core.py_set_economic_policy, self._handle, policy_json)
 
     async def get_economic_policy(self) -> str | None:
         """Return the economic policy for this context as a JSON string.
@@ -633,7 +635,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        return _scp_core.py_get_economic_policy(self._handle)
+        return await asyncio.to_thread(_scp_core.py_get_economic_policy, self._handle)
 
     # -- Broadcast operations -----------------------------------------------
 
@@ -657,7 +659,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        _scp_core.py_broadcast_subscribe(self._handle, subscriber_did)
+        await asyncio.to_thread(_scp_core.py_broadcast_subscribe, self._handle, subscriber_did)
 
     async def broadcast_unsubscribe(
         self,
@@ -683,7 +685,9 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        _scp_core.py_broadcast_unsubscribe(self._handle, subscriber_did, rotate_keys)
+        await asyncio.to_thread(
+            _scp_core.py_broadcast_unsubscribe, self._handle, subscriber_did, rotate_keys
+        )
 
     async def broadcast_publish(
         self,
@@ -711,7 +715,7 @@ class Context:
             ) from exc
 
         author_did = identity.did if identity is not None else self._creator_did
-        _scp_core.py_broadcast_publish(self._handle, author_did, payload)
+        await asyncio.to_thread(_scp_core.py_broadcast_publish, self._handle, author_did, payload)
 
     async def broadcast_publish_asset(
         self,
@@ -745,7 +749,8 @@ class Context:
             ) from exc
 
         author_did = identity.did if identity is not None else self._creator_did
-        result = _scp_core.py_broadcast_publish_asset(
+        result = await asyncio.to_thread(
+            _scp_core.py_broadcast_publish_asset,
             self._handle,
             author_did,
             asset.path,
@@ -788,7 +793,8 @@ class Context:
 
         author_did = identity.did if identity is not None else self._creator_did
         asset_tuples = [(a.path, a.content_type, a.body) for a in assets]
-        results = _scp_core.py_broadcast_publish_assets(
+        results = await asyncio.to_thread(
+            _scp_core.py_broadcast_publish_assets,
             self._handle,
             author_did,
             asset_tuples,
@@ -820,7 +826,9 @@ class Context:
             ) from exc
 
         blocker = blocker_did if blocker_did is not None else self._creator_did
-        _scp_core.py_broadcast_block_subscriber(self._handle, subscriber_did, blocker)
+        await asyncio.to_thread(
+            _scp_core.py_broadcast_block_subscriber, self._handle, subscriber_did, blocker
+        )
 
     async def broadcast_unblock_subscriber(
         self,
@@ -850,7 +858,12 @@ class Context:
             ) from exc
 
         unblocker = unblocker_did if unblocker_did is not None else self._creator_did
-        _scp_core.py_broadcast_unblock_subscriber(self._handle, subscriber_did, unblocker)
+        await asyncio.to_thread(
+            _scp_core.py_broadcast_unblock_subscriber,
+            self._handle,
+            subscriber_did,
+            unblocker,
+        )
 
     async def broadcast_handle_key_request(
         self,
@@ -877,7 +890,12 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        return _scp_core.py_broadcast_handle_key_request(self._handle, author_did, requester_did)
+        return await asyncio.to_thread(
+            _scp_core.py_broadcast_handle_key_request,
+            self._handle,
+            author_did,
+            requester_did,
+        )
 
     async def broadcast_subscriber_count(self) -> int | None:
         """Return the number of broadcast subscribers for this context.
@@ -897,7 +915,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        result = _scp_core.py_broadcast_subscriber_count(self._handle)
+        result = await asyncio.to_thread(_scp_core.py_broadcast_subscriber_count, self._handle)
         return int(result) if result is not None else None
 
     async def broadcast_is_subscriber(self, did: str) -> bool:
@@ -920,7 +938,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        return _scp_core.py_broadcast_is_subscriber(self._handle, did)
+        return await asyncio.to_thread(_scp_core.py_broadcast_is_subscriber, self._handle, did)
 
     async def broadcast_admission(self) -> str | None:
         """Return the broadcast admission policy for this context.
@@ -940,7 +958,7 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        return _scp_core.py_broadcast_admission(self._handle)
+        return await asyncio.to_thread(_scp_core.py_broadcast_admission, self._handle)
 
     # -- Configuration ------------------------------------------------------
 

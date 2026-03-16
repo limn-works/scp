@@ -16,6 +16,7 @@ See ``.docs/adrs/phase-3.md`` ADR-015 for the full design.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -189,7 +190,7 @@ class McpServer:
             return
         logger.info("Stopping MCP server (transport=%s)", self._transport)
         bridge = _bridge()
-        bridge.py_mcp_server_stop(self._handle)
+        await asyncio.to_thread(bridge.py_mcp_server_stop, self._handle)
         self._stopped = True
         logger.debug("MCP server stopped")
 
@@ -309,7 +310,8 @@ async def serve_mcp(
     bridge = _bridge()
 
     context_ids = [c.context_id for c in contexts]
-    handle = bridge.py_mcp_serve(
+    handle = await asyncio.to_thread(
+        bridge.py_mcp_serve,
         identity.did,
         context_ids,
         transport,
@@ -661,9 +663,9 @@ class McpClient:
         bridge = _bridge()
 
         if transport == "stdio":
-            handle = bridge.py_mcp_client_connect_stdio(command)
+            handle = await asyncio.to_thread(bridge.py_mcp_client_connect_stdio, command)
         else:
-            handle = bridge.py_mcp_client_connect_sse(url)
+            handle = await asyncio.to_thread(bridge.py_mcp_client_connect_sse, url)
 
         client = cls(handle=handle, transport=transport, command=command)
         logger.info("MCP client connected (transport=%s)", transport)
@@ -679,7 +681,7 @@ class McpClient:
             TransportError: If the server communication fails.
         """
         bridge = _bridge()
-        raw_tools = bridge.py_mcp_client_list_tools(self._handle)
+        raw_tools = await asyncio.to_thread(bridge.py_mcp_client_list_tools, self._handle)
         return [
             McpToolDefinition(
                 name=t["name"],
@@ -716,7 +718,8 @@ class McpClient:
             TransportError: If server communication fails.
         """
         bridge = _bridge()
-        raw = bridge.py_mcp_client_invoke(
+        raw = await asyncio.to_thread(
+            bridge.py_mcp_client_invoke,
             self._handle,
             tool,
             input,
@@ -747,7 +750,7 @@ class McpClient:
             return
         logger.info("Disconnecting MCP client (transport=%s)", self._transport)
         bridge = _bridge()
-        bridge.py_mcp_client_disconnect(self._handle)
+        await asyncio.to_thread(bridge.py_mcp_client_disconnect, self._handle)
         self._disconnected = True
         logger.debug("MCP client disconnected")
 
@@ -820,7 +823,6 @@ def cli_main() -> None:
         scp-mcp serve --identity <did> --relay <relay_url> --transport stdio
     """
     import argparse
-    import asyncio
 
     parser = argparse.ArgumentParser(
         prog="scp-mcp",
@@ -884,11 +886,11 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
 
     # Step 3: Load active contexts via the bridge.
     bridge = _bridge()
-    context_handles = bridge.py_mcp_load_contexts(did, relay_url)
+    context_handles = await asyncio.to_thread(bridge.py_mcp_load_contexts, did, relay_url)
 
     # Step 4: Start the MCP server.
     context_ids = [h["context_id"] for h in context_handles]
-    handle = bridge.py_mcp_serve(did, context_ids, transport)
+    handle = await asyncio.to_thread(bridge.py_mcp_serve, did, context_ids, transport)
 
     logger.info(
         "MCP server running: %d contexts, transport=%s",
@@ -906,8 +908,6 @@ async def _wait_for_shutdown(handle: Any, transport: str) -> None:
     For stdio transport, waits until stdin is closed (EOF).
     For SSE transport, waits until a termination signal is received.
     """
-    import asyncio
-
     bridge = _bridge()
     try:
         # The bridge provides a blocking wait that we run in a thread
@@ -916,7 +916,7 @@ async def _wait_for_shutdown(handle: Any, transport: str) -> None:
         await loop.run_in_executor(None, bridge.py_mcp_server_wait, handle)
     except KeyboardInterrupt:
         logger.info("Received interrupt, shutting down MCP server")
-        bridge.py_mcp_server_stop(handle)
+        await asyncio.to_thread(bridge.py_mcp_server_stop, handle)
 
 
 __all__ = [
