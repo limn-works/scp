@@ -6164,17 +6164,25 @@ fn broadcast_content_wire_format_matches_wasm() {
             body: b"cafe",
             desc: "Unicode NFC path",
         },
+        TestCase {
+            path: "/cafe\u{0301}.html", // NFD: 'e' + combining acute accent
+            content_type: "text/html",
+            deploy_id: Some("deploy-nfd"),
+            body: b"nfd",
+            desc: "Unicode NFD path (must NFC-normalize to match)",
+        },
     ];
 
     for tc in &test_cases {
         // Compute etag as SHA-256 hex of body (matches compute_etag).
         let etag = scp_core::context::broadcast_content::compute_etag(tc.body);
 
-        // Serialize via scp-core.
+        // Serialize via scp-core (ContentPath::new normalizes NFD → NFC).
+        let content_path = ContentPath::new(tc.path).unwrap();
         let content = BroadcastContent {
             version: BROADCAST_CONTENT_VERSION,
             metadata: ContentMetadata {
-                path: Some(ContentPath::new(tc.path).unwrap()),
+                path: Some(content_path.clone()),
                 content_type: Some(MimeType::new(tc.content_type).unwrap()),
                 deploy_id: tc.deploy_id.map(str::to_owned),
                 etag: Some(etag.clone()),
@@ -6184,9 +6192,11 @@ fn broadcast_content_wire_format_matches_wasm() {
         };
         let core_bytes = serialize_broadcast_content(&content).unwrap();
 
-        // Serialize via WASM mirror.
+        // Serialize via WASM mirror. Use the NFC-normalized path (matching
+        // the real WASM bridge which validates/normalizes before serializing).
+        let normalized_path = content_path.as_str();
         let wasm_bytes = wasm_broadcast_mirror::serialize_broadcast_content_wasm(
-            tc.path,
+            normalized_path,
             tc.content_type,
             tc.deploy_id,
             &etag,
@@ -6214,7 +6224,7 @@ fn broadcast_content_wire_format_matches_wasm() {
         );
         assert_eq!(
             deserialized.metadata.path.as_ref().unwrap().as_str(),
-            tc.path,
+            normalized_path,
             "round-trip path mismatch for {}",
             tc.desc
         );
@@ -6243,6 +6253,8 @@ fn broadcast_content_path_validation_matches_wasm() {
         "/assets/style.css",
         "/a/b/c/d.js",
         "/caf\u{00E9}.html",
+        "/",
+        "/cafe\u{0301}.html", // NFD input, normalizes to NFC
     ];
     for path in &valid_paths {
         let core_result = ContentPath::new(*path);
@@ -6257,10 +6269,18 @@ fn broadcast_content_path_validation_matches_wasm() {
             "WASM rejected valid path {path:?}: {:?}",
             wasm_result.err()
         );
+        // Cross-check: normalized paths must match between core and WASM.
+        let core_normalized = core_result.unwrap().as_str().to_owned();
+        let wasm_normalized = wasm_result.unwrap();
+        assert_eq!(
+            core_normalized, wasm_normalized,
+            "normalized path mismatch for {path:?}: core={core_normalized:?}, wasm={wasm_normalized:?}"
+        );
     }
 
     // Invalid paths: both must reject.
     let invalid_paths = [
+        "",
         "no-leading-slash",
         "/path/../traversal",
         "/double//slash",
