@@ -6192,11 +6192,14 @@ fn broadcast_content_wire_format_matches_wasm() {
         };
         let core_bytes = serialize_broadcast_content(&content).unwrap();
 
-        // Serialize via WASM mirror. Use the NFC-normalized path (matching
-        // the real WASM bridge which validates/normalizes before serializing).
-        let normalized_path = content_path.as_str();
+        // Serialize via WASM mirror. Feed through validate_content_path_wasm
+        // first (matching the real WASM bridge which validates/normalizes
+        // before serializing). For NFC inputs this is a no-op; for NFD inputs
+        // this exercises the WASM normalization pipeline.
+        let wasm_normalized_path = wasm_broadcast_mirror::validate_content_path_wasm(tc.path)
+            .unwrap_or_else(|e| panic!("WASM path validation failed for {}: {e}", tc.desc));
         let wasm_bytes = wasm_broadcast_mirror::serialize_broadcast_content_wasm(
-            normalized_path,
+            &wasm_normalized_path,
             tc.content_type,
             tc.deploy_id,
             &etag,
@@ -6224,7 +6227,7 @@ fn broadcast_content_wire_format_matches_wasm() {
         );
         assert_eq!(
             deserialized.metadata.path.as_ref().unwrap().as_str(),
-            normalized_path,
+            &wasm_normalized_path,
             "round-trip path mismatch for {}",
             tc.desc
         );
