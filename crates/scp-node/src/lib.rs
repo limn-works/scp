@@ -474,6 +474,69 @@ impl<S: Storage> ApplicationNode<S> {
         registry.remove(&routing_id);
     }
 
+    /// Updates the cached member public keys for a projected context.
+    ///
+    /// Called when context membership changes (new subscribers, removed
+    /// subscribers, key rotations). No-op if the context is not projected.
+    /// Also clears the UCAN validation cache since cached validations may
+    /// reference stale keys.
+    ///
+    /// See spec section 18.11.6.
+    pub async fn update_projection_member_keys(
+        &self,
+        context_id: &str,
+        member_keys: HashMap<String, [u8; 32]>,
+    ) {
+        let routing_id = projection::compute_routing_id(context_id);
+        {
+            let mut registry = self.state.projected_contexts.write().await;
+            if let Some(projected) = registry.get_mut(&routing_id) {
+                projected.update_member_keys(member_keys);
+            }
+        }
+        // Clear the validation cache and bump the generation counter so
+        // in-flight validations started before the rotation are discarded.
+        // Use unwrap_or_else to propagate through poisoned locks — key
+        // rotations must always reach the cache.
+        self.state
+            .projection_ucan_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear_and_bump_generation();
+    }
+
+    /// Adds a token CID to the projected context's revocation set.
+    ///
+    /// Tokens matching this CID will be rejected on subsequent requests.
+    /// The CID is `SHA-256(encoded_jwt)` hex-encoded, matching the format
+    /// used by `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
+    /// `token_exp` is the UCAN's `exp` field, used for pruning stale
+    /// revocations. No-op if the context is not projected.
+    ///
+    /// Also adds the CID to the validation cache's revocation set and
+    /// removes any cached validation entry, preventing TOCTOU races where
+    /// a revoked token could be re-cached.
+    ///
+    /// See spec section 18.11.6.
+    pub async fn revoke_projection_token(&self, context_id: &str, token_cid: &str, token_exp: u64) {
+        let routing_id = projection::compute_routing_id(context_id);
+        {
+            let mut registry = self.state.projected_contexts.write().await;
+            if let Some(projected) = registry.get_mut(&routing_id) {
+                projected.revoke_token(token_cid, token_exp);
+            }
+        }
+        // Add to the cache's revocation set AND remove from cached entries.
+        // This prevents re-caching of the revoked token (TOCTOU defense).
+        // Use unwrap_or_else to propagate through poisoned locks — revocations
+        // must always reach the cache.
+        self.state
+            .projection_ucan_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revoke(token_cid, token_exp);
+    }
+
     /// Propagates rotated broadcast keys to the projection registry after a
     /// governance ban.
     ///
@@ -2640,6 +2703,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
             projection_rate_limit,
         ),
+        projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
         did_document: document.clone(),
@@ -2784,6 +2848,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
             projection_rate_limit,
         ),
+        projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: None,
         cert_resolver: None,
         did_document: document.clone(),

@@ -132,6 +132,20 @@ pub struct NodeState {
     /// Configurable via `SCP_NODE_PROJECTION_RATE_LIMIT` (default 60 req/s).
     /// See spec section 18.11.6.
     pub(crate) projection_rate_limiter: PublishRateLimiter,
+    /// Cache of recently validated UCAN tokens for projection endpoints.
+    ///
+    /// Amortizes Ed25519 signature verification cost across repeated
+    /// requests with the same token. Entries expire after 60 seconds.
+    /// Separate from the projected context registry so validation can
+    /// proceed without a write lock on the registry.
+    ///
+    /// Uses `std::sync::RwLock` (not tokio) because the critical sections
+    /// are short (`HashMap` lookups/inserts, no async I/O) and the cache
+    /// is accessed from synchronous validation functions called within
+    /// async handlers.
+    ///
+    /// See spec section 18.11.6.
+    pub(crate) projection_ucan_cache: std::sync::RwLock<crate::projection::ProjectionUcanCache>,
     /// TLS configuration for the public HTTPS listener.
     ///
     /// When `Some`, [`ApplicationNode::serve`] terminates TLS using
@@ -881,6 +895,9 @@ mod tests {
             cors_origins,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
                 1000,
+            ),
+            projection_ucan_cache: std::sync::RwLock::new(
+                crate::projection::ProjectionUcanCache::new(),
             ),
             tls_config: None,
             cert_resolver: None,
