@@ -173,7 +173,13 @@ impl CapabilityUri {
     }
 
     fn matches(&self, required: &Self) -> bool {
-        if self.resource != required.resource || self.action != required.action {
+        // Resource must always match exactly.
+        if self.resource != required.resource {
+            return false;
+        }
+        // Action: wildcard "*" on the granting side matches any required action.
+        // Otherwise, actions must match exactly.
+        if self.action != "*" && self.action != required.action {
             return false;
         }
         match (&self.context_id, &required.context_id) {
@@ -571,7 +577,10 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
 
     // Step 8: Capability ceiling check.
     let cap_name = required_cap.capability_name();
-    if !ceiling.is_empty() && !ceiling.contains(&cap_name) {
+    if !ceiling.is_empty()
+        && !ceiling.contains(&cap_name)
+        && !ceiling.contains(&format!("{}:*", required_cap.resource))
+    {
         return Err(format!("capability outside ceiling: {cap_name}"));
     }
 
@@ -1982,6 +1991,104 @@ mod tests {
         assert!(
             err.contains("signature verification failed"),
             "expected signature error at step 2, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CapabilityUri::matches() wildcard action
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_matches_wildcard_action_grants_specific() {
+        let granted = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "tool_invoke".to_owned(),
+            action: "*".to_owned(),
+        };
+        let required = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "tool_invoke".to_owned(),
+            action: "calculator".to_owned(),
+        };
+        assert!(
+            granted.matches(&required),
+            "wildcard action '*' should match specific action 'calculator'"
+        );
+    }
+
+    #[test]
+    fn capability_matches_wildcard_action_does_not_cross_resources() {
+        let granted = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "tool_invoke".to_owned(),
+            action: "*".to_owned(),
+        };
+        let required = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "messages".to_owned(),
+            action: "write".to_owned(),
+        };
+        assert!(
+            !granted.matches(&required),
+            "wildcard on tool_invoke must not match messages resource"
+        );
+    }
+
+    #[test]
+    fn capability_matches_specific_does_not_satisfy_wildcard_requirement() {
+        let granted = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "tool_invoke".to_owned(),
+            action: "calculator".to_owned(),
+        };
+        let required = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "tool_invoke".to_owned(),
+            action: "*".to_owned(),
+        };
+        assert!(
+            !granted.matches(&required),
+            "specific grant must not satisfy wildcard requirement"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling wildcard fallback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ceiling_wildcard_fallback_allows_specific_action() {
+        // A ceiling containing "tool_invoke:*" should allow
+        // a capability with "tool_invoke:calculator".
+        let cap = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "tool_invoke".to_owned(),
+            action: "calculator".to_owned(),
+        };
+        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
+        let cap_name = cap.capability_name();
+        let within_ceiling =
+            ceiling.contains(&cap_name) || ceiling.contains(&format!("{}:*", cap.resource));
+        assert!(
+            within_ceiling,
+            "ceiling with 'tool_invoke:*' should cover 'tool_invoke:calculator'"
+        );
+    }
+
+    #[test]
+    fn ceiling_wildcard_does_not_cross_resources() {
+        let cap = CapabilityUri {
+            context_id: Some("ctx-1".to_owned()),
+            resource: "messages".to_owned(),
+            action: "write".to_owned(),
+        };
+        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
+        let cap_name = cap.capability_name();
+        let within_ceiling =
+            ceiling.contains(&cap_name) || ceiling.contains(&format!("{}:*", cap.resource));
+        assert!(
+            !within_ceiling,
+            "ceiling with 'tool_invoke:*' should not cover 'messages:write'"
         );
     }
 

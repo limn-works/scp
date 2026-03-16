@@ -147,14 +147,22 @@ impl CapabilityUri {
     ///
     /// A wildcard URI matches any URI with the same resource and action.
     /// A specific URI matches only URIs with the same context ID, resource,
-    /// and action.
+    /// and action. A wildcard action (`"*"`) on the granting URI matches any
+    /// action on the same resource (e.g., `tool_invoke:*` grants
+    /// `tool_invoke:calculator`).
     ///
     /// This is used during capability matching in UCAN validation: a token's
     /// attenuation must match the required capability.
     #[must_use]
     pub fn matches(&self, required: &Self) -> bool {
-        // Resource and action must always match exactly.
-        if self.resource != required.resource || self.action != required.action {
+        // Resource must always match exactly.
+        if self.resource != required.resource {
+            return false;
+        }
+
+        // Action: wildcard "*" on the granting side matches any required action.
+        // Otherwise, actions must match exactly.
+        if self.action != "*" && self.action != required.action {
             return false;
         }
 
@@ -176,13 +184,22 @@ impl CapabilityUri {
     /// (e.g., `"messages:write"`, `"tool_invoke:assistant"`). This performs a
     /// constant-time set membership test as specified by ADR-016.
     ///
+    /// A wildcard entry `{resource}:*` in the ceiling covers all actions on
+    /// that resource. For example, `"tool_invoke:*"` in the ceiling allows
+    /// `tool_invoke:calculator`, `tool_invoke:assistant`, etc.
+    ///
     /// # Arguments
     ///
     /// * `ceiling` - The context's immutable capability ceiling, represented as
     ///   a set of capability name strings.
     #[must_use]
     pub fn is_within_ceiling<S: BuildHasher>(&self, ceiling: &HashSet<String, S>) -> bool {
-        ceiling.contains(&self.capability_name())
+        // Exact match first (fast path).
+        if ceiling.contains(&self.capability_name()) {
+            return true;
+        }
+        // Check for wildcard: {resource}:* covers all actions on this resource.
+        ceiling.contains(&format!("{}:*", self.resource))
     }
 }
 
@@ -588,6 +605,45 @@ mod tests {
         assert!(!granted.matches(&required));
     }
 
+    #[test]
+    fn matches_wildcard_action_grants_specific_action() {
+        // tool_invoke:* grants tool_invoke:calculator (#1326)
+        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let required = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        assert!(granted.matches(&required));
+    }
+
+    #[test]
+    fn matches_wildcard_action_grants_any_action_on_same_resource() {
+        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let required_a = CapabilityUri::new("abc123", "tool_invoke", "assistant");
+        let required_b = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        assert!(granted.matches(&required_a));
+        assert!(granted.matches(&required_b));
+    }
+
+    #[test]
+    fn matches_wildcard_action_does_not_cross_resources() {
+        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let required = CapabilityUri::new("abc123", "messages", "write");
+        assert!(!granted.matches(&required));
+    }
+
+    #[test]
+    fn matches_wildcard_action_with_wildcard_context() {
+        let granted = CapabilityUri::wildcard("tool_invoke", "*");
+        let required = CapabilityUri::new("any-ctx", "tool_invoke", "calculator");
+        assert!(granted.matches(&required));
+    }
+
+    #[test]
+    fn matches_specific_action_does_not_satisfy_wildcard_action_requirement() {
+        // A specific grant cannot satisfy a wildcard action requirement.
+        let granted = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        let required = CapabilityUri::new("abc123", "tool_invoke", "*");
+        assert!(!granted.matches(&required));
+    }
+
     // -----------------------------------------------------------------------
     // is_within_ceiling
     // -----------------------------------------------------------------------
@@ -630,6 +686,34 @@ mod tests {
         let ceiling: HashSet<String> = HashSet::new();
         let uri = CapabilityUri::new("abc123", "messages", "write");
         assert!(!uri.is_within_ceiling(&ceiling));
+    }
+
+    #[test]
+    fn is_within_ceiling_wildcard_action_covers_specific() {
+        // "tool_invoke:*" in ceiling allows tool_invoke:calculator (#1326)
+        let ceiling: HashSet<String> = ["tool_invoke:*".to_owned()].into_iter().collect();
+        let uri = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        assert!(uri.is_within_ceiling(&ceiling));
+    }
+
+    #[test]
+    fn is_within_ceiling_wildcard_action_does_not_cross_resources() {
+        let ceiling: HashSet<String> = ["tool_invoke:*".to_owned()].into_iter().collect();
+        let uri = CapabilityUri::new("abc123", "messages", "write");
+        assert!(!uri.is_within_ceiling(&ceiling));
+    }
+
+    #[test]
+    fn is_within_ceiling_exact_match_preferred_over_wildcard() {
+        // Both exact and wildcard are present — exact match takes the fast path.
+        let ceiling: HashSet<String> = [
+            "tool_invoke:calculator".to_owned(),
+            "tool_invoke:*".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let uri = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        assert!(uri.is_within_ceiling(&ceiling));
     }
 
     // -----------------------------------------------------------------------

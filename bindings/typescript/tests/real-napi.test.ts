@@ -335,35 +335,30 @@ if (bridge === null) {
       expect(toolId.length).toBeGreaterThan(0);
     });
 
-    // toolInvoke requires UCAN authorization. Three naming mismatches exist:
-    // 1. mint_ucan splits "tool:invoke:*" → resource="tool", action="invoke:*".
-    //    validate_tool_invocation_ucan creates resource="tool_invoke", action=toolId.
-    // 2. The CapabilityUri.matches() check requires exact resource+action match,
-    //    so "tool"/"invoke:*" never matches "tool_invoke"/toolId.
-    // 3. Ceiling uses Capability::to_string() → "tool:invoke:*" but CapabilityUri
-    //    ceiling check uses capability_name() → "tool_invoke:*". Different strings.
-    // Root cause: Capability enum (roles.rs) and CapabilityUri (capability.rs) use
-    // incompatible naming conventions. Needs a coordinated fix across both systems.
-    // See #1144.
-    test.skip("invokes a registered tool (Capability/CapabilityUri naming mismatch)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+    test("invokes a registered tool", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
-        identity,
+        admin,
         JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
       );
       const toolId = await napi.toolRegister(ctx, {
         name: "test-tool",
         description: "A test tool",
-        inputSchema: { type: "object" },
+        inputSchema: {
+          type: "object",
+          properties: { x: { type: "number" }, y: { type: "number" } },
+        },
         outputSchema: { type: "object" },
-        operator: identity.did,
+        operator: admin.did,
       });
-      const ucan = await napi.ucanMint(ctx, identity.did, ["tool:invoke:*"]);
+      // Mint UCAN for the member (not self-delegation).
+      const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
         toolId,
-        JSON.stringify({ x: 42 }),
-        identity.did,
+        JSON.stringify({ x: 42, y: 7 }),
+        member.did,
         ucan.encoded,
       );
       expect(typeof resultJson).toBe("string");
@@ -944,14 +939,11 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E tool lifecycle (real NAPI)", () => {
-    // Capability enum (roles.rs) uses "tool:invoke:*" but CapabilityUri
-    // (capability.rs) expects "tool_invoke" as a single resource token.
-    // Three-way naming mismatch between mint, validate, and ceiling.
-    // See detailed comment in "invokes a registered tool" test and #1144.
-    test.skip("register -> invoke -> verify (Capability/CapabilityUri naming mismatch)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+    test("register -> invoke -> verify", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
-        identity,
+        admin,
         JSON.stringify({
           ceiling: ["tool:register", "tool:invoke:*"],
         }),
@@ -963,23 +955,23 @@ if (bridge === null) {
         description: "End-to-end test tool",
         inputSchema: {
           type: "object",
-          properties: { value: { type: "number" } },
+          properties: { value: { type: "number" }, mode: { type: "string" } },
         },
         outputSchema: {
           type: "object",
-          properties: { doubled: { type: "number" } },
+          properties: { doubled: { type: "number" }, ok: { type: "boolean" } },
         },
-        operator: identity.did,
+        operator: admin.did,
       });
       expect(toolId).toBeTruthy();
 
-      // Invoke.
-      const ucan = await napi.ucanMint(ctx, identity.did, ["tool:invoke:*"]);
+      // Invoke (mint for member, not self-delegation).
+      const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
         toolId,
         JSON.stringify({ value: 21 }),
-        identity.did,
+        member.did,
         ucan.encoded,
       );
       expect(typeof resultJson).toBe("string");
