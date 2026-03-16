@@ -177,7 +177,9 @@ if (bridge === null) {
       await napi.contextJoin(ctx, joiner.did);
     });
 
-    test.skip("sends a message without error (requires real MLS crypto provider)", async () => {
+    // NapiBridgeCryptoProvider::encrypt_message returns error for non-broadcast
+    // contexts. contextSend requires a production MLS crypto provider.
+    test.skip("sends a message without error (NapiBridgeCryptoProvider::encrypt_message not implemented)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -335,11 +337,11 @@ if (bridge === null) {
       expect(toolId.length).toBeGreaterThan(0);
     });
 
-    // toolInvoke requires UCAN authorization but the NAPI bridge's
-    // validate_tool_invocation_ucan uses a different capability URI format
-    // (tool_invoke:{id}) than what ucanMint produces (tool:invoke:*).
-    // Skip until the Rust UCAN capability URI format is unified. See #1144.
-    test.skip("invokes a registered tool (UCAN capability URI format mismatch)", async () => {
+    // validate_tool_invocation_ucan expects CapabilityUri resource "tool_invoke"
+    // but mint_ucan splits "tool:invoke:*" into resource="tool", action="invoke:*".
+    // The resource mismatch ("tool" vs "tool_invoke") causes validation to fail.
+    // This is a Rust-side URI format inconsistency between roles.rs and capability.rs.
+    test.skip("invokes a registered tool (UCAN capability URI format mismatch: tool_invoke vs tool:invoke)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -414,10 +416,10 @@ if (bridge === null) {
       expect(token.capabilities.some((c: string) => c.endsWith("/messages:read"))).toBe(true);
     });
 
-    // ucanValidate requires DHT resolution of the issuer DID (signature
-    // verification needs the public key from the DID document). In-memory
-    // identities aren't published to DHT. Skip until #1144 addresses DHT.
-    test.skip("validates a minted token for a granted capability (requires shared DID resolver)", async () => {
+    // IdentityBackedDidResolver cannot resolve locally-created in-memory identities
+    // because the resolver's InMemoryDhtClient is a separate instance from the one
+    // used during identity_create. DID resolution fails with "DID not found".
+    test.skip("validates a minted token for a granted capability (IdentityBackedDidResolver cannot resolve local DIDs)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
@@ -454,10 +456,11 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("Event log (real NAPI)", () => {
-    // Event log queries return 0 events because context creation does not
-    // append events without a functional crypto provider. Skip until a
-    // real MLS crypto backend is wired into the NAPI bridge. See #1144.
-    test.skip("queries events after context creation (EventLog stores hashes only, not payloads)", async () => {
+    // EventLog stores only leaf hashes (Merkle tree), not event payloads.
+    // eventLogQuery returns metadata (type, actor, sequence) from the event
+    // log provider, but the NAPI bridge's MerkleEventLogProvider only stores
+    // event type strings. Tracked in #1014.
+    test.skip("queries events after context creation (EventLog stores hashes only, not payloads — #1014)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -470,7 +473,8 @@ if (bridge === null) {
       expect(typeof events[0]?.sequence).toBe("number");
     });
 
-    test.skip("queries events with a filter (contextSend requires real MLS crypto)", async () => {
+    // contextSend fails: NapiBridgeCryptoProvider::encrypt_message not implemented.
+    test.skip("queries events with a filter (contextSend requires production MLS crypto)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -482,7 +486,9 @@ if (bridge === null) {
       expect(Array.isArray(events)).toBe(true);
     });
 
-    test.skip("verifies an inclusion proof (event log empty without MLS crypto)", async () => {
+    // Event log is empty after context creation — no events to verify against.
+    // Inclusion proof requires at least one event (e.g., after contextSend).
+    test.skip("verifies an inclusion proof (event log is empty after context creation)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -847,10 +853,9 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E context lifecycle (real NAPI)", () => {
-    // contextSend requires a real MLS crypto provider; the NAPI bridge uses a
-    // stub NapiBridgeCryptoProvider that rejects encrypt_message. Skip until a
-    // production crypto backend is wired. See #1144.
-    test.skip("create -> join -> send -> membership check -> leave -> close (requires real MLS crypto)", async () => {
+    // contextSend requires a production MLS crypto provider — NapiBridgeCryptoProvider
+    // rejects encrypt_message for non-broadcast contexts.
+    test.skip("create -> join -> send -> membership check -> leave -> close (NapiBridgeCryptoProvider::encrypt_message not implemented)", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -890,8 +895,9 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E UCAN lifecycle (real NAPI)", () => {
-    // ucanValidate requires DHT resolution of the issuer DID. Skip until #1144.
-    test.skip("mint -> validate -> revoke -> validation fails (requires shared DID resolver)", async () => {
+    // IdentityBackedDidResolver cannot resolve locally-created in-memory identities —
+    // same issue as "validates a minted token" above.
+    test.skip("mint -> validate -> revoke -> validation fails (IdentityBackedDidResolver cannot resolve local DIDs)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -926,10 +932,10 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E tool lifecycle (real NAPI)", () => {
-    // toolInvoke UCAN validation uses a different capability URI format
-    // (tool_invoke:{id}) than what ucanMint produces (tool:invoke:*).
-    // Skip until the Rust UCAN capability URI format is unified. See #1144.
-    test.skip("register -> invoke -> verify (UCAN capability URI format mismatch)", async () => {
+    // Same UCAN capability URI format mismatch as the individual toolInvoke
+    // test: validate_tool_invocation_ucan expects "tool_invoke" resource, but
+    // mint_ucan splits "tool:invoke:*" into "tool" / "invoke:*".
+    test.skip("register -> invoke -> verify (UCAN capability URI format mismatch: tool_invoke vs tool:invoke)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -1100,8 +1106,8 @@ if (bridge === null) {
       expect(typeof admission).toBe("string");
     });
 
-    // broadcastPublish requires a configured transport relay; the NAPI bridge
-    // does not auto-configure transport in tests. See #1144.
+    // broadcastPublish requires a configured transport relay.
+    // NotConfiguredTransportProvider returns descriptive errors.
     test.skip("publish sends a broadcast message (requires configured transport relay)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1116,10 +1122,11 @@ if (bridge === null) {
       await napi.broadcastPublish(ctx, identity.did, payload);
     });
 
-    // block_broadcast_subscriber does not remove the subscriber from the
-    // subscriber set in the current Rust implementation. The block list is
-    // maintained separately but isSubscriber still returns true. See #1144.
-    test.skip("block subscriber removes and blocks a subscriber (Rust block list is separate from subscriber set)", async () => {
+    // Per §5.14.8: per-author blocking does NOT remove from the context-wide
+    // subscriber roster. The subscriber loses access to the blocking author's
+    // content only, not to other authors'. Only governance_ban_subscriber
+    // removes from the roster.
+    test("block subscriber adds to block list without removing from roster", async () => {
       const identity = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1134,11 +1141,15 @@ if (bridge === null) {
       await napi.broadcastSubscribe(ctx, subscriber.did);
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
 
+      // Block does not throw.
       await napi.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
-      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+      // Per §5.14.8: subscriber stays in the roster after per-author block.
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
+      // Subscriber count unchanged (still in roster).
+      expect(await napi.broadcastSubscriberCount(ctx)).toBe(1);
     });
 
-    test.skip("unblock restores subscriber after block (Rust block list is separate from subscriber set)", async () => {
+    test("unblock after block does not throw and subscriber remains in roster", async () => {
       const identity = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1154,9 +1165,12 @@ if (bridge === null) {
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
 
       await napi.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
-      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+      // Subscriber stays in roster after block (§5.14.8).
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
 
+      // Unblock does not throw.
       await napi.broadcastUnblockSubscriber(ctx, subscriber.did, identity.did);
+      // Subscriber still in roster after unblock.
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
     });
 
@@ -1313,9 +1327,9 @@ if (bridge === null) {
       expect(data.length).toBeGreaterThan(0);
     });
 
-    // context_import triggers a crypto operation (re-establishing MLS state)
-    // which the stub NapiBridgeCryptoProvider cannot perform. See #1144.
-    test.skip("exports and imports a context round-trip (import requires real MLS crypto)", async () => {
+    // context_import fails because the context already exists in the ContextManager
+    // (same context ID from the export). Would need a separate manager or cleanup.
+    test.skip("exports and imports a context round-trip (context already exists on import)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -1456,7 +1470,8 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E broadcast lifecycle (real NAPI)", () => {
-    // broadcastPublish requires a configured transport relay. See #1144.
+    // broadcastPublish requires a configured transport relay.
+    // NotConfiguredTransportProvider returns descriptive errors.
     test.skip("create -> subscribe -> publish -> check subscriber -> unsubscribe (requires configured transport relay)", async () => {
       const author = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
