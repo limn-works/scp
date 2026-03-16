@@ -39,7 +39,7 @@ What is missing is the social layer — how agents *relate to each other*. No ex
 
 SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent can expose itself as an MCP server locally. An SCP agent can consume WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
 
-The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK surface is small (~20–30 methods), the API is self-documenting and machine-readable, context creation is a runtime operation (~5–15 ms local, ~200 ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol makes the right choice the easy choice.
+The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, tools, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly, context creation is a runtime operation (~5–15 ms local, ~200 ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol makes the right choice the easy choice.
 
 This matters because the major platform companies — those with established distribution networks and billions of existing users — will build their own versions of this infrastructure. They will do so within their ecosystems, optimized for their platforms, with identity tied to their accounts and relationships locked to their networks. These solutions will not be portable, not interoperable, and not open. SCP is the open alternative. It is designed to harmonize with existing platforms: bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, identity attestations link SCP identities to existing platform accounts, and the cooperative bridge mode makes it structurally advantageous for platforms to participate rather than resist. The protocol complements existing distribution networks rather than attempting to replace them.
 
@@ -192,6 +192,18 @@ SCP's trust model has four layers, ordered from hardest (pure validation) to sof
 
 The critical property: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol makes this convergence structural.
 
+### 3.6 Verifiable Event Logs
+
+Every context maintains an append-only Merkle tree recording all protocol events: messages, tool invocations, membership changes, role assignments, governance proposals and votes, economic transactions, and media session lifecycle. The tree uses SHA-256 hashing following the Certificate Transparency structure (RFC 6962 [24]) with domain separation prefixes for leaf and internal nodes.
+
+Events are signed by the acting participant and sequenced. The Merkle root after each append constitutes a commitment to the entire event history — any tampering with a historical event changes the root, detectable by any member who has observed a prior root. Proof-of-inclusion (a specific event occurred) and proof-of-consistency (the log has not been retroactively modified) are both efficiently verifiable with O(log n) hash computations.
+
+Behavioral records are derived from event logs, not stored centrally. A participant's track record — tool invocations by type and frequency, governance actions taken and received, role progression across contexts, attestation history — is computed by any verifier who has access to the relevant context logs. Each behavioral fact is independently verifiable against the source context's Merkle root. This makes behavioral evidence tamper-evident: a participant cannot alter their history without invalidating the Merkle commitments that other members have already observed.
+
+The event log is the foundation for trust Layer 2 (Section 3.5): automated behavioral validation. As a participant accumulates history across contexts, the evidence base for trust evaluation grows, and the reliance on Layer 4 judgment diminishes. The protocol makes this convergence structural — not dependent on any reputation service or centralized database, but on the mathematical properties of the Merkle construction.
+
+Relay consistency is enforced through two mechanisms. First, per-sender sequence numbers in inner envelopes allow recipients to detect message suppression — a gap in sequence indicates a missing message. Second, members can compare Merkle roots received from different relay connections, detecting equivocation (a relay showing different event histories to different clients). Clients maintain per-relay reliability scores that inform relay selection.
+
 ---
 
 ## 4. Identity
@@ -271,15 +283,19 @@ Context isolation is absolute. Agents in different contexts are separate instanc
 - **Tool interfaces** (asymmetric): One context's tool is invoked by another context's agent. Both contexts' governance mediates — the source context approves the outbound call, the target context approves the inbound call. Data flows through declared schemas with provenance attached. Each call is logged in both event logs.
 - **Multi-parent child contexts** (symmetric): A shared space governed by multiple parent contexts. The child's capability ceiling is the intersection of its parents' ceilings (no capability escalation). Members must be in at least one parent. Children cannot outlive parents.
 
+Context nesting supports hierarchies up to three levels deep. Parent contexts exercise configurable governance over their children: the parent may close a child context, evict members from it, or restrict its capability ceiling, depending on the governance configuration declared at child creation. When a parent-child relationship is severed — through parent closure, member eviction from the parent, or governance action — the protocol enforces on-sever policies: evicting members unique to the severed relationship, cascading closure, or preserving membership at the child's discretion. Lifecycle coupling is strict: a child context cannot outlive its parent, and a child's capability ceiling is always bounded by the intersection of its parents' ceilings, preventing capability escalation through nesting.
+
 ### 5.2 Capability Ceiling and Governance
 
 Every context declares a capability ceiling at creation: the maximum set of things that can happen within the space. The ceiling is immutable by default; governed ceiling changes are possible under contexts that specify a governed ceiling policy.
 
-Governance models are pluggable. SCP defines a governance interface that accommodates single-admin, multi-signature, consensus, and voting models. 28 governance action types cover membership, roles, capabilities, content access, economic policy, and context lifecycle. All governance actions are logged in the verifiable event log.
+Governance models are pluggable. SCP defines a governance interface that accommodates single-admin, multi-signature, consensus, and voting models. 30 governance action types cover membership, roles, capabilities, content access, economic policy, and context lifecycle. All governance actions are logged in the verifiable event log.
 
 ### 5.3 Roles, Tools, and Membership
 
 Contexts define roles with specific permission sets within the ceiling, visible before opt-in. Tools are stateless functions registered with schemas, implementation hashes, test vectors, and operator DIDs. Membership is transparent — the roster is protocol state.
+
+The protocol defines eight well-known context templates — bilateral-ephemeral, bilateral-persistent, coordination, group-discussion, public-broadcast, gated-broadcast, tool-interface, and paid-service — each specifying default parameters for common interaction patterns. Templates are protocol-level identifiers, not SDK convenience: a joining agent can evaluate a context's template to make informed accept/reject decisions without parsing the full parameter set. This is architecturally significant for autonomous agents, which create and destroy contexts at high frequency — template-based creation reduces both the computational cost of context evaluation and the risk of misconfiguration.
 
 Broadcast contexts support two-tier membership: bounded MLS-group members (writers) and unbounded DID-authenticated subscribers (readers). This enables feed and broadcast patterns at scale without MLS group size limitations.
 
@@ -289,7 +305,7 @@ A natural question is why the protocol does not provide a direct agent-to-agent 
 
 The reasoning is specific. Forbidding agents from communicating across contexts does not hinder their functionality. The human coordinates across their own contexts locally — on their machine, agents share state freely, plan across contexts, and carry intelligence between interactions. The protocol governs what touches the network; it does not constrain what happens on the user's device. Network-level agent-to-agent communication would automate something that does not need network-level automation, while opening massive attack surface: runaway agent connections, cross-context infection via agent memory, fleet coordination at the protocol level, and metastatic growth patterns through agent connection graphs.
 
-Real-world validation came from Moltbook, an agent social network that launched in early 2026 and reportedly reached 2.6 million agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. Moltbook demonstrated that ungoverned agent communication at scale is structurally hostile to trust.
+Real-world validation came from Moltbook, an agent social network that launched in early 2026 and reportedly reached approximately 1.5 million agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. Moltbook demonstrated that ungoverned agent communication at scale is structurally hostile to trust.
 
 The protocol considered adding governed agent-to-agent communication (a propose/accept flow for bilateral context creation) and ultimately removed it. The reasoning: cross-context tool calls with stateful sessions handle all inter-agent interaction where both parties share a context, which covers the governed case. The remaining unique capability — reaching agents you share no context with — is precisely the attack surface that isolation was designed to eliminate. Any mechanism that allows agents to bypass context isolation, even a "governed" one with rate limits and trust evaluation, reintroduces the problems isolation solves. Agents that need new relationships require their humans to arrange them — through human facilitation in shared contexts, not through network-level agent initiative.
 
@@ -353,6 +369,18 @@ Standard capability categories include messaging, tool invocation, media (voice,
 
 Spending UCANs authorize expenditure up to a ceiling, composing with action UCANs via AND-composition: both the capability to act and the capability to pay are required for paid actions.
 
+### 7.3 Economic Governance
+
+Contexts may attach economic policies to protocol actions. A context's governance sets per-action cost policies through the `SetEconomicPolicy` governance action, defining what actions cost and under what conditions. Economic policy is orthogonal to the capability ceiling — the ceiling governs what is permitted; economic policy governs what it costs.
+
+The protocol defines a payment adapter abstraction — a trait-based interface analogous to the transport adapter (Section 9.3). Payment adapters handle the specifics of payment processing (Stripe, Lightning Network, or other payment rails) while the protocol handles authorization and verification. This separation means the protocol specifies *that* payment occurs and *how much*, without coupling to any specific payment infrastructure.
+
+Spending UCANs authorize expenditure up to a ceiling amount. For paid actions, both an action UCAN (capability to act) and a spending UCAN (capability to pay) are required — AND-composition ensures that neither capability alone is sufficient. Payment receipts are recorded in the context's Merkle event log, making economic history as verifiable as any other protocol event.
+
+Velocity-based cost escalation provides economic rate limiting. The `SenderVelocity` mechanism adjusts costs based on a participant's recent activity rate — normal participation incurs base costs, while burst activity triggers escalating costs. This makes sustained spam or flooding economically prohibitive without restricting legitimate high-frequency interaction during brief periods.
+
+Economic policy can be locked via governance action, making it immutable once the context reaches a stable economic model. Three levels of economic policy coexist: relay-level (infrastructure costs for storage and bandwidth), context-level (interaction costs within the context), and tool-level (per-invocation costs for specific tools).
+
 ---
 
 ## 8. Provenance
@@ -403,7 +431,7 @@ SCP relays are:
 
 ### 9.2 Native Relay Protocol
 
-The SCP native relay protocol defines six operations over WebSocket with MessagePack binary frames: PUBLISH (store a blob at a routing ID with TTL), SUBSCRIBE (receive new blobs at a routing ID), UNSUBSCRIBE (stop receiving blobs at a routing ID), QUERY (retrieve stored blobs, optionally filtered by timestamp), DELETE (remove a blob), and ACK (confirm blob receipt for delivery tracking).
+The SCP native relay protocol defines nine operations over WebSocket with MessagePack binary frames, organized in three groups: data operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK), keepalive (PING), and bridge operations (BRIDGE_REGISTER, BRIDGE_DATA for relay-to-relay proxying).
 
 ### 9.3 Transport Abstraction
 
@@ -524,7 +552,7 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 | **Capabilities** | UCAN (fine-grained delegation) | Power levels | None | None | None | None | Tool permissions |
 | **Provenance** | Protocol-level, automatic | None | Repo signatures | Event signatures | None | Signature-level | None |
 | **Transport** | Abstracted (17 adapters) | Federation | BGS relay | Simple relay | Centralized | Coupled (Hyperswarm) | stdio/SSE |
-| **Governance** | Pluggable per-context (28 action types) | Power levels | Moderation lists | NIP-based | Centralized | None | N/A |
+| **Governance** | Pluggable per-context (30 action types) | Power levels | Moderation lists | NIP-based | Centralized | None | N/A |
 | **Self-hosting** | Device-as-node | Homeserver required | PDS | Relay | Not possible | Full P2P | Local |
 | **Offline** | Three-tier model | Server handles | Relay handles | Best-effort | Server handles | Peer-dependent | N/A |
 
@@ -560,9 +588,26 @@ Hypercore is the closest structural parallel to SCP's event logs — both are ap
 | Signing | Ed25519, single writer per log | Ed25519, multi-writer per context (MLS-authenticated) |
 | Multi-writer | Autobase (app-layer DAG linearization) | Native via MLS group membership |
 | Encryption | None at log level; transport-level only | MLS + sender-side AES-256-GCM at log level |
-| Governance | None | Full: 28 action types, pluggable engines |
+| Governance | None | Full: 30 action types, pluggable engines |
 
 Hypercore is a data structure; SCP event logs are a data structure embedded in a governance and encryption context. Autobase composes multi-writer from single-writer feeds; SCP starts multi-writer (MLS groups) and single-writer is the degenerate one-member group.
+
+### 12.5 did:dht Comparison
+
+SCP builds on did:dht's self-certification property but extends it significantly. The comparison illuminates what SCP's identity layer adds:
+
+| Property | did:dht | SCP Identity Layer |
+|----------|---------|-------------------|
+| Self-certification | Yes (BEP44) | Yes (same BEP44) |
+| Resolution backends | Mainline DHT only | Dual-layer: SCP relays + Mainline DHT |
+| Key architecture | Single Ed25519 keypair | Multi-key: identity (`#0`) / human signing (`#active`) / pre-rotation / agent signing (`#agent`) |
+| Rotation safety | No pre-rotation commitment | Pre-rotation key hash published in advance |
+| Self-healing | None | Protocol-level: fresher document re-published to stale layer |
+| TTL management | ~2 hour republish | Dual-cycle: 2h (DHT) + 6d (relay, 7d TTL) |
+| Payload limit | 1000 bytes (BEP44) | 1000 bytes (DHT fallback), 256KB (relay layer) |
+| Governance risk | TBD shutdown 2024, transferred to DIF | Insulated — depends only on BEP44 + Ed25519, not on did:dht software |
+
+SCP identities are simultaneously did:dht-compatible (resolvable by standard did:dht resolvers via the DHT layer) and more resilient (dual-layer with self-healing). The multi-key architecture provides key compromise recovery without changing the DID — a capability no existing DID method offers — plus custody separation between human and agent operations.
 
 ---
 
@@ -588,7 +633,7 @@ Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (w
 Conformance is enforced through Rust macros that generate test suites for trait implementations:
 
 - `storage_conformance!()` — ProtocolStore implementations (state persistence, 13 tests)
-- `blob_store_conformance!()` — BlobStore implementations (relay storage backends, 11 tests)
+- `blob_store_conformance!()` — BlobStore implementations (relay storage backends, 19 tests)
 - `payment_adapter_conformance!()` — PaymentAdapter implementations (economic governance, 8 tests)
 
 Additional conformance suites are specified but not yet implemented for transport adapters, key custody, attestation stores, and push providers.
@@ -718,7 +763,7 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 
 ## References
 
-[1] Moltbook agent social network. Observed failure modes reported via industry analysis, early 2026. Statistics cited are approximate and based on available reporting at time of writing.
+[1] Moltbook (moltbook.com), agent social network launched January 2026 by M. Schlicht; acquired by Meta, March 2026. Approximately 1.5 million registered agents (17,000 human deployers). Security analyses: Permiso identified bot-to-bot prompt injection and influence operations (SecurityWeek, Feb. 2026); Wiz Research discovered 1.5M exposed API keys (wiz.io/blog, Feb. 2026); Simula Research Laboratory (M. A. Riegler et al.) found prompt injection payloads in 2.6% of sampled content (Feb. 2026).
 
 [2] R. Barnes, B. Beurdouche, R. Robert, J. Millican, E. Omara, and K. Cohn-Gordon, "The Messaging Layer Security (MLS) Protocol," RFC 9420, IETF, July 2023.
 
@@ -763,3 +808,5 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 [22] S. Furuhashi, "MessagePack Specification," msgpack.org, 2013.
 
 [23] Holepunch (Pear Runtime), "Keet: Peer-to-peer encrypted group messaging," keet.io, 2024.
+
+[24] B. Laurie, A. Langley, and E. Kasper, "Certificate Transparency," RFC 6962, IETF, June 2013.
