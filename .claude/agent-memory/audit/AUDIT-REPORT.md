@@ -24,7 +24,7 @@ However, the audit identified **10 confirmed findings** — primarily **cross-br
 | 006 | Moderate | Wiring gap | SSE MCP transport not implemented in NAPI/UniFFI |
 | 007 | Moderate | Wiring gap | MCP resource subscriptions are no-ops (all bridges) |
 | 008 | Minor | Code quality | 47 `#[allow(dead_code)]` annotations |
-| 009 | **Major** | Security | UniFFI bridge uses no-op crypto for ContextManager |
+| 009 | **Major** | Security | PyO3+UniFFI bridges use no-op crypto for MLS group management (CORRECTED) |
 | 010 | Minor | Code quality | Silent Result discarding in transport server |
 
 **By severity:** 3 Major, 5 Moderate, 2 Minor
@@ -154,24 +154,26 @@ No `has_tool_invoke_capability` call anywhere in the WASM bridge (confirmed via 
 
 ---
 
-### Finding 009: UniFFI bridge uses no-op crypto for ContextManager
+### Finding 009: PyO3 AND UniFFI bridges use no-op crypto for MLS group management
 **Severity:** Major | **Category:** security
 
-**File:** `crates/scp-ffi/uniffi/src/runtime.rs`
+**CORRECTION:** Initial assessment stated UniFFI-only and claimed "messages are not encrypted." Deeper tracing reveals:
 
-The ContextManager in the UniFFI bridge is initialized with `FfiBridgeCrypto`:
-- Line 127: "Uses `FfiBridgeCrypto` (no-op)"
-- Lines 470-472: "All operations succeed (no-op). Real MLS and sender key operations are [handled by platform callbacks]."
+1. **Both PyO3 and UniFFI** use no-op crypto providers (`NoOpCryptoProvider` and `FfiBridgeCrypto` respectively)
+2. `encrypt_message` **returns an error** in both — messages cannot silently go unencrypted
+3. MLS **group management** operations (create group, add/remove member, validate key package, sender key rotation) all **succeed silently as no-ops**
 
-This means:
-- MLS encryption is a no-op — messages are not encrypted
-- Sender key rotation on member join/leave/block does nothing
-- Forward secrecy is not enforced
-- Group key management is non-functional
+**Files:**
+- PyO3: `crates/scp-ffi/src/runtime.rs:147` — `Box::new(NoOpCryptoProvider)`, lines 323-388 for impl
+- UniFFI: `crates/scp-ffi/uniffi/src/runtime.rs:474` — `FfiBridgeCrypto`, lines 476-551 for impl
+- NAPI: `crates/scp-ffi/napi/src/runtime.rs:169` — `Box::new(MlsCryptoProvider::new(did))` — real MLS
 
-**Comparison:** The NAPI bridge uses `MlsCryptoProvider` (real OpenMLS-backed crypto per runtime.rs CLAUDE.md).
-
-**Impact:** Swift and Kotlin SDK users sending messages through the UniFFI bridge have NO MLS encryption. This is the single most critical security finding.
+**Impact:** In PyO3 and UniFFI bridges:
+- Key package validation is bypassed (any joiner accepted without valid MLS key package)
+- Member removal doesn't trigger key rotation (no forward secrecy)
+- Encrypted mode contexts cannot send messages (encrypt_message errors out)
+- In practice, only broadcast mode works; encrypted mode is broken
+- NAPI is the only non-WASM bridge with real MLS crypto (issue #1294)
 
 ---
 
@@ -190,7 +192,7 @@ See `matrix.md` for the full operations × targets matrix.
 
 **Key gaps identified:**
 - NAPI MCP: 7/7 ContextProvider methods are stubs
-- UniFFI crypto: No-op (0% real crypto operations)
+- PyO3+UniFFI crypto: No-op MLS group ops (NAPI only bridge with real MlsCryptoProvider)
 - WASM capability: No role-based checks on tool invocation
 - Broadcast UCAN: NoOp validators in 3/4 bridges
 - SSE transport: Missing in 2/4 bridges
@@ -227,7 +229,7 @@ See `matrix.md` for the full operations × targets matrix.
 
 ### Immediate (P0)
 
-1. **Wire real MLS crypto in UniFFI bridge** (Finding 009) — This is a security-critical gap
+1. **Wire real MLS crypto in PyO3 and UniFFI bridges** (Finding 009) — NAPI pattern (#1294) is the template
 2. **Add capability checks to WASM tool invocation** (Finding 005) — Security gap
 3. **Wire NAPI MCP ContextProvider** (Finding 001) — Functional gap blocking TypeScript MCP
 

@@ -37,6 +37,16 @@ The UniFFI bridge (`crates/scp-ffi/uniffi/src/bridge.rs`) also has full implemen
 
 The NAPI MCP bridge was implemented as a minimal skeleton and never wired to the ContextManager or tool registry.
 
+## Additional: Missing MCP utility functions in NAPI
+
+Beyond the ContextProvider stubs, the NAPI bridge is also missing these MCP functions that exist in PyO3:
+- `mcp_server_wait` — blocking wait for server completion
+- `mcp_server_info` — query server status/info
+- `mcp_client_info` — query client connection info
+- `mcp_server_register_tool` / `mcp_server_deregister_tool` — dynamic tool registration on MCP server
+
+PyO3 has 21 MCP functions; NAPI has 15 (6 missing).
+
 ## Suggested Fix
 
-Port the MCP ContextProvider implementation from the UniFFI bridge to the NAPI bridge, adapting the runtime access patterns (NAPI uses `crate::runtime::context_manager()` and `crate::runtime::with_context()`).
+Port the MCP ContextProvider implementation from the UniFFI bridge to the NAPI bridge, adapting the runtime access patterns (NAPI uses `crate::runtime::context_manager()` and `crate::runtime::with_context()`). Also implement the missing 6 MCP utility functions.
