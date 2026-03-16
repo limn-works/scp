@@ -9,7 +9,7 @@ March 2026 — Preprint v0.1
 
 ## Abstract
 
-As software generation becomes trivial — frontier language models producing applications from prompts, agent frameworks composing workflows from modular tools — the bottleneck shifts from building software to connecting it. Identity, trust, and relationships remain siloed inside each application, and every independently generated application is an island.
+As software generation becomes trivial — frontier language models producing applications from prompts, agent frameworks composing workflows from modular tools — the bottleneck shifts from building software to connecting it. Existing approaches to shared identity, trust, and relationships — platform accounts, OAuth integrations, API-level federation — were designed for a world of long-lived, manually integrated applications. They do not scale to the pace at which software is now generated, and their assumptions about application longevity and integration effort are mismatched with ephemeral, agent-built software.
 
 This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID [10]), governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [12]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
@@ -79,15 +79,15 @@ The remainder of this paper is organized as follows: Section 2 analyzes the prob
 
 ### 2.1 The Connectivity Crisis
 
-Generated applications have no shared identity layer. Each application creates its own accounts, its own user model, its own notion of "who you are." When two independently generated applications need to know that the same person is using both, there is no mechanism — the identity is locked inside each application.
+Shared identity layers exist — OAuth, SSO, platform accounts — but they assume manual integration, long-lived applications, and human-mediated setup. When applications are generated on demand and discarded after use, the integration cost of connecting each one to an identity provider exceeds the cost of building the application itself. Each generated application defaults to its own accounts, its own user model, its own notion of "who you are."
 
-Trust is not portable. Reputation earned in one application does not transfer to another. A user who has been a reliable participant in one context for months starts as a stranger in the next. The behavioral evidence that could inform trust evaluation is siloed.
+Trust is not portable. Reputation earned in one application does not transfer to another. A user who has been a reliable participant in one context for months starts as a stranger in the next. Platform-level reputation systems exist but are locked to their platforms; there is no cross-platform mechanism that operates at the speed of application generation.
 
-Relationships are trapped inside their clients. When an application is replaced — and generated applications are replaced constantly — every connection, conversation, and shared context it mediated is lost. There is no mechanism for a relationship to survive the death of the software that introduced it, or to move between devices, or to function across two applications that have never heard of each other. In a world where agents run on personal hardware — laptops, workstations, phones — connections and their governing state need to be portable across machines, trivial to create and destroy on demand, and independent of any particular client. The infrastructure should impose no more overhead than the agent runtime itself.
+Relationships are trapped inside their clients. When an application is replaced — and generated applications are replaced constantly — every connection, conversation, and shared context it mediated is lost. Existing federation protocols (Matrix, ActivityPub, AT Protocol) address this for long-lived servers and accounts, but their integration assumptions do not match the lifecycle of ephemeral, agent-generated software.
 
-There is no governed interaction across independently generated software. When an agent in one application needs to interact with an agent in another, there is no protocol-level mechanism for establishing the rules of engagement — what capabilities are permitted, who is authorized to do what, what happens when rules are violated.
+Governed cross-application interaction requires manual API integration — negotiating schemas, authentication, and authorization between specific endpoints. When an agent in one application needs to interact with an agent in another, there is no lightweight protocol-level mechanism for establishing rules of engagement on the fly.
 
-Provenance is absent. When an agent produces content, there is no standard mechanism for verifying where that content came from, who produced it, or through how many intermediaries it has passed. In a world of generated content, the absence of provenance is a structural vulnerability.
+Provenance is largely absent. Existing provenance systems (W3C PROV, C2PA) address specific domains but are not embedded in general communication infrastructure. When an agent produces content, there is no standard mechanism for verifying where that content came from, who produced it, or through how many intermediaries it has passed.
 
 ### 2.2 The Agent Trust Problem
 
