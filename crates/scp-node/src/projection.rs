@@ -2149,9 +2149,13 @@ pub async fn site_handler(
             axum::http::HeaderValue::from_static(immutable_cache),
         );
     } else {
+        let revalidate_cache = match rule {
+            ProjectionRule::Public => "public, max-age=0, must-revalidate",
+            _ => "private, max-age=0, must-revalidate",
+        };
         resp_headers.insert(
             axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("public, max-age=0, must-revalidate"),
+            axum::http::HeaderValue::from_static(revalidate_cache),
         );
         // ETag: "<deploy_id>:<content_hash>"
         let etag_value = if let Some(ref etag) = content.metadata.etag {
