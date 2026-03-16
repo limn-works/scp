@@ -6342,3 +6342,346 @@ fn broadcast_mime_type_validation_matches_wasm() {
         assert!(wasm_result.is_err(), "WASM accepted invalid MIME {mime:?}");
     }
 }
+
+// ===========================================================================
+// Provenance hash conformance (issue #1325)
+//
+// The WASM bridge re-implements `DataProvenance` serialization via a local
+// `CanonicalProvenance` struct because it cannot depend on scp-core (ADR-034).
+// These tests assert that `serde_json::to_vec` of `DataProvenance` produces
+// byte-identical output to the WASM `CanonicalProvenance` path, and therefore
+// identical SHA-256 hashes.
+//
+// `chain_depth` is `u8` in scp-core and `u32` in the WASM bridge. JSON
+// numbers carry no type information, so both serialize identically for values
+// in the `u8` range (0..=255). The WASM bridge uses `u32` because
+// `wasm_bindgen` maps it directly to JS `number`; the protocol hard max is 5,
+// so the representable range is never exceeded.
+// ===========================================================================
+
+/// Mirror of `CanonicalProvenance` from `scp-ffi-wasm/src/provenance.rs`.
+///
+/// Field names and declaration order MUST match both `DataProvenance` in
+/// scp-core and `CanonicalProvenance` in the WASM bridge. `serde_json::to_vec`
+/// serializes struct fields in declaration order.
+mod wasm_provenance_mirror {
+    #[derive(serde::Serialize)]
+    pub struct CanonicalProvenance<'a> {
+        pub source_context: &'a str,
+        pub source_type: &'a str,
+        pub counterparties: &'a [String],
+        pub purpose: Option<&'a String>,
+        pub discovery_method: &'a serde_json::Value,
+        pub age: CanonicalDuration,
+        pub memory_scope: &'a str,
+        pub chain_depth: u32,
+        pub chain_path: &'a serde_json::Value,
+        pub payment_amount: Option<u64>,
+        pub payment_adapter: Option<&'a str>,
+        pub payment_receipt_id: Option<&'a [u8; 32]>,
+    }
+
+    /// Mirrors `std::time::Duration` serde representation: `{"secs": N, "nanos": N}`.
+    #[derive(serde::Serialize)]
+    pub struct CanonicalDuration {
+        pub secs: u64,
+        pub nanos: u32,
+    }
+
+    /// Mirrors `build_canonical_provenance_bytes` from the WASM bridge.
+    #[allow(clippy::too_many_arguments)] // mirrors WASM bridge function signature
+    pub fn build_canonical_provenance_bytes(
+        source_context: &str,
+        source_type: &str,
+        counterparties: &[String],
+        purpose: Option<&String>,
+        discovery_method: &serde_json::Value,
+        age_secs: u64,
+        age_nanos: u32,
+        memory_scope: &str,
+        chain_depth: u32,
+        chain_path: &serde_json::Value,
+        payment_amount: Option<u64>,
+        payment_adapter: Option<&str>,
+        payment_receipt_id: Option<&[u8; 32]>,
+    ) -> Vec<u8> {
+        let canonical = CanonicalProvenance {
+            source_context,
+            source_type,
+            counterparties,
+            purpose,
+            discovery_method,
+            age: CanonicalDuration {
+                secs: age_secs,
+                nanos: age_nanos,
+            },
+            memory_scope,
+            chain_depth,
+            chain_path,
+            payment_amount,
+            payment_adapter,
+            payment_receipt_id,
+        };
+        serde_json::to_vec(&canonical).unwrap_or_default()
+    }
+}
+
+/// Cross-bridge provenance hash: `DataProvenance` (scp-core) must produce
+/// the same `serde_json::to_vec` bytes — and therefore the same SHA-256
+/// hash — as `CanonicalProvenance` (WASM bridge) given identical inputs.
+#[test]
+fn provenance_hash_conformance_shared_context() {
+    use scp_core::context::MemoryScope;
+    use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+    use scp_identity::DID;
+    use std::time::Duration;
+
+    let provenance = DataProvenance {
+        source_context: "ctx-conformance-test".to_string(),
+        source_type: SourceType::Persistent,
+        counterparties: vec![DID::from("did:dht:z6MkAlice"), DID::from("did:dht:z6MkBob")],
+        purpose: Some("cross-context data flow".to_string()),
+        discovery_method: DiscoveryMethod::SharedContext("ctx-shared-disc".to_string()),
+        age: Duration::new(120, 0),
+        memory_scope: MemoryScope::Full,
+        chain_depth: 1,
+        chain_path: Some(vec!["ctx-hop-1".to_string()]),
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+
+    let core_bytes = serde_json::to_vec(&provenance).expect("core serialization");
+    let core_hash = Sha256::digest(&core_bytes);
+
+    // Build the same provenance via the WASM mirror path.
+    let counterparties = vec![
+        "did:dht:z6MkAlice".to_string(),
+        "did:dht:z6MkBob".to_string(),
+    ];
+    let purpose = "cross-context data flow".to_string();
+    let discovery_method = serde_json::json!({"SharedContext": "ctx-shared-disc"});
+    let chain_path = serde_json::json!(["ctx-hop-1"]);
+
+    let wasm_bytes = wasm_provenance_mirror::build_canonical_provenance_bytes(
+        "ctx-conformance-test",
+        "Persistent",
+        &counterparties,
+        Some(&purpose),
+        &discovery_method,
+        120,
+        0,
+        "Full",
+        1,
+        &chain_path,
+        None,
+        None,
+        None,
+    );
+
+    let wasm_hash = Sha256::digest(&wasm_bytes);
+
+    assert_eq!(
+        core_bytes,
+        wasm_bytes,
+        "serde_json::to_vec output diverges between DataProvenance and CanonicalProvenance\n\
+         core: {}\nwasm: {}",
+        String::from_utf8_lossy(&core_bytes),
+        String::from_utf8_lossy(&wasm_bytes),
+    );
+
+    assert_eq!(
+        core_hash, wasm_hash,
+        "SHA-256 hash diverges between scp-core and WASM provenance paths"
+    );
+
+    // Hardcoded expected hash — if either implementation changes serialization
+    // format, this test will catch it and force a conscious update.
+    let expected_hex = "6ad99978fdd5c8e5dd93a9d2577cd7820ca242d0068361f383d9cabb69da399a";
+    let actual_hex = hex::encode(core_hash);
+    assert_eq!(
+        actual_hex, expected_hex,
+        "provenance hash changed — if intentional, update the expected hash"
+    );
+}
+
+/// Cross-bridge provenance hash with `OutOfBand` discovery, no counterparties,
+/// no purpose, no chain path — exercises the null/empty paths.
+#[test]
+fn provenance_hash_conformance_out_of_band() {
+    use scp_core::context::MemoryScope;
+    use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+    use std::time::Duration;
+
+    let provenance = DataProvenance {
+        source_context: "ctx-ephemeral".to_string(),
+        source_type: SourceType::Ephemeral,
+        counterparties: vec![],
+        purpose: None,
+        discovery_method: DiscoveryMethod::OutOfBand,
+        age: Duration::new(0, 0),
+        memory_scope: MemoryScope::Ephemeral,
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+
+    let core_bytes = serde_json::to_vec(&provenance).expect("core serialization");
+    let core_hash = Sha256::digest(&core_bytes);
+
+    let counterparties: Vec<String> = vec![];
+    let discovery_method = serde_json::json!("OutOfBand");
+    let chain_path = serde_json::Value::Null;
+
+    let wasm_bytes = wasm_provenance_mirror::build_canonical_provenance_bytes(
+        "ctx-ephemeral",
+        "Ephemeral",
+        &counterparties,
+        None,
+        &discovery_method,
+        0,
+        0,
+        "Ephemeral",
+        0,
+        &chain_path,
+        None,
+        None,
+        None,
+    );
+
+    let wasm_hash = Sha256::digest(&wasm_bytes);
+
+    assert_eq!(
+        core_bytes,
+        wasm_bytes,
+        "serde_json::to_vec output diverges (OutOfBand case)\n\
+         core: {}\nwasm: {}",
+        String::from_utf8_lossy(&core_bytes),
+        String::from_utf8_lossy(&wasm_bytes),
+    );
+
+    assert_eq!(
+        core_hash, wasm_hash,
+        "SHA-256 hash diverges (OutOfBand case)"
+    );
+
+    let expected_hex = "31ae4bf9dc0462850dbc178523eaa5dc0e4973a17847e7af9fc85182840c8b43";
+    let actual_hex = hex::encode(core_hash);
+    assert_eq!(
+        actual_hex, expected_hex,
+        "provenance hash changed (OutOfBand) — if intentional, update the expected hash"
+    );
+}
+
+/// Cross-bridge provenance hash with `Registry` discovery and payment fields
+/// populated — exercises all non-null optional paths.
+#[test]
+fn provenance_hash_conformance_registry_with_payment() {
+    use scp_core::context::MemoryScope;
+    use scp_core::economy::types::Amount;
+    use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+    use scp_identity::DID;
+    use std::time::Duration;
+
+    let receipt_id: [u8; 32] = [0xab; 32];
+
+    let provenance = DataProvenance {
+        source_context: "ctx-paid".to_string(),
+        source_type: SourceType::Summary,
+        counterparties: vec![DID::from("did:dht:z6MkCharlie")],
+        purpose: Some("economic provenance".to_string()),
+        discovery_method: DiscoveryMethod::Registry("ctx-registry-1".to_string()),
+        age: Duration::new(3600, 500_000_000),
+        memory_scope: MemoryScope::Summary,
+        chain_depth: 2,
+        chain_path: Some(vec!["ctx-a".to_string(), "ctx-b".to_string()]),
+        payment_amount: Some(Amount::new(1000)),
+        payment_adapter: Some("stripe".to_string()),
+        payment_receipt_id: Some(receipt_id),
+    };
+
+    let core_bytes = serde_json::to_vec(&provenance).expect("core serialization");
+    let core_hash = Sha256::digest(&core_bytes);
+
+    let counterparties = vec!["did:dht:z6MkCharlie".to_string()];
+    let purpose = "economic provenance".to_string();
+    let discovery_method = serde_json::json!({"Registry": "ctx-registry-1"});
+    let chain_path = serde_json::json!(["ctx-a", "ctx-b"]);
+
+    let wasm_bytes = wasm_provenance_mirror::build_canonical_provenance_bytes(
+        "ctx-paid",
+        "Summary",
+        &counterparties,
+        Some(&purpose),
+        &discovery_method,
+        3600,
+        500_000_000,
+        "Summary",
+        2,
+        &chain_path,
+        Some(1000),
+        Some("stripe"),
+        Some(&receipt_id),
+    );
+
+    let wasm_hash = Sha256::digest(&wasm_bytes);
+
+    assert_eq!(
+        core_bytes,
+        wasm_bytes,
+        "serde_json::to_vec output diverges (Registry+payment case)\n\
+         core: {}\nwasm: {}",
+        String::from_utf8_lossy(&core_bytes),
+        String::from_utf8_lossy(&wasm_bytes),
+    );
+
+    assert_eq!(
+        core_hash, wasm_hash,
+        "SHA-256 hash diverges (Registry+payment case)"
+    );
+
+    let expected_hex = "d1ea301f474ee6b19f9660ca66b087f573c6704eae5859b418ca761cb9a3f4ec";
+    let actual_hex = hex::encode(core_hash);
+    assert_eq!(
+        actual_hex, expected_hex,
+        "provenance hash changed (Registry+payment) — if intentional, update the expected hash"
+    );
+}
+
+/// Confirms that `chain_depth: u8` (scp-core) and `chain_depth: u32` (WASM)
+/// produce identical JSON bytes for values in the protocol range (0..=5).
+///
+/// JSON numbers are untyped — `serde_json` renders both `0u8` and `0u32` as
+/// the same decimal string. This test makes that guarantee explicit and will
+/// break if `serde_json` ever changes its numeric rendering.
+#[test]
+fn provenance_hash_chain_depth_u8_vs_u32() {
+    // Serialize a minimal struct with u8 chain_depth (scp-core style)
+    #[derive(serde::Serialize)]
+    struct WithU8 {
+        chain_depth: u8,
+    }
+    // Serialize a minimal struct with u32 chain_depth (WASM style)
+    #[derive(serde::Serialize)]
+    struct WithU32 {
+        chain_depth: u32,
+    }
+
+    for depth in 0..=5u8 {
+        let u8_bytes =
+            serde_json::to_vec(&WithU8 { chain_depth: depth }).expect("u8 serialization");
+        let u32_bytes = serde_json::to_vec(&WithU32 {
+            chain_depth: u32::from(depth),
+        })
+        .expect("u32 serialization");
+        assert_eq!(
+            u8_bytes,
+            u32_bytes,
+            "JSON bytes differ for chain_depth={depth}: u8={} vs u32={}",
+            String::from_utf8_lossy(&u8_bytes),
+            String::from_utf8_lossy(&u32_bytes),
+        );
+    }
+}

@@ -656,6 +656,10 @@ struct CanonicalProvenance<'a> {
     discovery_method: &'a serde_json::Value,
     age: CanonicalDuration,
     memory_scope: &'a str,
+    /// `u32` in WASM (`wasm_bindgen` maps to JS `number`), `u8` in scp-core.
+    /// JSON numbers are untyped, so serialized output is identical for values
+    /// in the protocol range (0..=5). See `provenance_hash_chain_depth_u8_vs_u32`
+    /// conformance test in `scp-core/tests/wasm_conformance.rs`.
     chain_depth: u32,
     chain_path: &'a serde_json::Value,
     payment_amount: Option<u64>,
