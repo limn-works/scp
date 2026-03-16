@@ -494,9 +494,10 @@ impl<S: Storage> ApplicationNode<S> {
                 projected.update_member_keys(member_keys);
             }
         }
-        // Clear the validation cache since member keys changed.
+        // Clear the validation cache and bump the generation counter so
+        // in-flight validations started before the rotation are discarded.
         if let Ok(mut cache) = self.state.projection_ucan_cache.write() {
-            cache.clear();
+            cache.clear_and_bump_generation();
         }
     }
 
@@ -505,21 +506,26 @@ impl<S: Storage> ApplicationNode<S> {
     /// Tokens matching this CID will be rejected on subsequent requests.
     /// The CID is `SHA-256(encoded_jwt)` hex-encoded, matching the format
     /// used by `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
-    /// No-op if the context is not projected. Also removes any cached
-    /// validation for this token.
+    /// `token_exp` is the UCAN's `exp` field, used for pruning stale
+    /// revocations. No-op if the context is not projected.
+    ///
+    /// Also adds the CID to the validation cache's revocation set and
+    /// removes any cached validation entry, preventing TOCTOU races where
+    /// a revoked token could be re-cached.
     ///
     /// See spec section 18.11.6.
-    pub async fn revoke_projection_token(&self, context_id: &str, token_cid: &str) {
+    pub async fn revoke_projection_token(&self, context_id: &str, token_cid: &str, token_exp: u64) {
         let routing_id = projection::compute_routing_id(context_id);
         {
             let mut registry = self.state.projected_contexts.write().await;
             if let Some(projected) = registry.get_mut(&routing_id) {
-                projected.revoke_token(token_cid);
+                projected.revoke_token(token_cid, token_exp);
             }
         }
-        // Remove from validation cache too.
+        // Add to the cache's revocation set AND remove from cached entries.
+        // This prevents re-caching of the revoked token (TOCTOU defense).
         if let Ok(mut cache) = self.state.projection_ucan_cache.write() {
-            cache.remove(token_cid);
+            cache.revoke(token_cid, token_exp);
         }
     }
 
