@@ -470,21 +470,23 @@ impl<S: Storage> ApplicationNode<S> {
         projection::validate_projection_policy(admission, projection_policy.as_ref())
             .map_err(NodeError::InvalidConfig)?;
 
-        // Validate site config if provided.
+        let routing_id = projection::compute_routing_id(context_id);
+
+        // Acquire write lock FIRST, then validate hostname uniqueness inside
+        // the lock to eliminate the TOCTOU race between read-lock validation
+        // and write-lock insertion.
+        let mut registry = self.state.projected_contexts.write().await;
+
         if let Some(ref config) = site_config {
-            let registry = self.state.projected_contexts.read().await;
             let existing_hostnames: std::collections::HashSet<String> = registry
                 .values()
                 .filter_map(|p| p.hostname().map(String::from))
                 .collect();
-            drop(registry);
 
             projection::validate_site_config(config, self.domain.as_deref(), &existing_hostnames)
                 .map_err(NodeError::InvalidConfig)?;
         }
 
-        let routing_id = projection::compute_routing_id(context_id);
-        let mut registry = self.state.projected_contexts.write().await;
         if let Some(existing) = registry.get_mut(&routing_id) {
             existing.insert_key(broadcast_key);
             existing.admission = admission;
@@ -694,6 +696,9 @@ impl<S: Storage> ApplicationNode<S> {
         let mut entries: HashMap<ContentPath, [u8; 32]> = HashMap::new();
         let mut manifest_entries: Vec<projection::DeployManifestEntry> = Vec::new();
         let mut total_size: u64 = 0;
+        // Track per-path sizes so path collisions subtract the old size before
+        // adding the new one, preventing double-counting.
+        let mut path_sizes: HashMap<ContentPath, u64> = HashMap::new();
 
         for stored in &blobs {
             let envelope: scp_core::crypto::sender_keys::BroadcastEnvelope =
@@ -712,7 +717,7 @@ impl<S: Storage> ApplicationNode<S> {
                 continue;
             };
 
-            let Ok(content) = deserialize_broadcast_content(&plaintext) else {
+            let Ok(mut content) = deserialize_broadcast_content(&plaintext) else {
                 continue;
             };
 
@@ -726,14 +731,18 @@ impl<S: Storage> ApplicationNode<S> {
                 continue;
             }
 
-            // Verify ETag.
+            // Compute ETag if absent, then verify. Fail the entire commit on
+            // mismatch rather than silently skipping a corrupted blob.
+            if content.metadata.etag.is_none() {
+                content.metadata.etag = Some(scp_core::context::broadcast_content::compute_etag(
+                    &content.body,
+                ));
+            }
             if let Err(e) = verify_etag(&content) {
-                tracing::warn!(
-                    blob_id = projection::hex_encode(&stored.blob_id),
-                    error = %e,
-                    "ETag mismatch during deploy commit, skipping"
-                );
-                continue;
+                return Err(NodeError::InvalidConfig(format!(
+                    "blob {} etag mismatch: {e}",
+                    projection::hex_encode(&stored.blob_id)
+                )));
             }
 
             // Extract path.
@@ -741,9 +750,18 @@ impl<S: Storage> ApplicationNode<S> {
                 continue;
             };
 
-            total_size += content.body.len() as u64;
+            let new_size = content.body.len() as u64;
 
-            if entries.len() >= max_assets {
+            // Path collision: subtract old size before adding new, and remove
+            // stale manifest entry. Last-writer-wins (blobs are oldest-first).
+            if let Some(old_size) = path_sizes.get(&path) {
+                total_size -= old_size;
+                manifest_entries.retain(|e| e.path != path.as_str());
+            }
+
+            total_size += new_size;
+
+            if !entries.contains_key(&path) && entries.len() >= max_assets {
                 return Err(NodeError::InvalidConfig(format!(
                     "deploy exceeds max_assets_per_deploy ({max_assets})"
                 )));
@@ -755,18 +773,12 @@ impl<S: Storage> ApplicationNode<S> {
                 )));
             }
 
-            // Highest sequence wins for path collisions.
-            let existing_blob = entries.get(&path);
-            if existing_blob.is_some() {
-                // Path collision — this implementation keeps the last one encountered.
-                // In practice, blobs are ordered oldest-first so higher sequence comes last.
-            }
-
             manifest_entries.push(projection::DeployManifestEntry {
                 path: path.as_str().to_owned(),
                 blob_id: projection::hex_encode(&stored.blob_id),
             });
 
+            path_sizes.insert(path.clone(), new_size);
             entries.insert(path, stored.blob_id);
         }
 
@@ -804,9 +816,10 @@ impl<S: Storage> ApplicationNode<S> {
         // Commit: swap path index.
         let count = entries.len();
         let mut registry = self.state.projected_contexts.write().await;
-        if let Some(projected) = registry.get_mut(&routing_id) {
-            projected.commit_deploy(deploy_id.to_owned(), entries);
-        }
+        let projected = registry
+            .get_mut(&routing_id)
+            .ok_or_else(|| NodeError::InvalidConfig("context removed during deploy".into()))?;
+        projected.commit_deploy(deploy_id.to_owned(), entries);
         drop(registry);
 
         tracing::info!(
@@ -848,6 +861,41 @@ impl<S: Storage> ApplicationNode<S> {
             return Err(NodeError::InvalidConfig(format!(
                 "deploy_id '{deploy_id}' not found in history"
             )));
+        }
+
+        // Spot-check one blob from the restored deploy to verify storage
+        // freshness. If the blob has expired in storage, the rollback
+        // succeeded structurally but content is stale.
+        let sample_blob_id = {
+            let registry = self.state.projected_contexts.read().await;
+            registry.get(&routing_id).and_then(|p| {
+                let guard = p.path_index.load();
+                guard
+                    .as_ref()
+                    .as_ref()
+                    .and_then(|state| state.index.values().next().copied())
+            })
+        };
+        if let Some(blob_id) = sample_blob_id {
+            match self.state.blob_storage.get(&blob_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(
+                        context_id = context_id,
+                        deploy_id = deploy_id,
+                        blob_id = projection::hex_encode(&blob_id),
+                        "rollback blob spot-check: blob expired in storage"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = context_id,
+                        deploy_id = deploy_id,
+                        error = %e,
+                        "rollback blob spot-check: storage error"
+                    );
+                }
+            }
         }
 
         tracing::info!(

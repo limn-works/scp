@@ -212,13 +212,23 @@ pub fn validate_hostname(hostname: &str) -> Result<(), String> {
 ///
 /// Returns an error string if the CSP is invalid.
 pub fn validate_csp(csp: &str) -> Result<(), String> {
-    if csp.contains("unsafe-eval") {
-        return Err("CSP must not contain 'unsafe-eval'".into());
+    const FORBIDDEN_KEYWORDS: &[&str] = &["unsafe-eval", "unsafe-inline", "unsafe-hashes"];
+    for keyword in FORBIDDEN_KEYWORDS {
+        if csp.contains(keyword) {
+            return Err(format!("CSP must not contain '{keyword}'"));
+        }
     }
-    // Reject bare wildcard `*` as a source. Allow `*.example.com`.
+    // Reject bare wildcard `*`, `data:`, and `blob:` as sources.
+    // Allow `*.example.com` (subdomain wildcards).
     for token in csp.split_whitespace() {
         if token == "*" {
             return Err("CSP must not contain bare wildcard '*'".into());
+        }
+        if token == "data:" {
+            return Err("CSP must not contain 'data:' source".into());
+        }
+        if token == "blob:" {
+            return Err("CSP must not contain 'blob:' source".into());
         }
     }
     Ok(())
@@ -1922,12 +1932,16 @@ fn site_security_headers(csp: &str) -> axum::http::HeaderMap {
         axum::http::HeaderValue::from_static("nosniff"),
     );
     // CSP may be dynamic, so we handle the fallible conversion.
-    if let Ok(val) = axum::http::HeaderValue::from_str(csp) {
-        headers.insert(
-            axum::http::header::HeaderName::from_static("content-security-policy"),
-            val,
-        );
-    }
+    // On encoding failure, fall back to the restrictive default CSP rather
+    // than silently omitting the header (which would leave the page unprotected).
+    let csp_val = axum::http::HeaderValue::from_str(csp).unwrap_or_else(|_| {
+        tracing::warn!("CSP override failed encoding, using default");
+        axum::http::HeaderValue::from_static("default-src 'self'")
+    });
+    headers.insert(
+        axum::http::header::HeaderName::from_static("content-security-policy"),
+        csp_val,
+    );
     headers.insert(
         axum::http::header::HeaderName::from_static("x-frame-options"),
         axum::http::HeaderValue::from_static("DENY"),
@@ -2055,12 +2069,12 @@ pub async fn site_handler(
         Ok(Some(blob)) => blob,
         Ok(None) => return not_found_no_store(),
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 error = %e,
                 blob_id = hex_encode(blob_id),
                 "blob storage get failed for site path"
             );
-            return ApiError::internal_error("storage error").into_response();
+            return not_found_no_store();
         }
     };
 
@@ -5467,8 +5481,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_csp_rejects_unsafe_inline() {
+        assert!(validate_csp("default-src 'self' 'unsafe-inline'").is_err());
+    }
+
+    #[test]
+    fn validate_csp_rejects_unsafe_hashes() {
+        assert!(validate_csp("script-src 'unsafe-hashes'").is_err());
+    }
+
+    #[test]
     fn validate_csp_rejects_bare_wildcard() {
         assert!(validate_csp("default-src *").is_err());
+    }
+
+    #[test]
+    fn validate_csp_rejects_data_source() {
+        assert!(validate_csp("default-src 'self' data:").is_err());
+    }
+
+    #[test]
+    fn validate_csp_rejects_blob_source() {
+        assert!(validate_csp("default-src 'self' blob:").is_err());
     }
 
     #[test]
