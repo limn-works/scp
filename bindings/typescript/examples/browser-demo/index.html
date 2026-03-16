@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SCP Browser Demo</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --orange: #d29922;
+      --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      padding: 2rem;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 0.25rem;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      margin-bottom: 2rem;
+    }
+
+    .step {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .step-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .step-number {
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 700;
+      font-size: 0.85rem;
+      width: 1.75rem;
+      height: 1.75rem;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .step-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+
+    .step-status {
+      margin-left: auto;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+    }
+
+    .status-pending { color: var(--text-muted); }
+    .status-running { color: var(--orange); }
+    .status-done { color: var(--green); }
+    .status-error { color: var(--red); }
+
+    .step-output {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-x: auto;
+      max-height: 300px;
+      overflow-y: auto;
+      display: none;
+    }
+
+    .step-output.visible { display: block; }
+
+    .key { color: var(--accent); }
+    .val { color: var(--green); }
+    .dimmed { color: var(--text-muted); }
+
+    button {
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: 6px;
+      padding: 0.6rem 1.5rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 1rem;
+      transition: opacity 0.15s;
+    }
+
+    button:hover { opacity: 0.85; }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .error-banner {
+      background: #3d1418;
+      border: 1px solid var(--red);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+      display: none;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--red);
+      white-space: pre-wrap;
+    }
+
+    .error-banner.visible { display: block; }
+
+    .summary {
+      background: var(--surface);
+      border: 1px solid var(--green);
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin-top: 1.5rem;
+      display: none;
+    }
+
+    .summary.visible { display: block; }
+
+    .summary h2 {
+      color: var(--green);
+      font-size: 1.1rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .summary ul {
+      list-style: none;
+      padding: 0;
+    }
+
+    .summary li {
+      padding: 0.25rem 0;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    .summary li .label {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    footer {
+      margin-top: 2rem;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      text-align: center;
+    }
+
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Shared Context Protocol</h1>
+  <p class="subtitle">Browser WASM Demo &mdash; Identity, Context, Tool Registration, Provenance, and Event Log</p>
+
+  <div id="error-banner" class="error-banner"></div>
+
+  <div class="step" id="step-1">
+    <div class="step-header">
+      <div class="step-number">1</div>
+      <div class="step-title">Initialize WASM Module</div>
+      <div class="step-status status-pending" id="status-1">pending</div>
+    </div>
+    <div class="step-output" id="output-1"></div>
+  </div>
+
+  <div class="step" id="step-2">
+    <div class="step-header">
+      <div class="step-number">2</div>
+      <div class="step-title">Create Identity (DID)</div>
+      <div class="step-status status-pending" id="status-2">pending</div>
+    </div>
+    <div class="step-output" id="output-2"></div>
+  </div>
+
+  <div class="step" id="step-3">
+    <div class="step-header">
+      <div class="step-number">3</div>
+      <div class="step-title">Create Context</div>
+      <div class="step-status status-pending" id="status-3">pending</div>
+    </div>
+    <div class="step-output" id="output-3"></div>
+  </div>
+
+  <div class="step" id="step-4">
+    <div class="step-header">
+      <div class="step-number">4</div>
+      <div class="step-title">Register Tool</div>
+      <div class="step-status status-pending" id="status-4">pending</div>
+    </div>
+    <div class="step-output" id="output-4"></div>
+  </div>
+
+  <div class="step" id="step-5">
+    <div class="step-header">
+      <div class="step-number">5</div>
+      <div class="step-title">Send Message</div>
+      <div class="step-status status-pending" id="status-5">pending</div>
+    </div>
+    <div class="step-output" id="output-5"></div>
+  </div>
+
+  <div class="step" id="step-6">
+    <div class="step-header">
+      <div class="step-number">6</div>
+      <div class="step-title">Attach Provenance</div>
+      <div class="step-status status-pending" id="status-6">pending</div>
+    </div>
+    <div class="step-output" id="output-6"></div>
+  </div>
+
+  <div class="step" id="step-7">
+    <div class="step-header">
+      <div class="step-number">7</div>
+      <div class="step-title">Query Event Log</div>
+      <div class="step-status status-pending" id="status-7">pending</div>
+    </div>
+    <div class="step-output" id="output-7"></div>
+  </div>
+
+  <div class="step" id="step-8">
+    <div class="step-header">
+      <div class="step-number">8</div>
+      <div class="step-title">Evaluate Provenance Quality</div>
+      <div class="step-status status-pending" id="status-8">pending</div>
+    </div>
+    <div class="step-output" id="output-8"></div>
+  </div>
+
+  <div class="summary" id="summary">
+    <h2>Demo Complete</h2>
+    <ul id="summary-list"></ul>
+  </div>
+
+  <button id="run-btn" onclick="runDemo()">Run Demo</button>
+
+  <footer>
+    <p>SCP WASM Module &mdash; <a href="https://github.com/limn-works/scp">github.com/limn-works/scp</a></p>
+  </footer>
+
+  <script type="module" src="./demo.js"></script>
+</body>
+</html>
