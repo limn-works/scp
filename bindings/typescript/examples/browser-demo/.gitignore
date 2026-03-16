@@ -1,0 +1,5 @@
+# Built WASM package — not checked in, must be built locally.
+# See README instructions or run:
+#   wasm-pack build crates/scp-ffi/wasm --target web \
+#     --out-dir bindings/typescript/examples/browser-demo/pkg
+pkg/
