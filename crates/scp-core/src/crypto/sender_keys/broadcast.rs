@@ -662,6 +662,31 @@ pub fn open_broadcast_trusted(
     decrypt_envelope(key, envelope)
 }
 
+/// Decrypts a [`BroadcastEnvelope`] and deserializes the inner payload as a
+/// [`BroadcastContent`](crate::context::broadcast_content::BroadcastContent).
+///
+/// Chains [`open_broadcast_trusted`] (AES-256-GCM decryption, no signature
+/// verification) with
+/// [`deserialize_broadcast_content`](crate::context::broadcast_content::deserialize_broadcast_content)
+/// (magic prefix + `MessagePack` deserialization).
+///
+/// Does NOT change the signature of `open_broadcast_trusted()`.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError`] if decryption fails, or wraps
+/// [`BroadcastContentError`](crate::context::broadcast_content::BroadcastContentError)
+/// as a [`SenderKeyError::SerializationFailed`] if content deserialization fails.
+pub fn open_broadcast_content(
+    key: &BroadcastKey,
+    envelope: &BroadcastEnvelope,
+) -> Result<crate::context::broadcast_content::BroadcastContent, SenderKeyError> {
+    let bytes = open_broadcast_trusted(key, envelope)?;
+    crate::context::broadcast_content::deserialize_broadcast_content(&bytes).map_err(|e| {
+        SenderKeyError::SerializationFailed(format!("broadcast content deserialization: {e}"))
+    })
+}
+
 /// Validates that a broadcast envelope's version field is compatible (§13.5).
 ///
 /// Accepts envelopes with the same major version. When minor versions differ,

@@ -5,4 +5,6 @@ cognitive-complexity-threshold = 25
 # stack space. Raising the threshold avoids a false positive on generated code.
 # Increased from 750000 to 800000 after app sandboxing tests (#595) added ~100
 # new test functions to scp-core.
-stack-size-threshold = 800000
+# Increased from 800000 to 900000 after broadcast content tests (SCP-287)
+# added ~68 new test functions to scp-core.
+stack-size-threshold = 900000
