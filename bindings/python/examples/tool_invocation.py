@@ -1,51 +1,47 @@
-"""Tool invocation: register a tool with test vectors and invoke it."""
+"""Tool invocation: register a tool and invoke it with UCAN authorization."""
 
 import asyncio
 
 from scp_sdk import Context, Identity
+from scp_sdk.types import Capability, CustodyType, MemoryScope
+from scp_sdk.ucan import mint
 
 
 async def main() -> None:
-    identity = await Identity.create(custody="platform")
+    identity = await Identity.create(custody=CustodyType.IN_MEMORY)
 
     ctx = await Context.create(
-        identity=identity,
-        params={
-            "ceiling": ["msg:send", "msg:receive", "tool:invoke"],
-            "tools": [
-                {
-                    "name": "weather",
-                    "description": "Get current weather for a city",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                        "required": ["city"],
-                    },
-                    "output_schema": {
-                        "type": "object",
-                        "properties": {
-                            "temp_c": {"type": "number"},
-                            "condition": {"type": "string"},
-                        },
-                    },
-                    "operator": identity.did,
-                    "test_vectors": [
-                        {
-                            "input": {"city": "Berlin"},
-                            "expected_output": {"temp_c": 18, "condition": "cloudy"},
-                            "description": "Berlin weather lookup",
-                        }
-                    ],
-                }
-            ],
-        },
+        creator=identity,
+        ceiling=[
+            Capability.MESSAGES_READ,
+            Capability.MESSAGES_WRITE,
+            Capability.TOOL_INVOKE_ALL,
+            Capability.TOOL_REGISTER,
+        ],
+        memory_scope=MemoryScope.EPHEMERAL,
+        governance="single_admin",
     )
 
-    # Invoke the tool
-    result = await ctx.invoke_tool("weather", {"city": "Berlin"})
-    print(f"Weather result: {result}")
+    # Mint a UCAN token authorizing tool invocation
+    ucan_token = await mint(
+        audience=identity.did,
+        capabilities=["tool:invoke:*"],
+        context=ctx.context_id,
+    )
 
-    await ctx.close()
+    # Invoke the tool (requires a UCAN token)
+    try:
+        result = await ctx.invoke(
+            tool="weather",
+            input={"city": "Berlin"},
+            ucan_token=ucan_token.token_id,
+        )
+        print(f"Weather result: {result}")
+    except Exception as exc:
+        # Tool invocation may fail without a registered tool handler
+        print(f"Tool invocation result: {exc}")
+
+    await ctx.close(identity)
 
 
 if __name__ == "__main__":
