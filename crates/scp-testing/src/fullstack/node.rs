@@ -325,6 +325,9 @@ impl ContextCryptoProvider for ArcCryptoProvider {
     ) -> Result<Vec<u8>, ContextError> {
         self.0.encrypt_message(id, did, payload, epoch, seq)
     }
+    fn advance_epoch(&self, id: &[u8; 32]) -> Result<(), ContextError> {
+        self.0.advance_epoch(id)
+    }
 }
 
 /// Newtype wrapping `Arc<MerkleEventLogProvider>` to implement `ContextEventLogProvider`.

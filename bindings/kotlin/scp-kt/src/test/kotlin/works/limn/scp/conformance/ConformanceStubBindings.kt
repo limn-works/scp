@@ -3,6 +3,9 @@
 
 package works.limn.scp.conformance
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.MessageCallback
@@ -246,8 +249,15 @@ class ConformanceStubBindings : NativeBindings {
         toolId: String,
         targetContextId: String,
         rateLimitJson: String?,
-    ): String = """{"source_context":"ctx-src","target_context":"$targetContextId",""" +
-        """"tool_id":"$toolId","approved_by_source":true,"approved_by_target":false}"""
+    ): String = Json.encodeToString(
+        buildJsonObject {
+            put("source_context", "ctx-src")
+            put("target_context", targetContextId)
+            put("tool_id", toolId)
+            put("approved_by_source", true)
+            put("approved_by_target", false)
+        },
+    )
 
     override fun toolInterfaceAccept(
         contextHandle: Long,
@@ -257,7 +267,13 @@ class ConformanceStubBindings : NativeBindings {
     override fun toolInterfaceRevoke(
         contextHandle: Long,
         interfaceIdHex: String,
-    ): String = """{"interface_id":"$interfaceIdHex","revoking_context":"ctx-revoker","revoked_at":1700000000000}"""
+    ): String = Json.encodeToString(
+        buildJsonObject {
+            put("interface_id", interfaceIdHex)
+            put("revoking_context", "ctx-revoker")
+            put("revoked_at", 1700000000000)
+        },
+    )
 
     @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(
