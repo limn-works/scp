@@ -28,6 +28,8 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use base64::Engine as _;
+
 use crate::error::ScpWasmError;
 use crate::runtime::{
     ToolRegistration, ToolRegistry, WasmEventLog, prove_absence, prove_inclusion,
@@ -423,6 +425,9 @@ struct PerContextState {
     pruning_policy: Option<String>,
     /// Whether the economic policy is locked (§19.3, ADR-033).
     economic_policy_locked: bool,
+    /// MLS encryption + sender key state. `Some` for encrypted contexts,
+    /// `None` for broadcast-only or unencrypted contexts.
+    crypto: Option<crate::crypto::WasmCryptoState>,
 }
 
 /// A stateful tool session for the WASM bridge.
@@ -623,6 +628,10 @@ impl PerContextState {
 /// call these synchronously within `future_to_promise`).
 pub struct WasmContextManager {
     contexts: HashMap<String, PerContextState>,
+    /// Pending MLS key package holders for encrypted context joins.
+    /// Keyed by `"{context_id}:{member_did}"`. Consumed by
+    /// `join_context_encrypted`.
+    pending_key_packages: HashMap<String, crate::crypto::group::WasmMlsGroup>,
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +774,7 @@ impl WasmContextManager {
     pub fn new() -> Self {
         Self {
             contexts: HashMap::new(),
+            pending_key_packages: HashMap::new(),
         }
     }
 
@@ -829,6 +839,20 @@ impl WasmContextManager {
             None
         };
 
+        // Initialize MLS crypto state for Encrypted mode.
+        let crypto = if mode == "Encrypted" {
+            Some(
+                crate::crypto::WasmCryptoState::new_for_context(creator_did).map_err(|e| {
+                    ScpWasmError::Crypto {
+                        message: format!("MLS group creation failed: {e}"),
+                        code: "SCP-CRYPTO-4004".to_owned(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+
         // Initialize creator as admin member.
         let mut members = HashMap::new();
         members.insert(
@@ -872,6 +896,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            crypto,
         };
 
         self.contexts.insert(context_id.to_owned(), per_context);
@@ -955,6 +980,13 @@ impl WasmContextManager {
             bc.subscribers.remove(member_did);
         }
 
+        // Destroy crypto state on leave — the leaving member should not
+        // retain MLS key material.
+        if let Some(ref mut crypto) = ctx.crypto {
+            crypto.destroy();
+        }
+        ctx.crypto = None;
+
         ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: member_did.to_owned(),
         });
@@ -1007,16 +1039,42 @@ impl WasmContextManager {
         let seq = member.sequence_number;
         member.sequence_number += 1;
 
+        // If crypto state is available, encrypt the payload before recording.
+        let recorded_payload = if let Some(ref mut crypto) = ctx.crypto {
+            let raw_bytes = base64::engine::general_purpose::STANDARD
+                .decode(payload_base64)
+                .map_err(|e| ScpWasmError::Crypto {
+                    message: format!("invalid base64 payload: {e}"),
+                    code: "SCP-CRYPTO-4001".to_owned(),
+                })?;
+
+            let epoch = crypto.mls_group.epoch().map_err(|e| ScpWasmError::Crypto {
+                message: format!("failed to read MLS epoch: {e}"),
+                code: "SCP-CRYPTO-4002".to_owned(),
+            })?;
+
+            let ciphertext = crypto
+                .encrypt_message(&raw_bytes, context_id, sender_did, epoch, seq)
+                .map_err(|e| ScpWasmError::Crypto {
+                    message: format!("encryption failed: {e}"),
+                    code: "SCP-CRYPTO-4003".to_owned(),
+                })?;
+
+            base64::engine::general_purpose::STANDARD.encode(&ciphertext)
+        } else {
+            payload_base64.to_owned()
+        };
+
         ctx.push_event(WasmContextEvent::MessageSent {
             sender_did: sender_did.to_owned(),
             sequence_number: seq,
-            payload_base64: payload_base64.to_owned(),
+            payload_base64: recorded_payload.clone(),
         });
 
         ctx.event_log.append_event(
             crate::runtime::wasm_event_type_tag("MessageSent"),
             sender_did,
-            payload_base64.as_bytes(),
+            recorded_payload.as_bytes(),
         );
 
         Ok(())
@@ -1048,6 +1106,13 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast = None;
 
+        // Destroy crypto state on close — releases MLS group keys and
+        // sender key material.
+        if let Some(ref mut crypto) = ctx.crypto {
+            crypto.destroy();
+        }
+        ctx.crypto = None;
+
         ctx.push_event(WasmContextEvent::SystemClose {
             initiator_did: initiator_did.to_owned(),
         });
@@ -1057,6 +1122,133 @@ impl WasmContextManager {
             initiator_did,
             b"",
         );
+
+        Ok(())
+    }
+
+    /// Decrypts a message within a context.
+    ///
+    /// Reverses the double encryption: MLS decrypt -> sender key decrypt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context has no crypto state, or if decryption fails.
+    pub fn decrypt_message(
+        &mut self,
+        context_id: &str,
+        sender_did: &str,
+        ciphertext_base64: &str,
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<Vec<u8>, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        let crypto = ctx.crypto.as_mut().ok_or_else(|| ScpWasmError::Crypto {
+            message: "context has no MLS encryption state".to_string(),
+            code: "SCP-CRYPTO-4010".to_owned(),
+        })?;
+
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(ciphertext_base64)
+            .map_err(|e| ScpWasmError::Crypto {
+                message: format!("invalid base64 ciphertext: {e}"),
+                code: "SCP-CRYPTO-4001".to_owned(),
+            })?;
+
+        crypto
+            .decrypt_message(&ciphertext, context_id, sender_did, epoch, sequence)
+            .map_err(|e| ScpWasmError::Crypto {
+                message: format!("decryption failed: {e}"),
+                code: "SCP-CRYPTO-4011".to_owned(),
+            })
+    }
+
+    /// Generates an MLS `KeyPackage` for joining an encrypted context.
+    ///
+    /// Returns the TLS-serialized key package bytes. The private key material
+    /// is stored in `pending_key_packages` keyed by `(context_id, member_did)`
+    /// for later use by [`join_context_encrypted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key package generation fails.
+    pub fn generate_key_package_for_join(
+        &mut self,
+        context_id: &str,
+        member_did: &str,
+    ) -> Result<Vec<u8>, ScpWasmError> {
+        let credential = crate::crypto::credential::WasmScpCredential::new(
+            member_did.to_string(),
+            None,
+            crate::crypto::credential::WasmSigningKeyId::Active,
+        )
+        .map_err(|e| ScpWasmError::Crypto {
+            message: format!("credential creation failed: {e}"),
+            code: "SCP-CRYPTO-4020".to_owned(),
+        })?;
+
+        let (kp_bytes, holder) =
+            crate::crypto::group::WasmMlsGroup::generate_key_package(&credential).map_err(|e| {
+                ScpWasmError::Crypto {
+                    message: format!("key package generation failed: {e}"),
+                    code: "SCP-CRYPTO-4022".to_owned(),
+                }
+            })?;
+
+        // Store the holder for later use in join_context_encrypted.
+        self.pending_key_packages
+            .insert(format!("{context_id}:{member_did}"), holder);
+
+        Ok(kp_bytes)
+    }
+
+    /// Joins a context with encrypted MLS state.
+    ///
+    /// The joiner processes the MLS Welcome message to reconstruct the group.
+    /// A key package must have been previously generated via
+    /// [`generate_key_package_for_join`] for the same `(context_id, member_did)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no pending key package exists, or if the Welcome
+    /// cannot be processed.
+    pub fn join_context_encrypted(
+        &mut self,
+        context_id: &str,
+        member_did: &str,
+        welcome_bytes: &[u8],
+    ) -> Result<(), ScpWasmError> {
+        // Retrieve the pending key package holder.
+        let pending_key = format!("{context_id}:{member_did}");
+        let holder = self
+            .pending_key_packages
+            .remove(&pending_key)
+            .ok_or_else(|| ScpWasmError::Crypto {
+                message: format!(
+                    "no pending key package for '{member_did}' in context '{context_id}' — \
+                     call generate_key_package_for_join first"
+                ),
+                code: "SCP-CRYPTO-4023".to_owned(),
+            })?;
+
+        // First join the context normally (membership, events, etc.).
+        self.join_context(context_id, member_did)?;
+
+        // Then set up MLS crypto state from the Welcome.
+        let mls_group =
+            crate::crypto::group::WasmMlsGroup::join_from_welcome(welcome_bytes, holder).map_err(
+                |e| ScpWasmError::Crypto {
+                    message: format!("MLS welcome processing failed: {e}"),
+                    code: "SCP-CRYPTO-4021".to_owned(),
+                },
+            )?;
+
+        let ctx = self.require_active_context_mut(context_id)?;
+        ctx.crypto = Some(crate::crypto::WasmCryptoState {
+            mls_group,
+            local_sender_key: crate::crypto::sender_key::generate_sender_key(),
+            sender_key_store: std::collections::HashMap::new(),
+        });
 
         Ok(())
     }
@@ -4069,6 +4261,9 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: snap.pruning_policy.clone(),
             economic_policy_locked: snap.economic_policy_locked,
+            // Imported contexts do not carry MLS state — they must re-establish
+            // encryption via join_context_encrypted after import.
+            crypto: None,
         };
 
         self.contexts.insert(context_id.clone(), ctx);
@@ -5204,6 +5399,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            crypto: None,
         };
 
         let mut mgr = WasmContextManager::new();
@@ -5308,6 +5504,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            crypto: None,
         };
         let mut mgr = WasmContextManager::new();
         mgr.contexts.insert(context_id.to_owned(), ctx);

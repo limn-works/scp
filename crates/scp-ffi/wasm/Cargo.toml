@@ -38,6 +38,15 @@ serde_bytes = { workspace = true }
 scp-ffi-common = { path = "../common", default-features = false }
 zeroize = { workspace = true }
 subtle = { workspace = true }
+# MLS encryption — openmls with `js` feature for WASM crypto backend.
+# NOT workspace (workspace uses `libcrux-provider` which is native-only).
+openmls = { version = "0.8", default-features = false, features = ["js"] }
+openmls_traits = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+tls_codec = { version = "0.4", features = ["derive"] }
+rmp-serde = { workspace = true }
+aes-gcm = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

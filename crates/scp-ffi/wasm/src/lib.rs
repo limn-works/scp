@@ -76,6 +76,8 @@
 pub mod bridge;
 /// Context lifecycle and messaging (create, join, leave, close, send, subscribe).
 pub mod context;
+/// MLS encryption and sender key layer for real message confidentiality.
+pub mod crypto;
 /// JS-injected key custody callback types (`WebCrypto` integration).
 pub mod custody;
 /// Context discovery operations.

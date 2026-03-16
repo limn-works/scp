@@ -24,6 +24,30 @@ All re-implementations must be algorithm-identical to scp-core. When scp-core ch
 | `custody.rs` | `JsKeyCustody` extern type (WebCrypto injection point) |
 | `storage.rs` | `JsStorage` extern type (OPFS/IndexedDB injection point) |
 | `error.rs` | `ScpWasmError` → `JsError` mapping with stable error codes |
+| `crypto/` | MLS encryption + sender key layer (see below) |
+
+## MLS Encryption (`crypto/` module)
+
+Real MLS encryption using OpenMLS 0.8 with `features = ["js"]`. **Not a reimplementation** — uses the same `openmls` crate as scp-core, just with the WASM-compatible JS crypto backend instead of `libcrux-provider`.
+
+| Submodule | Responsibility |
+|-----------|---------------|
+| `crypto/error.rs` | `WasmCryptoError` enum → `JsError` mapping |
+| `crypto/credential.rs` | `WasmScpCredential` — MessagePack-serialized MLS identity payload (byte-compatible with scp-core) |
+| `crypto/group.rs` | `WasmMlsGroup` — OpenMLS `MlsGroup` wrapper (create, add, remove, join, encrypt, decrypt, destroy) |
+| `crypto/encrypt.rs` | Higher-level MLS encrypt/decrypt with TLS serialization |
+| `crypto/sender_key.rs` | AES-256-GCM sender-side key layer (AAD format matches scp-core exactly) |
+| `crypto/state.rs` | `WasmCryptoState` — orchestrates double encryption (sender key → MLS on send, MLS → sender key on receive) |
+
+**Key design points:**
+- `PerContextState` in `manager.rs` has a `crypto: Option<WasmCryptoState>` field. `Some` for encrypted contexts, `None` for broadcast/unencrypted.
+- `create_context` auto-initializes crypto for Encrypted mode contexts.
+- `send_message` encrypts via double layer when crypto is present.
+- `join_context_encrypted` requires a prior `generate_key_package_for_join` call (two-step flow: generate KP → send to adder → receive Welcome → join).
+- `close_context` and `leave_context` destroy crypto state (zeroize keys).
+- `WasmContextManager.pending_key_packages` stores key package holders between generate and join steps.
+
+**Ciphersuite:** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (same as scp-core).
 
 ## Runtime Registry
 
