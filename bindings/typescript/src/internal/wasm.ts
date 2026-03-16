@@ -261,9 +261,7 @@ interface WasmModule {
   broadcastPublishAsset: (
     handle: BridgeContextHandle,
     authorDid: string,
-    path: string,
-    contentType: string,
-    bodyBase64: string,
+    assetJson: string,
     deployId?: string,
   ) => Promise<unknown>;
   broadcastPublishAssets: (
@@ -801,12 +799,15 @@ export function createWasmBridge(): Bridge {
     ): Promise<{ blobId: string; etag: string }> {
       const wasm = getWasm();
       const bodyBase64 = uint8ToBase64(new Uint8Array(asset.body));
+      const assetJson = JSON.stringify({
+        path: asset.path.normalize("NFC"),
+        contentType: asset.contentType,
+        bodyBase64,
+      });
       return (await wasm.broadcastPublishAsset(
         handle,
         authorDid,
-        asset.path,
-        asset.contentType,
-        bodyBase64,
+        assetJson,
         deployId ?? undefined,
       )) as { blobId: string; etag: string };
     },
@@ -820,7 +821,7 @@ export function createWasmBridge(): Bridge {
       const wasm = getWasm();
       const assetsJson = JSON.stringify(
         assets.map((a) => ({
-          path: a.path,
+          path: a.path.normalize("NFC"),
           contentType: a.contentType,
           bodyBase64: uint8ToBase64(new Uint8Array(a.body)),
         })),

@@ -151,3 +151,14 @@
 - HIGH: /api/send sender_did spoofing (no session-DID binding); WebAuthn missing origin validation; scp-demo /tmp key leakage
 - MEDIUM: Hardcoded passphrase; thread_rng for challenges; no input size limits; unbounded members/challenges; error message leakage; testing feature in prod dep
 - GOOD: textContent (no innerHTML XSS); TLS key Zeroizing; challenge TTL+GC; scp-testing isolation; gitignore for key files
+
+### Phase 4 SDK Bindings -- BroadcastContent Publish (2026-03-16, re-reviewed)
+- WASM ContentPath: FIXED -- is_unicode_formatting_wasm now byte-identical to scp-core (all 6 ranges added)
+- WASM MimeType: FIXED -- RFC 7230 tchar enforcement + exactly-one-slash, algorithm-identical to scp-core
+- WASM wire format: FIXED -- SCP magic + version + rmp_serde::to_vec_named, wire-compatible with scp-core
+- WASM batch limit: FIXED -- MAX_BATCH_ASSETS=10_000, error SCP-CTX-2074 (NAPI has no equivalent limit)
+- WASM deploy_id: PASS (algorithm-identical to scp-core)
+- REMAINING MEDIUM: NFC normalization -- WASM skips NFC, scp-core applies it. Decomposed Unicode paths differ cross-platform. Fix: add .normalize('NFC') in TS SDK wasm.ts or add unicode-normalization crate to WASM.
+- Error codes 2070-2074: clean, no collisions
+- PyO3/NAPI/UniFFI: PASS -- all delegate to scp_core::context::{ContentPath,MimeType,validate_deploy_id}
+- Pattern: WASM reimplementations of scp-core validators consistently miss defensive checks that the core version has. Always diff WASM vs core line-by-line when reimplementing.

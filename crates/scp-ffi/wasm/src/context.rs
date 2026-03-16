@@ -1144,6 +1144,9 @@ pub fn broadcast_publish(
 
 /// Publishes a single asset to a broadcast context as structured content (SCP-290).
 ///
+/// Takes a JSON object string `{ "path", "contentType", "bodyBase64" }` for
+/// consistency with the batch method `broadcastPublishAssets`.
+///
 /// Returns a JS object with `blobId` and `etag` string properties.
 ///
 /// Delegates to `WasmContextManager::publish_broadcast_asset`.
@@ -1151,9 +1154,7 @@ pub fn broadcast_publish(
 pub fn broadcast_publish_asset(
     handle: &WasmContextHandle,
     author_did: String,
-    path: String,
-    content_type: String,
-    body_base64: String,
+    asset_json: String,
     deploy_id: Option<String>,
 ) -> Promise {
     if let Err(e) = validate_did(&author_did) {
@@ -1162,12 +1163,56 @@ pub fn broadcast_publish_asset(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
+        // Parse the asset JSON object.
+        let asset: serde_json::Value = serde_json::from_str(&asset_json).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("invalid asset JSON: {e}"),
+                code: "SCP-CTX-2073".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let path = asset
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ScpWasmError::Context {
+                    message: "asset must have a 'path' string field".to_owned(),
+                    code: "SCP-CTX-2073".to_owned(),
+                }
+                .into_js()
+            })?
+            .to_owned();
+
+        let content_type = asset
+            .get("contentType")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ScpWasmError::Context {
+                    message: "asset must have a 'contentType' string field".to_owned(),
+                    code: "SCP-CTX-2073".to_owned(),
+                }
+                .into_js()
+            })?
+            .to_owned();
+
+        let body_base64 = asset
+            .get("bodyBase64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ScpWasmError::Context {
+                    message: "asset must have a 'bodyBase64' string field".to_owned(),
+                    code: "SCP-CTX-2073".to_owned(),
+                }
+                .into_js()
+            })?;
+
         let body = base64::engine::general_purpose::STANDARD
-            .decode(&body_base64)
+            .decode(body_base64)
             .map_err(|e| {
                 ScpWasmError::Context {
                     message: format!("invalid base64 body: {e}"),
-                    code: "SCP-CTX-2044".to_owned(),
+                    code: "SCP-CTX-2073".to_owned(),
                 }
                 .into_js()
             })?;
@@ -1225,14 +1270,14 @@ pub fn broadcast_publish_assets(
         let assets_value: serde_json::Value = serde_json::from_str(&assets_json).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("invalid assets JSON: {e}"),
-                code: "SCP-CTX-2044".to_owned(),
+                code: "SCP-CTX-2073".to_owned(),
             }
             .into_js()
         })?;
         let assets_arr = assets_value.as_array().ok_or_else(|| {
             ScpWasmError::Context {
                 message: "assets must be a JSON array".to_owned(),
-                code: "SCP-CTX-2044".to_owned(),
+                code: "SCP-CTX-2073".to_owned(),
             }
             .into_js()
         })?;
@@ -1246,7 +1291,7 @@ pub fn broadcast_publish_assets(
                 .ok_or_else(|| {
                     ScpWasmError::Context {
                         message: "each asset must have a 'path' string field".to_owned(),
-                        code: "SCP-CTX-2044".to_owned(),
+                        code: "SCP-CTX-2073".to_owned(),
                     }
                     .into_js()
                 })?
@@ -1257,7 +1302,7 @@ pub fn broadcast_publish_assets(
                 .ok_or_else(|| {
                     ScpWasmError::Context {
                         message: "each asset must have a 'contentType' string field".to_owned(),
-                        code: "SCP-CTX-2044".to_owned(),
+                        code: "SCP-CTX-2073".to_owned(),
                     }
                     .into_js()
                 })?
@@ -1268,7 +1313,7 @@ pub fn broadcast_publish_assets(
                 .ok_or_else(|| {
                     ScpWasmError::Context {
                         message: "each asset must have a 'bodyBase64' string field".to_owned(),
-                        code: "SCP-CTX-2044".to_owned(),
+                        code: "SCP-CTX-2073".to_owned(),
                     }
                     .into_js()
                 })?;
@@ -1277,7 +1322,7 @@ pub fn broadcast_publish_assets(
                 .map_err(|e| {
                     ScpWasmError::Context {
                         message: format!("invalid base64 body: {e}"),
-                        code: "SCP-CTX-2044".to_owned(),
+                        code: "SCP-CTX-2073".to_owned(),
                     }
                     .into_js()
                 })?;

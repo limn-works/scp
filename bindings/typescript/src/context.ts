@@ -541,16 +541,16 @@ export class Context implements AsyncDisposable {
    * and publishes via the structured content path.
    *
    * @param asset - The asset entry containing path, contentType, and body.
-   * @param deployId - Optional deploy ID to group assets into atomic deploys.
    * @param authorDid - The DID of the author publishing the asset.
    *   Defaults to the identity that created/joined the context.
+   * @param deployId - Optional deploy ID to group assets into atomic deploys.
    * @returns A PublishResult with blobId and etag.
    * @throws {ContextError} If the context is not active or not broadcast.
    */
   async broadcastPublishAsset(
     asset: AssetEntry,
-    deployId?: string,
     authorDid?: string,
+    deployId?: string,
   ): Promise<PublishResult> {
     this.assertActive();
     try {
@@ -573,16 +573,16 @@ export class Context implements AsyncDisposable {
    * All assets are published with the same deployId (auto-generated if not provided).
    *
    * @param assets - The asset entries to publish.
-   * @param deployId - Optional deploy ID to group assets into atomic deploys.
    * @param authorDid - The DID of the author publishing the assets.
    *   Defaults to the identity that created/joined the context.
+   * @param deployId - Optional deploy ID to group assets into atomic deploys.
    * @returns A list of PublishResult objects with blobId and etag.
    * @throws {ContextError} If any asset fails validation or publish.
    */
   async broadcastPublishAssets(
     assets: AssetEntry[],
-    deployId?: string,
     authorDid?: string,
+    deployId?: string,
   ): Promise<PublishResult[]> {
     this.assertActive();
     try {
