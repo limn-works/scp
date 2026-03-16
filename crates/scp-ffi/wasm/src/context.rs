@@ -382,6 +382,104 @@ pub fn context_send(
     })
 }
 
+/// Decrypts a message received from an encrypted SCP context.
+///
+/// Reverses the double encryption: MLS decrypt -> sender key decrypt.
+/// Returns the decrypted plaintext as a `Uint8Array`.
+///
+/// # Errors
+///
+/// Returns an error if the context has no MLS encryption state, or if
+/// decryption fails.
+#[wasm_bindgen]
+pub fn context_decrypt_message(
+    handle: &WasmContextHandle,
+    sender_did: String,
+    ciphertext_base64: String,
+    epoch: u64,
+    sequence: u64,
+) -> Promise {
+    if let Err(e) = validate_did(&sender_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let plaintext = with_manager(|mgr| {
+            mgr.decrypt_message(
+                &context_id,
+                &sender_did,
+                &ciphertext_base64,
+                epoch,
+                sequence,
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        // Return as Uint8Array.
+        let js_array = js_sys::Uint8Array::from(plaintext.as_slice());
+        Ok(JsValue::from(js_array))
+    })
+}
+
+/// Generates an MLS key package for joining an encrypted context.
+///
+/// Returns the TLS-serialized key package bytes as a `Uint8Array`. The
+/// private key material is retained internally for later use by
+/// [`context_join_encrypted`].
+///
+/// This must be called BEFORE `context_join_encrypted` — the returned
+/// key package is sent to the adder, who uses it to produce a Welcome.
+///
+/// # Errors
+///
+/// Returns an error if key package generation fails.
+#[wasm_bindgen]
+pub fn context_generate_key_package(handle: &WasmContextHandle, identity_did: String) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let kp_bytes =
+            with_manager(|mgr| mgr.generate_key_package_for_join(&context_id, &identity_did))
+                .map_err(ScpWasmError::into_js)?;
+
+        let js_array = js_sys::Uint8Array::from(kp_bytes.as_slice());
+        Ok(JsValue::from(js_array))
+    })
+}
+
+/// Joins an encrypted SCP context using an MLS Welcome message.
+///
+/// Processes the Welcome to reconstruct the MLS group state, then sets up
+/// the sender key layer. A key package must have been previously generated
+/// via [`context_generate_key_package`] for the same context and identity.
+///
+/// # Errors
+///
+/// Returns an error if no pending key package exists, the Welcome cannot
+/// be processed, or the context is not active.
+#[wasm_bindgen]
+pub fn context_join_encrypted(
+    handle: &WasmContextHandle,
+    identity_did: String,
+    welcome_bytes: Vec<u8>,
+) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.join_context_encrypted(&context_id, &identity_did, &welcome_bytes))
+            .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::UNDEFINED)
+    })
+}
+
 /// Subscribes to incoming messages from an SCP context.
 ///
 /// Registers a JS callback. In the full runtime, the transport layer calls

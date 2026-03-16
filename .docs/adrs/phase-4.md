@@ -1414,7 +1414,7 @@ ADR-022 specifies a wasm-bindgen bridge crate (`crates/scp-ffi/wasm/`) that comp
 
 1. **tokio multi-thread runtime.** scp-core uses `tokio::runtime::Runtime` with the multi-thread scheduler (required by PyO3 native async, MLS group operations, and transport concurrency). The `wasm32-unknown-unknown` target does not support `std::thread`, so `tokio::runtime::Builder::new_multi_thread()` fails to compile. While tokio offers a `current_thread` runtime that compiles to WASM, switching would require pervasive changes throughout scp-core and all FFI bridges, breaking the single-implementation invariant.
 
-2. **OpenMLS dependencies.** OpenMLS pulls in platform-specific crypto backends (RustCrypto or ring) that include assembly routines and C code incompatible with `wasm32-unknown-unknown`. The OpenMLS `wasm` feature flag exists but changes the API surface and introduces a different set of trait requirements that would require a parallel integration path.
+2. **OpenMLS dependencies.** ~~OpenMLS pulls in platform-specific crypto backends (RustCrypto or ring) that include assembly routines and C code incompatible with `wasm32-unknown-unknown`.~~ **Update (2026-03-15):** OpenMLS 0.8 with `default-features = false, features = ["js"]` compiles cleanly to `wasm32-unknown-unknown`. The `js` feature uses the RustCrypto backend with WASM-compatible randomness (`getrandom/js`). The WASM bridge now uses OpenMLS directly for MLS encryption (see `crates/scp-ffi/wasm/src/crypto/`). Wire's production WASM deployment validates this approach. The remaining blocker is tokio multi-thread (item 1), not OpenMLS.
 
 These are not feature-flag-able constraints — they are structural incompatibilities between scp-core's architecture and the WASM compilation target.
 
@@ -1424,8 +1424,8 @@ The WASM bridge (`crates/scp-ffi/wasm/`) uses **verbatim re-implementation** of 
 
 - Implements the same public API types and function signatures as the napi-rs bridge.
 - Uses `wasm-bindgen-futures` for async bridging (single-threaded, cooperative scheduling on the browser event loop).
-- Uses WebCrypto API (via `web-sys`) for cryptographic operations instead of ring/RustCrypto.
-- Uses a WASM-compatible MLS implementation or a pure-Rust MLS subset that compiles to WASM.
+- Uses WebCrypto API (via `web-sys`) for non-MLS cryptographic operations (Ed25519, randomness). **Update (2026-03-15):** MLS encryption uses OpenMLS directly with `features = ["js"]` — no WebCrypto shim needed for MLS.
+- Uses OpenMLS 0.8 with the `js` feature flag for MLS group encryption, compiled directly to WASM. The `OpenMlsRustCrypto` in-memory provider handles crypto and storage.
 - Passes the same cross-language conformance test suite as all other bridges (JSON fixtures from `tests/conformance/`).
 
 The re-implementation is NOT a fork — it is a second implementation of the same specification, verified against the same acceptance criteria.
