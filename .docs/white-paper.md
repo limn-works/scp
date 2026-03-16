@@ -39,9 +39,9 @@ What is missing is the social layer — how agents *relate to each other*. No ex
 
 SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent can expose itself as an MCP server locally. An SCP agent can consume WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
 
-The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, tools, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly, context creation is a runtime operation (estimated ~5–15 ms local, ~200 ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol minimizes the barrier to correct-by-construction connected software.
+The protocol is designed to be what agents reach for first when building connected software. This is by design. The SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, tools, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly. Context creation is a runtime operation, not infrastructure provisioning. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol minimizes the barrier to correct-by-construction connected software.
 
-SCP is designed to harmonize with existing platforms rather than replace them. Bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, and identity attestations link SCP identities to existing platform accounts. The protocol complements existing distribution networks by providing the open social infrastructure they do not.
+Beyond new applications, SCP is designed to harmonize with existing platforms rather than replace them. Bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, and identity attestations link SCP identities to existing platform accounts. The protocol complements existing distribution networks by providing the open social infrastructure they do not.
 
 ### 1.3 Design Principles
 
@@ -71,7 +71,7 @@ SCP provides a complete protocol specification, a reference SDK (Rust core with 
 
 The primary contributions are architectural, not cryptographic — SCP composes established primitives (MLS, DIDs, UCANs, Merkle trees) into a system designed specifically for autonomous agent interaction. Three contributions are novel to SCP: (1) the shared-DID model for human-agent accountability, where human and agent share one identity with distinct signing keys and structural action provenance on every message; (2) context isolation as the primary security boundary, with all cross-context data flow mediated by governed protocol mechanisms; and (3) the sender-side key layer that decouples content access from MLS group membership, enabling per-sender blocking without group disruption. The remaining design choices — the multi-key identity architecture (extending KERI's [25] pre-rotation approach), the provenance model (applying W3C PROV [26] concepts to cross-context agent communication), dual-layer DID resolution, and encryption-as-access-control — are novel applications of known techniques to the agent-native case, not claimed as independent contributions.
 
-The remainder of this paper is organized as follows: Section 2 analyzes the problem space. Section 3 presents the architecture overview. Sections 4–8 detail the core protocol components: identity, contexts, encryption, capabilities, and provenance. Section 9 covers transport. Section 10 addresses discovery. Section 11 provides the security analysis. Section 12 compares with related work. Section 13 discusses implementation status and Section 14 addresses limitations and future work.
+The remainder of this paper is organized as follows: Section 2 analyzes the problem space. Section 3 presents the architecture overview. Sections 4–8 detail the core protocol components: identity, contexts, encryption, capabilities, and provenance. Section 9 covers transport. Section 10 addresses discovery. Section 11 provides the security analysis. Section 12 compares with related work. Section 13 discusses implementation status, Section 14 discusses open questions and future work, and Section 15 concludes.
 
 ---
 
@@ -184,13 +184,13 @@ SCP's trust model has four layers, ordered from hardest (pure validation) to sof
 
 **Layer 1: Protocol Enforcement.** Zero-trust, mandatory. Every action requires a valid UCAN capability token. Signature chains verified. Capability ceilings enforced. Role permissions checked. No action proceeds on reputation or identity alone.
 
-**Layer 2: Behavioral Validation.** Automated, objective. Verifiable event logs provide Merkle-backed evidence of participation history. Participation records — tool invocations by type and frequency, governance actions taken and received, role progression, attestation history — are derived from event logs, not stored centrally. Challenge-response verification tests agent capabilities objectively.
+**Layer 2: Behavioral Validation.** Automated, objective. Verifiable event logs provide Merkle-backed evidence of participation history. Participation records are derived from event logs, not stored centrally (Section 3.6). Challenge-response verification tests agent capabilities objectively.
 
 **Layer 3: Attestation Authenticity.** Automated signature verification. Attestations are verified as *real* (genuinely signed by the claimed issuer) but not as *true* (the content may be inaccurate). OAuth proofs, DNS records, and content hashes are verified where objectively checkable.
 
 **Layer 4: Trust Evaluation.** Agent-level judgment for what cannot be mechanized: new identities with no history, non-testable capabilities, novel situations. This layer exists because some evaluation inherently requires judgment.
 
-The design goal: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol is designed to make this convergence structural, though formal proof of monotonic decrease remains future work (Section 14.1).
+The design goal: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol is designed to support this convergence, though formal proof of monotonic decrease remains future work (Section 14).
 
 ### 3.6 Verifiable Event Logs
 
@@ -307,7 +307,7 @@ A natural question is why the protocol does not provide a direct agent-to-agent 
 
 The reasoning is specific. Forbidding agents from communicating across contexts does not hinder their functionality. The human coordinates across their own contexts locally — on their machine, agents share state freely, plan across contexts, and carry intelligence between interactions. The protocol governs what touches the network; it does not constrain what happens on the user's device. Network-level agent-to-agent communication would automate something that does not need network-level automation, while opening massive attack surface: runaway agent connections, cross-context infection via agent memory, fleet coordination at the protocol level, and metastatic growth patterns through agent connection graphs.
 
-Empirical support for this threat model came from Moltbook, an agent social network that launched in early 2026 and reportedly reached approximately 1.5 million agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. While Moltbook's failures resulted from the combination of absent identity binding, encryption, governance, and capability controls — not solely from ungoverned communication — the case illustrates the compound risks that arise when autonomous agents interact without protocol-level constraints.
+Empirical support for this threat model came from Moltbook, an agent social network that launched in early 2026 and reached approximately 1.5 million registered agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. While Moltbook's failures resulted from the combination of absent identity binding, encryption, governance, and capability controls — not solely from ungoverned communication — the case illustrates the compound risks that arise when autonomous agents interact without protocol-level constraints.
 
 The protocol considered adding governed agent-to-agent communication (a propose/accept flow for bilateral context creation) and ultimately removed it. The reasoning: cross-context tool calls with stateful sessions handle all inter-agent interaction where both parties share a context, which covers the governed case. The remaining unique capability — reaching agents you share no context with — is precisely the attack surface that isolation was designed to eliminate. Any mechanism that allows agents to bypass context isolation, even a "governed" one with rate limits and trust evaluation, reintroduces the problems isolation solves. Agents that need new relationships require their humans to arrange them — through human facilitation in shared contexts, not through network-level agent initiative.
 
@@ -367,9 +367,7 @@ Under the shared-DID model, intra-DID delegation uses self-delegation UCANs wher
 
 ### 7.2 Capability Categories
 
-Standard capability categories include messaging, tool invocation, media (voice, video, screen sharing), bridging, tool interfaces, and child context creation. Every action is checked against the context's capability ceiling, the agent's role permissions, and the token's validity. Economic policy (what actions cost) is orthogonal to the ceiling (what actions are permitted).
-
-Spending UCANs authorize expenditure up to a ceiling, composing with action UCANs via AND-composition: both the capability to act and the capability to pay are required for paid actions.
+Standard capability categories include messaging, tool invocation, media (voice, video, screen sharing), bridging, tool interfaces, and child context creation. Every action is checked against the context's capability ceiling, the agent's role permissions, and the token's validity.
 
 ### 7.3 Economic Governance
 
@@ -453,7 +451,7 @@ SCP is online-first — designed for always-connected agents — but deployable 
 
 The deployment spectrum ranges from phones (full participants when online, relays for offline delivery), through laptops (persistent daemons, potential personal relays), agent workstations (dedicated always-on hardware — natural SCP nodes), personal servers (power users), to managed infrastructure (convenience and high availability). All points on the spectrum are simultaneously valid; a user can operate at multiple points at once.
 
-The agent workstation tier is architecturally significant. As autonomous agents become mainstream, users are acquiring dedicated always-on hardware to run them. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware already running continuously, providing a natural deployment point for personal relay processes. This is why "online-first, deployable from anywhere" is the right framing rather than "offline-first": the protocol assumes agents are running and connected, and optimizes for that case. Offline tolerance exists (Section 9.5) but is the exception, not the design center.
+The agent workstation tier is architecturally significant. As autonomous agents become mainstream, users are acquiring dedicated always-on hardware to run them. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware already running continuously, providing a natural deployment point for personal relay processes. The protocol is designed for the online case and tolerates offline periods, rather than the reverse: the protocol assumes agents are running and connected, and optimizes for that case. Offline tolerance exists (Section 9.5) but is the exception, not the design center.
 
 ### 9.5 Offline Strategy
 
@@ -568,7 +566,7 @@ SCP builds on established standards rather than inventing from scratch where goo
 - **Merkle trees** from distributed systems: tamper-evident history.
 - **BEP44** [11] from BitTorrent: signed mutable items on Mainline DHT.
 
-The relay model is informed by Nostr's simplicity [17]. Federation lessons are informed by Matrix's experience [15]. The append-only log primitive draws from the same well-understood lineage as Hypercore [19]. DHT-integrated hole punching as a reachability concept is validated by Hyperswarm [18]. Keet [23] provides existence proof that zero-server encrypted group messaging works at production scale.
+The relay model is informed by Nostr's simplicity [17]. Federation lessons are informed by Matrix's experience [15]. The append-only log primitive draws from the same well-understood lineage as Hypercore [19]. DHT-integrated hole punching is validated by Hyperswarm [18]. Keet [23] provides existence proof that zero-server encrypted group messaging works at production scale.
 
 ### 12.3 Contributions
 
@@ -578,7 +576,7 @@ SCP's contributions are architectural — the composition of established primiti
 
 - **The shared-DID model for human-agent accountability.** Human and agent share one DID with distinct signing keys (`#active`, `#agent`). The `signing_key_id` field on every signed message provides structural action provenance — verifiers distinguish human from agent authorship cryptographically, not by self-report. No existing protocol binds agents to human accountability chains through shared identity with per-key attribution.
 - **Context isolation as the primary security boundary** for multi-agent interaction. While group key isolation exists in other protocols (Matrix rooms use separate Megolm sessions, for example), SCP makes isolation the *organizing principle*: all cross-context data flow is mediated by governed protocol mechanisms with provenance, chain depth limits, and bilateral governance consent. The contribution is the design philosophy and its systematic enforcement, not the underlying group key separation.
-- **The sender-side key layer** enabling per-sender blocking without MLS group disruption. Double encryption (sender key then MLS group key) with a pull-based key distribution model decouples content access from group membership — a practical construction not present in MLS, Megolm, or Signal Groups.
+- **The sender-side key layer** enabling per-sender blocking without MLS group disruption. Double encryption (sender key then MLS group key) with a pull-based key distribution model decouples content access from group membership. Signal Groups v2 uses a structurally similar per-sender symmetric key layer, but for performance rather than access control. SCP's contribution is applying per-sender keys to selective blocking — denying key distribution to specific members without MLS group disruption — which is not present in Signal, MLS, or Megolm.
 
 **Novel applications of known techniques:**
 
@@ -615,9 +613,9 @@ SCP builds on did:dht's self-certification property but extends it significantly
 | Self-healing | None | Protocol-level: fresher document re-published to stale layer |
 | TTL management | ~2 hour republish | Dual-cycle: 2h (DHT) + 6d (relay, 7d TTL) |
 | Payload limit | 1000 bytes (BEP44) | 1000 bytes (DHT fallback), 256KB (relay layer) |
-| Governance risk | TBD shutdown 2024, transferred to DIF | Insulated — depends only on BEP44 + Ed25519, not on did:dht software |
+| Governance risk | Original maintainer shut down Nov 2024; stewardship transferred to DIF | Insulated — depends only on BEP44 + Ed25519, not on did:dht software |
 
-SCP identities are simultaneously did:dht-compatible (resolvable by standard did:dht resolvers via the DHT layer) and more resilient (dual-layer with self-healing). The multi-key architecture provides key compromise recovery without changing the DID — a capability no existing DID method offers — plus custody separation between human and agent operations.
+SCP identities are simultaneously did:dht-compatible (resolvable by standard did:dht resolvers via the DHT layer) and more resilient (dual-layer with self-healing). The multi-key architecture provides key compromise recovery without changing the DID — extending KERI's [25] pre-rotation approach with custody separation between human and agent operations and graduated permission categories.
 
 ---
 
@@ -694,7 +692,7 @@ The protocol's contribution is a coherent architecture that composes established
 
 Three observations emerged from the design process and shaped the protocol's architecture. First, that the human must remain the root of trust and accountability even as agents become the primary actors — not because agents are untrustworthy, but because accountability requires a locus that cannot be manufactured computationally. Second, that isolation is a stronger security primitive than governance — a protocol that prevents cross-context infection by construction is fundamentally more secure than one that tries to govern it after the fact. Third, that the protocol that agents reach for first when building connected software will, over time, become the substrate for most connected software — and that this protocol must be open, interoperable with existing platforms, and independent of any single operator.
 
-The specification is complete and published under CC-BY 4.0. The reference implementation spans five binding targets. Independent implementation is possible from the specification alone.
+The specification is published under CC-BY 4.0 and covers the full protocol surface. The reference implementation spans five binding targets and serves as the authoritative guide for interoperability while the specification matures toward full wire-format precision.
 
 ---
 
