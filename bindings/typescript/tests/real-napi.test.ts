@@ -177,7 +177,7 @@ if (bridge === null) {
       await napi.contextJoin(ctx, joiner.did);
     });
 
-    test.skip("sends a message without error (requires real MLS crypto provider)", async () => {
+    test.skip("sends a message without error (requires configured transport relay)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -857,10 +857,7 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E context lifecycle (real NAPI)", () => {
-    // contextSend requires a real MLS crypto provider; the NAPI bridge uses a
-    // stub NapiBridgeCryptoProvider that rejects encrypt_message. Skip until a
-    // production crypto backend is wired. See #1144.
-    test.skip("create -> join -> send -> membership check -> leave -> close (requires real MLS crypto)", async () => {
+    test.skip("create -> join -> send -> membership check -> leave -> close (requires configured transport relay)", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -1344,9 +1341,7 @@ if (bridge === null) {
       expect(data.length).toBeGreaterThan(0);
     });
 
-    // context_import triggers a crypto operation (re-establishing MLS state)
-    // which the stub NapiBridgeCryptoProvider cannot perform. See #1144.
-    test.skip("exports and imports a context round-trip (import requires real MLS crypto)", async () => {
+    test.skip("exports and imports a context round-trip (import rejects same-process context — needs cross-process test)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,

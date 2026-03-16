@@ -5,11 +5,11 @@
 //! lifecycle, messaging, governance, broadcast, membership, and TTL operations
 //! to the manager.
 //!
-//! The manager is initialized once (via `OnceLock`) with lightweight provider
-//! implementations suitable for the Node.js/Bun FFI environment:
+//! The manager is initialized once (via `OnceLock`) with production provider
+//! implementations:
 //!
-//! - `NapiBridgeCryptoProvider` — No-op MLS/sender-key operations. Real
-//!   encryption is handled at the SDK layer above the FFI bridge.
+//! - `MlsCryptoProvider` — Real OpenMLS-backed encryption, sender key
+//!   generation, and group management. Wired in issue #1294.
 //! - `NotConfiguredTransportProvider` (from `scp-core`) — Returns descriptive
 //!   errors until transport is configured. See issue #501.
 //! - `MerkleEventLogProvider` — Persistent Merkle-chained event log backed by
@@ -23,10 +23,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
-use scp_core::context::ContextError;
-use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-};
+use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
@@ -144,12 +141,14 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
     })
 }
 
-/// Initializes the global [`ContextManager`] with bridge-local providers.
+/// Initializes the global [`ContextManager`] with production providers.
 ///
-/// Uses `NapiBridgeCryptoProvider` (no-op), `NotConfiguredTransportProvider`,
-/// `MerkleEventLogProvider` (persistent, #484), and `NapiBridgePersistence`.
-/// This is called during `context_create` to ensure the manager is ready
-/// before any context operations.
+/// Uses [`MlsCryptoProvider`] (real MLS encryption, #1294),
+/// `NotConfiguredTransportProvider`, `MerkleEventLogProvider` (persistent,
+/// #484), and `NapiBridgePersistence`.
+///
+/// The `local_did` is passed to [`MlsCryptoProvider::new`] which uses it as
+/// the MLS credential identity for group operations and sender key generation.
 ///
 /// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
 /// backed by a `ProtocolRepositoryEventLogBridge` over an encrypted in-memory
@@ -157,9 +156,17 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
 /// append (issue #484 AC).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_context_manager() {
+pub fn init_context_manager(local_did: &str) {
+    if CONTEXT_MANAGER.get().is_some() {
+        tracing::debug!(
+            requested_did = %local_did,
+            "init_context_manager already initialized — MLS crypto uses the original DID"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
     let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let crypto = Box::new(NapiBridgeCryptoProvider);
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
         let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
         let event_log = build_event_log_provider();
         let persistence = Box::new(NapiBridgePersistence::new());
@@ -223,19 +230,114 @@ fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
 
 /// Test variant of [`context_manager`] initialization that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider) instead of
-/// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider).
+/// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider)
+/// and a no-op crypto provider for Rust unit tests that pass `None` key
+/// package bytes with `did:key:` test DIDs.
 ///
 /// Must be called before the first `context_manager()` call in tests.
 /// `OnceLock::get_or_init` ensures only the first initialization wins.
 #[cfg(test)]
 pub(crate) fn init_context_manager_for_test() {
     let _ = CONTEXT_MANAGER.set(Arc::new(ContextManager::with_persistence(
-        Box::new(NapiBridgeCryptoProvider),
+        Box::new(TestNoOpCryptoProvider),
         Box::new(scp_core::context::LocalTransportProvider),
         build_event_log_provider(),
         Box::new(NapiBridgePersistence::new()),
         not_configured_key_resolver(),
     )));
+}
+
+/// No-op crypto provider for Rust unit tests only.
+///
+/// Accepts `None` key packages and `did:key:` DIDs, unlike the production
+/// `MlsCryptoProvider` which requires real MLS key package bytes and
+/// `did:dht:z` DIDs.
+#[cfg(test)]
+struct TestNoOpCryptoProvider;
+
+#[cfg(test)]
+impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvider {
+    fn validate_creator_identity(
+        &self,
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    fn create_mls_group(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    fn generate_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    fn init_broadcast_key(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_mls_group(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    fn validate_key_package(
+        &self,
+        _owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), scp_core::context::ContextError> {
+        Ok(())
+    }
+    fn add_member(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), scp_core::context::ContextError> {
+        Ok(())
+    }
+    fn remove_member(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), scp_core::context::ContextError> {
+        Ok(())
+    }
+    fn distribute_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), scp_core::context::ContextError> {
+        Ok(())
+    }
+    fn remove_member_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), scp_core::context::ContextError> {
+        Ok(())
+    }
+    fn encrypt_message(
+        &self,
+        _context_id: &[u8; 32],
+        _sender_did: &str,
+        _payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
+    ) -> Result<Vec<u8>, scp_core::context::ContextError> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,97 +824,6 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
     };
 
     map.entry(context_id.to_owned()).or_insert(state);
-}
-
-// ---------------------------------------------------------------------------
-// NapiBridgeCryptoProvider — no-op MLS/sender key operations
-// ---------------------------------------------------------------------------
-
-/// Bridge crypto provider for the NAPI layer.
-///
-/// All operations succeed immediately. Real MLS and sender key operations
-/// will be delegated to production providers when integrated. The bridge
-/// layer validates parameters and delegates lifecycle to `ContextManager`;
-/// the crypto provider is called by the manager during creation, join,
-/// leave, and send flows.
-struct NapiBridgeCryptoProvider;
-
-impl ContextCryptoProvider for NapiBridgeCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn add_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn distribute_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn remove_member_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn encrypt_message(
-        &self,
-        _context_id: &[u8; 32],
-        _sender_did: &str,
-        _payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        Err(ContextError::CryptoFailed(
-            "NapiBridgeCryptoProvider::encrypt_message is not a real implementation — \
-             wire a production crypto provider for MLS/sender-key encryption"
-                .to_owned(),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
