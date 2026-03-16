@@ -1090,6 +1090,12 @@ pub fn broadcast_projection_router(state: Arc<NodeState>) -> Router {
 /// (injected by `axum::serve` for plain HTTP, or manually for TLS connections
 /// in [`crate::tls::serve_tls`]). Falls back to `0.0.0.0` if unavailable.
 ///
+/// **Note:** This middleware currently uses the connection source IP only.
+/// Per spec §18.11.6, `X-Forwarded-For` extraction MUST only be enabled when the
+/// connecting IP is in a trusted-proxy allowlist. Without trusted-proxy
+/// configuration, rate limiting by connection source IP is the correct
+/// behavior. See <https://github.com/limn-works/scp/issues/1292>.
+///
 /// Returns HTTP 429 Too Many Requests when the per-IP token bucket is exhausted.
 /// See spec section 18.11.6.
 async fn projection_rate_limit_middleware(
