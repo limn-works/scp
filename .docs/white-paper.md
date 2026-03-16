@@ -126,7 +126,7 @@ flowchart TD
         A & B & C & D --> orch["Local Agent Orchestration\n(unconstrained by protocol)"]
     end
 
-    orch --> boundary(["══ PROTOCOL BOUNDARY ══"])
+    orch --> boundary(["PROTOCOL BOUNDARY"])
 
     boundary --> ctxA["Context A"]
     boundary --> ctxB["Context B"]
