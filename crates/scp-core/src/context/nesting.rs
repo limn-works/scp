@@ -119,9 +119,9 @@ impl ParentGovernanceConfig {
     /// Returns [`NestingError::SerializationFailed`] if the governance
     /// configuration cannot be serialized to JSON.
     pub fn content_hash(&self) -> Result<[u8; 32], NestingError> {
-        // Deterministic serialization via JSON with sorted keys.
-        let json = serde_json::to_string(self)
-            .map_err(|e| NestingError::SerializationFailed(e.to_string()))?;
+        // RFC 8785 JCS canonical serialization for cross-implementation
+        // deterministic hashing.
+        let json = crate::jcs::to_string(self).map_err(NestingError::SerializationFailed)?;
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
         let result = hasher.finalize();

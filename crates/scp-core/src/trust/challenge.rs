@@ -399,7 +399,7 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let type_tag = challenge_type_tag(&request.challenge_type);
-    let params_bytes = serde_json::to_vec(&request.parameters).unwrap_or_default();
+    let params_bytes = crate::jcs::to_vec(&request.parameters).unwrap_or_default();
 
     canonical_hash_bytes(
         DOMAIN_CHALLENGE_REQ_V1,
@@ -424,7 +424,7 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
 fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
-    let result_bytes = serde_json::to_vec(&response.result).unwrap_or_default();
+    let result_bytes = crate::jcs::to_vec(&response.result).unwrap_or_default();
 
     canonical_hash_bytes(
         DOMAIN_CHALLENGE_RESP_V1,

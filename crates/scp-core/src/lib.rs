@@ -27,6 +27,7 @@ pub mod economy;
 pub mod envelope;
 pub mod event_log;
 pub mod identity;
+pub(crate) mod jcs;
 pub mod provenance;
 pub mod serde_util;
 pub mod store;

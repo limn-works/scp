@@ -3841,13 +3841,15 @@ impl WasmContextManager {
             economic_policy_locked: ctx.economic_policy_locked,
         };
 
-        // Serialize snapshot to canonical JSON for HMAC computation.
-        // The HMAC is computed over this stable serialization — NOT the full
-        // envelope — to avoid a circular dependency (envelope contains the MAC).
-        let snapshot_json = serde_json::to_vec(&snapshot).map_err(|e| ScpWasmError::Context {
-            message: format!("export snapshot serialization failed: {e}"),
-            code: "SCP-CTX-2030".to_owned(),
-        })?;
+        // Serialize snapshot to RFC 8785 JCS canonical JSON for HMAC
+        // computation. The HMAC is computed over this stable serialization —
+        // NOT the full envelope — to avoid a circular dependency (envelope
+        // contains the MAC).
+        let snapshot_json =
+            serde_json_canonicalizer::to_vec(&snapshot).map_err(|e| ScpWasmError::Context {
+                message: format!("export snapshot serialization failed: {e}"),
+                code: "SCP-CTX-2030".to_owned(),
+            })?;
 
         // Compute HMAC-SHA256 over the snapshot JSON using the creator's
         // signing key (via HKDF domain separation). The creator DID is in the
@@ -3896,15 +3898,16 @@ impl WasmContextManager {
             });
         }
 
-        // Re-serialize the snapshot to canonical JSON and verify the HMAC tag
-        // using the creator's signing key. This MUST happen before any state
-        // reconstruction to prevent an attacker from crafting payloads that
-        // grant them admin of a context.
-        let snapshot_json =
-            serde_json::to_vec(&envelope.snapshot).map_err(|e| ScpWasmError::Context {
+        // Re-serialize the snapshot to RFC 8785 JCS canonical JSON and verify
+        // the HMAC tag using the creator's signing key. This MUST happen
+        // before any state reconstruction to prevent an attacker from crafting
+        // payloads that grant them admin of a context.
+        let snapshot_json = serde_json_canonicalizer::to_vec(&envelope.snapshot).map_err(|e| {
+            ScpWasmError::Context {
                 message: format!("snapshot re-serialization failed: {e}"),
                 code: "SCP-CTX-2032".to_owned(),
-            })?;
+            }
+        })?;
 
         if envelope.integrity_mac.is_empty() {
             return Err(ScpWasmError::Context {

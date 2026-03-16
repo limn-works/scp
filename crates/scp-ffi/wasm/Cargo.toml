@@ -22,6 +22,7 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console", "Window", "Crypto", "SubtleCrypto"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4", "js"] }
 getrandom = { version = "0.2", features = ["js"] }

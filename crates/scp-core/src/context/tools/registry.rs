@@ -487,14 +487,13 @@ where
 
 /// Computes the canonical bytes for tool registration signature verification.
 ///
-/// The signed payload is the `MessagePack` encoding of a canonical struct
-/// containing all `ToolRegistration` fields except `signature` itself,
-/// in a deterministic order. This ensures independent verification that
-/// the registration was created by the claimed registrant.
+/// The signed payload is a SHA-256 hash of a canonical struct containing all
+/// `ToolRegistration` fields except `signature` itself, in a deterministic
+/// order. JSON schema fields use RFC 8785 JCS canonical serialization.
 ///
 /// The canonical representation includes:
 /// - `tool_id`, `name`, `description`
-/// - `input_schema`, `output_schema` (JSON bytes)
+/// - `input_schema`, `output_schema` (JCS canonical JSON bytes)
 /// - `implementation_hash` (32 bytes)
 /// - `test_vectors` (count + hashes)
 /// - `operator_did`
@@ -517,10 +516,10 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     length_prefix(&mut hasher, registration.name.as_bytes());
     length_prefix(&mut hasher, registration.description.as_bytes());
 
-    // Schema as canonical JSON bytes.
-    let input_json = serde_json::to_vec(&registration.schema.input_schema).unwrap_or_default();
+    // Schema as RFC 8785 JCS canonical JSON bytes.
+    let input_json = crate::jcs::to_vec(&registration.schema.input_schema).unwrap_or_default();
     length_prefix(&mut hasher, &input_json);
-    let output_json = serde_json::to_vec(&registration.schema.output_schema).unwrap_or_default();
+    let output_json = crate::jcs::to_vec(&registration.schema.output_schema).unwrap_or_default();
     length_prefix(&mut hasher, &output_json);
 
     hasher.update(registration.implementation_hash);
@@ -529,9 +528,9 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((registration.test_vectors.len() as u32).to_be_bytes());
     for tv in &registration.test_vectors {
-        let input_bytes = serde_json::to_vec(&tv.input).unwrap_or_default();
+        let input_bytes = crate::jcs::to_vec(&tv.input).unwrap_or_default();
         length_prefix(&mut hasher, &input_bytes);
-        let output_bytes = serde_json::to_vec(&tv.expected_output).unwrap_or_default();
+        let output_bytes = crate::jcs::to_vec(&tv.expected_output).unwrap_or_default();
         length_prefix(&mut hasher, &output_bytes);
         length_prefix(&mut hasher, tv.description.as_bytes());
     }
