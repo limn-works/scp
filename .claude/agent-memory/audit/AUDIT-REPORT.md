@@ -10,7 +10,7 @@
 
 The SCP codebase is remarkably mature for its scope. **Zero `todo!()` or `unimplemented!()` macros exist** in the entire Rust codebase. **Zero `NotImplementedError` in Python**. The scp-core library (`crates/scp-core/`) is production-quality with comprehensive implementations across identity, context lifecycle, cryptography (MLS, UCAN, sender keys, access keys), trust scoring, discovery, economy, sync, and provenance. The PyO3 bridge (reference bridge) has the most complete FFI coverage.
 
-However, the audit identified **10 confirmed findings** — primarily **cross-bridge parity gaps** where functionality implemented in one bridge is stubbed or missing in another. The most critical finding is the UniFFI bridge's no-op crypto provider, which means messages in the mobile SDK path are not MLS-encrypted.
+However, the audit identified **13 confirmed findings** — primarily **cross-bridge parity gaps** where functionality implemented in one bridge is stubbed or missing in another. The most critical finding is the UniFFI bridge's no-op crypto provider, which means messages in the mobile SDK path are not MLS-encrypted.
 
 ### Finding Summary
 
@@ -26,8 +26,11 @@ However, the audit identified **10 confirmed findings** — primarily **cross-br
 | 008 | Minor | Code quality | 47 `#[allow(dead_code)]` annotations |
 | 009 | **Major** | Security | PyO3+UniFFI bridges use no-op crypto for MLS group management (CORRECTED) |
 | 010 | Minor | Code quality | Silent Result discarding in transport server |
+| 011 | Moderate | Wiring gap | Swift SDK MCP functions throw "not yet wired" errors |
+| 012 | Minor | Wiring gap | Provenance advanced functions unwrapped in all 4 SDKs |
+| 013 | Moderate | Bug | UDP/DTLS adapter query() truncates multi-blob results |
 
-**By severity:** 3 Major, 5 Moderate, 2 Minor
+**By severity:** 3 Major, 7 Moderate, 3 Minor
 
 ---
 
@@ -186,6 +189,47 @@ Most are acceptable fire-and-forget patterns. The `let _ = forward_handle.await`
 
 ---
 
+### Finding 011: Swift SDK MCP functions throw "not yet wired" errors
+**Severity:** Moderate | **Category:** wiring-gap
+
+**File:** `bindings/swift/Sources/SCP/Mcp.swift`, lines 140-169
+
+4 public MCP functions throw runtime errors:
+
+| Method | Error Code | Message |
+|--------|-----------|---------|
+| `McpBridge.defaultServe` | SCP-MCP-10001 | "not yet wired to UniFFI — awaiting mcp_serve export" |
+| `McpBridge.defaultClientCreate` | SCP-MCP-10002 | "not yet wired" |
+| `McpBridge.defaultClientListTools` | SCP-MCP-10003 | "not yet wired" |
+| `McpBridge.defaultClientInvoke` | SCP-MCP-10004 | "not yet wired" |
+
+**Impact:** Swift SDK users cannot use MCP server or client functionality.
+
+---
+
+### Finding 012: Provenance advanced functions unwrapped in all 4 SDKs
+**Severity:** Minor | **Category:** wiring-gap
+
+3 provenance functions exist in all FFI bridges but are not exposed in any SDK wrapper:
+- `provenance_redact_counterparties`
+- `provenance_pseudonymize_counterparties`
+- `provenance_update_source_type`
+
+**Impact:** SDK users cannot use provenance privacy features.
+
+---
+
+### Finding 013: UDP/DTLS adapter query() truncates multi-blob results
+**Severity:** Moderate | **Category:** bug
+
+**File:** `crates/scp-transport/src/udp/adapter.rs`, lines 305-358
+
+`UdpDtlsAdapter::query()` calls `send_request()` once, which reads a single DTLS datagram. If the relay responds with multiple BLOBs before `query_complete`, only the first is captured. Other adapters (QUIC at `quic/adapter.rs`, Native at `native/client.rs`, CoAP at `coap/adapter.rs`) correctly loop until `query_complete`.
+
+**Impact:** Multi-blob query results are silently truncated to the first result on UDP/DTLS transport.
+
+---
+
 ## Cross-Layer Coverage Matrix
 
 See `matrix.md` for the full operations × targets matrix.
@@ -243,5 +287,8 @@ See `matrix.md` for the full operations × targets matrix.
 ### Medium-term (P2)
 
 8. **Implement MCP resource subscription delivery** (Finding 007) — Requires transport integration
-9. **Clean up `#[allow(dead_code)]` annotations** (Finding 008)
-10. **Add logging for discarded Results** (Finding 010)
+9. **Wire Swift MCP to UniFFI bridge** (Finding 011) — 4 public methods throw "not yet wired"
+10. **Fix UDP/DTLS query truncation** (Finding 013) — Add read loop matching other adapters
+11. **Clean up `#[allow(dead_code)]` annotations** (Finding 008)
+12. **Wrap provenance privacy functions in all 4 SDKs** (Finding 012)
+13. **Add logging for discarded Results** (Finding 010)
