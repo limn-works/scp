@@ -133,12 +133,12 @@ flowchart TD
     boundary --> ctxC["Context C"]
     boundary --> ctxD["Context D"]
 
-    style local fill:#f9f9f9,stroke:#333
-    style boundary fill:#ffe066,stroke:#333,font-weight:bold,color:#333
-    style ctxA fill:#e1f0ff,stroke:#336
-    style ctxB fill:#e1f0ff,stroke:#336
-    style ctxC fill:#e1f0ff,stroke:#336
-    style ctxD fill:#e1f0ff,stroke:#336
+    style local fill:#1a1a1a,stroke:#444,color:#ccc
+    style boundary fill:#2a2a2a,stroke:#666,font-weight:bold,color:#eee
+    style ctxA fill:#1a1a1a,stroke:#555,color:#ccc
+    style ctxB fill:#1a1a1a,stroke:#555,color:#ccc
+    style ctxC fill:#1a1a1a,stroke:#555,color:#ccc
+    style ctxD fill:#1a1a1a,stroke:#555,color:#ccc
 ```
 
 *Figure 1: Protocol boundary. Above the line, agents coordinate freely on the user's machine. Below the line, each agent is a separate instance confined to its context. Cross-context data flow occurs only through governed protocol mechanisms.*
@@ -212,12 +212,12 @@ flowchart LR
 
     IE --> SIG --> SK --> MLS --> OE --> TX
 
-    style construction fill:#f0f7ff,stroke:#336
-    style signing fill:#fff0f0,stroke:#633
-    style sender fill:#f0fff0,stroke:#363
-    style mls fill:#fff8f0,stroke:#963
-    style outer fill:#f8f0ff,stroke:#639
-    style transport fill:#f0f0f0,stroke:#333
+    style construction fill:#1a1a1a,stroke:#555,color:#ccc
+    style signing fill:#1a1a1a,stroke:#555,color:#ccc
+    style sender fill:#1a1a1a,stroke:#555,color:#ccc
+    style mls fill:#2a2a2a,stroke:#666,color:#ddd
+    style outer fill:#1a1a1a,stroke:#555,color:#ccc
+    style transport fill:#1a1a1a,stroke:#444,color:#999
 ```
 
 *Figure 2: Message lifecycle. Each layer enforces distinct security properties: signatures provide non-repudiation and key attribution; sender-side keys enable per-sender blocking; MLS provides forward secrecy and post-compromise security; outer envelopes provide metadata privacy via pseudonymous routing IDs and bucket padding.*
@@ -307,14 +307,14 @@ flowchart TB
     agent -.-> catB
     catB --> catC
 
-    style did fill:#f0f7ff,stroke:#336
-    style id fill:#ffe0e0,stroke:#933
-    style active fill:#e0ffe0,stroke:#393
-    style prerot fill:#fff0d0,stroke:#963
-    style agent fill:#e0e0ff,stroke:#339
-    style catA fill:#ffe0e0,stroke:#933
-    style catB fill:#e0ffe0,stroke:#393
-    style catC fill:#f0f0f0,stroke:#666
+    style did fill:#1a1a1a,stroke:#555,color:#ccc
+    style id fill:#2a2a2a,stroke:#888,color:#eee
+    style active fill:#1a1a1a,stroke:#555,color:#ccc
+    style prerot fill:#1a1a1a,stroke:#444,color:#999
+    style agent fill:#1a1a1a,stroke:#555,color:#ccc
+    style catA fill:#2a2a2a,stroke:#666,color:#ddd
+    style catB fill:#1a1a1a,stroke:#555,color:#ccc
+    style catC fill:#1a1a1a,stroke:#444,color:#999
 ```
 
 *Figure 3: Multi-key identity architecture. The identity key (`#0`) is the root of trust, used only for DID document modifications. The human signing key (`#active`) handles day-to-day operations. The agent signing key (`#agent`) is authorized via self-delegation UCAN and independently revocable. Pre-rotation provides safe key recovery under compromise. Permission categories (A/B/C) govern which keys can perform which actions.*
