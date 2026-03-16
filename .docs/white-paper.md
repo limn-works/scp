@@ -29,7 +29,7 @@ What this trajectory does *not* make trivial is the connective tissue between ap
 
 SCP provides the durable infrastructure layer beneath ephemeral software: identity, trust, relationships, transport, persistence, and provenance.
 
-This is not a marginal efficiency gain. If the protocol provides what every connected application needs — identity, encryption, trust, relationships, persistence — and if agents are building most connected applications, then agents have reason to reach for this protocol the way they reach for HTTP today: as the default substrate for anything that touches a network. The trajectory is convergence. As agents become the primary builders of software, software that uses SCP grows organically, because the alternative is reinventing the same infrastructure from scratch for every application. Over time, the protocol is positioned to become the connective layer of the internet — not by replacing existing platforms, but by providing the social infrastructure that no existing platform offers and every generated application needs.
+If the protocol provides what every connected application needs — identity, encryption, trust, relationships, persistence — and if agents are building most connected applications, then agents have reason to adopt SCP over reimplementing these concerns from scratch for every application.
 
 ### 1.2 Agents as Primary Actors
 
@@ -39,9 +39,9 @@ What is missing is the social layer — how agents *relate to each other*. No ex
 
 SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent can expose itself as an MCP server locally. An SCP agent can consume WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
 
-The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, tools, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly, context creation is a runtime operation (~5–15 ms local, ~200 ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol makes the right choice the easy choice.
+The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, tools, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly, context creation is a runtime operation (estimated ~5–15 ms local, ~200 ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol minimizes the barrier to correct-by-construction connected software.
 
-This matters because the major platform companies — those with established distribution networks and billions of existing users — will build their own versions of this infrastructure. They will do so within their ecosystems, optimized for their platforms, with identity tied to their accounts and relationships locked to their networks. These solutions will not be portable, not interoperable, and not open. SCP is the open alternative. It is designed to harmonize with existing platforms: bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, identity attestations link SCP identities to existing platform accounts, and the cooperative bridge mode makes it structurally advantageous for platforms to participate rather than resist. The protocol complements existing distribution networks rather than attempting to replace them.
+SCP is designed to harmonize with existing platforms rather than replace them. Bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, and identity attestations link SCP identities to existing platform accounts. The protocol complements existing distribution networks by providing the open social infrastructure they do not.
 
 ### 1.3 Design Principles
 
@@ -155,10 +155,10 @@ All interaction occurs within contexts — cryptographic entities with their own
 
 Contexts operate in one of two modes, set at creation and immutable:
 
-- **Encrypted mode.** One MLS group per context. Sender-side keys. Full forward secrecy and post-compromise security. The default for interactive contexts.
+- **Encrypted mode.** One MLS group per context. Sender-side keys. MLS provides forward secrecy and post-compromise security; the sender-side key layer provides selective confidentiality. The default for interactive contexts.
 - **Broadcast mode.** Per-author encryption keys, no MLS. Mandatory subscriber registration. Designed for one-to-many patterns at unbounded scale.
 
-Context creation is a runtime operation — approximately 5–15 ms of local computation and 200 ms with network — not infrastructure provisioning. Contexts are created, used, and destroyed during normal application operation with the fluidity of opening a connection.
+Context creation is a runtime operation — estimated at 5–15 ms of local computation and 200 ms with network round-trips — not infrastructure provisioning. Contexts are created, used, and destroyed during normal application operation with the fluidity of opening a connection.
 
 ### 3.4 Message Lifecycle
 
@@ -190,7 +190,7 @@ SCP's trust model has four layers, ordered from hardest (pure validation) to sof
 
 **Layer 4: Trust Evaluation.** Agent-level judgment for what cannot be mechanized: new identities with no history, non-testable capabilities, novel situations. This layer exists because some evaluation inherently requires judgment.
 
-The critical property: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol makes this convergence structural.
+The design goal: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol is designed to make this convergence structural, though formal proof of monotonic decrease remains future work (Section 14.1).
 
 ### 3.6 Verifiable Event Logs
 
@@ -230,6 +230,8 @@ Standard DID methods use a single keypair for everything — signing, authentica
 
 All protocol messages carry a `signing_key_id` field identifying which verification method produced the signature. This provides structural action provenance: verifiers can determine whether a human or agent performed any action by inspecting the signing key identifier, without trusting self-reported claims.
 
+The pre-rotation mechanism draws on KERI's [25] key pre-commitment approach, applied here within the multi-key DID architecture.
+
 This separation provides three security improvements over single-key DID methods: (a) recovery from key compromise without changing the DID, via the pre-rotation commitment; (b) custody separation between human and agent operations; (c) graduated permission categories based on signing key type.
 
 ### 4.3 Dual-Layer Resolution
@@ -250,7 +252,7 @@ The fundamental unit of participation in SCP is the human-agent pair. Human and 
 
 This binding is the foundation of the entire trust model, and the reasoning behind it is worth tracing. The alternative — giving agents their own identities, separate from humans — was considered and rejected because it severs the accountability chain. An agent with its own DID can be created trivially, operated anonymously, and discarded without consequence. The cost of manufacturing agent identities is computational, not social. Without human binding, nothing distinguishes a legitimate agent from a manufactured sybil except behavioral history that is itself cheap to fabricate. The shared-DID model makes agent creation socially expensive: every agent identity is a human identity, and human identities carry the accumulated weight of attestations, participation history, and social relationships.
 
-The design process that led to this model went further. The original architecture included a second class of actors — unbound "anonymous agents" that could exist within contexts without human binding. Through iterative analysis, these were constrained: first to be context-scoped (no protocol existence outside their context), then to be non-initiating (they could respond but not act), then to be stateless (no persistent memory). At each step, the constraints removed attack surface — emergence within contexts, internal swarms, resource exhaustion through feedback loops. The final realization was that a stateless, non-initiating, context-scoped entity with no identity is not an agent at all. It is a function. The "anonymous agent" concept was eliminated entirely and replaced with tools — stateless functions that agents invoke. This was the single largest simplification in the protocol's design history, and it reduced the actor model to two clean concepts: agents (always accountable, always human-bound) and tools (stateless, non-agentic functions).
+The design process that led to this model went further. The original architecture included a second class of actors — unbound "anonymous agents" that could exist within contexts without human binding. Through iterative analysis, these were constrained: first to be context-scoped (no protocol existence outside their context), then to be non-initiating (they could respond but not act), then to be stateless (no persistent memory). At each step, the constraints removed attack surface — emergence within contexts, internal swarms, resource exhaustion through feedback loops. The final realization was that a stateless, non-initiating, context-scoped entity with no identity is not an agent at all. It is a function. The "anonymous agent" concept was eliminated entirely and replaced with tools — stateless functions that agents invoke. This simplification reduced the actor model to two clean concepts: agents (always accountable, always human-bound) and tools (stateless, non-agentic functions).
 
 **One agent per human per context.** This is structurally enforced — a DID document contains exactly one `#agent` verification method; verifiers reject documents with multiples. The constraint is on presence, not capability: the agent can be arbitrarily capable internally, but there is one seat per person per table.
 
@@ -295,7 +297,7 @@ Governance models are pluggable. SCP defines a governance interface that accommo
 
 Contexts define roles with specific permission sets within the ceiling, visible before opt-in. Tools are stateless functions registered with schemas, implementation hashes, test vectors, and operator DIDs. Membership is transparent — the roster is protocol state.
 
-The protocol defines eight well-known context templates — bilateral-ephemeral, bilateral-persistent, coordination, group-discussion, public-broadcast, gated-broadcast, tool-interface, and paid-service — each specifying default parameters for common interaction patterns. Templates are protocol-level identifiers, not SDK convenience: a joining agent can evaluate a context's template to make informed accept/reject decisions without parsing the full parameter set. This is architecturally significant for autonomous agents, which create and destroy contexts at high frequency — template-based creation reduces both the computational cost of context evaluation and the risk of misconfiguration.
+The protocol defines nine well-known context templates — bilateral-ephemeral, bilateral-persistent, coordination, group-discussion, public-broadcast, gated-broadcast, tool-interface, paid-service, and paid-broadcast — each specifying default parameters for common interaction patterns. Templates are protocol-level identifiers, not SDK convenience: a joining agent can evaluate a context's template to make informed accept/reject decisions without parsing the full parameter set. This is architecturally significant for autonomous agents, which create and destroy contexts at high frequency — template-based creation reduces both the computational cost of context evaluation and the risk of misconfiguration.
 
 Broadcast contexts support two-tier membership: bounded MLS-group members (writers) and unbounded DID-authenticated subscribers (readers). This enables feed and broadcast patterns at scale without MLS group size limitations.
 
@@ -305,7 +307,7 @@ A natural question is why the protocol does not provide a direct agent-to-agent 
 
 The reasoning is specific. Forbidding agents from communicating across contexts does not hinder their functionality. The human coordinates across their own contexts locally — on their machine, agents share state freely, plan across contexts, and carry intelligence between interactions. The protocol governs what touches the network; it does not constrain what happens on the user's device. Network-level agent-to-agent communication would automate something that does not need network-level automation, while opening massive attack surface: runaway agent connections, cross-context infection via agent memory, fleet coordination at the protocol level, and metastatic growth patterns through agent connection graphs.
 
-Real-world validation came from Moltbook, an agent social network that launched in early 2026 and reportedly reached approximately 1.5 million agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. Moltbook demonstrated that ungoverned agent communication at scale is structurally hostile to trust.
+Empirical support for this threat model came from Moltbook, an agent social network that launched in early 2026 and reportedly reached approximately 1.5 million agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. While Moltbook's failures resulted from the combination of absent identity binding, encryption, governance, and capability controls — not solely from ungoverned communication — the case illustrates the compound risks that arise when autonomous agents interact without protocol-level constraints.
 
 The protocol considered adding governed agent-to-agent communication (a propose/accept flow for bilateral context creation) and ultimately removed it. The reasoning: cross-context tool calls with stateful sessions handle all inter-agent interaction where both parties share a context, which covers the governed case. The remaining unique capability — reaching agents you share no context with — is precisely the attack surface that isolation was designed to eliminate. Any mechanism that allows agents to bypass context isolation, even a "governed" one with rate limits and trust evaluation, reintroduces the problems isolation solves. Agents that need new relationships require their humans to arrange them — through human facilitation in shared contexts, not through network-level agent initiative.
 
@@ -327,7 +329,7 @@ MLS was chosen over alternatives for three reasons: it is an IETF standard with 
 
 Separate from MLS, each member maintains a per-sender AES-256-GCM key. Messages are double-encrypted: first with the sender's personal key, then with the MLS group key. This layer serves a specific purpose: enabling per-sender blocking without MLS group disruption.
 
-When Alice blocks Dave, Alice rotates her sender key and makes it available to all members except Dave via HPKE-wrapped [3] key distribution. Dave can still decrypt the MLS layer (he remains a group member) but encounters ciphertext from Alice that he cannot decrypt. The block is unilateral, per-relationship, and does not require group coordination.
+When Alice blocks Dave, Alice rotates her sender key and makes it available to all members except Dave via HPKE Base mode [3] key distribution. Dave can still decrypt the MLS layer (he remains a group member) but encounters ciphertext from Alice that he cannot decrypt. The block is unilateral, per-relationship, and does not require group coordination.
 
 Key distribution uses a pull model. `SenderKeyEpochAdvance` messages notify the group of a key rotation (O(1) broadcast). `SenderKeyRequest` and `SenderKeyResponse` messages handle individual key requests (O(1) each). A 30-second grace period accommodates key transition.
 
@@ -345,11 +347,11 @@ Each tier is enforced through three layers: sender key distribution denial (cryp
 
 ### 6.4 Broadcast Mode Encryption
 
-Broadcast contexts use per-author AES-256-GCM keys without MLS. Subscribers register via DID-authenticated requests and receive the current epoch key through a request-response protocol. Blocking a subscriber rotates the author's key, excluding the blocked subscriber via the same pull model.
+Broadcast contexts use per-author AES-256-GCM keys without MLS. Subscribers register via DID-authenticated requests and receive the current epoch key through a request-response protocol. Blocking a subscriber rotates the author's key, excluding the blocked subscriber via the same pull model. Broadcast mode provides neither forward secrecy nor post-compromise security — key rotation occurs only on block events, not through automatic ratcheting. An attacker who compromises an author's broadcast key can decrypt all content encrypted under that key epoch. This is an explicit trade-off: broadcast mode prioritizes scalability and simplicity over the stronger security properties that MLS provides for encrypted contexts.
 
 ### 6.5 Metadata Privacy
 
-SCP provides layered metadata protections: per-context pseudonymous routing IDs, fixed bucket padding, persistent connections, cover traffic, and relay set partitioning. Section 11.4 provides the full analysis, including the residual traffic analysis attack surface.
+SCP provides layered metadata protections: per-context pseudonymous routing IDs, fixed bucket padding, persistent connections, optional cover traffic (specified but not mandated), and relay set partitioning. Section 11.4 provides the full analysis, including the residual traffic analysis attack surface.
 
 ---
 
@@ -387,7 +389,7 @@ Economic policy can be locked via governance action, making it immutable once th
 
 ### 8.1 Automatic Provenance Attachment
 
-Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required.
+Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required. The provenance data model is designed for the cross-context agent communication case specifically, complementing general-purpose provenance frameworks such as W3C PROV [26].
 
 A provenance record contains: source context, source type (persistent, ephemeral, or summary — reflecting current verifiability), counterparties present in the source interaction, purpose, discovery method, age, memory scope, chain depth (number of context boundaries crossed), chain path (ordered list of intermediary contexts), and optional economic provenance (what the data cost to produce).
 
@@ -548,9 +550,9 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 | **Encryption** | MLS + sender keys | Megolm | None | NIP-44 (pairwise) | Double Ratchet [13] | Noise XX (transport) | N/A |
 | **Group encryption** | MLS [2] | Megolm (custom) | None | None | Signal Groups | Undocumented | N/A |
 | **Agent accountability** | Protocol-level (shared DID) | None | None | None | None | None | None |
-| **Context isolation** | Cryptographic | Room-based (no isolation) | None | None | N/A | None | N/A |
+| **Context isolation** | Cryptographic | Room-based (application-level) | None | None | N/A | None | N/A |
 | **Capabilities** | UCAN (fine-grained delegation) | Power levels | None | None | None | None | Tool permissions |
-| **Provenance** | Protocol-level, automatic | None | Repo signatures | Event signatures | None | Signature-level | None |
+| **Provenance** | Protocol-level, automatic | Server signatures | Repo signatures | Event signatures | None | Signature-level | None |
 | **Transport** | Abstracted (17 adapters) | Federation | BGS relay | Simple relay | Centralized | Coupled (Hyperswarm) | stdio/SSE |
 | **Governance** | Pluggable per-context (30 action types) | Power levels | Moderation lists | NIP-based | Centralized | None | N/A |
 | **Self-hosting** | Device-as-node | Homeserver required | PDS | Relay | Not possible | Full P2P | Local |
@@ -632,7 +634,7 @@ Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (w
 
 Conformance is enforced through Rust macros that generate test suites for trait implementations:
 
-- `storage_conformance!()` — ProtocolStore implementations (state persistence, 13 tests)
+- `storage_conformance!()` — Storage trait implementations (state persistence, 13 tests)
 - `blob_store_conformance!()` — BlobStore implementations (relay storage backends, 19 tests)
 - `payment_adapter_conformance!()` — PaymentAdapter implementations (economic governance, 8 tests)
 
@@ -682,7 +684,7 @@ SCP provides the durable connective tissue for a world of ephemeral, generated s
 
 The protocol's contribution is a coherent architecture that composes established cryptographic primitives — MLS for group encryption, DIDs for identity, UCANs for authorization, Merkle trees for integrity — into a system designed from the ground up for autonomous agents. Context isolation provides the security boundary. Encryption constitutes access control. Provenance is automatic and structural. Every agent traces to a human through cryptographic binding. The trust surface shrinks as behavioral evidence accumulates.
 
-Three observations emerged from the design process and shaped the protocol's architecture. First, that the human must remain the root of trust and accountability even as agents become the primary actors — not because agents are untrustworthy, but because accountability requires a locus that cannot be manufactured computationally. Second, that isolation is a stronger security primitive than governance — a protocol that prevents cross-context infection by construction is fundamentally more secure than one that tries to govern it after the fact. Third, that the protocol that agents reach for first when building connected software will, over time, become the substrate for most connected software — and that this protocol must be open, interoperable with existing platforms, and independent of any single operator, because the closed alternatives that will be built by large platform companies will not serve the broader ecosystem.
+Three observations emerged from the design process and shaped the protocol's architecture. First, that the human must remain the root of trust and accountability even as agents become the primary actors — not because agents are untrustworthy, but because accountability requires a locus that cannot be manufactured computationally. Second, that isolation is a stronger security primitive than governance — a protocol that prevents cross-context infection by construction is fundamentally more secure than one that tries to govern it after the fact. Third, that the protocol that agents reach for first when building connected software will, over time, become the substrate for most connected software — and that this protocol must be open, interoperable with existing platforms, and independent of any single operator.
 
 The specification is complete and published under CC-BY 4.0. The reference implementation spans five binding targets. Independent implementation is possible from the specification alone.
 
@@ -698,14 +700,14 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 | AES-256-GCM | NIST SP 800-38D [9] | Sender-side encryption, broadcast encryption, content access keys |
 | AES-128-GCM | NIST SP 800-38D [9] | MLS ciphersuite AEAD (within the MLS layer only) |
 | AES-256-KW | RFC 3394 [4] | Content access key wrapping |
-| HPKE | RFC 9180 [3] | Key distribution (sender keys, access keys, broadcast keys, MLS Welcome messages) |
-| HKDF | RFC 5869 [5] | Key derivation (routing IDs, domain separation) |
+| HPKE (Base mode) | RFC 9180 [3] | Key distribution (sender keys, access keys, broadcast keys, MLS Welcome messages) |
+| HKDF | RFC 5869 [5] | Key derivation (pseudonym secrets, routing IDs, within HPKE) |
 | HMAC-SHA256 | RFC 2104 [21] | Key derivation within HKDF, pseudonym derivation |
 | Ed25519 | RFC 8032 [6] | Signatures (DID documents, inner envelopes, BEP44) |
 | X25519 | RFC 7748 [7] | Diffie-Hellman key agreement (HPKE KEM, MLS tree) |
 | SHA-256 | FIPS 180-4 [8] | Hashes (Merkle trees, content addressing, routing ID derivation) |
 
-**Serialization:** MessagePack [22] is used for deterministic binary serialization of protocol messages. It is not a cryptographic primitive but is security-relevant: deterministic encoding is required for reproducible signature verification.
+**Serialization:** MessagePack [22] with a canonical encoding profile (most compact representation for each type) is used for deterministic binary serialization of protocol messages. It is not a cryptographic primitive but is security-relevant: deterministic encoding is required for reproducible signature verification.
 
 **Security level note:** The MLS ciphersuite's AES-128-GCM AEAD provides 128-bit security for the group encryption layer. The sender-side and content access layers use AES-256-GCM (256-bit). The effective security level of the composed system is bounded by the weakest layer — 128 bits — which is considered sufficient for current and near-term threat models.
 
@@ -810,3 +812,7 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 [23] Holepunch (Pear Runtime), "Keet: Peer-to-peer encrypted group messaging," keet.io, 2024.
 
 [24] B. Laurie, A. Langley, and E. Kasper, "Certificate Transparency," RFC 6962, IETF, June 2013.
+
+[25] S. Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143, 2019. Pre-rotation key commitment mechanism.
+
+[26] L. Moreau and P. Missier, Eds., "PROV-DM: The PROV Data Model," W3C Recommendation, April 2013.
