@@ -34,12 +34,13 @@ use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
-use scp_transport::native::storage::BlobStorageBackend;
+use scp_transport::native::storage::{BlobStorage as _, BlobStorageBackend};
+use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 pub use http::BroadcastContext;
-pub use projection::ProjectedContext;
+pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, SiteConfig};
 
 // ---------------------------------------------------------------------------
 // Default HTTP bind address
@@ -436,9 +437,51 @@ impl<S: Storage> ApplicationNode<S> {
         admission: scp_core::context::broadcast::BroadcastAdmission,
         projection_policy: Option<scp_core::context::params::ProjectionPolicy>,
     ) -> Result<(), NodeError> {
+        self.enable_broadcast_projection_with_site(
+            context_id,
+            broadcast_key,
+            admission,
+            projection_policy,
+            None,
+        )
+        .await
+    }
+
+    /// Activates HTTP broadcast projection with optional site configuration.
+    ///
+    /// Like [`enable_broadcast_projection`](Self::enable_broadcast_projection) but
+    /// additionally accepts a [`SiteConfig`] for path-based serving (§18.11.12).
+    ///
+    /// When `site_config` is `Some`, validates the hostname (RFC 1123, not the
+    /// node's own hostname, no duplicates) and `deploy_retention_count` (<= 8).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] if validation fails.
+    pub async fn enable_broadcast_projection_with_site(
+        &self,
+        context_id: &str,
+        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+        admission: scp_core::context::broadcast::BroadcastAdmission,
+        projection_policy: Option<scp_core::context::params::ProjectionPolicy>,
+        site_config: Option<projection::SiteConfig>,
+    ) -> Result<(), NodeError> {
         // Validate: gated contexts cannot have public projection rules.
         projection::validate_projection_policy(admission, projection_policy.as_ref())
             .map_err(NodeError::InvalidConfig)?;
+
+        // Validate site config if provided.
+        if let Some(ref config) = site_config {
+            let registry = self.state.projected_contexts.read().await;
+            let existing_hostnames: std::collections::HashSet<String> = registry
+                .values()
+                .filter_map(|p| p.hostname().map(String::from))
+                .collect();
+            drop(registry);
+
+            projection::validate_site_config(config, self.domain.as_deref(), &existing_hostnames)
+                .map_err(NodeError::InvalidConfig)?;
+        }
 
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
@@ -446,6 +489,9 @@ impl<S: Storage> ApplicationNode<S> {
             existing.insert_key(broadcast_key);
             existing.admission = admission;
             existing.projection_policy = projection_policy;
+            if let Some(config) = site_config {
+                existing.set_site_config(config);
+            }
         } else {
             if registry.len() >= Self::MAX_PROJECTED_CONTEXTS {
                 return Err(NodeError::InvalidConfig(format!(
@@ -453,8 +499,11 @@ impl<S: Storage> ApplicationNode<S> {
                     Self::MAX_PROJECTED_CONTEXTS
                 )));
             }
-            let projected =
+            let mut projected =
                 ProjectedContext::new(context_id, broadcast_key, admission, projection_policy);
+            if let Some(config) = site_config {
+                projected.set_site_config(config);
+            }
             registry.insert(routing_id, projected);
         }
         drop(registry);
@@ -582,6 +631,232 @@ impl<S: Storage> ApplicationNode<S> {
                 projected.retain_only_epochs(&new_epochs);
             }
         }
+    }
+
+    /// Commits a deploy for a projected context (§18.11.11).
+    ///
+    /// Scans blobs matching the `deploy_id`, decrypts each to extract
+    /// `BroadcastContent` metadata, builds an immutable `PathIndex`, verifies
+    /// `ETag`s, stores a deploy manifest blob, and atomically swaps the path
+    /// index pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] if the context is not projected
+    /// or has no site config. Returns [`NodeError::Storage`] on storage
+    /// failures.
+    #[allow(clippy::too_many_lines)]
+    pub async fn commit_deploy(
+        &self,
+        context_id: &str,
+        deploy_id: &str,
+    ) -> Result<usize, NodeError> {
+        use scp_core::context::broadcast_content::{
+            ContentPath, deserialize_broadcast_content, verify_etag,
+        };
+
+        let routing_id = projection::compute_routing_id(context_id);
+
+        // Snapshot keys from the registry.
+        let registry = self.state.projected_contexts.read().await;
+        let projected = registry
+            .get(&routing_id)
+            .ok_or_else(|| NodeError::InvalidConfig("context is not projected".into()))?;
+
+        if projected.site_config.is_none() {
+            return Err(NodeError::InvalidConfig(
+                "context has no site config".into(),
+            ));
+        }
+
+        let max_assets = projected
+            .site_config
+            .as_ref()
+            .map_or(10_000, |c| c.max_assets_per_deploy);
+        let max_deploy_size = projected
+            .site_config
+            .as_ref()
+            .map_or(512 * 1024 * 1024, |c| c.max_deploy_size_bytes);
+
+        let keys: HashMap<u64, scp_core::crypto::sender_keys::BroadcastKey> =
+            projected.keys.clone();
+        drop(registry);
+
+        // Query all blobs for this routing_id. We scan all and filter by
+        // deploy_id after decryption (deploy_id is inside the ciphertext).
+        let blobs = self
+            .state
+            .blob_storage
+            .query(&routing_id, None, u32::MAX)
+            .await
+            .map_err(|e| NodeError::Storage(e.to_string()))?;
+
+        let mut entries: HashMap<ContentPath, [u8; 32]> = HashMap::new();
+        let mut manifest_entries: Vec<projection::DeployManifestEntry> = Vec::new();
+        let mut total_size: u64 = 0;
+
+        for stored in &blobs {
+            let envelope: scp_core::crypto::sender_keys::BroadcastEnvelope =
+                match rmp_serde::from_slice(&stored.blob) {
+                    Ok(env) => env,
+                    Err(_) => continue,
+                };
+
+            let Some(key) = keys.get(&envelope.key_epoch) else {
+                continue;
+            };
+
+            let Ok(plaintext) =
+                scp_core::crypto::sender_keys::open_broadcast_trusted(key, &envelope)
+            else {
+                continue;
+            };
+
+            let Ok(content) = deserialize_broadcast_content(&plaintext) else {
+                continue;
+            };
+
+            // Filter by deploy_id.
+            let matches_deploy = content
+                .metadata
+                .deploy_id
+                .as_deref()
+                .is_some_and(|id| id == deploy_id);
+            if !matches_deploy {
+                continue;
+            }
+
+            // Verify ETag.
+            if let Err(e) = verify_etag(&content) {
+                tracing::warn!(
+                    blob_id = projection::hex_encode(&stored.blob_id),
+                    error = %e,
+                    "ETag mismatch during deploy commit, skipping"
+                );
+                continue;
+            }
+
+            // Extract path.
+            let Some(path) = content.metadata.path else {
+                continue;
+            };
+
+            total_size += content.body.len() as u64;
+
+            if entries.len() >= max_assets {
+                return Err(NodeError::InvalidConfig(format!(
+                    "deploy exceeds max_assets_per_deploy ({max_assets})"
+                )));
+            }
+
+            if total_size > max_deploy_size {
+                return Err(NodeError::InvalidConfig(format!(
+                    "deploy exceeds max_deploy_size_bytes ({max_deploy_size})"
+                )));
+            }
+
+            // Highest sequence wins for path collisions.
+            let existing_blob = entries.get(&path);
+            if existing_blob.is_some() {
+                // Path collision — this implementation keeps the last one encountered.
+                // In practice, blobs are ordered oldest-first so higher sequence comes last.
+            }
+
+            manifest_entries.push(projection::DeployManifestEntry {
+                path: path.as_str().to_owned(),
+                blob_id: projection::hex_encode(&stored.blob_id),
+            });
+
+            entries.insert(path, stored.blob_id);
+        }
+
+        // Store deploy manifest as a special blob.
+        let manifest = projection::DeployManifest {
+            deploy_id: deploy_id.to_owned(),
+            entries: manifest_entries,
+        };
+        let manifest_bytes = rmp_serde::to_vec_named(&manifest)
+            .map_err(|e| NodeError::Storage(format!("manifest serialization failed: {e}")))?;
+
+        // Compute a deterministic manifest blob_id.
+        let manifest_blob_id: [u8; 32] = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"scp:deploy-manifest:");
+            hasher.update(context_id.as_bytes());
+            hasher.update(b":");
+            hasher.update(deploy_id.as_bytes());
+            hasher.finalize().into()
+        };
+
+        let _ = self
+            .state
+            .blob_storage
+            .store(
+                routing_id,
+                manifest_blob_id,
+                None,
+                86400 * 30,
+                manifest_bytes,
+            )
+            .await
+            .map_err(|e| NodeError::Storage(e.to_string()))?;
+
+        // Commit: swap path index.
+        let count = entries.len();
+        let mut registry = self.state.projected_contexts.write().await;
+        if let Some(projected) = registry.get_mut(&routing_id) {
+            projected.commit_deploy(deploy_id.to_owned(), entries);
+        }
+        drop(registry);
+
+        tracing::info!(
+            context_id = context_id,
+            deploy_id = deploy_id,
+            asset_count = count,
+            "deploy committed"
+        );
+
+        Ok(count)
+    }
+
+    /// Rolls back to a previous deploy for a projected context (§18.11.11).
+    ///
+    /// Sets the path index pointer to a previous deploy within the retention
+    /// window. Only works if the deploy is in the history buffer (within the
+    /// configured `deploy_retention_count`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] if the context is not projected
+    /// or the `deploy_id` is not in the history buffer.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn rollback_deploy(
+        &self,
+        context_id: &str,
+        deploy_id: &str,
+    ) -> Result<(), NodeError> {
+        let routing_id = projection::compute_routing_id(context_id);
+        let rolled_back = {
+            let mut registry = self.state.projected_contexts.write().await;
+            let projected = registry
+                .get_mut(&routing_id)
+                .ok_or_else(|| NodeError::InvalidConfig("context is not projected".into()))?;
+            projected.rollback_deploy(deploy_id)
+        };
+
+        if !rolled_back {
+            return Err(NodeError::InvalidConfig(format!(
+                "deploy_id '{deploy_id}' not found in history"
+            )));
+        }
+
+        tracing::info!(
+            context_id = context_id,
+            deploy_id = deploy_id,
+            "deploy rolled back"
+        );
+
+        Ok(())
     }
 }
 

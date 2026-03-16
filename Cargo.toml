@@ -66,6 +66,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 subtle = "2"
 unicode-normalization = "0.1"
+arc-swap = "1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 
