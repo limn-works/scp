@@ -474,6 +474,55 @@ impl<S: Storage> ApplicationNode<S> {
         registry.remove(&routing_id);
     }
 
+    /// Updates the cached member public keys for a projected context.
+    ///
+    /// Called when context membership changes (new subscribers, removed
+    /// subscribers, key rotations). No-op if the context is not projected.
+    /// Also clears the UCAN validation cache since cached validations may
+    /// reference stale keys.
+    ///
+    /// See spec section 18.11.6.
+    pub async fn update_projection_member_keys(
+        &self,
+        context_id: &str,
+        member_keys: HashMap<String, [u8; 32]>,
+    ) {
+        let routing_id = projection::compute_routing_id(context_id);
+        {
+            let mut registry = self.state.projected_contexts.write().await;
+            if let Some(projected) = registry.get_mut(&routing_id) {
+                projected.update_member_keys(member_keys);
+            }
+        }
+        // Clear the validation cache since member keys changed.
+        if let Ok(mut cache) = self.state.projection_ucan_cache.write() {
+            cache.clear();
+        }
+    }
+
+    /// Adds a token CID to the projected context's revocation set.
+    ///
+    /// Tokens matching this CID will be rejected on subsequent requests.
+    /// The CID is `SHA-256(encoded_jwt)` hex-encoded, matching the format
+    /// used by `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
+    /// No-op if the context is not projected. Also removes any cached
+    /// validation for this token.
+    ///
+    /// See spec section 18.11.6.
+    pub async fn revoke_projection_token(&self, context_id: &str, token_cid: &str) {
+        let routing_id = projection::compute_routing_id(context_id);
+        {
+            let mut registry = self.state.projected_contexts.write().await;
+            if let Some(projected) = registry.get_mut(&routing_id) {
+                projected.revoke_token(token_cid);
+            }
+        }
+        // Remove from validation cache too.
+        if let Ok(mut cache) = self.state.projection_ucan_cache.write() {
+            cache.remove(token_cid);
+        }
+    }
+
     /// Propagates rotated broadcast keys to the projection registry after a
     /// governance ban.
     ///
@@ -2640,6 +2689,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
             projection_rate_limit,
         ),
+        projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
         did_document: document.clone(),
@@ -2784,6 +2834,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
             projection_rate_limit,
         ),
+        projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: None,
         cert_resolver: None,
         did_document: document.clone(),

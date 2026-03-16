@@ -624,6 +624,9 @@ mod tests {
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
                 1000,
             ),
+            projection_ucan_cache: std::sync::RwLock::new(
+                crate::projection::ProjectionUcanCache::new(),
+            ),
             tls_config: None,
             cert_resolver: None,
             did_document: scp_identity::document::DidDocument {

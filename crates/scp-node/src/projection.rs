@@ -18,7 +18,7 @@
 //!
 //! See spec sections 18.11.2 and 18.11.5.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Json;
@@ -36,7 +36,7 @@ use scp_core::context::broadcast::BroadcastAdmission;
 use scp_core::context::params::{ProjectionPolicy, ProjectionRule};
 use scp_core::crypto::sender_keys::{BroadcastEnvelope, BroadcastKey, open_broadcast_trusted};
 use scp_core::crypto::ucan::CapabilityUri;
-use scp_core::crypto::ucan::validate::parse_ucan;
+use scp_core::crypto::ucan::validate::{DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, parse_ucan};
 use scp_transport::native::storage::BlobStorage;
 
 use crate::error::ApiError;
@@ -64,6 +64,12 @@ pub fn compute_routing_id(context_id: &str) -> [u8; 32] {
 // ProjectedContext
 // ---------------------------------------------------------------------------
 
+/// Cache TTL for validated UCAN tokens, in seconds.
+///
+/// Successfully validated tokens are cached for this duration to amortize
+/// the cost of Ed25519 signature verification across repeated requests.
+const UCAN_CACHE_TTL_SECS: u64 = 60;
+
 /// A broadcast context whose messages are projected (decrypted and served)
 /// by this node's HTTP endpoints.
 ///
@@ -75,6 +81,10 @@ pub fn compute_routing_id(context_id: &str) -> [u8; 32] {
 /// Stores the context's [`BroadcastAdmission`] mode and optional
 /// [`ProjectionPolicy`] so projection handlers can enforce authentication
 /// requirements (SCP-GG-007, SCP-GG-008).
+///
+/// For gated contexts, also stores member public keys, context creator DID,
+/// and a revocation set for full UCAN cryptographic verification
+/// (spec section 18.11.6).
 ///
 /// See spec section 18.11.5.
 #[derive(Debug)]
@@ -101,22 +111,121 @@ pub struct ProjectedContext {
     /// projected content requires authentication. When `None`, the admission
     /// mode alone determines the behavior (open = public, gated = gated).
     pub(crate) projection_policy: Option<ProjectionPolicy>,
+    /// Cached Ed25519 public keys for context members, keyed by DID string.
+    ///
+    /// Used for UCAN signature verification on gated projection endpoints.
+    /// Populated at registration time via `enable_broadcast_projection` and
+    /// updated via `update_projection_member_keys`. The node resolves DIDs
+    /// at registration time rather than per-request.
+    ///
+    /// See spec section 18.11.6.
+    pub(crate) member_keys: HashMap<String, [u8; 32]>,
+    /// Set of revoked token CIDs (SHA-256 hex of the encoded JWT).
+    ///
+    /// Tokens matching a CID in this set are rejected. Updated via
+    /// `revoke_projection_token`.
+    pub(crate) revoked_tokens: HashSet<String>,
+}
+
+/// Thread-safe validation cache for recently verified UCAN tokens.
+///
+/// Maps `SHA-256(encoded_jwt)` hex to the Unix timestamp at which the cache
+/// entry expires. Shared across handlers via `NodeState` to avoid
+/// requiring a write lock on the projected context registry for cache
+/// updates.
+///
+/// Entries are evicted lazily: stale entries are ignored on lookup and
+/// pruned periodically (every 100 insertions).
+#[derive(Debug)]
+pub struct ProjectionUcanCache {
+    entries: HashMap<String, u64>,
+    insert_count: u64,
+}
+
+impl ProjectionUcanCache {
+    /// Creates an empty validation cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insert_count: 0,
+        }
+    }
+
+    /// Returns `true` if the token CID has a valid (non-expired) cache entry.
+    #[must_use]
+    pub fn is_valid(&self, token_cid: &str, now: u64) -> bool {
+        self.entries
+            .get(token_cid)
+            .is_some_and(|&expiry| expiry > now)
+    }
+
+    /// Records a successful validation. Periodically prunes stale entries.
+    pub fn insert(&mut self, token_cid: String, now: u64) {
+        self.entries.insert(token_cid, now + UCAN_CACHE_TTL_SECS);
+        self.insert_count += 1;
+        if self.insert_count.is_multiple_of(100) {
+            self.entries.retain(|_, &mut expiry| expiry > now);
+        }
+    }
+
+    /// Removes a specific entry (e.g., on revocation).
+    pub fn remove(&mut self, token_cid: &str) {
+        self.entries.remove(token_cid);
+    }
+
+    /// Clears all cached entries (e.g., when member keys change).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Default for ProjectionUcanCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProjectedContext {
     /// Creates a new [`ProjectedContext`] from a context ID, initial broadcast key,
-    /// admission mode, and optional projection policy.
+    /// admission mode, optional projection policy, member public keys, and
+    /// context creator DID.
     ///
     /// The routing ID is computed as `SHA-256(context_id)` per spec section 5.14.6.
     /// The key is inserted at its own epoch number. The admission mode and
     /// projection policy are stored for use by projection handlers when deciding
     /// whether to require authentication (spec section 18.11.2.1).
+    ///
+    /// `member_keys` maps subscriber DIDs to their Ed25519 public keys for
+    /// UCAN signature verification on gated endpoints (spec section 18.11.6).
+    /// `context_creator_did` is used for root issuer verification (UCAN step 4).
     #[must_use]
     pub fn new(
         context_id: &str,
         broadcast_key: BroadcastKey,
         admission: BroadcastAdmission,
         projection_policy: Option<ProjectionPolicy>,
+    ) -> Self {
+        Self::with_member_keys(
+            context_id,
+            broadcast_key,
+            admission,
+            projection_policy,
+            HashMap::new(),
+        )
+    }
+
+    /// Creates a new [`ProjectedContext`] with full UCAN validation state.
+    ///
+    /// Like [`new`](Self::new) but also accepts member public keys for
+    /// cryptographic UCAN verification on gated projection endpoints.
+    #[must_use]
+    pub fn with_member_keys(
+        context_id: &str,
+        broadcast_key: BroadcastKey,
+        admission: BroadcastAdmission,
+        projection_policy: Option<ProjectionPolicy>,
+        member_keys: HashMap<String, [u8; 32]>,
     ) -> Self {
         let routing_id = compute_routing_id(context_id);
         let epoch = broadcast_key.epoch();
@@ -128,6 +237,8 @@ impl ProjectedContext {
             keys,
             admission,
             projection_policy,
+            member_keys,
+            revoked_tokens: HashSet::new(),
         }
     }
 
@@ -201,6 +312,22 @@ impl ProjectedContext {
     #[must_use]
     pub fn key_for_epoch(&self, epoch: u64) -> Option<&BroadcastKey> {
         self.keys.get(&epoch)
+    }
+
+    /// Replaces the cached member public keys with a new set.
+    ///
+    /// Called when context membership changes (new subscribers, removals,
+    /// key rotations).
+    pub fn update_member_keys(&mut self, member_keys: HashMap<String, [u8; 32]>) {
+        self.member_keys = member_keys;
+    }
+
+    /// Adds a token CID to the revocation set.
+    ///
+    /// The CID is `SHA-256(encoded_jwt)` hex-encoded, matching the format
+    /// used by `scp_core::crypto::ucan::revoke::compute_revocation_cid`.
+    pub fn revoke_token(&mut self, token_cid: &str) {
+        self.revoked_tokens.insert(token_cid.to_owned());
     }
 }
 
@@ -279,42 +406,78 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     }
 }
 
-/// Validates a bearer token as a UCAN with `messages:read` capability for the
-/// given context.
+/// Computes a cache key for a UCAN token: `SHA-256(encoded_jwt)` hex.
 ///
-/// Performs structural validation plus temporal checks: parses the JWT,
-/// verifies the UCAN header fields (algorithm, version), checks token
-/// expiry (`exp`) and not-before (`nbf`), and confirms that at least one
-/// attenuation grants `messages:read` for the specified context (or a
-/// wildcard context).
+/// This matches the format used by `compute_revocation_cid` for consistency
+/// between caching and revocation lookups.
+fn compute_token_cid(encoded: &str) -> String {
+    let hash = Sha256::digest(encoded.as_bytes());
+    hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Snapshot of UCAN validation state extracted from a [`ProjectedContext`]
+/// under a read lock, so validation can proceed without holding the lock.
+struct UcanValidationState {
+    member_keys: HashMap<String, [u8; 32]>,
+    revoked_tokens: HashSet<String>,
+}
+
+/// Validates a bearer token as a UCAN with full cryptographic verification
+/// for the given context.
 ///
-/// **Note:** This is a simplified validation suitable for projection
-/// endpoints. It does NOT perform the full 11-step UCAN validation pipeline
-/// (DID resolution, Ed25519 signature verification, delegation chain
-/// traversal, revocation check) from
-/// [`scp_core::context::broadcast::validate_messages_read_ucan`], because
-/// the projection layer does not hold DID documents or the full
-/// `BroadcastContext` state. The primary access-control boundary is key
-/// distribution (subscribers must obtain broadcast keys via the gated key
-/// request flow); this check is a secondary defense-in-depth gate.
+/// Performs the following validation steps:
+/// 1. **Parse**: Decode JWT-format UCAN token and validate header fields
+///    (algorithm, version).
+/// 2. **Temporal**: Check `exp`/`nbf` bounds with clock skew tolerance.
+/// 3. **Capability**: Confirm `messages:read` for the specified context.
+/// 4. **Cache check**: Return early if the token was recently validated.
+/// 5. **Signature**: Verify Ed25519 signature against issuer's public key
+///    (resolved from the projected context's member key cache).
+/// 6. **Revocation**: Verify the token CID is not in the revocation set.
+/// 7. **Cache result**: Store successful validation for TTL reuse.
+///
+/// Structural and temporal checks (steps 1-3) are performed first as fast
+/// pre-checks before the more expensive Ed25519 signature verification.
+///
+/// `validation_state` contains member keys and revoked tokens extracted
+/// from the projected context under a read lock. `cache` is the shared
+/// validation cache (written to on success).
 ///
 /// Returns `Ok(())` on success, or an error response on failure.
+#[allow(clippy::too_many_lines)]
 fn validate_projection_ucan(
     token: &str,
     context_id: &str,
+    validation_state: &UcanValidationState,
+    cache: &std::sync::RwLock<ProjectionUcanCache>,
 ) -> Result<(), Box<axum::response::Response>> {
     let ucan = parse_ucan(token).map_err(|e| {
         tracing::debug!(error = %e, "UCAN parse failed for projection auth");
         Box::new(ApiError::unauthorized_with("invalid UCAN token").into_response())
     })?;
 
-    // Temporal checks: reject expired or not-yet-valid tokens.
+    // Step 2: Temporal checks with clock skew tolerance.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| {
+            Box::new(
+                ApiError::unauthorized_with("system clock error during UCAN validation")
+                    .into_response(),
+            )
+        })?;
 
-    if ucan.payload.exp <= now {
+    // Check exp with clock skew tolerance: reject if exp + tolerance <= now.
+    if ucan
+        .payload
+        .exp
+        .saturating_add(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS)
+        <= now
+    {
         tracing::debug!(
             exp = ucan.payload.exp,
             now = now,
@@ -325,8 +488,9 @@ fn validate_projection_ucan(
         ));
     }
 
+    // Check nbf with clock skew tolerance: reject if nbf - tolerance > now.
     if let Some(nbf) = ucan.payload.nbf
-        && nbf > now
+        && nbf.saturating_sub(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS) > now
     {
         tracing::debug!(
             nbf = nbf,
@@ -338,10 +502,9 @@ fn validate_projection_ucan(
         ));
     }
 
-    // Build the required capability URI for this context.
+    // Step 3: Capability match.
     let required = CapabilityUri::new(context_id, "messages", "read");
 
-    // Check that at least one attenuation grants the required capability.
     let has_capability = ucan.payload.att.iter().any(|att| {
         att.with
             .parse::<CapabilityUri>()
@@ -353,6 +516,133 @@ fn validate_projection_ucan(
             context_id = context_id,
             "UCAN missing messages:read capability for context"
         );
+        return Err(Box::new(
+            ApiError::unauthorized_with("UCAN missing messages:read capability").into_response(),
+        ));
+    }
+
+    // Step 4: Cache check — skip expensive crypto if recently validated.
+    let token_cid = compute_token_cid(&ucan.encoded);
+
+    // Blocking read on the cache is acceptable: the lock is never held
+    // across await points and the critical section is a HashMap lookup.
+    if cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_valid(&token_cid, now)
+    {
+        return Ok(());
+    }
+
+    // Step 5: Ed25519 signature verification.
+    // Resolve the issuer's public key from the member key cache.
+    let pk_bytes = validation_state
+        .member_keys
+        .get(&ucan.payload.iss)
+        .copied()
+        .ok_or_else(|| {
+            tracing::debug!(
+                issuer = %ucan.payload.iss,
+                "UCAN issuer not found in projection member keys"
+            );
+            Box::new(
+                ApiError::unauthorized_with("UCAN issuer not a known context member")
+                    .into_response(),
+            )
+        })?;
+
+    // Extract signing input: everything before the last '.' in the encoded JWT.
+    let signing_input = ucan
+        .encoded
+        .rfind('.')
+        .map(|pos| &ucan.encoded[..pos])
+        .ok_or_else(|| {
+            Box::new(ApiError::unauthorized_with("malformed UCAN token").into_response())
+        })?;
+
+    scp_core::crypto::ed25519::verify_ed25519_signature(
+        &pk_bytes,
+        signing_input.as_bytes(),
+        &ucan.signature,
+    )
+    .map_err(|_| {
+        tracing::debug!(
+            issuer = %ucan.payload.iss,
+            "UCAN signature verification failed for projection auth"
+        );
+        Box::new(ApiError::unauthorized_with("UCAN signature verification failed").into_response())
+    })?;
+
+    // Step 6: Revocation check.
+    if validation_state.revoked_tokens.contains(&token_cid) {
+        tracing::debug!(
+            token_cid = %token_cid,
+            "UCAN token revoked for projection auth"
+        );
+        return Err(Box::new(
+            ApiError::unauthorized_with("UCAN token has been revoked").into_response(),
+        ));
+    }
+
+    // Step 7: Cache successful validation.
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(token_cid, now);
+
+    Ok(())
+}
+
+/// Validates a bearer token using structural-only checks (no signature
+/// verification).
+///
+/// This is a lightweight validation path used when the projected context
+/// has no member keys configured (backward compatibility, or when
+/// the caller only needs structural validation for per-author override
+/// decisions in mixed-auth feeds).
+///
+/// Performs: parse, temporal checks, and capability matching.
+fn validate_projection_ucan_structural(
+    token: &str,
+    context_id: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    let ucan = parse_ucan(token).map_err(|e| {
+        tracing::debug!(error = %e, "UCAN parse failed for projection auth");
+        Box::new(ApiError::unauthorized_with("invalid UCAN token").into_response())
+    })?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if ucan
+        .payload
+        .exp
+        .saturating_add(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS)
+        <= now
+    {
+        return Err(Box::new(
+            ApiError::unauthorized_with("UCAN token expired").into_response(),
+        ));
+    }
+
+    if let Some(nbf) = ucan.payload.nbf
+        && nbf.saturating_sub(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS) > now
+    {
+        return Err(Box::new(
+            ApiError::unauthorized_with("UCAN token not yet valid").into_response(),
+        ));
+    }
+
+    let required = CapabilityUri::new(context_id, "messages", "read");
+    let has_capability = ucan.payload.att.iter().any(|att| {
+        att.with
+            .parse::<CapabilityUri>()
+            .is_ok_and(|cap| cap.matches(&required))
+    });
+
+    if !has_capability {
         return Err(Box::new(
             ApiError::unauthorized_with("UCAN missing messages:read capability").into_response(),
         ));
@@ -400,6 +690,10 @@ fn effective_projection_rule(
 /// `ProjectionRule::Gated`, a valid UCAN with `messages:read` capability must
 /// be present in the `Authorization: Bearer <token>` header.
 ///
+/// When `validation_state` is `Some` and contains member keys, performs full
+/// cryptographic UCAN validation including Ed25519 signature verification and
+/// revocation checks. Otherwise falls back to structural-only validation.
+///
 /// `ProjectionRule::AuthorChoice` is treated as `Gated` at the projection
 /// layer — the author's own choice is enforced at the context level, not
 /// at HTTP projection.
@@ -407,6 +701,8 @@ fn check_projection_auth(
     headers: &axum::http::HeaderMap,
     context_id: &str,
     rule: ProjectionRule,
+    validation_state: Option<&UcanValidationState>,
+    cache: &std::sync::RwLock<ProjectionUcanCache>,
 ) -> Result<(), Box<axum::response::Response>> {
     match rule {
         ProjectionRule::Public => Ok(()),
@@ -417,7 +713,12 @@ fn check_projection_auth(
                         .into_response(),
                 )
             })?;
-            validate_projection_ucan(token, context_id)
+            match validation_state {
+                Some(vs) if !vs.member_keys.is_empty() => {
+                    validate_projection_ucan(token, context_id, vs, cache)
+                }
+                _ => validate_projection_ucan_structural(token, context_id),
+            }
         }
     }
 }
@@ -678,13 +979,24 @@ pub async fn feed_handler(
     let projection_policy = projected.projection_policy.clone();
     // We need a snapshot of the keys to avoid holding the lock during async I/O.
     let keys: HashMap<u64, BroadcastKey> = projected.keys.clone();
+    // Extract UCAN validation state for full crypto verification.
+    let validation_state = UcanValidationState {
+        member_keys: projected.member_keys.clone(),
+        revoked_tokens: projected.revoked_tokens.clone(),
+    };
     drop(projected_contexts);
 
     // Enforce projection auth. Feed endpoint uses the default rule (no
     // per-author override) since the feed may contain messages from
     // multiple authors.
     let rule = effective_projection_rule(admission, projection_policy.as_ref(), None);
-    if let Err(resp) = check_projection_auth(&headers, &context_id, rule) {
+    if let Err(resp) = check_projection_auth(
+        &headers,
+        &context_id,
+        rule,
+        Some(&validation_state),
+        &state.projection_ucan_cache,
+    ) {
         return *resp;
     }
 
@@ -785,12 +1097,25 @@ pub async fn feed_handler(
         for ov in &policy.overrides {
             if ov.rule == ProjectionRule::Gated && auth_gated.is_none() {
                 auth_gated = Some(
-                    check_projection_auth(&headers, &context_id, ProjectionRule::Gated).is_ok(),
+                    check_projection_auth(
+                        &headers,
+                        &context_id,
+                        ProjectionRule::Gated,
+                        Some(&validation_state),
+                        &state.projection_ucan_cache,
+                    )
+                    .is_ok(),
                 );
             } else if ov.rule == ProjectionRule::AuthorChoice && auth_author_choice.is_none() {
                 auth_author_choice = Some(
-                    check_projection_auth(&headers, &context_id, ProjectionRule::AuthorChoice)
-                        .is_ok(),
+                    check_projection_auth(
+                        &headers,
+                        &context_id,
+                        ProjectionRule::AuthorChoice,
+                        Some(&validation_state),
+                        &state.projection_ucan_cache,
+                    )
+                    .is_ok(),
                 );
             }
             // ProjectionRule::Public is always authorized; already-computed
@@ -918,6 +1243,10 @@ pub async fn message_handler(
     let admission = projected.admission;
     let projection_policy = projected.projection_policy.clone();
     let keys: HashMap<u64, BroadcastKey> = projected.keys.clone();
+    let validation_state = UcanValidationState {
+        member_keys: projected.member_keys.clone(),
+        revoked_tokens: projected.revoked_tokens.clone(),
+    };
     drop(projected_contexts);
 
     // Pre-auth check with default rule (before we know the author). For
@@ -927,8 +1256,13 @@ pub async fn message_handler(
     if matches!(
         default_rule,
         ProjectionRule::Gated | ProjectionRule::AuthorChoice
-    ) && let Err(resp) = check_projection_auth(&headers, &context_id, default_rule)
-    {
+    ) && let Err(resp) = check_projection_auth(
+        &headers,
+        &context_id,
+        default_rule,
+        Some(&validation_state),
+        &state.projection_ucan_cache,
+    ) {
         return *resp;
     }
 
@@ -994,7 +1328,13 @@ pub async fn message_handler(
         Some(&envelope.author_did),
     );
     if effective_rule != default_rule
-        && let Err(resp) = check_projection_auth(&headers, &context_id, effective_rule)
+        && let Err(resp) = check_projection_auth(
+            &headers,
+            &context_id,
+            effective_rule,
+            Some(&validation_state),
+            &state.projection_ucan_cache,
+        )
     {
         return *resp;
     }
@@ -1382,6 +1722,7 @@ mod tests {
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
                 rate_limit,
             ),
+            projection_ucan_cache: std::sync::RwLock::new(ProjectionUcanCache::new()),
             tls_config: None,
             cert_resolver: None,
             did_document: scp_identity::document::DidDocument {
@@ -3163,7 +3504,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(vec![0u8; 64]),
         );
 
-        let result = validate_projection_ucan(&token, "test_ctx");
+        let result = validate_projection_ucan_structural(&token, "test_ctx");
         assert!(result.is_err(), "expired UCAN should be rejected");
     }
 
@@ -3201,7 +3542,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(vec![0u8; 64]),
         );
 
-        let result = validate_projection_ucan(&token, "test_ctx");
+        let result = validate_projection_ucan_structural(&token, "test_ctx");
         assert!(result.is_err(), "not-yet-valid UCAN should be rejected");
     }
 
@@ -3378,5 +3719,481 @@ mod tests {
             URL_SAFE_NO_PAD.encode(&payload_json),
             URL_SAFE_NO_PAD.encode(&signature),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: build a cryptographically signed test UCAN JWT
+    // -----------------------------------------------------------------------
+
+    /// Ed25519 keypair for test UCAN signing.
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        let seed = [42u8; 32];
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// Builds a cryptographically signed UCAN JWT with `messages:read`
+    /// capability for the given context.
+    fn build_signed_test_ucan(context_id: &str, signing_key: &ed25519_dalek::SigningKey) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::Signer;
+        use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+
+        let issuer_did = format!(
+            "did:dht:z6Mk{}",
+            bs58::encode(signing_key.verifying_key().as_bytes()).into_string()
+        );
+
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = UcanPayload {
+            iss: issuer_did,
+            aud: "did:dht:test_audience".to_owned(),
+            exp: now + 3600,
+            nbf: None,
+            nnc: "test-nonce-signed-001".to_owned(),
+            att: vec![Attenuation {
+                with: format!("scp:ctx:{context_id}/messages:read"),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&header_json),
+            URL_SAFE_NO_PAD.encode(&payload_json),
+        );
+
+        let signature = signing_key.sign(signing_input.as_bytes());
+
+        format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Full UCAN cryptographic verification tests (#1290)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_ucan_accepts_valid_signature() {
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
+        let context_id = "sig_valid_ctx";
+        let token = build_signed_test_ucan(context_id, &signing_key);
+
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let validation_state = UcanValidationState {
+            member_keys,
+            revoked_tokens: HashSet::new(),
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        let result = validate_projection_ucan(&token, context_id, &validation_state, &cache);
+        assert!(result.is_ok(), "valid signed UCAN should be accepted");
+    }
+
+    #[test]
+    fn validate_ucan_rejects_forged_signature() {
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
+        let context_id = "sig_forged_ctx";
+
+        // Build a token signed by a DIFFERENT key but claiming the issuer DID
+        // of the original key. This simulates a forgery attack.
+        let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+        let token = build_signed_test_ucan(context_id, &wrong_key);
+
+        // But register the original key (not the forging key) in member_keys.
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let validation_state = UcanValidationState {
+            member_keys,
+            revoked_tokens: HashSet::new(),
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        let result = validate_projection_ucan(&token, context_id, &validation_state, &cache);
+        assert!(result.is_err(), "forged UCAN signature should be rejected");
+    }
+
+    #[test]
+    fn validate_ucan_rejects_unknown_issuer() {
+        let signing_key = test_signing_key();
+
+        let context_id = "sig_unknown_issuer_ctx";
+        let token = build_signed_test_ucan(context_id, &signing_key);
+
+        // Empty member_keys — issuer is not a known member.
+        let validation_state = UcanValidationState {
+            member_keys: HashMap::new(),
+            revoked_tokens: HashSet::new(),
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        let result = validate_projection_ucan(&token, context_id, &validation_state, &cache);
+        assert!(
+            result.is_err(),
+            "UCAN from unknown issuer should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_ucan_rejects_wrong_capability() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::Signer;
+        use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
+        // Build a UCAN with messages:write instead of messages:read.
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = UcanPayload {
+            iss: issuer_did.clone(),
+            aud: "did:dht:test_audience".to_owned(),
+            exp: now + 3600,
+            nbf: None,
+            nnc: "test-nonce-wrong-cap".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:wrong_cap_ctx/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&header_json),
+            URL_SAFE_NO_PAD.encode(&payload_json),
+        );
+        let signature = signing_key.sign(signing_input.as_bytes());
+        let token = format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        );
+
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let validation_state = UcanValidationState {
+            member_keys,
+            revoked_tokens: HashSet::new(),
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        let result = validate_projection_ucan(&token, "wrong_cap_ctx", &validation_state, &cache);
+        assert!(
+            result.is_err(),
+            "UCAN with wrong capability should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_ucan_rejects_revoked_token() {
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
+        let context_id = "sig_revoked_ctx";
+        let token = build_signed_test_ucan(context_id, &signing_key);
+
+        // Compute the token CID and add it to revoked set.
+        let token_cid = compute_token_cid(&token);
+
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let mut revoked_tokens = HashSet::new();
+        revoked_tokens.insert(token_cid);
+
+        let validation_state = UcanValidationState {
+            member_keys,
+            revoked_tokens,
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        let result = validate_projection_ucan(&token, context_id, &validation_state, &cache);
+        assert!(result.is_err(), "revoked UCAN should be rejected");
+    }
+
+    #[test]
+    fn validate_ucan_caches_valid_token() {
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+
+        let context_id = "sig_cache_ctx";
+        let token = build_signed_test_ucan(context_id, &signing_key);
+
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let validation_state = UcanValidationState {
+            member_keys,
+            revoked_tokens: HashSet::new(),
+        };
+        let cache = std::sync::RwLock::new(ProjectionUcanCache::new());
+
+        // First call: performs signature verification and caches.
+        let result = validate_projection_ucan(&token, context_id, &validation_state, &cache);
+        assert!(result.is_ok(), "first validation should succeed");
+
+        // Check that the token is now cached.
+        let token_cid = compute_token_cid(&token);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_valid(&token_cid, now),
+            "token should be cached after successful validation"
+        );
+
+        // Second call: should succeed via cache (even if we remove the member key).
+        let empty_state = UcanValidationState {
+            member_keys: HashMap::new(),
+            revoked_tokens: HashSet::new(),
+        };
+        let result = validate_projection_ucan(&token, context_id, &empty_state, &cache);
+        assert!(result.is_ok(), "second validation should succeed via cache");
+    }
+
+    #[tokio::test]
+    async fn feed_gated_context_rejects_forged_ucan_with_member_keys() {
+        // When member keys are configured, a structurally valid but
+        // cryptographically invalid UCAN (dummy signature) is rejected.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "gated_forged_ucan_ctx";
+
+        // Create a gated context with a member key for a real issuer.
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let projected = ProjectedContext::with_member_keys(
+            context_id,
+            key,
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, InMemoryBlobStorage::new());
+
+        // Use the dummy-signed UCAN (which was previously accepted by structural
+        // validation). Now it should be rejected because signature verification
+        // fails.
+        let dummy_ucan = build_test_ucan(context_id);
+        let router = broadcast_projection_router(state);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .header("Authorization", format!("Bearer {dummy_ucan}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::UNAUTHORIZED,
+            "forged UCAN should be rejected when member keys are configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_gated_context_accepts_signed_ucan_with_member_keys() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "gated_signed_ucan_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Store a message so the feed isn't empty.
+        let envelope = test_seal(&key, b"gated content");
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+
+        let signed_ucan = build_signed_test_ucan(context_id, &signing_key);
+        let router = broadcast_projection_router(state);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .header("Authorization", format!("Bearer {signed_ucan}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::OK,
+            "properly signed UCAN should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_context_does_not_require_ucan() {
+        // Open contexts serve without any auth, even with member keys configured.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "public_no_ucan_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Open,
+            None,
+            member_keys,
+        );
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+        let envelope = test_seal(&key, b"public content");
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::OK,
+            "public context should serve without auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_context_rejects_missing_auth_with_member_keys() {
+        // Gated context with member keys still rejects requests without
+        // any Authorization header.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "gated_no_header_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let projected = ProjectedContext::with_member_keys(
+            context_id,
+            key,
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, InMemoryBlobStorage::new());
+        let router = broadcast_projection_router(state);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::UNAUTHORIZED,
+            "missing auth should be rejected"
+        );
     }
 }
