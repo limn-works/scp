@@ -47,6 +47,7 @@ openmls_rust_crypto = { workspace = true }
 tls_codec = { version = "0.4", features = ["derive"] }
 rmp-serde = { workspace = true }
 aes-gcm = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

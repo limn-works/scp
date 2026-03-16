@@ -5226,6 +5226,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tls_codec",
+ "unicode-normalization",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

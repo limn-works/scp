@@ -778,6 +778,10 @@ impl Default for WasmContextManager {
 /// Maximum number of assets in a single batch publish call.
 const MAX_BATCH_ASSETS: usize = 10_000;
 
+/// Maximum body size in bytes (10 MiB).
+/// Algorithm-identical to `scp_core::context::broadcast_content::MAX_BODY_BYTES`.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Magic byte prefix for structured broadcast content: ASCII "SCP".
 /// Algorithm-identical to `scp_core::context::broadcast_content::BROADCAST_CONTENT_MAGIC`.
 const BROADCAST_CONTENT_MAGIC: [u8; 3] = [0x53, 0x43, 0x50];
@@ -793,14 +797,17 @@ const BROADCAST_CONTENT_VERSION: u8 = 1;
 /// Validates a content path for broadcast asset publishing (SCP-290).
 ///
 /// Algorithm-identical to `scp_core::context::broadcast_content::ContentPath::new`.
-/// Reimplemented locally per ADR-034.
-///
-/// Note: scp-core applies NFC normalization before validation. WASM accepts
-/// pre-normalized paths only (no `unicode-normalization` dependency). Paths
-/// containing decomposed sequences that would normalize differently will pass
-/// validation but may not match scp-core's normalized form. Callers should
-/// ensure paths are NFC-normalized before calling this function.
-fn validate_content_path_wasm(path: &str) -> Result<(), String> {
+/// Reimplemented locally per ADR-034. Applies NFC normalization before
+/// validation, matching scp-core's behavior.
+fn validate_content_path_wasm(path: &str) -> Result<String, String> {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = path.nfc().collect();
+    validate_content_path_wasm_inner(&normalized)?;
+    Ok(normalized)
+}
+
+/// Inner validation logic for content paths (post-NFC-normalization).
+fn validate_content_path_wasm_inner(path: &str) -> Result<(), String> {
     // Must start with '/'
     if !path.starts_with('/') {
         return Err("path must start with '/'".to_owned());
@@ -1030,6 +1037,14 @@ fn serialize_broadcast_content_wasm(
     etag: &str,
     body: &[u8],
 ) -> Result<Vec<u8>, String> {
+    // Body size limit — reject oversized payloads before serialization.
+    if body.len() > MAX_BODY_BYTES {
+        return Err(format!(
+            "body too large: {} bytes (max {MAX_BODY_BYTES})",
+            body.len()
+        ));
+    }
+
     let content = WasmBroadcastContent {
         version: BROADCAST_CONTENT_VERSION,
         metadata: WasmContentMetadata {
@@ -3755,11 +3770,12 @@ impl WasmContextManager {
         body: &[u8],
         deploy_id: Option<&str>,
     ) -> Result<(String, String), ScpWasmError> {
-        // Validate path (reimplemented per ADR-034).
-        validate_content_path_wasm(path).map_err(|msg| ScpWasmError::Context {
-            message: format!("invalid path: {msg}"),
-            code: "SCP-CTX-2070".to_owned(),
-        })?;
+        // Validate and NFC-normalize path (reimplemented per ADR-034).
+        let normalized_path =
+            validate_content_path_wasm(path).map_err(|msg| ScpWasmError::Context {
+                message: format!("invalid path: {msg}"),
+                code: "SCP-CTX-2070".to_owned(),
+            })?;
 
         // Validate content_type (reimplemented per ADR-034).
         validate_mime_type_wasm(content_type).map_err(|msg| ScpWasmError::Context {
@@ -3767,12 +3783,37 @@ impl WasmContextManager {
             code: "SCP-CTX-2071".to_owned(),
         })?;
 
+        // Auto-generate deploy_id when None, matching batch behavior.
+        let deploy_id_val: String;
+        let deploy_id_resolved = if let Some(d) = deploy_id {
+            d
+        } else {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(context_id.as_bytes());
+            hasher.update(author_did.as_bytes());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ts = js_sys::Date::now() as u64;
+            hasher.update(ts.to_le_bytes());
+            deploy_id_val = hex::encode(&Sha256::digest(hasher.finalize())[..16]);
+            &deploy_id_val
+        };
+
         // Validate deploy_id.
-        if let Some(did) = deploy_id {
-            validate_deploy_id_wasm(did).map_err(|msg| ScpWasmError::Context {
-                message: format!("invalid deploy_id: {msg}"),
-                code: "SCP-CTX-2072".to_owned(),
-            })?;
+        validate_deploy_id_wasm(deploy_id_resolved).map_err(|msg| ScpWasmError::Context {
+            message: format!("invalid deploy_id: {msg}"),
+            code: "SCP-CTX-2072".to_owned(),
+        })?;
+
+        // Body size limit — reject oversized payloads before serialization.
+        if body.len() > MAX_BODY_BYTES {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "body too large: {} bytes (max {MAX_BODY_BYTES})",
+                    body.len()
+                ),
+                code: "SCP-CTX-2075".to_owned(),
+            });
         }
 
         // Compute ETag: SHA-256(body) hex.
@@ -3784,29 +3825,29 @@ impl WasmContextManager {
         // Build the BroadcastContent wire format: magic "SCP" + version byte
         // + MessagePack serialized content. Matches scp-core's
         // serialize_broadcast_content exactly. Reimplemented per ADR-034.
-        let wire_bytes =
-            serialize_broadcast_content_wasm(path, content_type, deploy_id, &etag, body).map_err(
-                |msg| ScpWasmError::Context {
-                    message: format!("broadcast content serialization failed: {msg}"),
-                    code: "SCP-CTX-2073".to_owned(),
-                },
-            )?;
+        let wire_bytes = serialize_broadcast_content_wasm(
+            &normalized_path,
+            content_type,
+            Some(deploy_id_resolved),
+            &etag,
+            body,
+        )
+        .map_err(|msg| ScpWasmError::Context {
+            message: format!("broadcast content serialization failed: {msg}"),
+            code: "SCP-CTX-2073".to_owned(),
+        })?;
 
         // Base64-encode the wire bytes for the publish_broadcast path.
         let payload = base64::engine::general_purpose::STANDARD.encode(&wire_bytes);
         self.publish_broadcast(context_id, author_did, &payload)?;
 
-        // Compute synthetic blob_id from context + author + etag.
+        // Compute blob_id as SHA-256 of the serialized broadcast content bytes.
+        // Content-addressed and deterministic — matches the intent of other bridges
+        // which use SHA-256(serialized_envelope). WASM doesn't have the envelope,
+        // so we use the wire bytes (the content that gets encrypted).
         let blob_id = {
             use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(context_id.as_bytes());
-            hasher.update(author_did.as_bytes());
-            hasher.update(etag.as_bytes());
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let ts = js_sys::Date::now() as u64;
-            hasher.update(ts.to_le_bytes());
-            hex::encode(Sha256::digest(hasher.finalize()))
+            hex::encode(Sha256::digest(&wire_bytes))
         };
 
         Ok((blob_id, etag))

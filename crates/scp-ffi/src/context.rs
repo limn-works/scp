@@ -2668,7 +2668,22 @@ fn py_broadcast_publish_asset(
     let author_did_owned = author_did.to_owned();
     let path_owned = path.to_owned();
     let content_type_owned = content_type.to_owned();
-    let deploy_id_owned = deploy_id.map(str::to_owned);
+    // Auto-generate deploy_id when None, matching batch behavior.
+    let deploy_id_owned = Some(deploy_id.map_or_else(
+        || {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(context_id.as_bytes());
+            hasher.update(author_did_owned.as_bytes());
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            hasher.update(ts.to_le_bytes());
+            hex::encode(&Sha256::digest(hasher.finalize())[..16])
+        },
+        str::to_owned,
+    ));
 
     crate::runtime::with_identity(&author_did_owned, |entry| {
         let custody = entry.custody.clone();
@@ -2753,6 +2768,14 @@ fn py_broadcast_publish_assets(
     assets: Vec<(String, String, Vec<u8>)>,
     deploy_id: Option<&str>,
 ) -> PyResult<Vec<HashMap<String, String>>> {
+    const MAX_BATCH_ASSETS: usize = 10_000;
+    if assets.len() > MAX_BATCH_ASSETS {
+        return Err(PyRuntimeError::new_err(format!(
+            "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
+            assets.len()
+        )));
+    }
+
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
     let mgr =

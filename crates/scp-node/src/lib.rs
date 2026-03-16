@@ -657,6 +657,10 @@ impl<S: Storage> ApplicationNode<S> {
             ContentPath, deserialize_broadcast_content, verify_etag,
         };
 
+        /// Reasonable upper bound for blob queries to prevent unbounded memory
+        /// allocation on large routing IDs.
+        const MAX_BLOB_QUERY: u32 = 50_000;
+
         let routing_id = projection::compute_routing_id(context_id);
 
         // Snapshot keys from the registry.
@@ -689,7 +693,7 @@ impl<S: Storage> ApplicationNode<S> {
         let blobs = self
             .state
             .blob_storage
-            .query(&routing_id, None, u32::MAX)
+            .query(&routing_id, None, MAX_BLOB_QUERY)
             .await
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 

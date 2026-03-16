@@ -386,6 +386,11 @@ pub fn verify_etag(content: &BroadcastContent) -> Result<(), BroadcastContentErr
 pub fn serialize_broadcast_content(
     content: &BroadcastContent,
 ) -> Result<Vec<u8>, BroadcastContentError> {
+    // Body size limit — reject oversized payloads before serialization.
+    if content.body.len() > MAX_BODY_BYTES {
+        return Err(BroadcastContentError::BodyTooLarge(content.body.len()));
+    }
+
     // Validate deploy_id before serialization.
     if let Some(ref id) = content.metadata.deploy_id {
         validate_deploy_id(id)?;
@@ -1311,8 +1316,8 @@ mod tests {
             },
             body: big_body,
         };
-        // Bypass serialize_broadcast_content (it doesn't check body size)
-        // and build the wire format directly.
+        // Bypass serialize_broadcast_content (which also checks body size)
+        // and build the wire format directly to test the deserialization guard.
         let msgpack = rmp_serde::to_vec_named(&content).unwrap();
         let mut bytes = Vec::with_capacity(4 + msgpack.len());
         bytes.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
@@ -1507,5 +1512,46 @@ mod tests {
         };
         assert!(format!("{err}").contains("aaa"));
         assert!(format!("{err}").contains("bbb"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Body size validation on serialization (fix #3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_rejects_body_too_large() {
+        let big_body = vec![0xBB; MAX_BODY_BYTES + 1];
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: None,
+                content_type: None,
+                deploy_id: None,
+                etag: None,
+                immutable: false,
+            },
+            body: big_body,
+        };
+        let result = serialize_broadcast_content(&content);
+        assert!(
+            matches!(result, Err(BroadcastContentError::BodyTooLarge(sz)) if sz == MAX_BODY_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn serialize_accepts_body_at_max() {
+        let body = vec![0xCC; MAX_BODY_BYTES];
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: None,
+                content_type: None,
+                deploy_id: None,
+                etag: None,
+                immutable: false,
+            },
+            body,
+        };
+        assert!(serialize_broadcast_content(&content).is_ok());
     }
 }

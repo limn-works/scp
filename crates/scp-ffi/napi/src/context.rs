@@ -1135,7 +1135,21 @@ pub async fn broadcast_publish_asset(
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
-    let author_did_val = DID(author_did);
+    let author_did_val = DID(author_did.clone());
+
+    // Auto-generate deploy_id when None, matching batch behavior.
+    let deploy_id = Some(deploy_id.unwrap_or_else(|| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(context_id.as_bytes());
+        hasher.update(author_did.as_bytes());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        hasher.update(ts.to_le_bytes());
+        hex::encode(&Sha256::digest(hasher.finalize())[..16])
+    }));
 
     // Validate fields.
     let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
@@ -1244,6 +1258,17 @@ pub async fn broadcast_publish_assets(
     assets: Vec<NapiAssetEntry>,
     deploy_id: Option<String>,
 ) -> napi::Result<Vec<NapiPublishResult>> {
+    const MAX_BATCH_ASSETS: usize = 10_000;
+    if assets.len() > MAX_BATCH_ASSETS {
+        return Err(NapiError::from(ScpNapiError::Context {
+            message: format!(
+                "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
+                assets.len()
+            ),
+            code: "SCP-CTX-2074".to_owned(),
+        }));
+    }
+
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();

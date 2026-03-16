@@ -213,14 +213,16 @@ pub fn validate_hostname(hostname: &str) -> Result<(), String> {
 /// Returns an error string if the CSP is invalid.
 pub fn validate_csp(csp: &str) -> Result<(), String> {
     const FORBIDDEN_KEYWORDS: &[&str] = &["unsafe-eval", "unsafe-inline", "unsafe-hashes"];
+    // Normalize to lowercase to prevent case-variant bypasses (e.g. "Unsafe-Eval").
+    let lower = csp.to_ascii_lowercase();
     for keyword in FORBIDDEN_KEYWORDS {
-        if csp.contains(keyword) {
+        if lower.contains(keyword) {
             return Err(format!("CSP must not contain '{keyword}'"));
         }
     }
     // Reject bare wildcard `*`, `data:`, and `blob:` as sources.
     // Allow `*.example.com` (subdomain wildcards).
-    for token in csp.split_whitespace() {
+    for token in lower.split_whitespace() {
         if token == "*" {
             return Err("CSP must not contain bare wildcard '*'".into());
         }
@@ -438,7 +440,7 @@ impl ProjectionUcanCache {
             return;
         }
         self.entries.insert(token_cid, now + UCAN_CACHE_TTL_SECS);
-        self.insert_count += 1;
+        self.insert_count = self.insert_count.wrapping_add(1);
         if self.insert_count.is_multiple_of(100) {
             self.entries.retain(|_, &mut expiry| expiry > now);
         }
@@ -452,7 +454,7 @@ impl ProjectionUcanCache {
             return;
         }
         self.entries.insert(token_cid, now + UCAN_CACHE_TTL_SECS);
-        self.insert_count += 1;
+        self.insert_count = self.insert_count.wrapping_add(1);
         if self.insert_count.is_multiple_of(100) {
             self.entries.retain(|_, &mut expiry| expiry > now);
         }
@@ -2133,16 +2135,27 @@ pub async fn site_handler(
         resp_headers.insert(axum::http::header::CONTENT_TYPE, val);
     }
 
-    // Cache behavior based on immutability flag.
+    // Cache behavior based on immutability flag. Non-public rules use
+    // `private` to prevent shared caches from serving authenticated content.
     if content.metadata.immutable {
+        let immutable_cache = match rule {
+            ProjectionRule::Public => "public, immutable, max-age=31536000",
+            ProjectionRule::Gated | ProjectionRule::AuthorChoice => {
+                "private, immutable, max-age=31536000"
+            }
+        };
         resp_headers.insert(
             axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("public, immutable, max-age=31536000"),
+            axum::http::HeaderValue::from_static(immutable_cache),
         );
     } else {
+        let revalidate_cache = match rule {
+            ProjectionRule::Public => "public, max-age=0, must-revalidate",
+            _ => "private, max-age=0, must-revalidate",
+        };
         resp_headers.insert(
             axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("public, max-age=0, must-revalidate"),
+            axum::http::HeaderValue::from_static(revalidate_cache),
         );
         // ETag: "<deploy_id>:<content_hash>"
         let etag_value = if let Some(ref etag) = content.metadata.etag {
@@ -5512,6 +5525,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_csp_case_insensitive_forbidden_keywords() {
+        // Mixed-case variants must also be rejected.
+        assert!(validate_csp("default-src 'self' 'Unsafe-Eval'").is_err());
+        assert!(validate_csp("default-src 'self' 'UNSAFE-INLINE'").is_err());
+        assert!(validate_csp("script-src 'Unsafe-Hashes'").is_err());
+        assert!(validate_csp("default-src 'self' Data:").is_err());
+        assert!(validate_csp("default-src 'self' Blob:").is_err());
+    }
+
+    #[test]
     fn validate_site_config_rejects_node_hostname() {
         let config = SiteConfig {
             hostname: "node.example.com".into(),
@@ -5962,6 +5985,82 @@ mod tests {
             .unwrap();
         assert!(cc.contains("immutable"));
         assert!(cc.contains("max-age=31536000"));
+        // Open admission => public cache.
+        assert!(cc.contains("public"));
+    }
+
+    #[tokio::test]
+    async fn site_gated_immutable_uses_private_cache() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_gated_immutable_ctx";
+
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut member_keys = HashMap::new();
+        member_keys.insert(issuer_did, pk);
+
+        let mut projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Gated,
+            None,
+            member_keys,
+        );
+        projected.set_site_config(SiteConfig {
+            hostname: "gated-immutable.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/assets/app.hash.js").unwrap()),
+                content_type: Some(MimeType::new("application/javascript").unwrap()),
+                deploy_id: Some("gated-d1".into()),
+                etag: None,
+                immutable: true,
+            },
+            body: b"console.log('gated')".to_vec(),
+        };
+
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/assets/app.hash.js").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, blob_id);
+        projected.commit_deploy("gated-d1".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let ucan_token = build_signed_test_ucan(context_id, &signing_key);
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!(
+                "/scp/broadcast/{routing_hex}/site/assets/app.hash.js"
+            ))
+            .header("Authorization", format!("Bearer {ucan_token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Gated admission => private cache.
+        assert_eq!(cc, "private, immutable, max-age=31536000");
     }
 
     #[tokio::test]
