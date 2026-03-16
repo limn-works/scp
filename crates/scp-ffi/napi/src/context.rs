@@ -32,6 +32,48 @@ use crate::runtime::context_manager;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
+// MLS key package generation for context join (#1294)
+// ---------------------------------------------------------------------------
+
+/// Generates TLS-serialized MLS key package bytes for a DID.
+///
+/// Creates an `ScpCredential` from the DID, generates a fresh
+/// `KeyPackage` via `scp_core::crypto::mls::group::generate_key_package`,
+/// and TLS-serializes it to bytes suitable for
+/// `ContextCryptoProvider::validate_key_package` and `add_member`.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Crypto` if the DID format is invalid (must be
+/// `did:dht:z...`), key package generation fails, or TLS serialization
+/// fails.
+fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
+    use scp_core::crypto::mls::credential::ScpCredential;
+    use scp_core::crypto::mls::group::generate_key_package;
+    use tls_codec::Serialize as TlsSerializeTrait;
+
+    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
+        .map_err(|e| ScpNapiError::Crypto {
+            message: format!("failed to create SCP credential for MLS key package: {e}"),
+            code: "SCP-CRYPTO-4010".to_owned(),
+        })?;
+
+    let (kp_bundle, _signer, _provider) =
+        generate_key_package(&cred).map_err(|e| ScpNapiError::Crypto {
+            message: format!("MLS key package generation failed: {e}"),
+            code: "SCP-CRYPTO-4011".to_owned(),
+        })?;
+
+    kp_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .map_err(|e| ScpNapiError::Crypto {
+            message: format!("MLS key package TLS serialization failed: {e}"),
+            code: "SCP-CRYPTO-4012".to_owned(),
+        })
+}
+
+// ---------------------------------------------------------------------------
 // NapiContextHandle — opaque JS class for SCP contexts
 // ---------------------------------------------------------------------------
 
@@ -419,7 +461,8 @@ pub async fn context_create(
     };
 
     // Initialize the ContextManager if not already done (first context_create call).
-    crate::runtime::init_context_manager();
+    // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
+    crate::runtime::init_context_manager(&creator_did);
 
     // Delegate to ContextManager.
     let manager = context_manager()?;
@@ -483,12 +526,20 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
     // Ensure the ContextManager is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073
-    crate::runtime::init_context_manager();
+    // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1294).
+    crate::runtime::init_context_manager(&identity_did);
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+
+    // Generate a real MLS key package for the joining member (#1294).
+    // The key package contains the joiner's SCP credential (DID) and is
+    // validated by MlsCryptoProvider::validate_key_package before MLS
+    // group addition.
+    let kp_bytes = generate_mls_key_package_bytes(&identity_did)?;
+
     let key_package = scp_core::context::membership::KeyPackage {
         owner_did: DID(identity_did.clone()),
-        mls_key_package_bytes: None,
+        mls_key_package_bytes: Some(kp_bytes),
     };
 
     let manager = context_manager()?;
@@ -2346,7 +2397,8 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
     // Ensure the ContextManager is initialized — context_import is a valid
     // first operation (e.g. a device receiving exported context data).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073
-    crate::runtime::init_context_manager();
+    // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
+    crate::runtime::init_context_manager(&export.exporter_did.0);
 
     let manager = context_manager()?;
     manager

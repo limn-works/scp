@@ -12,8 +12,8 @@ Node.js/Bun via napi-rs `#[napi]` types and functions.
 All context lifecycle, messaging, governance, broadcast, membership, and TTL operations
 delegate to a shared `Arc<ContextManager>` initialized once via `OnceLock` in `runtime.rs`.
 
-The `ContextManager` is constructed with bridge-local provider implementations:
-- `NapiBridgeCryptoProvider` — no-op MLS/sender-key operations
+The `ContextManager` is constructed with production provider implementations:
+- `MlsCryptoProvider` — real OpenMLS-backed encryption, sender keys, and group management (#1294)
 - `NotConfiguredTransportProvider` (from `scp-core`) — returns descriptive errors until relay configured (#501)
 - `MerkleEventLogProvider` — persistent Merkle-chained event log backed by
   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484)

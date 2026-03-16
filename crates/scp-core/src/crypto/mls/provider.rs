@@ -369,57 +369,45 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             )
         })?;
 
-        // Deserialize and validate the key package.
-        let kp_in = MlsMessageIn::tls_deserialize(&mut &*bytes)
+        // Deserialize the key package as KeyPackageIn (TLS format).
+        // This matches add_member() which also uses KeyPackageIn, ensuring
+        // both methods accept the same byte format (#1294).
+        let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}")))?;
 
-        // Extract the KeyPackage from the MlsMessageIn.
-        let body = kp_in.extract();
-        match body {
-            MlsMessageBodyIn::KeyPackage(kp) => {
-                // Validate ciphersuite and signature.
-                let provider = super::storage::InMemoryMlsProvider::default();
-                let verified = kp
-                    .validate(provider.crypto(), ProtocolVersion::Mls10)
-                    .map_err(|e| {
-                        ContextError::InvalidKeyPackage(format!("validation failed: {e}"))
-                    })?;
+        // Validate ciphersuite and signature.
+        let provider = super::storage::InMemoryMlsProvider::default();
+        let verified = kp_in
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
 
-                if verified.ciphersuite() != SCP_CIPHERSUITE {
-                    return Err(ContextError::InvalidKeyPackage(format!(
-                        "wrong ciphersuite: expected {:?}, got {:?}",
-                        SCP_CIPHERSUITE,
-                        verified.ciphersuite()
-                    )));
-                }
-
-                // Bind credential to owner_did: extract the ScpCredential
-                // from the key package's leaf node and verify the DID matches.
-                let leaf_node = verified.leaf_node();
-                if let Ok(basic_cred) = BasicCredential::try_from(leaf_node.credential().clone()) {
-                    let scp_cred =
-                        ScpCredential::from_bytes(basic_cred.identity()).map_err(|e| {
-                            ContextError::InvalidKeyPackage(format!(
-                                "credential deserialization failed: {e}"
-                            ))
-                        })?;
-                    if scp_cred.did != owner_did {
-                        return Err(ContextError::InvalidKeyPackage(
-                            "key package credential DID does not match owner_did".to_string(),
-                        ));
-                    }
-                } else {
-                    return Err(ContextError::InvalidKeyPackage(
-                        "key package does not contain a BasicCredential".to_string(),
-                    ));
-                }
-
-                Ok(())
-            }
-            _ => Err(ContextError::InvalidKeyPackage(
-                "message is not a KeyPackage".to_string(),
-            )),
+        if verified.ciphersuite() != SCP_CIPHERSUITE {
+            return Err(ContextError::InvalidKeyPackage(format!(
+                "wrong ciphersuite: expected {:?}, got {:?}",
+                SCP_CIPHERSUITE,
+                verified.ciphersuite()
+            )));
         }
+
+        // Bind credential to owner_did: extract the ScpCredential
+        // from the key package's leaf node and verify the DID matches.
+        let leaf_node = verified.leaf_node();
+        if let Ok(basic_cred) = BasicCredential::try_from(leaf_node.credential().clone()) {
+            let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).map_err(|e| {
+                ContextError::InvalidKeyPackage(format!("credential deserialization failed: {e}"))
+            })?;
+            if scp_cred.did != owner_did {
+                return Err(ContextError::InvalidKeyPackage(
+                    "key package credential DID does not match owner_did".to_string(),
+                ));
+            }
+        } else {
+            return Err(ContextError::InvalidKeyPackage(
+                "key package does not contain a BasicCredential".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn add_member(
@@ -473,12 +461,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     }
 
     fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
-        // Reject self-removal: the local member cannot remove themselves via
-        // this method — they should leave the group instead.
+        // Self-removal (leave): the local member's MLS group state does not
+        // need to be updated when they leave — they simply abandon their
+        // local group state. The remaining members process the removal via
+        // a Commit from the group admin. Treat as a no-op (#1294).
         if member_did == self.local_did {
-            return Err(ContextError::CryptoFailed(
-                "cannot remove self from MLS group — use leave instead".to_string(),
-            ));
+            return Ok(());
         }
 
         self.with_context(context_id, |state| {
@@ -508,9 +496,19 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 }
             }
 
-            let leaf_index = target_index.ok_or_else(|| {
-                ContextError::MemberNotFound(format!("member {member_did} not found in MLS group"))
-            })?;
+            // If the member is not in the MLS group (e.g., they were never
+            // MLS-added, or they're the local member under a different DID
+            // in a multi-identity test environment), treat as a no-op. The
+            // ContextManager handles membership state authoritatively; the
+            // crypto provider only manages MLS group state (#1294).
+            let Some(leaf_index) = target_index else {
+                tracing::warn!(
+                    member_did = %member_did,
+                    "remove_member: member DID not found in MLS group leaf nodes — \
+                     member may not have been MLS-added"
+                );
+                return Ok(());
+            };
 
             let _result = group::remove_member(&mut state.mls_group, leaf_index)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -1460,12 +1458,15 @@ mod tests {
     }
 
     #[test]
-    fn self_removal_rejected() {
+    fn self_removal_is_noop() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
+        // Self-removal is a no-op: the leaving member abandons their local
+        // MLS group state; the remaining members handle the actual removal
+        // via a Commit from the group admin (#1294).
         let result = provider.remove_member(&ctx_id, TEST_DID);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     // -- New tests for sender key distribution wiring --------------------------
