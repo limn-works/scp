@@ -24,6 +24,7 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.1", features
     "s3-blob",
 ] }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", features = ["testing", "sqlite", "file", "encrypting"] }
+arc-swap = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }
 instant-acme = "0.8"
