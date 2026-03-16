@@ -9,15 +9,16 @@ import SCP
 @main
 struct McpIntegration {
     static func main() async throws {
-        let identity = try await identityCreate(custody: "platform")
+        let identity = try await identityCreate(custody: "in_memory")
 
         // Create a context with tool capabilities
         let params = ContextParams(
-            ceiling: ["msg:send", "msg:receive", "tool:invoke"],
+            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
-            promotable: false
+            promotable: false,
+            minProtocolVersion: 0
         )
         let handle = try await contextCreate(identity: identity, params: params)
 
@@ -36,7 +37,7 @@ struct McpIntegration {
 
         // Start an MCP server exposing context tools on stdio.
         // Note: serveMcp takes an McpServerConfig, not a Context.
-        // The bridge function is not yet wired — this will throw SCP-MCP-10001.
+        // The bridge function is not yet wired -- this will throw SCP-MCP-10001.
         let serverConfig = McpServerConfig(
             identityDid: identity.did(),
             contextIds: [handle.contextId()],
@@ -52,7 +53,7 @@ struct McpIntegration {
 
         // Connect as an MCP client to a remote server.
         // McpClient.connect takes an McpClientConfig enum.
-        // The bridge function is not yet wired — this will throw SCP-MCP-10002.
+        // The bridge function is not yet wired -- this will throw SCP-MCP-10002.
         do {
             let client = try await McpClient.connect(
                 config: .sse(url: "http://localhost:8080/mcp")

@@ -63,17 +63,25 @@ struct MultiAgent {
 
     static func main() async throws {
         // Create identities for coordinator and two agents
-        let coordinator = try await identityCreate(custody: "platform")
-        let agentA = try await identityCreate(custody: "platform")
-        let agentB = try await identityCreate(custody: "platform")
+        let coordinator = try await identityCreate(custody: "in_memory")
+        let agentA = try await identityCreate(custody: "in_memory")
+        let agentB = try await identityCreate(custody: "in_memory")
 
         // Coordinator creates the context
         let params = ContextParams(
-            ceiling: ["msg:send", "msg:receive", "tool:invoke"],
+            ceiling: [
+                "messages:read",
+                "messages:write",
+                "tool:invoke:*",
+                "member:invite",
+                "member:remove",
+                "role:assign"
+            ],
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
-            promotable: false
+            promotable: false,
+            minProtocolVersion: 0
         )
         let handle = try await contextCreate(identity: coordinator, params: params)
         print("Context created: \(handle.contextId())")
@@ -82,12 +90,12 @@ struct MultiAgent {
         _ = try await ucanMint(
             handle: handle,
             memberDid: agentA.did(),
-            capabilities: ["msg:send", "msg:receive"]
+            capabilities: ["messages:write", "messages:read"]
         )
         _ = try await ucanMint(
             handle: handle,
             memberDid: agentB.did(),
-            capabilities: ["msg:send", "msg:receive"]
+            capabilities: ["messages:write", "messages:read"]
         )
 
         // Run agents concurrently

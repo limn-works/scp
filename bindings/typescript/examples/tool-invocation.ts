@@ -6,7 +6,7 @@ import { Context, Identity, mintUcan } from "@limn-works/scp-ts";
 import type { ToolDefinition } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
-  const identity = await Identity.create({ custody: "platform" });
+  const identity = await Identity.create({ custody: "in_memory" });
 
   const weatherTool: ToolDefinition = {
     name: "weather",
@@ -34,9 +34,14 @@ async function main(): Promise<void> {
   };
 
   const ctx = await Context.create(identity, {
-    ceiling: ["msg:send", "msg:receive", "tool:invoke"],
-    tools: [weatherTool],
+    ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+    memoryScope: "ephemeral",
+    governance: "single_admin",
   });
+
+  // Register the tool
+  const toolId = await ctx.registerTool(weatherTool);
+  console.log(`Registered tool: ${toolId}`);
 
   // Mint a UCAN token for tool invocation (§7.2 — required for all actions)
   const ucan = await mintUcan(ctx, identity.did, ["tool_invoke:*"]);

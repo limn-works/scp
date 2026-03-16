@@ -3,48 +3,37 @@
 package works.limn.scp.examples
 
 import works.limn.scp.Context
+import works.limn.scp.CustodyType
 import works.limn.scp.Identity
+import works.limn.scp.ToolDefinition
 import kotlinx.coroutines.runBlocking
 
 fun main() = runBlocking {
-    val identity = Identity.create(custody = "platform")
+    val identity = Identity.create(custody = CustodyType.IN_MEMORY)
+
+    val weatherTool = ToolDefinition(
+        name = "weather",
+        description = "Get current weather for a city",
+        inputSchemaJson = """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""",
+        outputSchemaJson = """{"type":"object","properties":{"tempC":{"type":"number"},"condition":{"type":"string"}}}""",
+        operatorDid = identity.did,
+        testVectorsJson = """[{"input":{"city":"Berlin"},"expected":{"tempC":18,"condition":"cloudy"}}]""",
+    )
 
     val ctx = Context.create(
         identity = identity,
-        params = mapOf(
-            "ceiling" to listOf("msg:send", "msg:receive", "tool:invoke"),
-            "tools" to listOf(
-                mapOf(
-                    "name" to "weather",
-                    "description" to "Get current weather for a city",
-                    "inputSchema" to mapOf(
-                        "type" to "object",
-                        "properties" to mapOf("city" to mapOf("type" to "string")),
-                        "required" to listOf("city"),
-                    ),
-                    "outputSchema" to mapOf(
-                        "type" to "object",
-                        "properties" to mapOf(
-                            "tempC" to mapOf("type" to "number"),
-                            "condition" to mapOf("type" to "string"),
-                        ),
-                    ),
-                    "operator" to identity.did,
-                    "testVectors" to listOf(
-                        mapOf(
-                            "input" to mapOf("city" to "Berlin"),
-                            "expectedOutput" to mapOf("tempC" to 18, "condition" to "cloudy"),
-                            "description" to "Berlin weather lookup",
-                        ),
-                    ),
-                ),
-            ),
-        ),
+        ceiling = listOf("messages:read", "messages:write", "tool:invoke:*", "tool:register"),
+        memoryScope = "ephemeral",
+        governance = "single_admin",
     )
 
+    // Register the tool
+    val toolId = ctx.registerTool(weatherTool)
+    println("Registered tool: $toolId")
+
     // Invoke the tool
-    val result = ctx.invokeTool("weather", mapOf("city" to "Berlin"))
+    val result = ctx.invokeTool("weather", """{"city":"Berlin"}""", identity)
     println("Weather result: $result")
 
-    ctx.close()
+    ctx.close(identity = identity)
 }

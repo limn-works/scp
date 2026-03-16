@@ -10,20 +10,21 @@ import SCP
 @main
 struct BasicMessaging {
     static func main() async throws {
-        // Create two identities via the UniFFI bridge function
-        let alice = try await identityCreate(custody: "platform")
-        let bob = try await identityCreate(custody: "platform")
+        // Create two identities via the UniFFI bridge function (in_memory custody for examples)
+        let alice = try await identityCreate(custody: "in_memory")
+        let bob = try await identityCreate(custody: "in_memory")
         print("Alice DID: \(alice.did())")
         print("Bob DID: \(bob.did())")
 
         // Alice creates a context via the UniFFI bridge function.
-        // ContextParams requires: ceiling, governance, memoryScope, ttlSeconds, promotable
+        // ContextParams requires: ceiling, governance, memoryScope, ttlSeconds, promotable, minProtocolVersion
         let params = ContextParams(
-            ceiling: ["msg:send", "msg:receive"],
+            ceiling: ["messages:read", "messages:write", "member:invite"],
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
-            promotable: false
+            promotable: false,
+            minProtocolVersion: 0
         )
         let aliceHandle = try await contextCreate(identity: alice, params: params)
         print("Context ID: \(aliceHandle.contextId())")

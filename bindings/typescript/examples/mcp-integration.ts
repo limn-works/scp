@@ -3,14 +3,41 @@
  */
 
 import { Context, Identity } from "@limn-works/scp-ts";
-import { McpClient, serveMcp } from "@limn-works/scp-ts/mcp";
+import { connectMcp, serveMcp } from "@limn-works/scp-ts/mcp";
 
 async function main(): Promise<void> {
-  const identity = await Identity.create({ custody: "platform" });
+  const identity = await Identity.create({ custody: "in_memory" });
 
-  // Create a context with tools
+  // Create a context with tool capabilities
   const ctx = await Context.create(identity, {
-    ceiling: ["msg:send", "msg:receive", "tool:invoke", "mcp:serve"],
+    ceiling: [
+      "messages:read",
+      "messages:write",
+      "tool:invoke:*",
+      "tool:register",
+    ],
+    memoryScope: "ephemeral",
+    governance: "single_admin",
+  });
+
+  // Register a tool in the context
+  await ctx.registerTool({
+    name: "summarize",
+    description: "Summarize text content",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: { summary: { type: "string" } },
+    },
+    operator: identity.did,
+  });
+
+  // Start an MCP server exposing context tools on stdio
+  const server = await serveMcp(ctx, {
     tools: [
       {
         name: "summarize",
@@ -28,22 +55,19 @@ async function main(): Promise<void> {
       },
     ],
   });
-
-  // Start an MCP server exposing context tools on stdio
-  const server = await serveMcp(ctx, { transport: "stdio" });
-  console.log(`MCP server running, exposing tools`);
+  console.log("MCP server running, exposing tools");
 
   // Or connect as an MCP client to a remote server
-  const client = await McpClient.connect("ws://localhost:8080/mcp");
+  const client = await connectMcp({ serverUrl: "http://localhost:8080/mcp" });
   const tools = await client.listTools();
   console.log(`Remote server offers ${tools.length} tool(s)`);
 
-  const result = await client.callTool("summarize", {
+  const result = await client.invokeTool("summarize", {
     text: "SCP is a protocol for...",
   });
   console.log("Result:", result);
 
-  await client.close();
+  await client.disconnect();
   await server.stop();
   await ctx.close();
 }
