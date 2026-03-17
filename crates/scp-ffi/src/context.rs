@@ -720,6 +720,43 @@ fn resolve_future(
 }
 
 // ---------------------------------------------------------------------------
+// MLS key package generation helper (#1324)
+// ---------------------------------------------------------------------------
+
+/// Generates serialized MLS key package bytes for a given DID.
+///
+/// Ported from the NAPI bridge (`generate_mls_key_package_bytes` in
+/// `napi/src/context.rs`) as part of issue #1324. Creates an SCP credential
+/// for the DID, generates a fresh MLS key package, and returns the
+/// TLS-serialized bytes suitable for passing to
+/// `ContextManager::join_context`.
+fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::ScpPyError> {
+    use scp_core::crypto::mls::credential::ScpCredential;
+    use scp_core::crypto::mls::group::generate_key_package;
+    use tls_codec::Serialize as TlsSerializeTrait;
+
+    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
+        .map_err(|e| {
+            crate::error::ScpPyError::crypto(format!(
+                "failed to create SCP credential for MLS key package: {e}"
+            ))
+        })?;
+
+    let (kp_bundle, _signer, _provider) = generate_key_package(&cred).map_err(|e| {
+        crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
+    })?;
+
+    kp_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .map_err(|e| {
+            crate::error::ScpPyError::crypto(format!(
+                "MLS key package TLS serialization failed: {e}"
+            ))
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -879,10 +916,11 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
     // Ensure the ContextManager is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
     crate::runtime::init_context_manager_for_test();
     #[cfg(not(test))]
-    crate::runtime::init_context_manager();
+    crate::runtime::init_context_manager(identity_did);
 
     // Delegate join to the shared ContextManager for membership tracking.
     {
@@ -893,10 +931,16 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        // Build a key package for the joining member.
+        // Generate a real MLS key package for the joining member (#1324).
+        // The key package contains the joiner's SCP credential (DID) and is
+        // validated by MlsCryptoProvider::validate_key_package before MLS
+        // group addition.
+        let kp_bytes = generate_mls_key_package_bytes(identity_did)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
         let key_package = scp_core::context::membership::KeyPackage {
             owner_did: scp_identity::DID(member_did.clone()),
-            mls_key_package_bytes: None,
+            mls_key_package_bytes: Some(kp_bytes),
         };
 
         // Look up the ContextHandle from a completed create_context call.
@@ -1559,13 +1603,17 @@ fn py_context_import(data: &[u8]) -> PyResult<String> {
 
     let context_id = export.snapshot.context_id.clone();
 
+    // Validate the exporter DID before passing to init_context_manager (#1324).
+    validate::validate_did(&export.exporter_did.0)?;
+
     // Ensure the ContextManager is initialized — context_import is a valid
     // first operation (e.g. a device receiving exported context data).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
     crate::runtime::init_context_manager_for_test();
     #[cfg(not(test))]
-    crate::runtime::init_context_manager();
+    crate::runtime::init_context_manager(&export.exporter_did.0);
 
     let rt = crate::runtime()?;
     let mgr =

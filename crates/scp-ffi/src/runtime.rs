@@ -122,12 +122,16 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     })
 }
 
-/// Initializes the global [`ContextManager`] with production-appropriate providers.
+/// Initializes the global [`ContextManager`] with production providers.
 ///
-/// Uses `NoOpCryptoProvider` (crypto operations handled by bridge-level
-/// `KeyCustody` and the `MlsCryptoProvider` singleton), `NotConfiguredTransportProvider`
-/// (returns descriptive errors until transport is configured via `transport_connect`),
-/// and `NoOpEventLogProvider` (bridge-level `EventLog` instances handle Merkle ops).
+/// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
+/// group management — ported from NAPI bridge #1305, closes #1324),
+/// `NotConfiguredTransportProvider` (returns descriptive errors until transport
+/// is configured via `transport_connect`), and `NoOpEventLogProvider`
+/// (bridge-level `EventLog` instances handle Merkle ops).
+///
+/// The `local_did` is passed to `MlsCryptoProvider::new` which uses it as
+/// the MLS credential identity for group operations and sender key generation.
 ///
 /// The key resolver rejects all lookups with an error rather than silently
 /// returning `None`, ensuring governance vote signature verification failures
@@ -139,12 +143,22 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// context state persistence across process restarts without requiring
 /// callers to manually wire persistence. See issue #329.
 ///
-/// This function is idempotent -- subsequent calls are no-ops.
-pub fn init_context_manager() {
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+/// If the manager is already initialized with a different DID, a warning is logged.
+pub fn init_context_manager(local_did: &str) {
+    if CONTEXT_MANAGER.get().is_some() {
+        tracing::warn!(
+            requested_did = %local_did,
+            "init_context_manager already initialized — MLS crypto uses the original DID"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
     let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
         let persistence = build_persistence_provider();
         build_context_manager(
-            Box::new(NoOpCryptoProvider),
+            crypto,
             Box::new(NotConfiguredTransportProvider),
             Box::new(NoOpEventLogProvider),
             persistence,
@@ -310,14 +324,11 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 // No-op provider implementations for ContextManager initialization
 // ---------------------------------------------------------------------------
 
-/// No-op crypto provider for bridge-layer `ContextManager` initialization.
+/// No-op crypto provider used only by [`init_context_manager_for_test`].
 ///
-/// All operations succeed without performing real cryptographic work. The
-/// bridge layer performs its own crypto operations (inner envelope signing
-/// via `KeyCustody`, MLS group operations via future wiring). The
-/// `ContextManager`'s crypto provider is used for the two-phase context
-/// creation flow and membership operations, which currently succeed as
-/// no-ops at the FFI bridge level.
+/// Production code now uses `MlsCryptoProvider` (issue #1324). Tests
+/// continue using this no-op because they pass `did:key:` test DIDs and
+/// `None` key packages which `MlsCryptoProvider` rejects.
 struct NoOpCryptoProvider;
 
 impl ContextCryptoProvider for NoOpCryptoProvider {
@@ -1172,10 +1183,11 @@ pub fn register_context(
     // Production uses NotConfiguredTransportProvider — publish_context
     // returns an error that create_context logs as a warning (best-effort;
     // context is valid locally even without relay publication, #501).
+    // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
     init_context_manager_for_test();
     #[cfg(not(test))]
-    init_context_manager();
+    init_context_manager(creator_did);
 
     // Register FFI-specific state.
     register_ffi_state(context_id, creator_did, user_ceiling)
