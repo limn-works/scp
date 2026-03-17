@@ -550,3 +550,121 @@ fun validateBroadcastKeyHex(broadcastKeyHex: String) {
         "broadcastKeyHex must be exactly 64 hex characters (32 bytes)"
     }
 }
+
+// ---------------------------------------------------------------------------
+// Client-side Validation (SCP-297, spec §18.11.9)
+// ---------------------------------------------------------------------------
+
+/** Maximum content path length in bytes. */
+private const val MAX_CONTENT_PATH_BYTES = 1024
+
+/** Maximum deploy ID length in bytes. */
+private const val MAX_DEPLOY_ID_BYTES = 128
+
+/** Allowed deploy ID character regex: ASCII alphanumeric plus `-` and `_`. */
+private val DEPLOY_ID_REGEX = Regex("^[a-zA-Z0-9\\-_]+$")
+
+/** Forbidden substrings in content paths, paired with error messages. */
+private val CONTENT_PATH_FORBIDDEN = listOf(
+    "\\" to "ContentPath must not contain backslashes",
+    "%" to "ContentPath must not contain percent-encoded bytes",
+    "?" to "ContentPath must not contain query strings ('?')",
+    "#" to "ContentPath must not contain fragments ('#')",
+    "\u0000" to "ContentPath must not contain null bytes",
+    "//" to "ContentPath must not contain '//'",
+)
+
+/** Checks for forbidden substrings and control characters in a content path. */
+private fun contentPathCharError(path: String): String? {
+    val substringErr = CONTENT_PATH_FORBIDDEN.firstOrNull { path.contains(it.first) }?.second
+    if (substringErr != null) return substringErr
+    val ctrlChar = path.firstOrNull { it.code in 0x00..0x1F || it.code == 0x7F }
+    return ctrlChar?.let { "ContentPath must not contain control character U+${"%04X".format(it.code)}" }
+}
+
+/** Checks structural rules (prefix, length, trailing slash, segments). */
+private fun contentPathStructureError(path: String): String? = when {
+    !path.startsWith("/") -> "ContentPath must start with '/'"
+    path.toByteArray(Charsets.UTF_8).size > MAX_CONTENT_PATH_BYTES ->
+        "ContentPath exceeds $MAX_CONTENT_PATH_BYTES bytes"
+    path.length > 1 && path.endsWith("/") -> "ContentPath must not have trailing slash (except root '/')"
+    else -> path.split("/").drop(1).firstNotNullOfOrNull { segment ->
+        when (segment) {
+            "." -> "ContentPath must not contain '.' segments"
+            ".." -> "ContentPath must not contain '..' segments (directory traversal)"
+            else -> null
+        }
+    }
+}
+
+/**
+ * Validates a content path before FFI crossing (SCP-297).
+ *
+ * Mirrors the Rust `ContentPath::new` validation from
+ * `crates/scp-core/src/context/broadcast_content.rs`.
+ *
+ * @param path The content path to validate.
+ * @throws BridgeException if the path is invalid.
+ */
+fun validateContentPath(path: String) {
+    val error = contentPathStructureError(path) ?: contentPathCharError(path)
+    if (error != null) throw BridgeException(error, "SCP-VALID-7010")
+}
+
+/** Checks for control characters in a MIME type string. */
+private fun mimeTypeControlCharError(contentType: String): String? {
+    val ctrlChar = contentType.firstOrNull { it.code <= 0x1F || it.code == 0x7F }
+    return ctrlChar?.let { "MimeType must not contain control character U+${"%04X".format(it.code)}" }
+}
+
+/** Checks MIME type structure (semicolon, slash count, non-empty parts). */
+private fun mimeTypeStructureError(contentType: String): String? = when {
+    contentType.isEmpty() -> "MimeType must not be empty"
+    contentType.contains(";") -> "MimeType must not contain parameters (';' not allowed)"
+    contentType.count { it == '/' } != 1 -> "MimeType must be 'type/subtype' (exactly one '/')"
+    else -> {
+        val parts = contentType.split("/", limit = 2)
+        if (parts.size != 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
+            "MimeType type and subtype must both be non-empty"
+        } else {
+            null
+        }
+    }
+}
+
+/**
+ * Validates a MIME type before FFI crossing (SCP-297).
+ *
+ * Mirrors the Rust `MimeType::new` validation from
+ * `crates/scp-core/src/context/broadcast_content.rs`.
+ *
+ * @param contentType The MIME type to validate.
+ * @throws BridgeException if the MIME type is invalid.
+ */
+fun validateMimeType(contentType: String) {
+    val error = mimeTypeStructureError(contentType) ?: mimeTypeControlCharError(contentType)
+    if (error != null) throw BridgeException(error, "SCP-VALID-7011")
+}
+
+/** Returns an error message if the deploy ID is invalid, null otherwise. */
+private fun deployIdError(deployId: String): String? = when {
+    deployId.isEmpty() -> "deploy_id must not be empty"
+    deployId.toByteArray(Charsets.UTF_8).size > MAX_DEPLOY_ID_BYTES ->
+        "deploy_id exceeds $MAX_DEPLOY_ID_BYTES bytes"
+    !DEPLOY_ID_REGEX.matches(deployId) ->
+        "deploy_id must be ASCII alphanumeric, '-', or '_'"
+    else -> null
+}
+
+/**
+ * Validates a deploy ID before FFI crossing (SCP-297).
+ *
+ * Mirrors the Rust `validate_deploy_id` from
+ * `crates/scp-core/src/context/broadcast_content.rs`.
+ *
+ * @param deployId The deploy ID to validate.
+ * @throws BridgeException if the deploy ID is invalid.
+ */
+fun validateDeployId(deployId: String) {
+    deployIdError(deployId)?.let { throw BridgeException(it, "SCP-VALID-7012") }
+}

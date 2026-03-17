@@ -41,6 +41,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import works.limn.scp.AssetEntry
 import works.limn.scp.BatchPublishResult
+import works.limn.scp.validateContentPath
+import works.limn.scp.validateDeployId
+import works.limn.scp.validateMimeType
 import works.limn.scp.BridgeConnectorBindings
 import works.limn.scp.BridgeConnectorBridge
 import works.limn.scp.DiscoveryBindings
@@ -2332,6 +2335,11 @@ class BroadcastBridgeOps internal constructor(
         asset: AssetEntry,
         deployId: String? = null,
     ): PublishResult {
+        // SCP-297: Client-side validation before FFI crossing.
+        validateContentPath(asset.path)
+        validateMimeType(asset.contentType)
+        if (deployId != null) validateDeployId(deployId)
+
         val resolved = resolveIdentityHandle(identityHandle)
         val assetJson = serializeAsset(asset)
         val resultJson =
@@ -2354,7 +2362,8 @@ class BroadcastBridgeOps internal constructor(
      * @param deployId Optional deploy ID to group assets into atomic deploys.
      * @return A [BatchPublishResult] with per-asset results and the shared deploy ID.
      * @throws BridgeException if no identity handle is provided and
-     *   [defaultIdentityHandle] is not set.
+     *   [defaultIdentityHandle] is not set, or if any path/contentType/deployId
+     *   is invalid (SCP-297).
      */
     suspend fun publishAssets(
         contextHandle: Long,
@@ -2362,6 +2371,13 @@ class BroadcastBridgeOps internal constructor(
         assets: List<AssetEntry>,
         deployId: String? = null,
     ): BatchPublishResult {
+        // SCP-297: Client-side validation before FFI crossing.
+        for (asset in assets) {
+            validateContentPath(asset.path)
+            validateMimeType(asset.contentType)
+        }
+        if (deployId != null) validateDeployId(deployId)
+
         val resolved = resolveIdentityHandle(identityHandle)
         val assetsJson = serializeAssets(assets)
         val resultJson =

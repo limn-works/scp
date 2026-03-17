@@ -88,6 +88,149 @@ export function _validateEconomicPolicyJson(json: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Client-side validation (SCP-297, spec §18.11.9)
+// ---------------------------------------------------------------------------
+
+/** Maximum content path length in bytes. */
+const MAX_CONTENT_PATH_BYTES = 1024;
+
+/** Maximum deploy ID length in bytes. */
+const MAX_DEPLOY_ID_BYTES = 128;
+
+/**
+ * Validates a content path before FFI crossing (SCP-297).
+ *
+ * Mirrors the Rust `ContentPath::new` validation from
+ * `crates/scp-core/src/context/broadcast_content.rs`.
+ *
+ * @throws {ValidationError} If the path is invalid.
+ * @internal Exported for testing.
+ */
+export function _validateContentPath(path: string): void {
+  if (!path.startsWith("/")) {
+    throw new ValidationError("ContentPath must start with '/'", "SCP-VALID-7010");
+  }
+  if (new TextEncoder().encode(path).length > MAX_CONTENT_PATH_BYTES) {
+    throw new ValidationError(
+      `ContentPath exceeds ${MAX_CONTENT_PATH_BYTES} bytes`,
+      "SCP-VALID-7010",
+    );
+  }
+  if (path.includes("\\")) {
+    throw new ValidationError("ContentPath must not contain backslashes", "SCP-VALID-7010");
+  }
+  if (path.includes("%")) {
+    throw new ValidationError(
+      "ContentPath must not contain percent-encoded bytes",
+      "SCP-VALID-7010",
+    );
+  }
+  if (path.includes("?")) {
+    throw new ValidationError("ContentPath must not contain query strings ('?')", "SCP-VALID-7010");
+  }
+  if (path.includes("#")) {
+    throw new ValidationError("ContentPath must not contain fragments ('#')", "SCP-VALID-7010");
+  }
+  if (path.includes("\0")) {
+    throw new ValidationError("ContentPath must not contain null bytes", "SCP-VALID-7010");
+  }
+  for (const ch of path) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if ((cp >= 0x00 && cp <= 0x1f) || cp === 0x7f) {
+      throw new ValidationError(
+        `ContentPath must not contain control character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`,
+        "SCP-VALID-7010",
+      );
+    }
+  }
+  if (path.includes("//")) {
+    throw new ValidationError("ContentPath must not contain '//'", "SCP-VALID-7010");
+  }
+  if (path.length > 1 && path.endsWith("/")) {
+    throw new ValidationError(
+      "ContentPath must not have trailing slash (except root '/')",
+      "SCP-VALID-7010",
+    );
+  }
+  for (const segment of path.split("/").slice(1)) {
+    if (segment === ".") {
+      throw new ValidationError("ContentPath must not contain '.' segments", "SCP-VALID-7010");
+    }
+    if (segment === "..") {
+      throw new ValidationError(
+        "ContentPath must not contain '..' segments (directory traversal)",
+        "SCP-VALID-7010",
+      );
+    }
+  }
+}
+
+/**
+ * Validates a MIME type before FFI crossing (SCP-297).
+ *
+ * Mirrors the Rust `MimeType::new` validation from
+ * `crates/scp-core/src/context/broadcast_content.rs`.
+ *
+ * @throws {ValidationError} If the MIME type is invalid.
+ * @internal Exported for testing.
+ */
+export function _validateMimeType(contentType: string): void {
+  if (!contentType) {
+    throw new ValidationError("MimeType must not be empty", "SCP-VALID-7011");
+  }
+  for (const ch of contentType) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp <= 0x1f || cp === 0x7f) {
+      throw new ValidationError(
+        `MimeType must not contain control character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`,
+        "SCP-VALID-7011",
+      );
+    }
+  }
+  if (contentType.includes(";")) {
+    throw new ValidationError(
+      "MimeType must not contain parameters (';' not allowed)",
+      "SCP-VALID-7011",
+    );
+  }
+  const slashCount = [...contentType].filter((c) => c === "/").length;
+  if (slashCount !== 1) {
+    throw new ValidationError(
+      "MimeType must be 'type/subtype' (exactly one '/')",
+      "SCP-VALID-7011",
+    );
+  }
+  const [typePart, subtypePart] = contentType.split("/", 2);
+  if (!typePart || !subtypePart) {
+    throw new ValidationError("MimeType type and subtype must both be non-empty", "SCP-VALID-7011");
+  }
+}
+
+/**
+ * Validates a deploy ID before FFI crossing (SCP-297).
+ *
+ * Mirrors the Rust `validate_deploy_id` from
+ * `crates/scp-core/src/context/broadcast_content.rs`.
+ *
+ * @throws {ValidationError} If the deploy ID is invalid.
+ * @internal Exported for testing.
+ */
+export function _validateDeployId(deployId: string): void {
+  if (!deployId) {
+    throw new ValidationError("deploy_id must not be empty", "SCP-VALID-7012");
+  }
+  if (new TextEncoder().encode(deployId).length > MAX_DEPLOY_ID_BYTES) {
+    throw new ValidationError(`deploy_id exceeds ${MAX_DEPLOY_ID_BYTES} bytes`, "SCP-VALID-7012");
+  }
+  if (!/^[a-zA-Z0-9\-_]+$/.test(deployId)) {
+    throw new ValidationError(
+      "deploy_id must be ASCII alphanumeric, '-', or '_'",
+      "SCP-VALID-7012",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
@@ -547,6 +690,7 @@ export class Context implements AsyncDisposable {
    * @param deployId - Optional deploy ID to group assets into atomic deploys.
    * @returns A PublishResult with blobId and etag.
    * @throws {ContextError} If the context is not active or not broadcast.
+   * @throws {ValidationError} If path, contentType, or deployId is invalid (SCP-297).
    */
   async broadcastPublishAsset(
     asset: AssetEntry,
@@ -554,6 +698,12 @@ export class Context implements AsyncDisposable {
     deployId?: string,
   ): Promise<PublishResult> {
     this.assertActive();
+    // SCP-297: Client-side validation before FFI crossing.
+    _validateContentPath(asset.path);
+    _validateMimeType(asset.contentType);
+    if (deployId != null) {
+      _validateDeployId(deployId);
+    }
     try {
       const bridge = await getBridge();
       const result = await bridge.broadcastPublishAsset(
@@ -579,6 +729,7 @@ export class Context implements AsyncDisposable {
    * @param deployId - Optional deploy ID to group assets into atomic deploys.
    * @returns A BatchPublishResult with per-asset results and the shared deployId.
    * @throws {ContextError} If any asset fails validation or publish.
+   * @throws {ValidationError} If any path, contentType, or deployId is invalid (SCP-297).
    */
   async broadcastPublishAssets(
     assets: AssetEntry[],
@@ -586,6 +737,14 @@ export class Context implements AsyncDisposable {
     deployId?: string,
   ): Promise<BatchPublishResult> {
     this.assertActive();
+    // SCP-297: Client-side validation before FFI crossing.
+    for (const asset of assets) {
+      _validateContentPath(asset.path);
+      _validateMimeType(asset.contentType);
+    }
+    if (deployId != null) {
+      _validateDeployId(deployId);
+    }
     try {
       const bridge = await getBridge();
       const napiAssets = assets.map((a) => ({

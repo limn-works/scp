@@ -26,7 +26,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ContextError
+from scp_sdk.errors import ContextError, ValidationError
 from scp_sdk.types import (
     Capability,
     CeilingPolicy,
@@ -54,6 +54,158 @@ _MIN_BUFFER_SIZE: int = 100
 
 #: Maximum configurable buffer size.
 _MAX_BUFFER_SIZE: int = 10_000
+
+#: Maximum content path length in bytes.
+_MAX_CONTENT_PATH_BYTES: int = 1024
+
+#: Maximum deploy ID length in bytes.
+_MAX_DEPLOY_ID_BYTES: int = 128
+
+
+# ---------------------------------------------------------------------------
+# Client-side validation helpers (SCP-297, spec §18.11.9)
+# ---------------------------------------------------------------------------
+
+
+def validate_content_path(path: str) -> None:
+    """Validate a content path before FFI crossing (SCP-297).
+
+    Mirrors the Rust ``ContentPath::new`` validation from
+    ``crates/scp-core/src/context/broadcast_content.rs``.
+
+    Raises:
+        ValidationError: If the path is invalid, with a message
+            describing the specific violation.
+    """
+    if not path.startswith("/"):
+        raise ValidationError(
+            "ContentPath must start with '/'",
+            code="SCP-VALID-7010",
+        )
+    if len(path.encode("utf-8")) > _MAX_CONTENT_PATH_BYTES:
+        raise ValidationError(
+            f"ContentPath exceeds {_MAX_CONTENT_PATH_BYTES} bytes",
+            code="SCP-VALID-7010",
+        )
+    if "\\" in path:
+        raise ValidationError(
+            "ContentPath must not contain backslashes",
+            code="SCP-VALID-7010",
+        )
+    if "%" in path:
+        raise ValidationError(
+            "ContentPath must not contain percent-encoded bytes",
+            code="SCP-VALID-7010",
+        )
+    if "?" in path:
+        raise ValidationError(
+            "ContentPath must not contain query strings ('?')",
+            code="SCP-VALID-7010",
+        )
+    if "#" in path:
+        raise ValidationError(
+            "ContentPath must not contain fragments ('#')",
+            code="SCP-VALID-7010",
+        )
+    if "\0" in path:
+        raise ValidationError(
+            "ContentPath must not contain null bytes",
+            code="SCP-VALID-7010",
+        )
+    for ch in path:
+        cp = ord(ch)
+        if 0x00 <= cp <= 0x1F or cp == 0x7F:
+            raise ValidationError(
+                f"ContentPath must not contain control character U+{cp:04X}",
+                code="SCP-VALID-7010",
+            )
+    if "//" in path:
+        raise ValidationError(
+            "ContentPath must not contain '//'",
+            code="SCP-VALID-7010",
+        )
+    if len(path) > 1 and path.endswith("/"):
+        raise ValidationError(
+            "ContentPath must not have trailing slash (except root '/')",
+            code="SCP-VALID-7010",
+        )
+    for segment in path.split("/")[1:]:
+        if segment == ".":
+            raise ValidationError(
+                "ContentPath must not contain '.' segments",
+                code="SCP-VALID-7010",
+            )
+        if segment == "..":
+            raise ValidationError(
+                "ContentPath must not contain '..' segments (directory traversal)",
+                code="SCP-VALID-7010",
+            )
+
+
+def validate_mime_type(content_type: str) -> None:
+    """Validate a MIME type before FFI crossing (SCP-297).
+
+    Mirrors the Rust ``MimeType::new`` validation from
+    ``crates/scp-core/src/context/broadcast_content.rs``.
+
+    Raises:
+        ValidationError: If the MIME type is invalid, with a message
+            describing the specific violation.
+    """
+    if not content_type:
+        raise ValidationError(
+            "MimeType must not be empty",
+            code="SCP-VALID-7011",
+        )
+    for ch in content_type:
+        if ord(ch) <= 0x1F or ord(ch) == 0x7F:
+            raise ValidationError(
+                f"MimeType must not contain control character U+{ord(ch):04X}",
+                code="SCP-VALID-7011",
+            )
+    if ";" in content_type:
+        raise ValidationError(
+            "MimeType must not contain parameters (';' not allowed)",
+            code="SCP-VALID-7011",
+        )
+    if content_type.count("/") != 1:
+        raise ValidationError(
+            "MimeType must be 'type/subtype' (exactly one '/')",
+            code="SCP-VALID-7011",
+        )
+    type_part, subtype_part = content_type.split("/", 1)
+    if not type_part or not subtype_part:
+        raise ValidationError(
+            "MimeType type and subtype must both be non-empty",
+            code="SCP-VALID-7011",
+        )
+
+
+def validate_deploy_id(deploy_id: str) -> None:
+    """Validate a deploy ID before FFI crossing (SCP-297).
+
+    Mirrors the Rust ``validate_deploy_id`` from
+    ``crates/scp-core/src/context/broadcast_content.rs``.
+
+    Raises:
+        ValidationError: If the deploy ID is invalid, with a message
+            describing the specific violation.
+    """
+    if not deploy_id:
+        raise ValidationError(
+            "deploy_id must not be empty",
+            code="SCP-VALID-7012",
+        )
+    if len(deploy_id.encode("utf-8")) > _MAX_DEPLOY_ID_BYTES:
+        raise ValidationError(
+            f"deploy_id exceeds {_MAX_DEPLOY_ID_BYTES} bytes",
+            code="SCP-VALID-7012",
+        )
+    if not all(c.isascii() and (c.isalnum() or c in "-_") for c in deploy_id):
+        raise ValidationError(
+            "deploy_id must be ASCII alphanumeric, '-', or '_'",
+            code="SCP-VALID-7012",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -902,7 +1054,14 @@ class Context:
 
         Raises:
             ContextError: If the context is not active or not broadcast.
+            ValidationError: If path, content_type, or deploy_id is invalid (SCP-297).
         """
+        # SCP-297: Client-side validation before FFI crossing.
+        validate_content_path(asset.path)
+        validate_mime_type(asset.content_type)
+        if deploy_id is not None:
+            validate_deploy_id(deploy_id)
+
         try:
             import _scp_core
         except ImportError as exc:
@@ -949,7 +1108,15 @@ class Context:
 
         Raises:
             ContextError: If any asset fails validation or publish.
+            ValidationError: If any path, content_type, or deploy_id is invalid (SCP-297).
         """
+        # SCP-297: Client-side validation before FFI crossing.
+        for asset in assets:
+            validate_content_path(asset.path)
+            validate_mime_type(asset.content_type)
+        if deploy_id is not None:
+            validate_deploy_id(deploy_id)
+
         try:
             import _scp_core
         except ImportError as exc:
