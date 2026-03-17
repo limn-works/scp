@@ -1102,9 +1102,13 @@ pub fn handle_register(
     let normalized = handle.to_lowercase();
     let now = crate::time::now_secs();
 
-    let tags: Option<Vec<String>> = tags_json
-        .as_deref()
-        .map(|s| serde_json::from_str(s).unwrap_or_default());
+    let tags: Option<Vec<String>> = match tags_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid tags_json: {e}")))?,
+        ),
+        None => None,
+    };
 
     let entry_id = {
         let mut guard = wasm_handle_registries()
@@ -1235,17 +1239,27 @@ fn wasm_validate_scope_name(name: &str) -> Result<(), JsError> {
     Ok(())
 }
 
+/// What a WASM scope entry resolves to. Nested under `WasmScopeEntry` to match
+/// the scp-core `ScopeTarget` wire format (context-only by construction).
+#[derive(Clone, serde::Serialize)]
+struct WasmScopeTarget {
+    context_id: String,
+    relay_urls: Vec<String>,
+}
+
 /// In-memory scope entry for WASM bridge.
 #[derive(Clone, serde::Serialize)]
 struct WasmScopeEntry {
     name: String,
-    context_id: String,
-    relay_urls: Vec<String>,
+    target: WasmScopeTarget,
     owner_did: String,
     registered_at: u64,
     metadata: serde_json::Value,
     entry_id: String,
 }
+
+/// Maximum number of entries in a single WASM scope registry (mirrors scp-core).
+const MAX_WASM_SCOPE_ENTRIES: usize = 10_000;
 
 /// In-memory scope registry for one context.
 struct WasmScopeRegistry {
@@ -1269,12 +1283,16 @@ fn wasm_scope_registries() -> &'static Mutex<HashMap<String, WasmScopeRegistry>>
 }
 
 /// Collects scope name -> context ID mappings for WASM address resolution.
+///
+/// **Cross-context note:** Merges all scope registries globally, matching
+/// how handle registries are merged in `resolve_via_handles`. A future
+/// refinement could scope to caller-provided trusted registry context IDs.
 fn wasm_known_contexts_from_scope_registries() -> HashMap<String, String> {
     let mut result = HashMap::new();
     if let Ok(guard) = wasm_scope_registries().lock() {
         for registry in guard.values() {
             for entry in registry.entries.values() {
-                result.insert(entry.name.clone(), entry.context_id.clone());
+                result.insert(entry.name.clone(), entry.target.context_id.clone());
             }
         }
     }
@@ -1319,6 +1337,16 @@ pub fn scope_register(
                 "[SCP-VALID-7135] relay URL must start with ws://, wss://, http://, or https://, got {url:?}"
             )));
         }
+        if url.len() > 2048 {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] relay URL exceeds 2048 characters",
+            ));
+        }
+        if url.bytes().any(|b| b == b'\r' || b == b'\n' || b < 0x20) {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] relay URL contains control characters",
+            ));
+        }
     }
 
     // Validate metadata bounds
@@ -1329,9 +1357,13 @@ pub fn scope_register(
             "[SCP-VALID-7131] description exceeds maximum length of 1024 characters",
         ));
     }
-    let tags: Option<Vec<String>> = tags_json
-        .as_deref()
-        .map(|s| serde_json::from_str(s).unwrap_or_default());
+    let tags: Option<Vec<String>> = match tags_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| JsError::new(&format!("[SCP-VALID-7131] invalid tags_json: {e}")))?,
+        ),
+        None => None,
+    };
     if let Some(ref t) = tags {
         if t.len() > 20 {
             return Err(JsError::new(
@@ -1360,8 +1392,10 @@ pub fn scope_register(
     // Same-owner re-registration → atomic update
     if let Some(existing) = registry.entries.get_mut(&normalized) {
         if existing.owner_did == registrant_did {
-            existing.context_id = target_context_id;
-            existing.relay_urls = relay_urls;
+            existing.target = WasmScopeTarget {
+                context_id: target_context_id,
+                relay_urls,
+            };
             existing.metadata = serde_json::json!({"description": description, "tags": tags});
             existing.registered_at = now;
             let result = serde_json::json!({"status": "updated", "entry_id": existing.entry_id});
@@ -1371,13 +1405,22 @@ pub fn scope_register(
         return Ok(result.to_string());
     }
 
+    // Capacity check before new registration
+    if registry.entries.len() >= MAX_WASM_SCOPE_ENTRIES {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] scope registry capacity exceeded (max 10,000 entries)",
+        ));
+    }
+
     let eid = format!("scope-{}", registry.next_id);
     registry.next_id += 1;
 
     let entry = WasmScopeEntry {
         name: normalized.clone(),
-        context_id: target_context_id,
-        relay_urls,
+        target: WasmScopeTarget {
+            context_id: target_context_id,
+            relay_urls,
+        },
         owner_did: registrant_did,
         registered_at: now,
         metadata: serde_json::json!({"description": description, "tags": tags}),
@@ -1394,9 +1437,10 @@ pub fn scope_register(
 ///
 /// # Errors
 ///
-/// Returns `JsError` if the lock is poisoned.
+/// Returns `JsError` if validation fails or the lock is poisoned.
 #[wasm_bindgen]
 pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, JsError> {
+    wasm_validate_scope_name(&name)?;
     let normalized = name.to_lowercase();
     let results: Vec<serde_json::Value> = wasm_scope_registries()
         .lock()
@@ -1415,13 +1459,14 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, Js
 ///
 /// # Errors
 ///
-/// Returns `JsError` if the lock is poisoned.
+/// Returns `JsError` if validation fails or the lock is poisoned.
 #[wasm_bindgen]
 pub fn scope_deregister(
     scope_context_id: String,
     name: String,
     did: String,
 ) -> Result<String, JsError> {
+    wasm_validate_scope_name(&name)?;
     let normalized = name.to_lowercase();
     let removed = wasm_scope_registries()
         .lock()

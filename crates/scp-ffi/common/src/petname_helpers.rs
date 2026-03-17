@@ -80,11 +80,17 @@ pub fn reset_scope_registry_for(context_id: &str) {
     }
 }
 
-/// Collects scope name → context ID mappings from all scope registries.
+/// Collects scope name -> context ID mappings from all scope registries.
 ///
-/// Iterates all scope registries, collecting `entry.name → entry.target.context_id`
+/// Iterates all scope registries, collecting `entry.name -> entry.target.context_id`
 /// for every scope entry. Used by `address_resolve` to merge scope registry
 /// output into `known_contexts` for two-hop resolution (§22.3.5).
+///
+/// **Cross-context note:** This merges all scope registries globally, matching
+/// how `handle_registries` merges all handle registries in `address_resolve`.
+/// Both approaches expose entries from all contexts the caller has interacted
+/// with (registered in). A future refinement could scope to a caller-provided
+/// list of trusted registry context IDs for stricter context isolation.
 #[must_use]
 pub fn known_contexts_from_scope_registries() -> HashMap<String, String> {
     let mut result = HashMap::new();
