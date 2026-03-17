@@ -262,16 +262,16 @@ impl NapiNodeHandle {
         deploy_retention_count: Option<u32>,
         csp_override: Option<String>,
     ) -> napi::Result<()> {
-        let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        let key_vec = Zeroizing::new(
             hex::decode(&broadcast_key_hex)
-                .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?
-                .try_into()
-                .map_err(|_| {
-                    NapiError::from_reason(
-                        "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                    )
-                })?,
+                .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?,
         );
+        let key_bytes: Zeroizing<[u8; 32]> =
+            Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
+                NapiError::from_reason(
+                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                )
+            })?);
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),

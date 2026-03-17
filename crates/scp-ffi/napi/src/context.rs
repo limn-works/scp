@@ -22,6 +22,8 @@ use uuid::Uuid;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
+use zeroize::Zeroizing;
+
 use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpNapiError;
@@ -2093,12 +2095,12 @@ pub async fn context_create_governance_checkpoint(
     let merkle_root = parse_napi_hex_32(&merkle_root_hex, "merkle_root")?;
     let last_event_hash = parse_napi_hex_32(&last_event_hash_hex, "last_event_hash")?;
     let state_snapshot_hash = parse_napi_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
-    let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
+    let creator_signature = Zeroizing::new(hex::decode(&creator_signature_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid creator_signature hex: {e}"),
             code: "SCP-CTX-2062".to_owned(),
         })
-    })?;
+    })?);
     let did = DID(creator_did);
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2115,7 +2117,7 @@ pub async fn context_create_governance_checkpoint(
             last_event_hash,
             state_snapshot_hash,
             &did,
-            creator_signature,
+            (*creator_signature).clone(),
         )
         .await
         .map_err(|e| {
@@ -2157,16 +2159,16 @@ pub async fn context_add_checkpoint_cosignature(
             })
         })?;
 
-    let signature = hex::decode(&signature_hex).map_err(|e| {
+    let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid signature hex: {e}"),
             code: "SCP-CTX-2063".to_owned(),
         })
-    })?;
+    })?);
 
     let cosignature = scp_core::context::governance::CosignedCheckpoint {
         signer_did: DID(signer_did),
-        signature,
+        signature: (*signature).clone(),
     };
 
     let status = manager
@@ -2776,12 +2778,12 @@ pub fn metadata_record_to_json(
             })
         })?;
 
-    let signature = hex::decode(&signature_hex).map_err(|e| {
+    let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid signature hex: {e}"),
             code: "SCP-VALID-7001".to_owned(),
         })
-    })?;
+    })?);
     if signature.len() != 64 {
         return Err(NapiError::from(ScpNapiError::Validation {
             message: format!("signature must be 64 bytes (got {})", signature.len()),
@@ -2798,7 +2800,7 @@ pub fn metadata_record_to_json(
         timestamp: ts,
         structural,
         operational,
-        signature,
+        signature: (*signature).clone(),
     };
 
     serde_json::to_string(&record).map_err(|e| {

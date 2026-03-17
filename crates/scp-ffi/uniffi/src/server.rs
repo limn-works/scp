@@ -298,19 +298,21 @@ impl NodeHandle {
         deploy_retention_count: Option<u32>,
         csp_override: Option<String>,
     ) -> Result<(), ScpError> {
-        let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            hex::decode(&broadcast_key_hex)
-                .map_err(|e| ScpError::Validation {
+        let key_vec =
+            Zeroizing::new(
+                hex::decode(&broadcast_key_hex).map_err(|e| ScpError::Validation {
                     msg: format!("invalid broadcast_key_hex: {e}"),
                     code: "SCP-TRANS-5060".to_owned(),
-                })?
-                .try_into()
-                .map_err(|_| ScpError::Validation {
+                })?,
+            );
+        let key_bytes: Zeroizing<[u8; 32]> =
+            Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
+                ScpError::Validation {
                     msg: "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
                         .to_owned(),
                     code: "SCP-TRANS-5060".to_owned(),
-                })?,
-        );
+                }
+            })?);
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
