@@ -55,23 +55,23 @@ impl From<NodeError> for ScpError {
         match &e {
             NodeError::MissingField(_) | NodeError::InvalidConfig(_) => Self::Validation {
                 msg: e.to_string(),
-                code: "SCP-NODE-6001".to_owned(),
+                code: "SCP-TRANS-5050".to_owned(),
             },
             NodeError::Identity(_) => Self::Identity {
                 msg: e.to_string(),
-                code: "SCP-NODE-6002".to_owned(),
+                code: "SCP-TRANS-5051".to_owned(),
             },
             NodeError::Relay(_) => Self::Transport {
                 msg: e.to_string(),
-                code: "SCP-NODE-6003".to_owned(),
+                code: "SCP-TRANS-5052".to_owned(),
             },
             NodeError::Storage(_) => Self::Context {
                 msg: e.to_string(),
-                code: "SCP-NODE-6004".to_owned(),
+                code: "SCP-TRANS-5053".to_owned(),
             },
             NodeError::Serve(_) | NodeError::Nat(_) | NodeError::Tls(_) => Self::Transport {
                 msg: e.to_string(),
-                code: "SCP-NODE-6005".to_owned(),
+                code: "SCP-TRANS-5054".to_owned(),
             },
         }
     }
@@ -299,12 +299,12 @@ impl NodeHandle {
         let key_bytes: [u8; 32] = hex::decode(&broadcast_key_hex)
             .map_err(|e| ScpError::Validation {
                 msg: format!("invalid broadcast_key_hex: {e}"),
-                code: "SCP-NODE-6010".to_owned(),
+                code: "SCP-TRANS-5060".to_owned(),
             })?
             .try_into()
             .map_err(|_| ScpError::Validation {
                 msg: "broadcast_key_hex must be exactly 64 hex characters (32 bytes)".to_owned(),
-                code: "SCP-NODE-6010".to_owned(),
+                code: "SCP-TRANS-5060".to_owned(),
             })?;
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
@@ -319,7 +319,7 @@ impl NodeHandle {
             other => {
                 return Err(ScpError::Validation {
                     msg: format!("admission must be \"open\" or \"gated\", got \"{other}\""),
-                    code: "SCP-NODE-6011".to_owned(),
+                    code: "SCP-TRANS-5061".to_owned(),
                 });
             }
         };
@@ -328,7 +328,7 @@ impl NodeHandle {
         let content_path = scp_core::context::broadcast_content::ContentPath::new(idx_path_str)
             .map_err(|e| ScpError::Validation {
                 msg: format!("invalid index_path: {e}"),
-                code: "SCP-NODE-6012".to_owned(),
+                code: "SCP-TRANS-5062".to_owned(),
             })?;
 
         let site_config = scp_node::projection::SiteConfig {
@@ -366,7 +366,7 @@ impl NodeHandle {
             .map_err(ScpError::from)?;
         u32::try_from(count).map_err(|_| ScpError::Validation {
             msg: format!("asset count {count} exceeds u32::MAX"),
-            code: "SCP-NODE-6013".to_owned(),
+            code: "SCP-TRANS-5063".to_owned(),
         })
     }
 
@@ -614,7 +614,7 @@ mod tests {
         match scp_err {
             ScpError::Validation { msg, code } => {
                 assert!(msg.contains("test config"), "msg={msg}");
-                assert_eq!(code, "SCP-NODE-6001");
+                assert_eq!(code, "SCP-TRANS-5050");
             }
             other => panic!("expected Validation, got: {other:?}"),
         }
