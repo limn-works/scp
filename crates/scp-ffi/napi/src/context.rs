@@ -466,6 +466,17 @@ pub async fn context_create(
         Some((major, minor))
     });
 
+    // Parse context-configurable limits (ADR-043).
+    let max_chain_depth = params["maxChainDepth"]
+        .as_u64()
+        .and_then(|v| u8::try_from(v).ok());
+    let max_nesting_depth = params["maxNestingDepth"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok());
+    let session_cap = params["sessionCap"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok());
+
     let context_params = ContextParams {
         mode,
         ceiling: core_ceiling,
@@ -475,6 +486,9 @@ pub async fn context_create(
         memory_scope: core_memory_scope,
         governance: core_governance,
         min_protocol_version,
+        max_chain_depth,
+        max_nesting_depth,
+        session_cap,
         ..ContextParams::default()
     };
 

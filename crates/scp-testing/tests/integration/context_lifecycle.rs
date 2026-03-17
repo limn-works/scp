@@ -15,10 +15,10 @@ use scp_core::context::params::{CeilingPolicy, GovernanceModel, MemoryScope, Pro
 use scp_core::context::ttl::{TtlError, TtlPolicy};
 use scp_core::context::{
     Capability, CapabilityCeiling, ContextError, ContextHandle, ContextMode, ContextParams,
-    ContextState, ExtensionConsentMode, MAX_NESTING_DEPTH, MembershipState, TemplateId,
-    TtlExtensionProposal, builtin_admin, builtin_author, builtin_member, builtin_observer,
-    builtin_subscriber, check_ttl, compute_ceiling_intersection, consent_mode_for_member_count,
-    template_params, validate_child_ttl, validate_nesting_depth,
+    ContextState, ExtensionConsentMode, MembershipState, TemplateId, TtlExtensionProposal,
+    builtin_admin, builtin_author, builtin_member, builtin_observer, builtin_subscriber, check_ttl,
+    compute_ceiling_intersection, consent_mode_for_member_count, template_params,
+    validate_child_ttl, validate_nesting_depth,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +171,8 @@ async fn context_params_all_fields() {
         projection_policy: None,
         discoverable: true,
         max_chain_depth: Some(3),
+        max_nesting_depth: None,
+        session_cap: None,
         counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
         incomplete_verification_policy:
@@ -496,20 +498,23 @@ async fn ttl_extension_proposal() {
 
 #[tokio::test]
 async fn nesting_depth_validation() {
-    // Depth 0 through MAX_NESTING_DEPTH should all be ok
-    for depth in 0..=MAX_NESTING_DEPTH {
+    // Unbounded by default (ADR-043) — any depth is valid with no limit.
+    for depth in [0, 1, 3, 10, 100, u32::MAX] {
         assert!(
-            validate_nesting_depth(depth).is_ok(),
-            "depth {depth} should be valid"
+            validate_nesting_depth(depth, None).is_ok(),
+            "depth {depth} should be valid when unbounded"
         );
     }
 
-    // Depth MAX_NESTING_DEPTH + 1 should fail
-    let result = validate_nesting_depth(MAX_NESTING_DEPTH + 1);
+    // Context-configurable limit enforced.
+    assert!(validate_nesting_depth(5, Some(5)).is_ok());
+    let result = validate_nesting_depth(6, Some(5));
     assert!(result.is_err());
 
-    // Depth 6 should fail (hard cap is 3)
-    let result = validate_nesting_depth(6);
+    // Depth 0 with Some(0) should fail (depth > max).
+    // Actually 0 == 0, so depth 0 with max 0 is ok.
+    assert!(validate_nesting_depth(0, Some(0)).is_ok());
+    let result = validate_nesting_depth(1, Some(0));
     assert!(result.is_err());
 }
 

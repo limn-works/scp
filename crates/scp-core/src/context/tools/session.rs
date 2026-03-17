@@ -30,11 +30,12 @@ use super::registry::ToolRegistry;
 use super::schema::validate_value_against_schema;
 use super::{DID, ToolError, ToolId};
 
-/// Default maximum concurrent sessions per calling context (spec section 6.2.1).
+/// Default maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
 ///
 /// Prevents session exhaustion attacks by bounding the number of active
-/// sessions any single calling context can hold simultaneously.
-pub const DEFAULT_SESSION_CAP_PER_CALLER: usize = 5;
+/// sessions any single calling context can hold simultaneously. Context-
+/// configurable via `ContextParams::session_cap`.
+pub const DEFAULT_SESSION_CAP_PER_CALLER: u32 = 1000;
 
 /// Context identifier type alias.
 pub type ContextId = String;
@@ -225,13 +226,18 @@ pub async fn create_session(
         });
     }
 
-    // Enforce per-caller session cap (spec section 6.2.1, 9.2.1).
-    let current = store.count_by_source(source_context);
-    if current >= DEFAULT_SESSION_CAP_PER_CALLER {
+    // Enforce per-caller session cap (spec §6.2.1, §9.2.1, ADR-043).
+    // Use context-configured cap, falling back to DEFAULT_SESSION_CAP_PER_CALLER.
+    let cap = context
+        .params()
+        .session_cap
+        .unwrap_or(DEFAULT_SESSION_CAP_PER_CALLER);
+    let current = u32::try_from(store.count_by_source(source_context)).unwrap_or(u32::MAX);
+    if current >= cap {
         return Err(ToolError::SessionCapExceeded {
             source_context: source_context.clone(),
             current,
-            max: DEFAULT_SESSION_CAP_PER_CALLER,
+            max: cap,
         });
     }
 
@@ -716,12 +722,18 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        // Use a context with session_cap = Some(5) for a manageable test.
+        let params = ContextParams {
+            session_cap: Some(5),
+            ..ContextParams::default()
+        };
+        let context = ContextHandle::new("ctx-session-test".to_owned(), params);
+        context.transition_to(&ContextState::Active).await.unwrap();
         let mut store = SessionStore::new();
         let source_ctx = "ctx-source".to_owned();
 
-        // Fill up to the cap (DEFAULT_SESSION_CAP_PER_CALLER = 5).
-        for _ in 0..DEFAULT_SESSION_CAP_PER_CALLER {
+        // Fill up to the configured cap (5).
+        for _ in 0..5u32 {
             let result = create_session(
                 &mut store,
                 &registry,
@@ -766,15 +778,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_default_cap_is_1000() {
+        // ContextParams { session_cap: None } should resolve to DEFAULT_SESSION_CAP_PER_CALLER (1000).
+        assert_eq!(DEFAULT_SESSION_CAP_PER_CALLER, 1000);
+        let context = active_context().await;
+        assert!(context.params().session_cap.is_none());
+    }
+
+    #[tokio::test]
     async fn create_session_allows_different_callers_independently() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        // Use session_cap = Some(3) for a manageable test.
+        let params = ContextParams {
+            session_cap: Some(3),
+            ..ContextParams::default()
+        };
+        let context = ContextHandle::new("ctx-session-test".to_owned(), params);
+        context.transition_to(&ContextState::Active).await.unwrap();
         let mut store = SessionStore::new();
 
         // Fill caller A to the cap.
-        for _ in 0..DEFAULT_SESSION_CAP_PER_CALLER {
+        for _ in 0..3u32 {
             create_session(
                 &mut store,
                 &registry,

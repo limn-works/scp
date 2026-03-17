@@ -100,6 +100,9 @@ fn full_capability_params() -> ContextParams {
         ttl_seconds: 3600,
         promotable: false,
         min_protocol_version: 0,
+        max_chain_depth: None,
+        max_nesting_depth: None,
+        session_cap: None,
     }
 }
 
@@ -115,6 +118,9 @@ fn default_encrypted_params() -> ContextParams {
         ttl_seconds: 3600,
         promotable: false,
         min_protocol_version: 0,
+        max_chain_depth: None,
+        max_nesting_depth: None,
+        session_cap: None,
     }
 }
 
@@ -766,6 +772,9 @@ async fn context_create_with_all_governance_models() {
             ttl_seconds: 3600,
             promotable: false,
             min_protocol_version: 0,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -788,6 +797,9 @@ async fn context_create_with_all_memory_scopes() {
             ttl_seconds: 3600,
             promotable: false,
             min_protocol_version: 0,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

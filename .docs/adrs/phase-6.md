@@ -3370,3 +3370,83 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
 | `exclusion.rs` | Exclusion list management, member_id computation |
 
 **Estimated functions:** ~15-20 public functions, ~10 internal helpers.
+
+---
+
+## ADR-043: Protocol Constants Reclassification
+
+**Status:** Decided
+
+### Context
+
+The Protocol Constants Registry (§9.18) promoted many implementation defaults to protocol-level constants. Constants like `MAX_SEQUENTIAL_COMMITS`, `RECONNECTION_TIMEOUT`, `SENDER_KEY_TIMEOUT`, `RECONNECTION_DEDUP_WINDOW`, and the nesting depth ceiling have no security or correctness basis for their specific values. The session cap default of 5 was a placeholder. The relay blob TTL is the relay operator's business. Several timeouts are hardware-dependent.
+
+This creates unnecessary rigidity: independent implementations cannot tune for their deployment without breaking spec compliance. A nesting depth ceiling of 3 blocks real hierarchies. A protocol hard max chain depth of 5 prevents contexts from allowing deeper provenance chains when that is the correct tradeoff.
+
+### Decision
+
+Reclassify protocol constants into three tiers:
+
+**Tier 1 — Protocol Invariants** (fixed, all implementations MUST agree):
+
+| Constant | Value | Rationale |
+|----------|-------|-----------|
+| `DHT_REPUBLISH_INTERVAL` | 7200s | BEP44 constraint, not SCP's choice. |
+| `SENDER_KEY_GRACE` | 30s | ADR-001 criterion 6: "not configurable — it bounds the forward secrecy window." Explicit decision not to make configurable. |
+| `BUCKET_SIZES` | [256, 1024, 4096, 16384, 65536, 262144] | Interop requirement — implementations MUST use identical bucket sizes, otherwise relays distinguish implementations by ciphertext size, defeating padding. |
+| Cryptographic primitives | (§9.18.1) | Algorithm choices are protocol-level. |
+| Domain separators | (§9.18.2) | Hash domain separation is protocol-level. |
+
+**Tier 2 — Configurable Parameters** (protocol defines mechanism + range, deployers/contexts set value):
+
+| Constant | Default | Range | Rationale |
+|----------|---------|-------|-----------|
+| Nesting depth | Unbounded (no limit) | [1, u32 max] | Context-configurable via `ContextParams::max_nesting_depth`. `None` = unbounded. Costs are borne by participants, not the protocol. |
+| Chain depth | 8 | [1, 255] (u8) | Context-configurable via `ContextParams::max_chain_depth`. No protocol hard max — `PROTOCOL_HARD_MAX_CHAIN_DEPTH` removed. Provenance degrades with depth, but that is an information-quality signal (provenance tiers handle this), not a protocol integrity concern. Default raised from 3 to 8 (3 was unnecessarily conservative). |
+| Session cap per caller | 1000 | [1, u32 max] | Context-configurable via `ContextParams::session_cap`. Sessions are lightweight. `u32` (not `usize`) for cross-platform serialization (usize is 32-bit on WASM, UniFFI does not support it). Default raised from 5 to 1000. |
+| Relay blob TTL | 604800s (operator config) | [1, infinity] | Relay operator's business. No protocol floor on TTL itself. |
+| Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived | At 7-day TTL: 518400s (current value). At 1-hour TTL: 1800s. Floor of 60s prevents spin loop at very small TTLs. |
+
+**Tier 3 — Implementation Recommendations** (removed from spec normative language, SDK defaults):
+
+| Constant | Old Value | Rationale |
+|----------|-----------|-----------|
+| `MAX_SEQUENTIAL_COMMITS` | 100 | Hardware-dependent; already configurable via `SyncPolicy`. Time-bounded, not count-bounded. |
+| `RECONNECTION_TIMEOUT` | 120s | Already just an error enum value. SDK decides retry strategy. |
+| `SENDER_KEY_TIMEOUT` | 60s | Already configurable via `SyncPolicy`. SDK decides retry strategy. |
+| `RECONNECTION_DEDUP_WINDOW` | 30s | Implementation detail. Already configurable via `SyncPolicy`. |
+
+**Key decisions:**
+
+1. `SENDER_KEY_GRACE` (30s) stays as a protocol invariant per ADR-001 criterion 6. This is an explicit decision not to make it configurable — it bounds the forward secrecy window.
+
+2. `PROTOCOL_HARD_MAX_CHAIN_DEPTH` is removed. Chain depth is a context concern, not a protocol integrity concern. Provenance quality naturally degrades with depth (§24), which is the correct signal — agents decide how to weight it.
+
+3. `MAX_NESTING_DEPTH` is removed as a protocol ceiling. Same rationale as chain depth — nesting costs are borne by participants, not the protocol. Contexts may set their own limit via `ContextParams::max_nesting_depth`.
+
+4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity-layer publication TTL for DID documents, used by the healing publisher, and remains unchanged.
+
+### Migration
+
+All changes are backwards-compatible relaxations:
+
+- **Nesting depth:** No protocol ceiling. `ContextParams { max_nesting_depth: None }` means no limit. Contexts wanting the old limit set `Some(3)`.
+- **Chain depth:** Hard max removed. `ContextParams { max_chain_depth: None }` resolves to default 8 (was 3). Existing contexts relying on default 3 see a higher effective limit — a relaxation, not a tightening. Contexts wanting the old limit set `Some(3)`.
+- **Session cap:** Default raised 5 to 1000. `ContextParams { session_cap: None }` resolves to 1000. Contexts wanting a lower limit set `Some(n)`.
+- **Relay TTL:** Relay-side config. Existing relays keep current behavior until operators update.
+
+No protocol versioning mechanism is required for this change set.
+
+### Rejected Alternative
+
+**Keep all as protocol constants.** Rejected because: (a) it conflates protocol integrity requirements with deployment preferences, (b) it forces all implementations to use arbitrary values with no security basis, (c) it prevents legitimate use cases (deep nesting hierarchies, high session counts, operator-tuned relay TTLs).
+
+### Acceptance Criteria
+
+1. Each constant categorized as invariant, configurable, or recommendation in spec §9.18.
+2. §9.18 restructured into three subsections: Protocol Invariants (§9.18.A), Configurable Parameters (§9.18.B), Implementation Recommendations (§9.18.C).
+3. `PROTOCOL_HARD_MAX_CHAIN_DEPTH` removed from code; `DEFAULT_MAX_CHAIN_DEPTH` changed from 3 to 8.
+4. `MAX_NESTING_DEPTH` removed as protocol ceiling; `ContextParams::max_nesting_depth` added.
+5. `DEFAULT_SESSION_CAP_PER_CALLER` changed from 5 to 1000; `ContextParams::session_cap` added.
+6. All spec sections referencing old values updated (§9.2.1, §5.13.8, §6.2.1, §24.1, §24.4, §23).
+7. Tests updated to reflect new defaults and absence of hard protocol ceilings.

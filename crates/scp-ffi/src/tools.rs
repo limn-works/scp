@@ -788,11 +788,18 @@ pub fn py_tool_invoke_cross_context(
         .into());
     }
 
-    // Validate chain depth (max 3 per spec section 6.2).
-    if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+    // Validate chain depth (context-configurable, default 8 per ADR-043).
+    let max_chain_depth = {
+        let mgr = crate::runtime::context_manager()?;
+        let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+        let source_max = tokio_rt
+            .block_on(mgr.context_params(source_context_id))
+            .and_then(|p| p.max_chain_depth);
+        scp_core::provenance::attach::effective_max_chain_depth(source_max)
+    };
+    if chain_depth > max_chain_depth {
         return Err(ScpPyError::context(format!(
-            "cross-context chain depth {chain_depth} exceeds maximum {}",
-            scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+            "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
         ))
         .into());
     }
@@ -858,7 +865,7 @@ pub fn py_tool_invoke_cross_context(
 ///
 /// Sessions enable multi-turn workflows with state preservation across
 /// invocations. Each session has a TTL and is subject to per-caller caps
-/// (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+/// (default: 1000 concurrent sessions per caller, per spec §6.2.1 and ADR-043).
 ///
 /// # Arguments
 ///
@@ -897,14 +904,20 @@ pub fn py_tool_session_create(
             )));
         }
 
-        // Enforce per-caller session cap.
+        // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
+        let cap = {
+            let mgr = crate::runtime::context_manager()?;
+            let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+            tokio_rt
+                .block_on(mgr.context_params(context_id))
+                .and_then(|p| p.session_cap)
+                .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                as usize
+        };
         let current = rt.session_store.count_by_source(source_context_id);
-        if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+        if current >= cap {
             return Err(ScpPyError::context(format!(
-                "session cap exceeded for caller '{}': {} active (max {})",
-                source_context_id,
-                current,
-                scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+                "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
             )));
         }
 

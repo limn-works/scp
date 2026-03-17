@@ -1340,14 +1340,16 @@ A context might use both: tool interfaces for structured service queries and a m
 
 ### 5.13.8 Nesting Depth
 
-The protocol enforces a maximum nesting depth (suggested default: 3 levels). A child of a child of a child is permitted; a fourth level is rejected. This bounds:
+Context-configurable via `ContextParams::max_nesting_depth`. Unbounded by default; contexts MAY set a limit. When set, the limit applies to the longest path from any root ancestor to the context being created. Nesting depth is immutable after context creation.
+
+Deep nesting increases:
 
 - Governance complexity (each level adds configurable permissions)
 - Ceiling reduction (each level can only narrow, so deep nesting converges on empty ceilings)
 - Lifecycle cascade depth (closing a grandparent cascades through children and grandchildren)
 - Trust evaluation complexity (provenance with deep nesting lineage is harder to evaluate)
 
-The nesting depth limit is a protocol constant, not configurable per context. It applies to the longest path from any root ancestor to the context being created.
+These costs are borne by context participants, not the protocol. Contexts that need deep hierarchies (organizational structures, layered communities) set `max_nesting_depth: None` (the default). Contexts wanting to bound complexity set an explicit limit (e.g., `Some(3)` for the previous behavior). See ADR-043.
 
 ## 5.14 Broadcast Contexts
 

@@ -116,7 +116,7 @@ struct ProvenanceTests {
         let mockCheck: ProvenanceBridge.CheckChainDepthFn = { chainDepth, maxDepth in
             receivedChainDepth = chainDepth
             receivedMaxDepth = maxDepth
-            return chainDepth <= (maxDepth ?? 3)
+            return chainDepth <= (maxDepth ?? 8)
         }
 
         let withinLimit = checkProvenanceChainDepth(
@@ -133,11 +133,11 @@ struct ProvenanceTests {
     @Test("checkProvenanceChainDepth returns false when exceeded")
     func checkChainDepthExceeded() {
         let mockCheck: ProvenanceBridge.CheckChainDepthFn = { chainDepth, maxDepth in
-            chainDepth <= (maxDepth ?? 3)
+            chainDepth <= (maxDepth ?? 8)
         }
 
         let withinLimit = checkProvenanceChainDepth(
-            chainDepth: 4,
+            chainDepth: 9,
             checkChainDepthFn: mockCheck
         )
 

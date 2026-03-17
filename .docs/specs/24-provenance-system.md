@@ -12,7 +12,7 @@ See ADR-019 in `.docs/adrs/phase-4.md` for the full architectural decision recor
 
 3. **Absence is a signal, not an error.** Data introduced without protocol-level origin tracking evaluates as `NoProvenance` -- the lowest quality tier, not an error condition. The protocol is honest about what it can and cannot track. Agents calibrate trust accordingly.
 
-4. **Chain depth bounds accountability.** Unlimited cross-context hops create accountability laundering -- data traverses enough contexts that its origin becomes meaningless. The protocol enforces a hard maximum of 5 hops (RECOMMENDED context default: 3) to bound this (§24.4).
+4. **Chain depth bounds accountability.** Excessive cross-context hops create accountability laundering -- data traverses enough contexts that its origin becomes meaningless. Chain depth is context-configurable via `ContextParams::max_chain_depth` (default: 8, range [1, 255]). Provenance quality naturally degrades with depth, providing the correct trust signal without requiring a protocol hard maximum (§24.4, ADR-043).
 
 ## 24.2 Core Types
 
@@ -128,14 +128,13 @@ The `counterparties` field in `DataProvenance` reveals context membership -- a p
 
 ## 24.4 Chain Depth Enforcement
 
-The protocol enforces a maximum chain depth to prevent accountability laundering -- data traversing enough contexts that its origin becomes meaningless.
+Chain depth is context-configurable via `ContextParams::max_chain_depth` (default: 8, range [1, 255]). There is no protocol hard maximum — chain depth is a context concern, not a protocol integrity concern. Provenance quality naturally degrades with depth (§24.5), which is the correct trust signal. Per ADR-043.
 
-- **Protocol hard maximum:** 5 hops. This is a protocol-level invariant that cannot be exceeded by any context configuration. It bounds the worst-case amplification factor for chained cross-context tool calls.
-- **Context-configurable maximum:** Contexts MAY configure a lower maximum via `max_chain_depth` in `ContextParams`. The RECOMMENDED default is 3 hops. Values above the protocol hard maximum (5) are rejected at context creation time.
-- At the effective maximum depth (the lower of the context's configured limit and the protocol hard maximum), data cannot trigger further cross-context tool calls.
+- **Context-configurable maximum:** Contexts set `max_chain_depth` in `ContextParams`. When not set, the default of 8 applies. The u8 type bounds the range to [0, 255].
+- At the configured maximum depth, data cannot trigger further cross-context tool calls.
 - Exceeding the maximum produces a `ChainDepthExceeded` error (not a degradation -- a hard rejection).
 
-The `check_chain_depth` operation verifies that a provenance record's chain depth is within the allowed limit. It is called before any cross-context tool invocation to enforce the bound. The effective limit is `min(context.max_chain_depth.unwrap_or(3), 5)`.
+The `check_chain_depth` operation verifies that a provenance record's chain depth is within the allowed limit. It is called before any cross-context tool invocation to enforce the bound. The effective limit is `context.max_chain_depth.unwrap_or(8)`.
 
 ## 24.5 Provenance Quality Evaluation
 

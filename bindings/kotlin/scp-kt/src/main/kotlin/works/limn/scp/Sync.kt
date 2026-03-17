@@ -90,16 +90,16 @@ data class SyncPolicy(
         /** Default reorder buffer capacity: 100 messages. */
         const val DEFAULT_REORDER_BUFFER_CAPACITY: Int = 100
 
-        /** Default max sequential commits: 100. */
+        /** SDK default max sequential commits: 100. Implementation recommendation (ADR-043). */
         const val DEFAULT_MAX_SEQUENTIAL_COMMITS: Long = 100L
 
         /** Default commit process timeout: 5 seconds. */
         const val DEFAULT_COMMIT_PROCESS_TIMEOUT_SECS: Long = 5L
 
-        /** Default sender key timeout: 60 seconds. */
+        /** SDK default sender key timeout: 60s. Implementation recommendation (ADR-043). */
         const val DEFAULT_SENDER_KEY_TIMEOUT_SECS: Long = 60L
 
-        /** Default reconnection dedup window: 30 seconds. */
+        /** SDK default reconnection dedup window: 30s. Implementation recommendation (ADR-043). */
         const val DEFAULT_RECONNECTION_DEDUP_WINDOW_SECS: Long = 30L
     }
 }

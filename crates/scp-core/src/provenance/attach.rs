@@ -23,24 +23,14 @@ use super::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Protocol default maximum chain depth (3 hops). Cross-context data flows
-/// beyond this limit are rejected to prevent accountability laundering.
+/// Default maximum chain depth (8 hops, ADR-043). Cross-context data flows
+/// beyond the effective limit are rejected to prevent accountability laundering.
 ///
-/// Contexts may override this via `ContextParams::max_chain_depth`, but the
-/// effective limit is always clamped to [`PROTOCOL_HARD_MAX_CHAIN_DEPTH`].
+/// Contexts may override this via `ContextParams::max_chain_depth`. The u8
+/// type naturally bounds the range to [0, 255].
 ///
-/// See spec §24.4 and ADR-019.
-pub const DEFAULT_MAX_CHAIN_DEPTH: u8 = 3;
-
-/// Protocol hard maximum chain depth (5 hops).
-///
-/// No context may configure a `max_chain_depth` higher than this value.
-/// The effective limit is always
-/// `min(context.max_chain_depth.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH), PROTOCOL_HARD_MAX_CHAIN_DEPTH)`.
-///
-/// This bounds the worst-case amplification factor for cross-context tool
-/// call chains regardless of per-context configuration.
-pub const PROTOCOL_HARD_MAX_CHAIN_DEPTH: u8 = 5;
+/// See spec §24.4, ADR-019, and ADR-043.
+pub const DEFAULT_MAX_CHAIN_DEPTH: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // SourceContextInfo
@@ -274,7 +264,7 @@ pub fn pseudonymize_counterparties(provenance: &mut DataProvenance, pseudonym_ke
 
 /// Checks whether the provenance chain depth is within the allowed limit.
 ///
-/// The protocol default maximum is [`DEFAULT_MAX_CHAIN_DEPTH`] (3 hops). At
+/// The protocol default maximum is [`DEFAULT_MAX_CHAIN_DEPTH`] (8 hops). At
 /// the maximum depth, data cannot trigger further cross-context calls. This
 /// prevents accountability laundering -- data traversing enough contexts that
 /// its origin becomes meaningless.
@@ -304,25 +294,19 @@ pub const fn check_chain_depth(
 
 /// Computes the effective maximum chain depth for a context.
 ///
-/// The effective limit is `min(context_max.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH), PROTOCOL_HARD_MAX_CHAIN_DEPTH)`.
-/// This ensures:
-/// - Contexts without an explicit setting use the protocol default (3).
-/// - No context can exceed the protocol hard maximum (5).
+/// Returns the context-configured value when set, otherwise falls back to
+/// [`DEFAULT_MAX_CHAIN_DEPTH`] (8). The u8 type naturally bounds the range
+/// to [0, 255] (ADR-043).
 ///
 /// # Arguments
 ///
 /// - `context_max_chain_depth` -- The context's configured `max_chain_depth`,
-///   or `None` to use the protocol default.
+///   or `None` to use the default.
 #[must_use]
 pub const fn effective_max_chain_depth(context_max_chain_depth: Option<u8>) -> u8 {
-    let context_or_default = match context_max_chain_depth {
+    match context_max_chain_depth {
         Some(v) => v,
         None => DEFAULT_MAX_CHAIN_DEPTH,
-    };
-    if context_or_default < PROTOCOL_HARD_MAX_CHAIN_DEPTH {
-        context_or_default
-    } else {
-        PROTOCOL_HARD_MAX_CHAIN_DEPTH
     }
 }
 
@@ -711,10 +695,13 @@ mod tests {
 
     #[test]
     fn check_chain_depth_rejects_depth_exceeding_limit() {
+        // Depth 9 exceeds DEFAULT_MAX_CHAIN_DEPTH (8) per ADR-043.
         let prov = make_provenance_with_chain(
             "ctx-src",
-            4,
-            Some(vec!["ctx-1", "ctx-2", "ctx-3", "ctx-4"]),
+            9,
+            Some(vec![
+                "ctx-1", "ctx-2", "ctx-3", "ctx-4", "ctx-5", "ctx-6", "ctx-7", "ctx-8", "ctx-9",
+            ]),
         );
 
         let result = check_chain_depth(&prov, DEFAULT_MAX_CHAIN_DEPTH);
@@ -723,8 +710,8 @@ mod tests {
         let err = result.unwrap_err();
         match err {
             ProvenanceError::ChainDepthExceeded { depth, max_depth } => {
-                assert_eq!(depth, 4);
-                assert_eq!(max_depth, 3);
+                assert_eq!(depth, 9);
+                assert_eq!(max_depth, 8);
             }
         }
     }
@@ -768,22 +755,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DEFAULT_MAX_CHAIN_DEPTH / PROTOCOL_HARD_MAX_CHAIN_DEPTH
+    // DEFAULT_MAX_CHAIN_DEPTH
     // -----------------------------------------------------------------------
 
     #[test]
-    fn default_max_chain_depth_is_three() {
-        assert_eq!(DEFAULT_MAX_CHAIN_DEPTH, 3);
-    }
-
-    #[test]
-    fn protocol_hard_max_chain_depth_is_five() {
-        assert_eq!(PROTOCOL_HARD_MAX_CHAIN_DEPTH, 5);
-    }
-
-    #[test]
-    fn default_does_not_exceed_hard_max() {
-        assert!(DEFAULT_MAX_CHAIN_DEPTH <= PROTOCOL_HARD_MAX_CHAIN_DEPTH);
+    fn default_max_chain_depth_is_eight() {
+        assert_eq!(DEFAULT_MAX_CHAIN_DEPTH, 8);
     }
 
     // -----------------------------------------------------------------------
@@ -796,29 +773,21 @@ mod tests {
     }
 
     #[test]
-    fn effective_max_uses_context_value_when_within_hard_max() {
+    fn effective_max_uses_context_value() {
         assert_eq!(effective_max_chain_depth(Some(4)), 4);
     }
 
     #[test]
-    fn effective_max_clamps_to_hard_max_when_context_exceeds() {
-        assert_eq!(
-            effective_max_chain_depth(Some(10)),
-            PROTOCOL_HARD_MAX_CHAIN_DEPTH
-        );
+    fn effective_max_accepts_values_above_default() {
+        // No protocol hard max — context-configured values > 8 are accepted (ADR-043).
+        assert_eq!(effective_max_chain_depth(Some(10)), 10);
+        assert_eq!(effective_max_chain_depth(Some(200)), 200);
+        assert_eq!(effective_max_chain_depth(Some(255)), 255);
     }
 
     #[test]
     fn effective_max_allows_zero() {
         assert_eq!(effective_max_chain_depth(Some(0)), 0);
-    }
-
-    #[test]
-    fn effective_max_allows_exact_hard_max() {
-        assert_eq!(
-            effective_max_chain_depth(Some(PROTOCOL_HARD_MAX_CHAIN_DEPTH)),
-            PROTOCOL_HARD_MAX_CHAIN_DEPTH
-        );
     }
 
     #[test]

@@ -475,11 +475,12 @@ impl WasmToolSession {
     }
 }
 
-/// Maximum concurrent sessions per calling context (spec section 6.2.1).
-const WASM_SESSION_CAP_PER_CALLER: usize = 5;
+/// Maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
+const WASM_SESSION_CAP_PER_CALLER: usize = 1000;
 
 /// Maximum concurrent sessions across all callers (global cap).
-const WASM_SESSION_GLOBAL_CAP: usize = 100;
+/// Must be >= `WASM_SESSION_CAP_PER_CALLER` so the per-caller cap is meaningful.
+const WASM_SESSION_GLOBAL_CAP: usize = 10_000;
 
 /// Maximum number of nonces tracked per context before triggering eviction.
 const WASM_NONCE_CAP: usize = 10_000;
@@ -1847,13 +1848,23 @@ impl WasmContextManager {
         chain_depth: u8,
     ) -> Result<serde_json::Value, ScpWasmError> {
         // Validate both contexts exist and are active.
-        let _source = self.require_active_context(source_context_id)?;
+        let source = self.require_active_context(source_context_id)?;
         let target = self.require_active_context(target_context_id)?;
 
-        // Validate chain depth (max 3 per spec section 6.2).
-        if chain_depth > 3 {
+        // Validate chain depth against SOURCE context's configurable max (ADR-043).
+        // Chain depth is a property of the originating context — matches scp-core,
+        // PyO3, NAPI, and UniFFI bridges.
+        let max_chain_depth = source
+            .params_json
+            .get("maxChainDepth")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(crate::provenance::DEFAULT_MAX_CHAIN_DEPTH);
+        if u32::from(chain_depth) > max_chain_depth {
             return Err(ScpWasmError::Tool {
-                message: format!("cross-context chain depth {chain_depth} exceeds maximum 3"),
+                message: format!(
+                    "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
+                ),
                 code: "SCP-TOOL-6012".to_owned(),
             });
         }
@@ -1941,16 +1952,22 @@ impl WasmContextManager {
             });
         }
 
-        // Enforce per-caller cap.
+        // Enforce per-caller cap (context-configurable via sessionCap param).
+        let session_cap = ctx
+            .params_json
+            .get("sessionCap")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(WASM_SESSION_CAP_PER_CALLER);
         let current = ctx
             .sessions
             .values()
             .filter(|s| s.source_context == source_context_id)
             .count();
-        if current >= WASM_SESSION_CAP_PER_CALLER {
+        if current >= session_cap {
             return Err(ScpWasmError::Tool {
                 message: format!(
-                    "session cap exceeded for caller '{source_context_id}': {current} active (max {WASM_SESSION_CAP_PER_CALLER})"
+                    "session cap exceeded for caller '{source_context_id}': {current} active (max {session_cap})"
                 ),
                 code: "SCP-TOOL-6015".to_owned(),
             });

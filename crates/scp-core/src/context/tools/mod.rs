@@ -267,7 +267,7 @@ pub enum ToolError {
         max_depth: u8,
     },
 
-    /// The per-caller session cap has been reached (spec section 6.2.1, 9.2.1).
+    /// The per-caller session cap has been reached (spec §6.2.1, §9.2.1, ADR-043).
     #[error(
         "session cap exceeded: calling context \"{source_context}\" has {current} active sessions (max {max})"
     )]
@@ -275,9 +275,9 @@ pub enum ToolError {
         /// The calling context that hit the cap.
         source_context: String,
         /// Current number of active sessions from this caller.
-        current: usize,
+        current: u32,
         /// Maximum allowed concurrent sessions per caller.
-        max: usize,
+        max: u32,
     },
 
     /// The tool schema does not meet the specificity floor (spec section 6.2, 9.2.1).

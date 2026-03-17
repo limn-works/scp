@@ -553,20 +553,27 @@ pub async fn tool_invoke_cross_context(
         .into());
     }
 
-    // Validate chain depth (max 3 per spec section 6.2).
-    if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+    let source_context_id = source_handle.context_id();
+    let target_context_id = target_handle.context_id();
+
+    // Validate chain depth (context-configurable, default 8 per ADR-043).
+    let max_chain_depth = {
+        let mgr = crate::runtime::context_manager()?;
+        let source_max = mgr
+            .context_params(&source_context_id)
+            .await
+            .and_then(|p| p.max_chain_depth);
+        scp_core::provenance::attach::effective_max_chain_depth(source_max)
+    };
+    if chain_depth > max_chain_depth {
         return Err(ScpNapiError::Tool {
             message: format!(
-                "cross-context chain depth {chain_depth} exceeds maximum {}",
-                scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+                "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
             ),
             code: "SCP-TOOL-6012".to_owned(),
         }
         .into());
     }
-
-    let source_context_id = source_handle.context_id();
-    let target_context_id = target_handle.context_id();
 
     // Ensure target context UCAN state is registered.
     crate::runtime::ensure_registered(target_handle)?;
@@ -692,16 +699,22 @@ pub async fn tool_session_create(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
+    // Read context-configured session cap (ADR-043), falling back to default.
+    let cap = {
+        let mgr = crate::runtime::context_manager()?;
+        mgr.context_params(&context_id)
+            .await
+            .and_then(|p| p.session_cap)
+            .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize
+    };
+
     crate::runtime::with_context(&context_id, |rt| {
-        // Enforce per-caller session cap.
+        // Enforce per-caller session cap (context-configured, ADR-043).
         let current = rt.session_store.count_by_source(&source_context_id);
-        if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+        if current >= cap {
             return Err(ScpNapiError::Tool {
                 message: format!(
-                    "session cap exceeded for caller '{}': {} active (max {})",
-                    source_context_id,
-                    current,
-                    scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+                    "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
                 ),
                 code: "SCP-TOOL-6015".to_owned(),
             });

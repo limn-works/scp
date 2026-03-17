@@ -36,12 +36,11 @@ use scp_identity::DID;
 /// Context identifier (string alias used throughout the context module).
 pub type ContextId = String;
 
-/// Maximum nesting depth (protocol constant, spec section 5.13.8).
-///
-/// A child of a child of a child is permitted (depth 3); a fourth level is
-/// rejected. This bounds governance complexity, ceiling reduction, lifecycle
-/// cascade depth, and trust evaluation complexity.
-pub const MAX_NESTING_DEPTH: u32 = 3;
+// After ADR-043, nesting depth has no protocol ceiling. It is context-
+// configurable via `ContextParams::max_nesting_depth`. When `None`,
+// nesting is unbounded (no depth limit). When `Some(n)`, depth is
+// enforced at creation time. The old `MAX_NESTING_DEPTH = 3` constant
+// has been removed.
 
 // ---------------------------------------------------------------------------
 // OnSeverPolicy
@@ -201,11 +200,13 @@ pub enum NestingError {
         min_parent_ttl: std::time::Duration,
     },
 
-    /// Nesting depth would exceed the maximum allowed.
-    #[error("nesting depth {depth} exceeds maximum {}", MAX_NESTING_DEPTH)]
+    /// Nesting depth would exceed the context-configured maximum.
+    #[error("nesting depth {depth} exceeds maximum {max}")]
     DepthExceeded {
         /// The depth that would result.
         depth: u32,
+        /// The context-configured maximum nesting depth.
+        max: u32,
     },
 
     /// A parent context is not in Active state.
@@ -340,7 +341,7 @@ impl ContextNesting {
     /// # Validation
     ///
     /// 1. At least one parent must be provided.
-    /// 2. Nesting depth must not exceed [`MAX_NESTING_DEPTH`].
+    /// 2. Nesting depth must not exceed the context-configured limit (if any).
     /// 3. The child ceiling must be a subset of the intersection of all parent
     ///    ceilings.
     /// 4. The creator must have `ChildContextCreate` capability in at least one
@@ -357,15 +358,18 @@ impl ContextNesting {
         creator: &DID,
         governance_approvals: &HashSet<ContextId>,
         depth: u32,
+        max_nesting_depth: Option<u32>,
     ) -> Result<Self, NestingError> {
         // 1. At least one parent.
         if parents.is_empty() {
             return Err(NestingError::NoParents);
         }
 
-        // 2. Nesting depth check.
-        if depth > MAX_NESTING_DEPTH {
-            return Err(NestingError::DepthExceeded { depth });
+        // 2. Nesting depth check (only if context-configured limit is set).
+        if let Some(max) = max_nesting_depth
+            && depth > max
+        {
+            return Err(NestingError::DepthExceeded { depth, max });
         }
 
         // 3. Ceiling intersection validation.
@@ -661,17 +665,23 @@ pub fn validate_child_ttl(
     Ok(())
 }
 
-/// Validates that the proposed nesting depth does not exceed the maximum.
+/// Validates that the proposed nesting depth does not exceed the context-
+/// configured maximum.
+///
+/// When `max_nesting_depth` is `None`, no validation is performed (unbounded).
+/// When `Some(n)`, rejects depths exceeding `n`.
 ///
 /// # Errors
 ///
-/// Returns [`NestingError::DepthExceeded`] if the depth exceeds
-/// [`MAX_NESTING_DEPTH`].
-pub const fn validate_nesting_depth(depth: u32) -> Result<(), NestingError> {
-    if depth > MAX_NESTING_DEPTH {
-        return Err(NestingError::DepthExceeded { depth });
+/// Returns [`NestingError::DepthExceeded`] if the depth exceeds the limit.
+pub const fn validate_nesting_depth(
+    depth: u32,
+    max_nesting_depth: Option<u32>,
+) -> Result<(), NestingError> {
+    match max_nesting_depth {
+        Some(max) if depth > max => Err(NestingError::DepthExceeded { depth, max }),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +811,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         );
 
         assert!(result.is_err());
@@ -820,6 +831,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -846,6 +858,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -877,6 +890,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -905,6 +919,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -942,6 +957,7 @@ mod tests {
             &carol,
             &approvals(&["A", "B"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -991,6 +1007,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1034,6 +1051,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1073,6 +1091,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1105,6 +1124,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1148,6 +1168,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         );
 
         assert!(result.is_err());
@@ -1166,6 +1187,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -1189,6 +1211,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         );
 
         assert!(result.is_err());
@@ -1220,6 +1243,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         );
 
         assert!(result.is_err());
@@ -1303,17 +1327,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn nesting_depth_at_max_is_allowed() {
-        assert!(validate_nesting_depth(MAX_NESTING_DEPTH).is_ok());
+    fn nesting_depth_unbounded_when_none() {
+        // No context-configured limit — any depth is valid.
+        assert!(validate_nesting_depth(0, None).is_ok());
+        assert!(validate_nesting_depth(100, None).is_ok());
+        assert!(validate_nesting_depth(u32::MAX, None).is_ok());
     }
 
     #[test]
-    fn nesting_depth_exceeds_max_is_rejected() {
-        let result = validate_nesting_depth(MAX_NESTING_DEPTH + 1);
+    fn nesting_depth_at_configured_max_is_allowed() {
+        assert!(validate_nesting_depth(10, Some(10)).is_ok());
+    }
+
+    #[test]
+    fn nesting_depth_exceeds_configured_max_is_rejected() {
+        let result = validate_nesting_depth(11, Some(10));
         assert!(result.is_err());
         match result.unwrap_err() {
-            NestingError::DepthExceeded { depth } => {
-                assert_eq!(depth, MAX_NESTING_DEPTH + 1);
+            NestingError::DepthExceeded { depth, max } => {
+                assert_eq!(depth, 11);
+                assert_eq!(max, 10);
             }
             other => panic!("expected DepthExceeded, got: {other:?}"),
         }
@@ -1346,6 +1379,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1370,6 +1404,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1383,6 +1418,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1497,6 +1533,7 @@ mod tests {
             &alice,
             &HashSet::new(),
             1,
+            None,
         );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), NestingError::NoParents));
@@ -1523,6 +1560,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             1,
+            None,
         )
         .unwrap();
 
@@ -1564,6 +1602,7 @@ mod tests {
             &alice,
             &approvals(&["A", "B"]),
             1,
+            None,
         );
         assert!(result.is_err());
     }
@@ -1589,6 +1628,7 @@ mod tests {
             &alice,
             &approvals(&["A"]),
             2,
+            None,
         )
         .unwrap();
 

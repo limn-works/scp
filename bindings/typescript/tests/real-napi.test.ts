@@ -705,10 +705,10 @@ if (bridge === null) {
       expect(record.counterparties).toEqual([]);
     });
 
-    test("checks chain depth within default limit (3)", () => {
+    test("checks chain depth within default limit (8)", () => {
       expect(napi.provenanceCheckChainDepth(0, undefined)).toBe(true);
-      expect(napi.provenanceCheckChainDepth(3, undefined)).toBe(true);
-      expect(napi.provenanceCheckChainDepth(4, undefined)).toBe(false);
+      expect(napi.provenanceCheckChainDepth(8, undefined)).toBe(true);
+      expect(napi.provenanceCheckChainDepth(9, undefined)).toBe(false);
     });
 
     test("checks chain depth with custom limit", () => {

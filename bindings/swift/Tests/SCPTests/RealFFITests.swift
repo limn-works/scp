@@ -94,7 +94,10 @@ private func makeTestParams(
         memoryScope: memoryScope,
         ttlSeconds: ttlSeconds,
         promotable: promotable,
-        minProtocolVersion: minProtocolVersion
+        minProtocolVersion: minProtocolVersion,
+        maxChainDepth: nil,
+        maxNestingDepth: nil,
+        sessionCap: nil
     )
 }
 
@@ -200,18 +203,18 @@ struct RealFFIStatelessTests {
     func ffiProvenanceCheckChainDepthWithinLimit() throws {
         try requireFFI()
 
-        // Default max depth is 3 per spec
+        // Default max depth is 8 (ADR-043)
         #expect(checkProvenanceChainDepth(chainDepth: 0) == true)
         #expect(checkProvenanceChainDepth(chainDepth: 1) == true)
-        #expect(checkProvenanceChainDepth(chainDepth: 2) == true)
-        #expect(checkProvenanceChainDepth(chainDepth: 3) == true)
+        #expect(checkProvenanceChainDepth(chainDepth: 7) == true)
+        #expect(checkProvenanceChainDepth(chainDepth: 8) == true)
     }
 
     @Test("FFI: provenanceCheckChainDepth exceeds default limit")
     func ffiProvenanceCheckChainDepthExceedsLimit() throws {
         try requireFFI()
 
-        #expect(checkProvenanceChainDepth(chainDepth: 4) == false)
+        #expect(checkProvenanceChainDepth(chainDepth: 9) == false)
         #expect(checkProvenanceChainDepth(chainDepth: 255) == false)
     }
 

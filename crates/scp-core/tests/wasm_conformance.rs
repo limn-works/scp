@@ -6355,8 +6355,8 @@ fn broadcast_mime_type_validation_matches_wasm() {
 // `chain_depth` is `u8` in scp-core and `u32` in the WASM bridge. JSON
 // numbers carry no type information, so both serialize identically for values
 // in the `u8` range (0..=255). The WASM bridge uses `u32` because
-// `wasm_bindgen` maps it directly to JS `number`; the protocol hard max is 5,
-// so the representable range is never exceeded.
+// `wasm_bindgen` maps it directly to JS `number`; the default max is 8 (ADR-043),
+// and the u8 range [0, 255] is the natural bound.
 // ===========================================================================
 
 /// Mirror of `CanonicalProvenance` from `scp-ffi-wasm/src/provenance.rs`.

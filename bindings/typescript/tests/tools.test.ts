@@ -145,7 +145,7 @@ describe("toolInvokeCrossContext", () => {
     expect(output.status).toBe("validated");
   });
 
-  it("rejects chainDepth > 5 (protocol hard max per spec §24.4)", async () => {
+  it("rejects chainDepth > 255 (u8 range per ADR-043)", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
@@ -158,12 +158,12 @@ describe("toolInvokeCrossContext", () => {
         "{}",
         identity.did,
         "token",
-        6,
+        256,
       ),
     ).rejects.toThrow(ValidationError);
   });
 
-  it("accepts chainDepth at protocol hard max (5)", async () => {
+  it("accepts chainDepth at u8 max (255)", async () => {
     const identity = await mockBridge.identityCreate("in_memory");
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
@@ -183,10 +183,10 @@ describe("toolInvokeCrossContext", () => {
       "{}",
       identity.did,
       "token",
-      5,
+      255,
     );
 
-    expect(result.chainDepth).toBe(5);
+    expect(result.chainDepth).toBe(255);
   });
 
   it("rejects negative chainDepth", async () => {

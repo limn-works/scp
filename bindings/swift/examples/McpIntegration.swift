@@ -20,7 +20,10 @@ struct McpIntegration {
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
             promotable: false,
-            minProtocolVersion: 0
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil
         )
         let handle = try await contextCreate(identity: identity, params: params)
 

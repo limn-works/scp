@@ -135,11 +135,11 @@ public func attachProvenance(
 
 /// Checks whether a provenance chain depth is within the allowed limit.
 ///
-/// The default maximum chain depth is 3 (per spec).
+/// The default maximum chain depth is 8 (ADR-043).
 ///
 /// - Parameters:
 ///   - chainDepth: The current chain depth to check.
-///   - maxDepth: Optional custom maximum depth (default: 3).
+///   - maxDepth: Optional custom maximum depth (default: 8).
 ///   - checkChainDepthFn: Bridge function override for testing.
 /// - Returns: `true` if within limit, `false` otherwise.
 ///

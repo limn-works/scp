@@ -198,6 +198,15 @@ pub struct PyContextParams {
     /// Minimum protocol version as `(major, minor)` tuple (spec §13.4).
     /// When `None`, defaults to `(1, 0)`.
     min_protocol_version: Option<(u8, u8)>,
+    /// Maximum cross-context chain depth (spec §24.4, ADR-043).
+    /// When `None`, defaults to `DEFAULT_MAX_CHAIN_DEPTH` (8).
+    max_chain_depth: Option<u8>,
+    /// Maximum nesting depth for sub-contexts (spec §5.6, ADR-043).
+    /// When `None`, nesting is unbounded.
+    max_nesting_depth: Option<u32>,
+    /// Per-caller session cap (spec §6.2.1, ADR-043).
+    /// When `None`, defaults to `DEFAULT_SESSION_CAP_PER_CALLER` (1000).
+    session_cap: Option<u32>,
 }
 
 #[pymethods]
@@ -291,12 +300,37 @@ impl PyContextParams {
         self.min_protocol_version
     }
 
+    /// Returns the maximum cross-context chain depth, or `None` if using
+    /// the protocol default (8, spec §24.4, ADR-043).
+    #[getter]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 getter cannot be const.
+    fn max_chain_depth(&self) -> Option<u8> {
+        self.max_chain_depth
+    }
+
+    /// Returns the maximum nesting depth, or `None` for unbounded
+    /// (spec §5.6, ADR-043).
+    #[getter]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 getter cannot be const.
+    fn max_nesting_depth(&self) -> Option<u32> {
+        self.max_nesting_depth
+    }
+
+    /// Returns the per-caller session cap, or `None` if using the protocol
+    /// default (1000, spec §6.2.1, ADR-043).
+    #[getter]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 getter cannot be const.
+    fn session_cap(&self) -> Option<u32> {
+        self.session_cap
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
              memory_scope='{}', governance='{}', mode='{}', ceiling_policy='{}', \
              promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
-             min_protocol_version={:?})",
+             min_protocol_version={:?}, max_chain_depth={:?}, \
+             max_nesting_depth={:?}, session_cap={:?})",
             self.ceiling,
             self.roles,
             self.tools,
@@ -309,6 +343,9 @@ impl PyContextParams {
             self.template_id,
             self.economic_policy,
             self.min_protocol_version,
+            self.max_chain_depth,
+            self.max_nesting_depth,
+            self.session_cap,
         )
     }
 }
@@ -481,6 +518,27 @@ impl PyContextParams {
             None => None,
         };
 
+        // max_chain_depth: Optional[int] (default: None → 8) -- spec §24.4, ADR-043
+        let max_chain_depth: Option<u8> = match dict.get_item("max_chain_depth")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => Some(val.extract()?),
+            None => None,
+        };
+
+        // max_nesting_depth: Optional[int] (default: None → unbounded) -- spec §5.6, ADR-043
+        let max_nesting_depth: Option<u32> = match dict.get_item("max_nesting_depth")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => Some(val.extract()?),
+            None => None,
+        };
+
+        // session_cap: Optional[int] (default: None → 1000) -- spec §6.2.1, ADR-043
+        let session_cap: Option<u32> = match dict.get_item("session_cap")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => Some(val.extract()?),
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -494,6 +552,9 @@ impl PyContextParams {
             template_id,
             economic_policy,
             min_protocol_version,
+            max_chain_depth,
+            max_nesting_depth,
+            session_cap,
         })
     }
 }
@@ -1484,7 +1545,9 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
         projection_policy: None,
         discoverable: false,
-        max_chain_depth: None,
+        max_chain_depth: py_params.max_chain_depth,
+        max_nesting_depth: py_params.max_nesting_depth,
+        session_cap: py_params.session_cap,
         counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
         incomplete_verification_policy:
@@ -4118,6 +4181,9 @@ mod tests {
             template_id: None,
             economic_policy: None,
             min_protocol_version: None,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
         }
     }
 

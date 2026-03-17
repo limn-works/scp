@@ -718,8 +718,13 @@ fn provenance_check_chain_depth_within_limit() {
 #[test]
 fn provenance_check_chain_depth_exceeds_limit() {
     setup();
-    assert!(!_scp_core::provenance::py_provenance_check_chain_depth(
+    // Default is now 8 (ADR-043), so depth 4 is within default.
+    assert!(_scp_core::provenance::py_provenance_check_chain_depth(
         4, None
+    ));
+    // Depth 9 exceeds default of 8.
+    assert!(!_scp_core::provenance::py_provenance_check_chain_depth(
+        9, None
     ));
     assert!(!_scp_core::provenance::py_provenance_check_chain_depth(
         2,

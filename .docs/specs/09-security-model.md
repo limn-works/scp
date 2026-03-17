@@ -67,7 +67,7 @@ These constraints don't prevent a sufficiently creative attacker from encoding a
 
 *Mitigation — chain depth limit and provenance-based cost attribution.*
 
-- **Protocol-enforced chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. The protocol enforces a hard maximum chain depth of 5 hops that cannot be exceeded. Contexts MAY configure a lower limit via `max_chain_depth` in `ContextParams` (RECOMMENDED default: 3 hops). The effective limit is `min(context.max_chain_depth.unwrap_or(3), 5)`. A tool call at the effective depth limit cannot trigger further cross-context tool calls. The protocol hard maximum bounds the worst-case amplification factor; the context-configurable limit allows stricter enforcement where desired (§24.4).
+- **Context-configurable chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. Contexts configure a maximum via `max_chain_depth` in `ContextParams` (default: 8 hops, range [1, 255]). The effective limit is `context.max_chain_depth.unwrap_or(8)`. A tool call at the effective depth limit cannot trigger further cross-context tool calls. There is no protocol hard maximum — chain depth is a context concern, and provenance quality naturally degrades with depth (§24), providing the correct trust signal. The context-configurable limit allows stricter enforcement where desired (§24.4, ADR-043).
 - **Provenance carries chain depth.** The provenance record (§7.7.1) includes the chain depth at each hop. Receiving contexts see how many boundaries the data has crossed. This enables depth-aware trust evaluation: data at chain depth 1 (direct tool call) carries stronger provenance than data at chain depth 3 (three intermediaries).
 - **Per-window rate limiting across chains.** Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window. A context that receives a burst of inbound tool calls (even from different source contexts) throttles proportionally. This prevents amplification where many chains converge on a single target. Economic rate limits (§19.7) complement participation rate limits — cost escalation via `SenderVelocity` makes high-velocity patterns increasingly expensive, providing an economic deterrent that operates independently of and in parallel with participation throttling.
 - **Provenance degradation as trust signal.** Transitive provenance degradation is not a flaw — it is the protocol working as designed. Data from many degrees of separation away should be less trusted, the same way a message from a stranger deserves more scrutiny than one from a known contact. The chain depth in provenance gives the receiving agent the information to calibrate trust: "this data originated three hops away in a context I have no relationship with" is a meaningful signal. The protocol ensures this signal is always available; the agent decides how to weight it.
@@ -78,7 +78,7 @@ These constraints don't prevent a sufficiently creative attacker from encoding a
 
 *Mitigation — per-caller session cap and optional TTL.*
 
-- **Per-caller session cap.** A context limits the number of concurrent active sessions per calling context (suggested default: 5). Attempts to open additional sessions from the same caller are rejected until existing sessions close or expire. This is the primary resource exhaustion defense — it bounds the damage any single caller can inflict regardless of session duration.
+- **Per-caller session cap.** A context limits the number of concurrent active sessions per calling context. Context-configurable via `ContextParams::session_cap` (default: 1000, range [1, u32 max]). Attempts to open additional sessions from the same caller are rejected until existing sessions close or expire. This is the primary resource exhaustion defense — it bounds the damage any single caller can inflict regardless of session duration.
 - **Optional TTL for time-bounded sessions.** The tool's context MAY set a TTL on sessions. When set, expired sessions are garbage-collected automatically. When not set, sessions persist for the context's lifetime — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context is the lifecycle boundary.
 - **Session cost is borne by the tool's context.** Session state is internal to the tool's context. The tool's context chooses to offer stateful sessions, chooses whether to impose TTLs, and accepts the storage cost. This aligns incentives: contexts that offer sessions manage their own resource budget.
 
@@ -1422,9 +1422,19 @@ For a context with 100 members, each message adds ~4KB of wrapped CEKs (100 × 4
 
 ## 9.18 Protocol Constants Registry
 
-This section consolidates all protocol-level constants that independent implementations must agree on. Using different values for any of these constants will cause interoperability failures. Constants are grouped by subsystem with source references for traceability.
+This section consolidates protocol-level constants organized into three tiers per ADR-043:
 
-### 9.18.1 Cryptographic Primitives
+- **§9.18.A — Protocol Invariants.** Fixed values that all implementations MUST agree on. Using different values causes interoperability failures.
+- **§9.18.B — Configurable Parameters.** The protocol defines the mechanism and acceptable range. Deployers, relay operators, or context creators set the actual value. Defaults are provided.
+- **§9.18.C — Implementation Recommendations.** Suggested values for SDK authors. Not normative — implementations MAY use different values without breaking interoperability.
+
+Constants within each tier are grouped by subsystem with source references for traceability.
+
+### 9.18.A Protocol Invariants
+
+The following constants are protocol invariants. All implementations MUST use these exact values. Deviations cause interoperability failures.
+
+#### 9.18.1 Cryptographic Primitives
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1443,7 +1453,7 @@ This section consolidates all protocol-level constants that independent implemen
 | Ed25519 public key size | 32 bytes | Fixed | §9.5 |
 | X25519 public key size | 32 bytes | Fixed | §9.5 |
 
-### 9.18.2 Domain Separators
+#### 9.18.2 Domain Separators
 
 All domain separators are UTF-8 strings used as prefixes in canonical hash constructions (§9.5.1). Each separator identifies the struct type being hashed to prevent cross-protocol hash confusion.
 
@@ -1484,7 +1494,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
 | `"SCP-CONTEXT-SNAPSHOT-V1:"` | Context snapshot signing | §23.16.4 |
 
-### 9.18.3 Key Derivation and HPKE Labels
+#### 9.18.3 Key Derivation and HPKE Labels
 
 This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strings, and MLS exporter labels. Each label provides domain separation for a specific key derivation or encapsulation protocol.
 
@@ -1517,7 +1527,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 |-------|----------|----------------|
 | `"scp-media-key-v1"` | DTLS-SRTP media key derivation from MLS group state | §10.9.1 |
 
-### 9.18.4 Key and Nonce Sizes
+#### 9.18.4 Key and Nonce Sizes
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1530,7 +1540,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | AES-KW IV | `[0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6]` | RFC 3394 Initial Value for AES Key Wrap | §9.17 |
 | AES-KW semiblocks | 4 | Number of 64-bit semiblocks in 256-bit key | §9.17 |
 
-### 9.18.5 Envelope and Padding
+#### 9.18.5 Envelope and Padding
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1542,25 +1552,21 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Max outer envelope wire size | 589,824 bytes (576 KiB) | `MAX_BOUNDED_BINARY + 65,536` — checked before deserialization | §9.5 |
 | Max bounded string field | 1,024 bytes | OOM-prevention limit for string identifier fields | §9.5 |
 
-### 9.18.6 Context and Governance
+#### 9.18.6 Context and Governance (Invariants)
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
-| Max nesting depth | 3 | Maximum parent-child context nesting levels | §5.13.8 |
 | Max tool interfaces per context | 256 | Hard cap on registered tool interfaces | §6.2 |
 | Ceiling change notification period | 259,200s (72h) | Members notified before ceiling change takes effect | §5.3.2 |
 | Freeze timeout | 172,800s (48h) | Frozen context auto-unfreezes after this period | §5.6 |
 | Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
-| Default session cap per caller | 5 | Max concurrent tool sessions per source context | §6.2 |
 | Tool lifecycle default timeout | 30,000ms (30s) | Default tool invocation timeout | §6.2 |
 | Tool lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for tool invocation timeout | §6.2 |
 | Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §6.4 |
 | Max threshold signers | 64 | Maximum co-signers for multi-sig governance actions | §5.6 |
 | Max role name length | 64 bytes | Maximum length of custom role names | §5.6 |
-| Default provenance chain depth | 3 hops | Default max cross-context provenance chain depth | §24.4 |
-| Protocol hard max chain depth | 5 hops | Absolute maximum — no context may exceed this | §24.4 |
 
-### 9.18.7 MLS and UCAN
+#### 9.18.7 MLS and UCAN
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1579,12 +1585,11 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | UCAN nonce cache max capacity | 100,000 | Maximum nonces tracked for deduplication | §9.8.2 |
 | UCAN nonce min retention | 86,400s (24h) | Minimum time nonces are retained before garbage collection | §9.8.2 |
 
-### 9.18.8 Sender Key Protocol
+#### 9.18.8 Sender Key Protocol
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
-| Sender key grace period | 30s | Window for accepting messages with pre-rotation keys | §9.16 |
-| Sender key timeout | 60s | Timeout for sender key request/response exchange | §9.16.2 |
+| Sender key grace period | 30s | Window for accepting messages with pre-rotation keys. Protocol invariant per ADR-001 criterion 6 — bounds the forward secrecy window. Not configurable. | §9.16 |
 | Sender key nonce expiry | 300s (5 min) | Validity window for sender key request nonces | §9.16.2 |
 | Sender key request freshness | 300s (5 min) | Request freshness window (synchronized with nonce expiry) | §9.16.2 |
 | Block notification freshness | 30,000ms (30s) | Maximum age for block notification messages | §9.16.4 |
@@ -1592,15 +1597,13 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Access key request freshness | 30s | Freshness window for access key request messages | §9.17.1 |
 | Broadcast replay max authors | 10,000 | Maximum unique senders tracked in broadcast replay detector | §9.16.5 |
 
-### 9.18.9 Sync and Offline Recovery
+#### 9.18.9 Sync and Offline Recovery (Invariants)
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
 | Tier 1 threshold (minutes offline) | 14,400s (4h) | Below: sequential commit replay | §23 |
 | Tier 2 threshold (days offline) | 604,800s (7d) | Below: snapshot + delta; above: full reset | §23 |
-| Max sequential commits | 100 epochs | Maximum epochs replayed sequentially in Tier 1 | §23 |
 | Commit process timeout | 5s | Timeout for individual commit processing | §23 |
-| Reconnection dedup window | 30s | Deduplication window for reconnection messages | §23 |
 | Gap timeout | 30s | Timeout waiting for missing epochs before escalating | §23 |
 | Default snapshot interval | 14,400s (4h) | How often Tier 2 snapshots are generated | §23 |
 | Reset welcome timeout | 60s | Timeout for receiving MLS Welcome after reset request | §23.5 |
@@ -1611,7 +1614,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Reset request freshness | 30s | Freshness window for Tier 3 reset request signatures | §23.5 |
 | Reset request nonce TTL | 60s | TTL for Tier 3 reset request nonces in anti-replay cache | §23.5 |
 
-### 9.18.10 Event Log
+#### 9.18.10 Event Log
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1622,7 +1625,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Max hot bytes | 52,428,800 (50 MiB) | Maximum bytes retained in hot tier | §11 |
 | Min retention (prune) | 2,592,000s (30d) | Minimum event retention before pruning is allowed | §11 |
 
-### 9.18.11 Transport and Relay
+#### 9.18.11 Transport and Relay
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1638,13 +1641,13 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Relay timestamp deviation threshold | 60s | Maximum acceptable clock skew between client and relay | §10.5 |
 | Max blob size | 262,144 bytes (256 KiB) | Maximum blob payload size on relay (matches largest padding bucket) | §10.5 |
 
-### 9.18.12 Bridge
+#### 9.18.12 Bridge
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
 | Max shadows per bridge | 10,000 | Maximum shadow identities per bridge connector | §12.3 |
 
-### 9.18.13 Discovery and Addressing
+#### 9.18.13 Discovery and Addressing
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1660,21 +1663,21 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |
 
-### 9.18.14 Version Constants
+#### 9.18.14 Version Constants
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
 | SCP protocol version | `0x0100` (u16) | SCP/1.0, encoded as `(major << 8) \| minor`; first field in all envelope types | §9.5 |
 | Inner envelope version | `1` (u8) | Inner envelope format version | §9.5 |
 
-### 9.18.15 Timestamp and Message Validation
+#### 9.18.15 Timestamp and Message Validation
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
 | Default clock skew tolerance | 300,000ms (5 min) | Maximum acceptable clock skew for envelope timestamp validation | §9.5 |
 | Default max message age | 604,800,000ms (7d) | Messages older than this are rejected regardless of clock skew | §9.5 |
 
-### 9.18.16 Membership and Buffers
+#### 9.18.16 Membership and Buffers
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
@@ -1683,3 +1686,27 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Max receive buffer capacity | 10,000 events | Maximum configurable buffer capacity | §5.6 |
 | Default key package min buffer | 10 | Minimum MLS key packages to keep available | §9.7 |
 | Key package replenish threshold | 5 | Trigger replenishment when buffer drops below this | §9.7 |
+
+### 9.18.B Configurable Parameters
+
+The following constants have protocol-defined mechanisms and acceptable ranges, but the actual value is set by the context creator, relay operator, or deployer. Defaults are provided for when no explicit value is configured. Per ADR-043.
+
+| Parameter | Default | Range | Mechanism | Spec Reference |
+|-----------|---------|-------|-----------|----------------|
+| Nesting depth | Unbounded (no protocol ceiling) | [1, u32 max] | `ContextParams::max_nesting_depth`. `None` = unbounded; contexts MAY set a limit. | §5.13.8 |
+| Chain depth | 8 hops | [1, 255] (u8) | `ContextParams::max_chain_depth`. `None` = use default. No protocol hard max. | §24.4 |
+| Session cap per caller | 1000 | [1, u32 max] | `ContextParams::session_cap`. `None` = use default. | §6.2.1 |
+| Relay blob TTL | 604,800s (7d) | [1, infinity] | Relay operator configuration. | §10.5 |
+| Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived from TTL | Computed from relay blob TTL. Floor of 60s prevents spin loop at very small TTLs. | §10.5 |
+| DHT republish interval | 7200s (2h) | Fixed (BEP44) | BEP44 constraint. Listed here because the value is externally imposed, but functionally invariant. | §3.3 |
+
+### 9.18.C Implementation Recommendations
+
+The following values are RECOMMENDED defaults for SDK implementations. They are not normative — implementations MAY use different values without breaking protocol interoperability. Per ADR-043.
+
+| Parameter | Recommended Value | Notes | Spec Reference |
+|-----------|-------------------|-------|----------------|
+| Max sequential commits (catch-up) | 100 epochs | Hardware-dependent. Already configurable via `SyncPolicy`. | §23 |
+| Sender key timeout | 60s | SDK decides retry strategy. Already configurable via `SyncPolicy`. | §9.16.2 |
+| Reconnection timeout | 120s | Overall reconnection timeout. SDK decides retry strategy. | §23 |
+| Reconnection dedup window | 30s | Multi-device reconnection deduplication. Already configurable via `SyncPolicy`. | §23 |

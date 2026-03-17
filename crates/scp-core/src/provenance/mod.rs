@@ -193,7 +193,7 @@ impl Default for CounterpartyPolicy {
 /// # Chain depth
 ///
 /// The `chain_depth` field tracks how many cross-context hops this data has
-/// traversed. The protocol default maximum is 3 hops to prevent accountability
+/// traversed. The protocol default maximum is 8 hops to prevent accountability
 /// laundering -- data traversing enough contexts that its origin becomes
 /// meaningless. See [`ProvenanceError::ChainDepthExceeded`].
 ///
@@ -216,7 +216,7 @@ pub struct DataProvenance {
     /// Memory scope of the source context, controlling data retention behavior.
     pub memory_scope: MemoryScope,
     /// Number of cross-context hops this data has traversed. Protocol default
-    /// maximum is 3.
+    /// maximum is 8.
     pub chain_depth: u8,
     /// Ordered list of intermediary context IDs when `chain_depth > 0`.
     /// Records the full path the data has traversed across contexts.
@@ -243,7 +243,7 @@ pub struct DataProvenance {
 pub enum ProvenanceError {
     /// The data has exceeded the maximum allowed cross-context hop count.
     ///
-    /// The protocol default maximum is 3 hops. At the maximum depth, the data
+    /// The protocol default maximum is 8 hops. At the maximum depth, the data
     /// cannot trigger further cross-context calls. This prevents accountability
     /// laundering where data traverses enough contexts that its origin becomes
     /// meaningless.

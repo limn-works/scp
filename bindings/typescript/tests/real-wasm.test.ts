@@ -168,10 +168,10 @@ if (bridge === null || wasmModule === null) {
       expect(record.discovery_method).toEqual({ Registry: "ctx-registry-abc" });
     });
 
-    test("checks chain depth within default limit (3)", () => {
+    test("checks chain depth within default limit (8)", () => {
       expect(wasm.provenanceCheckChainDepth(0, undefined)).toBe(true);
-      expect(wasm.provenanceCheckChainDepth(3, undefined)).toBe(true);
-      expect(wasm.provenanceCheckChainDepth(4, undefined)).toBe(false);
+      expect(wasm.provenanceCheckChainDepth(8, undefined)).toBe(true);
+      expect(wasm.provenanceCheckChainDepth(9, undefined)).toBe(false);
     });
 
     test("checks chain depth with custom limit", () => {

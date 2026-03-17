@@ -512,12 +512,12 @@ mod tests {
     #[test]
     fn check_chain_depth_within_limit() {
         assert!(provenance_check_chain_depth(0, None));
-        assert!(provenance_check_chain_depth(3, None));
+        assert!(provenance_check_chain_depth(8, None)); // default is 8 (ADR-043)
     }
 
     #[test]
     fn check_chain_depth_exceeds_limit() {
-        assert!(!provenance_check_chain_depth(4, None));
+        assert!(!provenance_check_chain_depth(9, None)); // 9 > default 8
         assert!(!provenance_check_chain_depth(2, Some(1)));
     }
 

@@ -479,10 +479,8 @@ export function createMockBridge(): Bridge & {
       if (targetCtx.state !== "active") {
         throw new Error(`[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`);
       }
-      if (chainDepth > 5) {
-        throw new Error(
-          `[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds protocol hard maximum 5`,
-        );
+      if (chainDepth > 255) {
+        throw new Error(`[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds maximum 255`);
       }
 
       const tool = targetCtx.tools.get(toolId);
@@ -523,12 +521,12 @@ export function createMockBridge(): Bridge & {
         throw new Error(`[SCP-TOOL-6002] Tool '${toolId}' not found`);
       }
 
-      // Per-caller session cap (5 per spec section 6.2.1)
+      // Per-caller session cap (1000 per spec §6.2.1, ADR-043)
       let callerSessions = 0;
       for (const session of ctx.sessions.values()) {
         if (session.sourceContextId === sourceContextId) callerSessions++;
       }
-      if (callerSessions >= 5) {
+      if (callerSessions >= 1000) {
         throw new Error(`[SCP-TOOL-6015] Session cap exceeded for caller '${sourceContextId}'`);
       }
 
