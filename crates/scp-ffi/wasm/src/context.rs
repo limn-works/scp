@@ -2412,7 +2412,8 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
             "memory_scope": mem, "governance": gov, "template_id": null,
             "economic_policy": null, "metadata_visibility": vis,
             "projection_policy": proj, "discoverable": disc,
-            "max_chain_depth": null, "counterparty_policy": default_cp,
+            "max_chain_depth": null, "max_nesting_depth": null, "session_cap": null,
+            "counterparty_policy": default_cp,
             "participation_requirements": [],
             "incomplete_verification_policy": "AllowWithWarning",
             "min_protocol_version": null, "migration_source": null

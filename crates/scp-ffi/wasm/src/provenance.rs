@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 // ---------------------------------------------------------------------------
 
 /// Default maximum chain depth (8 hops, ADR-043).
-const DEFAULT_MAX_CHAIN_DEPTH: u32 = 8;
+pub(crate) const DEFAULT_MAX_CHAIN_DEPTH: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // Local enums (mirror scp-core::provenance)
@@ -657,7 +657,7 @@ struct CanonicalProvenance<'a> {
     memory_scope: &'a str,
     /// `u32` in WASM (`wasm_bindgen` maps to JS `number`), `u8` in scp-core.
     /// JSON numbers are untyped, so serialized output is identical for values
-    /// in the protocol range (0..=5). See `provenance_hash_chain_depth_u8_vs_u32`
+    /// in the protocol range (0..=255). See `provenance_hash_chain_depth_u8_vs_u32`
     /// conformance test in `scp-core/tests/wasm_conformance.rs`.
     chain_depth: u32,
     chain_path: &'a serde_json::Value,
