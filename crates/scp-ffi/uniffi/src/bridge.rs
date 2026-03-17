@@ -7406,28 +7406,11 @@ pub struct PublishResult {
     pub etag: String,
 }
 
-/// Node-local site configuration for broadcast projection (spec §18.11.12, SCP-293).
-///
-/// Passed to `enable_site_projection` to configure path-based serving.
-/// NOT part of governance — deployment concern only.
-///
-/// Mirrors `scp_node::projection::SiteConfig`.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct SiteConfig {
-    /// Virtual host hostname (e.g., `"mysite.example.com"`). RFC 1123 validated.
-    pub hostname: String,
-    /// Default path for directory requests (default: `"/index.html"`).
-    pub index_path: String,
-    /// Maximum assets per deploy (default: 10,000).
-    pub max_assets_per_deploy: u32,
-    /// Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB).
-    pub max_deploy_size_bytes: u64,
-    /// Number of deploys to retain (default: 2, max 8).
-    pub deploy_retention_count: u32,
-    /// Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`,
-    /// `unsafe-hashes`, bare `*`, `data:`, `blob:`.
-    pub csp_override: Option<String>,
-}
+// NOTE: SiteConfig is defined at the SDK layer (Swift Governance.swift, Kotlin Types.kt)
+// with client-side validation. It is NOT a UniFFI record to avoid type ambiguity with
+// the auto-generated ScpBindings.swift. The SDK types will be mapped to the Rust
+// `scp_node::projection::SiteConfig` at the FFI call site when lifecycle methods
+// are wired (SCP-295).
 
 /// Publishes a single asset to a broadcast context as structured content (SCP-290).
 ///
