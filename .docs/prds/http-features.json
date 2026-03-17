@@ -35,7 +35,14 @@
         "SCP-287",
         "SCP-288",
         "SCP-289",
-        "SCP-290"
+        "SCP-290",
+        "SCP-292",
+        "SCP-293",
+        "SCP-294",
+        "SCP-295",
+        "SCP-296",
+        "SCP-297",
+        "SCP-298"
       ]
     }
   ],
@@ -474,7 +481,7 @@
       "gate": "gate-http-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/context/broadcast_content.rs",
         "crates/scp-core/src/context/mod.rs"
@@ -557,7 +564,7 @@
       "gate": "gate-http-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs",
         "crates/scp-node/src/http.rs",
@@ -649,7 +656,7 @@
       "gate": "gate-http-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/projection.rs",
         "crates/scp-node/src/lib.rs"
@@ -715,7 +722,7 @@
       "gate": "gate-http-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/napi/src/context.rs",
@@ -775,6 +782,446 @@
         "phase": 2,
         "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi", "scp-ffi-wasm"],
         "bindings": ["typescript", "python"]
+      }
+    },
+    {
+      "id": "SCP-292",
+      "title": "Return deployId from publish methods in all FFI bridges and SDK bindings",
+      "gate": "gate-http-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/wasm/src/context.rs",
+        "bindings/typescript/src/types.ts",
+        "bindings/typescript/src/context.ts",
+        "bindings/python/scp_sdk/context.py",
+        "bindings/swift/Sources/SCP/Governance.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt"
+      ],
+      "description": "The FFI bridges already auto-generate deploy_id (SHA-256(context_id ++ author_did ++ timestamp)[..16]) but discard it. Add deploy_id to PublishResult for single-asset publish. Create BatchPublishResult { results: Vec<PublishResult>, deploy_id: String } for batch publish. No Rust core changes needed — bridges already have the value, they just need to include it in the return type. Update all 4 SDK wrappers to expose the new field. Per §18.11.8 and ADR-042.",
+      "acceptanceCriteria": [
+        "PublishResult includes deploy_id: String field in all 4 FFI bridges",
+        "BatchPublishResult type exists with results: Vec<PublishResult> and deploy_id: String fields in all 4 FFI bridges",
+        "broadcastPublishAsset returns PublishResult with deploy_id populated in all bridges",
+        "broadcastPublishAssets returns BatchPublishResult with deploy_id populated in all bridges",
+        "Auto-generated deploy_id is 32 lowercase hex characters",
+        "Python SDK context.py exposes deploy_id on publish return types",
+        "TypeScript SDK types.ts has BatchPublishResult interface and updated PublishResult",
+        "Swift SDK exposes deploy_id on publish return types",
+        "Kotlin SDK Types.kt has BatchPublishResult data class",
+        "Unit test: auto-generated deploy_id is 32 hex chars",
+        "Unit test: batch publish returns single deploy_id shared across all results"
+      ],
+      "actionItems": [
+        "Update PyO3 bridge PublishResult dict to include deploy_id",
+        "Create NapiBatchPublishResult in NAPI bridge, update NapiPublishResult",
+        "Update UniFFI bridge PublishResult record, add BatchPublishResult record",
+        "Update WASM bridge JS return object to include deploy_id",
+        "Update TypeScript PublishResult interface and add BatchPublishResult interface in types.ts",
+        "Update TypeScript context.ts broadcastPublishAssets return type",
+        "Update Python context.py return types and add BatchPublishResult dataclass",
+        "Update Swift Governance.swift publish return types",
+        "Update Kotlin Types.kt with BatchPublishResult data class",
+        "Add unit tests verifying deploy_id format and batch consistency"
+      ],
+      "blockedBy": [
+        "SCP-290"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi", "scp-ffi-wasm"],
+        "bindings": ["typescript", "python", "swift", "kotlin"]
+      }
+    },
+    {
+      "id": "SCP-293",
+      "title": "Define SiteConfig type in all SDKs and UniFFI bridge",
+      "gate": "gate-http-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/typescript/src/types.ts",
+        "bindings/python/scp_sdk/context.py",
+        "bindings/swift/Sources/SCP/Governance.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
+        "crates/scp-ffi/uniffi/src/bridge.rs"
+      ],
+      "description": "Define SiteConfig in all 4 SDKs matching the Rust SiteConfig struct at crates/scp-node/src/projection.rs exactly: hostname (String, required), indexPath (String, default '/index.html'), maxAssetsPerDeploy (number, default 10000), maxDeploySizeBytes (number, default 536870912), deployRetentionCount (number, default 2, max 8), cspOverride (optional String, validated against unsafe-eval/unsafe-inline/unsafe-hashes/wildcard/data:/blob:). Add SiteConfig as a UniFFI record for Swift/Kotlin auto-generation. Per §18.11.12 and ADR-042.",
+      "acceptanceCriteria": [
+        "TypeScript types.ts has SiteConfig interface with all 6 fields and JSDoc defaults",
+        "Python context.py has SiteConfig frozen dataclass with all 6 fields and default values",
+        "Swift Governance.swift has SiteConfig struct with all 6 fields and default values",
+        "Kotlin Types.kt has SiteConfig data class with all 6 fields and default values",
+        "UniFFI bridge.rs has SiteConfig record with all 6 fields",
+        "hostname validated as RFC 1123 DNS hostname in all SDKs",
+        "deployRetentionCount rejects values above 8 in all SDKs",
+        "deployRetentionCount rejects values below 1 in all SDKs",
+        "cspOverride rejects strings containing 'unsafe-eval' in all SDKs",
+        "cspOverride rejects strings containing 'unsafe-inline' in all SDKs",
+        "cspOverride rejects strings containing 'unsafe-hashes' in all SDKs",
+        "cspOverride rejects strings containing wildcard '*' in all SDKs",
+        "cspOverride rejects strings containing 'data:' in all SDKs",
+        "cspOverride rejects strings containing 'blob:' in all SDKs",
+        "Unit test per SDK: construction with defaults produces correct values",
+        "Unit test per SDK: hostname validation rejects invalid hostnames",
+        "Unit test per SDK: CSP override validation rejects unsafe directives"
+      ],
+      "actionItems": [
+        "Add SiteConfig interface to TypeScript types.ts with JSDoc defaults",
+        "Add SiteConfig frozen dataclass to Python context.py with field defaults",
+        "Add SiteConfig struct to Swift Governance.swift with default values",
+        "Add SiteConfig data class to Kotlin Types.kt with default values",
+        "Add SiteConfig UniFFI record to bridge.rs",
+        "Implement hostname RFC 1123 validation in each SDK",
+        "Implement deployRetentionCount bounds validation (1-8) in each SDK",
+        "Implement CSP override validation in each SDK",
+        "Add unit tests for construction, hostname validation, and CSP validation"
+      ],
+      "blockedBy": [
+        "SCP-290"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.12 Site Configuration"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "bindings": ["typescript", "python", "swift", "kotlin"],
+        "crates": ["scp-ffi-uniffi"]
+      }
+    },
+    {
+      "id": "SCP-294",
+      "title": "Fix Python custody naming and normalize identity parameter across SDKs",
+      "gate": "gate-http-3",
+      "priority": "P1",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "bindings/python/scp_sdk/identity.py",
+        "bindings/swift/Sources/SCP/Governance.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
+      ],
+      "description": "Two related SDK ergonomic fixes. (a) Python custody='platform' actually uses FileKeyCustody, which is misleading. Add 'file' as a recognized alias in parse_custody at crates/scp-ffi/src/identity.rs, keep 'platform' working for backwards compatibility, and update Python CustodyType enum and docstrings in identity.py. (b) Swift and Kotlin require identity/identityHandle as mandatory parameters for publish methods, while Python and TypeScript default to context creator. Make identity optional with default-to-context-creator in Swift and Kotlin publish methods. Per §3.2 (identity custody) and ADR-006 (platform adapter).",
+      "acceptanceCriteria": [
+        "PyO3 parse_custody accepts 'file' as alias for 'platform' custody type",
+        "PyO3 parse_custody still accepts 'platform' (backwards compatible)",
+        "Python CustodyType enum includes FILE variant",
+        "Python identity.py docstrings document 'file' as preferred name",
+        "Identity.create(custody='file') works in Python and creates FileKeyCustody",
+        "Swift publish methods accept optional identity parameter (defaults to context creator)",
+        "Kotlin publish methods accept optional identityHandle parameter (defaults to context creator)",
+        "Unit test: Python custody='file' creates identity successfully",
+        "Unit test: Python custody='platform' still works (alias)",
+        "Unit test: Swift publish without explicit identity succeeds",
+        "Unit test: Kotlin publish without explicit identityHandle succeeds"
+      ],
+      "actionItems": [
+        "Update parse_custody in crates/scp-ffi/src/identity.rs to accept 'file' alias",
+        "Add FILE variant to Python CustodyType enum in identity.py",
+        "Update Python identity.py docstrings to document 'file' as preferred",
+        "Make identity parameter optional in Swift Governance.swift publish methods",
+        "Make identityHandle parameter optional in Kotlin CoroutineBridge.kt publish methods",
+        "Add unit tests for custody alias in Python",
+        "Add unit tests for optional identity in Swift and Kotlin"
+      ],
+      "blockedBy": [
+        "SCP-290"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "## 3.2 Key Custody"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-006: Platform Abstraction (In-Memory Testing Adapter)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crates": ["scp-ffi"],
+        "bindings": ["python", "swift", "kotlin"]
+      }
+    },
+    {
+      "id": "SCP-295",
+      "title": "Add lifecycle FFI methods to NodeHandle in all 3 non-WASM bridges",
+      "gate": "gate-http-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/server.rs",
+        "crates/scp-ffi/napi/src/server.rs",
+        "crates/scp-ffi/uniffi/src/server.rs"
+      ],
+      "description": "Extend NodeInner impl in each of the 3 non-WASM FFI bridges with 4 async lifecycle methods: enable_site_projection(context_id, broadcast_key, admission, site_config), commit_deploy(context_id, deploy_id) returning asset count, rollback_deploy(context_id, deploy_id), and disable_site_projection(context_id). Each method dispatches through NodeInner to the underlying ApplicationNode. PyO3 bridge (server.rs) is the reference implementation; NAPI and UniFFI follow. Error propagation: Rust NodeError mapped to bridge-specific error types. WASM excluded — browsers cannot host HTTP servers. Per §18.11.8 and ADR-042.",
+      "acceptanceCriteria": [
+        "PyO3 PyNodeHandle has enable_site_projection(context_id, hostname, config_json=None) method",
+        "PyO3 PyNodeHandle has commit_deploy(context_id, deploy_id) -> int method",
+        "PyO3 PyNodeHandle has rollback_deploy(context_id, deploy_id) method",
+        "PyO3 PyNodeHandle has disable_site_projection(context_id) method",
+        "NAPI NapiNodeHandle has enableSiteProjection async method",
+        "NAPI NapiNodeHandle has commitDeploy async method returning number",
+        "NAPI NapiNodeHandle has rollbackDeploy async method",
+        "NAPI NapiNodeHandle has disableSiteProjection async method",
+        "UniFFI NodeHandle has enable_site_projection method",
+        "UniFFI NodeHandle has commit_deploy method returning UInt32",
+        "UniFFI NodeHandle has rollback_deploy method",
+        "UniFFI NodeHandle has disable_site_projection method",
+        "All methods dispatch through NodeInner to ApplicationNode",
+        "NodeError mapped to PyErr in PyO3 bridge",
+        "NodeError mapped to napi::Error in NAPI bridge",
+        "NodeError mapped to UniFFI error type in UniFFI bridge",
+        "Unit test per bridge: enable_site_projection error propagation",
+        "Unit test per bridge: commit_deploy returns asset count"
+      ],
+      "actionItems": [
+        "Add 4 lifecycle methods to PyNodeHandle in crates/scp-ffi/src/server.rs",
+        "Add 4 lifecycle methods to NapiNodeHandle in crates/scp-ffi/napi/src/server.rs",
+        "Add 4 lifecycle methods to NodeHandle in crates/scp-ffi/uniffi/src/server.rs",
+        "Implement NodeInner dispatch for each method in all 3 bridges",
+        "Map NodeError to bridge-specific error types in each bridge",
+        "Add unit tests for each method in each bridge"
+      ],
+      "blockedBy": [
+        "SCP-293"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.12 Site Configuration"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi"]
+      }
+    },
+    {
+      "id": "SCP-296",
+      "title": "Add SDK lifecycle wrappers for Node class in all 4 languages",
+      "gate": "gate-http-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/node.py",
+        "bindings/python/scp_sdk/__init__.py",
+        "bindings/typescript/src/node.ts",
+        "bindings/typescript/src/internal/bridge.ts",
+        "bindings/typescript/src/internal/native.ts",
+        "bindings/typescript/src/index.ts",
+        "bindings/swift/Sources/SCP/Node.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Node.kt"
+      ],
+      "description": "Create Node class in all 4 SDKs wrapping the FFI lifecycle methods from SCP-295. Each class exposes 4 methods: enableSiteProjection, commitDeploy (returns asset count), rollbackDeploy, disableSiteProjection. Python wraps PyNodeHandle calls in asyncio.to_thread(). TypeScript adds Node to bridge interface, native adapter delegates to NAPI, WASM adapter throws 'not supported in browser'. Swift uses injectable bridge pattern matching existing Context. Kotlin uses CoroutineBridge suspend functions. Per §18.11.8 and ADR-042.",
+      "acceptanceCriteria": [
+        "Python Node class exists in bindings/python/scp_sdk/node.py with 4 async methods",
+        "Python Node exported from __init__.py",
+        "Python Node.enable_site_projection wraps PyNodeHandle call via asyncio.to_thread",
+        "Python Node.commit_deploy returns int (asset count)",
+        "TypeScript Node class exists in bindings/typescript/src/node.ts with 4 async methods",
+        "TypeScript Node added to bridge interface in internal/bridge.ts",
+        "TypeScript native adapter delegates to NAPI NodeHandle",
+        "TypeScript WASM adapter throws Error('Node lifecycle not supported in browser')",
+        "TypeScript Node exported from index.ts",
+        "Swift Node actor exists in bindings/swift/Sources/SCP/Node.swift with 4 async methods",
+        "Swift Node uses injectable bridge pattern",
+        "Kotlin Node class exists with 4 suspend functions",
+        "Kotlin Node delegates to CoroutineBridge",
+        "Unit test per SDK: all 4 methods callable (mock/stub bridge)",
+        "Unit test: TypeScript WASM path throws 'not supported in browser'"
+      ],
+      "actionItems": [
+        "Create bindings/python/scp_sdk/node.py with Node class and 4 async methods",
+        "Export Node from bindings/python/scp_sdk/__init__.py",
+        "Create bindings/typescript/src/node.ts with Node class and 4 async methods",
+        "Add Node lifecycle methods to bridge interface in internal/bridge.ts",
+        "Implement native adapter delegation in internal/native.ts",
+        "Add WASM adapter throwing 'not supported in browser'",
+        "Export Node from bindings/typescript/src/index.ts",
+        "Create bindings/swift/Sources/SCP/Node.swift with Node actor",
+        "Create bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Node.kt",
+        "Add unit tests for each SDK including WASM not-supported test"
+      ],
+      "blockedBy": [
+        "SCP-293",
+        "SCP-295"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "bindings": ["python", "typescript", "swift", "kotlin"]
+      }
+    },
+    {
+      "id": "SCP-297",
+      "title": "Add client-side validation for ContentPath, MimeType, and deploy_id in all SDK wrappers",
+      "gate": "gate-http-3",
+      "priority": "P2",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/context.py",
+        "bindings/typescript/src/context.ts",
+        "bindings/swift/Sources/SCP/Governance.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
+      ],
+      "description": "Validate ContentPath, MimeType, and deploy_id at the SDK layer before crossing the FFI boundary, producing clear language-native error messages instead of opaque Rust errors. ContentPath validation: reject traversal patterns (.., ./, //), backslashes, null bytes, control characters, percent-encoded bytes, query strings, fragments; enforce leading slash, max 1024 bytes. MimeType validation: reject CRLF, control characters; enforce type/subtype form. deploy_id validation: 1-128 bytes, ASCII alphanumeric plus '-' and '_'. Per §18.11.9.",
+      "acceptanceCriteria": [
+        "Python context.py validates ContentPath before FFI call",
+        "TypeScript context.ts validates ContentPath before FFI call",
+        "Swift Governance.swift validates ContentPath before FFI call",
+        "Kotlin CoroutineBridge.kt validates ContentPath before FFI call",
+        "ContentPath validation rejects '..' traversal in all 4 SDKs",
+        "ContentPath validation rejects backslashes in all 4 SDKs",
+        "ContentPath validation rejects null bytes in all 4 SDKs",
+        "ContentPath validation enforces leading '/' in all 4 SDKs",
+        "ContentPath validation enforces max 1024 bytes in all 4 SDKs",
+        "MimeType validation rejects CRLF in all 4 SDKs",
+        "MimeType validation enforces type/subtype form in all 4 SDKs",
+        "deploy_id validation rejects empty strings in all 4 SDKs",
+        "deploy_id validation rejects strings over 128 bytes in all 4 SDKs",
+        "deploy_id validation rejects non-ASCII-alphanumeric characters (except '-' and '_') in all 4 SDKs",
+        "Invalid input produces clear error message naming the invalid field and reason",
+        "Unit test per SDK: invalid ContentPath produces clear error",
+        "Unit test per SDK: invalid MimeType produces clear error",
+        "Unit test per SDK: invalid deploy_id produces clear error"
+      ],
+      "actionItems": [
+        "Add ContentPath validation function to Python context.py",
+        "Add MimeType validation function to Python context.py",
+        "Add deploy_id validation function to Python context.py",
+        "Add ContentPath validation to TypeScript context.ts",
+        "Add MimeType validation to TypeScript context.ts",
+        "Add deploy_id validation to TypeScript context.ts",
+        "Add ContentPath validation to Swift Governance.swift",
+        "Add MimeType validation to Swift Governance.swift",
+        "Add deploy_id validation to Swift Governance.swift",
+        "Add ContentPath validation to Kotlin CoroutineBridge.kt",
+        "Add MimeType validation to Kotlin CoroutineBridge.kt",
+        "Add deploy_id validation to Kotlin CoroutineBridge.kt",
+        "Add unit tests for all validation rules in each SDK"
+      ],
+      "blockedBy": [
+        "SCP-292"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.9 Structured Broadcast Content"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "bindings": ["python", "typescript", "swift", "kotlin"]
+      }
+    },
+    {
+      "id": "SCP-298",
+      "title": "E2E workflow test for broadcast publish, project, commit, serve, and rollback",
+      "gate": "gate-http-3",
+      "priority": "P2",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/tests/broadcast_lifecycle.rs",
+        "bindings/python/tests/test_broadcast_lifecycle.py",
+        "bindings/typescript/tests/broadcast-lifecycle.test.ts"
+      ],
+      "description": "Full end-to-end workflow test covering the complete broadcast content delivery lifecycle: node.startLocal() -> Identity.load() -> Context.create(broadcast) -> broadcastPublishAssets() -> node.enableSiteProjection() -> node.commitDeploy() -> HTTP GET returns content with correct Content-Type -> node.rollbackDeploy() -> HTTP GET returns previous deploy content. Primary implementation in Rust (crates/scp-node/tests/). Ideally also Python and TypeScript integration tests. Per §18.11.8-12.",
+      "acceptanceCriteria": [
+        "Rust test starts local node and publishes assets via broadcastPublishAssets",
+        "Rust test enables site projection with SiteConfig",
+        "Rust test commits deploy and verifies asset count returned",
+        "Rust test performs HTTP GET and receives correct Content-Type and body",
+        "Rust test rolls back deploy and verifies HTTP GET returns previous content",
+        "Rust test verifies security headers present on all responses",
+        "Test covers full lifecycle: publish -> project -> commit -> serve -> rollback",
+        "Test exercises deploy_id flow end-to-end (publish returns it, commit uses it)",
+        "Test passes in CI (no external dependencies required)"
+      ],
+      "actionItems": [
+        "Create crates/scp-node/tests/broadcast_lifecycle.rs with full E2E test",
+        "Test publish multiple assets with broadcastPublishAssets",
+        "Test enableSiteProjection with SiteConfig",
+        "Test commitDeploy and verify returned asset count",
+        "Test HTTP GET against projected content",
+        "Test rollbackDeploy and verify content reverts",
+        "Verify security headers on all responses",
+        "Optionally add Python and TypeScript integration tests"
+      ],
+      "blockedBy": [
+        "SCP-295",
+        "SCP-296"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.8 SDK Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.9 Structured Broadcast Content"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.10 Path-Based Projection Endpoints"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.11 Atomic Deploys"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.12 Site Configuration"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-node",
+        "bindings": ["python", "typescript"]
       }
     }
   ]
