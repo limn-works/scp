@@ -372,15 +372,15 @@ Transport + Data (relay-based, transport-agnostic)
 ## 11. Discovery and Addressing (~2 pages)
 
 ### 11.1 Protocol-Level Discovery
-- Discovery contexts: standard SCP contexts with open join policies and standardized discovery tools
+- Contexts with discovery tools: standard SCP contexts with open join policies and standardized discovery tools
 - Two-tier model: MLS members (bounded writers) + DID-authenticated readers (unbounded)
-- Bootstrap: SDK ships with default discovery context IDs (like DNS root servers)
-- Anyone can run a discovery context — no central authority
+- Bootstrap: SDK ships with default bootstrap context IDs (like DNS root servers)
+- Anyone can run a context with discovery tools — no central authority
 
 ### 11.2 Human-Readable Addressing
 - Five resolution mechanisms with graceful degradation:
   1. Petnames (local, zero infrastructure, always work)
-  2. Discovery context handles (SCP-native, DNS-free, community-governed)
+  2. Context handles (SCP-native, DNS-free, community-governed)
   3. Attestation-backed handles (external platform identity → DID reverse lookup)
   4. Domain handles (.well-known/scp extension, web compatibility)
   5. Unscoped resolution (try all layers)
@@ -632,7 +632,7 @@ Key points for the paper:
 - MessagePack: deterministic serialization
 
 ### D. Glossary
-- Context, DID, UCAN, MLS, Epoch, Sender Key, Routing ID, Capability Ceiling, Governance Model, Event Log, Provenance, Attestation, Discovery Context, etc.
+- Context, DID, UCAN, MLS, Epoch, Sender Key, Routing ID, Capability Ceiling, Governance Model, Event Log, Provenance, Attestation, Bootstrap Context, etc.
 
 ---
 

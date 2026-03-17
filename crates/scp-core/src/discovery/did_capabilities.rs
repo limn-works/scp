@@ -2,7 +2,7 @@
 //!
 //! Extracts `SCPCapabilities` service entries from DID documents resolved via
 //! `did:dht`. Any agent can publish capabilities in their DID document -- zero
-//! setup, zero registration, zero dependency on discovery contexts.
+//! setup, zero registration, zero dependency on contexts with discovery tools.
 //!
 //! Each individual capability string within an `SCPCapabilities` service
 //! endpoint is a validated [`CapabilityUri`] (ADR-041, §7.3.4.1). The
@@ -29,7 +29,7 @@ const SCP_CAPABILITIES_SERVICE_TYPE: &str = "SCPCapabilities";
 /// Capability entry extracted from a DID document's `SCPCapabilities` service.
 ///
 /// Represents the capabilities advertised by an agent in their DID document.
-/// Resolved by anyone who knows the agent's DID -- no discovery context
+/// Resolved by anyone who knows the agent's DID -- no context
 /// membership required. Each capability is a validated [`CapabilityUri`]
 /// (ADR-041, §7.3.4.1).
 ///

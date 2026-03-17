@@ -482,18 +482,18 @@ pub enum ProvenanceQuality {
 
 ### Context
 
-Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and discovery contexts (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. Discovery contexts are standard SCP contexts with open join policies and standardized tool schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
+Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and contexts with discovery tools (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. These are standard SCP contexts with open join policies and standardized tool schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
 
 ### Decision
 
-Implement `scp-core/discovery/` module. DID document capability resolution via did:dht (ADR-003). Discovery contexts as standard SCP contexts with standardized tool schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and discovery context queries.
+Implement `scp-core/discovery/` module. DID document capability resolution via did:dht (ADR-003). Contexts with discovery tools as standard SCP contexts with standardized tool schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and context queries.
 
 ### Rationale
 
-- **Two-tier membership over MLS-only:** MLS groups have practical size limits (~500 members for acceptable performance). Discovery contexts may serve thousands of readers. Separating writers (who process registrations as MLS application messages) from readers (who query via tool endpoints without MLS join) scales discovery beyond MLS group limits.
-- **DID document capabilities over central registry:** Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on discovery contexts. Discovery contexts add searchability for agents that don't know each other's DIDs.
-- **Standard schemas as conventions, not mandates:** The `agent_search`, `agent_register`, `agent_deregister` schemas are conventions that discovery contexts follow for interoperability. Custom tools (reputation scoring, category browsing, geographic filtering) are allowed beyond the standard set.
-- **Bootstrap defaults as DNS root analogues:** SDK ships with configurable default discovery context IDs, analogous to DNS root servers. Users can add custom discovery contexts. If defaults are unreachable, direct DID resolution still works.
+- **Two-tier membership over MLS-only:** MLS groups have practical size limits (~500 members for acceptable performance). Contexts may serve thousands of readers. Separating writers (who process registrations as MLS application messages) from readers (who query via tool endpoints without MLS join) scales discovery beyond MLS group limits.
+- **DID document capabilities over central registry:** Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery tools. Contexts add searchability for agents that don't know each other's DIDs.
+- **Standard schemas as conventions, not mandates:** The `agent_search`, `agent_register`, `agent_deregister` schemas are conventions that contexts with discovery tools follow for interoperability. Custom tools (reputation scoring, category browsing, geographic filtering) are allowed beyond the standard set.
+- **Bootstrap defaults as DNS root analogues:** SDK ships with configurable default bootstrap context IDs, analogous to DNS root servers. Users can add custom contexts with discovery tools. If defaults are unreachable, direct DID resolution still works.
 
 ### Implementation
 
@@ -504,8 +504,8 @@ Implement `scp-core/discovery/` module. DID document capability resolution via d
 ### Dependencies
 
 - **ADR-003 (DID):** DID document resolution for capability lookup. `SCPCapabilities` service extraction.
-- **ADR-010 (Tool Registration/Invocation):** Discovery contexts use standard tool schemas. Registration/search are tool invocations.
-- **ADR-008 (Context Lifecycle):** Discovery contexts are standard SCP contexts with specific configuration.
+- **ADR-010 (Tool Registration/Invocation):** Contexts use standard tool schemas. Registration/search are tool invocations.
+- **ADR-008 (Context Lifecycle):** These are standard SCP contexts with specific configuration.
 
 ### Acceptance Criteria
 
@@ -563,7 +563,7 @@ agent_deregister(did) -> { removed }
 2. **DID document capability resolution:**
    - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve DID via did:dht, extract `SCPCapabilities` from service array, cache in local contact index. Resolution returns all verification methods including the optional `#agent` VM (ADR-039), enabling callers to determine whether a DID has agent delegation enabled.
 
-3. **Discovery context standard tools:**
+3. **Context standard tools:**
    - `agent_search`, `agent_register`, `agent_deregister` implemented per schema.
    - Custom tools (reputation scoring, category browsing, geographic filtering) allowed beyond standard.
 
@@ -582,23 +582,23 @@ agent_deregister(did) -> { removed }
 
 7. **`unified_search(query, known_contexts) -> Result<DiscoveryResult, DiscoveryError>`**
    - Local contact cache (instant).
-   - Each known discovery context (parallel tool calls).
+   - Each known context (parallel tool calls).
    - Merge, deduplicate, rank results.
    - Returns results with provenance per entry.
 
 8. **Bootstrap:**
-   - SDK ships configurable default discovery context IDs.
+   - SDK ships configurable default bootstrap context IDs.
    - Auto-query on first identity creation (opt-out).
    - Fallback to direct DID resolution + manual context ID sharing.
 
 9. **Privacy:**
-   - Registration opt-in per discovery context.
+   - Registration opt-in per context.
    - Metadata controlled per registry.
    - Withdrawable via `agent_deregister`.
    - Agent can publish different capability subsets to different registries.
 
 10. **Consistency:**
-    - All writes recorded in discovery context's Merkle event log (ADR-011).
+    - All writes recorded in context's Merkle event log (ADR-011).
     - Readers can request inclusion proofs to verify registration and audit registry integrity.
 
 ### Scope
@@ -609,7 +609,7 @@ agent_deregister(did) -> { removed }
 |------|---------|
 | `mod.rs` | Module root, `DiscoveryQuery`, `DiscoveryResult`, re-exports |
 | `did_capabilities.rs` | `resolve_capabilities`, DID document `SCPCapabilities` extraction, local contact cache |
-| `context.rs` | Discovery context standard tool implementations (`agent_search`, `agent_register`, `agent_deregister`) |
+| `context.rs` | Context standard tool implementations (`agent_search`, `agent_register`, `agent_deregister`) |
 | `search.rs` | `unified_search`, result merging, deduplication, ranking |
 | `bootstrap.rs` | `DiscoveryBootstrap`, default context configuration, auto-query logic |
 

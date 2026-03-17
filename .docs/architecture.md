@@ -471,20 +471,20 @@ State:
 ```
 Responsibilities:
   • DID document capability resolution — resolve capabilities from DID service arrays
-  • Discovery context management — join/leave discovery contexts, bootstrap defaults
-  • Unified search — merge results from local contacts and discovery contexts
-  • Agent registration/deregistration in discovery contexts
+  • Context management — join/leave contexts with discovery tools, bootstrap defaults
+  • Unified search — merge results from local contacts and contexts with discovery tools
+  • Agent registration/deregistration in contexts with discovery tools
   • Local contact index — cache of resolved DID documents for instant lookup
 
 Depends on:
-  • Context Manager (discovery contexts are standard contexts — join, tool invocation)
+  • Context Manager (contexts with discovery tools are standard contexts — join, tool invocation)
   • Identity Manager (DID resolution for capability lookup, DID document updates)
   • Transport Adapter (DID document publication)
 
 State:
   • Local contact index (cached DID documents, TTL-based refresh)
-  • Known discovery context IDs (defaults + user-added)
-  • Registration state per discovery context
+  • Known bootstrap context IDs (defaults + user-added)
+  • Registration state per context
 ```
 
 **Crypto Layer** (wraps external libraries — see .docs/specs/09-security-model.md §9.5 for primitive specification, §9.7 for MLS integration):

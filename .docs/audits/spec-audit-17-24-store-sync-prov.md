@@ -379,7 +379,7 @@ The findings are organized per-file, then by severity.
 ### [22.2] Scope Disambiguation for Single-Label Domains
 - **Category**: Missing edge cases
 - **Location**: Section 22.2, lines 33-38
-- **What's missing**: Scope disambiguation relies on the presence of a `.` to distinguish domain handles from discovery context handles. But single-label domains exist (e.g., `localhost`, `.internal` TLDs, some ccTLDs like `.ai`). `alice@ai` -- is this a discovery context named "ai" or the domain `ai`?
+- **What's missing**: Scope disambiguation relies on the presence of a `.` to distinguish domain handles from context handles. But single-label domains exist (e.g., `localhost`, `.internal` TLDs, some ccTLDs like `.ai`). `alice@ai` -- is this a context with discovery tools named "ai" or the domain `ai`?
 - **Why it matters**: The disambiguation rule is fragile. In practice, new TLDs and single-label domains mean the "contains a dot" heuristic has edge cases.
 - **Severity**: LOW
 
@@ -387,10 +387,10 @@ The findings are organized per-file, then by severity.
 - **Category**: Security-relevant omissions
 - **Location**: Section 22.3.1, line 148
 - **What's missing**: "All handle tool requests MUST carry a DID signature over the request payload." But: (a) What is "the request payload" -- the JSON body? A canonical serialization? (b) What signature scheme -- Ed25519 over the raw bytes? JWS? (c) Where is the signature carried -- an HTTP header? A field in the request body? A UCAN?
-- **Why it matters**: Without specifying the signature format, implementations cannot verify each other's registrations. Cross-implementation discovery context participation would fail.
+- **Why it matters**: Without specifying the signature format, implementations cannot verify each other's registrations. Cross-implementation context participation would fail.
 - **Severity**: HIGH
 
-### [22.3.2] Discovery Context Naming Normalization Not Deterministic
+### [22.3.2] Scope Naming Normalization Not Deterministic
 - **Category**: Underspecified algorithms
 - **Location**: Section 22.3.2, lines 154-155
 - **What's missing**: "Normalized: lowercased, spaces replaced with hyphens, non-alphanumeric characters (except hyphens) removed." But: (a) What about underscores? The `local-part` allows underscores but the scope normalization removes "non-alphanumeric except hyphens." (b) What about consecutive hyphens after normalization (e.g., "My -- Context" -> "my---context" or "my-context")? (c) What about leading/trailing hyphens after normalization?
@@ -401,7 +401,7 @@ The findings are organized per-file, then by severity.
 - **Category**: Ambiguous state transitions
 - **Location**: Section 22.3.2, line 160
 - **What's missing**: "If multiple contexts share a name, the SDK uses the most recently used or user-preferred context." This is implementation guidance, not a protocol rule. No default is specified. "Most recently used" requires tracking usage history. "User-preferred" requires explicit configuration. Neither is mandatory.
-- **Why it matters**: Two SDKs resolving the same address could resolve to different discovery contexts, breaking resolution consistency.
+- **Why it matters**: Two SDKs resolving the same address could resolve to different contexts with discovery tools, breaking resolution consistency.
 - **Severity**: MEDIUM
 
 ### [22.4] Petname Maximum Length Not Specified
@@ -415,13 +415,13 @@ The findings are organized per-file, then by severity.
 - **Category**: Missing constants/defaults
 - **Location**: Section 22.5.1, lines 263-279
 - **What's missing**: The `attestation_lookup` tool returns `results: [{...}]` with no pagination mechanism. If a popular handle has hundreds of claiming DIDs, the response could be very large.
-- **Why it matters**: Unbounded response size in a discovery context tool call.
+- **Why it matters**: Unbounded response size in a discovery tool call.
 - **Severity**: LOW
 
 ### [22.5.2] Auto-Registration Failure Behavior Not Specified
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 22.5.2, lines 286-293
-- **What's missing**: "SDK SHOULD register the mapping in known discovery contexts." But what happens when registration fails (discovery context unreachable, registration rejected by governance, network error)? Is the attestation still created? Is the user notified? Is registration retried?
+- **What's missing**: "SDK SHOULD register the mapping in known contexts with discovery tools." But what happens when registration fails (context unreachable, registration rejected by governance, network error)? Is the attestation still created? Is the user notified? Is registration retried?
 - **Why it matters**: Silent registration failure means the attestation exists but is not discoverable via reverse-lookup, which the user might not realize.
 - **Severity**: LOW
 
@@ -442,14 +442,14 @@ The findings are organized per-file, then by severity.
 ### [22.8.2] Unscoped Resolution Timeout Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 22.8.2, lines 443-461
-- **What's missing**: Unscoped resolution queries "in parallel: domain handles, discovery contexts, attestation indexes." No timeout is specified for the parallel resolution phase. If one discovery context is slow, does the resolver wait indefinitely? Return partial results after a timeout?
-- **Why it matters**: In practice, resolution latency determines UX quality. Without a timeout, a single slow discovery context blocks the entire resolution.
+- **What's missing**: Unscoped resolution queries "in parallel: domain handles, contexts with discovery tools, attestation indexes." No timeout is specified for the parallel resolution phase. If one context is slow, does the resolver wait indefinitely? Return partial results after a timeout?
+- **Why it matters**: In practice, resolution latency determines UX quality. Without a timeout, a single slow context blocks the entire resolution.
 - **Severity**: MEDIUM
 
 ### [22.8.4] Resolution Cache Invalidation Not Specified
 - **Category**: Missing edge cases
 - **Location**: Section 22.8.4, line 479
-- **What's missing**: Cache entries have per-layer TTLs but no invalidation mechanism beyond TTL expiry. If a handle is deregistered from a discovery context, the cache could serve stale results for up to 15 minutes (the discovery context TTL). No push-based invalidation or event-based cache clearing is specified.
+- **What's missing**: Cache entries have per-layer TTLs but no invalidation mechanism beyond TTL expiry. If a handle is deregistered from a context with discovery tools, the cache could serve stale results for up to 15 minutes (the context TTL). No push-based invalidation or event-based cache clearing is specified.
 - **Why it matters**: 15 minutes of stale handle resolution could lead a user to contact the wrong DID.
 - **Severity**: LOW
 

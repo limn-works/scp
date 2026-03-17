@@ -377,9 +377,9 @@ pub struct RoleDefinition {
 
    **Broadcast-specific roles.** Broadcast contexts (§5.14) add two roles that reuse existing primitives:
    - `author` — `MessagesWrite`, `MessagesRead`, `ToolInvokeAll`. Authors are bounded. Added via `RoleAssigned` event.
-   - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on DID-authenticated registration, following the discovery context reader-tier pattern (§6.2.2B). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
+   - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
 
-   The auto-grant subscriber pattern extends the discovery context two-tier model — it is not a new primitive.
+   The auto-grant subscriber pattern extends the context two-tier model — it is not a new primitive.
 
 3. **`assign_role(context: &ContextHandle, member_did: &DID, role: &str, assigner_did: &DID) -> Result<Vec<UcanToken>, ContextError>`**
    - Verifies assigner has `RoleAssign` capability (via UCAN validation).

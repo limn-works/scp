@@ -7,7 +7,7 @@
 //! inspection. Four addressing mechanisms are supported:
 //!
 //! - **Petnames** -- local, private, instant resolution (§22.4).
-//! - **Discovery context handles** -- SCP-native, DNS-free, community-governed (§22.3).
+//! - **Context handles** -- SCP-native, DNS-free, community-governed (§22.3).
 //! - **Attestation-backed handles** -- external identity bridge via reverse-lookup (§22.5).
 //! - **Domain handles** -- optional web on-ramp via `.well-known/scp` (§22.6).
 //!
@@ -32,7 +32,7 @@ pub const MAX_LOCAL_PART_LENGTH: usize = 64;
 /// Default TTL for domain handle cache entries (1 hour per §22.8.4).
 pub const DOMAIN_HANDLE_CACHE_TTL: Duration = Duration::from_secs(3600);
 
-/// Default TTL for discovery context handle cache entries (15 minutes per §22.8.4).
+/// Default TTL for context handle cache entries (15 minutes per §22.8.4).
 pub const DISCOVERY_HANDLE_CACHE_TTL: Duration = Duration::from_secs(900);
 
 /// TTL for petname cache entries (effectively indefinite: 1 year per §22.8.4).
@@ -68,7 +68,7 @@ pub enum AddressType {
 
 /// The target of a handle registration -- what the handle points to.
 ///
-/// Used when registering handles in a discovery context via `handle_register`.
+/// Used when registering handles in a context with discovery tools via `handle_register`.
 ///
 /// See §22.3.1 Handle Tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +115,7 @@ pub enum TrustLevel {
     DomainVerified,
     /// Cryptographically signed, platform-dependent verification.
     AttestationVerified,
-    /// Community-governed, discovery context controls binding.
+    /// Community-governed, context controls binding.
     DiscoveryContextVerified,
 }
 
@@ -152,9 +152,9 @@ impl TrustLevel {
 pub struct ResolutionPath {
     /// The resolution layer that produced this result.
     pub layer: ResolutionLayer,
-    /// Human-readable source identifier (discovery context name, domain, platform).
+    /// Human-readable source identifier (context name, domain, platform).
     pub source: String,
-    /// Discovery context ID (hex), present only for the `DiscoveryContext` layer.
+    /// Context ID (hex), present only for the `DiscoveryContext` layer.
     pub source_id: Option<String>,
     /// Unix timestamp (seconds) when resolution occurred.
     pub resolved_at: u64,
@@ -165,7 +165,7 @@ pub struct ResolutionPath {
 pub enum ResolutionLayer {
     /// Resolved via local petname lookup.
     Petname,
-    /// Resolved via a discovery context handle lookup.
+    /// Resolved via a context with discovery tools handle lookup.
     DiscoveryContext,
     /// Resolved via attestation-backed handle reverse-lookup.
     Attestation,
@@ -247,12 +247,12 @@ impl AddressResolution {
 /// See §22.2 Address Format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedAddress {
-    /// Scoped address with no `.` in scope -- discovery context handle.
+    /// Scoped address with no `.` in scope -- context handle.
     /// Example: `alice@cooking-community`
     DiscoveryHandle {
         /// The local-part (handle name).
         local_part: String,
-        /// The discovery context scope name.
+        /// The context scope name.
         scope: String,
     },
     /// Scoped address with `.` in scope -- domain handle (with attestation fallback).
@@ -453,7 +453,7 @@ struct CacheEntry {
 /// determined by the resolution layer per §22.8.4:
 /// - Petnames: indefinite (user-managed).
 /// - Domain handles: ~1 hour.
-/// - Discovery context handles: ~15 minutes.
+/// - Context handles: ~15 minutes.
 /// - Attestation handles: match attestation renewal intervals.
 ///
 /// See §22.8.4 Resolution Caching.
@@ -544,7 +544,7 @@ impl Default for ResolutionCache {
 /// SDK-level type implementing multi-path address resolution.
 ///
 /// The `AddressResolver` orchestrates resolution across all four addressing
-/// layers (petnames, discovery context handles, attestation handles, domain
+/// layers (petnames, context handles, attestation handles, domain
 /// handles). It is not a wire-protocol component -- it is standardized SDK
 /// behavior per §22.8.
 ///
@@ -578,8 +578,8 @@ impl AddressResolver {
     ///
     /// * `address` -- The human-readable address string to resolve.
     /// * `petname_store` -- Local petname store for instant lookup.
-    /// * `handle_querier` -- Querier for discovery context handle lookups.
-    /// * `known_contexts` -- Known discovery context scope names and their IDs.
+    /// * `handle_querier` -- Querier for context handle lookups.
+    /// * `known_contexts` -- Known context scope names and their IDs.
     /// * `known_domains` -- Configured domains to check for domain handles during
     ///   unscoped resolution (§22.8.2 step 2a).
     ///
@@ -648,7 +648,7 @@ impl AddressResolver {
                     return Ok(results);
                 }
 
-                // Then check all discovery contexts.
+                // Then check all contexts with discovery tools.
                 for (scope, context_id) in known_contexts {
                     let handle_results =
                         handle_querier.lookup_handle(context_id, &name, None).await;
@@ -723,13 +723,13 @@ pub trait PetnameStore {
 
 /// Trait for querying remote handle resolution layers.
 ///
-/// Abstracts discovery context handle lookup, attestation reverse-lookup,
+/// Abstracts context handle lookup, attestation reverse-lookup,
 /// and domain handle resolution.
 #[allow(async_fn_in_trait)]
 pub trait HandleQuerier {
-    /// Looks up a handle in a discovery context.
+    /// Looks up a handle in a context with discovery tools.
     ///
-    /// Returns resolution results from the specified discovery context.
+    /// Returns resolution results from the specified context.
     async fn lookup_handle(
         &self,
         context_id: &ContextId,
@@ -745,7 +745,7 @@ pub trait HandleQuerier {
     /// Looks up an attestation-backed handle via reverse-lookup.
     ///
     /// Returns resolution results from attestation indexes in known
-    /// discovery contexts.
+    /// contexts with discovery tools.
     async fn lookup_attestation_handle(
         &self,
         handle: &str,

@@ -144,18 +144,18 @@ public enum DiscoveryBridge {
 
     // MARK: - Handle registry bridge types (§22.3.1)
 
-    /// Register a handle in a discovery context.
+    /// Register a handle in a context with discovery tools.
     public typealias HandleRegisterFn = @Sendable (
         _ discoveryContextId: String, _ handle: String, _ targetJson: String,
         _ registrantDid: String, _ description: String?, _ tags: [String]?
     ) throws -> String
 
-    /// Look up a handle in a discovery context.
+    /// Look up a handle in a context with discovery tools.
     public typealias HandleLookupFn = @Sendable (
         _ discoveryContextId: String, _ handle: String, _ typeFilter: String?
     ) throws -> String
 
-    /// Deregister a handle from a discovery context.
+    /// Deregister a handle from a context with discovery tools.
     public typealias HandleDeregisterFn = @Sendable (
         _ discoveryContextId: String, _ handle: String, _ did: String
     ) throws -> String
@@ -462,10 +462,10 @@ public func getPetnameForContext(
 
 // MARK: - Handle registry operations (§22.3.1)
 
-/// Registers a handle in a discovery context.
+/// Registers a handle in a context with discovery tools.
 ///
 /// - Parameters:
-///   - discoveryContextId: ID of the discovery context.
+///   - discoveryContextId: ID of the context.
 ///   - handle: The handle string to register.
 ///   - targetJson: JSON describing the target.
 ///   - registrantDid: DID of the registrant.
@@ -486,10 +486,10 @@ public func registerHandle(
     try handleRegisterFn(discoveryContextId, handle, targetJson, registrantDid, description, tags)
 }
 
-/// Looks up a handle in a discovery context.
+/// Looks up a handle in a context with discovery tools.
 ///
 /// - Parameters:
-///   - discoveryContextId: ID of the discovery context.
+///   - discoveryContextId: ID of the context.
 ///   - handle: The handle string to look up.
 ///   - typeFilter: Optional filter: ``"identity"`` or ``"context"``.
 ///   - handleLookupFn: Bridge function override for testing.
@@ -503,10 +503,10 @@ public func lookupHandle(
     try handleLookupFn(discoveryContextId, handle, typeFilter)
 }
 
-/// Deregisters a handle from a discovery context.
+/// Deregisters a handle from a context with discovery tools.
 ///
 /// - Parameters:
-///   - discoveryContextId: ID of the discovery context.
+///   - discoveryContextId: ID of the context.
 ///   - handle: The handle string to deregister.
 ///   - did: DID of the registrant requesting deregistration.
 ///   - handleDeregisterFn: Bridge function override for testing.

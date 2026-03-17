@@ -414,7 +414,7 @@ This is a P0 gap for the Identity document — the multi-key architecture and sh
 | §22.2 Address Format | **P** | Canonical format, normalization — **normative** |
 | §22.2.1 Address Types | **P** | Identity vs context addresses — normative |
 | §22.2.2 Normalization | **P** | Normalization algorithm — normative |
-| §22.3 Discovery Context Handles | **P** | Handle registration, lookup, deregistration — normative |
+| §22.3 Context Handles | **P** | Handle registration, lookup, deregistration — normative |
 | §22.4 Petnames | **P** | Local name assignment — normative |
 | §22.5 Attestation-Backed Handles | **P** | Reverse lookup — normative |
 | §22.6 Domain Handles | **P** | .well-known/scp handles map — normative |

@@ -37,8 +37,8 @@ pub fn petname_maps() -> &'static Mutex<HashMap<String, PetnameMap>> {
     MAPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Global handle registries keyed by discovery context ID.
-/// Each discovery context has its own handle registry (§22.3.1).
+/// Global handle registries keyed by bootstrap context ID.
+/// Each context has its own handle registry (§22.3.1).
 pub fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
     static REGISTRIES: OnceLock<Mutex<HashMap<String, HandleRegistry>>> = OnceLock::new();
     REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -294,7 +294,7 @@ pub fn handle_entry_to_resolution(
 // ---------------------------------------------------------------------------
 
 /// A [`HandleQuerier`] implementation that queries the global in-memory handle registries.
-/// Used by `address_resolve` for the discovery context handle lookup layer.
+/// Used by `address_resolve` for the context handle lookup layer.
 pub struct LocalHandleQuerier;
 
 impl HandleQuerier for LocalHandleQuerier {
@@ -342,8 +342,8 @@ impl HandleQuerier for LocalHandleQuerier {
         _platform: Option<&str>,
     ) -> Vec<AddressResolution> {
         // Attestation handle resolution requires querying attestation indexes
-        // in discovery contexts. Not available in FFI bridge — requires
-        // discovery context query infrastructure.
+        // in contexts with discovery tools. Not available in FFI bridge — requires
+        // context query infrastructure.
         Vec::new()
     }
 }

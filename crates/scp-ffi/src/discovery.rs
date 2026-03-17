@@ -14,9 +14,9 @@
 //! - [`py_petname_get_for_context`] -- Get the petname assigned to a context.
 //! - [`py_petname_set_context`] -- Set a petname for a context.
 //! - [`py_petname_remove_context`] -- Remove a petname from a context.
-//! - [`py_handle_register`] -- Register a handle in a discovery context.
-//! - [`py_handle_lookup`] -- Look up a handle in a discovery context.
-//! - [`py_handle_deregister`] -- Deregister a handle from a discovery context.
+//! - [`py_handle_register`] -- Register a handle in a context with discovery tools.
+//! - [`py_handle_lookup`] -- Look up a handle in a context with discovery tools.
+//! - [`py_handle_deregister`] -- Deregister a handle from a context with discovery tools.
 //! - [`py_scope_register`] -- Register a scope name (§22.3.5, ADR-043).
 //! - [`py_scope_lookup`] -- Look up a scope name (§22.3.5, ADR-043).
 //! - [`py_scope_deregister`] -- Deregister a scope name (§22.3.5, ADR-043).
@@ -622,11 +622,11 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
 // Handle registry bridge functions (§22.3.1)
 // ---------------------------------------------------------------------------
 
-/// Registers a handle in a discovery context.
+/// Registers a handle in a context with discovery tools.
 ///
 /// # Arguments
 ///
-/// * `discovery_context_id` -- The discovery context ID.
+/// * `discovery_context_id` -- The bootstrap context ID.
 /// * `handle` -- The local-part to register (e.g., `"alice"`).
 /// * `target_json` -- JSON string describing the target. Either
 ///   `{"type": "identity", "did": "did:..."}` or
@@ -689,11 +689,11 @@ pub fn py_handle_register(
     })
 }
 
-/// Looks up a handle in a discovery context.
+/// Looks up a handle in a context with discovery tools.
 ///
 /// # Arguments
 ///
-/// * `discovery_context_id` -- The discovery context ID.
+/// * `discovery_context_id` -- The bootstrap context ID.
 /// * `handle` -- The local-part to look up.
 /// * `type_filter` -- Optional type filter: `"identity"` or `"context"`.
 ///
@@ -753,13 +753,13 @@ pub fn py_handle_lookup(
     })
 }
 
-/// Deregisters a handle from a discovery context.
+/// Deregisters a handle from a context with discovery tools.
 ///
 /// Only succeeds if the provided DID matches the handle owner.
 ///
 /// # Arguments
 ///
-/// * `discovery_context_id` -- The discovery context ID.
+/// * `discovery_context_id` -- The bootstrap context ID.
 /// * `handle` -- The local-part to deregister.
 /// * `did` -- The registrant's DID (must match the handle owner).
 ///
@@ -1015,14 +1015,14 @@ pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyR
 /// Resolves a human-readable address string via multi-path resolution.
 ///
 /// Uses the caller's petname map and all known handle registries as
-/// discovery context handles. Results are sorted by trust level (descending).
+/// context handles. Results are sorted by trust level (descending).
 ///
 /// # Arguments
 ///
 /// * `owner_did` -- The DID of the identity whose petname map to use.
 /// * `address` -- The address string to resolve.
 /// * `known_contexts_json` -- Optional JSON object mapping scope names to
-///   discovery context IDs, e.g., `{"cooking": "ctx-abc"}`. If absent,
+///   bootstrap context IDs, e.g., `{"cooking": "ctx-abc"}`. If absent,
 ///   all known handle registries are used with their context IDs as scope
 ///   names.
 ///

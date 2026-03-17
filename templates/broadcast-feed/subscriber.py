@@ -42,7 +42,7 @@ async def join_feed(subscriber: Identity, context_id: str) -> Context:
     # Create a Context handle for the existing broadcast context.
     # In production, the context_id and relay info come from discovery
     # (spec section 5.14.11) -- shared via URI, .well-known/scp, or
-    # discovery context registration.
+    # context registration.
     ctx = await Context.create(
         creator=subscriber,
         ceiling=[],

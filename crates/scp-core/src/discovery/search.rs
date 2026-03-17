@@ -1,7 +1,7 @@
 //! Unified discovery search with result merging.
 //!
 //! Implements `unified_search` per ADR-020 acceptance criterion 7: search local
-//! contact cache (instant), query each known discovery context (parallel tool
+//! contact cache (instant), query each known context (parallel tool
 //! calls), merge, deduplicate, and rank results. Returns results with
 //! provenance per entry.
 //!
@@ -35,19 +35,19 @@ pub trait ContactCache {
 // ContextQuerier trait
 // ---------------------------------------------------------------------------
 
-/// Trait for querying a remote discovery context.
+/// Trait for querying a remote context.
 ///
-/// Each known discovery context is queried via its `agent_search` tool
+/// Each known context is queried via its `agent_search` tool
 /// endpoint. Implementations handle the network transport and response
 /// parsing.
 #[allow(async_fn_in_trait)]
 pub trait ContextQuerier {
-    /// Queries a single discovery context for results matching the given
+    /// Queries a single context for results matching the given
     /// search parameters.
     ///
     /// # Arguments
     ///
-    /// * `context_id` -- The discovery context to query.
+    /// * `context_id` -- The context to query.
     /// * `params` -- The search parameters (capability filter, keywords, limit).
     ///
     /// # Errors
@@ -70,7 +70,7 @@ pub trait ContextQuerier {
 ///
 /// Execution strategy per ADR-020 acceptance criterion 7:
 /// 1. Search local contact cache (instant, no network).
-/// 2. Query each known discovery context in parallel.
+/// 2. Query each known context in parallel.
 /// 3. Merge all results, deduplicating by DID.
 /// 4. Rank by relevance score (descending).
 ///
@@ -79,9 +79,9 @@ pub trait ContextQuerier {
 /// # Arguments
 ///
 /// * `query` -- The discovery query (capability filter, keywords, min history).
-/// * `known_contexts` -- Discovery context IDs to query in parallel.
+/// * `known_contexts` -- Context IDs to query in parallel.
 /// * `cache` -- Local contact cache for instant lookup.
-/// * `querier` -- Remote discovery context querier.
+/// * `querier` -- Remote context querier.
 ///
 /// # Errors
 ///
@@ -98,7 +98,7 @@ pub async fn unified_search<C: ContactCache, Q: ContextQuerier>(
     // Step 1: Search local contact cache (instant).
     let local_entries = cache.search_local(query);
 
-    // Step 2: Query each known discovery context in parallel.
+    // Step 2: Query each known context in parallel.
     let search_params = query_to_search_params(query);
     let remote_results = query_contexts_parallel(known_contexts, &search_params, querier).await;
 
@@ -149,7 +149,7 @@ fn query_to_search_params(query: &DiscoveryQuery) -> AgentSearchParams {
     }
 }
 
-/// Queries multiple discovery contexts in parallel, collecting successful
+/// Queries multiple contexts with discovery tools in parallel, collecting successful
 /// results. Individual failures are silently tolerated.
 #[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
 async fn query_contexts_parallel<Q: ContextQuerier>(
@@ -175,7 +175,7 @@ async fn query_contexts_parallel<Q: ContextQuerier>(
 }
 
 /// Deduplicates entries by DID, keeping the entry with the highest relevance
-/// score. When scores tie, the entry with provenance from a discovery context
+/// score. When scores tie, the entry with provenance from a context with discovery tools
 /// (non-local) is preferred over local cache entries.
 fn deduplicate_entries(entries: Vec<DiscoveryResultEntry>) -> Vec<DiscoveryResultEntry> {
     let mut by_did: HashMap<DID, DiscoveryResultEntry> = HashMap::new();
@@ -214,7 +214,7 @@ fn deduplicate_entries(entries: Vec<DiscoveryResultEntry>) -> Vec<DiscoveryResul
 /// Scoring factors:
 /// - Capability match ratio: fraction of queried capabilities the entry has.
 /// - Keyword match count: number of keywords that appear in capabilities or DID.
-/// - Source bonus: entries from discovery contexts get a small boost.
+/// - Source bonus: entries from contexts with discovery tools get a small boost.
 ///
 /// Entries are sorted by descending relevance score.
 fn rank_entries(

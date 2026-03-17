@@ -14,9 +14,9 @@
 //! - [`petname_resolve_context`] -- Resolve a petname to context IDs.
 //! - [`petname_get_for_did`] -- Get the petname for a DID.
 //! - [`petname_get_for_context`] -- Get the petname for a context.
-//! - [`handle_register`] -- Register a handle in a discovery context.
-//! - [`handle_lookup`] -- Look up a handle in a discovery context.
-//! - [`handle_deregister`] -- Deregister a handle from a discovery context.
+//! - [`handle_register`] -- Register a handle in a context with discovery tools.
+//! - [`handle_lookup`] -- Look up a handle in a context with discovery tools.
+//! - [`handle_deregister`] -- Deregister a handle from a context with discovery tools.
 //! - [`address_resolve`] -- Resolve an address via multi-path resolution.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
@@ -443,7 +443,7 @@ pub fn petname_get_for_context(
 // Handle registry bridge functions (§22.3.1)
 // ---------------------------------------------------------------------------
 
-/// Registers a handle in a discovery context. Returns JSON result.
+/// Registers a handle in a context with discovery tools. Returns JSON result.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_register(
@@ -485,7 +485,7 @@ pub fn handle_register(
     })
 }
 
-/// Looks up a handle in a discovery context. Returns JSON result.
+/// Looks up a handle in a context with discovery tools. Returns JSON result.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_lookup(
@@ -529,7 +529,7 @@ pub fn handle_lookup(
     })
 }
 
-/// Deregisters a handle from a discovery context. Returns JSON result.
+/// Deregisters a handle from a context with discovery tools. Returns JSON result.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_deregister(

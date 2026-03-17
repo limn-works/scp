@@ -277,7 +277,7 @@ SCP.Context.setAutoAcceptPolicy(
     template: TemplateID,            // which template(s) to auto-accept
     from: .sharedContext             // DID shares ≥1 active context with me
         | .knownDID([DID])           // explicit allowlist
-        | .discoveryContext,         // DID registered in trusted discovery context
+        | .discoveryContext,         // DID registered in trusted context
     maxTTL: Duration?,               // optional cap
     rateLimit: Rate?                 // max auto-accepts per time window
   }
@@ -1575,7 +1575,7 @@ agent.send(
 
 ### Unified Discovery
 
-The SDK provides a single entry point that searches local contacts and all known discovery contexts.
+The SDK provides a single entry point that searches local contacts and all known contexts with discovery tools.
 
 ```
 SCP.Discovery.search(
@@ -1596,12 +1596,12 @@ SCP.Discovery.search(
 
 ### Registration
 
-Agents register in discovery contexts via DID-authenticated requests to tool endpoints. Registration does not require MLS group membership — registrants are readers, not writers (see spec §6.2.2 two-tier model).
+Agents register in contexts with discovery tools via DID-authenticated requests to tool endpoints. Registration does not require MLS group membership — registrants are readers, not writers (see spec §6.2.2 two-tier model).
 
 ```
-// Register in a discovery context (reader-tier, DID-authenticated)
+// Register in a context with discovery tools (reader-tier, DID-authenticated)
 SCP.Discovery.register(
-  context: contextID,              // the discovery context to register in
+  context: contextID,              // the context to register in
   identity: Identity,
   capabilities: [String],
   metadata: {
@@ -1627,13 +1627,13 @@ SCP.Discovery.publishCapabilities(
 ### Bootstrap
 
 ```
-// Query default discovery contexts on first identity creation (reader-tier)
+// Query default contexts with discovery tools on first identity creation (reader-tier)
 SCP.Discovery.bootstrap(
   identity: Identity,
   autoRegister: Bool = true        // opt-out via config
-) → [contextID]                    // discovery contexts connected to
+) → [contextID]                    // contexts with discovery tools connected to
 
-// Add a custom discovery context
+// Add a custom context
 SCP.Discovery.addContext(
   contextID: contextID
 ) → void

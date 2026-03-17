@@ -123,7 +123,7 @@ interface DiscoveryBindings {
 
     // Handle registry operations (§22.3.1)
 
-    /** Registers a handle in a discovery context. Returns JSON result. */
+    /** Registers a handle in a context with discovery tools. Returns JSON result. */
     @Suppress("LongParameterList")
     fun handleRegister(
         discoveryContextId: String,
@@ -134,14 +134,14 @@ interface DiscoveryBindings {
         tags: List<String>?,
     ): String
 
-    /** Looks up a handle in a discovery context. Returns JSON result. */
+    /** Looks up a handle in a context with discovery tools. Returns JSON result. */
     fun handleLookup(
         discoveryContextId: String,
         handle: String,
         typeFilter: String?,
     ): String
 
-    /** Deregisters a handle from a discovery context. Returns JSON result. */
+    /** Deregisters a handle from a context with discovery tools. Returns JSON result. */
     fun handleDeregister(
         discoveryContextId: String,
         handle: String,
@@ -362,9 +362,9 @@ class DiscoveryBridge internal constructor(
     // Handle registry operations (§22.3.1)
 
     /**
-     * Registers a handle in a discovery context.
+     * Registers a handle in a context with discovery tools.
      *
-     * @param discoveryContextId ID of the discovery context.
+     * @param discoveryContextId ID of the context.
      * @param handle The handle string to register.
      * @param targetJson JSON describing the target.
      * @param registrantDid DID of the registrant.
@@ -393,9 +393,9 @@ class DiscoveryBridge internal constructor(
         }
 
     /**
-     * Looks up a handle in a discovery context.
+     * Looks up a handle in a context with discovery tools.
      *
-     * @param discoveryContextId ID of the discovery context.
+     * @param discoveryContextId ID of the context.
      * @param handle The handle string to look up.
      * @param typeFilter Optional filter: "identity" or "context".
      * @return JSON string with a results array of matching entries.
@@ -410,9 +410,9 @@ class DiscoveryBridge internal constructor(
         }
 
     /**
-     * Deregisters a handle from a discovery context.
+     * Deregisters a handle from a context with discovery tools.
      *
-     * @param discoveryContextId ID of the discovery context.
+     * @param discoveryContextId ID of the context.
      * @param handle The handle string to deregister.
      * @param did DID of the registrant requesting deregistration.
      * @return JSON string with a removed boolean.

@@ -34,10 +34,10 @@ Older audit findings moved from MEMORY.md for space. Still valid unless supersed
 
 ### CRITICAL: MultiLayerCorroborated trust level is trivially gameable
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.7, 22.8.2, 22.10.2
-- Single attacker controls domain + discovery context + attestation = highest trust
+- Single attacker controls domain + context + attestation = highest trust
 - No independence verification between corroborating layers
 
-### CRITICAL: Discovery context governance capture = total namespace hijack
+### CRITICAL: Context governance capture = total namespace hijack
 - File: `.docs/specs/22-human-readable-addressing.md` Section 22.3.4
 
 ### HIGH: Handle squatting -- zero economic cost for bulk registration

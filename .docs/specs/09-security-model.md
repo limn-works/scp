@@ -916,7 +916,7 @@ The `context_metadata_key` is a 32-byte symmetric key distributed as follows:
 
 - **At context creation:** The creator generates `context_metadata_key` and includes it in the context's initial parameters.
 - **In invitations:** The `context_metadata_key` is included in the invitation payload (which is encrypted to the invitee's public key). This allows prospective members to inspect context metadata before joining.
-- **In discovery contexts:** Public or discoverable contexts publish their `context_metadata_key` in their discovery context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
+- **In contexts with discovery tools:** Public or discoverable contexts publish their `context_metadata_key` in their context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
 - **Rotation:** The `context_metadata_key` MAY be rotated via a governance action. On rotation, the context re-publishes metadata under the new routing ID and maintains the old routing ID for a grace period (2x blob TTL).
 
 **Backward compatibility:** Contexts created before this change use the legacy `SHA-256(context_id || "scp-metadata")` derivation. SDKs MUST support both derivation schemes during the migration period. New contexts MUST use the keyed derivation.
@@ -1654,11 +1654,11 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Handle max length | 64 characters | Maximum `local-part` length for handles | §22.2 |
 | Handle charset | `[a-z0-9._-]` | Allowed characters in handle local-part | §22.2 |
 | Domain handle cache TTL | 3,600s (1h) | Resolution cache lifetime for domain handles | §22.8.4 |
-| Discovery handle cache TTL | 900s (15 min) | Resolution cache lifetime for discovery context handles | §22.8.4 |
+| Discovery handle cache TTL | 900s (15 min) | Resolution cache lifetime for context handles | §22.8.4 |
 | Petname cache TTL | 31,536,000s (1 year) | Resolution cache lifetime for petnames | §22.8.4 |
 | Attestation handle cache TTL | 86,400s (24h) | Resolution cache lifetime for attestation handles | §22.8.4 |
 | Discovery cache default capacity | 10,000 entries | Default capacity for the resolution cache | §22.8.4 |
-| Max discovery context writers | 500 | Maximum writer members in a discovery context | §22.3 |
+| Max context writers | 500 | Maximum writer members in a context with discovery tools | §22.3 |
 | Push platform tag: APNS | `0x01` | Platform tag byte for Apple Push Notification Service | §10.7.1 |
 | Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |

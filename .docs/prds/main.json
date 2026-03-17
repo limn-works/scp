@@ -1647,7 +1647,7 @@
         "Ceiling is set at context creation via ContextParams.ceiling; ceiling is immutable, any attempt to modify returns ContextError::CeilingImmutable; role permission sets are validated against the ceiling at role definition time — a role cannot grant capabilities outside the ceiling",
         "`RoleDefinition` struct with `name: String` and `capabilities: HashSet<Capability>`",
         "Built-in roles always available: `admin` (all capabilities in the ceiling), `member` (MessagesRead, MessagesWrite, ToolInvokeAll), `observer` (MessagesRead only)",
-        "Broadcast-specific roles: `author` (MessagesWrite, MessagesRead, ToolInvokeAll — authors are bounded, added via RoleAssigned event), `subscriber` (MessagesRead only — in open broadcast contexts auto-granted on DID-authenticated registration following discovery context reader-tier pattern, in gated broadcast contexts requires explicit admin-issued UCAN)",
+        "Broadcast-specific roles: `author` (MessagesWrite, MessagesRead, ToolInvokeAll — authors are bounded, added via RoleAssigned event), `subscriber` (MessagesRead only — in open broadcast contexts auto-granted on DID-authenticated registration following context reader-tier pattern, in gated broadcast contexts requires explicit admin-issued UCAN)",
         "Custom roles defined at context creation with arbitrary capability subsets of the ceiling",
         "`assign_role(context: &ContextHandle, member_did: &DID, role: &str, assigner_did: &DID) -> Result<Vec<UcanToken>, ContextError>` verifies assigner has RoleAssign capability via UCAN validation; validates role exists in context's role definitions; mints UCAN tokens for each capability in the role's permission set; each token has iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce; distributes tokens to member via MLS application message; revokes any previous tokens for this member (role change); appends RoleAssigned event to event log; returns the minted tokens",
         "`check_ceiling(ceiling: &CapabilityCeiling, capability: &Capability) -> bool` returns true if the capability is within the ceiling; called as part of every UCAN validation; called at role definition time to validate role permission sets",
@@ -1683,7 +1683,7 @@
       "details": {
         "CapabilityCeiling type": "```rust\npub struct CapabilityCeiling {\n    pub capabilities: HashSet<Capability>,\n}\n\n#[derive(Debug, Clone, Hash, PartialEq, Eq)]\npub enum Capability {\n    MessagesRead,\n    MessagesWrite,\n    ToolInvoke(ToolId),\n    ToolInvokeAll,\n    ToolRegister,\n    MemberInvite,\n    MemberRemove,\n    RoleAssign,\n    GovernancePropose,\n    GovernanceVote,\n    ContextClose,\n    ChildContextCreate,\n    Custom(String),\n}\n```",
         "RoleDefinition type": "```rust\npub struct RoleDefinition {\n    pub name: String,\n    pub capabilities: HashSet<Capability>,\n}\n```",
-        "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, ToolInvokeAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, ToolInvokeAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the discovery context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
+        "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, ToolInvokeAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, ToolInvokeAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
         "UCAN token format": "Each token: iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce."
       },
       "result": "Already implemented in prior iteration (SCP-018 remediation). 54 tests, all acceptance criteria met."
@@ -4161,7 +4161,7 @@
         "crates/scp-core/discovery/mod.rs",
         "crates/scp-core/discovery/did_capabilities.rs"
       ],
-      "description": "Implement `scp-core/discovery/` module root with all discovery types and DID document capability resolution. DID documents contain a SCPCapabilities service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on discovery contexts.",
+      "description": "Implement `scp-core/discovery/` module root with all discovery types and DID document capability resolution. DID documents contain a SCPCapabilities service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery tools.",
       "acceptanceCriteria": [
         "CapabilityEntry struct defined with fields: did (DID), capabilities (Vec<String>), service_endpoints (Vec<String>), resolved_at (u64)",
         "DiscoveryQuery struct defined with fields: capability_filter (Option<Vec<String>>), keywords (Option<Vec<String>>), min_history (Option<Duration>)",
@@ -4211,7 +4211,7 @@
     },
     {
       "id": "SCP-074",
-      "title": "Implement discovery context standard tools and two-tier membership",
+      "title": "Implement context standard tools and two-tier membership",
       "gate": "gate-4",
       "priority": "P1",
       "severity": "major",
@@ -4219,7 +4219,7 @@
       "files": [
         "crates/scp-core/discovery/context.rs"
       ],
-      "description": "Implement discovery contexts as standard SCP contexts with standardized tool schemas. Two-tier membership separates writers (MLS members, bounded at 500) from readers (DID-authenticated, unbounded). Registration flow: reader sends DID-signed request, writer verifies signature and records in event log. Self-service updates via DID-authenticated requests.",
+      "description": "Implement contexts with discovery tools as standard SCP contexts with standardized tool schemas. Two-tier membership separates writers (MLS members, bounded at 500) from readers (DID-authenticated, unbounded). Registration flow: reader sends DID-signed request, writer verifies signature and records in event log. Self-service updates via DID-authenticated requests.",
       "acceptanceCriteria": [
         "agent_search, agent_register, agent_deregister implemented per standard schema",
         "Custom tools (reputation scoring, category browsing, geographic filtering) allowed beyond standard",
@@ -4229,13 +4229,13 @@
         "Registrant does NOT become MLS member",
         "Self-service updates: registered agents update entries via DID-authenticated requests to tool endpoints",
         "Writers verify DID matches entry owner before applying update",
-        "Privacy: registration opt-in per discovery context, metadata controlled per registry, withdrawable via agent_deregister",
+        "Privacy: registration opt-in per context, metadata controlled per registry, withdrawable via agent_deregister",
         "Agent can publish different capability subsets to different registries",
-        "All writes recorded in discovery context's Merkle event log (ADR-011)",
+        "All writes recorded in context's Merkle event log (ADR-011)",
         "Readers can request inclusion proofs to verify registration and audit registry integrity"
       ],
       "actionItems": [
-        "Create crates/scp-core/discovery/context.rs with discovery context tool implementations",
+        "Create crates/scp-core/discovery/context.rs with context tool implementations",
         "Implement agent_search tool: query registered entries by capability, keywords, history",
         "Implement agent_register tool: validate DID-signed request, record in event log",
         "Implement agent_deregister tool: validate DID ownership, remove entry",
@@ -4269,7 +4269,7 @@
           "agent_deregister"
         ]
       },
-      "result": "Discovery context tools with writer/reader tiers, search/register/deregister. 54 tests."
+      "result": "Context tools with writer/reader tiers, search/register/deregister. 54 tests."
     },
     {
       "id": "SCP-075",
@@ -4281,17 +4281,17 @@
       "files": [
         "crates/scp-core/discovery/search.rs"
       ],
-      "description": "Implement unified_search that merges local cache, DID resolution, and discovery context queries. SDK provides unified search that merges results from multiple sources with provenance per entry. Results are deduplicated and ranked by relevance.",
+      "description": "Implement unified_search that merges local cache, DID resolution, and context queries. SDK provides unified search that merges results from multiple sources with provenance per entry. Results are deduplicated and ranked by relevance.",
       "acceptanceCriteria": [
         "unified_search(query, known_contexts) -> Result<DiscoveryResult, DiscoveryError> searches local contact cache (instant)",
-        "unified_search queries each known discovery context (parallel tool calls)",
+        "unified_search queries each known context (parallel tool calls)",
         "unified_search merges, deduplicates, and ranks results",
         "Returns results with provenance per entry"
       ],
       "actionItems": [
         "Create crates/scp-core/discovery/search.rs with unified_search function",
         "Implement local contact cache search (instant lookup)",
-        "Implement parallel discovery context querying via tool calls",
+        "Implement parallel context querying via tool calls",
         "Implement result merging from multiple sources",
         "Implement deduplication by DID",
         "Implement relevance ranking",
@@ -4323,19 +4323,19 @@
       "files": [
         "crates/scp-core/discovery/bootstrap.rs"
       ],
-      "description": "Implement bootstrap defaults as DNS root analogues. SDK ships with configurable default discovery context IDs. Auto-query on first identity creation (opt-out). Fallback to direct DID resolution + manual context ID sharing if defaults are unreachable.",
+      "description": "Implement bootstrap defaults as DNS root analogues. SDK ships with configurable default bootstrap context IDs. Auto-query on first identity creation (opt-out). Fallback to direct DID resolution + manual context ID sharing if defaults are unreachable.",
       "acceptanceCriteria": [
-        "SDK ships configurable default discovery context IDs",
+        "SDK ships configurable default bootstrap context IDs",
         "Auto-query on first identity creation (opt-out)",
         "Fallback to direct DID resolution + manual context ID sharing",
-        "Users can add custom discovery contexts"
+        "Users can add custom contexts with discovery tools"
       ],
       "actionItems": [
         "Create crates/scp-core/discovery/bootstrap.rs with DiscoveryBootstrap implementation",
-        "Implement default discovery context ID configuration",
+        "Implement default bootstrap context ID configuration",
         "Implement auto-query on first identity creation with opt-out flag",
         "Implement fallback to direct DID resolution when defaults unreachable",
-        "Implement custom discovery context addition",
+        "Implement custom context addition",
         "Write unit tests for bootstrap, auto-query, and fallback behavior"
       ],
       "blockedBy": [
@@ -10187,11 +10187,11 @@
         "crates/scp-core/src/discovery/petnames.rs",
         "crates/scp-core/src/discovery/mod.rs"
       ],
-      "description": "Spec §22 defines a human-readable addressing layer with 5 mechanisms: petnames (local), discovery context handles, attestation-backed handles, domain handles, and unified resolution. Currently zero implementation exists.",
+      "description": "Spec §22 defines a human-readable addressing layer with 5 mechanisms: petnames (local), context handles, attestation-backed handles, domain handles, and unified resolution. Currently zero implementation exists.",
       "acceptanceCriteria": [
         "Address format types: Petname, DiscoveryHandle, AttestationHandle, DomainHandle per §22.2",
         "TrustLevel enum: Self, Attestation, Context, Community per §22.7",
-        "handle_register, handle_lookup, handle_deregister discovery context tools per §22.5",
+        "handle_register, handle_lookup, handle_deregister context tools per §22.5",
         "AddressResolver with resolve() returning results ranked by TrustLevel (Self > Attestation > Context > Community)",
         "Petname storage in identity private state per §22.3",
         "Resolution caching with TTL per §22.8",

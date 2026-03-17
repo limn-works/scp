@@ -90,7 +90,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 - **Category**: Underspecified interfaces
 - **Location**: ADR-020, acceptance criterion 4-5
 - **What's missing**: "Reader tier: DID-authenticated, unbounded, query via tool endpoints without MLS join." How is DID authentication performed for readers who are not MLS group members? The ADR says "DID-signed request" but does not specify the authentication protocol -- is it a signed HTTP request? A signed SCP message? What prevents replay of a valid DID-signed query?
-- **Why it matters**: Unauthenticated or replay-vulnerable reader queries could be used to enumerate all entries in a discovery context.
+- **Why it matters**: Unauthenticated or replay-vulnerable reader queries could be used to enumerate all entries in a context with discovery tools.
 - **Severity**: HIGH
 
 ### [ADR-021] H6: Tokio Runtime Shutdown Grace Period May Lose Crypto State
@@ -198,14 +198,14 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-020] M7: Discovery Bootstrap Default Context IDs Not Specified
 - **Category**: Missing defaults
 - **Location**: ADR-020, acceptance criterion 8
-- **What's missing**: "SDK ships configurable default discovery context IDs." But no actual default context IDs are listed. Who creates these contexts? How are they bootstrapped? What if they do not exist yet at launch?
+- **What's missing**: "SDK ships configurable default bootstrap context IDs." But no actual default context IDs are listed. Who creates these contexts? How are they bootstrapped? What if they do not exist yet at launch?
 - **Why it matters**: Discovery is useless without at least one default context. The bootstrapping problem is punted.
 - **Severity**: MEDIUM
 
 ### [ADR-020] M8: Two-Tier Membership Write/Read Isolation Not Cryptographically Enforced
 - **Category**: Missing security analysis
 - **Location**: ADR-020, acceptance criteria 4-5
-- **What's missing**: Writers are MLS members; readers are not. But the ADR does not specify how readers query the discovery context without MLS membership. If readers send requests through the relay, they can observe MLS ciphertext. If they query through a tool endpoint, how is that endpoint authenticated and how does it access the MLS-encrypted registration data?
+- **What's missing**: Writers are MLS members; readers are not. But the ADR does not specify how readers query the context without MLS membership. If readers send requests through the relay, they can observe MLS ciphertext. If they query through a tool endpoint, how is that endpoint authenticated and how does it access the MLS-encrypted registration data?
 - **Why it matters**: The two-tier model's security properties depend on a reader-query mechanism that is not defined.
 - **Severity**: MEDIUM
 

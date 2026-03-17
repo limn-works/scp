@@ -618,9 +618,9 @@ export type ResolutionLayer =
 export interface ResolutionPath {
   /** The resolution layer that produced this result. */
   readonly layer: ResolutionLayer;
-  /** Human-readable source identifier (discovery context name, domain, platform). */
+  /** Human-readable source identifier (context name, domain, platform). */
   readonly source: string;
-  /** Discovery context ID (hex), present only for the `DiscoveryContext` layer. */
+  /** Context ID (hex), present only for the `DiscoveryContext` layer. */
   readonly sourceId: string | null;
   /** Unix timestamp (seconds) when resolution occurred. */
   readonly resolvedAt: number;

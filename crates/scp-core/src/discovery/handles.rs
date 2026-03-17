@@ -1,4 +1,4 @@
-//! Discovery context handle tools: register, lookup, and deregister.
+//! Context handle tools: register, lookup, and deregister.
 //!
 //! Implements §22.3.1 Handle Tools: three standard tool schemas for discovery
 //! contexts that support human-readable handles. These follow the same two-tier
@@ -40,9 +40,9 @@ pub const TOOL_HANDLE_DEREGISTER: &str = "handle_deregister";
 
 /// Input parameters for the `handle_register` tool.
 ///
-/// Registers a handle in a discovery context. The registrant's DID is
+/// Registers a handle in a context with discovery tools. The registrant's DID is
 /// authenticated via the DID-signed request. Handle uniqueness is enforced
-/// per local-part within the discovery context namespace.
+/// per local-part within the context namespace.
 ///
 /// See §22.3.1 Handle Tools.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,7 +94,7 @@ pub enum HandleRegisterStatus {
 
 /// Input parameters for the `handle_lookup` tool.
 ///
-/// Looks up a handle in a discovery context. Available to readers
+/// Looks up a handle in a context with discovery tools. Available to readers
 /// (DID-authenticated, unbounded tier).
 ///
 /// See §22.3.1 Handle Tools.
@@ -172,16 +172,16 @@ pub struct HandleDeregisterResult {
 // HandleRegistry (in-memory reference implementation)
 // ---------------------------------------------------------------------------
 
-/// In-memory handle registry for a single discovery context.
+/// In-memory handle registry for a single context.
 ///
 /// Enforces handle uniqueness per local-part and owner-only deregistration.
 /// Production implementations would back this with a persistent store and
 /// event log recording.
 ///
-/// See §22.3.1 Handle Tools and §22.3.2 Discovery Context Naming.
+/// See §22.3.1 Handle Tools and §22.3.2 Scope Naming.
 #[derive(Debug)]
 pub struct HandleRegistry {
-    /// The discovery context ID this registry belongs to.
+    /// The bootstrap context ID this registry belongs to.
     context_id: ContextId,
     /// Handle entries keyed by normalized local-part.
     entries: HashMap<String, HandleEntry>,
@@ -190,7 +190,7 @@ pub struct HandleRegistry {
 }
 
 impl HandleRegistry {
-    /// Creates a new empty handle registry for the given discovery context.
+    /// Creates a new empty handle registry for the given context.
     #[must_use]
     pub fn new(context_id: ContextId) -> Self {
         Self {
@@ -200,7 +200,7 @@ impl HandleRegistry {
         }
     }
 
-    /// Returns the discovery context ID this registry belongs to.
+    /// Returns the bootstrap context ID this registry belongs to.
     #[must_use]
     pub const fn context_id(&self) -> &ContextId {
         &self.context_id

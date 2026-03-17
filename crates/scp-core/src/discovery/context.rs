@@ -1,7 +1,7 @@
 //! Standard tool schemas, parameter/result types, and registration events for
 //! contexts with discovery tools.
 //!
-//! Discovery contexts are standard SCP contexts equipped with standardized tool
+//! These are standard SCP contexts equipped with standardized tool
 //! schemas for agent search, registration, and deregistration. This module
 //! defines the canonical tool names, typed parameters, result envelopes, and
 //! registration event payloads.
@@ -139,7 +139,7 @@ pub struct AgentDeregisterResult {
 
 /// Event payload for registration operations recorded in the Merkle event log.
 ///
-/// All writes to the discovery context are recorded in the context's Merkle
+/// All writes to the context are recorded in the context's Merkle
 /// event log (ADR-011). Readers can request inclusion proofs to verify
 /// registration and audit registry integrity.
 ///
