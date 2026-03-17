@@ -35,7 +35,7 @@ All SCP human-readable addresses use a single canonical text format:
 | Pattern | Resolution path | Example |
 |---------|----------------|---------|
 | Scope contains a `.` | Domain handle (§22.6), then attestation fallback (§22.5) | `alice@example.com` |
-| Scope has no `.` | Discovery context handle (§22.3) | `alice@cooking-community` |
+| Scope has no `.` | Scope-based resolution (§22.3.3, §22.3.5) | `alice@cooking-community` |
 | No `@` separator, starts with `@` | Attestation-backed handle (§22.5) | `@alice_on_x` |
 | No `@`, no prefix (bare name) | Unscoped — try all layers | `alice` |
 
@@ -257,7 +257,7 @@ Callers always use the `Scope*` names. The independent struct definitions reflec
 | Scope Tool | Handle Analogue | Additional Constraints |
 |------------|----------------|----------------------|
 | `scope_register` | `handle_register` | `ScopeTarget` is context-only by construction; validates scope name via `validate_scope_name()` |
-| `scope_lookup` | `handle_lookup` | Returns only context targets (enforced by `ScopeRegistry` construction) |
+| `scope_lookup` | `handle_lookup` | Validates scope name via `validate_scope_name()`; returns only context targets (enforced by `ScopeRegistry` construction) |
 | `scope_deregister` | `handle_deregister` | Validates scope name via `validate_scope_name()` |
 
 **`validate_scope_name()` rules.** Scope names are more constrained than general handle local-parts (§22.2):
@@ -933,8 +933,8 @@ Scope tools use independent structs for all types (see §22.3.5, ADR-043). All s
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `description` | `String` | No | Human-readable description. |
-| `tags` | `Vec<String>` | No | Categorization tags. |
+| `description` | `String` | No | Human-readable description. Max 1024 characters. |
+| `tags` | `Vec<String>` | No | Categorization tags. Max 20 items, each max 64 characters. |
 
 **`ScopeLookupParams`** — Input for `scope_lookup` tool.
 

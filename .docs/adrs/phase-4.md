@@ -1713,7 +1713,7 @@ Scope registries, as first-hop resolution points, see resolution metadata for ev
 
 3. **`scope_register` accepts `ScopeTarget` (context-only by construction).** `ScopeTarget` has no identity variant — context-only is enforced at the type level, not by runtime rejection. Validates the scope name via `validate_scope_name`. Operates on `ScopeRegistry` (not `HandleRegistry`). Same-owner re-registration atomically updates the existing entry and returns `Updated` status, avoiding the deregister/reregister TOCTOU race window.
 
-4. **`scope_lookup` returns context entries only.** Queries `ScopeRegistry::lookup()`. All entries in a `ScopeRegistry` are context targets by construction.
+4. **`scope_lookup` validates the scope name via `validate_scope_name()` and returns context entries only.** Queries `ScopeRegistry::lookup()`. All entries in a `ScopeRegistry` are context targets by construction.
 
 5. **`scope_deregister` removes from `ScopeRegistry`.** Calls `ScopeRegistry::deregister()` with scope name validation and owner verification.
 
