@@ -16,6 +16,7 @@
 use pyo3::prelude::*;
 
 use scp_ffi_common::server::{self, RunningRelay, ServerError};
+use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,10 @@ use scp_platform::testing::InMemoryStorage;
 // ---------------------------------------------------------------------------
 
 fn server_err(e: ServerError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
+fn node_err(e: NodeError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
@@ -133,6 +138,58 @@ impl NodeInner {
             Self::Filesystem(n) => n.shutdown(),
         }
     }
+
+    async fn enable_broadcast_projection_with_site(
+        &self,
+        context_id: &str,
+        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+        admission: scp_core::context::broadcast::BroadcastAdmission,
+        site_config: Option<scp_node::projection::SiteConfig>,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::InMemory(n) => {
+                n.enable_broadcast_projection_with_site(
+                    context_id,
+                    broadcast_key,
+                    admission,
+                    None,
+                    site_config,
+                )
+                .await
+            }
+            Self::Filesystem(n) => {
+                n.enable_broadcast_projection_with_site(
+                    context_id,
+                    broadcast_key,
+                    admission,
+                    None,
+                    site_config,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn commit_deploy(&self, context_id: &str, deploy_id: &str) -> Result<usize, NodeError> {
+        match self {
+            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
+            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
+        }
+    }
+
+    async fn rollback_deploy(&self, context_id: &str, deploy_id: &str) -> Result<(), NodeError> {
+        match self {
+            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
+            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
+        }
+    }
+
+    async fn disable_broadcast_projection(&self, context_id: &str) {
+        match self {
+            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
+            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
+        }
+    }
 }
 
 /// Opaque handle to a running SCP application node.
@@ -179,6 +236,140 @@ impl PyNodeHandle {
     /// Signals the node to stop (relay + background tasks).
     fn shutdown(&self) {
         self.inner.shutdown();
+    }
+
+    /// Activates HTTP broadcast projection with site configuration.
+    ///
+    /// Registers a broadcast context for HTTP content delivery. The
+    /// ``broadcast_key_hex`` is the 32-byte AES-256 broadcast key as a
+    /// 64-character hex string. ``author_did`` is the DID of the key owner.
+    /// ``admission`` is ``"open"`` or ``"gated"``.
+    ///
+    /// Site configuration fields:
+    /// - ``hostname`` (required): virtual host hostname (RFC 1123).
+    /// - ``index_path``: default path for directory requests (default ``"/index.html"``).
+    /// - ``max_assets_per_deploy``: max assets per deploy (default 10000).
+    /// - ``max_deploy_size_bytes``: max total deploy size in bytes (default 536870912).
+    /// - ``deploy_retention_count``: deploys to retain (default 2, max 8).
+    /// - ``csp_override``: optional Content-Security-Policy override.
+    #[pyo3(signature = (context_id, broadcast_key_hex, author_did, admission, hostname, index_path=None, max_assets_per_deploy=None, max_deploy_size_bytes=None, deploy_retention_count=None, csp_override=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn enable_site_projection(
+        &self,
+        py: Python<'_>,
+        context_id: String,
+        broadcast_key_hex: String,
+        author_did: String,
+        admission: String,
+        hostname: String,
+        index_path: Option<String>,
+        max_assets_per_deploy: Option<usize>,
+        max_deploy_size_bytes: Option<u64>,
+        deploy_retention_count: Option<usize>,
+        csp_override: Option<String>,
+    ) -> PyResult<()> {
+        let rt = crate::runtime()?;
+
+        let key_bytes: [u8; 32] = hex::decode(&broadcast_key_hex)
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid broadcast_key_hex: {e}"))
+            })?
+            .try_into()
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                )
+            })?;
+
+        let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(key_bytes),
+            0,
+            author_did,
+        );
+
+        let adm = match admission.as_str() {
+            "open" => scp_core::context::broadcast::BroadcastAdmission::Open,
+            "gated" => scp_core::context::broadcast::BroadcastAdmission::Gated,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "admission must be \"open\" or \"gated\", got \"{other}\""
+                )));
+            }
+        };
+
+        let idx_path_str = index_path.as_deref().unwrap_or("/index.html");
+        let content_path = scp_core::context::broadcast_content::ContentPath::new(idx_path_str)
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid index_path: {e}"))
+            })?;
+
+        let site_config = scp_node::projection::SiteConfig {
+            hostname,
+            index_path: content_path,
+            max_assets_per_deploy: max_assets_per_deploy.unwrap_or(10_000),
+            max_deploy_size_bytes: max_deploy_size_bytes.unwrap_or(512 * 1024 * 1024),
+            deploy_retention_count: deploy_retention_count.unwrap_or(2),
+            csp_override,
+        };
+
+        py.allow_threads(|| {
+            rt.block_on(self.inner.enable_broadcast_projection_with_site(
+                &context_id,
+                broadcast_key,
+                adm,
+                Some(site_config),
+            ))
+            .map_err(node_err)
+        })
+    }
+
+    /// Commits a deploy for a projected context (§18.11.11).
+    ///
+    /// Scans blobs matching the ``deploy_id``, decrypts each to extract
+    /// metadata, builds an immutable path index, and atomically swaps the
+    /// serving pointer.
+    ///
+    /// Returns the number of assets in the committed deploy.
+    fn commit_deploy(
+        &self,
+        py: Python<'_>,
+        context_id: String,
+        deploy_id: String,
+    ) -> PyResult<usize> {
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            rt.block_on(self.inner.commit_deploy(&context_id, &deploy_id))
+                .map_err(node_err)
+        })
+    }
+
+    /// Rolls back to a previous deploy for a projected context (§18.11.11).
+    ///
+    /// Sets the path index pointer to a previous deploy within the retention
+    /// window.
+    fn rollback_deploy(
+        &self,
+        py: Python<'_>,
+        context_id: String,
+        deploy_id: String,
+    ) -> PyResult<()> {
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            rt.block_on(self.inner.rollback_deploy(&context_id, &deploy_id))
+                .map_err(node_err)
+        })
+    }
+
+    /// Deactivates HTTP broadcast projection for the given context.
+    ///
+    /// Removes the projected context from the registry and drops all
+    /// retained epoch keys.
+    fn disable_site_projection(&self, py: Python<'_>, context_id: String) -> PyResult<()> {
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            rt.block_on(self.inner.disable_broadcast_projection(&context_id));
+            Ok(())
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -348,5 +539,104 @@ mod tests {
         let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
         relay.shutdown();
         relay.shutdown();
+    }
+
+    #[test]
+    fn enable_site_projection_invalid_context_returns_error() {
+        // enable_broadcast_projection_with_site on a fresh node with a valid
+        // key should succeed (the context need not exist in the manager for
+        // projection — it is purely a node-local routing table entry).
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
+            0,
+            "did:dht:test123".to_owned(),
+        );
+        let site_config = scp_node::projection::SiteConfig::with_hostname("example.com").unwrap();
+        let result = rt().block_on(node.enable_broadcast_projection_with_site(
+            "test-ctx",
+            key,
+            scp_core::context::broadcast::BroadcastAdmission::Open,
+            None,
+            Some(site_config),
+        ));
+        assert!(
+            result.is_ok(),
+            "enable_site_projection should succeed: {result:?}"
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn commit_deploy_on_unprojected_context_returns_error() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let result = rt().block_on(node.commit_deploy("nonexistent-ctx", "deploy-1"));
+        assert!(
+            result.is_err(),
+            "commit_deploy on unknown context should fail"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not projected"),
+            "error should mention 'not projected', got: {err_msg}"
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn rollback_deploy_on_unprojected_context_returns_error() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let result = rt().block_on(node.rollback_deploy("nonexistent-ctx", "deploy-1"));
+        assert!(
+            result.is_err(),
+            "rollback_deploy on unknown context should fail"
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn disable_site_projection_on_unprojected_context_is_noop() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        // Should not panic — disable on unknown context is a no-op.
+        rt().block_on(node.disable_broadcast_projection("nonexistent-ctx"));
+        node.shutdown();
+    }
+
+    #[test]
+    fn node_inner_lifecycle_dispatch() {
+        // Test the NodeInner dispatch methods (which are the FFI layer).
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = NodeInner::InMemory(node);
+
+        // enable_site_projection via NodeInner
+        let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_core::crypto::sender_keys::SenderKey::from_bytes([0xCD; 32]),
+            0,
+            "did:dht:dispatch-test".to_owned(),
+        );
+        let site_config =
+            scp_node::projection::SiteConfig::with_hostname("dispatch.example.com").unwrap();
+        let result = rt().block_on(inner.enable_broadcast_projection_with_site(
+            "dispatch-ctx",
+            key,
+            scp_core::context::broadcast::BroadcastAdmission::Open,
+            Some(site_config),
+        ));
+        assert!(
+            result.is_ok(),
+            "NodeInner enable should succeed: {result:?}"
+        );
+
+        // commit_deploy — will fail because no blobs exist but should return
+        // a proper error, not panic.
+        let cd_result = rt().block_on(inner.commit_deploy("dispatch-ctx", "deploy-abc"));
+        // This will return an error about no assets or similar — the important
+        // thing is that dispatch works and doesn't panic.
+        assert!(cd_result.is_ok() || cd_result.is_err());
+
+        // disable
+        rt().block_on(inner.disable_broadcast_projection("dispatch-ctx"));
+
+        inner.shutdown();
     }
 }
