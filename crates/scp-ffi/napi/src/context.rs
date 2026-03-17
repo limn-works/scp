@@ -813,6 +813,7 @@ pub fn context_subscribe(
 
     // `identity_did` is validated at the API boundary for future membership
     // checks but not used in the current subscription path.
+    validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     drop(identity_did);
 
     let Some(adapter) = crate::transport::get_relay_adapter() else {
@@ -827,6 +828,11 @@ pub fn context_subscribe(
     };
 
     let context_id = handle.context_id.clone();
+    // NOTE: This uses SHA-256(context_id) as the routing ID. The send path
+    // (RelayTransportProvider::send_message) uses raw context_id bytes.
+    // These routing IDs DO NOT match — subscribe will not receive messages
+    // from the production send path. This requires pseudonym routing
+    // (ADR-002) to be wired for end-to-end correctness. See issue #NNNN.
     let routing_id_bytes = scp_core::context::context_id_bytes(&context_id);
     let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
 
@@ -853,7 +859,11 @@ pub fn context_subscribe(
     // Spawn a background task that subscribes to the relay and delivers
     // incoming messages through the JS callback. The task terminates when
     // the stream ends OR the cancellation token is triggered.
-    tokio::spawn(async move {
+    //
+    // Uses the shared NAPI runtime (not bare `tokio::spawn`) because this
+    // is a sync `#[napi]` function — it runs on the Node.js main thread
+    // which has no active tokio runtime context.
+    crate::runtime().spawn(async move {
         use futures::StreamExt;
         use scp_transport::TransportAdapter;
 

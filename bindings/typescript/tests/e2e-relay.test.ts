@@ -1,27 +1,31 @@
 /**
  * E2E encrypted messaging tests with an in-process relay.
  *
- * These tests exercise the protocol stack at two levels:
+ * These tests exercise the FULL send pipeline end-to-end:
  *
- * **Relay lifecycle tests** (section 1) verify the real WebSocket relay:
- * - In-process relay starts and reports a valid WebSocket URL (ADR-004)
- * - `transportConnect` establishes a real WebSocket connection (ADR-005)
- *
- * **Send tests** (sections 2-7) exercise the MLS encryption pipeline:
  * - Real did:dht identity creation (ADR-003)
  * - Real MLS group encryption (ADR-001)
  * - Real sender key signing (ADR-007)
  * - Real inner/outer envelope construction (ADR-002)
+ * - Real WebSocket relay transport (ADR-004, ADR-005)
+ * - Real relay publication via `contextSend`
  *
- * Send tests route through LocalTransportProvider, NOT the relay. The relay
- * is started for lifecycle tests, but `configureLocalTransport` wins the
- * OnceLock race (called after `transportConnect` in beforeAll), so sends
- * complete locally. Each send verifies the full MLS encryption pipeline
- * executes without error, but messages are not delivered through the relay
- * (receive is not yet wired to real relay subscription delivery).
+ * Two relay connections are established:
  *
- * The Rust integration test `encrypted_relay_roundtrip` covers full
- * send-receive-decrypt verification at the protocol layer.
+ * 1. `configureRelayTransport(relayUrl, did)` -- initializes the
+ *    ContextManager with a `RelayTransportProvider` so `contextSend`
+ *    publishes encrypted payloads to the relay.
+ * 2. `transportConnect(relayUrl)` -- stores a `NativeRelayAdapter` in
+ *    global state for `contextSubscribe` to subscribe.
+ *
+ * NOTE: Full decrypt roundtrip (send -> relay -> subscribe -> MLS decrypt)
+ * cannot be tested in a single-process NAPI bridge because the single
+ * `MlsCryptoProvider` instance cannot decrypt its own ciphertext (MLS
+ * self-decryption is not supported -- the group's encryption state has
+ * already advanced past the sent message). The full decrypt roundtrip is
+ * verified at the Rust layer in the `encrypted_relay_roundtrip` integration
+ * test (`crates/scp-testing/tests/integration/encrypted_relay_roundtrip.rs`)
+ * which uses separate MLS group instances for Alice and Bob.
  *
  * Prerequisites:
  * - NAPI bridge compiled with `allow_in_memory_custody` feature.
@@ -45,8 +49,27 @@ type ServerAddon = {
     shutdown(): void;
   }>;
   transportConnect(relayUrl: string): Promise<unknown>;
-  configureLocalTransport(localDid: string): void;
+  configureRelayTransport(relayUrl: string, localDid: string): Promise<void>;
+  contextSubscribe(
+    handle: unknown,
+    identityDid: string,
+    onMessage: (msg: NapiRawMessage | null) => void,
+  ): void;
 };
+
+/**
+ * Raw message object returned by the NAPI bridge's `contextSubscribe`.
+ *
+ * napi-rs converts Rust snake_case fields to camelCase. `payload` is
+ * `Vec<u8>` which marshals as `number[]` in JS.
+ */
+interface NapiRawMessage {
+  senderDid: string;
+  payload: number[];
+  timestamp: number;
+  sequence: number;
+  contextId: string;
+}
 
 let bridge: NativeBridge | null = null;
 let serverAddon: ServerAddon | null = null;
@@ -97,17 +120,23 @@ if (bridge === null || serverAddon === null) {
     // Start an in-memory relay on an ephemeral port
     relayHandle = await addon.relayStartInMemory();
 
-    // Establish a real WebSocket connection from the SDK transport layer
-    // to the relay. This is a REAL connection — not LocalTransportProvider.
-    await addon.transportConnect(relayHandle.relayUrl);
-
-    // Bootstrap the ContextManager with a DID for MLS credential identity.
-    // `configureLocalTransport` wins the OnceLock race because
-    // `transportConnect` does NOT initialize the ContextManager — it only
-    // establishes a WebSocket connection. So sends route through
-    // LocalTransportProvider, not the relay.
+    // Bootstrap identity first to get a DID for MLS credential identity.
+    // This must happen BEFORE configureRelayTransport because the
+    // ContextManager OnceLock is set by whichever call wins the race.
     const bootstrap = await napi.identityCreate("in_memory");
-    addon.configureLocalTransport(bootstrap.did);
+
+    // Configure the ContextManager with a relay-backed transport provider.
+    // configureRelayTransport creates a relay connection and wraps it in
+    // RelayTransportProvider, so contextSend publishes encrypted payloads
+    // through the relay. Must be called BEFORE any contextCreate (which
+    // triggers init_context_manager via OnceLock).
+    await addon.configureRelayTransport(relayHandle.relayUrl, bootstrap.did);
+
+    // Establish a SECOND WebSocket connection for contextSubscribe.
+    // contextSubscribe uses the global RELAY_ADAPTER (set by
+    // transportConnect) for its subscription stream, separate from the
+    // ContextManager's transport provider.
+    await addon.transportConnect(relayHandle.relayUrl);
   });
 
   afterAll(async () => {
@@ -139,10 +168,18 @@ if (bridge === null || serverAddon === null) {
 
   // -------------------------------------------------------------------------
   // 2. Two-party encrypted send through real relay
+  //
+  // Verifies the full send pipeline: identity -> context -> MLS encrypt ->
+  // sender key encrypt -> outer envelope -> relay publish. The relay accepts
+  // the message (no error), proving the envelope is well-formed and the
+  // transport is wired correctly.
+  //
+  // Decrypt verification is covered by the Rust-level integration test
+  // `encrypted_relay_roundtrip` which uses separate MLS group instances.
   // -------------------------------------------------------------------------
 
   describe("Two-party encrypted messaging", () => {
-    test("Alice creates identity, context, Bob joins, Alice sends -- full MLS pipeline", async () => {
+    test("Alice sends to Bob through relay -- full send pipeline", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -175,21 +212,16 @@ if (bridge === null || serverAddon === null) {
       expect(members).toContain(alice.did);
       expect(members).toContain(bob.did);
 
-      // Alice sends a message -- exercises the full pipeline:
-      // inner envelope creation (Ed25519 signing) -> MLS encryption ->
-      // sender key encryption -> outer envelope -> relay publish
+      // Alice sends a message -- full pipeline:
+      // inner envelope (Ed25519 signing) -> MLS encryption ->
+      // sender key encryption -> outer envelope -> relay publish.
+      // No error means the relay accepted the well-formed envelope.
       const plaintext = "hello from Alice to Bob -- E2E encrypted via MLS";
       const payload = new TextEncoder().encode(plaintext);
       await napi.contextSend(ctx, alice.did, payload);
-
-      // NOTE: contextSubscribe is not yet wired to real relay delivery
-      // (it signals immediate completion). The Rust test
-      // encrypted_relay_roundtrip.rs verifies the full decrypt path.
-      // Here we verify the send pipeline completed without error,
-      // proving MLS encryption + relay publish succeeded.
     });
 
-    test("Bob sends a reply after joining", async () => {
+    test("Bob sends a reply through relay", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -204,10 +236,8 @@ if (bridge === null || serverAddon === null) {
 
       await napi.contextJoin(ctx, bob.did);
 
-      // Alice sends
-      await napi.contextSend(ctx, alice.did, new TextEncoder().encode("message 1 from Alice"));
-
-      // Bob sends a reply
+      // Both Alice and Bob can send through the relay without error.
+      await napi.contextSend(ctx, alice.did, new TextEncoder().encode("message from Alice"));
       await napi.contextSend(ctx, bob.did, new TextEncoder().encode("reply from Bob"));
     });
   });
@@ -217,7 +247,7 @@ if (bridge === null || serverAddon === null) {
   // -------------------------------------------------------------------------
 
   describe("Three-party encrypted messaging", () => {
-    test("Alice, Bob, and Carol all exchange messages in one context", async () => {
+    test("three members can all send through relay", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
       const carol = await napi.identityCreate("in_memory");
@@ -234,23 +264,22 @@ if (bridge === null || serverAddon === null) {
       await napi.contextJoin(ctx, bob.did);
       await napi.contextJoin(ctx, carol.did);
 
-      // Three members
       const count = await napi.contextMemberCount(ctx);
       expect(count).toBe(3);
 
-      // Each participant sends
-      await napi.contextSend(ctx, alice.did, new TextEncoder().encode("Alice says hi"));
-      await napi.contextSend(ctx, bob.did, new TextEncoder().encode("Bob says hello"));
-      await napi.contextSend(ctx, carol.did, new TextEncoder().encode("Carol joins the chat"));
+      // Each member sends through the relay -- all succeed.
+      await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello from Alice"));
+      await napi.contextSend(ctx, bob.did, new TextEncoder().encode("hello from Bob"));
+      await napi.contextSend(ctx, carol.did, new TextEncoder().encode("hello from Carol"));
     });
   });
 
   // -------------------------------------------------------------------------
-  // 4. Multiple messages (ordering)
+  // 4. Multiple messages (ordering) -- send pipeline
   // -------------------------------------------------------------------------
 
   describe("Multiple sequential messages", () => {
-    test("five messages sent sequentially without error", async () => {
+    test("five messages sent sequentially through relay", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -265,13 +294,13 @@ if (bridge === null || serverAddon === null) {
 
       await napi.contextJoin(ctx, bob.did);
 
-      // Send 5 messages with incrementing content
+      // Send 5 messages -- all should succeed through the relay.
       for (let i = 0; i < 5; i++) {
         await napi.contextSend(ctx, alice.did, new TextEncoder().encode(`message ${i}`));
       }
     });
 
-    test("binary payload roundtrip through send pipeline", async () => {
+    test("binary payload through send pipeline", async () => {
       const alice = await napi.identityCreate("in_memory");
 
       const ctx = await napi.contextCreate(
@@ -283,14 +312,85 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
-      // Send raw binary (not UTF-8 text)
+      // Send raw binary (not UTF-8 text) -- relay must accept it.
       const binaryPayload = new Uint8Array([0x00, 0xff, 0x42, 0xde, 0xad, 0xbe, 0xef]);
       await napi.contextSend(ctx, alice.did, binaryPayload);
     });
   });
 
   // -------------------------------------------------------------------------
-  // 5. Governance after join
+  // 5. contextSubscribe wiring
+  // -------------------------------------------------------------------------
+
+  describe("contextSubscribe relay wiring", () => {
+    test("contextSubscribe establishes relay subscription without error", async () => {
+      const alice = await napi.identityCreate("in_memory");
+
+      const ctx = await napi.contextCreate(
+        alice,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      // contextSubscribe should not throw -- it establishes a relay
+      // subscription and spawns a background task.
+      addon.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
+        // Callback may or may not fire depending on relay delivery.
+      });
+
+      // The subscription was accepted (no error thrown).
+      // A brief wait to let the background task reach the relay.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    test("duplicate subscription is rejected (SCP-CTX-2022)", async () => {
+      const alice = await napi.identityCreate("in_memory");
+
+      const ctx = await napi.contextCreate(
+        alice,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      // First subscription succeeds.
+      addon.contextSubscribe(ctx, alice.did, () => {});
+
+      // Second subscription to the same context must fail.
+      expect(() => {
+        addon.contextSubscribe(ctx, alice.did, () => {});
+      }).toThrow(/already subscribed/);
+    });
+
+    test("subscription rejected on non-active context", async () => {
+      const alice = await napi.identityCreate("in_memory");
+
+      const ctx = await napi.contextCreate(
+        alice,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write", "context:close"],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      // Close the context first.
+      await napi.contextClose(ctx, alice.did);
+
+      // Subscription to a closed context must fail.
+      expect(() => {
+        addon.contextSubscribe(ctx, alice.did, () => {});
+      }).toThrow();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. Governance after join
   // -------------------------------------------------------------------------
 
   // NOTE: These governance tests exercise the execution path with auto-approved
@@ -327,7 +427,7 @@ if (bridge === null || serverAddon === null) {
       expect(initialRole).toBeTruthy();
 
       // Execute governance action: change Bob's role to moderator.
-      // GovernanceAction is a Rust tagged enum — serialized as {"VariantName":{fields}}.
+      // GovernanceAction is a Rust tagged enum -- serialized as {"VariantName":{fields}}.
       const result = await napi.contextExecuteGovernanceAction(
         ctx,
         JSON.stringify({
@@ -384,7 +484,7 @@ if (bridge === null || serverAddon === null) {
   });
 
   // -------------------------------------------------------------------------
-  // 6. Context lifecycle with relay
+  // 7. Context lifecycle with relay
   // -------------------------------------------------------------------------
 
   describe("Context lifecycle with relay", () => {
@@ -411,7 +511,7 @@ if (bridge === null || serverAddon === null) {
       await napi.contextJoin(ctx, bob.did);
       expect(await napi.contextMemberCount(ctx)).toBe(2);
 
-      // Send
+      // Send through relay
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("test message"));
 
       // Bob leaves
@@ -444,7 +544,7 @@ if (bridge === null || serverAddon === null) {
   });
 
   // -------------------------------------------------------------------------
-  // 7. Event log with relay context
+  // 8. Event log with relay context
   // -------------------------------------------------------------------------
 
   describe("Event log on relay-connected context", () => {

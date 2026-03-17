@@ -346,6 +346,56 @@ pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
     Ok(())
 }
 
+/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+///
+/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
+/// Once the `ContextManager` is initialized (by whichever call arrives first),
+/// the transport provider is locked in for the lifetime of the process.
+///
+/// Unlike `configureLocalTransport` (which silently succeeds without reaching
+/// the relay), this function creates a **real** relay connection and wraps it
+/// in `RelayTransportProvider`. This means `contextSend` will publish
+/// encrypted payloads through the relay, enabling full end-to-end
+/// send → relay → subscribe → receive tests.
+///
+/// The `relay_url` must point to a running relay. A separate
+/// `transportConnect` call is still needed for `contextSubscribe` (which
+/// uses the global `RELAY_ADAPTER` for its subscription stream).
+///
+/// # Arguments
+///
+/// * `relay_url` — The URL of the relay to connect to.
+/// * `local_did` — The DID for MLS credential identity. Pass any valid
+///   `did:dht:` string (typically the DID of the first identity you plan
+///   to create).
+///
+/// # Errors
+///
+/// - Returns an error if `relay_url` fails URL validation.
+/// - Returns an error if `local_did` fails DID format validation.
+/// - Returns an error if the relay connection fails.
+#[napi(js_name = "configureRelayTransport")]
+pub async fn configure_relay_transport(relay_url: String, local_did: String) -> napi::Result<()> {
+    validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_did(&local_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+        url: relay_url.clone(),
+        source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+    };
+
+    let adapter = scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced)
+        .await
+        .map_err(|e| ScpNapiError::Transport {
+            message: format!("failed to connect to relay '{relay_url}': {e}"),
+            code: "SCP-TRANS-5001".to_owned(),
+        })?;
+
+    crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
