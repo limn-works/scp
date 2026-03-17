@@ -1226,6 +1226,22 @@ fn wasm_validate_scope_did(did: &str) -> Result<(), JsError> {
             "[SCP-VALID-7136] DID must start with \"did:\"",
         ));
     }
+    let rest = &did[4..];
+    if !rest.contains(':') {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID must match 'did:<method>:<id>' format",
+        ));
+    }
+    let method = rest.split(':').next().unwrap_or("");
+    if method.is_empty()
+        || !method
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID method must be non-empty lowercase alphanumeric",
+        ));
+    }
     if did.bytes().any(|b| b < 0x20) {
         return Err(JsError::new(
             "[SCP-VALID-7136] DID contains control characters",
@@ -1247,9 +1263,12 @@ fn wasm_validate_scope_context_id(context_id: &str) -> Result<(), JsError> {
             "[SCP-VALID-7137] context_id exceeds 256 characters",
         ));
     }
-    if context_id.bytes().any(|b| b < 0x20) {
+    if !context_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(JsError::new(
-            "[SCP-VALID-7137] context_id contains control characters",
+            "[SCP-VALID-7137] context_id contains invalid characters: expected alphanumeric, hyphens, or underscores",
         ));
     }
     Ok(())
