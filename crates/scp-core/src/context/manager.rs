@@ -2986,6 +2986,78 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Delivers an incoming encrypted message from the relay to a context.
+    ///
+    /// Decrypts the ciphertext using the crypto provider (MLS + sender key),
+    /// validates the context is `Active`, and emits a `MessageReceived` event
+    /// to the context's receive buffer.
+    ///
+    /// Returns `(plaintext, sender_did)` on success so the FFI bridge can
+    /// forward the decrypted message to the SDK consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if:
+    /// - The context is not registered or not in `Active` state.
+    /// - Decryption fails (MLS or sender key layer).
+    pub async fn deliver_incoming(
+        &self,
+        context_id: &str,
+        encrypted_blob: &[u8],
+    ) -> Result<(Vec<u8>, String), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Hold the lock across the entire operation: state check, decrypt,
+        // membership verification, and receive-buffer push. `decrypt_message`
+        // is sync and does not acquire `self.contexts`, so no deadlock risk.
+        // Holding the lock prevents TOCTOU races where a member is removed
+        // between the active-check and the buffer push.
+        let mut contexts = self.contexts.lock().await;
+
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+        require_active(&ctx.handle)?;
+
+        // Decrypt: MLS layer (ADR-001) -> sender key layer (ADR-007).
+        // Uses epoch=0, sequence=0 matching the send path's AAD.
+        let (plaintext, sender_did) =
+            self.crypto
+                .decrypt_message(&context_id_bytes, encrypted_blob, 0, 0)?;
+
+        // Verify sender is a current member and not write-revoked (§9.17,
+        // ADR-038). Mirrors the send_message path's membership checks.
+        let sender_did_obj = DID(sender_did.clone());
+        if !ctx.membership.contains(&sender_did) {
+            return Err(ContextError::MemberNotFound(format!(
+                "sender {sender_did} is not a member of this context"
+            )));
+        }
+        if ctx.write_revoked_members.contains(&sender_did_obj) {
+            return Err(ContextError::PermissionDenied(format!(
+                "write access has been revoked for {sender_did}"
+            )));
+        }
+
+        // Emit MessageReceived event to the receive buffer.
+        if let Some(ctx_mut) = contexts.get_mut(context_id) {
+            ctx_mut.receive_buffer.push(ContextEvent::MessageReceived {
+                sender_did: sender_did_obj,
+                payload: plaintext.clone(),
+            });
+        }
+
+        // Drop lock before the best-effort event log append.
+        drop(contexts);
+
+        // Append event to event log (best-effort, matches send_message).
+        let _ = self
+            .event_log
+            .append_context_event(&context_id_bytes, "MessageReceived");
+
+        Ok((plaintext, sender_did))
+    }
+
     /// Returns the current member count for a context.
     ///
     /// Returns `None` if the context is not registered with this manager.
@@ -8312,6 +8384,9 @@ mod tests {
         /// Shared handle for test code to observe `advance_epoch` calls after
         /// the mock has been moved into the `ContextManager`.
         epochs_advanced_shared: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+        /// When `Some`, `decrypt_message` returns `(ciphertext, sender_did)`.
+        /// When `None`, the default trait impl (error) is used.
+        decrypt_sender_did: Option<String>,
     }
 
     impl ContextCryptoProvider for MockCrypto {
@@ -8421,6 +8496,23 @@ mod tests {
                 .push(payload.to_vec());
             // Mock: return payload as-is (no real encryption).
             Ok(payload.to_vec())
+        }
+
+        fn decrypt_message(
+            &self,
+            _context_id: &[u8; 32],
+            ciphertext: &[u8],
+            _epoch: u64,
+            _sequence: u64,
+        ) -> Result<(Vec<u8>, String), ContextError> {
+            self.decrypt_sender_did.as_ref().map_or_else(
+                || {
+                    Err(ContextError::CryptoFailed(
+                        "decrypt_message not configured in mock".to_owned(),
+                    ))
+                },
+                |did| Ok((ciphertext.to_vec(), did.clone())),
+            )
         }
 
         fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
@@ -9062,6 +9154,147 @@ mod tests {
             .collect();
 
         assert_eq!(seq_nums, vec![1, 2, 3, 4, 5]);
+    }
+
+    // -----------------------------------------------------------------------
+    // deliver_incoming tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a manager whose `MockCrypto` supports `decrypt_message`,
+    /// returning `(plaintext_passthrough, sender_did)`.
+    async fn setup_active_context_with_decrypt(
+        sender_did: &str,
+    ) -> (ContextManager, ContextHandle) {
+        let crypto = MockCrypto {
+            decrypt_sender_did: Some(sender_did.to_owned()),
+            ..MockCrypto::default()
+        };
+
+        let manager = ContextManager::new(
+            Box::new(crypto),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("test-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        (manager, handle)
+    }
+
+    #[tokio::test]
+    async fn deliver_incoming_success_for_member() {
+        let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
+
+        let result = manager
+            .deliver_incoming("test-ctx", b"encrypted-payload")
+            .await;
+        assert!(result.is_ok());
+
+        let (plaintext, sender) = result.unwrap();
+        assert_eq!(plaintext, b"encrypted-payload");
+        assert_eq!(sender, "did:key:creator");
+
+        // Verify MessageReceived event was emitted.
+        let events = manager.drain_events("test-ctx").await;
+        let recv_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::MessageReceived { .. }))
+            .collect();
+        assert_eq!(recv_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deliver_incoming_rejects_non_member_sender() {
+        // Crypto mock claims "did:key:intruder" sent the message, but that
+        // DID is not a member of the context.
+        let (manager, _handle) = setup_active_context_with_decrypt("did:key:intruder").await;
+
+        let result = manager.deliver_incoming("test-ctx", b"evil-payload").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ContextError::MemberNotFound(msg) => {
+                assert!(
+                    msg.contains("did:key:intruder"),
+                    "error should mention the sender DID"
+                );
+            }
+            other => panic!("expected MemberNotFound, got: {other:?}"),
+        }
+
+        // Verify no MessageReceived event was emitted.
+        let events = manager.drain_events("test-ctx").await;
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, ContextEvent::MessageReceived { .. })),
+            "no MessageReceived event should be emitted for non-member sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_incoming_rejects_write_revoked_sender() {
+        let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
+
+        // Revoke write access for the creator.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            ctx.write_revoked_members
+                .insert(DID("did:key:creator".to_owned()));
+        }
+
+        let result = manager
+            .deliver_incoming("test-ctx", b"revoked-payload")
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ContextError::PermissionDenied(msg) => {
+                assert!(msg.contains("revoked"), "error should mention revocation");
+            }
+            other => panic!("expected PermissionDenied, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_incoming_rejects_inactive_context() {
+        let (manager, handle) = setup_active_context_with_decrypt("did:key:creator").await;
+
+        handle.transition_to(&ContextState::Closing).await.unwrap();
+
+        let result = manager.deliver_incoming("test-ctx", b"late-payload").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::ContextNotActive
+        ));
+    }
+
+    #[tokio::test]
+    async fn deliver_incoming_rejects_unknown_context() {
+        let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
+
+        let result = manager
+            .deliver_incoming("nonexistent-ctx", b"payload")
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ContextError::MembershipFailed(msg) => {
+                assert!(msg.contains("not registered"));
+            }
+            other => panic!("expected MembershipFailed, got: {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

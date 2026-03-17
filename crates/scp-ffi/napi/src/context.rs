@@ -17,6 +17,7 @@ use scp_core::context::manager::GovernanceActionResult;
 use scp_core::context::params::ContextMode;
 use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[cfg(feature = "allow_in_memory_custody")]
@@ -123,6 +124,13 @@ pub struct NapiContextHandle {
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
     /// The scp-core `ContextHandle` for this context, used for manager delegation.
     pub(crate) core_handle: Option<ContextHandle>,
+    /// Cancellation token for the subscription task spawned by `context_subscribe`.
+    /// Cancelled in `context_leave` and `context_close` to stop the background
+    /// relay listener, preventing orphaned tasks.
+    pub(crate) subscription_cancel: CancellationToken,
+    /// Guard preventing duplicate `context_subscribe` calls. Set to `true` on
+    /// the first successful call; subsequent calls return `SCP-CTX-2022`.
+    pub(crate) subscription_active: std::sync::atomic::AtomicBool,
 }
 
 /// Internal context lifecycle state string helper.
@@ -302,6 +310,8 @@ impl NapiContextHandle {
             in_memory_custody: None,
             signing_key: None,
             core_handle: None,
+            subscription_cancel: CancellationToken::new(),
+            subscription_active: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -498,6 +508,8 @@ pub async fn context_create(
         in_memory_custody,
         signing_key,
         core_handle: Some(core_handle),
+        subscription_cancel: CancellationToken::new(),
+        subscription_active: std::sync::atomic::AtomicBool::new(false),
     };
     increment_handle_count();
     Ok(handle)
@@ -575,6 +587,10 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
         .into());
     }
 
+    // Cancel the subscription task before leaving so the background relay
+    // listener stops promptly.
+    handle.subscription_cancel.cancel();
+
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
@@ -613,6 +629,10 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
         }
         .into());
     }
+
+    // Cancel the subscription task before closing so the background relay
+    // listener stops promptly.
+    handle.subscription_cancel.cancel();
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
@@ -716,11 +736,20 @@ pub async fn context_send(
 /// Subscribes to incoming messages from an SCP context.
 ///
 /// Registers a JS callback to receive incoming messages. The callback is
-/// invoked with a [`NapiMessage`] object for each message.
+/// invoked with a `NapiMessage` object for each message received from the
+/// relay. When the stream ends (relay disconnect, context close, or error),
+/// the callback receives `null` to signal completion.
+///
+/// Internally, this subscribes to the relay using the context's routing ID
+/// (SHA-256 of `context_id`, matching what `context_send` publishes). Incoming
+/// envelopes are decrypted via `ContextManager::deliver_incoming` and
+/// forwarded to the JS callback.
 ///
 /// # Errors
 ///
-/// Rejects with `SCP-CTX-2021` if the context is not in `"active"` state.
+/// - Rejects with `SCP-CTX-2021` if the context is not in `"active"` state.
+/// - Rejects with `SCP-CTX-2022` if already subscribed.
+/// - Rejects with `SCP-TRANS-5010` if no relay connection is available.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn context_subscribe(
@@ -728,8 +757,25 @@ pub fn context_subscribe(
     identity_did: String,
     on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
 ) -> napi::Result<()> {
+    // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
+    // true on the first call; subsequent calls see `true` and bail.
+    if handle
+        .subscription_active
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ScpNapiError::Context {
+            message: "already subscribed — each context supports a single subscription".to_owned(),
+            code: "SCP-CTX-2022".to_owned(),
+        }
+        .into());
+    }
+
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
+        // Reset the guard so the caller can retry after state changes.
+        handle
+            .subscription_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         return Err(ScpNapiError::Context {
             message: format!(
                 "cannot subscribe to context in {state_str:?} state — context must be active"
@@ -739,14 +785,147 @@ pub fn context_subscribe(
         .into());
     }
 
-    let _ = identity_did;
+    // `identity_did` is validated at the API boundary for future membership
+    // checks but not used in the current subscription path.
+    drop(identity_did);
 
-    // Signal stream completion — full transport wiring connects this callback
-    // to the message pipeline via ContextManager's transport provider.
-    on_message.call(
-        Ok(None),
-        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-    );
+    let Some(adapter) = crate::transport::get_relay_adapter() else {
+        // Reset the guard so the caller can retry after connecting a relay.
+        handle
+            .subscription_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(NapiError::from(ScpNapiError::Transport {
+            message: "no relay connection — call transportConnect() before subscribing".to_owned(),
+            code: "SCP-TRANS-5010".to_owned(),
+        }));
+    };
+
+    let context_id = handle.context_id.clone();
+    let routing_id_bytes = scp_core::context::context_id_bytes(&context_id);
+    let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
+
+    // Clone the cancellation token so the spawned task can observe cancellation
+    // triggered by context_leave / context_close.
+    let cancel_token = handle.subscription_cancel.clone();
+
+    // Spawn a background task that subscribes to the relay and delivers
+    // incoming messages through the JS callback. The task terminates when
+    // the stream ends OR the cancellation token is triggered.
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        use scp_transport::TransportAdapter;
+
+        let stream_result = adapter.subscribe(&routing_id, None).await;
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    context_id = %context_id,
+                    error = %e,
+                    "relay subscription failed"
+                );
+                // Signal completion on error.
+                on_message.call(
+                    Ok(None),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+                return;
+            }
+        };
+
+        let manager = match context_manager() {
+            Ok(m) => m.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, "ContextManager not initialized");
+                on_message.call(
+                    Ok(None),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+                return;
+            }
+        };
+
+        let mut sequence_counter: f64 = 0.0;
+
+        loop {
+            // Select between the next stream event and cancellation.
+            let event = tokio::select! {
+                () = cancel_token.cancelled() => {
+                    tracing::info!(
+                        context_id = %context_id,
+                        "subscription cancelled via token"
+                    );
+                    break;
+                }
+                maybe_event = stream.next() => {
+                    match maybe_event {
+                        Some(e) => e,
+                        None => break, // stream exhausted
+                    }
+                }
+            };
+
+            match event {
+                scp_transport::TransportEvent::Envelope(envelope) => {
+                    // Decrypt via ContextManager.
+                    match manager
+                        .deliver_incoming(&context_id, &envelope.encrypted_blob)
+                        .await
+                    {
+                        Ok((plaintext, sender_did)) => {
+                            sequence_counter += 1.0;
+                            #[allow(clippy::cast_precision_loss)]
+                            let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                            let msg = NapiMessage {
+                                sender_did,
+                                payload: plaintext,
+                                timestamp: ts,
+                                sequence: sequence_counter,
+                                context_id: context_id.clone(),
+                            };
+                            on_message.call(
+                                Ok(Some(msg)),
+                                napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                context_id = %context_id,
+                                error = %e,
+                                "failed to decrypt incoming message — skipping"
+                            );
+                        }
+                    }
+
+                    // Yield to prevent starving other tasks under high message rates.
+                    tokio::task::yield_now().await;
+                }
+                scp_transport::TransportEvent::Terminated { reason } => {
+                    tracing::info!(
+                        context_id = %context_id,
+                        reason = %reason,
+                        "relay subscription terminated"
+                    );
+                    break;
+                }
+                scp_transport::TransportEvent::Error(e) => {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "transient relay error — continuing"
+                    );
+                }
+                // BackfillComplete, Reconnected, SuppressionDetected — informational.
+                _ => {}
+            }
+        }
+
+        // Signal stream completion.
+        on_message.call(
+            Ok(None),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    });
 
     Ok(())
 }
@@ -3017,6 +3196,8 @@ mod tests {
             in_memory_custody: None,
             signing_key: None,
             core_handle: None,
+            subscription_cancel: CancellationToken::new(),
+            subscription_active: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Initially None.

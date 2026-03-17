@@ -238,6 +238,13 @@ pub enum ContextEvent {
         /// The message payload (encrypted in production; plaintext for tests).
         payload: Vec<u8>,
     },
+    /// A message was received from the relay and successfully decrypted.
+    MessageReceived {
+        /// The DID of the sender (extracted from MLS credential).
+        sender_did: DID,
+        /// The decrypted plaintext payload.
+        payload: Vec<u8>,
+    },
     /// The context is being closed by a participant or governance action.
     ///
     /// Replaces the former sentinel DID string `"__close_notification:<did>"`.

@@ -37,6 +37,7 @@ pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
 pub use credential::ScpCredential;
+pub use encrypt::DecryptedContent;
 pub use error::MlsError;
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,

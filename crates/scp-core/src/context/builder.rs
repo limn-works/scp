@@ -291,6 +291,34 @@ pub trait ContextCryptoProvider: Send + Sync {
         sequence: u64,
     ) -> Result<Vec<u8>, ContextError>;
 
+    /// Decrypts a message received from transport: MLS decrypt (ADR-001),
+    /// extract sender DID from the MLS credential, then sender key decrypt
+    /// (ADR-007).
+    ///
+    /// Returns `(plaintext, sender_did)` on success.
+    ///
+    /// `epoch` and `sequence` are the sender-key AAD values. For standard
+    /// sender keys these are `(0, 0)` matching the encrypt path.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) and E2E test providers override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if MLS decryption, credential
+    /// extraction, or sender key decryption fails.
+    fn decrypt_message(
+        &self,
+        _context_id: &[u8; 32],
+        _ciphertext: &[u8],
+        _epoch: u64,
+        _sequence: u64,
+    ) -> Result<(Vec<u8>, String), ContextError> {
+        Err(ContextError::CryptoFailed(
+            "decrypt_message not supported by this provider".to_string(),
+        ))
+    }
+
     // -- Recovery operations (§9.12) -----------------------------------------
 
     /// Advances the MLS epoch for post-compromise security (§9.12 step 2).
