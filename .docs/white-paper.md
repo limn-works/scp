@@ -804,19 +804,35 @@ The specification is published under CC-BY 4.0 and covers the full protocol surf
 
 ## Appendix B: Protocol Constants
 
+Constants are organized into three tiers per ADR-043.
+
+### Tier 1: Protocol Invariants (fixed, all implementations must agree)
+
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| Maximum nesting depth | 3 | Bounds context hierarchy |
-| Chain depth limit | 5 (protocol max), 3 (default) | Bounds cross-context data flow |
-| Bucket padding sizes | 256, 1024, 4096, 16384, 65536, 262144 bytes | Fixed-size outer envelopes |
-| Relay blob TTL | 604800 seconds (7 days) | Maximum relay retention |
-| DHT republish interval | 7200 seconds (2 hours) | BEP44 expiry |
-| Relay republish interval | 518400 seconds (6 days) | 7-day TTL with 1-day margin |
-| Sender key grace period | 30 seconds | Key transition overlap |
-| Per-caller session cap | 5 | Resource exhaustion prevention |
-| MLS catch-up limit | 100 MLS Commit messages | Practical epoch processing bound |
+| MLS ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | Single non-negotiable ciphersuite |
+| Bucket padding sizes | 256, 1024, 4096, 16384, 65536, 262144 bytes | Fixed-size outer envelopes (all implementations must agree) |
+| Sender key grace period | 30 seconds | Key transition overlap (ADR-001 criterion 6: bounds forward secrecy window) |
+| DHT republish interval | 7200 seconds (2 hours) | BEP44 expiry (external constraint) |
+
+### Tier 2: Configurable Parameters (protocol defines mechanism, deployers/contexts set value)
+
+| Constant | Default | Range | Purpose |
+|----------|---------|-------|---------|
+| Nesting depth | Unbounded | [1, u32 max] | Context hierarchy depth. No protocol ceiling. |
+| Chain depth limit | 8 | [1, 255] (u8) | Cross-context data flow hops. No protocol hard max. |
+| Session cap per caller | 1000 | [1, u32 max] | Tool session resource bound per context. |
+| Relay blob TTL | 604800 seconds (7 days) | [1, ∞] | Relay operator configuration. |
+| Relay republish interval | Derived: max(TTL - 86400, TTL / 2, 60) | Derived | Identity-layer DID document re-publication. |
+
+### Tier 3: Implementation Recommendations (SDK defaults, not protocol constants)
+
+| Constant | Recommended | Purpose |
+|----------|-------------|---------|
+| MLS catch-up limit | 100 sequential commits | Epoch processing bound (hardware-dependent) |
 | Reconnection timeout | 120 seconds | Overall sync timeout |
 | Sender key acquisition timeout | 60 seconds | Per-sender key recovery |
+| Reconnection dedup window | 30 seconds | Multi-device reconnection dedup |
 
 ## Appendix C: Glossary
 
