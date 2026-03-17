@@ -404,7 +404,7 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
 use scp_core::context::NotConfiguredTransportProvider;
 
 /// No-op event log provider for bridge-layer `ContextManager` initialization.
-struct NoOpEventLogProvider;
+pub(crate) struct NoOpEventLogProvider;
 
 impl ContextEventLogProvider for NoOpEventLogProvider {
     fn init_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {

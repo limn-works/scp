@@ -706,18 +706,22 @@ class TestBroadcastPublishAsset:
             ("/app.js", "application/javascript", b"console.log('ok')"),
         ]
         try:
-            results = _scp_core.py_broadcast_publish_assets(
+            result = _scp_core.py_broadcast_publish_assets(
                 handle,
                 alice.did,
                 assets,
                 "deploy-batch-1",
             )
-            assert len(results) == 3
-            for r in results:
+            # Batch returns {"results": [...], "deploy_id": "..."}.
+            assert "results" in result
+            assert "deploy_id" in result
+            asset_results = result["results"]
+            assert len(asset_results) == 3
+            for r in asset_results:
                 assert "blob_id" in r
                 assert "etag" in r
                 assert len(r["blob_id"]) == 64
-        except Exception as e:
+        except RuntimeError as e:
             # Transport-not-configured is acceptable in CI (no relay).
             msg = str(e)
             assert "transport" in msg.lower() or "not configured" in msg.lower(), (

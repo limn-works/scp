@@ -215,6 +215,57 @@ pub fn py_transport_status() -> PyResult<PyTransportStatus> {
     })
 }
 
+/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+///
+/// **Must be called before any `py_identity_create` → `py_context_create` sequence.**
+/// Once the `ContextManager` is initialized (by whichever call arrives first),
+/// the transport provider is locked in for the lifetime of the process.
+///
+/// Unlike the default transport (`NotConfiguredTransportProvider`), this creates a
+/// **real** relay connection and wraps it in `RelayTransportProvider`. This means
+/// `py_context_send` will publish encrypted payloads through the relay, enabling
+/// full end-to-end send → relay → subscribe → receive tests.
+///
+/// A separate `transport_connect` call is still needed for relay-based context
+/// discovery and any subscribe-side operations.
+///
+/// # Arguments
+///
+/// * `relay_url` -- The URL of the relay to connect to.
+/// * `local_did` -- The DID for MLS credential identity (typically the first identity).
+///
+/// # Errors
+///
+/// Raises `TransportError` if the URL fails validation or the connection fails.
+#[pyfunction]
+#[pyo3(name = "configure_relay_transport")]
+pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResult<()> {
+    validate::validate_relay_url(relay_url)?;
+    validate::validate_did(local_did)?;
+
+    let rt = crate::runtime()?;
+
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    let adapter = rt
+        .block_on(async { NativeRelayAdapter::connect_sourced(&sourced).await })
+        .map_err(|e| {
+            ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
+        })?;
+
+    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        local_did.to_owned(),
+    ));
+    let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+    let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
+        Box::new(crate::runtime::NoOpEventLogProvider);
+    crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
@@ -231,6 +282,7 @@ pub fn register_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_transport_connect, m)?)?;
     m.add_function(wrap_pyfunction!(py_transport_disconnect, m)?)?;
     m.add_function(wrap_pyfunction!(py_transport_status, m)?)?;
+    m.add_function(wrap_pyfunction!(py_configure_relay_transport, m)?)?;
     Ok(())
 }
 

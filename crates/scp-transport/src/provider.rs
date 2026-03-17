@@ -32,6 +32,14 @@ use scp_core::envelope::OuterEnvelope;
 
 use crate::traits::{BlobId, TransportAdapter};
 
+/// Default blob TTL in seconds (1 hour) for relay-published envelopes.
+///
+/// The relay enforces `MIN_BLOB_TTL..=MAX_BLOB_TTL` (1..=604800). A TTL of 0
+/// is rejected with relay error 4011. 3600 seconds (1 hour) matches the
+/// standard default used across the codebase (`scp-node`, adapter tests,
+/// protocol tests).
+const DEFAULT_BLOB_TTL: u32 = 3600;
+
 /// Production [`ContextTransportProvider`] wrapping a [`TransportAdapter`].
 ///
 /// Provides relay connectivity checks, context publication, deletion, and
@@ -105,13 +113,16 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
     ) -> Result<(), ContextCreationError> {
         // Build an OuterEnvelope representing the context announcement.
         // The routing_id is the context_id itself (used by relays for routing).
-        // blob_ttl of 0 means use relay default.
+        //
+        // Context announcements carry a minimal 1-byte placeholder blob because
+        // the relay rejects empty blobs. The actual context parameters are not
+        // published (they are exchanged via the invite/join flow).
         let envelope = OuterEnvelope {
             version: scp_core::envelope::SCP_PROTOCOL_VERSION,
             routing_id: context_id.to_vec(),
             recipient_hint: None,
-            blob_ttl: 0,
-            encrypted_blob: Vec::new(), // Context announcement: empty blob.
+            blob_ttl: DEFAULT_BLOB_TTL,
+            encrypted_blob: vec![0x00], // Placeholder: relay rejects empty blobs.
             extensions: std::collections::HashMap::new(),
             version_compatibility: None,
         };
@@ -161,7 +172,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
             version: scp_core::envelope::SCP_PROTOCOL_VERSION,
             routing_id: context_id.to_vec(),
             recipient_hint: None,
-            blob_ttl: 0,
+            blob_ttl: DEFAULT_BLOB_TTL,
             encrypted_blob: encrypted_payload.to_vec(),
             extensions: std::collections::HashMap::new(),
             version_compatibility: None,
