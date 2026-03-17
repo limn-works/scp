@@ -7132,6 +7132,7 @@ mod tests {
     }
 
     /// Commits a deploy via the shared `NodeState` write lock.
+    #[allow(clippy::significant_drop_tightening)]
     async fn commit_via_state(
         state: &Arc<NodeState>,
         routing_id: [u8; 32],
@@ -7144,6 +7145,7 @@ mod tests {
     }
 
     /// Rolls back to a previous deploy via the shared `NodeState` write lock.
+    #[allow(clippy::significant_drop_tightening)]
     async fn rollback_via_state(
         state: &Arc<NodeState>,
         routing_id: [u8; 32],
