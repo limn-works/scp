@@ -473,7 +473,7 @@ if (bridge === null) {
       const events = await napi.eventLogQuery(ctx, undefined);
       expect(events.length).toBeGreaterThanOrEqual(1);
       expect(events[0]?.eventType).toBe("ContextCreated");
-      expect(events[0]?.actorDid).toBeTruthy();
+      expect(typeof events[0]?.actorDid).toBe("string");
       expect(typeof events[0]?.sequence).toBe("number");
     });
 

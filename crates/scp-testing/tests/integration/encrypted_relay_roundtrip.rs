@@ -1,4 +1,4 @@
-//! Phase 1 Integration Test — proves all 7 ADRs work together.
+//! Encrypted relay roundtrip — proves all 7 Phase 1 ADRs work together.
 //!
 //! Alice and Bob exchange encrypted messages through the SCP native relay.
 //! The relay sees nothing — no DIDs, no context IDs, no message content,
@@ -201,14 +201,14 @@ async fn receive_envelope(
 // Integration test exercises full Phase 1 flow; splitting would
 // fragment the sequential scenario.
 #[allow(clippy::too_many_lines)]
-async fn phase1_alice_bob_encrypted_message_via_relay() {
+async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 1 & 2: Alice and Bob create did:dht identities (ADR-003, ADR-006)
     // ---------------------------------------------------------------
     let (alice_id, alice_custody, alice_pubkey) = create_identity().await;
     let (bob_id, bob_custody, bob_pubkey) = create_identity().await;
 
-    let ctx_id = "test-context-phase1";
+    let ctx_id = "test-context-roundtrip";
 
     // ---------------------------------------------------------------
     // Step 3: Alice creates an MLS group (ADR-001)

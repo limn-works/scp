@@ -1,7 +1,7 @@
 //! Full-stack end-to-end testing infrastructure.
 //!
 //! Bridges the gap between:
-//! - **Crypto+Transport** tests (`phase1.rs`): real MLS + sender keys + relay, but bypasses `ContextManager`
+//! - **Crypto+Transport** tests (`encrypted_relay_roundtrip.rs`): real MLS + sender keys + relay, but bypasses `ContextManager`
 //! - **Application** tests (`e2e_context_manager.rs`): real `ContextManager`, but mock crypto/transport
 //!
 //! This module provides [`E2eCryptoProvider`] (real MLS through `ContextManager`) and

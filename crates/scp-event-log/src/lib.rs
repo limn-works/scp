@@ -449,6 +449,7 @@ impl EventLog {
     /// from a verified event. Injecting arbitrary hashes produces Merkle
     /// proofs for events that never occurred. Only call with hashes from
     /// trusted sources (e.g., `ContextManager`'s `MerkleEventLogProvider`).
+    #[doc(hidden)]
     pub fn push_leaf_raw(&mut self, leaf_hash: [u8; 32]) {
         let leaf_index = self.leaves.len() as u64;
         self.leaves.push(leaf_hash);

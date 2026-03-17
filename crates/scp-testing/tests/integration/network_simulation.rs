@@ -5,7 +5,7 @@
     clippy::cast_possible_truncation
 )]
 
-//! End-to-end network demo — run with `cargo test --test demo -- --nocapture`
+//! End-to-end network simulation — run with `cargo test --test network_simulation -- --nocapture`
 //!
 //! This test narrates itself: every step prints what's happening so you can
 //! watch a simulated SCP network boot up, exchange encrypted messages, handle
@@ -47,7 +47,7 @@ use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 // -------------------------------------------------------------------------
-// MLS signer adapter (reused from phase1.rs pattern)
+// MLS signer adapter (reused from encrypted_relay_roundtrip.rs pattern)
 // -------------------------------------------------------------------------
 
 struct MlsGroupKeyCustody<'a> {
