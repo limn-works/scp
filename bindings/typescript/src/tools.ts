@@ -163,8 +163,8 @@ export async function toolInvokeCrossContext(
  * Creates a stateful tool session.
  *
  * Sessions enable multi-turn workflows with state preservation across
- * invocations. Each session is subject to per-caller caps (default: 5
- * concurrent sessions per caller, per spec section 6.2.1).
+ * invocations. Each session is subject to per-caller caps (default: 1000
+ * concurrent sessions per caller, per spec §6.2.1 and ADR-043).
  *
  * @param handle - Bridge handle for the context containing the tool.
  * @param toolId - The tool to create a session for.

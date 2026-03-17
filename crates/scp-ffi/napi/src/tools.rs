@@ -705,8 +705,7 @@ pub async fn tool_session_create(
         mgr.context_params(&context_id)
             .await
             .and_then(|p| p.session_cap)
-            .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
-            as usize
+            .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize
     };
 
     crate::runtime::with_context(&context_id, |rt| {

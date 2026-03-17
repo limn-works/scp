@@ -133,7 +133,10 @@ struct ContextTests {
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
             promotable: false,
-            minProtocolVersion: 0
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil
         )
 
         let context = try await Context.create(
@@ -181,7 +184,10 @@ struct ContextTests {
             memoryScope: .ephemeral,
             ttlSeconds: 0,
             promotable: false,
-            minProtocolVersion: 0
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil
         )
 
         await #expect(throws: ScpError.self) {

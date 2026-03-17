@@ -51,13 +51,13 @@ On reconnection (at least one relay WebSocket connection re-established), the SD
 
 **Phase 3 -- Event log sync.** For each context, exchange consistency checkpoints (ADR-011 criterion 8) with online members. Compare Merkle roots. If roots match at the same event count, the logs are consistent. If they diverge, identify the first divergent event and resolve (section 23.6).
 
-**Phase 4 -- Sender key re-acquisition.** For each context, check for `SenderKeyEpochAdvance` events received during catch-up. For any sender whose key epoch has advanced beyond the locally cached version, issue `SenderKeyRequest` (ADR-007) to obtain the current key. Messages encrypted with missed sender key epochs are buffered until the key is obtained or a **60-second timeout** expires. After timeout, those messages are marked as `UnrecoverableSenderKey` and the application layer is notified.
+**Phase 4 -- Sender key re-acquisition.** For each context, check for `SenderKeyEpochAdvance` events received during catch-up. For any sender whose key epoch has advanced beyond the locally cached version, issue `SenderKeyRequest` (ADR-007) to obtain the current key. Messages encrypted with missed sender key epochs are buffered until the key is obtained or the sender key timeout expires (RECOMMENDED default: **60 seconds**, configurable via `SyncPolicy`). After timeout, those messages are marked as `UnrecoverableSenderKey` and the application layer is notified.
 
 **Phase 5 -- MLS Update.** After catch-up is complete, the SDK issues an MLS Update proposal in each active context (section 9.7.3: "SDK SHOULD issue an Update after re-establishing connectivity following an offline period"). This provides post-compromise security for the reconnecting member.
 
 **Phase 6 -- Queue drain.** Drain the outbound queue for each context. Each queued inner envelope is MLS-encrypted with the current epoch's key schedule and sent. If a queued message references a context that no longer exists (closed or expired while offline), the message is discarded with a `ContextGone` notification to the application layer.
 
-Each context is synced concurrently, with a **120-second overall timeout**. Contexts that timeout are marked as `Failed`.
+Each context is synced concurrently, with an overall timeout (RECOMMENDED default: **120 seconds**, configurable via `SyncPolicy`). Contexts that timeout are marked as `Failed`.
 
 ## 23.4 MLS Epoch Catch-Up (Tier 1 and Tier 2)
 
@@ -75,7 +75,7 @@ Tried in order:
 
 ### 23.4.2 Epoch Catch-Up Limits
 
-- The SDK processes at most **100 sequential Commits** per catch-up attempt. Beyond 100 Commits, the SDK switches to Welcome-based fast-forward.
+- The SDK SHOULD process at most **100 sequential Commits** per catch-up attempt (RECOMMENDED implementation default, configurable via `SyncPolicy`). Beyond this limit, the SDK switches to Welcome-based fast-forward.
 - Each Commit is processed within a **5-second timeout**. Commits that fail to process (corrupted, missing dependencies) are logged as `EpochCatchUpFailure` and the SDK falls through to the next recovery source.
 - The 100-Commit limit is a practical bound. In a context with 24-hour PCS Update intervals and 10 members, 100 Commits represents roughly 10 days of activity. Contexts with higher churn (frequent joins/leaves) may hit this limit sooner.
 
@@ -177,7 +177,7 @@ Multi-device sync during offline/online transitions follows the principle from s
 
 Each device independently runs the reconnection protocol. There is no device-to-device coordination at the protocol level. The SDK provides hooks for client-layer coordination:
 
-- **Reconnection deduplication.** If multiple devices reconnect simultaneously and all issue MLS Updates, the resulting epoch churn is harmless but wasteful. The SDK emits a `ReconnectionStarted` event to the identity's private state log (section 3.7, encrypted, synced across devices). Devices observing another device's reconnection event within a **30-second deduplication window** defer their own MLS Update to avoid redundant epoch advances.
+- **Reconnection deduplication.** If multiple devices reconnect simultaneously and all issue MLS Updates, the resulting epoch churn is harmless but wasteful. The SDK emits a `ReconnectionStarted` event to the identity's private state log (section 3.7, encrypted, synced across devices). Devices observing another device's reconnection event within a deduplication window (RECOMMENDED default: **30 seconds**, configurable via `SyncPolicy`) defer their own MLS Update to avoid redundant epoch advances.
 - **Queue deduplication.** Each queued message includes a content-addressable hash. If multiple devices queued the same message (e.g., user typed a message on phone, then opened laptop), the first device to drain delivers the message; the second device recognizes the duplicate hash in the event log and discards the queued copy.
 
 ## 23.9 Reorder Buffering
@@ -270,10 +270,10 @@ During event log reconciliation (section 23.7, Phase 3 of the reconnection proto
 | `TIER_2_THRESHOLD_SECS` | 604,800 (7 days) | Upper bound for Tier 2 (Extended) offline duration |
 | `GAP_TIMEOUT` | 30 seconds | Reorder buffer gap timeout |
 | `REORDER_BUFFER_CAPACITY` | 100 messages | Maximum messages in the reorder buffer |
-| `MAX_SEQUENTIAL_COMMITS` | 100 | Epoch catch-up limit before Welcome-based fast-forward |
+| `MAX_SEQUENTIAL_COMMITS` | 100 | RECOMMENDED implementation default. Epoch catch-up limit before Welcome-based fast-forward. Configurable via `SyncPolicy`. |
 | `COMMIT_PROCESS_TIMEOUT` | 5 seconds | Per-Commit processing timeout |
-| `SENDER_KEY_TIMEOUT` | 60 seconds | Sender key re-acquisition timeout |
-| `RECONNECTION_DEDUP_WINDOW` | 30 seconds | Multi-device reconnection deduplication window |
+| `SENDER_KEY_TIMEOUT` | 60 seconds | RECOMMENDED implementation default. Sender key re-acquisition timeout. Configurable via `SyncPolicy`. |
+| `RECONNECTION_DEDUP_WINDOW` | 30 seconds | RECOMMENDED implementation default. Multi-device reconnection deduplication window. Configurable via `SyncPolicy`. |
 | `RESET_REQUEST_NONCE_SIZE` | 16 bytes | Random nonce size for ResetRequest anti-replay |
 | `RESET_REQUEST_FRESHNESS_WINDOW` | 30 seconds | Maximum age of a valid ResetRequest timestamp |
 | `RESET_NONCE_DEDUP_TTL` | 60 seconds | TTL for ResetRequest nonce deduplication cache entries |

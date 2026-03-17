@@ -480,9 +480,7 @@ export function createMockBridge(): Bridge & {
         throw new Error(`[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`);
       }
       if (chainDepth > 255) {
-        throw new Error(
-          `[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds maximum 255`,
-        );
+        throw new Error(`[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds maximum 255`);
       }
 
       const tool = targetCtx.tools.get(toolId);

@@ -24,7 +24,10 @@ struct BasicMessaging {
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
             promotable: false,
-            minProtocolVersion: 0
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil
         )
         let handle = try await contextCreate(identity: alice, params: params)
         print("Context ID: \(handle.contextId())")

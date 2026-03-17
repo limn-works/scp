@@ -715,12 +715,12 @@ mod tests {
     #[test]
     fn check_chain_depth_within_default() {
         assert!(provenance_check_chain_depth(0, None));
-        assert!(provenance_check_chain_depth(3, None));
+        assert!(provenance_check_chain_depth(8, None));
     }
 
     #[test]
     fn check_chain_depth_exceeds_default() {
-        assert!(!provenance_check_chain_depth(4, None));
+        assert!(!provenance_check_chain_depth(9, None));
     }
 
     #[test]
@@ -730,10 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn check_chain_depth_clamps_to_hard_max() {
-        // Even with override of 10, hard max is 5
-        assert!(!provenance_check_chain_depth(6, Some(10)));
-        assert!(provenance_check_chain_depth(5, Some(10)));
+    fn check_chain_depth_custom_override_respected() {
+        assert!(provenance_check_chain_depth(10, Some(10)));
+        assert!(!provenance_check_chain_depth(11, Some(10)));
     }
 
     #[test]
