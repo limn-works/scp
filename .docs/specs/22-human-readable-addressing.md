@@ -28,14 +28,14 @@ All SCP human-readable addresses use a single canonical text format:
 
 **`local-part`:** The name portion. Case-insensitive, Unicode-normalized (NFC). Restricted to lowercase ASCII letters, digits, hyphens, underscores, and periods: `[a-z0-9._-]`. Maximum 64 characters. Leading and trailing hyphens/periods are not allowed. Consecutive periods are not allowed.
 
-**`scope`:** The resolution context — determines how the local-part is resolved. Either a DNS domain or a discovery context name.
+**`scope`:** The resolution context — determines how the local-part is resolved. Either a DNS domain or a scope name. Scope names (non-domain scopes) are constrained to `[a-z0-9-]`, max 64 characters, no leading or trailing hyphens (§22.3.5). The absence of a dot (`.`) in the scope is the syntactic discriminator that routes to scope-based resolution rather than domain-based resolution.
 
 **Scope disambiguation.** Scope type is determined by syntactic inspection:
 
 | Pattern | Resolution path | Example |
 |---------|----------------|---------|
 | Scope contains a `.` | Domain handle (§22.6), then attestation fallback (§22.5) | `alice@example.com` |
-| Scope has no `.` | Discovery context handle (§22.3) | `alice@cooking-community` |
+| Scope has no `.` | Scope-based resolution (§22.3.3, §22.3.5) | `alice@cooking-community` |
 | No `@` separator, starts with `@` | Attestation-backed handle (§22.5) | `@alice_on_x` |
 | No `@`, no prefix (bare name) | Unscoped — try all layers | `alice` |
 
@@ -150,7 +150,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 **DID-signature verification scheme.** Handle tool requests use the same DID-authentication mechanism as discovery context reader requests (§6.2.2B). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
-2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse.
+2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse. Scope tools sign with their own tool name (e.g., `"scope_register"`), not the corresponding handle tool name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
 3. **Signature algorithm.** Ed25519 using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation).
 4. **Transport.** The signature is carried as an additional field in the tool call request envelope:
    ```
@@ -171,24 +171,38 @@ Discovery contexts have a `name` field in their metadata (§5.7). The name used 
 
 Example: A discovery context with metadata name "Cooking Community" has canonical scope name `cooking-community`.
 
-The SDK ships with a mapping of default discovery context IDs to their canonical scope names. This mapping is configurable and extensible — apps can add domain-specific discovery contexts with their own scope names.
+The SDK ships with a mapping of default discovery context IDs to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific discovery contexts with their own scope names.
 
-**Scope name collisions.** Two discovery contexts may have the same canonical scope name. This is analogous to two email providers happening to exist — they are different namespaces with different content, and the resolver must distinguish them. The SDK maintains a local registry of known discovery contexts indexed by canonical scope name. If multiple contexts share a name, the SDK uses the most recently used or user-preferred context. Users can disambiguate by specifying a discovery context explicitly in client UI (selecting from a list rather than typing a scope name).
+**Scope name collisions.** Two contexts in different scope registries may register the same scope name. Intra-registry conflicts are prevented by `scope_register`'s conflict detection — a scope name maps to at most one context within a single registry (§22.3.5). Cross-registry conflicts are resolved by registry priority in the SDK's bootstrap configuration: the first matching registry in the priority order wins, with the resolution path metadata identifying which registry produced the result. Users can disambiguate by specifying a discovery context explicitly in client UI (selecting from a list rather than typing a scope name).
 
 ### 22.3.3 Resolution Flow
 
 ```
 1. Client receives "alice@cooking-community"
 2. Parse: local-part = "alice", scope = "cooking-community"
-3. Scope has no "." → discovery context handle
-4. Look up "cooking-community" in SDK's known discovery context registry
-5. Call handle_lookup("alice") on the matched discovery context
-6. Get result: Identity { did: "did:dht:z6MkAlice..." }
-7. Resolve DID via Mainline DHT (self-certifying, §9.6.1)
-8. Return AddressResolution::Identity {
+3. Scope has no "." → scope-based resolution (two-hop model, §22.3.5)
+4. Check SDK-local scope cache for "cooking-community"
+   a. Cache hit → use cached context ID (skip to step 6)
+   b. Cache miss → query bootstrap context(s) via scope_lookup("cooking-community") (§22.3.5)
+5. Get scope result: Context { context_id: "a1b2c3...", relay_urls: ["wss://..."] }
+   Update SDK-local scope cache with the result
+6. Connect to resolved context via MLS group join.
+   The SDK MUST verify that the connected context's ID matches the context_id
+   returned by scope_lookup. This verification is provided by MLS group joining —
+   the GroupContext authenticates the context_id.
+   Call handle_lookup("alice")
+7. Get result: Identity { did: "did:dht:z6MkAlice..." }
+8. Resolve DID via Mainline DHT (self-certifying, §9.6.1)
+9. Return AddressResolution::Identity {
      did: "did:dht:z6MkAlice...",
      trust_level: DiscoveryContextVerified,
-     resolution_path: { layer: "DiscoveryContext", context_name: "cooking-community", context_id: "..." }
+     resolution_path: {
+       layer: "DiscoveryContext",
+       source: "cooking-community",
+       source_id: "a1b2c3...",
+       scope_registry_id: "<bootstrap-context-id>",
+       scope_registry_source: "limn-bootstrap"
+     }
    }
 ```
 
@@ -208,10 +222,115 @@ Template: "scp:template/handle-registry"
   governance:    single-admin
   memory_scope:  full
   tools:         handle_register, handle_lookup, handle_deregister,
+                 scope_register, scope_lookup, scope_deregister,
                  agent_search, agent_register, agent_deregister
 ```
 
 This template is a starting point. Discovery contexts can customize governance, add tools (reputation scoring, category browsing), or restrict registration policies via context governance. The template follows the two-tier model: bounded registrars/admins (MLS members), unbounded readers.
+
+### 22.3.5 Scope Tools (Namespace Registration)
+
+Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools use **independent structs for all types**, with separate storage. See ADR-043 for the design decision and security analysis.
+
+**Types.** All scope types are independent structs. Scope types are conceptually distinct from handle types — scopes are namespace registrations ("the phone book for namespaces"), while handles are participant registrations ("the phone book for participants"). Every scope type has its own struct definition:
+
+```
+// All scope types are independent structs
+ScopeRegisterParams   { name: String, target: ScopeTarget, metadata: Option<ScopeMetadata> }
+ScopeLookupParams     { name: String }
+ScopeDeregisterParams { name: String, did: DID }
+ScopeRegisterResult   { status: ScopeRegisterStatus, entry_id: Option<String> }
+ScopeLookupResult     { results: Vec<ScopeEntry> }
+ScopeDeregisterResult { removed: bool }
+ScopeEntry            { name: String, target: ScopeTarget, owner_did: DID, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
+ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
+ScopeTarget           { context_id: String, relay_urls: Vec<String> }
+ScopeRegisterStatus   :: Registered | Conflict | Updated
+```
+
+Callers always use the `Scope*` names. The independent struct definitions reflect the conceptual separation at the type level — no scope type shares a definition with any handle type.
+
+**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope tools and handle tools has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-DID/context mappings. This eliminates cross-type namespace collision by construction.
+
+**Scope tools (operate on `ScopeRegistry`):**
+
+| Scope Tool | Handle Analogue | Additional Constraints |
+|------------|----------------|----------------------|
+| `scope_register` | `handle_register` | `ScopeTarget` is context-only by construction; validates scope name via `validate_scope_name()` |
+| `scope_lookup` | `handle_lookup` | Validates scope name via `validate_scope_name()`; returns only context targets (enforced by `ScopeRegistry` construction) |
+| `scope_deregister` | `handle_deregister` | Validates scope name via `validate_scope_name()` |
+
+**`validate_scope_name()` rules.** Scope names are more constrained than general handle local-parts (§22.2):
+
+| Rule | Rationale |
+|------|-----------|
+| Charset: `[a-z0-9-]` only | Matches §22.3.2 normalization output. No underscores (stripped by normalization), no periods (see below). |
+| No periods (`.`) | Periods are the syntactic discriminator between scope-based and domain-based resolution (§22.8.1). A scope name containing a dot would be misrouted to the domain resolution path. |
+| Length: 1-64 characters | Consistent with handle local-part maximum (§22.2). |
+| No leading or trailing hyphens | Consistent with DNS label conventions and general handle rules. |
+
+**Charset choice: `[a-z0-9-]` without underscores.** The handle local-part charset is `[a-z0-9._-]` (§22.2). Scope names exclude both `.` (resolution discriminator) and `_` (underscore). Underscores are excluded because §22.3.2 normalization strips non-alphanumeric characters except hyphens — a scope name containing an underscore would normalize to a different string, creating a mismatch between the registered name and the normalized form used for resolution. The scope charset is the exact output alphabet of §22.3.2 normalization.
+
+**Validation, not normalization.** `validate_scope_name()` is a validator — it rejects non-conforming names and returns an error. It is not a normalizer — it does not transform input. Callers must pass already-normalized names (e.g., output of §22.3.2 normalization). This prevents silent mismatches where a name passes validation after transformation but the caller stores the pre-transformation form.
+
+**`scope_register` — register a scope name:**
+
+```
+scope_register(params: ScopeRegisterParams) → ScopeRegisterResult
+  input:  ScopeRegisterParams {
+    name:     string,          // scope name to register (validated by validate_scope_name)
+    target:   ScopeTarget,     // context-only by construction { context_id, relay_urls }
+    metadata: ScopeMetadata?   // optional descriptive metadata
+  }
+  output: ScopeRegisterResult  // { status: "registered"|"conflict"|"updated", entry_id? }
+
+  ScopeRegistry::register() validates the scope name. ScopeTarget is context-only by
+  construction — no identity variant exists. Same-owner re-registration atomically updates
+  the existing entry and returns status "updated" with the existing entry_id.
+```
+
+**`scope_lookup` — look up a scope name:**
+
+```
+scope_lookup(params: ScopeLookupParams) → ScopeLookupResult
+  input:  ScopeLookupParams {
+    name: string               // scope name to look up
+  }
+  output: ScopeLookupResult    // { results: [ScopeEntry] } — context entries only
+
+  Validates the scope name via `validate_scope_name()`. Queries the ScopeRegistry
+  (not HandleRegistry). Returns only context targets.
+```
+
+**`scope_deregister` — remove a scope registration:**
+
+```
+scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
+  input:  ScopeDeregisterParams {
+    name: string,              // scope name to deregister
+    did:  DID                  // must match entry owner (verified via transport auth)
+  }
+  output: ScopeDeregisterResult  // { removed: bool }
+
+  Removes from ScopeRegistry with scope name validation.
+  Admin-level scope entry removal is a governance action processed through the context's
+  governance engine (§5.9), not through the `scope_deregister` tool. The governance engine
+  can remove any entry regardless of owner DID, logged as a governance action in the event log.
+```
+
+**Resolution flow — two-hop address resolution.** See §22.3.3 for the complete resolution flow. Steps 4-5 use `scope_lookup` on bootstrap context(s) to resolve the scope name to a context ID (the "phone book for namespaces" hop). Step 6 uses `handle_lookup` within the resolved context (the "phone book for participants" hop). The SDK ships Limn's context ID in bootstrap defaults, providing the initial scope registry. Apps can add additional scope registries via configuration.
+
+**Hosting model.** Any context can host scope tools. A context with scope tools is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its tool set. A single context can combine scope tools with handle tools, agent tools, and any other tools. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-DID mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously, with each backed by its own storage.
+
+**Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
+
+**Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, `ScopeUpdated { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
+
+**Relay URL validation.** `ScopeTarget.relay_urls` MUST contain at least one valid relay URL. `ScopeTarget.relay_urls` MUST use `wss://` scheme (or `ws://` in development). Implementations MUST validate relay URLs at registration time: `wss://` scheme required (`ws://` permitted in development mode only), no control characters, maximum URL length 2048.
+
+**Capacity limits.** `ScopeRegistry` implementations SHOULD enforce a configurable `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit are rejected with a capacity error. The limit is configurable per hosting context via governance parameters.
+
+**Metadata bounds.** `ScopeMetadata.description` max 1024 characters. `ScopeMetadata.tags` max 20 items, each max 64 characters.
 
 ## 22.4 Petnames (Local Floor)
 
@@ -434,10 +553,12 @@ Each `AddressResolution` also carries a `ResolutionPath` — structured metadata
 
 ```
 ResolutionPath {
-  layer:         "Petname" | "DiscoveryContext" | "Attestation" | "Domain",
-  source:        string,     // discovery context name, domain, platform
-  source_id:     string?,    // discovery context ID (hex, for DiscoveryContext layer)
-  resolved_at:   timestamp,
+  layer:                  "Petname" | "DiscoveryContext" | "Attestation" | "Domain",
+  source:                 string,     // discovery context name, domain, platform
+  source_id:              string?,    // discovery context ID (hex, for DiscoveryContext layer)
+  scope_registry_id:      string?,    // context ID of the scope registry (if two-hop resolution)
+  scope_registry_source:  string?,    // human-readable name of the scope registry
+  resolved_at:            timestamp,
 }
 ```
 
@@ -449,7 +570,7 @@ The `AddressResolver` is an SDK-level type that implements multi-path resolution
 
 When the address includes a scope, the scope determines the resolution path:
 
-- **No `.` in scope** (`alice@cooking-community`): discovery context handle only. One namespace, one authority, one answer.
+- **No `.` in scope** (`alice@cooking-community`): two-hop scope-based resolution (§22.3.5). First, resolve the scope name to a context ID via `scope_lookup` on bootstrap context(s), with the SDK-local scope cache as a fast path. Then resolve the handle within the target context via `handle_lookup`. The SDK queries ALL configured scope registries and returns all results with provenance (each result carries `scope_registry_id` and `scope_registry_source` in its `ResolutionPath`). The first-priority match (per the SDK's bootstrap configuration priority order) is the default, but disagreements across registries are surfaced as warnings to the consumer. This is the secure option — silent disagreement suppression would hide registry compromise or squatting.
 - **`.` in scope** (`alice@example.com`): domain-first with attestation fallback (§22.6.2). If the domain serves `.well-known/scp` with the handle, that answer wins with `DomainVerified`. If not, attestation fallback is tried. The result carries its trust level, so the consumer knows which path succeeded.
 
 ### 22.8.2 Unscoped Resolution
@@ -478,7 +599,7 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
 
 ### 22.8.3 Collision and Disambiguation
 
-**Scoped addresses: no collision possible.** Each scope is its own namespace with its own authority. `alice@example.com` has exactly one answer (domain operator controls it). `alice@cooking-community` has exactly one answer (discovery context enforces uniqueness via `handle_register`).
+**Scoped addresses: no collision within a single registry.** Each scope is its own namespace with its own authority. Within a single scope registry, `cooking-community` has exactly one entry (the `ScopeRegistry` enforces uniqueness). Within a single handle registry, `alice` has exactly one entry. However, across registries, collisions are possible — two different scope registries may map `cooking-community` to different context IDs. These cross-registry collisions are resolved by provenance: each resolution result carries `ResolutionPath` metadata identifying which registry made the claim, and the resolver returns all results for consumer disambiguation.
 
 **Cross-scope: not a collision.** `alice@example.com` and `alice@cooking-community` may be different people. These are different addresses — like `alice@gmail.com` and `alice@yahoo.com` in email. No disambiguation needed.
 
@@ -492,7 +613,7 @@ The protocol does not prevent name collisions — it surfaces them transparently
 
 ### 22.8.4 Resolution Caching
 
-The SDK caches resolution results locally to avoid redundant network calls. Cache entries are keyed by normalized address string, with per-layer TTLs: petnames are indefinite (user-managed); domain handles follow HTTP caching semantics (~1 hour); discovery context handles are short-lived (~15 minutes); attestation handles match attestation renewal intervals (§7.3.6). Cache misses trigger fresh resolution. Cache hits with expired TTL trigger background re-resolution (return cached result immediately, verify in background). Cache implementation details are specified in `.docs/scaffold/`.
+The SDK caches resolution results locally to avoid redundant network calls. Cache entries are keyed by normalized address string, with per-layer TTLs: petnames are indefinite (user-managed); domain handles follow HTTP caching semantics (~1 hour); discovery context handles are short-lived (~15 minutes); scope entries use ~15 minutes (matching discovery context handles — scope entries are more stable than individual handles but should still be refreshed to detect re-registrations); attestation handles match attestation renewal intervals (§7.3.6). Cache misses trigger fresh resolution. Cache hits with expired TTL trigger background re-resolution (return cached result immediately, verify in background). Cache implementation details are specified in `.docs/scaffold/`.
 
 ### 22.8.5 SDK Surface
 
@@ -519,6 +640,24 @@ SCP.Address.deregister(
 // Set a petname (local, private)
 SCP.Address.setPetname(name: "alice", did: aliceDID)
 SCP.Address.setContextPetname(name: "recipes", contextID: recipesCtx)
+
+// Scope management — register/lookup/deregister scope-to-context mappings
+SCP.Address.registerScope(
+  name: "cooking-community",
+  scopeRegistry: bootstrapContextID,
+  target: ScopeTarget(contextID: cookingCtx, relayURLs: [...]),
+  metadata: { description: "Cooking enthusiast community" }?
+) → { status: "registered" | "conflict" | "updated", entryID: string? }
+
+SCP.Address.lookupScope(
+  name: "cooking-community",
+  scopeRegistry: bootstrapContextID?   // optional — queries all configured registries if omitted
+) → [ScopeEntry]
+
+SCP.Address.deregisterScope(
+  name: "cooking-community",
+  scopeRegistry: bootstrapContextID
+) → { removed: bool }
 
 // Resolve with explicit scope
 SCP.Address.resolveInContext(
@@ -763,6 +902,93 @@ These types are the tool call schemas for the standard discovery context tools d
 | `Identity` | `"Identity"` | `did: String` | Handle points to a DID. |
 | `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>` | Handle points to a context. |
 
+### 22.11.2a Scope Registration and Lookup
+
+Scope tools use independent structs for all types (see §22.3.5, ADR-043). All scope types below are the wire-level representation.
+
+**`ScopeRegisterParams`** — Input for `scope_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | Scope name to register. Must match `[a-z0-9-]`, max 64 chars, no leading/trailing hyphens (§22.3.5). |
+| `target` | `ScopeTarget` | Yes | Context the scope name resolves to. |
+| `metadata` | `ScopeMetadata` | No | Optional descriptive metadata. |
+
+**`ScopeRegisterResult`** — Output from `scope_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `status` | `ScopeRegisterStatus` | Yes | Registration outcome. |
+| `entry_id` | `String` | No | Present when `status` = `Registered` or `Updated`. Unique entry ID. |
+
+**`ScopeRegisterStatus`** — Enum for scope registration outcomes.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Registered` | `"registered"` | Scope registered successfully. |
+| `Conflict` | `"conflict"` | Another DID already holds this scope name. |
+| `Updated` | `"updated"` | Same-owner re-registration atomically updated the existing entry (target/metadata changed). |
+
+**`ScopeMetadata`** — Optional descriptive metadata for scopes.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `description` | `String` | No | Human-readable description. Max 1024 characters. |
+| `tags` | `Vec<String>` | No | Categorization tags. Max 20 items, each max 64 characters. |
+
+**`ScopeLookupParams`** — Input for `scope_lookup` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | Scope name to look up. |
+
+**`ScopeLookupResult`** — Output from `scope_lookup` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `results` | `Vec<ScopeEntry>` | Yes | Matching scope entries. All entries have context targets per ScopeTarget constraints. |
+
+**`ScopeEntry`** — A resolved scope record.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | The scope name. |
+| `target` | `ScopeTarget` | Yes | Context the scope points to. |
+| `owner_did` | `String` (DID) | Yes | DID of the scope entry owner. |
+| `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `metadata` | `ScopeMetadata` | Yes | Descriptive metadata. May have all fields absent. |
+| `entry_id` | `String` | Yes | Unique entry identifier. |
+
+**`ScopeDeregisterParams`** — Input for `scope_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | Scope name to deregister. |
+| `did` | `String` (DID) | Yes | Must match the scope entry owner. |
+
+**`ScopeDeregisterResult`** — Output from `scope_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `removed` | `bool` | Yes | `true` if the scope entry was found and removed. |
+
+**`ScopeTarget`** — What a scope name resolves to. Context-only by construction — has no identity variant.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `context_id` | `String` | Yes | Hex-encoded context ID. |
+| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. MUST be non-empty. Each URL MUST use wss:// scheme (ws:// in development only), no control characters, max 2048 characters. |
+
+**`ScopeRegistrationEvent`** — Tagged enum for scope registration lifecycle events (event log entries).
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `ScopeRegistered` | `"ScopeRegistered"` | `name: String`, `context_id: String`, `relay_urls: Vec<String>`, `owner_did: String`, `entry_id: String`, `metadata: ScopeMetadata`, `timestamp: u64` | New scope registration. |
+| `ScopeUpdated` | `"ScopeUpdated"` | `name: String`, `context_id: String`, `relay_urls: Vec<String>`, `owner_did: String`, `entry_id: String`, `metadata: ScopeMetadata`, `timestamp: u64` | Same-owner re-registration updated existing entry. |
+| `ScopeDeregistered` | `"ScopeDeregistered"` | `name: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | Removed scope registration. |
+
+Admin removal via governance produces standard governance events (§5.9), not `ScopeRegistrationEvent` variants.
+
 ### 22.11.3 Address Resolution
 
 **`AddressType`** — Enum for address categories.
@@ -797,6 +1023,8 @@ These types are the tool call schemas for the standard discovery context tools d
 | `layer` | `ResolutionLayer` | Yes | Which resolution layer found the result. |
 | `source` | `String` | Yes | Discovery context name, domain, or platform. |
 | `source_id` | `String` | No | Discovery context ID (hex) when `layer` = `DiscoveryContext`. |
+| `scope_registry_id` | `String` | No | Context ID of the scope registry used for two-hop resolution (§22.3.5). Present when scope lookup was involved. |
+| `scope_registry_source` | `String` | No | Human-readable name of the scope registry (e.g., "limn-bootstrap"). Present when `scope_registry_id` is present. |
 | `resolved_at` | `u64` | Yes | Unix timestamp (seconds) of resolution. |
 
 **`ResolutionLayer`** — Enum for resolution path layers.
@@ -943,6 +1171,9 @@ The following tool names are normative — independent implementations MUST use 
 | `handle_lookup` | Reader (DID-authenticated query) | §22.3.1 |
 | `handle_deregister` | Writer (MLS member write) | §22.3.1 |
 | `attestation_lookup` | Reader (DID-authenticated query) | §22.5.1 |
+| `scope_register` | Writer (MLS member write) | §22.3.5 |
+| `scope_lookup` | Reader (DID-authenticated query) | §22.3.5 |
+| `scope_deregister` | Writer (MLS member write) | §22.3.5 |
 
 ### 22.11.8 DID Document Service Types
 
@@ -954,4 +1185,4 @@ The following tool names are normative — independent implementations MUST use 
 
 ## 22.12 Phase Integration
 
-Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Discovery context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on discovery context and attestation infrastructure).
+Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Discovery context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on discovery context and attestation infrastructure). Scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle tools from Phase 3).

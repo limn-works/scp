@@ -1471,7 +1471,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
-| `"SCP-HANDLE-TOOL-V1:"` | Handle tool request signing | §22.3.1 |
+| `"SCP-HANDLE-TOOL-V1:"` | Handle and scope tool request signing | §22.3.1, §22.3.5 |
 | `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request signing | §7.4 |
 | `"SCP-CHALLENGE-RESP-V1:"` | Trust challenge response signing | §7.4 |
 | `"SCP-CHALLENGE-VERIFY-V1:"` | Trust challenge verification signing | §7.4 |
