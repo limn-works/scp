@@ -9921,6 +9921,122 @@ pub fn handle_deregister(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Scope registry bridge functions (§22.3.5, ADR-043)
+// ---------------------------------------------------------------------------
+
+fn uniffi_scope_registries()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::ScopeRegistry>>
+{
+    petname_helpers::scope_registries()
+}
+
+/// Registers a scope name in a scope registry. Returns JSON result.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn scope_register(
+    scope_context_id: String,
+    name: String,
+    target_context_id: String,
+    relay_urls: Vec<String>,
+    registrant_did: String,
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<String, ScpError> {
+    // Validate relay URLs at the FFI boundary
+    for url in &relay_urls {
+        scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: "SCP-VALID-7135".to_owned(),
+        })?;
+    }
+
+    let params = scp_core::discovery::ScopeRegisterParams {
+        name,
+        target: scp_core::discovery::ScopeTarget {
+            context_id: target_context_id,
+            relay_urls,
+        },
+        metadata: Some(scp_core::discovery::ScopeMetadata { description, tags }),
+    };
+
+    let mut guard = uniffi_scope_registries()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            msg: format!("scope registry lock poisoned: {e}"),
+            code: "SCP-VALID-7130".to_owned(),
+        })?;
+
+    let registry = guard
+        .entry(scope_context_id.clone())
+        .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
+
+    let result = registry
+        .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
+        .map_err(|e| ScpError::Validation {
+            msg: format!("scope registration failed: {e}"),
+            code: "SCP-VALID-7131".to_owned(),
+        })?;
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize scope register result: {e}"),
+        code: "SCP-VALID-7132".to_owned(),
+    })
+}
+
+/// Looks up a scope name in a scope registry. Returns JSON result.
+#[uniffi::export]
+pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, ScpError> {
+    let guard = uniffi_scope_registries()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            msg: format!("scope registry lock poisoned: {e}"),
+            code: "SCP-VALID-7130".to_owned(),
+        })?;
+
+    let result = guard.get(&scope_context_id).map_or_else(
+        || scp_core::discovery::ScopeLookupResult {
+            results: Vec::new(),
+        },
+        |registry| registry.lookup(&scp_core::discovery::ScopeLookupParams { name }),
+    );
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize scope lookup result: {e}"),
+        code: "SCP-VALID-7133".to_owned(),
+    })
+}
+
+/// Deregisters a scope name from a scope registry. Returns JSON result.
+#[uniffi::export]
+pub fn scope_deregister(
+    scope_context_id: String,
+    name: String,
+    did: String,
+) -> Result<String, ScpError> {
+    let mut guard = uniffi_scope_registries()
+        .lock()
+        .map_err(|e| ScpError::Validation {
+            msg: format!("scope registry lock poisoned: {e}"),
+            code: "SCP-VALID-7130".to_owned(),
+        })?;
+
+    let result = guard.get_mut(&scope_context_id).map_or_else(
+        || scp_core::discovery::ScopeDeregisterResult { removed: false },
+        |registry| {
+            registry.deregister(&scp_core::discovery::ScopeDeregisterParams {
+                name,
+                did: scp_identity::DID::from(did.as_str()),
+            })
+        },
+    );
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize scope deregister result: {e}"),
+        code: "SCP-VALID-7134".to_owned(),
+    })
+}
+
 /// Resolves a human-readable address via multi-path resolution.
 /// Returns a JSON array of `AddressResolution` objects.
 #[uniffi::export]
@@ -9936,7 +10052,7 @@ pub fn address_resolve(
         });
     }
 
-    let known_contexts: std::collections::HashMap<String, String> =
+    let mut known_contexts: std::collections::HashMap<String, String> =
         if let Some(ref json) = known_contexts_json {
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
                 msg: format!("invalid known_contexts_json: {e}"),
@@ -9951,6 +10067,13 @@ pub fn address_resolve(
                 })?;
             guard.keys().map(|k| (k.clone(), k.clone())).collect()
         };
+
+    // Merge scope registry contexts for two-hop resolution (§22.3.5).
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    for (name, ctx_id) in scope_contexts {
+        known_contexts.entry(name).or_insert(ctx_id);
+    }
+
     let known_domains: Vec<&str> = Vec::new();
     let petname_map = {
         let guard = uniffi_petname_maps()

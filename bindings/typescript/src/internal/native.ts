@@ -1211,6 +1211,41 @@ export function createNativeBridge(): Bridge {
       );
     },
 
+    // Scope Registry (§22.3.5, ADR-043)
+    scopeRegister(
+      scopeContextId: string,
+      name: string,
+      targetContextId: string,
+      relayUrls: string[],
+      registrantDid: string,
+      description: string | undefined,
+      tags: string[] | undefined,
+    ): string {
+      return (
+        addon.scopeRegister as (
+          sc: string,
+          n: string,
+          tc: string,
+          r: string[],
+          rd: string,
+          d: string | undefined,
+          t: string[] | undefined,
+        ) => string
+      )(scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags);
+    },
+
+    scopeLookup(scopeContextId: string, name: string): string {
+      return (addon.scopeLookup as (sc: string, n: string) => string)(scopeContextId, name);
+    },
+
+    scopeDeregister(scopeContextId: string, name: string, did: string): string {
+      return (addon.scopeDeregister as (sc: string, n: string, d: string) => string)(
+        scopeContextId,
+        name,
+        did,
+      );
+    },
+
     // Address Resolution (§22.8)
     async addressResolve(
       ownerDid: string,

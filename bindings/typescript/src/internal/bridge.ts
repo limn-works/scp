@@ -367,6 +367,19 @@ export interface Bridge {
   handleLookup(discoveryContextId: string, handle: string, typeFilter: string | undefined): string;
   handleDeregister(discoveryContextId: string, handle: string, did: string): string;
 
+  // Scope Registry (section 22.3.5, ADR-043)
+  scopeRegister(
+    scopeContextId: string,
+    name: string,
+    targetContextId: string,
+    relayUrls: string[],
+    registrantDid: string,
+    description: string | undefined,
+    tags: string[] | undefined,
+  ): string;
+  scopeLookup(scopeContextId: string, name: string): string;
+  scopeDeregister(scopeContextId: string, name: string, did: string): string;
+
   // Address Resolution (section 22.8)
   addressResolve(
     ownerDid: string,

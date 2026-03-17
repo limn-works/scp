@@ -497,6 +497,105 @@ export async function handleDeregister(
 }
 
 // ---------------------------------------------------------------------------
+// Scope Registry operations (§22.3.5, ADR-043)
+// ---------------------------------------------------------------------------
+
+/** Result of a scope registration. */
+export interface ScopeRegisterResult {
+  readonly status: string;
+  readonly entry_id: string | null;
+}
+
+/** Result of a scope lookup. */
+export interface ScopeLookupResult {
+  readonly results: readonly Record<string, unknown>[];
+}
+
+/** Result of a scope deregistration. */
+export interface ScopeDeregisterResult {
+  readonly removed: boolean;
+}
+
+/**
+ * Registers a scope name in a scope registry.
+ *
+ * @param scopeContextId - ID of the context hosting the scope registry.
+ * @param name - Scope name to register (`[a-z0-9-]`, max 64 chars).
+ * @param targetContextId - Context ID the scope name resolves to.
+ * @param relayUrls - Relay URLs for the target context.
+ * @param registrantDid - DID of the registrant.
+ * @param options - Optional description and tags.
+ * @returns Registration result.
+ * @throws {ValidationError} If the scope name or relay URLs are invalid.
+ */
+export async function scopeRegister(
+  scopeContextId: string,
+  name: string,
+  targetContextId: string,
+  relayUrls: string[],
+  registrantDid: string,
+  options?: { description?: string; tags?: string[] },
+): Promise<ScopeRegisterResult> {
+  try {
+    const bridge = await getBridge();
+    const result = bridge.scopeRegister(
+      scopeContextId,
+      name,
+      targetContextId,
+      relayUrls,
+      registrantDid,
+      options?.description,
+      options?.tags,
+    );
+    return safeJsonParse(result, "scopeRegister") as ScopeRegisterResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Looks up a scope name in a scope registry.
+ *
+ * @param scopeContextId - ID of the context hosting the scope registry.
+ * @param name - The scope name to look up.
+ * @returns Lookup result with a `results` array of matching scope entries.
+ */
+export async function scopeLookup(
+  scopeContextId: string,
+  name: string,
+): Promise<ScopeLookupResult> {
+  try {
+    const bridge = await getBridge();
+    const result = bridge.scopeLookup(scopeContextId, name);
+    return safeJsonParse(result, "scopeLookup") as ScopeLookupResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Deregisters a scope name from a scope registry.
+ *
+ * @param scopeContextId - ID of the context hosting the scope registry.
+ * @param name - The scope name to deregister.
+ * @param did - DID of the registrant requesting deregistration.
+ * @returns Deregistration result with a `removed` boolean.
+ */
+export async function scopeDeregister(
+  scopeContextId: string,
+  name: string,
+  did: string,
+): Promise<ScopeDeregisterResult> {
+  try {
+    const bridge = await getBridge();
+    const result = bridge.scopeDeregister(scopeContextId, name, did);
+    return safeJsonParse(result, "scopeDeregister") as ScopeDeregisterResult;
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Multi-path address resolution (§22.8)
 // ---------------------------------------------------------------------------
 

@@ -24,6 +24,7 @@ use scp_core::discovery::handles::{
     HandleEntry, HandleLookupParams, HandleRegistry, HandleTypeFilter,
 };
 use scp_core::discovery::petnames::PetnameMap;
+use scp_core::discovery::scope::ScopeRegistry;
 
 // ---------------------------------------------------------------------------
 // Global singletons
@@ -59,6 +60,42 @@ pub fn reset_handle_registry_for(context_id: &str) {
     if let Ok(mut guard) = handle_registries().lock() {
         guard.remove(context_id);
     }
+}
+
+/// Global scope registries keyed by context ID.
+///
+/// Each context that hosts scope tools has its own scope registry (§22.3.5, ADR-043).
+/// Separate from handle registries — scope entries and handle entries never share storage.
+pub fn scope_registries() -> &'static Mutex<HashMap<String, ScopeRegistry>> {
+    static REGISTRIES: OnceLock<Mutex<HashMap<String, ScopeRegistry>>> = OnceLock::new();
+    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Removes a specific context's scope registry. Test-only — ensures each test starts
+/// with clean state even if a previous test panicked before manual cleanup.
+#[cfg(any(test, feature = "testing"))]
+pub fn reset_scope_registry_for(context_id: &str) {
+    if let Ok(mut guard) = scope_registries().lock() {
+        guard.remove(context_id);
+    }
+}
+
+/// Collects scope name → context ID mappings from all scope registries.
+///
+/// Iterates all scope registries, collecting `entry.name → entry.target.context_id`
+/// for every scope entry. Used by `address_resolve` to merge scope registry
+/// output into `known_contexts` for two-hop resolution (§22.3.5).
+#[must_use]
+pub fn known_contexts_from_scope_registries() -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    if let Ok(guard) = scope_registries().lock() {
+        for registry in guard.values() {
+            for entry in registry.entries() {
+                result.insert(entry.name.clone(), entry.target.context_id.clone());
+            }
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
