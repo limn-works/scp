@@ -1,8 +1,8 @@
 // Multi-agent coordination: multiple agents collaborating in a shared context.
 //
-// Demonstrates identity creation, context creation with governance, UCAN
-// minting, message sending, and message receiving using the actual SCP
-// Swift SDK API surface.
+// Demonstrates identity creation via `createIdentity()`, context creation,
+// UCAN minting via `mintUcanToken()`, message sending, and message receiving
+// using the SCP Swift SDK wrapper API.
 
 import Foundation
 import SCP
@@ -63,9 +63,9 @@ struct MultiAgent {
 
     static func main() async throws {
         // Create identities for coordinator and two agents
-        let coordinator = try await identityCreate(custody: "in_memory")
-        let agentA = try await identityCreate(custody: "in_memory")
-        let agentB = try await identityCreate(custody: "in_memory")
+        let coordinator = try await createIdentity(custody: "in_memory")
+        let agentA = try await createIdentity(custody: "in_memory")
+        let agentB = try await createIdentity(custody: "in_memory")
 
         // Coordinator creates the context
         let params = ContextParams(
@@ -86,13 +86,13 @@ struct MultiAgent {
         let handle = try await contextCreate(identity: coordinator, params: params)
         print("Context created: \(handle.contextId())")
 
-        // Mint UCANs for each agent via the bridge function
-        _ = try await ucanMint(
+        // Mint UCANs for each agent via the SDK wrapper function
+        _ = try await mintUcanToken(
             handle: handle,
             memberDid: agentA.did(),
             capabilities: ["messages:write", "messages:read"]
         )
-        _ = try await ucanMint(
+        _ = try await mintUcanToken(
             handle: handle,
             memberDid: agentB.did(),
             capabilities: ["messages:write", "messages:read"]

@@ -200,18 +200,21 @@ console.log(`DID: ${identity.did}`);
 ```swift
 import SCP
 
-let identity = try await Identity.create(custody: "platform")
-print("DID: \(identity.did)")
+let identity = try await createIdentity(custody: "platform")
+print("DID: \(identity.did())")
 ```
 
 ### Kotlin
 
 ```kotlin
-import works.limn.scp.Identity
+import works.limn.scp.CustodyType
+import works.limn.scp.bridge.CoroutineBridge
 
 suspend fun main() {
-    val identity = Identity.create(custody = "platform")
-    println("DID: ${identity.did}")
+    // CoroutineBridge wraps all FFI calls on Dispatchers.IO
+    val bridge: CoroutineBridge = // ... construct with NativeBindings
+    val identityHandle = bridge.identity.create(CustodyType.PLATFORM)
+    println("Identity handle: $identityHandle")
 }
 ```
 
@@ -281,18 +284,23 @@ let params = ContextParams(
     minProtocolVersion: 0
 )
 let handle = try await contextCreate(identity: identity, params: params)
+print("Context ID: \(handle.contextId())")
 ```
 
 ### Kotlin
 
 ```kotlin
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.putJsonArray
+
 val paramsJson = buildJsonObject {
     putJsonArray("ceiling") {
         add(JsonPrimitive("messages:read"))
         add(JsonPrimitive("messages:write"))
         add(JsonPrimitive("member:invite"))
     }
-    put("governance", "single_admin")
+    put("governance", JsonPrimitive("single_admin"))
 }.toString()
 
 val contextHandle = bridge.context.create(identityHandle, paramsJson)
@@ -353,7 +361,7 @@ await ctx.close();
 
 ```swift
 // Send
-let payload = "Hello from SCP".data(using: .utf8)!
+let payload = Data("Hello from SCP".utf8)
 try await contextSend(handle: handle, identity: identity, payload: payload)
 
 // Receive via MessageListener callback
@@ -370,8 +378,10 @@ try await contextClose(handle: handle, identity: identity)
 ### Kotlin
 
 ```kotlin
+import kotlinx.coroutines.flow.take
+
 // Send
-bridge.context.send(contextHandle, "Hello from SCP".toByteArray())
+bridge.context.send(contextHandle, identityHandle, "Hello from SCP".toByteArray())
 
 // Receive via Flow
 val subscription = bridge.context.subscribe(contextHandle)
@@ -379,7 +389,7 @@ subscription.take(1).collect { messageJson ->
     println("Received: $messageJson")
 }
 
-bridge.context.close(contextHandle)
+bridge.context.close(contextHandle, identityHandle)
 ```
 
 ---
@@ -429,18 +439,20 @@ try {
 
 ```swift
 do {
-    try await ctx.send(Data("data".utf8))
-} catch ScpError.context(let message, let code) {
-    print("[\(code)] \(message)")
+    try await contextSend(handle: handle, identity: identity, payload: Data("data".utf8))
+} catch ScpError.Context(let msg, let code) {
+    print("[\(code)] \(msg)")
 }
 ```
 
 ### Kotlin
 
 ```kotlin
+import works.limn.scp.bridge.BridgeException
+
 try {
-    ctx.send(payload)
-} catch (e: ContextException) {
+    bridge.context.send(contextHandle, identityHandle, payload)
+} catch (e: BridgeException) {
     println("[${e.code}] ${e.message}")
 }
 ```

@@ -1,8 +1,8 @@
 // Tool invocation: register a tool and invoke it within a context.
 //
-// Demonstrates ToolDefinition construction with the actual UniFFI field
-// names (inputSchemaJson, outputSchemaJson, testVectorsJson) and tool
-// invocation via the Context actor's invokeTool method.
+// Demonstrates ToolDefinition construction with the UniFFI field names
+// (inputSchemaJson, outputSchemaJson, testVectorsJson, implementationHash,
+// cost) and tool invocation via the bridge functions.
 
 import Foundation
 import SCP
@@ -10,10 +10,11 @@ import SCP
 @main
 struct ToolInvocation {
     static func main() async throws {
-        let identity = try await identityCreate(custody: "in_memory")
+        let identity = try await createIdentity(custody: "in_memory")
 
         // ToolDefinition uses UniFFI field names: inputSchemaJson, outputSchemaJson,
-        // testVectorsJson (optional JSON string), implementationHash (optional Data)
+        // testVectorsJson (optional JSON string), implementationHash (optional Data),
+        // cost (optional ToolCostDefinition)
         let weatherTool = ToolDefinition(
             name: "weather",
             description: "Get current weather for a city",
@@ -45,7 +46,9 @@ struct ToolInvocation {
             handle: handle,
             toolId: "weather",
             inputJson: #"{"city":"Berlin"}"#,
-            identity: identity
+            identity: identity,
+            ucanToken: nil,
+            proofTokens: nil
         )
         print("Weather result: \(resultJson)")
 

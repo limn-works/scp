@@ -1,48 +1,72 @@
-/** MCP integration: expose SCP tools via MCP JSON-RPC server. */
+/**
+ * MCP integration: expose SCP tools via MCP and consume external MCP servers.
+ *
+ * Demonstrates tool registration via the CoroutineBridge and the
+ * ToolDefinition data class. MCP server/client functionality is not yet
+ * wired through the FFI bridge -- this example shows the tool registration
+ * pattern and documents the planned MCP surface.
+ *
+ * Prerequisites:
+ *   implementation("works.limn:scp-kt:0.1.0")
+ *
+ * Usage:
+ *   ./gradlew run --args="mcp"
+ */
 
 package works.limn.scp.examples
 
-import works.limn.scp.Context
-import works.limn.scp.CustodyType
-import works.limn.scp.Identity
-import works.limn.scp.McpClient
-import works.limn.scp.ToolDefinition
-import works.limn.scp.serveMcp
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.putJsonArray
+import works.limn.scp.CustodyType
+import works.limn.scp.ToolDefinition
+import works.limn.scp.bridge.CoroutineBridge
 
-fun main() = runBlocking {
-    val identity = Identity.create(custody = CustodyType.IN_MEMORY)
+fun mcpIntegrationExample(bridge: CoroutineBridge) = runBlocking {
+    val operatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    println("Operator handle: $operatorHandle")
 
-    val ctx = Context.create(
-        identity = identity,
-        ceiling = listOf("messages:read", "messages:write", "tool:invoke:*", "tool:register"),
-        memoryScope = "ephemeral",
-        governance = "single_admin",
-    )
+    // Create a context with tool capabilities
+    val paramsJson = buildJsonObject {
+        putJsonArray("ceiling") {
+            add(JsonPrimitive("messages:read"))
+            add(JsonPrimitive("messages:write"))
+            add(JsonPrimitive("tool:invoke:*"))
+            add(JsonPrimitive("tool:register"))
+        }
+    }.toString()
 
-    // Register a tool in the context
+    val contextHandle = bridge.context.create(operatorHandle, paramsJson)
+    println("Context handle: $contextHandle")
+
+    // Define a tool using the typed ToolDefinition data class.
+    // ToolDefinition.toJson() serializes to the JSON format expected by the FFI bridge.
     val tool = ToolDefinition(
         name = "summarize",
         description = "Summarize text content",
         inputSchemaJson = """{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}""",
         outputSchemaJson = """{"type":"object","properties":{"summary":{"type":"string"}}}""",
-        operatorDid = identity.did,
+        operatorDid = "did:dht:z6MkOperator",
     )
-    ctx.registerTool(tool)
 
-    // Start an MCP server exposing context tools on stdio
-    val server = serveMcp(ctx, transport = "stdio")
-    println("MCP server running, exposing tools")
+    // Register the tool in the context via the bridge
+    val toolId = bridge.tools.register(contextHandle, tool.toJson())
+    println("Registered tool: $toolId")
 
-    // Or connect as an MCP client to a remote server
-    val client = McpClient.connect("ws://localhost:8080/mcp")
-    val tools = client.listTools()
-    println("Remote server offers ${tools.size} tool(s)")
+    // MCP server/client operations are not yet wired through the FFI bridge.
+    // When available, the pattern will be:
+    //
+    //   // Start an MCP server exposing context tools
+    //   val server = bridge.mcp.serve(contextHandle, transport = "stdio")
+    //
+    //   // Connect as an MCP client
+    //   val client = bridge.mcp.connect("ws://localhost:8080/mcp")
+    //   val tools = client.listTools()
+    //   val result = client.callTool("summarize", """{"text":"..."}""")
+    //
+    println("(MCP server/client not yet available via FFI bridge)")
 
-    val result = client.callTool("summarize", mapOf("text" to "SCP is a protocol for..."))
-    println("Result: $result")
-
-    client.close()
-    server.stop()
-    ctx.close(identity = identity)
+    bridge.context.close(contextHandle, operatorHandle)
+    println("Context closed.")
 }

@@ -1,39 +1,67 @@
-/** Tool invocation: register a tool with test vectors and invoke it. */
+/**
+ * Tool invocation: register a tool with test vectors and invoke it.
+ *
+ * Demonstrates the ToolDefinition data class, tool registration via the
+ * CoroutineBridge, and tool invocation. Uses the actual Kotlin SDK API surface.
+ *
+ * Prerequisites:
+ *   implementation("works.limn:scp-kt:0.1.0")
+ *
+ * Usage:
+ *   ./gradlew run --args="tool-invocation"
+ */
 
 package works.limn.scp.examples
 
-import works.limn.scp.Context
-import works.limn.scp.CustodyType
-import works.limn.scp.Identity
-import works.limn.scp.ToolDefinition
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.putJsonArray
+import works.limn.scp.CustodyType
+import works.limn.scp.ToolDefinition
+import works.limn.scp.bridge.CoroutineBridge
 
-fun main() = runBlocking {
-    val identity = Identity.create(custody = CustodyType.IN_MEMORY)
+fun toolInvocationExample(bridge: CoroutineBridge) = runBlocking {
+    val operatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    println("Operator handle: $operatorHandle")
 
+    // Define a weather tool using the typed ToolDefinition data class
     val weatherTool = ToolDefinition(
         name = "weather",
         description = "Get current weather for a city",
         inputSchemaJson = """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""",
         outputSchemaJson = """{"type":"object","properties":{"tempC":{"type":"number"},"condition":{"type":"string"}}}""",
-        operatorDid = identity.did,
+        operatorDid = "did:dht:z6MkOperator",
         testVectorsJson = """[{"input":{"city":"Berlin"},"expected":{"tempC":18,"condition":"cloudy"}}]""",
     )
 
-    val ctx = Context.create(
-        identity = identity,
-        ceiling = listOf("messages:read", "messages:write", "tool:invoke:*", "tool:register"),
-        memoryScope = "ephemeral",
-        governance = "single_admin",
-    )
+    // Create a context with tool capabilities
+    val paramsJson = buildJsonObject {
+        putJsonArray("ceiling") {
+            add(JsonPrimitive("messages:read"))
+            add(JsonPrimitive("messages:write"))
+            add(JsonPrimitive("tool:invoke:*"))
+            add(JsonPrimitive("tool:register"))
+        }
+    }.toString()
 
-    // Register the tool
-    val toolId = ctx.registerTool(weatherTool)
+    val contextHandle = bridge.context.create(operatorHandle, paramsJson)
+    println("Context handle: $contextHandle")
+
+    // Register the tool via the bridge (toJson() serializes the ToolDefinition)
+    val toolId = bridge.tools.register(contextHandle, weatherTool.toJson())
     println("Registered tool: $toolId")
 
-    // Invoke the tool
-    val result = ctx.invokeTool("weather", """{"city":"Berlin"}""", identity)
-    println("Weather result: $result")
+    // Invoke the tool via the bridge
+    val resultJson = bridge.tools.invoke(
+        contextHandle,
+        toolId,
+        """{"city":"Berlin"}""",
+        operatorHandle,
+        null,
+    )
+    println("Weather result: $resultJson")
 
-    ctx.close(identity = identity)
+    bridge.context.close(contextHandle, operatorHandle)
+    println("Context closed.")
 }
