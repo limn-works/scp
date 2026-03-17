@@ -298,24 +298,26 @@ impl PyDIDDocument {
 ///
 /// - `"in_memory"` — Test-only in-memory custody. Keys are lost on process
 ///   exit. Only available when compiled with `cfg(feature = "testing")`.
-/// - `"platform"` — Encrypted file-backed custody ([`FileKeyCustody`]) using
+/// - `"file"` — Encrypted file-backed custody ([`FileKeyCustody`]) using
 ///   Argon2id + AES-256-GCM. This is the production default for desktop/server
 ///   platforms. Mobile platforms (iOS/Android) should use their native
 ///   `KeyCustodyProvider` callback interface via `UniFFI` instead.
+/// - `"platform"` — Backward-compatible alias for `"file"` (SCP-294a).
 ///
-/// The `"platform"` path creates a [`FileKeyCustody`] at a default location
-/// (`$HOME/.scp/keys.bin`) with a passphrase from the `SCP_KEY_PASSPHRASE`
-/// environment variable. If the variable is not set, an error is returned.
+/// The `"file"` / `"platform"` path creates a [`FileKeyCustody`] at a default
+/// location (`$HOME/.scp/keys.bin`) with a passphrase from the
+/// `SCP_KEY_PASSPHRASE` environment variable. If the variable is not set, an
+/// error is returned.
 ///
 /// # Errors
 ///
 /// Returns [`ScpPyError::ValidationError`] if:
 /// - The custody string is not recognized.
 /// - `"in_memory"` is requested but the `testing` feature is not enabled.
-/// - `"platform"` is requested but `SCP_KEY_PASSPHRASE` is not set.
+/// - `"file"` / `"platform"` is requested but `SCP_KEY_PASSPHRASE` is not set.
 /// - [`FileKeyCustody`] initialization fails (I/O error, corrupt key file).
 ///
-/// See issue #323 and ADR-006.
+/// See issue #323, ADR-006, and SCP-294a.
 fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
         #[cfg(feature = "allow_in_memory_custody")]
@@ -327,10 +329,12 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
         "in_memory" => Err(ScpPyError::validation(
             "in_memory custody is not available in this build -- enable the              allow_in_memory_custody feature for dev/desktop use",
         )),
-        "platform" => {
+        // "file" is the canonical name; "platform" is a backward-compat alias
+        // (SCP-294a). Both resolve to FileKeyCustody.
+        "file" | "platform" => {
             let passphrase = std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
                 ScpPyError::validation(
-                    "platform custody requires the SCP_KEY_PASSPHRASE environment \
+                    "file custody requires the SCP_KEY_PASSPHRASE environment \
                      variable to be set — this passphrase protects the encrypted key file",
                 )
             })?;
@@ -351,10 +355,12 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
                 ))
             })?;
 
-            Ok((Arc::new(FfiKeyCustody::File(file_kc)), custody.to_owned()))
+            // Normalize: always store "file" as the canonical custody type,
+            // even when the caller passed the "platform" backward-compat alias.
+            Ok((Arc::new(FfiKeyCustody::File(file_kc)), "file".to_owned()))
         }
         other => Err(ScpPyError::validation(format!(
-            "unknown custody type: {other:?} — expected \"in_memory\" or \"platform\""
+            "unknown custody type: {other:?} — expected \"in_memory\", \"file\", or \"platform\""
         ))),
     }
 }

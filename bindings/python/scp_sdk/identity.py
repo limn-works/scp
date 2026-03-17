@@ -91,7 +91,7 @@ class Identity:
 
         identity = await Identity.create()
         print(identity.did)           # "did:dht:z6Mk..."
-        print(identity.custody_type)  # "platform"
+        print(identity.custody_type)  # CustodyType.FILE
 
     See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 1.
     """
@@ -129,7 +129,7 @@ class Identity:
     # -- Async factory methods -----------------------------------------------
 
     @classmethod
-    async def create(cls, custody: CustodyType | str = CustodyType.PLATFORM) -> Identity:
+    async def create(cls, custody: CustodyType | str = CustodyType.FILE) -> Identity:
         """Create a new SCP identity with the specified key custody method.
 
         Args:
@@ -137,10 +137,12 @@ class Identity:
                 :class:`~scp_sdk.types.CustodyType` enum member or a raw
                 string.  Valid values:
 
-                - :attr:`CustodyType.PLATFORM` / ``"platform"``
-                  (default) -- platform-native secure storage (Keychain
-                  on macOS/iOS, Keystore on Android, credential manager
-                  on Windows/Linux).
+                - :attr:`CustodyType.FILE` / ``"file"`` (default) --
+                  encrypted file-backed key custody (Argon2id +
+                  AES-256-GCM at ``$HOME/.scp/keys.bin``).  Requires
+                  the ``SCP_KEY_PASSPHRASE`` environment variable.
+                - :attr:`CustodyType.PLATFORM` / ``"platform"`` --
+                  backward-compatible alias for ``"file"``.
                 - :attr:`CustodyType.IN_MEMORY` / ``"in_memory"`` --
                   ephemeral in-memory key store, suitable for testing or
                   short-lived agents.
@@ -183,7 +185,7 @@ class Identity:
     # -- Sync convenience wrappers -------------------------------------------
 
     @classmethod
-    def create_sync(cls, custody: CustodyType | str = CustodyType.PLATFORM) -> Identity:
+    def create_sync(cls, custody: CustodyType | str = CustodyType.FILE) -> Identity:
         """Synchronous convenience wrapper for :meth:`create`.
 
         Uses :func:`scp_sdk.sync.run_sync` with a dedicated background
@@ -205,9 +207,7 @@ class Identity:
     # -- Async instance methods ----------------------------------------------
 
     @classmethod
-    async def create_with_agent_key(
-        cls, custody: CustodyType | str = CustodyType.PLATFORM
-    ) -> Identity:
+    async def create_with_agent_key(cls, custody: CustodyType | str = CustodyType.FILE) -> Identity:
         """Create a new SCP identity with an agent signing key (ADR-039).
 
         Creates a DID identity with both the standard signing key and an
@@ -216,7 +216,7 @@ class Identity:
         Args:
             custody: Key custody type.  Accepts a
                 :class:`~scp_sdk.types.CustodyType` enum member or a
-                raw string (``"platform"``, ``"in_memory"``,
+                raw string (``"file"``, ``"platform"``, ``"in_memory"``,
                 ``"software"``).
 
         Returns:
