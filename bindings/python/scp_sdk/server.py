@@ -192,7 +192,7 @@ class Node:
         broadcast_key_hex: str,
         author_did: str,
         admission: str,
-        config: SiteConfig | None = None,
+        config: SiteConfig,
     ) -> None:
         """Activate HTTP broadcast projection for a context.
 
@@ -204,18 +204,13 @@ class Node:
                 64-character hex string.
             author_did: DID of the broadcast key owner.
             admission: ``"open"`` or ``"gated"``.
-            config: Optional :class:`~scp_sdk.context.SiteConfig` with
-                hostname, index path, and deploy limits. When ``None``,
-                a ``ValueError`` is raised — ``config`` is required to
-                establish the hostname binding.
+            config: :class:`~scp_sdk.context.SiteConfig` with hostname,
+                index path, and deploy limits.
 
         Raises:
-            ValueError: If parameters are invalid or ``config`` is None.
+            ValueError: If parameters are invalid.
             RuntimeError: If the underlying node operation fails.
         """
-        if config is None:
-            raise ValueError("config is required for enable_site_projection")
-
         await asyncio.to_thread(
             self._handle.enable_site_projection,
             context_id,

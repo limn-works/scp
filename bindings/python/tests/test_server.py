@@ -136,16 +136,15 @@ async def test_enable_site_projection_defaults_pass_none() -> None:
 
 @pytest.mark.asyncio
 async def test_enable_site_projection_requires_config() -> None:
-    """enable_site_projection raises ValueError when config is None."""
+    """enable_site_projection raises TypeError when config is omitted."""
     node = _make_node()
 
-    with pytest.raises(ValueError, match="config is required"):
-        await node.enable_site_projection(
+    with pytest.raises(TypeError):
+        await node.enable_site_projection(  # type: ignore[call-arg]
             context_id="ctx-789",
             broadcast_key_hex="ef" * 32,
             author_did="did:dht:z6MkAuthor3",
             admission="open",
-            config=None,
         )
 
 

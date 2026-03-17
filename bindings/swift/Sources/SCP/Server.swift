@@ -299,7 +299,7 @@ public struct Node: Sendable {
             config.hostname,
             config.indexPath == "/index.html" ? nil : config.indexPath,
             config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
-            config.maxDeploySizeBytes == 536_870_912 ? nil : config.maxDeploySizeBytes,
+            config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
             config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
             config.cspOverride
         )
