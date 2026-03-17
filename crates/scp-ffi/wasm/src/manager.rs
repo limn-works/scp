@@ -74,7 +74,7 @@ where
 
 /// Governance action variants dispatchable through the `WasmContextManager`.
 ///
-/// Mirrors all 28 `GovernanceAction` variants from
+/// Mirrors all 30 `GovernanceAction` variants from
 /// `scp_core::context::governance::GovernanceAction`. WASM bridge functions
 /// serialize JS governance requests into this enum for dispatch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -174,6 +174,13 @@ pub enum WasmGovernanceAction {
         purpose: String,
     },
     LockEconomicPolicy,
+    ProposeContextMigration {
+        new_context_params_json: String,
+        reason: String,
+        grace_period_secs: u64,
+        auto_invite: bool,
+    },
+    CancelContextMigration,
 }
 
 /// Validates a revocation scope string.
@@ -2343,7 +2350,9 @@ impl WasmContextManager {
             | WasmGovernanceAction::ReconfigureGovernance { .. }
             | WasmGovernanceAction::SetEconomicPolicy { .. }
             | WasmGovernanceAction::ApproveSpend { .. }
-            | WasmGovernanceAction::LockEconomicPolicy => "governance:propose",
+            | WasmGovernanceAction::LockEconomicPolicy
+            | WasmGovernanceAction::ProposeContextMigration { .. }
+            | WasmGovernanceAction::CancelContextMigration => "governance:propose",
         }
     }
 
@@ -2509,7 +2518,7 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "ExtendTtl", "additionalSecs": additional_secs}))
             }
-            WasmGovernanceAction::TransferAdmin { .. } // 20 remaining: exhaustive, no wildcard
+            WasmGovernanceAction::TransferAdmin { .. } // 22 remaining: exhaustive, no wildcard
             | WasmGovernanceAction::RevokeWriteAccess { .. }
             | WasmGovernanceAction::RestoreWriteAccess { .. }
             | WasmGovernanceAction::BlockAuthor { .. }
@@ -2528,7 +2537,9 @@ impl WasmContextManager {
             | WasmGovernanceAction::ReconfigureGovernance { .. }
             | WasmGovernanceAction::SetEconomicPolicy { .. }
             | WasmGovernanceAction::ApproveSpend { .. }
-            | WasmGovernanceAction::LockEconomicPolicy => self.dispatch_governance_action_ext(context_id, action),
+            | WasmGovernanceAction::LockEconomicPolicy
+            | WasmGovernanceAction::ProposeContextMigration { .. }
+            | WasmGovernanceAction::CancelContextMigration => self.dispatch_governance_action_ext(context_id, action),
         }
     }
 
@@ -2684,7 +2695,7 @@ impl WasmContextManager {
             | WasmGovernanceAction::ModifyCeiling { .. }
             | WasmGovernanceAction::CloseContext { .. }
             | WasmGovernanceAction::ExtendTtl { .. } => unreachable!(),
-            // 14 variants handled by downstream dispatch methods.
+            // 16 variants handled by downstream dispatch methods.
             WasmGovernanceAction::PromoteContext
             | WasmGovernanceAction::CreateChildContext { .. }
             | WasmGovernanceAction::ModifyPruningPolicy { .. }
@@ -2698,7 +2709,9 @@ impl WasmContextManager {
             | WasmGovernanceAction::ReconfigureGovernance { .. }
             | WasmGovernanceAction::SetEconomicPolicy { .. }
             | WasmGovernanceAction::ApproveSpend { .. }
-            | WasmGovernanceAction::LockEconomicPolicy => {
+            | WasmGovernanceAction::LockEconomicPolicy
+            | WasmGovernanceAction::ProposeContextMigration { .. }
+            | WasmGovernanceAction::CancelContextMigration => {
                 self.dispatch_governance_action_structural(context_id, action)
             }
         }
@@ -2848,14 +2861,16 @@ impl WasmContextManager {
             | WasmGovernanceAction::BlockAuthor { .. }
             | WasmGovernanceAction::RevokeReadAccess { .. }
             | WasmGovernanceAction::RestoreReadAccess { .. } => unreachable!(),
-            WasmGovernanceAction::EstablishToolInterface { .. } // 8 downstream
+            WasmGovernanceAction::EstablishToolInterface { .. } // 10 downstream
             | WasmGovernanceAction::ResetMember { .. }
             | WasmGovernanceAction::ResolveConflict { .. }
             | WasmGovernanceAction::RotateContentKeys { .. }
             | WasmGovernanceAction::ReconfigureGovernance { .. }
             | WasmGovernanceAction::SetEconomicPolicy { .. }
             | WasmGovernanceAction::ApproveSpend { .. }
-            | WasmGovernanceAction::LockEconomicPolicy => {
+            | WasmGovernanceAction::LockEconomicPolicy
+            | WasmGovernanceAction::ProposeContextMigration { .. }
+            | WasmGovernanceAction::CancelContextMigration => {
                 self.dispatch_governance_action_remaining(context_id, action)
             }
         }
@@ -2863,7 +2878,8 @@ impl WasmContextManager {
 
     /// Handles remaining governance actions: `EstablishToolInterface`,
     /// `ResetMember`, `ResolveConflict`, `RotateContentKeys`,
-    /// `ReconfigureGovernance`.
+    /// `ReconfigureGovernance`, `ProposeContextMigration`,
+    /// `CancelContextMigration`.
     fn dispatch_governance_action_remaining(
         &mut self,
         context_id: &str,
@@ -2876,28 +2892,7 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "EstablishToolInterface"}))
             }
             WasmGovernanceAction::ResetMember { did, reason } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                if !ctx.members.contains_key(did) {
-                    return Err(ScpWasmError::Context {
-                        message: format!("member '{did}' not found"),
-                        code: "SCP-CTX-2015".to_owned(),
-                    });
-                }
-                // Member reset: remove + re-add with same role (ADR-029 §Tier 3).
-                let role = ctx
-                    .members
-                    .get(did)
-                    .map(|m| m.role.clone())
-                    .unwrap_or_default();
-                ctx.members.insert(
-                    did.clone(),
-                    MemberEntry {
-                        did: did.clone(),
-                        role,
-                        sequence_number: 0,
-                    },
-                );
-                Ok(serde_json::json!({"action": "ResetMember", "did": did, "reason": reason}))
+                self.dispatch_reset_member(context_id, did, reason)
             }
             WasmGovernanceAction::ResolveConflict {
                 proposal_a,
@@ -2913,23 +2908,25 @@ impl WasmContextManager {
             WasmGovernanceAction::ReconfigureGovernance {
                 changes_json,
                 justification,
+            } => self.dispatch_reconfigure_governance(context_id, changes_json, justification),
+            WasmGovernanceAction::ProposeContextMigration {
+                new_context_params_json,
+                reason,
+                grace_period_secs,
+                auto_invite,
             } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                if changes_json.is_empty() {
-                    return Err(ScpWasmError::Permission {
-                        message: "reconfigure_governance requires at least one change".to_owned(),
-                        code: "SCP-PERM-3000".to_owned(),
-                    });
-                }
-                if justification.is_empty() {
-                    return Err(ScpWasmError::Permission {
-                        message: "deadlock justification must not be empty".to_owned(),
-                        code: "SCP-PERM-3000".to_owned(),
-                    });
-                }
-                // Clear governance freeze as the reconfiguration resolves it.
-                ctx.governance_freeze = false;
-                Ok(serde_json::json!({"action": "ReconfigureGovernance"}))
+                let _ = self.require_active_context_mut(context_id)?;
+                Ok(serde_json::json!({
+                    "action": "ProposeContextMigration",
+                    "newContextParamsJson": new_context_params_json,
+                    "reason": reason,
+                    "gracePeriodSecs": grace_period_secs,
+                    "autoInvite": auto_invite,
+                }))
+            }
+            WasmGovernanceAction::CancelContextMigration => {
+                let _ = self.require_active_context_mut(context_id)?;
+                Ok(serde_json::json!({"action": "CancelContextMigration"}))
             }
             // 20 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             WasmGovernanceAction::AddMember { .. }
@@ -3016,7 +3013,7 @@ impl WasmContextManager {
                 ctx.economic_policy_locked = true;
                 Ok(serde_json::json!({"action": "LockEconomicPolicy"}))
             }
-            // 25 variants handled by upstream dispatch methods (exhaustive, no wildcard).
+            // 27 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             WasmGovernanceAction::AddMember { .. }
             | WasmGovernanceAction::RemoveMember { .. }
             | WasmGovernanceAction::ChangeRole { .. }
@@ -3041,7 +3038,9 @@ impl WasmContextManager {
             | WasmGovernanceAction::ResetMember { .. }
             | WasmGovernanceAction::ResolveConflict { .. }
             | WasmGovernanceAction::RotateContentKeys { .. }
-            | WasmGovernanceAction::ReconfigureGovernance { .. } => unreachable!(),
+            | WasmGovernanceAction::ReconfigureGovernance { .. }
+            | WasmGovernanceAction::ProposeContextMigration { .. }
+            | WasmGovernanceAction::CancelContextMigration => unreachable!(),
         }
     }
 
@@ -3088,6 +3087,62 @@ impl WasmContextManager {
             ctx.executed_proposals.insert(loser.to_owned(), now);
         }
         Ok(serde_json::json!({"action": "ResolveConflict"}))
+    }
+
+    /// Helper for `ResetMember` governance action.
+    fn dispatch_reset_member(
+        &mut self,
+        context_id: &str,
+        did: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        if !ctx.members.contains_key(did) {
+            return Err(ScpWasmError::Context {
+                message: format!("member '{did}' not found"),
+                code: "SCP-CTX-2015".to_owned(),
+            });
+        }
+        // Member reset: remove + re-add with same role (ADR-029 §Tier 3).
+        let role = ctx
+            .members
+            .get(did)
+            .map(|m| m.role.clone())
+            .unwrap_or_default();
+        ctx.members.insert(
+            did.to_owned(),
+            MemberEntry {
+                did: did.to_owned(),
+                role,
+                sequence_number: 0,
+            },
+        );
+        Ok(serde_json::json!({"action": "ResetMember", "did": did, "reason": reason}))
+    }
+
+    /// Helper for `ReconfigureGovernance` governance action.
+    fn dispatch_reconfigure_governance(
+        &mut self,
+        context_id: &str,
+        changes_json: &str,
+        justification: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        if changes_json.is_empty() {
+            return Err(ScpWasmError::Permission {
+                message: "reconfigure_governance requires at least one change".to_owned(),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+        if justification.is_empty() {
+            return Err(ScpWasmError::Permission {
+                message: "deadlock justification must not be empty".to_owned(),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+        // Clear governance freeze as the reconfiguration resolves it.
+        ctx.governance_freeze = false;
+        Ok(serde_json::json!({"action": "ReconfigureGovernance"}))
     }
 
     /// Helper for `RegisterTool` governance action.
@@ -5305,15 +5360,28 @@ mod tests {
         roundtrip(&WasmGovernanceAction::LockEconomicPolicy);
     }
 
+    #[test]
+    fn serde_roundtrip_propose_context_migration() {
+        roundtrip(&WasmGovernanceAction::ProposeContextMigration {
+            new_context_params_json: r#"{"mode":"encrypted"}"#.to_owned(),
+            reason: "protocol upgrade".to_owned(),
+            grace_period_secs: 604_800,
+            auto_invite: true,
+        });
+    }
+
+    #[test]
+    fn serde_roundtrip_cancel_context_migration() {
+        roundtrip(&WasmGovernanceAction::CancelContextMigration);
+    }
+
     // -----------------------------------------------------------------------
     // Variant count exhaustiveness
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn governance_action_has_28_variants() {
-        // Ensure all 28 variants are covered by serializing each and counting
-        // unique "type" values.
-        let all: Vec<WasmGovernanceAction> = vec![
+    /// Builds all 30 `WasmGovernanceAction` variants for exhaustive testing.
+    fn all_wasm_governance_actions() -> Vec<WasmGovernanceAction> {
+        vec![
             WasmGovernanceAction::AddMember {
                 did: "d".into(),
                 role: "r".into(),
@@ -5392,8 +5460,20 @@ mod tests {
                 purpose: "p".into(),
             },
             WasmGovernanceAction::LockEconomicPolicy,
-        ];
-        assert_eq!(all.len(), 28, "expected 28 governance action variants");
+            WasmGovernanceAction::ProposeContextMigration {
+                new_context_params_json: "{}".into(),
+                reason: "upgrade".into(),
+                grace_period_secs: 604_800,
+                auto_invite: true,
+            },
+            WasmGovernanceAction::CancelContextMigration,
+        ]
+    }
+
+    #[test]
+    fn governance_action_has_30_variants() {
+        let all = all_wasm_governance_actions();
+        assert_eq!(all.len(), 30, "expected 30 governance action variants");
 
         // Verify each serializes to unique "type" tag.
         let types: std::collections::HashSet<String> = all
@@ -5405,8 +5485,8 @@ mod tests {
             .collect();
         assert_eq!(
             types.len(),
-            28,
-            "expected 28 unique type tags, got {}: {types:?}",
+            30,
+            "expected 30 unique type tags, got {}: {types:?}",
             types.len()
         );
     }

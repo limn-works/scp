@@ -1995,8 +1995,9 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    /// Returns all 28 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
-    /// and 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`)
+    /// Returns all 30 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
+    /// 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`,
+    /// and 2 migration: `ProposeContextMigration`, `CancelContextMigration`)
     /// for serialization testing. Split into two helpers to stay within the
     /// function line limit.
     fn all_governance_actions() -> Vec<GovernanceAction> {

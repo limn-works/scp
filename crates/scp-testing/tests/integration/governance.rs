@@ -132,12 +132,13 @@ fn simple_tool_registration() -> scp_core::context::params::ToolRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// 1. all_28_governance_action_variants_roundtrip
+// 1. all_30_governance_action_variants_roundtrip
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn all_28_governance_action_variants_roundtrip() {
-    let actions: Vec<GovernanceAction> = vec![
+/// Builds all 30 `GovernanceAction` variants for exhaustive testing.
+/// Split into a helper to keep the test function within the line limit.
+fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
+    vec![
         GovernanceAction::AddMember {
             did: bob(),
             role: "member".to_owned(),
@@ -224,12 +225,24 @@ async fn all_28_governance_action_variants_roundtrip() {
             purpose: "tool costs".to_owned(),
         },
         GovernanceAction::LockEconomicPolicy,
-    ];
+        GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(ContextParams::default()),
+            reason: "protocol upgrade".to_owned(),
+            grace_period_secs: 604_800,
+            auto_invite: true,
+        },
+        GovernanceAction::CancelContextMigration,
+    ]
+}
+
+#[tokio::test]
+async fn all_30_governance_action_variants_roundtrip() {
+    let actions = all_governance_actions_for_test();
 
     assert_eq!(
         actions.len(),
-        28,
-        "must cover all 28 GovernanceAction variants"
+        30,
+        "must cover all 30 GovernanceAction variants"
     );
 
     for action in &actions {
