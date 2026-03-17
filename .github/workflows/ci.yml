@@ -318,6 +318,8 @@ jobs:
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
       - uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
@@ -348,6 +350,8 @@ jobs:
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
       - uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
       - run: sdkmanager "platforms;android-35"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
