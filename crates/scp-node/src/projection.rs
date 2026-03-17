@@ -7060,4 +7060,316 @@ mod tests {
             "same-origin"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // E2E workflow: broadcast content delivery lifecycle (SCP-298)
+    // -----------------------------------------------------------------------
+
+    /// Asserts all 8 security headers are present on a response.
+    fn assert_security_headers(h: &axum::http::HeaderMap) {
+        assert_eq!(
+            h.get("x-content-type-options").unwrap().to_str().unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            h.get("content-security-policy").unwrap().to_str().unwrap(),
+            "default-src 'self'"
+        );
+        assert_eq!(h.get("x-frame-options").unwrap().to_str().unwrap(), "DENY");
+        assert!(
+            h.get("strict-transport-security")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("max-age=63072000")
+        );
+        assert_eq!(
+            h.get("cross-origin-opener-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            h.get("cross-origin-embedder-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "require-corp"
+        );
+        assert!(h.get("permissions-policy").is_some());
+        assert_eq!(
+            h.get("referrer-policy").unwrap().to_str().unwrap(),
+            "same-origin"
+        );
+    }
+
+    /// Issues a GET to the site path and returns `(status, headers, body_bytes)`.
+    async fn site_get(
+        state: &Arc<NodeState>,
+        routing_hex: &str,
+        path: &str,
+        auth_header: Option<&str>,
+    ) -> (HttpStatus, axum::http::HeaderMap, Vec<u8>) {
+        let router = broadcast_projection_router(Arc::clone(state));
+        let mut builder =
+            Request::builder().uri(format!("/scp/broadcast/{routing_hex}/site/{path}"));
+        if let Some(auth) = auth_header {
+            builder = builder.header("Authorization", auth);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// Commits a deploy via the shared `NodeState` write lock.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn commit_via_state(
+        state: &Arc<NodeState>,
+        routing_id: [u8; 32],
+        deploy_id: &str,
+        entries: HashMap<ContentPath, [u8; 32]>,
+    ) -> usize {
+        let mut guard = state.projected_contexts.write().await;
+        let ctx = guard.get_mut(&routing_id).unwrap();
+        ctx.commit_deploy(deploy_id.to_owned(), entries)
+    }
+
+    /// Rolls back to a previous deploy via the shared `NodeState` write lock.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn rollback_via_state(
+        state: &Arc<NodeState>,
+        routing_id: [u8; 32],
+        deploy_id: &str,
+    ) -> bool {
+        let mut guard = state.projected_contexts.write().await;
+        let ctx = guard.get_mut(&routing_id).unwrap();
+        ctx.rollback_deploy(deploy_id)
+    }
+
+    /// Builds a test `BroadcastContent` for a given path, content type, deploy
+    /// ID, and body.
+    fn make_content(path: &str, ct: &str, deploy_id: &str, body: &[u8]) -> BroadcastContent {
+        BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new(path).unwrap()),
+                content_type: Some(MimeType::new(ct).unwrap()),
+                deploy_id: Some(deploy_id.into()),
+                etag: None,
+                immutable: false,
+            },
+            body: body.to_vec(),
+        }
+    }
+
+    /// Full lifecycle: publish, commit, serve, update, rollback (SCP-298).
+    #[tokio::test]
+    async fn site_e2e_publish_commit_serve_rollback() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_e2e_lifecycle_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "e2e-lifecycle.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+        let routing_hex = hex_encode(&routing_id);
+        let storage = InMemoryBlobStorage::new();
+
+        // Publish and commit v1 (HTML + CSS).
+        let v1_html = make_content("/index.html", "text/html", "deploy-v1", b"<h1>V1</h1>");
+        let v1_css = make_content("/style.css", "text/css", "deploy-v1", b"body{color:red}");
+        let v1_html_id = store_content_blob(&storage, routing_id, &key, &v1_html).await;
+        let v1_css_id = store_content_blob(&storage, routing_id, &key, &v1_css).await;
+        let mut e1 = HashMap::new();
+        e1.insert(ContentPath::new("/index.html").unwrap(), v1_html_id);
+        e1.insert(ContentPath::new("/style.css").unwrap(), v1_css_id);
+        assert_eq!(projected.commit_deploy("deploy-v1".into(), e1), 2);
+
+        let mut pm = HashMap::new();
+        pm.insert(routing_id, projected);
+        let state = test_state_with(pm, storage.clone());
+
+        // Verify v1 HTML: status, Content-Type, body, security headers.
+        let (status, headers, body) = site_get(&state, &routing_hex, "index.html", None).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_security_headers(&headers);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
+        assert_eq!(&body[..], b"<h1>V1</h1>");
+
+        // Verify v1 CSS.
+        let (status, headers, body) = site_get(&state, &routing_hex, "style.css", None).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/css"
+        );
+        assert_security_headers(&headers);
+        assert_eq!(&body[..], b"body{color:red}");
+
+        // Publish v2 HTML, commit v2.
+        let v2_html = make_content("/index.html", "text/html", "deploy-v2", b"<h1>V2</h1>");
+        let v2_html_id = store_content_blob(&storage, routing_id, &key, &v2_html).await;
+        let mut e2 = HashMap::new();
+        e2.insert(ContentPath::new("/index.html").unwrap(), v2_html_id);
+        e2.insert(ContentPath::new("/style.css").unwrap(), v1_css_id);
+        assert_eq!(
+            commit_via_state(&state, routing_id, "deploy-v2", e2).await,
+            2
+        );
+
+        // Verify v2 body.
+        let (status, headers, body) = site_get(&state, &routing_hex, "index.html", None).await;
+        assert_eq!(status, HttpStatus::OK);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
+        assert_eq!(&body[..], b"<h1>V2</h1>");
+
+        // Rollback to v1, verify v1 body restored.
+        assert!(rollback_via_state(&state, routing_id, "deploy-v1").await);
+        let (status, headers, body) = site_get(&state, &routing_hex, "index.html", None).await;
+        assert_eq!(status, HttpStatus::OK);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
+        assert_eq!(&body[..], b"<h1>V1</h1>");
+        assert_security_headers(&headers);
+    }
+
+    /// Gated variant: publish, commit, serve with UCAN auth, rollback (SCP-298).
+    #[tokio::test]
+    async fn site_e2e_gated_publish_commit_serve_rollback() {
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_e2e_gated_ctx";
+        let signing_key = test_signing_key();
+        let pk = *signing_key.verifying_key().as_bytes();
+        let issuer_did = format!("did:dht:z6Mk{}", bs58::encode(pk).into_string());
+        let mut mk = HashMap::new();
+        mk.insert(issuer_did, pk);
+
+        let mut projected = ProjectedContext::with_member_keys(
+            context_id,
+            key.clone(),
+            BroadcastAdmission::Gated,
+            None,
+            mk,
+        );
+        projected.set_site_config(SiteConfig {
+            hostname: "gated-e2e.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+        let routing_hex = hex_encode(&routing_id);
+        let storage = InMemoryBlobStorage::new();
+
+        // Publish and commit v1.
+        let v1 = make_content("/index.html", "text/html", "gated-v1", b"<h1>Gated V1</h1>");
+        let v1_id = store_content_blob(&storage, routing_id, &key, &v1).await;
+        let mut e1 = HashMap::new();
+        e1.insert(ContentPath::new("/index.html").unwrap(), v1_id);
+        assert_eq!(projected.commit_deploy("gated-v1".into(), e1), 1);
+
+        let mut pm = HashMap::new();
+        pm.insert(routing_id, projected);
+        let state = test_state_with(pm, storage.clone());
+
+        // Without UCAN -> 401.
+        let (status, _, _) = site_get(&state, &routing_hex, "index.html", None).await;
+        assert_eq!(status, HttpStatus::UNAUTHORIZED);
+
+        // With valid signed UCAN -> 200 + correct body + security headers.
+        let token = build_signed_test_ucan(context_id, &signing_key);
+        let auth = format!("Bearer {token}");
+        let (status, headers, body) =
+            site_get(&state, &routing_hex, "index.html", Some(&auth)).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_security_headers(&headers);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
+        assert_eq!(&body[..], b"<h1>Gated V1</h1>");
+
+        // Publish and commit v2.
+        let v2 = make_content("/index.html", "text/html", "gated-v2", b"<h1>Gated V2</h1>");
+        let v2_id = store_content_blob(&storage, routing_id, &key, &v2).await;
+        let mut e2 = HashMap::new();
+        e2.insert(ContentPath::new("/index.html").unwrap(), v2_id);
+        commit_via_state(&state, routing_id, "gated-v2", e2).await;
+
+        // Verify v2.
+        let token = build_signed_test_ucan(context_id, &signing_key);
+        let auth = format!("Bearer {token}");
+        let (status, headers, body) =
+            site_get(&state, &routing_hex, "index.html", Some(&auth)).await;
+        assert_eq!(status, HttpStatus::OK);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
+        assert_eq!(&body[..], b"<h1>Gated V2</h1>");
+
+        // Rollback to v1.
+        assert!(rollback_via_state(&state, routing_id, "gated-v1").await);
+
+        // Still 401 without UCAN after rollback.
+        let (status, _, _) = site_get(&state, &routing_hex, "index.html", None).await;
+        assert_eq!(status, HttpStatus::UNAUTHORIZED);
+
+        // v1 body with UCAN after rollback.
+        let token = build_signed_test_ucan(context_id, &signing_key);
+        let auth = format!("Bearer {token}");
+        let (status, headers, body) =
+            site_get(&state, &routing_hex, "index.html", Some(&auth)).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_security_headers(&headers);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
+        assert_eq!(&body[..], b"<h1>Gated V1</h1>");
+    }
 }
