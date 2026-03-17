@@ -24,6 +24,8 @@
 
 import { createRequire } from "node:module";
 import { TransportError } from "./errors";
+import type { SiteConfig } from "./types";
+import { validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // Native addon access — server operations bypass the Bridge interface
@@ -44,6 +46,21 @@ interface NativeNodeHandle {
   readonly did: string;
   readonly isShutdown: boolean;
   shutdown(): void;
+  enableSiteProjection(
+    contextId: string,
+    broadcastKeyHex: string,
+    authorDid: string,
+    admission: string,
+    hostname: string,
+    indexPath: string | null,
+    maxAssetsPerDeploy: number | null,
+    maxDeploySizeBytes: number | null,
+    deployRetentionCount: number | null,
+    cspOverride: string | null,
+  ): Promise<void>;
+  commitDeploy(contextId: string, deployId: string): Promise<number>;
+  rollbackDeploy(contextId: string, deployId: string): Promise<void>;
+  disableSiteProjection(contextId: string): Promise<void>;
 }
 
 /** Typed subset of the native addon for server operations. */
@@ -244,6 +261,84 @@ export class Node implements AsyncDisposable {
     const addon = loadServerAddon();
     const handle = await addon.nodeStartLocal(dataDir);
     return new Node(handle);
+  }
+
+  // -------------------------------------------------------------------------
+  // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Activate HTTP broadcast projection for a context.
+   *
+   * Registers a broadcast context for HTTP content delivery.
+   *
+   * @param contextId - The context ID to project.
+   * @param broadcastKeyHex - 32-byte AES-256 broadcast key as a 64-char hex string.
+   * @param authorDid - DID of the broadcast key owner.
+   * @param admission - `"open"` or `"gated"`.
+   * @param config - {@link SiteConfig} with hostname, index path, and deploy limits.
+   * @throws {Error} If parameters are invalid.
+   */
+  async enableSiteProjection(
+    contextId: string,
+    broadcastKeyHex: string,
+    authorDid: string,
+    admission: string,
+    config: SiteConfig,
+  ): Promise<void> {
+    validateSiteConfig(config);
+    await this.#handle.enableSiteProjection(
+      contextId,
+      broadcastKeyHex,
+      authorDid,
+      admission,
+      config.hostname,
+      config.indexPath ?? null,
+      config.maxAssetsPerDeploy ?? null,
+      config.maxDeploySizeBytes ?? null,
+      config.deployRetentionCount ?? null,
+      config.cspOverride ?? null,
+    );
+  }
+
+  /**
+   * Commit a deploy for a projected context (section 18.11.11).
+   *
+   * Scans blobs matching the `deployId`, decrypts each to extract metadata,
+   * builds an immutable path index, and atomically swaps the serving pointer.
+   *
+   * @param contextId - The projected context ID.
+   * @param deployId - The deploy identifier (hex, from publish).
+   * @returns The number of assets in the committed deploy.
+   * @throws {Error} If the context is not projected or commit fails.
+   */
+  async commitDeploy(contextId: string, deployId: string): Promise<number> {
+    return this.#handle.commitDeploy(contextId, deployId);
+  }
+
+  /**
+   * Roll back to a previous deploy for a projected context (section 18.11.11).
+   *
+   * Sets the path index pointer to a previous deploy within the retention window.
+   *
+   * @param contextId - The projected context ID.
+   * @param deployId - The deploy identifier to roll back to.
+   * @throws {Error} If the context is not projected or deploy not found.
+   */
+  async rollbackDeploy(contextId: string, deployId: string): Promise<void> {
+    await this.#handle.rollbackDeploy(contextId, deployId);
+  }
+
+  /**
+   * Deactivate HTTP broadcast projection for a context.
+   *
+   * Removes the projected context from the registry and drops all retained
+   * epoch keys. Idempotent — calling on a non-projected context is a no-op.
+   *
+   * @param contextId - The context ID to stop projecting.
+   */
+  async disableSiteProjection(contextId: string): Promise<void> {
+    await this.#handle.disableSiteProjection(contextId);
   }
 
   /**
