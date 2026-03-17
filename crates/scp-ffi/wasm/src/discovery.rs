@@ -1216,6 +1216,11 @@ fn wasm_validate_scope_did(did: &str) -> Result<(), JsError> {
     if did.is_empty() {
         return Err(JsError::new("[SCP-VALID-7136] DID must not be empty"));
     }
+    if did.len() > 512 {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID exceeds maximum length of 512 characters",
+        ));
+    }
     if !did.starts_with("did:") {
         return Err(JsError::new(
             "[SCP-VALID-7136] DID must start with \"did:\"",
@@ -1235,6 +1240,11 @@ fn wasm_validate_scope_context_id(context_id: &str) -> Result<(), JsError> {
     if context_id.is_empty() {
         return Err(JsError::new(
             "[SCP-VALID-7137] context_id must not be empty",
+        ));
+    }
+    if context_id.len() > 256 {
+        return Err(JsError::new(
+            "[SCP-VALID-7137] context_id exceeds 256 characters",
         ));
     }
     if context_id.bytes().any(|b| b < 0x20) {
