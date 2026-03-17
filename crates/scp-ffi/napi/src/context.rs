@@ -126,11 +126,14 @@ pub struct NapiContextHandle {
     pub(crate) core_handle: Option<ContextHandle>,
     /// Cancellation token for the subscription task spawned by `context_subscribe`.
     /// Cancelled in `context_leave` and `context_close` to stop the background
-    /// relay listener, preventing orphaned tasks.
-    pub(crate) subscription_cancel: CancellationToken,
+    /// relay listener, preventing orphaned tasks. Wrapped in a `Mutex` so that
+    /// `context_subscribe` can replace a spent token with a fresh one, enabling
+    /// re-subscription after relay disconnect or task termination.
+    pub(crate) subscription_cancel: std::sync::Mutex<CancellationToken>,
     /// Guard preventing duplicate `context_subscribe` calls. Set to `true` on
-    /// the first successful call; subsequent calls return `SCP-CTX-2022`.
-    pub(crate) subscription_active: std::sync::atomic::AtomicBool,
+    /// the first successful call; reset to `false` when the spawned task exits,
+    /// enabling re-subscription after relay disconnect or task termination.
+    pub(crate) subscription_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Internal context lifecycle state string helper.
@@ -282,6 +285,9 @@ impl NapiContextHandle {
 
 impl Drop for NapiContextHandle {
     fn drop(&mut self) {
+        if let Ok(token) = self.subscription_cancel.lock() {
+            token.cancel();
+        }
         decrement_handle_count();
     }
 }
@@ -310,8 +316,8 @@ impl NapiContextHandle {
             in_memory_custody: None,
             signing_key: None,
             core_handle: None,
-            subscription_cancel: CancellationToken::new(),
-            subscription_active: std::sync::atomic::AtomicBool::new(false),
+            subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -508,8 +514,8 @@ pub async fn context_create(
         in_memory_custody,
         signing_key,
         core_handle: Some(core_handle),
-        subscription_cancel: CancellationToken::new(),
-        subscription_active: std::sync::atomic::AtomicBool::new(false),
+        subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
+        subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     increment_handle_count();
     Ok(handle)
@@ -589,7 +595,9 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 
     // Cancel the subscription task before leaving so the background relay
     // listener stops promptly.
-    handle.subscription_cancel.cancel();
+    if let Ok(token) = handle.subscription_cancel.lock() {
+        token.cancel();
+    }
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
@@ -632,7 +640,9 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
 
     // Cancel the subscription task before closing so the background relay
     // listener stops promptly.
-    handle.subscription_cancel.cancel();
+    if let Ok(token) = handle.subscription_cancel.lock() {
+        token.cancel();
+    }
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
@@ -759,6 +769,8 @@ pub fn context_subscribe(
 ) -> napi::Result<()> {
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
+    // The flag is reset to `false` by the spawned task when it exits,
+    // enabling re-subscription after relay disconnect or task termination.
     if handle
         .subscription_active
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -804,9 +816,25 @@ pub fn context_subscribe(
     let routing_id_bytes = scp_core::context::context_id_bytes(&context_id);
     let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
 
-    // Clone the cancellation token so the spawned task can observe cancellation
-    // triggered by context_leave / context_close.
-    let cancel_token = handle.subscription_cancel.clone();
+    // Replace the cancellation token with a fresh one so a previously
+    // cancelled token doesn't immediately cancel the new subscription.
+    let cancel_token = {
+        let mut guard = handle.subscription_cancel.lock().map_err(|_| {
+            handle
+                .subscription_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            NapiError::from(ScpNapiError::Context {
+                message: "subscription cancel lock is poisoned".to_owned(),
+                code: "SCP-CTX-2012".to_owned(),
+            })
+        })?;
+        *guard = CancellationToken::new();
+        guard.clone()
+    };
+
+    // Clone the Arc<AtomicBool> so the spawned task can reset it on exit,
+    // enabling re-subscription after relay disconnect or task termination.
+    let active_flag = Arc::clone(&handle.subscription_active);
 
     // Spawn a background task that subscribes to the relay and delivers
     // incoming messages through the JS callback. The task terminates when
@@ -829,6 +857,8 @@ pub fn context_subscribe(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
+                // Reset the active flag so re-subscription is possible.
+                active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
         };
@@ -841,6 +871,8 @@ pub fn context_subscribe(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
+                // Reset the active flag so re-subscription is possible.
+                active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
         };
@@ -925,6 +957,10 @@ pub fn context_subscribe(
             Ok(None),
             napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
         );
+
+        // Reset the active flag so re-subscription is possible after relay
+        // disconnect or task termination.
+        active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 
     Ok(())
@@ -3196,8 +3232,8 @@ mod tests {
             in_memory_custody: None,
             signing_key: None,
             core_handle: None,
-            subscription_cancel: CancellationToken::new(),
-            subscription_active: std::sync::atomic::AtomicBool::new(false),
+            subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Initially None.

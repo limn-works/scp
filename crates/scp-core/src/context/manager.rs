@@ -3007,48 +3007,69 @@ impl ContextManager {
     ) -> Result<(Vec<u8>, String), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Hold the lock across the entire operation: state check, decrypt,
-        // membership verification, and receive-buffer push. `decrypt_message`
-        // is sync and does not acquire `self.contexts`, so no deadlock risk.
-        // Holding the lock prevents TOCTOU races where a member is removed
-        // between the active-check and the buffer push.
-        let mut contexts = self.contexts.lock().await;
+        // Phase 1: Acquire lock → state check → drop lock.
+        // Follows the send_message pattern: narrow lock scope so decrypt
+        // (which is sync but potentially expensive) doesn't serialize all
+        // context operations behind a single global mutex.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+        }
 
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-        require_active(&ctx.handle)?;
-
-        // Decrypt: MLS layer (ADR-001) -> sender key layer (ADR-007).
+        // Phase 2: Decrypt outside the lock.
+        // `decrypt_message` is sync and takes its own internal mutex for
+        // OpenMLS group state — no need to hold `self.contexts` here.
+        // MLS layer (ADR-001) -> sender key layer (ADR-007).
         // Uses epoch=0, sequence=0 matching the send path's AAD.
         let (plaintext, sender_did) =
             self.crypto
                 .decrypt_message(&context_id_bytes, encrypted_blob, 0, 0)?;
 
-        // Verify sender is a current member and not write-revoked (§9.17,
-        // ADR-038). Mirrors the send_message path's membership checks.
+        // Phase 3: Re-acquire lock → re-check active → verify membership →
+        // capability check → push to receive buffer. Re-checking eliminates the
+        // TOCTOU window between Phase 1 and Phase 3.
         let sender_did_obj = DID(sender_did.clone());
-        if !ctx.membership.contains(&sender_did) {
-            return Err(ContextError::MemberNotFound(format!(
-                "sender {sender_did} is not a member of this context"
-            )));
-        }
-        if ctx.write_revoked_members.contains(&sender_did_obj) {
-            return Err(ContextError::PermissionDenied(format!(
-                "write access has been revoked for {sender_did}"
-            )));
-        }
+        {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
-        // Emit MessageReceived event to the receive buffer.
-        if let Some(ctx_mut) = contexts.get_mut(context_id) {
-            ctx_mut.receive_buffer.push(ContextEvent::MessageReceived {
+            // Re-check active state: context may have been closed/left during decrypt.
+            require_active(&ctx.handle)?;
+
+            // Verify sender is a current member and not write-revoked (§9.17,
+            // ADR-038). Mirrors the send_message path's membership checks.
+            if !ctx.membership.contains(&sender_did) {
+                return Err(ContextError::MemberNotFound(format!(
+                    "sender {sender_did} is not a member of this context"
+                )));
+            }
+            if ctx.write_revoked_members.contains(&sender_did_obj) {
+                return Err(ContextError::PermissionDenied(format!(
+                    "write access has been revoked for {sender_did}"
+                )));
+            }
+
+            // Role-based capability check, mirroring send_message's encrypted path.
+            if !ctx
+                .role_state
+                .member_has_capability(&sender_did, &Capability::MessagesWrite)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {sender_did} does not have messages:write capability"
+                )));
+            }
+
+            // Emit MessageReceived event to the receive buffer.
+            ctx.receive_buffer.push(ContextEvent::MessageReceived {
                 sender_did: sender_did_obj,
                 payload: plaintext.clone(),
             });
         }
-
-        // Drop lock before the best-effort event log append.
-        drop(contexts);
 
         // Append event to event log (best-effort, matches send_message).
         let _ = self
@@ -9262,6 +9283,38 @@ mod tests {
         match result.unwrap_err() {
             ContextError::PermissionDenied(msg) => {
                 assert!(msg.contains("revoked"), "error should mention revocation");
+            }
+            other => panic!("expected PermissionDenied, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_incoming_rejects_sender_without_messages_write() {
+        let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
+
+        // Remove messages:write capability from the creator.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            if let Some(caps) = ctx
+                .role_state
+                .member_capabilities
+                .get_mut("did:key:creator")
+            {
+                caps.remove(&Capability::MessagesWrite);
+            }
+        }
+
+        let result = manager
+            .deliver_incoming("test-ctx", b"no-write-cap-payload")
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ContextError::PermissionDenied(msg) => {
+                assert!(
+                    msg.contains("messages:write"),
+                    "error should mention missing capability"
+                );
             }
             other => panic!("expected PermissionDenied, got: {other:?}"),
         }
