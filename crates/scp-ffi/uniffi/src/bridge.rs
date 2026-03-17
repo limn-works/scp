@@ -28,6 +28,7 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use sha2::Digest;
+use zeroize::Zeroizing;
 
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
@@ -6972,10 +6973,12 @@ pub async fn create_governance_checkpoint(
     let last_event_hash = parse_uniffi_hex_32(&last_event_hash_hex, "last_event_hash")?;
     let state_snapshot_hash = parse_uniffi_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
     let creator_signature =
-        hex::decode(&creator_signature_hex).map_err(|e| ScpError::Validation {
-            msg: format!("invalid creator_signature hex: {e}"),
-            code: "SCP-CTX-2062".to_owned(),
-        })?;
+        Zeroizing::new(
+            hex::decode(&creator_signature_hex).map_err(|e| ScpError::Validation {
+                msg: format!("invalid creator_signature hex: {e}"),
+                code: "SCP-CTX-2062".to_owned(),
+            })?,
+        );
     let did = scp_identity::DID(creator_did);
 
     runtime()
@@ -6990,7 +6993,7 @@ pub async fn create_governance_checkpoint(
                     last_event_hash,
                     state_snapshot_hash,
                     &did,
-                    creator_signature,
+                    (*creator_signature).clone(),
                 )
                 .await
                 .map_err(ScpError::from)?;
@@ -7031,14 +7034,17 @@ pub async fn add_checkpoint_cosignature(
             code: "SCP-CTX-2063".to_owned(),
         })?;
 
-    let signature = hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
-        msg: format!("invalid signature hex: {e}"),
-        code: "SCP-CTX-2063".to_owned(),
-    })?;
+    let signature =
+        Zeroizing::new(
+            hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
+                msg: format!("invalid signature hex: {e}"),
+                code: "SCP-CTX-2063".to_owned(),
+            })?,
+        );
 
     let cosignature = scp_core::context::governance::CosignedCheckpoint {
         signer_did: scp_identity::DID(signer_did),
-        signature,
+        signature: (*signature).clone(),
     };
 
     runtime()
@@ -9026,10 +9032,13 @@ pub fn provenance_pseudonymize_counterparties(
             code: "SCP-VALID-7050".to_owned(),
         })?;
 
-    let key = hex::decode(&pseudonym_key_hex).map_err(|e| ScpError::Validation {
-        msg: format!("invalid pseudonym_key_hex: {e}"),
-        code: "SCP-VALID-7052".to_owned(),
-    })?;
+    let key =
+        Zeroizing::new(
+            hex::decode(&pseudonym_key_hex).map_err(|e| ScpError::Validation {
+                msg: format!("invalid pseudonym_key_hex: {e}"),
+                code: "SCP-VALID-7052".to_owned(),
+            })?,
+        );
 
     scp_core::provenance::attach::pseudonymize_counterparties(&mut prov, &key);
 
@@ -11657,10 +11666,13 @@ pub fn metadata_record_to_json(
             code: "SCP-VALID-7001".to_owned(),
         })?;
 
-    let signature = hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
-        msg: format!("invalid signature hex: {e}"),
-        code: "SCP-VALID-7001".to_owned(),
-    })?;
+    let signature =
+        Zeroizing::new(
+            hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
+                msg: format!("invalid signature hex: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            })?,
+        );
     if signature.len() != 64 {
         return Err(ScpError::Validation {
             msg: format!("signature must be 64 bytes (got {})", signature.len()),
@@ -11675,7 +11687,7 @@ pub fn metadata_record_to_json(
         timestamp,
         structural,
         operational,
-        signature,
+        signature: (*signature).clone(),
     };
 
     serde_json::to_string(&record).map_err(|e| ScpError::Validation {

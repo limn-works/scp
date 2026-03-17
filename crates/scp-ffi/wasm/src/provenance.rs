@@ -21,6 +21,7 @@
 
 use sha2::Digest;
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Constants (mirror scp-core::provenance::attach)
@@ -501,8 +502,10 @@ pub fn provenance_pseudonymize_counterparties(
     let mut parsed: serde_json::Value = serde_json::from_str(&provenance_json)
         .map_err(|e| JsError::new(&format!("[SCP-VALID-7050] invalid provenance JSON: {e}")))?;
 
-    let key = hex::decode(&pseudonym_key_hex)
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7052] invalid pseudonym_key_hex: {e}")))?;
+    let key =
+        Zeroizing::new(hex::decode(&pseudonym_key_hex).map_err(|e| {
+            JsError::new(&format!("[SCP-VALID-7052] invalid pseudonym_key_hex: {e}"))
+        })?);
 
     let context_id = parsed
         .get("source_context")

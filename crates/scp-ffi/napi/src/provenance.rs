@@ -18,6 +18,7 @@
 
 use napi_derive::napi;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use scp_core::context::MemoryScope;
 use scp_core::provenance::attach::{
@@ -274,12 +275,12 @@ pub fn provenance_pseudonymize_counterparties(
         })
     })?;
 
-    let key = hex::decode(&pseudonym_key_hex).map_err(|e| {
+    let key = Zeroizing::new(hex::decode(&pseudonym_key_hex).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid pseudonym_key_hex: {e}"),
             code: "SCP-VALID-7052".to_owned(),
         })
-    })?;
+    })?);
 
     pseudonymize_counterparties(&mut prov, &key);
 

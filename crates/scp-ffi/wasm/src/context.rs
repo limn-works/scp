@@ -11,6 +11,8 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use zeroize::Zeroizing;
+
 use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpWasmError;
@@ -954,13 +956,14 @@ pub fn context_create_governance_checkpoint(
         let last_event_hash = parse_wasm_hex_32(&last_event_hash_hex, "last_event_hash")?;
         let state_snapshot_hash =
             parse_wasm_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
-        let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("invalid creator_signature hex: {e}"),
-                code: "SCP-CTX-2062".to_owned(),
-            }
-            .into_js()
-        })?;
+        let creator_signature =
+            Zeroizing::new(hex::decode(&creator_signature_hex).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid creator_signature hex: {e}"),
+                    code: "SCP-CTX-2062".to_owned(),
+                }
+                .into_js()
+            })?);
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let seq = checkpoint_seq as u64;
@@ -1020,13 +1023,13 @@ pub fn context_add_checkpoint_cosignature(
                 .into_js()
             })?;
 
-        let signature = hex::decode(&signature_hex).map_err(|e| {
+        let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid signature hex: {e}"),
                 code: "SCP-CTX-2063".to_owned(),
             }
             .into_js()
-        })?;
+        })?);
 
         let status = with_manager(|mgr| {
             mgr.add_checkpoint_cosignature(&context_id, &mut checkpoint, &signer_did, &signature)
@@ -2113,13 +2116,13 @@ pub fn metadata_record_to_json(
         .into_js()
     })?;
 
-    let signature = hex::decode(&signature_hex).map_err(|e| {
+    let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid signature hex: {e}"),
             code: "SCP-VALID-7001".to_owned(),
         }
         .into_js()
-    })?;
+    })?);
     if signature.len() != 64 {
         return Err(ScpWasmError::Validation {
             message: format!("signature must be 64 bytes (got {})", signature.len()),
@@ -2137,7 +2140,7 @@ pub fn metadata_record_to_json(
         timestamp: ts,
         structural,
         operational,
-        signature,
+        signature: (*signature).clone(),
     };
 
     serde_json::to_string(&record).map_err(|e| {

@@ -20,6 +20,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use scp_core::context::MemoryScope;
 use scp_core::provenance::attach::{
@@ -259,10 +260,12 @@ pub fn py_provenance_pseudonymize_counterparties(
             code: "SCP-VALID-7050".to_string(),
         })?;
 
-    let key = hex::decode(pseudonym_key_hex).map_err(|e| ScpPyError::ValidationError {
-        message: format!("invalid pseudonym_key_hex: {e}"),
-        code: "SCP-VALID-7052".to_string(),
-    })?;
+    let key = Zeroizing::new(hex::decode(pseudonym_key_hex).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("invalid pseudonym_key_hex: {e}"),
+            code: "SCP-VALID-7052".to_string(),
+        }
+    })?);
 
     pseudonymize_counterparties(&mut prov, &key);
 
