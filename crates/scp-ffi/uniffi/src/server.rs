@@ -18,7 +18,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use scp_ffi_common::server::{self, ServerError};
-use scp_ffi_common::validate::{validate_context_id, validate_deploy_id};
+use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 
@@ -300,6 +300,7 @@ impl NodeHandle {
         csp_override: Option<String>,
     ) -> Result<(), ScpError> {
         validate_context_id(&context_id)?;
+        validate_did(&author_did)?;
         let key_vec =
             Zeroizing::new(
                 hex::decode(&broadcast_key_hex).map_err(|e| ScpError::Validation {

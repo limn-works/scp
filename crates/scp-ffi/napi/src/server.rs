@@ -18,7 +18,7 @@ use napi_derive::napi;
 use zeroize::Zeroizing;
 
 use scp_ffi_common::server::{self, RunningRelay, ServerError};
-use scp_ffi_common::validate::{validate_context_id, validate_deploy_id};
+use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 
@@ -265,6 +265,7 @@ impl NapiNodeHandle {
         csp_override: Option<String>,
     ) -> napi::Result<()> {
         validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         let key_vec = Zeroizing::new(
             hex::decode(&broadcast_key_hex)
                 .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?,

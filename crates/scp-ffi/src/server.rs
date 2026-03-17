@@ -270,6 +270,7 @@ impl PyNodeHandle {
         csp_override: Option<String>,
     ) -> PyResult<()> {
         crate::validate::validate_context_id(&context_id)?;
+        crate::validate::validate_did(&author_did)?;
         let rt = crate::runtime()?;
 
         let key_vec = Zeroizing::new(hex::decode(&broadcast_key_hex).map_err(|e| {
