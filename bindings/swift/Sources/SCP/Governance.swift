@@ -1391,7 +1391,7 @@ public struct SiteConfig: Sendable, Equatable {
     public init(
         hostname: String,
         indexPath: String = "/index.html",
-        maxAssetsPerDeploy: Int = 10_000,
+        maxAssetsPerDeploy: Int = 10000,
         maxDeploySizeBytes: Int = 536_870_912,
         deployRetentionCount: Int = 2,
         cspOverride: String? = nil
@@ -1409,7 +1409,7 @@ public struct SiteConfig: Sendable, Equatable {
                 code: "SCP-VALID-7021"
             )
         }
-        guard (1...8).contains(deployRetentionCount) else {
+        guard (1 ... 8).contains(deployRetentionCount) else {
             throw ScpError.Validation(
                 msg: "deployRetentionCount must be between 1 and 8, got \(deployRetentionCount)",
                 code: "SCP-VALID-7010"

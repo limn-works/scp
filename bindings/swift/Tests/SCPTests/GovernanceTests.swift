@@ -1363,7 +1363,7 @@ struct SiteConfigTests {
         let config = try SiteConfig(hostname: "example.com")
         #expect(config.hostname == "example.com")
         #expect(config.indexPath == "/index.html")
-        #expect(config.maxAssetsPerDeploy == 10_000)
+        #expect(config.maxAssetsPerDeploy == 10000)
         #expect(config.maxDeploySizeBytes == 536_870_912)
         #expect(config.deployRetentionCount == 2)
         #expect(config.cspOverride == nil)
@@ -1373,14 +1373,14 @@ struct SiteConfigTests {
         let config = try SiteConfig(
             hostname: "cdn.example.com",
             indexPath: "/home.html",
-            maxAssetsPerDeploy: 5_000,
+            maxAssetsPerDeploy: 5000,
             maxDeploySizeBytes: 268_435_456,
             deployRetentionCount: 4,
             cspOverride: "default-src 'self'"
         )
         #expect(config.hostname == "cdn.example.com")
         #expect(config.indexPath == "/home.html")
-        #expect(config.maxAssetsPerDeploy == 5_000)
+        #expect(config.maxAssetsPerDeploy == 5000)
         #expect(config.maxDeploySizeBytes == 268_435_456)
         #expect(config.deployRetentionCount == 4)
         #expect(config.cspOverride == "default-src 'self'")
