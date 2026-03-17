@@ -158,7 +158,7 @@ Each test specifies:
 | **Tier** | Full |
 | **Spec Sections** | §5.13 |
 | **Preconditions** | Parent context exists. Creator is a member of parent. |
-| **Steps** | 1. Create child context with parent reference. 2. Verify nesting depth <= 3 (§9.18.6). 3. Verify child ceiling is intersection of parent ceiling and requested ceiling (§5.13.1). 4. Verify child references parent in metadata. |
+| **Steps** | 1. Create child context with parent reference. 2. If `ContextParams::max_nesting_depth` is set, verify nesting depth does not exceed it (§5.13.8, ADR-043). 3. Verify child ceiling is intersection of parent ceiling and requested ceiling (§5.13.1). 4. Verify child references parent in metadata. |
 | **Expected Outcome** | Child context created. Ceiling intersection enforced. Parent-child relationship visible in metadata. |
 
 ### CONF-013: Context Close Lifecycle

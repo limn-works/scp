@@ -35,7 +35,7 @@ Hypercore and SCP's event logs serve a structurally similar function: tamper-evi
 | Verification | Sparse — verify any entry without full history | Proof-of-inclusion and proof-of-absence |
 | Multi-writer | Autobase (app-layer DAG linearization over single-writer cores) | Native via MLS group membership — the group key proves write authority |
 | Encryption | None at log level; transport-level only (Noise XX + XChaCha20-Poly1305) | MLS + sender-side AES-256-GCM at log level |
-| Governance | None — data structure has no concept of rules, roles, or permissions | Full governance model: 28 action types, pluggable governance engines (§5.9) |
+| Governance | None — data structure has no concept of rules, roles, or permissions | Full governance model: 30 action types, pluggable governance engines (§5.9) |
 
 **The key distinction:** Hypercore is a data structure. SCP event logs are a data structure embedded in a governance and encryption context. Hypercore answers "who appended this?" (signature verification). SCP event logs answer "who appended this, were they authorized to, under what governance, in what role, with what capabilities, and is it encrypted to the right group?"
 

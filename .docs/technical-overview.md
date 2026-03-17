@@ -499,7 +499,7 @@ Contexts can have parent-child relationships for two distinct purposes:
 **Multi-parent nesting** — bridges between contexts. Two contexts that need a shared collaboration space create a child with both as parents. The child's ceiling is the intersection of both parents' ceilings — the narrowest common denominator. Members from both parents can join if they meet eligibility requirements.
 
 Protocol-enforced limits:
-- **Nesting depth: 3 levels max.** A child of a child of a child is permitted; a fourth level is rejected. This bounds cascading state propagation, capability inheritance chains, and the attack surface from compromised child contexts.
+- **Nesting depth: unbounded by default, context-configurable.** Contexts set an explicit limit via `ContextParams::max_nesting_depth` when they want to bound cascading state propagation, capability inheritance chains, and attack surface from compromised child contexts. The default is no limit (ADR-043).
 - **Ceiling intersection converges on empty.** Each level can only narrow capabilities. Deep nesting naturally constrains what's possible, preventing capability amplification through nesting.
 
 ### Apps and MCP integration

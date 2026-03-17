@@ -604,8 +604,8 @@ The findings are organized per-file, then by severity.
 ### [24.2.1] chain_path Unbounded
 - **Category**: Missing constants/defaults
 - **Location**: Section 24.2.1, line 33
-- **What's missing**: `chain_path: [ContextId]?` grows with each hop. The chain depth maximum is 3, so `chain_path` is at most 3 entries. But `chain_depth` saturates at `u8::MAX` (255) -- if the max is raised per-context, `chain_path` could grow to 255 entries. No explicit bound on `chain_path` length is specified.
-- **Why it matters**: The chain depth default max is 3, but it's "configurable per context" (section 24.4). A context with `max_chain_depth = 200` would allow a 200-entry `chain_path`. This is mostly a storage size concern.
+- **What's missing**: `chain_path: [ContextId]?` grows with each hop. The chain depth default maximum is 8 (ADR-043), so `chain_path` is at most 8 entries. But `chain_depth` saturates at `u8::MAX` (255) -- if the max is raised per-context, `chain_path` could grow to 255 entries. No explicit bound on `chain_path` length is specified.
+- **Why it matters**: The chain depth default max is 8 (ADR-043, raised from 3), and it's configurable per context via `ContextParams::max_chain_depth` (range [1, 255], section 24.4). A context with `max_chain_depth = 200` would allow a 200-entry `chain_path`. This is mostly a storage size concern.
 - **Severity**: LOW
 
 ### [24.2.3] DiscoveryMethod::OutOfBand Semantics Overlap with NoProvenance
@@ -625,7 +625,7 @@ The findings are organized per-file, then by severity.
 ### [24.3.2] First Crossing chain_depth = 0 vs chain_depth = 1 Discrepancy
 - **Category**: Cross-reference inconsistencies
 - **Location**: Section 24.3.2, lines 95-99
-- **What's missing**: "When data crosses its first context boundary, `chain_depth` is 0." But section 24.4 says "At the maximum depth, data cannot trigger further cross-context tool calls" with default maximum 3. If the first crossing is depth 0, then 4 crossings are possible (0, 1, 2, 3) before hitting the max of 3. Section 9.2.1 says "maximum chain depth (suggested default: 3 hops)" -- does "3 hops" mean 3 crossings (depth 0-2) or depth value 3 (4 crossings)?
+- **What's missing**: "When data crosses its first context boundary, `chain_depth` is 0." But section 24.4 says "At the maximum depth, data cannot trigger further cross-context tool calls" with default maximum now 8 (ADR-043, raised from 3). If the first crossing is depth 0, then 9 crossings are possible (0-8) before hitting the default max of 8. The semantics question remains: does "8 hops" mean 8 crossings (depth 0-7) or depth value 8 (9 crossings)?
 - **Why it matters**: Off-by-one in chain depth enforcement means either one too many or one too few cross-context hops are allowed.
 - **Severity**: MEDIUM
 

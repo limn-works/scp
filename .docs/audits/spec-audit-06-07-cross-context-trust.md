@@ -46,6 +46,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **What's missing**: "protocol default: 3" is used in spec 06, but spec 09 says "suggested default: 3 hops" and spec 24 says "protocol default maximum: 3 hops." The language is inconsistent -- is 3 a MUST, a SHOULD, or a suggested value? Spec 09 explicitly says it is "a hard protocol limit, not a governance option" but spec 24 says "configurable per context." These are contradictory: it cannot be both a hard protocol limit and configurable per context.
 - **Why it matters**: If contexts can set their own maximum (spec 24), a malicious context could set max_depth=255 and enable amplification attacks. If it is truly a hard protocol limit, spec 24 needs correction.
 - **Severity**: HIGH
+- **Resolution (ADR-043):** Chain depth is now context-configurable (default 8), with no protocol hard max. The contradiction between "protocol default: 3" and "configurable per context" is resolved — the default is 8, contexts may override.
 
 ### [6.2] Schema Specificity Floor -- No Recursive Depth Check
 - **Category**: Missing edge cases
@@ -67,6 +68,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **What's missing**: "suggested default: 5 concurrent sessions per calling context" -- this is not a MUST or SHOULD. An implementation that sets the cap to 1000 or unlimited is technically conformant. The spec provides no normative floor.
 - **Why it matters**: The session cap is the primary defense against session exhaustion attacks (acknowledged in Section 9.2.1). A "suggested" value is not a security guarantee.
 - **Severity**: MEDIUM
+- **Resolution (ADR-043):** Session cap raised to default 1000, context-configurable via `ContextParams::session_cap`.
 
 ### [6.2.1] Session State Visibility and Cleanup Semantics
 - **Category**: Undefined error/failure behavior

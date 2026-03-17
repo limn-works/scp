@@ -684,7 +684,7 @@ Only the tool's operator (or context admin) can update. Schema changes that brea
 
 ### Cross-Context Tool Interface (§6.2)
 
-Both contexts opt in. Calls carry provenance including chain depth. Schema constraints enforce structural specificity (no unbounded string-only interfaces, minimum two distinct fields). Chain depth limit (protocol default: 3) prevents amplification.
+Both contexts opt in. Calls carry provenance including chain depth. Schema constraints enforce structural specificity (no unbounded string-only interfaces, minimum two distinct fields). Chain depth limit (default: 8, context-configurable via `ContextParams::max_chain_depth`, ADR-043) prevents amplification.
 
 ```
 // Context A exposes a tool to Context B
@@ -720,7 +720,7 @@ SCP.ToolInterface.call(
   output: { sessionID: "sched:abc123", status: "pending" },
   provenance: DataProvenance { ... }
 }
-// Per-caller session cap (default: 5) prevents exhaustion. Optional session TTL.
+// Per-caller session cap (default: 1000, context-configurable via ContextParams::session_cap, ADR-043) prevents exhaustion. Optional session TTL.
 ```
 
 ### Revoke Tool Interface
@@ -1657,11 +1657,11 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 - **~~Context lifecycle state machine.~~** ✅ **Resolved.** ADR-008 specifies states (Creating, Active, Closing, Closed, Expired), transitions, TTL management, governance enforcement.
 - **~~Context templates and lightweight creation.~~** ✅ **Resolved.** .docs/specs/ §5.12 specifies 6 well-known templates (4 encrypted + 2 broadcast), auto-accept policies, invitation bundling, computational profile, standing bilateral contexts. sdk-common.md specifies cross-language SDK surface.
 - **~~Context nesting.~~** ✅ **Resolved.** .docs/specs/ §5.13 specifies parent-child relationships (8 subsections): ceiling inheritance, membership eligibility, creation protocol, parent governance configuration, lifecycle coupling, metadata/legibility, interaction with other mechanisms, depth limits. Cryptographic binding via MLS `group_context` extensions. ADR-008 defines the `ChildContextCreate` capability. Nesting implementation (`nesting.rs`) is deferred to a later phase (see SCP-134 in the PRD).
-- **~~Cross-context provenance chain tracking.~~** ✅ **Resolved.** DataProvenance type includes `chainDepth` (boundary hop count) and `chainPath` (intermediary context IDs). Chain depth limit (default: 3) enforced at protocol level. .docs/specs/ §7.7.1.
+- **~~Cross-context provenance chain tracking.~~** ✅ **Resolved.** DataProvenance type includes `chainDepth` (boundary hop count) and `chainPath` (intermediary context IDs). Chain depth limit (default: 8, context-configurable, no protocol hard max per ADR-043) enforced at context level. .docs/specs/ §7.7.1.
 - **~~Minimum viable agent.~~** ✅ **Resolved.** MCP server/client translating between model and SCP SDK. See `00-open-questions.md`, §4.4–4.5, §8.5. Tracked at [#364](https://github.com/limn-works/scp/issues/364).
 - **~~Capability declaration format.~~** ✅ **Resolved.** JSON Schema (MCP-compatible) with SCP-specific extensions. §8.4 specifies the contract; §8.5 establishes MCP compatibility. See `00-open-questions.md`.
 - **~~Offline/local-first.~~** ✅ **Resolved.** ADR-029 specifies offline/sync strategy. §23 specifies the full sync protocol. Three-tier recovery (local replay, peer sync, governance-triggered reset).
-- **~~Governance interface.~~** ✅ **Resolved.** ADR-031 specifies multi-admin governance. `GovernanceEngine` trait with `SingleAdmin`, `Threshold`, `Majority`, and `Unanimity` models. 28 governance action types. §5.9 specifies the governance proposal lifecycle.
+- **~~Governance interface.~~** ✅ **Resolved.** ADR-031 specifies multi-admin governance. `GovernanceEngine` trait with `SingleAdmin`, `Threshold`, `Majority`, and `Unanimity` models. 30 governance action types. §5.9 specifies the governance proposal lifecycle.
 - **~~Summary generation protocol.~~** ✅ **Resolved.** §5.11 specifies memory scope enforcement including summary lifecycle: pre-close generation, 300-second verification window, key destruction. Summary format defined by context tools/governance.
 - **~~Context promotion.~~** ✅ **Resolved.** §5.10 specifies `PromotionPolicy` (declared at creation, immutable). Same context with TTL removed. Requires unanimous consent. `PromoteContext` governance action in ADR-031.
 

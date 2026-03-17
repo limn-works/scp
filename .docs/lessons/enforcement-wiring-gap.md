@@ -4,9 +4,9 @@
 
 **Context**: Three spec requirements had partial or absent enforcement in the SCP codebase:
 
-1. **Chain depth limit** (spec 6.2): `check_chain_depth` existed in `provenance/attach.rs` with `DEFAULT_MAX_CHAIN_DEPTH = 3` and 34 tests, but was never called from `invoke_cross_context` in `tools/interface.rs`. Cross-context tool calls could chain indefinitely.
+1. **Chain depth limit** (spec 6.2): `check_chain_depth` existed in `provenance/attach.rs` with `DEFAULT_MAX_CHAIN_DEPTH = 3` (now 8 per ADR-043) and 34 tests, but was never called from `invoke_cross_context` in `tools/interface.rs`. Cross-context tool calls could chain indefinitely.
 
-2. **Per-caller session cap** (spec 6.2.1): The spec requires a cap of 5 concurrent sessions per calling context, but `create_session` in `tools/session.rs` had no cap enforcement at all. Any caller could exhaust sessions.
+2. **Per-caller session cap** (spec 6.2.1): The spec requires a cap (now default 1000, context-configurable via `ContextParams::session_cap` per ADR-043) per calling context, but `create_session` in `tools/session.rs` had no cap enforcement at all. Any caller could exhaust sessions.
 
 3. **Schema specificity floor** (spec 6.2): The spec requires minimum 2 distinct fields in tool schemas to prevent degenerate broad-schema tools, but `register_tool` in `tools/registry.rs` only checked structural validity (is-an-object, has-type-field), not field count.
 

@@ -229,7 +229,7 @@ Transport + Data (relay-based, transport-agnostic)
   - Both contexts opt in (bidirectional governance consent)
   - Shared-member bridging (primary transport) or multi-parent child contexts (fallback)
   - Schema constraints (no unbounded string-only interfaces)
-  - Chain depth limit (protocol default: 3 hops)
+  - Chain depth limit (default: 8, context-configurable, ADR-043)
   - Stateful sessions (optional, per-caller cap, optional TTL)
 - Multi-parent child contexts: symmetric collaboration
   - Ceiling = intersection of parent ceilings (no capability escalation)
@@ -239,7 +239,7 @@ Transport + Data (relay-based, transport-agnostic)
 
 ### 5.6 Context Nesting
 - Parent-child relationships for sub-spaces and governed bridges
-- Max nesting depth (3)
+- Nesting depth unbounded by default, context-configurable via `ContextParams::max_nesting_depth` (ADR-043)
 - Parent governance over child: configurable (can_close_child, can_evict_members, can_restrict_ceiling)
 - On-sever policies: evict unique members, cascade close, preserve membership
 
@@ -312,7 +312,7 @@ Transport + Data (relay-based, transport-agnostic)
 - Quality degrades with indirection (chain depth) — this is the protocol working as designed
 
 ### 8.3 Chain Depth Enforcement
-- Protocol-enforced maximum (default: 3 hops)
+- Context-configurable maximum (default: 8 hops, ADR-043)
 - Prevents accountability laundering through cascading context traversals
 - Chain path recorded for full traversal audit
 
@@ -594,13 +594,25 @@ Key points for the paper:
 
 ## Appendices
 
-### A. Protocol Constants
-- Maximum nesting depth (3)
-- Default chain depth limit (3)
+### A. Protocol Constants (Three-Tier Classification, ADR-043)
+
+**Tier 1 — Protocol Invariants** (not configurable, changing them is a protocol-breaking change):
+- MLS ciphersuite, HPKE suite, hash algorithms, key sizes
+- Domain separator strings for all canonical hashing
 - Bucket padding sizes
+- Wire format version numbers
+
+**Tier 2 — Configurable Parameters** (context-configurable via `ContextParams`, with protocol defaults):
+- Nesting depth: unbounded by default, context-configurable via `max_nesting_depth`
+- Chain depth limit: default 8, range [1, 255], context-configurable via `max_chain_depth`
+- Session cap per caller: default 1000, context-configurable via `session_cap`
 - Default TTLs
 - Rate limit defaults
-- Key derivation domain separators
+
+**Tier 3 — Implementation Recommendations** (suggested values, not protocol-enforced):
+- `MAX_SEQUENTIAL_COMMITS`, `SENDER_KEY_TIMEOUT`, `RECONNECTION_TIMEOUT`
+- Relay blob TTL (relay operator config)
+- Relay republish interval (derived from TTL)
 
 ### B. Wire Format Summary
 - Outer envelope fields and types
