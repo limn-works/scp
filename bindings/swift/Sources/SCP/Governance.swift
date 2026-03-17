@@ -1397,6 +1397,18 @@ public struct SiteConfig: Sendable, Equatable {
         cspOverride: String? = nil
     ) throws {
         try SiteConfig.validateHostname(hostname)
+        guard maxAssetsPerDeploy > 0 else {
+            throw ScpError.Validation(
+                msg: "maxAssetsPerDeploy must be >= 1, got \(maxAssetsPerDeploy)",
+                code: "SCP-VALID-7020"
+            )
+        }
+        guard maxDeploySizeBytes > 0 else {
+            throw ScpError.Validation(
+                msg: "maxDeploySizeBytes must be >= 1, got \(maxDeploySizeBytes)",
+                code: "SCP-VALID-7021"
+            )
+        }
         guard (1...8).contains(deployRetentionCount) else {
             throw ScpError.Validation(
                 msg: "deployRetentionCount must be between 1 and 8, got \(deployRetentionCount)",
@@ -1469,7 +1481,7 @@ public struct SiteConfig: Sendable, Equatable {
                 )
             }
         }
-        for token in lower.split(separator: " ") {
+        for token in lower.split(whereSeparator: { $0.isWhitespace }) {
             let tokenStr = String(token)
             guard tokenStr != "*" else {
                 throw ScpError.Validation(

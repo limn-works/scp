@@ -193,6 +193,41 @@ class SiteConfigTest {
         }.also { assertTrue(it.message!!.contains("CSP must not contain 'unsafe-eval'")) }
     }
 
+    @Test
+    fun `CSP tab-separated bare wildcard rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            SiteConfig(hostname = "example.com", cspOverride = "default-src\t*")
+        }.also { assertTrue(it.message!!.contains("CSP must not contain bare wildcard '*'")) }
+    }
+
+    // MARK: - Deploy Limits Validation
+
+    @Test
+    fun `maxAssetsPerDeploy zero rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            SiteConfig(hostname = "example.com", maxAssetsPerDeploy = 0)
+        }.also { assertTrue(it.message!!.contains("maxAssetsPerDeploy must be >= 1")) }
+    }
+
+    @Test
+    fun `maxDeploySizeBytes negative rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            SiteConfig(hostname = "example.com", maxDeploySizeBytes = -1)
+        }.also { assertTrue(it.message!!.contains("maxDeploySizeBytes must be >= 1")) }
+    }
+
+    @Test
+    fun `maxAssetsPerDeploy one accepted`() {
+        val config = SiteConfig(hostname = "example.com", maxAssetsPerDeploy = 1)
+        assertEquals(1, config.maxAssetsPerDeploy)
+    }
+
+    @Test
+    fun `maxDeploySizeBytes one accepted`() {
+        val config = SiteConfig(hostname = "example.com", maxDeploySizeBytes = 1)
+        assertEquals(1L, config.maxDeploySizeBytes)
+    }
+
     // MARK: - JSON Serialization
 
     @Test

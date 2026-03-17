@@ -752,3 +752,35 @@ class TestSiteConfigCspValidation:
                 hostname="example.com",
                 csp_override="script-src 'Unsafe-Eval'",
             )
+
+
+class TestSiteConfigDeployLimitsValidation:
+    """Tests for max_assets_per_deploy and max_deploy_size_bytes bounds."""
+
+    def test_max_assets_per_deploy_zero_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="max_assets_per_deploy must be >= 1"):
+            SiteConfig(hostname="example.com", max_assets_per_deploy=0)
+
+    def test_max_deploy_size_bytes_negative_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="max_deploy_size_bytes must be >= 1"):
+            SiteConfig(hostname="example.com", max_deploy_size_bytes=-1)
+
+    def test_max_assets_per_deploy_one_accepted(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com", max_assets_per_deploy=1)
+        assert config.max_assets_per_deploy == 1
+
+    def test_max_deploy_size_bytes_one_accepted(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com", max_deploy_size_bytes=1)
+        assert config.max_deploy_size_bytes == 1

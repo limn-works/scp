@@ -1510,4 +1510,34 @@ struct SiteConfigTests {
             _ = try SiteConfig(hostname: "example.com", cspOverride: "script-src 'Unsafe-Eval'")
         }
     }
+
+    @Test func cspTabSeparatedBareWildcardRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "default-src\t*")
+        }
+    }
+
+    // MARK: - Deploy Limits Validation
+
+    @Test func maxAssetsPerDeployZeroRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", maxAssetsPerDeploy: 0)
+        }
+    }
+
+    @Test func maxDeploySizeBytesNegativeRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", maxDeploySizeBytes: -1)
+        }
+    }
+
+    @Test func maxAssetsPerDeployOneAccepted() throws {
+        let config = try SiteConfig(hostname: "example.com", maxAssetsPerDeploy: 1)
+        #expect(config.maxAssetsPerDeploy == 1)
+    }
+
+    @Test func maxDeploySizeBytesOneAccepted() throws {
+        let config = try SiteConfig(hostname: "example.com", maxDeploySizeBytes: 1)
+        #expect(config.maxDeploySizeBytes == 1)
+    }
 }

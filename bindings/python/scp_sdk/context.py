@@ -202,6 +202,10 @@ class SiteConfig:
 
     def __post_init__(self) -> None:
         _validate_hostname(self.hostname)
+        if self.max_assets_per_deploy < 1:
+            raise ValueError("max_assets_per_deploy must be >= 1")
+        if self.max_deploy_size_bytes < 1:
+            raise ValueError("max_deploy_size_bytes must be >= 1")
         if not isinstance(self.deploy_retention_count, int) or not (
             1 <= self.deploy_retention_count <= 8
         ):

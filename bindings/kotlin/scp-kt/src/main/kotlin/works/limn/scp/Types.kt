@@ -316,6 +316,8 @@ data class SiteConfig(
 ) {
     init {
         validateHostname(hostname)
+        require(maxAssetsPerDeploy >= 1) { "maxAssetsPerDeploy must be >= 1" }
+        require(maxDeploySizeBytes >= 1) { "maxDeploySizeBytes must be >= 1" }
         require(deployRetentionCount in 1..8) {
             "deployRetentionCount must be between 1 and 8, got $deployRetentionCount"
         }

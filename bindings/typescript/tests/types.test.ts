@@ -502,4 +502,28 @@ describe("validateSiteConfig", () => {
       validateSiteConfig({ hostname: "example.com", cspOverride: "script-src 'Unsafe-Eval'" }),
     ).toThrow("CSP must not contain 'unsafe-eval'");
   });
+
+  it("rejects maxAssetsPerDeploy of 0", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", maxAssetsPerDeploy: 0 }),
+    ).toThrow("maxAssetsPerDeploy must be >= 1");
+  });
+
+  it("rejects maxDeploySizeBytes of -1", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", maxDeploySizeBytes: -1 }),
+    ).toThrow("maxDeploySizeBytes must be >= 1");
+  });
+
+  it("accepts maxAssetsPerDeploy of 1", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", maxAssetsPerDeploy: 1 }),
+    ).not.toThrow();
+  });
+
+  it("accepts maxDeploySizeBytes of 1", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", maxDeploySizeBytes: 1 }),
+    ).not.toThrow();
+  });
 });
