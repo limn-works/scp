@@ -1540,6 +1540,27 @@ export function createMockBridge(): Bridge & {
       return JSON.stringify({ handle, status: "deregistered" });
     },
 
+    // Scope Registry (section 22.3.5, ADR-043)
+    scopeRegister(
+      _scopeContextId: string,
+      _name: string,
+      _targetContextId: string,
+      _relayUrls: string[],
+      _registrantDid: string,
+      _description: string | undefined,
+      _tags: string[] | undefined,
+    ): string {
+      return JSON.stringify({ status: "registered", entry_id: "scope-1" });
+    },
+
+    scopeLookup(_scopeContextId: string, _name: string): string {
+      return JSON.stringify({ results: [] });
+    },
+
+    scopeDeregister(_scopeContextId: string, _name: string, _did: string): string {
+      return JSON.stringify({ removed: true });
+    },
+
     // Address Resolution (section 22.8)
     async addressResolve(
       _ownerDid: string,

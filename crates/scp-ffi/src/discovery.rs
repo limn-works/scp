@@ -854,6 +854,11 @@ pub fn py_scope_register(
     description: Option<String>,
     tags: Option<Vec<String>>,
 ) -> PyResult<String> {
+    // Validate inputs at the FFI boundary (defense-in-depth)
+    crate::validate::validate_context_id(scope_context_id)?;
+    crate::validate::validate_context_id(target_context_id)?;
+    crate::validate::validate_did(registrant_did)?;
+
     // Validate relay URLs at the FFI boundary (defense-in-depth)
     for url in &relay_urls {
         crate::validate::validate_relay_url(url)?;
@@ -917,6 +922,8 @@ pub fn py_scope_register(
 #[pyfunction]
 #[pyo3(name = "scope_lookup")]
 pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
+    crate::validate::validate_context_id(scope_context_id)?;
+
     let guard =
         petname_helpers::scope_registries()
             .lock()
@@ -968,6 +975,9 @@ pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(name = "scope_deregister")]
 pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyResult<String> {
+    crate::validate::validate_context_id(scope_context_id)?;
+    crate::validate::validate_did(did)?;
+
     let mut guard =
         petname_helpers::scope_registries()
             .lock()

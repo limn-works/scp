@@ -45,6 +45,9 @@ const MAX_SCOPE_TAGS_COUNT: usize = 20;
 /// Maximum length for a single tag in scope metadata (§22.3.5).
 const MAX_SCOPE_TAG_LENGTH: usize = 64;
 
+/// Maximum number of relay URLs per scope target (§22.3.5).
+const MAX_RELAY_URLS_COUNT: usize = 10;
+
 /// Maximum number of entries in a single scope registry (§22.3.5).
 const MAX_SCOPE_ENTRIES: usize = 10_000;
 
@@ -86,6 +89,7 @@ pub struct ScopeMetadata {
 /// another DID already holds the scope name, `Updated` when the same owner
 /// re-registers (atomic update).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeRegisterResult {
     /// Outcome of the registration attempt.
     pub status: ScopeRegisterStatus,
@@ -203,7 +207,7 @@ pub struct ScopeTarget {
 /// when recording scope operations in the context event log, not by
 /// `ScopeRegistry` methods directly (matching `HandleRegistry` pattern).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type")]
+#[serde(deny_unknown_fields, tag = "type")]
 pub enum ScopeRegistrationEvent {
     /// A scope name was registered.
     ScopeRegistered {
@@ -361,6 +365,36 @@ impl ScopeRegistry {
             ));
         }
 
+        // Validate relay_urls count
+        if params.target.relay_urls.len() > MAX_RELAY_URLS_COUNT {
+            return Err(ScopeRegistryError::Validation(format!(
+                "relay_urls exceeds maximum count of {MAX_RELAY_URLS_COUNT}"
+            )));
+        }
+
+        // Validate individual relay URLs
+        for url in &params.target.relay_urls {
+            if url.len() > 2048 {
+                return Err(ScopeRegistryError::Validation(
+                    "relay URL exceeds 2048 characters".into(),
+                ));
+            }
+            if url.bytes().any(|b| b == b'\r' || b == b'\n' || b < 0x20) {
+                return Err(ScopeRegistryError::Validation(
+                    "relay URL contains control characters".into(),
+                ));
+            }
+            if !(url.starts_with("ws://")
+                || url.starts_with("wss://")
+                || url.starts_with("http://")
+                || url.starts_with("https://"))
+            {
+                return Err(ScopeRegistryError::Validation(
+                    "relay URL must use ws://, wss://, http://, or https:// scheme".into(),
+                ));
+            }
+        }
+
         // Validate metadata bounds
         if let Some(ref metadata) = params.metadata {
             if let Some(ref desc) = metadata.description
@@ -377,6 +411,11 @@ impl ScopeRegistry {
                     )));
                 }
                 for tag in tags {
+                    if tag.is_empty() {
+                        return Err(ScopeRegistryError::Validation(
+                            "tag must not be empty".into(),
+                        ));
+                    }
                     if tag.len() > MAX_SCOPE_TAG_LENGTH {
                         return Err(ScopeRegistryError::Validation(format!(
                             "tag exceeds maximum length of {MAX_SCOPE_TAG_LENGTH} characters"

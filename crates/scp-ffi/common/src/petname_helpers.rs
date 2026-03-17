@@ -97,7 +97,9 @@ pub fn known_contexts_from_scope_registries() -> HashMap<String, String> {
     if let Ok(guard) = scope_registries().lock() {
         for registry in guard.values() {
             for entry in registry.entries() {
-                result.insert(entry.name.clone(), entry.target.context_id.clone());
+                result
+                    .entry(entry.name.clone())
+                    .or_insert_with(|| entry.target.context_id.clone());
             }
         }
     }

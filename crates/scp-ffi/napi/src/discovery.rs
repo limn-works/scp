@@ -576,6 +576,14 @@ pub fn scope_register(
     description: Option<String>,
     tags: Option<Vec<String>>,
 ) -> napi::Result<String> {
+    // Validate inputs at the FFI boundary (defense-in-depth)
+    scp_ffi_common::validate::validate_context_id(&scope_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_context_id(&target_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_did(&registrant_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // Validate relay URLs at the FFI boundary
     for url in &relay_urls {
         scp_ffi_common::validate::validate_relay_url(url).map_err(|e| {
@@ -631,6 +639,9 @@ pub fn scope_register(
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<String> {
+    scp_ffi_common::validate::validate_context_id(&scope_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let guard = petname_helpers::scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
@@ -668,6 +679,11 @@ pub fn scope_deregister(
     name: String,
     did: String,
 ) -> napi::Result<String> {
+    scp_ffi_common::validate::validate_context_id(&scope_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_did(&did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let mut guard = petname_helpers::scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),

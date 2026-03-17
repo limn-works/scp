@@ -9978,6 +9978,11 @@ pub fn scope_register(
     description: Option<String>,
     tags: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
+    // Validate inputs at the FFI boundary (defense-in-depth)
+    validate_context_id(&scope_context_id)?;
+    validate_context_id(&target_context_id)?;
+    validate_did(&registrant_did)?;
+
     // Validate relay URLs at the FFI boundary
     for url in &relay_urls {
         scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
@@ -10026,6 +10031,8 @@ pub fn scope_register(
 /// Looks up a scope name in a scope registry. Returns JSON result.
 #[uniffi::export]
 pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, ScpError> {
+    validate_context_id(&scope_context_id)?;
+
     let guard = uniffi_scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
@@ -10058,6 +10065,9 @@ pub fn scope_deregister(
     name: String,
     did: String,
 ) -> Result<String, ScpError> {
+    validate_context_id(&scope_context_id)?;
+    validate_did(&did)?;
+
     let mut guard = uniffi_scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
