@@ -211,6 +211,7 @@ __all__ = [
     "PARTICIPATION_THRESHOLD_OPERATORS",
     "AssetEntry",
     "Attestation",
+    "BatchPublishResult",
     "BehavioralRecord",
     "BridgeMode",
     "Capability",

@@ -36,6 +36,7 @@ import works.limn.scp.MetadataBindings
 import works.limn.scp.MetadataBridge
 import works.limn.scp.ProvenanceBindings
 import works.limn.scp.ProvenanceBridge
+import works.limn.scp.BatchPublishResult
 import works.limn.scp.ServerBindings
 import works.limn.scp.ServerBridge
 import works.limn.scp.PublishResult
@@ -2317,7 +2318,7 @@ class BroadcastBridgeOps internal constructor(
      *   Defaults to [defaultIdentityHandle] when null (SCP-294b).
      * @param assets The assets to publish.
      * @param deployId Optional deploy ID to group assets into atomic deploys.
-     * @return A list of [PublishResult] values, one per asset.
+     * @return A [BatchPublishResult] with per-asset results and the shared deploy ID.
      * @throws BridgeException if no identity handle is provided and
      *   [defaultIdentityHandle] is not set.
      */
@@ -2326,7 +2327,7 @@ class BroadcastBridgeOps internal constructor(
         identityHandle: Long? = null,
         assets: List<AssetEntry>,
         deployId: String? = null,
-    ): List<PublishResult> {
+    ): BatchPublishResult {
         val resolved = resolveIdentityHandle(identityHandle)
         val assetsJson = serializeAssets(assets)
         val resultJson = bridge.ffiCall {
@@ -2386,7 +2387,7 @@ internal fun serializeAssets(assets: List<AssetEntry>): String = Json.encodeToSt
 /**
  * Parses a JSON publish result string into a [PublishResult].
  *
- * Expected format: `{"blob_id":"...","etag":"..."}`.
+ * Expected format: `{"blob_id":"...","etag":"...","deploy_id":"..."}`.
  *
  * @throws BridgeException if the JSON is malformed or missing required fields.
  */
@@ -2396,24 +2397,35 @@ internal fun parsePublishResult(json: String): PublishResult {
         ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
     val etag = obj["etag"]?.jsonPrimitive?.content
         ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
-    return PublishResult(blobId = blobId, etag = etag)
+    val deployId = obj["deploy_id"]?.jsonPrimitive?.content
+        ?: throw BridgeException("missing deploy_id in publish result", "SCP-CTX-2036")
+    return PublishResult(blobId = blobId, etag = etag, deployId = deployId)
 }
 
 /**
- * Parses a JSON array of publish results into a list of [PublishResult].
+ * Parses a JSON batch publish result into a [BatchPublishResult].
+ *
+ * Expected format: `{"results":[...],"deploy_id":"..."}`.
  *
  * @throws BridgeException if the JSON is malformed.
  */
-internal fun parsePublishResults(json: String): List<PublishResult> {
-    val array = Json.parseToJsonElement(json).jsonArray
-    return array.map { element ->
-        val obj = element.jsonObject
-        val blobId = obj["blob_id"]?.jsonPrimitive?.content
+internal fun parsePublishResults(json: String): BatchPublishResult {
+    val obj = Json.parseToJsonElement(json).jsonObject
+    val deployId = obj["deploy_id"]?.jsonPrimitive?.content
+        ?: throw BridgeException("missing deploy_id in batch publish result", "SCP-CTX-2036")
+    val resultsArray = obj["results"]?.jsonArray
+        ?: throw BridgeException("missing results in batch publish result", "SCP-CTX-2036")
+    val results = resultsArray.map { element ->
+        val resultObj = element.jsonObject
+        val blobId = resultObj["blob_id"]?.jsonPrimitive?.content
             ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
-        val etag = obj["etag"]?.jsonPrimitive?.content
+        val etag = resultObj["etag"]?.jsonPrimitive?.content
             ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
-        PublishResult(blobId = blobId, etag = etag)
+        val resultDeployId = resultObj["deploy_id"]?.jsonPrimitive?.content
+            ?: throw BridgeException("missing deploy_id in publish result", "SCP-CTX-2036")
+        PublishResult(blobId = blobId, etag = etag, deployId = resultDeployId)
     }
+    return BatchPublishResult(results = results, deployId = deployId)
 }
 
 /**

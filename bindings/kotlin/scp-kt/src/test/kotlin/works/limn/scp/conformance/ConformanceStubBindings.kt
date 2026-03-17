@@ -220,13 +220,14 @@ class ConformanceStubBindings : NativeBindings {
         identityHandle: Long,
         assetJson: String,
         deployId: String?,
-    ): String = """{"blob_id":"stub-blob","etag":"stub-etag"}"""
+    ): String = """{"blob_id":"stub-blob","etag":"stub-etag","deploy_id":"stub-deploy"}"""
     override fun broadcastPublishAssets(
         contextHandle: Long,
         identityHandle: Long,
         assetsJson: String,
         deployId: String?,
-    ): String = """[{"blob_id":"stub-blob","etag":"stub-etag"}]"""
+    ): String =
+        """{"results":[{"blob_id":"stub-blob","etag":"stub-etag","deploy_id":"stub-deploy"}],"deploy_id":"stub-deploy"}"""
 
     override fun toolRegister(
         contextHandle: Long,

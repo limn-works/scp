@@ -606,12 +606,13 @@ class CoroutineBridgeTest {
                     works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
                     works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
                 )
-                val results = bridge.broadcast.publishAssets(1L, 42L, assets, "deploy-batch")
-                assertEquals(2, results.size)
-                assertEquals("blob-0", results[0].blobId)
-                assertEquals("etag-0", results[0].etag)
-                assertEquals("blob-1", results[1].blobId)
-                assertEquals("etag-1", results[1].etag)
+                val batch = bridge.broadcast.publishAssets(1L, 42L, assets, "deploy-batch")
+                assertEquals(2, batch.results.size)
+                assertEquals("blob-0", batch.results[0].blobId)
+                assertEquals("etag-0", batch.results[0].etag)
+                assertEquals("blob-1", batch.results[1].blobId)
+                assertEquals("etag-1", batch.results[1].etag)
+                assertEquals("deploy-batch", batch.deployId)
                 assertTrue(stubBindings.broadcastPublishAssetsCalled)
                 assertEquals("deploy-batch", stubBindings.lastPublishAssetsDeployId)
             }
@@ -920,7 +921,7 @@ class StubNativeBindings : NativeBindings {
     var lastPublishAssetJson: String? = null
     var lastPublishAssetDeployId: String? = null
     var lastPublishAssetIdentityHandle: Long? = null
-    var broadcastPublishAssetResult = """{"blob_id":"abc123","etag":"def456"}"""
+    var broadcastPublishAssetResult = """{"blob_id":"abc123","etag":"def456","deploy_id":"deploy-1"}"""
     var broadcastPublishAssetThrows: Exception? = null
     override fun broadcastPublishAsset(
         contextHandle: Long,
@@ -941,7 +942,7 @@ class StubNativeBindings : NativeBindings {
     var lastPublishAssetsDeployId: String? = null
     var lastPublishAssetsIdentityHandle: Long? = null
     @Suppress("MaxLineLength")
-    var broadcastPublishAssetsResult = """[{"blob_id":"blob-0","etag":"etag-0"},{"blob_id":"blob-1","etag":"etag-1"}]"""
+    var broadcastPublishAssetsResult = """{"results":[{"blob_id":"blob-0","etag":"etag-0","deploy_id":"deploy-batch"},{"blob_id":"blob-1","etag":"etag-1","deploy_id":"deploy-batch"}],"deploy_id":"deploy-batch"}"""
     var broadcastPublishAssetsThrows: Exception? = null
     override fun broadcastPublishAssets(
         contextHandle: Long,

@@ -883,7 +883,7 @@ struct GovernanceTests {
         let mockPublishAsset: BroadcastBridge.PublishAssetFn = { _, _, asset, deployId in
             receivedAsset = asset
             receivedDeployId = deployId
-            return PublishResult(blobId: "abc123", etag: "def456")
+            return PublishResult(blobId: "abc123", etag: "def456", deployId: deployId ?? "auto-gen-id")
         }
 
         let asset = AssetEntry(
@@ -899,6 +899,7 @@ struct GovernanceTests {
         )
         #expect(result.blobId == "abc123")
         #expect(result.etag == "def456")
+        #expect(result.deployId == "deploy-1")
         #expect(receivedAsset == asset)
         #expect(receivedDeployId == "deploy-1")
     }
@@ -930,7 +931,7 @@ struct GovernanceTests {
         }
     }
 
-    @Test("broadcastPublishAssets batch returns multiple results")
+    @Test("broadcastPublishAssets batch returns BatchPublishResult with deploy ID")
     func broadcastPublishAssetsBatchRoundtrip() async throws {
         let context = makeActiveContext()
 
@@ -939,26 +940,28 @@ struct GovernanceTests {
         let mockPublishAssets: BroadcastBridge.PublishAssetsFn = { _, _, assets, deployId in
             receivedAssets = assets
             receivedDeployId = deployId
-            return assets.indices.map { idx in
-                PublishResult(blobId: "blob-\(idx)", etag: "etag-\(idx)")
+            let results = assets.indices.map { idx in
+                PublishResult(blobId: "blob-\(idx)", etag: "etag-\(idx)", deployId: deployId ?? "auto")
             }
+            return BatchPublishResult(results: results, deployId: deployId ?? "auto")
         }
 
         let assets = [
             AssetEntry(path: "/index.html", contentType: "text/html", body: Data("<h1>Hi</h1>".utf8)),
             AssetEntry(path: "/style.css", contentType: "text/css", body: Data("body{}".utf8))
         ]
-        let results = try await context.broadcastPublishAssets(
+        let batch = try await context.broadcastPublishAssets(
             assets: assets,
             identity: Identity(noPointer: .init()),
             deployId: "deploy-batch",
             publishAssetsFn: mockPublishAssets
         )
-        #expect(results.count == 2)
-        #expect(results[0].blobId == "blob-0")
-        #expect(results[1].blobId == "blob-1")
-        #expect(results[0].etag == "etag-0")
-        #expect(results[1].etag == "etag-1")
+        #expect(batch.results.count == 2)
+        #expect(batch.results[0].blobId == "blob-0")
+        #expect(batch.results[1].blobId == "blob-1")
+        #expect(batch.results[0].etag == "etag-0")
+        #expect(batch.results[1].etag == "etag-1")
+        #expect(batch.deployId == "deploy-batch")
         #expect(receivedAssets == assets)
         #expect(receivedDeployId == "deploy-batch")
     }

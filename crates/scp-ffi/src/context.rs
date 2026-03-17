@@ -2792,6 +2792,9 @@ fn py_broadcast_publish_asset(
             let mut result = HashMap::new();
             result.insert("blob_id".to_owned(), blob_id);
             result.insert("etag".to_owned(), etag);
+            if let Some(ref did) = deploy_id_owned {
+                result.insert("deploy_id".to_owned(), did.clone());
+            }
             Ok(result)
         })
     })
@@ -2908,8 +2911,10 @@ fn py_broadcast_publish_assets(
                 let mut result = HashMap::new();
                 result.insert("blob_id".to_owned(), blob_id);
                 result.insert("etag".to_owned(), etag);
+                result.insert("deploy_id".to_owned(), deploy_id_owned.clone());
                 results.push(result);
             }
+
             Ok(results)
         })
     })

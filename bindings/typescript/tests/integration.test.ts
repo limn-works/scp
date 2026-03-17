@@ -1685,7 +1685,7 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   // broadcastPublishAsset / broadcastPublishAssets (SCP-290)
   // ---------------------------------------------------------------------------
 
-  it("broadcastPublishAsset returns blob_id and etag", async () => {
+  it("broadcastPublishAsset returns blobId, etag, and deployId", async () => {
     const identity = await Identity.create({ custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
@@ -1699,17 +1699,37 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
     expect(result).toBeDefined();
     expect(typeof result.blobId).toBe("string");
     expect(typeof result.etag).toBe("string");
+    expect(typeof result.deployId).toBe("string");
     expect(result.blobId.length).toBeGreaterThan(0);
     expect(result.etag.length).toBeGreaterThan(0);
+    expect(result.deployId.length).toBeGreaterThan(0);
   });
 
-  it("broadcastPublishAssets returns list of results", async () => {
+  it("broadcastPublishAsset with caller-provided deployId returns it as-is", async () => {
     const identity = await Identity.create({ custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
       mode: "Broadcast",
     });
-    const results = await ctx.broadcastPublishAssets([
+    const result = await ctx.broadcastPublishAsset(
+      {
+        path: "/index.html",
+        contentType: "text/html",
+        body: new TextEncoder().encode("<h1>hello</h1>"),
+      },
+      undefined,
+      "my-custom-deploy-id-1234567890ab",
+    );
+    expect(result.deployId).toBe("my-custom-deploy-id-1234567890ab");
+  });
+
+  it("broadcastPublishAssets returns BatchPublishResult with shared deployId", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read", "messages:write"],
+      mode: "Broadcast",
+    });
+    const batch = await ctx.broadcastPublishAssets([
       {
         path: "/index.html",
         contentType: "text/html",
@@ -1721,11 +1741,29 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
         body: new TextEncoder().encode("body { color: red; }"),
       },
     ]);
-    expect(results).toHaveLength(2);
-    for (const r of results) {
+    expect(batch.results).toHaveLength(2);
+    expect(typeof batch.deployId).toBe("string");
+    expect(batch.deployId.length).toBeGreaterThan(0);
+    for (const r of batch.results) {
       expect(typeof r.blobId).toBe("string");
       expect(typeof r.etag).toBe("string");
+      expect(typeof r.deployId).toBe("string");
     }
+  });
+
+  it("auto-generated deployId is a non-empty string", async () => {
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read", "messages:write"],
+      mode: "Broadcast",
+    });
+    const result = await ctx.broadcastPublishAsset({
+      path: "/index.html",
+      contentType: "text/html",
+      body: new TextEncoder().encode("<h1>hello</h1>"),
+    });
+    expect(typeof result.deployId).toBe("string");
+    expect(result.deployId.length).toBeGreaterThan(0);
   });
 
   it("broadcastPublishAsset rejects on non-broadcast context", async () => {

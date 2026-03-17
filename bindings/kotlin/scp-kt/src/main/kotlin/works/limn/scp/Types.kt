@@ -433,14 +433,27 @@ class AssetEntry(
 }
 
 /**
- * Result of publishing an asset to a broadcast context (SCP-290).
+ * Result of publishing an asset to a broadcast context (SCP-290, SCP-292).
  *
  * @property blobId Hex-encoded SHA-256 of the serialized broadcast envelope.
  * @property etag Hex-encoded SHA-256 of the asset body.
+ * @property deployId The deploy ID for this asset (auto-generated or caller-provided).
  */
 data class PublishResult(
     val blobId: String,
     val etag: String,
+    val deployId: String,
+)
+
+/**
+ * Result of publishing multiple assets to a broadcast context (SCP-292).
+ *
+ * @property results Per-asset publish results.
+ * @property deployId The shared deploy ID for this batch.
+ */
+data class BatchPublishResult(
+    val results: List<PublishResult>,
+    val deployId: String,
 )
 
 // ---------------------------------------------------------------------------

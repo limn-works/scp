@@ -226,13 +226,14 @@ private class TestNativeBindings : NativeBindings {
         identityHandle: Long,
         assetJson: String,
         deployId: String?,
-    ): String = """{"blob_id":"stub","etag":"stub"}"""
+    ): String = """{"blob_id":"stub","etag":"stub","deploy_id":"stub-deploy"}"""
     override fun broadcastPublishAssets(
         contextHandle: Long,
         identityHandle: Long,
         assetsJson: String,
         deployId: String?,
-    ): String = """[{"blob_id":"stub","etag":"stub"}]"""
+    ): String =
+        """{"results":[{"blob_id":"stub","etag":"stub","deploy_id":"stub-deploy"}],"deploy_id":"stub-deploy"}"""
 
     override fun toolRegister(contextHandle: Long, definitionJson: String): String = ""
     override fun toolInvoke(

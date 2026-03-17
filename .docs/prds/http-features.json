@@ -790,17 +790,22 @@
       "gate": "gate-http-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/napi/src/context.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/wasm/src/context.rs",
+        "crates/scp-ffi/wasm/src/manager.rs",
         "bindings/typescript/src/types.ts",
         "bindings/typescript/src/context.ts",
+        "bindings/typescript/src/internal/bridge.ts",
+        "bindings/typescript/src/internal/native.ts",
+        "bindings/typescript/src/internal/wasm.ts",
         "bindings/python/scp_sdk/context.py",
         "bindings/swift/Sources/SCP/Governance.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt"
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
       ],
       "description": "The FFI bridges already auto-generate deploy_id (SHA-256(context_id ++ author_did ++ timestamp)[..16]) but discard it. Add deploy_id to PublishResult for single-asset publish. Create BatchPublishResult { results: Vec<PublishResult>, deploy_id: String } for batch publish. No Rust core changes needed — bridges already have the value, they just need to include it in the return type. Update all 4 SDK wrappers to expose the new field. Per §18.11.8 and ADR-042.",
       "acceptanceCriteria": [

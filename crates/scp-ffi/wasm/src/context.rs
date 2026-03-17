@@ -1217,7 +1217,7 @@ pub fn broadcast_publish_asset(
                 .into_js()
             })?;
 
-        let (blob_id, etag) = with_manager(|mgr| {
+        let (blob_id, etag, deploy_id_out) = with_manager(|mgr| {
             mgr.publish_broadcast_asset(
                 &context_id,
                 &author_did,
@@ -1242,6 +1242,12 @@ pub fn broadcast_publish_asset(
             &JsValue::from_str(&etag),
         )
         .map_err(|_| JsValue::from_str("failed to set etag"))?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("deployId"),
+            &JsValue::from_str(&deploy_id_out),
+        )
+        .map_err(|_| JsValue::from_str("failed to set deployId"))?;
 
         Ok(result.into())
     })
@@ -1253,6 +1259,42 @@ pub fn broadcast_publish_asset(
 /// `deployId`. Returns an array of `{ blobId, etag }` objects.
 ///
 /// Delegates to `WasmContextManager::publish_broadcast_assets`.
+/// Builds a JS batch publish result from per-asset tuples and a shared deploy ID.
+fn build_batch_js_result(
+    results: Vec<(String, String, String)>,
+    deploy_id: &str,
+) -> Result<JsValue, JsValue> {
+    let js_results = js_sys::Array::new();
+    for (blob_id, etag, did) in results {
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("blobId"),
+            &JsValue::from_str(&blob_id),
+        )
+        .map_err(|_| JsValue::from_str("failed to set blobId"))?;
+        js_sys::Reflect::set(&obj, &JsValue::from_str("etag"), &JsValue::from_str(&etag))
+            .map_err(|_| JsValue::from_str("failed to set etag"))?;
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("deployId"),
+            &JsValue::from_str(&did),
+        )
+        .map_err(|_| JsValue::from_str("failed to set deployId"))?;
+        js_results.push(&obj);
+    }
+    let batch = js_sys::Object::new();
+    js_sys::Reflect::set(&batch, &JsValue::from_str("results"), &js_results.into())
+        .map_err(|_| JsValue::from_str("failed to set results"))?;
+    js_sys::Reflect::set(
+        &batch,
+        &JsValue::from_str("deployId"),
+        &JsValue::from_str(deploy_id),
+    )
+    .map_err(|_| JsValue::from_str("failed to set deployId"))?;
+    Ok(batch.into())
+}
+
 #[wasm_bindgen(js_name = "broadcastPublishAssets")]
 pub fn broadcast_publish_assets(
     handle: &WasmContextHandle,
@@ -1329,7 +1371,7 @@ pub fn broadcast_publish_assets(
             parsed_assets.push((path, ct, body));
         }
 
-        let results = with_manager(|mgr| {
+        let (results, batch_deploy_id) = with_manager(|mgr| {
             mgr.publish_broadcast_assets(
                 &context_id,
                 &author_did,
@@ -1339,21 +1381,7 @@ pub fn broadcast_publish_assets(
         })
         .map_err(ScpWasmError::into_js)?;
 
-        let js_results = js_sys::Array::new();
-        for (blob_id, etag) in results {
-            let obj = js_sys::Object::new();
-            js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("blobId"),
-                &JsValue::from_str(&blob_id),
-            )
-            .map_err(|_| JsValue::from_str("failed to set blobId"))?;
-            js_sys::Reflect::set(&obj, &JsValue::from_str("etag"), &JsValue::from_str(&etag))
-                .map_err(|_| JsValue::from_str("failed to set etag"))?;
-            js_results.push(&obj);
-        }
-
-        Ok(js_results.into())
+        build_batch_js_result(results, &batch_deploy_id)
     })
 }
 

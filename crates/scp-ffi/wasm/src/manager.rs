@@ -3769,7 +3769,7 @@ impl WasmContextManager {
         content_type: &str,
         body: &[u8],
         deploy_id: Option<&str>,
-    ) -> Result<(String, String), ScpWasmError> {
+    ) -> Result<(String, String, String), ScpWasmError> {
         // Validate and NFC-normalize path (reimplemented per ADR-034).
         let normalized_path =
             validate_content_path_wasm(path).map_err(|msg| ScpWasmError::Context {
@@ -3850,10 +3850,10 @@ impl WasmContextManager {
             hex::encode(Sha256::digest(&wire_bytes))
         };
 
-        Ok((blob_id, etag))
+        Ok((blob_id, etag, deploy_id_resolved.to_owned()))
     }
 
-    /// Publishes multiple assets to a broadcast context (SCP-290).
+    /// Publishes multiple assets to a broadcast context (SCP-290, SCP-292).
     ///
     /// All assets are published with the same `deploy_id`. Returns a list of
     /// `(blob_id, etag)` tuples.
@@ -3862,13 +3862,14 @@ impl WasmContextManager {
     ///
     /// Returns an error if any asset fails validation or publish, or if the
     /// batch exceeds `MAX_BATCH_ASSETS` (10,000).
+    #[allow(clippy::type_complexity)]
     pub fn publish_broadcast_assets(
         &mut self,
         context_id: &str,
         author_did: &str,
         assets: &[(String, String, Vec<u8>)],
         deploy_id: Option<&str>,
-    ) -> Result<Vec<(String, String)>, ScpWasmError> {
+    ) -> Result<(Vec<(String, String, String)>, String), ScpWasmError> {
         // Enforce batch size limit.
         if assets.len() > MAX_BATCH_ASSETS {
             return Err(ScpWasmError::Context {
@@ -3898,7 +3899,7 @@ impl WasmContextManager {
 
         let mut results = Vec::with_capacity(assets.len());
         for (path, content_type, body) in assets {
-            let (blob_id, etag) = self.publish_broadcast_asset(
+            let (blob_id, etag, deploy_id_out) = self.publish_broadcast_asset(
                 context_id,
                 author_did,
                 path,
@@ -3906,9 +3907,9 @@ impl WasmContextManager {
                 body,
                 Some(did),
             )?;
-            results.push((blob_id, etag));
+            results.push((blob_id, etag, deploy_id_out));
         }
-        Ok(results)
+        Ok((results, did.to_owned()))
     }
 
     /// Unsubscribes from a broadcast context. Mirrors `ContextManager::unsubscribe_broadcast`.

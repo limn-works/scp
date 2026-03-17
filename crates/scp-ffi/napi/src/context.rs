@@ -1105,13 +1105,26 @@ pub struct NapiAssetEntry {
     pub body: Vec<u8>,
 }
 
-/// Result of publishing an asset to a broadcast context (SCP-290).
+/// Result of publishing an asset to a broadcast context (SCP-290, SCP-292).
 #[napi(object)]
 pub struct NapiPublishResult {
     /// Hex-encoded SHA-256 of the serialized broadcast envelope.
     pub blob_id: String,
     /// Hex-encoded SHA-256 of the asset body.
     pub etag: String,
+    /// The deploy ID for this asset (auto-generated or caller-provided).
+    pub deploy_id: String,
+}
+
+/// Result of publishing multiple assets to a broadcast context (SCP-292).
+///
+/// Groups per-asset results with the shared deploy ID used across the batch.
+#[napi(object)]
+pub struct NapiBatchPublishResult {
+    /// Per-asset publish results.
+    pub results: Vec<NapiPublishResult>,
+    /// The shared deploy ID for this batch.
+    pub deploy_id: String,
 }
 
 /// Publishes a single asset to a broadcast context as structured content (SCP-290).
@@ -1174,6 +1187,8 @@ pub async fn broadcast_publish_asset(
     }
 
     let etag = scp_core::context::compute_etag(&asset.body);
+    // Capture the deploy_id string before moving into BroadcastContent (SCP-292).
+    let deploy_id_str = deploy_id.as_ref().map_or_else(String::new, Clone::clone);
     let content = scp_core::context::BroadcastContent {
         version: scp_core::context::BROADCAST_CONTENT_VERSION,
         metadata: scp_core::context::ContentMetadata {
@@ -1227,12 +1242,16 @@ pub async fn broadcast_publish_asset(
             hex::encode(Sha256::digest(&envelope_bytes))
         };
 
-        Ok(NapiPublishResult { blob_id, etag })
+        Ok(NapiPublishResult {
+            blob_id,
+            etag,
+            deploy_id: deploy_id_str,
+        })
     }
 
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (manager, context_id, author_did_val, content);
+        let _ = (manager, context_id, author_did_val, content, deploy_id_str);
         Err(NapiError::from(ScpNapiError::Permission {
             message: "broadcast publish asset requires key custody — in_memory custody feature is \
                       not enabled"
@@ -1257,7 +1276,7 @@ pub async fn broadcast_publish_assets(
     author_did: String,
     assets: Vec<NapiAssetEntry>,
     deploy_id: Option<String>,
-) -> napi::Result<Vec<NapiPublishResult>> {
+) -> napi::Result<NapiBatchPublishResult> {
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(NapiError::from(ScpNapiError::Context {
@@ -1360,9 +1379,16 @@ pub async fn broadcast_publish_assets(
                 hex::encode(Sha256::digest(&envelope_bytes))
             };
 
-            results.push(NapiPublishResult { blob_id, etag });
+            results.push(NapiPublishResult {
+                blob_id,
+                etag,
+                deploy_id: deploy_id_val.clone(),
+            });
         }
-        Ok(results)
+        Ok(NapiBatchPublishResult {
+            results,
+            deploy_id: deploy_id_val,
+        })
     }
 
     #[cfg(not(feature = "allow_in_memory_custody"))]

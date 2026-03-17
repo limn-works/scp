@@ -804,7 +804,7 @@ export function createWasmBridge(): Bridge {
       authorDid: string,
       asset: { path: string; contentType: string; body: number[] },
       deployId: string | null,
-    ): Promise<{ blobId: string; etag: string }> {
+    ): Promise<{ blobId: string; etag: string; deployId: string }> {
       const wasm = getWasm();
       const bodyBase64 = uint8ToBase64(new Uint8Array(asset.body));
       const assetJson = JSON.stringify({
@@ -817,7 +817,7 @@ export function createWasmBridge(): Bridge {
         authorDid,
         assetJson,
         deployId ?? undefined,
-      )) as { blobId: string; etag: string };
+      )) as { blobId: string; etag: string; deployId: string };
     },
 
     async broadcastPublishAssets(
@@ -825,7 +825,10 @@ export function createWasmBridge(): Bridge {
       authorDid: string,
       assets: { path: string; contentType: string; body: number[] }[],
       deployId: string | null,
-    ): Promise<{ blobId: string; etag: string }[]> {
+    ): Promise<{
+      results: { blobId: string; etag: string; deployId: string }[];
+      deployId: string;
+    }> {
       const wasm = getWasm();
       const assetsJson = JSON.stringify(
         assets.map((a) => ({
@@ -839,7 +842,10 @@ export function createWasmBridge(): Bridge {
         authorDid,
         assetsJson,
         deployId ?? undefined,
-      )) as { blobId: string; etag: string }[];
+      )) as {
+        results: { blobId: string; etag: string; deployId: string }[];
+        deployId: string;
+      };
     },
 
     async broadcastBlockSubscriber(
