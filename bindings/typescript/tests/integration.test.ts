@@ -1780,3 +1780,50 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
     ).rejects.toThrow(/SCP-CTX-2001/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 14. Scope registry runtime tests (§22.3.5, ADR-043)
+// ---------------------------------------------------------------------------
+
+describe("Scope registry runtime (mock bridge)", () => {
+  it("scope register/lookup/deregister round-trip", async () => {
+    _setBridge(mockBridge);
+
+    const { scopeRegister, scopeLookup, scopeDeregister } = await import("../src/discovery");
+
+    // Register
+    const reg = await scopeRegister(
+      "test-ctx",
+      "my-scope",
+      "target-ctx",
+      ["wss://relay.example.com"],
+      "did:dht:zTest",
+    );
+    expect(reg.status).toBe("registered");
+    expect(reg.entry_id).toBe("scope-1");
+
+    // Lookup
+    const lookup = await scopeLookup("test-ctx", "my-scope");
+    expect(lookup.results).toBeDefined();
+    expect(Array.isArray(lookup.results)).toBe(true);
+
+    // Deregister
+    const dereg = await scopeDeregister("test-ctx", "my-scope", "did:dht:zTest");
+    expect(dereg.removed).toBe(true);
+  });
+
+  it("scope register returns typed status values", async () => {
+    _setBridge(mockBridge);
+    const { scopeRegister } = await import("../src/discovery");
+
+    const result = await scopeRegister(
+      "test-ctx",
+      "my-scope",
+      "target-ctx",
+      ["wss://relay.example.com"],
+      "did:dht:zTest",
+    );
+    // The mock bridge returns "registered" status
+    expect(["registered", "conflict", "updated"]).toContain(result.status);
+  });
+});

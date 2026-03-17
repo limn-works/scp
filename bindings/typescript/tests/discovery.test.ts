@@ -2,12 +2,21 @@
  * Tests for the discovery module types and DiscoveryResult field mapping.
  *
  * These tests verify that DiscoveryResult correctly includes trustLevel
- * and resolutionPath per §22.2.1, and that resolveAddress() returns
- * properly typed AddressResolution results.
+ * and resolutionPath per §22.2.1, that resolveAddress() returns
+ * properly typed AddressResolution results, and that scope registry
+ * types are properly structured (§22.3.5, ADR-043).
  */
 
 import { describe, expect, it } from "bun:test";
-import type { DiscoveryResult } from "../src/discovery";
+import type {
+  DiscoveryResult,
+  ScopeDeregisterResult,
+  ScopeEntry,
+  ScopeLookupResult,
+  ScopeMetadata,
+  ScopeRegisterResult,
+  ScopeTarget,
+} from "../src/discovery";
 import type { AddressResolution, ResolutionPath, TrustLevel } from "../src/types";
 
 describe("DiscoveryResult type (§22.2.1)", () => {
@@ -184,5 +193,108 @@ describe("AddressResolution discriminated union", () => {
       };
       expect(path.layer).toBe(layer);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope registry types (§22.3.5, ADR-043)
+// ---------------------------------------------------------------------------
+
+describe("Scope registry types (§22.3.5)", () => {
+  it("ScopeTarget has context_id and relay_urls fields", () => {
+    const target: ScopeTarget = {
+      context_id: "ctx-cooking",
+      relay_urls: ["wss://relay.example.com"],
+    };
+    expect(target.context_id).toBe("ctx-cooking");
+    expect(target.relay_urls).toHaveLength(1);
+  });
+
+  it("ScopeMetadata supports null description and tags", () => {
+    const metadata: ScopeMetadata = {
+      description: null,
+      tags: null,
+    };
+    expect(metadata.description).toBeNull();
+    expect(metadata.tags).toBeNull();
+  });
+
+  it("ScopeMetadata supports populated description and tags", () => {
+    const metadata: ScopeMetadata = {
+      description: "A cooking community",
+      tags: ["food", "recipes"],
+    };
+    expect(metadata.description).toBe("A cooking community");
+    expect(metadata.tags).toHaveLength(2);
+  });
+
+  it("ScopeEntry has all required fields", () => {
+    const entry: ScopeEntry = {
+      name: "cooking-community",
+      target: {
+        context_id: "ctx-cooking",
+        relay_urls: ["wss://relay.example.com"],
+      },
+      owner_did: "did:dht:zAdmin",
+      registered_at: 1700000000,
+      metadata: { description: null, tags: null },
+      entry_id: "scope-1",
+    };
+    expect(entry.name).toBe("cooking-community");
+    expect(entry.target.context_id).toBe("ctx-cooking");
+    expect(entry.owner_did).toBe("did:dht:zAdmin");
+    expect(entry.registered_at).toBe(1700000000);
+    expect(entry.entry_id).toBe("scope-1");
+  });
+
+  it("ScopeRegisterResult status is a string union", () => {
+    const registered: ScopeRegisterResult = {
+      status: "registered",
+      entry_id: "scope-1",
+    };
+    const conflict: ScopeRegisterResult = {
+      status: "conflict",
+      entry_id: null,
+    };
+    const updated: ScopeRegisterResult = {
+      status: "updated",
+      entry_id: "scope-1",
+    };
+    expect(registered.status).toBe("registered");
+    expect(conflict.status).toBe("conflict");
+    expect(conflict.entry_id).toBeNull();
+    expect(updated.status).toBe("updated");
+  });
+
+  it("ScopeLookupResult contains typed ScopeEntry array", () => {
+    const result: ScopeLookupResult = {
+      results: [
+        {
+          name: "cooking-community",
+          target: {
+            context_id: "ctx-cooking",
+            relay_urls: ["wss://relay.example.com"],
+          },
+          owner_did: "did:dht:zAdmin",
+          registered_at: 1700000000,
+          metadata: {
+            description: "A cooking community",
+            tags: ["food"],
+          },
+          entry_id: "scope-1",
+        },
+      ],
+    };
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]?.name).toBe("cooking-community");
+    expect(result.results[0]?.target.context_id).toBe("ctx-cooking");
+    expect(result.results[0]?.metadata.description).toBe("A cooking community");
+  });
+
+  it("ScopeDeregisterResult has removed boolean", () => {
+    const removed: ScopeDeregisterResult = { removed: true };
+    const notRemoved: ScopeDeregisterResult = { removed: false };
+    expect(removed.removed).toBe(true);
+    expect(notRemoved.removed).toBe(false);
   });
 });

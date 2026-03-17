@@ -149,3 +149,109 @@ struct DiscoveryTests {
         }
     }
 } // end DiscoveryTests
+
+// MARK: - Scope Registry Tests (§22.3.5, ADR-043)
+
+/// Tests for scope registry operations via injectable bridge closures.
+struct ScopeRegistryTests {
+    @Test("registerScope calls bridge and returns result JSON")
+    func registerScopeRoundtrip() throws {
+        var capturedScopeContextId: String?
+        var capturedName: String?
+
+        let mockRegister: DiscoveryBridge.ScopeRegisterFn = { scopeCtxId, name, _, _, _, _, _ in
+            capturedScopeContextId = scopeCtxId
+            capturedName = name
+            return #"{"status":"registered","entry_id":"scope-1"}"#
+        }
+
+        let result = try registerScope(
+            scopeContextId: "test-ctx",
+            name: "my-scope",
+            targetContextId: "target-ctx",
+            relayUrls: ["wss://relay.example.com"],
+            registrantDid: "did:dht:zTest",
+            scopeRegisterFn: mockRegister
+        )
+
+        #expect(capturedScopeContextId == "test-ctx")
+        #expect(capturedName == "my-scope")
+        #expect(result.contains("registered"))
+        #expect(result.contains("scope-1"))
+    }
+
+    @Test("lookupScope calls bridge and returns results JSON")
+    func lookupScopeRoundtrip() throws {
+        var capturedName: String?
+
+        let mockLookup: DiscoveryBridge.ScopeLookupFn = { _, name in
+            capturedName = name
+            return #"{"results":[{"name":"my-scope","target":{"context_id":"target-ctx","relay_urls":["wss://relay.example.com"]},"owner_did":"did:dht:zTest","registered_at":1700000000,"metadata":{"description":null,"tags":null},"entry_id":"scope-1"}]}"#
+        }
+
+        let result = try lookupScope(
+            scopeContextId: "test-ctx",
+            name: "my-scope",
+            scopeLookupFn: mockLookup
+        )
+
+        #expect(capturedName == "my-scope")
+        #expect(result.contains("my-scope"))
+        #expect(result.contains("target-ctx"))
+    }
+
+    @Test("deregisterScope calls bridge and returns removed status")
+    func deregisterScopeRoundtrip() throws {
+        var capturedDid: String?
+
+        let mockDeregister: DiscoveryBridge.ScopeDeregisterFn = { _, _, did in
+            capturedDid = did
+            return #"{"removed":true}"#
+        }
+
+        let result = try deregisterScope(
+            scopeContextId: "test-ctx",
+            name: "my-scope",
+            did: "did:dht:zTest",
+            scopeDeregisterFn: mockDeregister
+        )
+
+        #expect(capturedDid == "did:dht:zTest")
+        #expect(result.contains("true"))
+    }
+
+    @Test("scope register/lookup/deregister round-trip with mock bridge")
+    func scopeFullRoundtrip() throws {
+        // Register
+        let regResult = try registerScope(
+            scopeContextId: "rt-ctx",
+            name: "roundtrip-scope",
+            targetContextId: "target-ctx",
+            relayUrls: ["wss://relay.example.com"],
+            registrantDid: "did:dht:zRoundtrip",
+            scopeRegisterFn: { _, _, _, _, _, _, _ in
+                #"{"status":"registered","entry_id":"scope-42"}"#
+            }
+        )
+        #expect(regResult.contains("registered"))
+
+        // Lookup
+        let lookupResult = try lookupScope(
+            scopeContextId: "rt-ctx",
+            name: "roundtrip-scope",
+            scopeLookupFn: { _, _ in
+                #"{"results":[{"name":"roundtrip-scope","target":{"context_id":"target-ctx","relay_urls":["wss://relay.example.com"]},"owner_did":"did:dht:zRoundtrip","registered_at":1700000000,"metadata":{"description":null,"tags":null},"entry_id":"scope-42"}]}"#
+            }
+        )
+        #expect(lookupResult.contains("roundtrip-scope"))
+
+        // Deregister
+        let deregResult = try deregisterScope(
+            scopeContextId: "rt-ctx",
+            name: "roundtrip-scope",
+            did: "did:dht:zRoundtrip",
+            scopeDeregisterFn: { _, _, _ in #"{"removed":true}"# }
+        )
+        #expect(deregResult.contains("true"))
+    }
+} // end ScopeRegistryTests

@@ -332,6 +332,48 @@ fn validate_scope_context_id(context_id: &str) -> Result<(), ScopeRegistryError>
 }
 
 // ---------------------------------------------------------------------------
+// validate_scope_metadata
+// ---------------------------------------------------------------------------
+
+/// Validates scope metadata bounds per §22.3.5 rules.
+///
+/// Checks description length (max 1024 chars) and tag constraints (max 20
+/// tags, each non-empty and max 64 chars).
+///
+/// # Errors
+///
+/// Returns [`ScopeRegistryError::Validation`] if any constraint is violated.
+fn validate_scope_metadata(metadata: &ScopeMetadata) -> Result<(), ScopeRegistryError> {
+    if let Some(ref desc) = metadata.description
+        && desc.len() > MAX_SCOPE_DESCRIPTION_LENGTH
+    {
+        return Err(ScopeRegistryError::Validation(format!(
+            "description exceeds maximum length of {MAX_SCOPE_DESCRIPTION_LENGTH} characters"
+        )));
+    }
+    if let Some(ref tags) = metadata.tags {
+        if tags.len() > MAX_SCOPE_TAGS_COUNT {
+            return Err(ScopeRegistryError::Validation(format!(
+                "tags exceed maximum count of {MAX_SCOPE_TAGS_COUNT}"
+            )));
+        }
+        for tag in tags {
+            if tag.is_empty() {
+                return Err(ScopeRegistryError::Validation(
+                    "tag must not be empty".into(),
+                ));
+            }
+            if tag.len() > MAX_SCOPE_TAG_LENGTH {
+                return Err(ScopeRegistryError::Validation(format!(
+                    "tag exceeds maximum length of {MAX_SCOPE_TAG_LENGTH} characters"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ScopeRegistry (in-memory reference implementation)
 // ---------------------------------------------------------------------------
 
@@ -437,32 +479,7 @@ impl ScopeRegistry {
 
         // Validate metadata bounds
         if let Some(ref metadata) = params.metadata {
-            if let Some(ref desc) = metadata.description
-                && desc.len() > MAX_SCOPE_DESCRIPTION_LENGTH
-            {
-                return Err(ScopeRegistryError::Validation(format!(
-                    "description exceeds maximum length of {MAX_SCOPE_DESCRIPTION_LENGTH} characters"
-                )));
-            }
-            if let Some(ref tags) = metadata.tags {
-                if tags.len() > MAX_SCOPE_TAGS_COUNT {
-                    return Err(ScopeRegistryError::Validation(format!(
-                        "tags exceed maximum count of {MAX_SCOPE_TAGS_COUNT}"
-                    )));
-                }
-                for tag in tags {
-                    if tag.is_empty() {
-                        return Err(ScopeRegistryError::Validation(
-                            "tag must not be empty".into(),
-                        ));
-                    }
-                    if tag.len() > MAX_SCOPE_TAG_LENGTH {
-                        return Err(ScopeRegistryError::Validation(format!(
-                            "tag exceeds maximum length of {MAX_SCOPE_TAG_LENGTH} characters"
-                        )));
-                    }
-                }
-            }
+            validate_scope_metadata(metadata)?;
         }
 
         let normalized = params.name.to_lowercase();
@@ -494,6 +511,12 @@ impl ScopeRegistry {
         }
 
         // New registration
+        //
+        // NOTE: Sequential entry IDs are a known information leak — they reveal
+        // registration volume to any observer. Production implementations SHOULD
+        // use opaque IDs (e.g., UUIDs or random tokens) to avoid this. This
+        // reference implementation uses sequential IDs to avoid adding a UUID
+        // dependency.
         let entry_id = format!("scope-{}", self.next_entry_id);
         self.next_entry_id += 1;
 

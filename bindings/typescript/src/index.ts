@@ -129,8 +129,11 @@ export type {
   HandleRegisterResult,
   ParsedAddress,
   ScopeDeregisterResult,
+  ScopeEntry,
   ScopeLookupResult,
+  ScopeMetadata,
   ScopeRegisterResult,
+  ScopeTarget,
 } from "./discovery";
 export {
   addressResolve,

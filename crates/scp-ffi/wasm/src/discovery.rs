@@ -1347,10 +1347,12 @@ impl WasmScopeRegistry {
     }
 }
 
-fn wasm_scope_registries() -> &'static Mutex<HashMap<String, WasmScopeRegistry>> {
-    use std::sync::OnceLock;
-    static REGISTRIES: OnceLock<Mutex<HashMap<String, WasmScopeRegistry>>> = OnceLock::new();
-    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+thread_local! {
+    /// Per-context scope registries. WASM is single-threaded, so `RefCell` is
+    /// sufficient — no `Mutex` needed. Matches the `thread_local!` pattern
+    /// used by `IDENTITY_REGISTRY`, `RATE_LIMIT_TRACKERS`, and `MANAGER`.
+    static WASM_SCOPE_REGISTRIES: std::cell::RefCell<HashMap<String, WasmScopeRegistry>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// Collects scope name -> context ID mappings for WASM address resolution.
@@ -1359,8 +1361,9 @@ fn wasm_scope_registries() -> &'static Mutex<HashMap<String, WasmScopeRegistry>>
 /// how handle registries are merged in `resolve_via_handles`. A future
 /// refinement could scope to caller-provided trusted registry context IDs.
 fn wasm_known_contexts_from_scope_registries() -> HashMap<String, String> {
-    let mut result = HashMap::new();
-    if let Ok(guard) = wasm_scope_registries().lock() {
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let guard = registries.borrow();
+        let mut result = HashMap::new();
         for registry in guard.values() {
             for entry in registry.entries.values() {
                 result
@@ -1368,8 +1371,8 @@ fn wasm_known_contexts_from_scope_registries() -> HashMap<String, String> {
                     .or_insert_with(|| entry.target.context_id.clone());
             }
         }
-    }
-    result
+        result
+    })
 }
 
 /// Parsed and validated scope-register inputs.
@@ -1465,7 +1468,6 @@ fn wasm_validate_scope_register_input(
 ///
 /// Returns `JsError` if validation fails or the lock is poisoned.
 #[wasm_bindgen]
-#[allow(clippy::significant_drop_tightening)]
 pub fn scope_register(
     scope_context_id: String,
     name: String,
@@ -1485,61 +1487,62 @@ pub fn scope_register(
     let normalized = name.to_lowercase();
     let now = crate::time::now_secs();
 
-    let mut guard = wasm_scope_registries()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7130] lock poisoned: {e}")))?;
-    let registry = guard
-        .entry(scope_context_id)
-        .or_insert_with(WasmScopeRegistry::new);
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let mut guard = registries.borrow_mut();
+        let registry = guard
+            .entry(scope_context_id)
+            .or_insert_with(WasmScopeRegistry::new);
 
-    // Same-owner re-registration → atomic update
-    if let Some(existing) = registry.entries.get_mut(&normalized) {
-        if existing.owner_did == registrant_did {
-            existing.target = WasmScopeTarget {
-                context_id: target_context_id,
-                relay_urls: input.relay_urls,
-            };
-            existing.metadata = WasmScopeMetadata {
-                description: input.description,
-                tags: input.tags,
-            };
-            existing.registered_at = now;
-            let result = serde_json::json!({"status": "updated", "entry_id": existing.entry_id});
+        // Same-owner re-registration -> atomic update
+        if let Some(existing) = registry.entries.get_mut(&normalized) {
+            if existing.owner_did == registrant_did {
+                existing.target = WasmScopeTarget {
+                    context_id: target_context_id,
+                    relay_urls: input.relay_urls,
+                };
+                existing.metadata = WasmScopeMetadata {
+                    description: input.description,
+                    tags: input.tags,
+                };
+                existing.registered_at = now;
+                let result =
+                    serde_json::json!({"status": "updated", "entry_id": existing.entry_id});
+                return Ok(result.to_string());
+            }
+            let result = serde_json::json!({"status": "conflict", "entry_id": null});
             return Ok(result.to_string());
         }
-        let result = serde_json::json!({"status": "conflict", "entry_id": null});
-        return Ok(result.to_string());
-    }
 
-    // Capacity check before new registration
-    if registry.entries.len() >= MAX_WASM_SCOPE_ENTRIES {
-        return Err(JsError::new(
-            "[SCP-VALID-7131] scope registry capacity exceeded (max 10,000 entries)",
-        ));
-    }
+        // Capacity check before new registration
+        if registry.entries.len() >= MAX_WASM_SCOPE_ENTRIES {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] scope registry capacity exceeded (max 10,000 entries)",
+            ));
+        }
 
-    let eid = format!("scope-{}", registry.next_id);
-    registry.next_id += 1;
+        let eid = format!("scope-{}", registry.next_id);
+        registry.next_id += 1;
 
-    let entry = WasmScopeEntry {
-        name: normalized.clone(),
-        target: WasmScopeTarget {
-            context_id: target_context_id,
-            relay_urls: input.relay_urls,
-        },
-        owner_did: registrant_did,
-        registered_at: now,
-        metadata: WasmScopeMetadata {
-            description: input.description,
-            tags: input.tags,
-        },
-        entry_id: eid.clone(),
-    };
+        let entry = WasmScopeEntry {
+            name: normalized.clone(),
+            target: WasmScopeTarget {
+                context_id: target_context_id,
+                relay_urls: input.relay_urls,
+            },
+            owner_did: registrant_did,
+            registered_at: now,
+            metadata: WasmScopeMetadata {
+                description: input.description,
+                tags: input.tags,
+            },
+            entry_id: eid.clone(),
+        };
 
-    registry.entries.insert(normalized, entry);
+        registry.entries.insert(normalized, entry);
 
-    let result = serde_json::json!({"status": "registered", "entry_id": eid});
-    Ok(result.to_string())
+        let result = serde_json::json!({"status": "registered", "entry_id": eid});
+        Ok(result.to_string())
+    })
 }
 
 /// Looks up a scope name in a scope registry. Returns JSON result.
@@ -1552,24 +1555,26 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, Js
     wasm_validate_scope_context_id(&scope_context_id)?;
     wasm_validate_scope_name(&name)?;
     let normalized = name.to_lowercase();
-    let results: Vec<serde_json::Value> = wasm_scope_registries()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7130] lock poisoned: {e}")))?
-        .get(&scope_context_id)
-        .and_then(|registry| registry.entries.get(&normalized))
-        .map(|entry| {
-            serde_json::to_value(entry).map_err(|e| {
-                JsError::new(&format!(
-                    "[SCP-VALID-7133] scope entry serialization failed: {e}"
-                ))
-            })
-        })
-        .transpose()?
-        .into_iter()
-        .collect();
 
-    let result = serde_json::json!({"results": results});
-    Ok(result.to_string())
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let guard = registries.borrow();
+        let results: Vec<serde_json::Value> = guard
+            .get(&scope_context_id)
+            .and_then(|registry| registry.entries.get(&normalized))
+            .map(|entry| {
+                serde_json::to_value(entry).map_err(|e| {
+                    JsError::new(&format!(
+                        "[SCP-VALID-7133] scope entry serialization failed: {e}"
+                    ))
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+
+        let result = serde_json::json!({"results": results});
+        Ok(result.to_string())
+    })
 }
 
 /// Deregisters a scope name from a scope registry. Returns JSON result.
@@ -1587,11 +1592,10 @@ pub fn scope_deregister(
     wasm_validate_scope_did(&did)?;
     wasm_validate_scope_name(&name)?;
     let normalized = name.to_lowercase();
-    let removed = wasm_scope_registries()
-        .lock()
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7130] lock poisoned: {e}")))?
-        .get_mut(&scope_context_id)
-        .is_some_and(|registry| {
+
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let mut guard = registries.borrow_mut();
+        let removed = guard.get_mut(&scope_context_id).is_some_and(|registry| {
             if registry
                 .entries
                 .get(&normalized)
@@ -1604,8 +1608,9 @@ pub fn scope_deregister(
             }
         });
 
-    let result = serde_json::json!({"removed": removed});
-    Ok(result.to_string())
+        let result = serde_json::json!({"removed": removed});
+        Ok(result.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------

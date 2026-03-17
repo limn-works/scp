@@ -482,4 +482,63 @@ class RealFFITest {
             assertEquals("long", uniffi.scp.syncClassifyOffline(lastSeen, now))
         }
     }
+
+    // -- Scope registry (§22.3.5, ADR-043) ------------------------------------
+
+    @Nested
+    inner class ScopeRegistry {
+        @Test
+        fun `scope register-lookup-deregister round-trip`() {
+            assumeTrue(nativeAvailable, skipReason)
+            val regJson = uniffi.scp.scopeRegister(
+                scopeContextId = "kt-test-ctx",
+                name = "my-scope",
+                targetContextId = "target-ctx",
+                relayUrls = listOf("wss://relay.example.com"),
+                registrantDid = "did:dht:zTest",
+                description = null,
+                tags = null,
+            )
+            assertTrue(regJson.contains("\"registered\""), "expected registered status, got: $regJson")
+            assertTrue(regJson.contains("entry_id"), "expected entry_id in result, got: $regJson")
+
+            val lookupJson = uniffi.scp.scopeLookup(
+                scopeContextId = "kt-test-ctx",
+                name = "my-scope",
+            )
+            assertTrue(lookupJson.contains("\"my-scope\""), "expected scope name in lookup, got: $lookupJson")
+            assertTrue(lookupJson.contains("\"target-ctx\""), "expected target context in lookup, got: $lookupJson")
+
+            val deregJson = uniffi.scp.scopeDeregister(
+                scopeContextId = "kt-test-ctx",
+                name = "my-scope",
+                did = "did:dht:zTest",
+            )
+            assertTrue(deregJson.contains("true"), "expected removed=true, got: $deregJson")
+        }
+
+        @Test
+        fun `scope register conflict for different owner`() {
+            assumeTrue(nativeAvailable, skipReason)
+            uniffi.scp.scopeRegister(
+                scopeContextId = "kt-conflict-ctx",
+                name = "taken",
+                targetContextId = "target-ctx",
+                relayUrls = listOf("wss://relay.example.com"),
+                registrantDid = "did:dht:zAlice",
+                description = null,
+                tags = null,
+            )
+            val conflictJson = uniffi.scp.scopeRegister(
+                scopeContextId = "kt-conflict-ctx",
+                name = "taken",
+                targetContextId = "other-ctx",
+                relayUrls = listOf("wss://relay.example.com"),
+                registrantDid = "did:dht:zEve",
+                description = null,
+                tags = null,
+            )
+            assertTrue(conflictJson.contains("\"conflict\""), "expected conflict status, got: $conflictJson")
+        }
+    }
 }

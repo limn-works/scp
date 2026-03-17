@@ -500,15 +500,37 @@ export async function handleDeregister(
 // Scope Registry operations (§22.3.5, ADR-043)
 // ---------------------------------------------------------------------------
 
+/** Target context for a scope entry (context-only by construction per ADR-043). */
+export interface ScopeTarget {
+  readonly context_id: string;
+  readonly relay_urls: readonly string[];
+}
+
+/** Optional metadata attached to a scope registration (§22.3.5). */
+export interface ScopeMetadata {
+  readonly description: string | null;
+  readonly tags: readonly string[] | null;
+}
+
+/** A single scope entry in the registry (§22.3.5). */
+export interface ScopeEntry {
+  readonly name: string;
+  readonly target: ScopeTarget;
+  readonly owner_did: string;
+  readonly registered_at: number;
+  readonly metadata: ScopeMetadata;
+  readonly entry_id: string;
+}
+
 /** Result of a scope registration. */
 export interface ScopeRegisterResult {
-  readonly status: string;
+  readonly status: "registered" | "conflict" | "updated";
   readonly entry_id: string | null;
 }
 
 /** Result of a scope lookup. */
 export interface ScopeLookupResult {
-  readonly results: readonly Record<string, unknown>[];
+  readonly results: readonly ScopeEntry[];
 }
 
 /** Result of a scope deregistration. */
