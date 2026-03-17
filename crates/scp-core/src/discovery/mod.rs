@@ -20,6 +20,7 @@
 //! - [`dht_context`] -- DHT-based context discovery via DID document service endpoints (§5.14.11, §18.2.2).
 //! - [`addressing`] -- Address format types, trust levels, and unified resolution (§22).
 //! - [`handles`] -- Discovery context handle tools: register, lookup, deregister (§22.3).
+//! - [`scope`] -- Scope tools: namespace-to-context registration (§22.3.5, ADR-043).
 //! - [`petnames`] -- Petname storage in identity private state (§22.4).
 //!
 //! # Types
@@ -45,6 +46,7 @@ pub mod did_capabilities;
 pub mod handles;
 pub mod petnames;
 pub mod push;
+pub mod scope;
 pub mod search;
 
 use std::time::Duration;
@@ -76,6 +78,12 @@ pub use handles::{
     TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER,
 };
 pub use petnames::{PetnameEvent, PetnameMap};
+pub use scope::{
+    ScopeDeregisterParams, ScopeDeregisterResult, ScopeEntry, ScopeLookupParams, ScopeLookupResult,
+    ScopeMetadata, ScopeRegisterParams, ScopeRegisterResult, ScopeRegisterStatus,
+    ScopeRegistrationEvent, ScopeRegistry, ScopeRegistryError, ScopeTarget, TOOL_SCOPE_DEREGISTER,
+    TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER, validate_scope_name,
+};
 pub use search::{ContactCache, ContextQuerier, unified_search};
 
 // ---------------------------------------------------------------------------

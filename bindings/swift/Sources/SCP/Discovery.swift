@@ -179,6 +179,45 @@ public enum DiscoveryBridge {
         try handleDeregister(discoveryContextId: $0, handle: $1, did: $2)
     }
 
+    // MARK: - Scope registry bridge types (§22.3.5, ADR-043)
+
+    /// Register a scope name in a scope registry.
+    public typealias ScopeRegisterFn = @Sendable (
+        _ scopeContextId: String, _ name: String,
+        _ targetContextId: String, _ relayUrls: [String],
+        _ registrantDid: String,
+        _ description: String?, _ tags: [String]?
+    ) throws -> String
+
+    /// Look up a scope name in a scope registry.
+    public typealias ScopeLookupFn = @Sendable (
+        _ scopeContextId: String, _ name: String
+    ) throws -> String
+
+    /// Deregister a scope name from a scope registry.
+    public typealias ScopeDeregisterFn = @Sendable (
+        _ scopeContextId: String, _ name: String, _ did: String
+    ) throws -> String
+
+    /// Default scope register — delegates to UniFFI ``scopeRegister``.
+    public static let defaultScopeRegister: ScopeRegisterFn = {
+        try scopeRegister(
+            scopeContextId: $0, name: $1,
+            targetContextId: $2, relayUrls: $3,
+            registrantDid: $4, description: $5, tags: $6
+        )
+    }
+
+    /// Default scope lookup — delegates to UniFFI ``scopeLookup``.
+    public static let defaultScopeLookup: ScopeLookupFn = {
+        try scopeLookup(scopeContextId: $0, name: $1)
+    }
+
+    /// Default scope deregister — delegates to UniFFI ``scopeDeregister``.
+    public static let defaultScopeDeregister: ScopeDeregisterFn = {
+        try scopeDeregister(scopeContextId: $0, name: $1, did: $2)
+    }
+
     // MARK: - Address resolution bridge types (§22.8)
 
     /// Resolve an address via multi-path resolution.
@@ -479,6 +518,68 @@ public func deregisterHandle(
     handleDeregisterFn: DiscoveryBridge.HandleDeregisterFn = DiscoveryBridge.defaultHandleDeregister
 ) throws -> String {
     try handleDeregisterFn(discoveryContextId, handle, did)
+}
+
+// MARK: - Scope registry operations (§22.3.5, ADR-043)
+
+/// Registers a scope name in a scope registry.
+///
+/// - Parameters:
+///   - scopeContextId: ID of the context hosting the scope registry.
+///   - name: Scope name to register.
+///   - targetContextId: Context ID the scope name resolves to.
+///   - relayUrls: Relay URLs for the target context.
+///   - registrantDid: DID of the registrant.
+///   - description: Optional human-readable description.
+///   - tags: Optional list of tag strings.
+///   - scopeRegisterFn: Bridge function override for testing.
+/// - Returns: A JSON string with the registration result.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the scope name or relay URLs are invalid.
+public func registerScope(
+    scopeContextId: String,
+    name: String,
+    targetContextId: String,
+    relayUrls: [String],
+    registrantDid: String,
+    description: String? = nil,
+    tags: [String]? = nil,
+    scopeRegisterFn: DiscoveryBridge.ScopeRegisterFn = DiscoveryBridge.defaultScopeRegister
+) throws -> String {
+    try scopeRegisterFn(
+        scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags
+    )
+}
+
+/// Looks up a scope name in a scope registry.
+///
+/// - Parameters:
+///   - scopeContextId: ID of the context hosting the scope registry.
+///   - name: The scope name to look up.
+///   - scopeLookupFn: Bridge function override for testing.
+/// - Returns: A JSON string with a ``results`` array of matching scope entries.
+public func lookupScope(
+    scopeContextId: String,
+    name: String,
+    scopeLookupFn: DiscoveryBridge.ScopeLookupFn = DiscoveryBridge.defaultScopeLookup
+) throws -> String {
+    try scopeLookupFn(scopeContextId, name)
+}
+
+/// Deregisters a scope name from a scope registry.
+///
+/// - Parameters:
+///   - scopeContextId: ID of the context hosting the scope registry.
+///   - name: The scope name to deregister.
+///   - did: DID of the registrant requesting deregistration.
+///   - scopeDeregisterFn: Bridge function override for testing.
+/// - Returns: A JSON string with a ``removed`` boolean.
+public func deregisterScope(
+    scopeContextId: String,
+    name: String,
+    did: String,
+    scopeDeregisterFn: DiscoveryBridge.ScopeDeregisterFn = DiscoveryBridge.defaultScopeDeregister
+) throws -> String {
+    try scopeDeregisterFn(scopeContextId, name, did)
 }
 
 // MARK: - Address resolution (§22.8)

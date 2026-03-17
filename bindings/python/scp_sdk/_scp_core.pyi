@@ -1863,6 +1863,68 @@ def handle_deregister(
     """
     ...
 
+# -- Scope registry operations (section 22.3.5, ADR-043) --
+
+def scope_register(
+    scope_context_id: str,
+    name: str,
+    target_context_id: str,
+    relay_urls: list[str],
+    registrant_did: str,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Register a scope name in a scope registry.
+
+    Args:
+        scope_context_id: ID of the context hosting the scope registry.
+        name: Scope name to register ([a-z0-9-], max 64 chars).
+        target_context_id: Context ID the scope name resolves to.
+        relay_urls: Relay URLs for the target context.
+        registrant_did: DID of the registrant.
+        description: Optional human-readable description.
+        tags: Optional list of tag strings.
+
+    Returns:
+        JSON string with status and optional entry_id.
+
+    Raises:
+        ValidationError: If scope name or relay URLs are invalid.
+    """
+    ...
+
+def scope_lookup(
+    scope_context_id: str,
+    name: str,
+) -> str:
+    """Look up a scope name in a scope registry.
+
+    Args:
+        scope_context_id: ID of the context hosting the scope registry.
+        name: The scope name to look up.
+
+    Returns:
+        JSON string with a results array of matching scope entries.
+    """
+    ...
+
+def scope_deregister(
+    scope_context_id: str,
+    name: str,
+    did: str,
+) -> str:
+    """Deregister a scope name from a scope registry.
+
+    Args:
+        scope_context_id: ID of the context hosting the scope registry.
+        name: The scope name to deregister.
+        did: DID of the registrant requesting deregistration.
+
+    Returns:
+        JSON string with a removed boolean.
+    """
+    ...
+
 # -- Address resolution (section 22.8) --
 
 def address_resolve(

@@ -17,6 +17,9 @@
 //! - [`py_handle_register`] -- Register a handle in a discovery context.
 //! - [`py_handle_lookup`] -- Look up a handle in a discovery context.
 //! - [`py_handle_deregister`] -- Deregister a handle from a discovery context.
+//! - [`py_scope_register`] -- Register a scope name (§22.3.5, ADR-043).
+//! - [`py_scope_lookup`] -- Look up a scope name (§22.3.5, ADR-043).
+//! - [`py_scope_deregister`] -- Deregister a scope name (§22.3.5, ADR-043).
 //! - [`py_address_resolve`] -- Resolve an address via multi-path resolution.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
@@ -812,6 +815,180 @@ fn parse_handle_target(json: &str) -> PyResult<HandleTarget> {
 }
 
 // ---------------------------------------------------------------------------
+// Scope registry bridge functions (§22.3.5, ADR-043)
+// ---------------------------------------------------------------------------
+
+/// Registers a scope name in a scope registry.
+///
+/// Scope tools use independent structs and separate storage from handle tools.
+/// `ScopeTarget` is context-only by construction — no identity variant.
+///
+/// # Arguments
+///
+/// * `scope_context_id` -- The context ID hosting the scope registry.
+/// * `name` -- The scope name to register (validated via `validate_scope_name`).
+/// * `target_context_id` -- The context ID the scope name resolves to.
+/// * `relay_urls` -- Relay URLs for the target context.
+/// * `registrant_did` -- The DID of the authenticated caller.
+/// * `description` -- Optional description metadata.
+/// * `tags` -- Optional list of tag strings.
+///
+/// # Returns
+///
+/// A JSON string with `status` (`"registered"`, `"conflict"`, or `"updated"`)
+/// and optional `entry_id`.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if parameters are invalid.
+#[pyfunction]
+#[pyo3(name = "scope_register")]
+#[pyo3(signature = (scope_context_id, name, target_context_id, relay_urls, registrant_did, description=None, tags=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn py_scope_register(
+    scope_context_id: &str,
+    name: &str,
+    target_context_id: &str,
+    relay_urls: Vec<String>,
+    registrant_did: &str,
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+) -> PyResult<String> {
+    // Validate relay URLs at the FFI boundary (defense-in-depth)
+    for url in &relay_urls {
+        crate::validate::validate_relay_url(url)?;
+    }
+
+    let params = scp_core::discovery::ScopeRegisterParams {
+        name: name.to_owned(),
+        target: scp_core::discovery::ScopeTarget {
+            context_id: target_context_id.to_owned(),
+            relay_urls,
+        },
+        metadata: Some(scp_core::discovery::ScopeMetadata { description, tags }),
+    };
+
+    let mut guard =
+        petname_helpers::scope_registries()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("scope registry lock poisoned: {e}"),
+                code: "SCP-VALID-7130".to_owned(),
+            })?;
+
+    let registry = guard
+        .entry(scope_context_id.to_owned())
+        .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id.to_owned()));
+
+    let result = registry
+        .register(&params, &DID::from(registrant_did))
+        .map_err(|e| ScpPyError::ValidationError {
+            message: format!("scope registration failed: {e}"),
+            code: "SCP-VALID-7131".to_owned(),
+        })?;
+
+    serde_json::to_string(&result).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("failed to serialize scope register result: {e}"),
+            code: "SCP-VALID-7132".to_owned(),
+        }
+        .into()
+    })
+}
+
+/// Looks up a scope name in a scope registry.
+///
+/// # Arguments
+///
+/// * `scope_context_id` -- The context ID hosting the scope registry.
+/// * `name` -- The scope name to look up.
+///
+/// # Returns
+///
+/// A JSON string with a `results` array of scope entries.
+///
+/// # Errors
+///
+/// Raises `ValidationError` on failure.
+#[pyfunction]
+#[pyo3(name = "scope_lookup")]
+pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
+    let guard =
+        petname_helpers::scope_registries()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("scope registry lock poisoned: {e}"),
+                code: "SCP-VALID-7130".to_owned(),
+            })?;
+
+    let result = guard.get(scope_context_id).map_or_else(
+        || scp_core::discovery::ScopeLookupResult {
+            results: Vec::new(),
+        },
+        |registry| {
+            registry.lookup(&scp_core::discovery::ScopeLookupParams {
+                name: name.to_owned(),
+            })
+        },
+    );
+
+    serde_json::to_string(&result).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("failed to serialize scope lookup result: {e}"),
+            code: "SCP-VALID-7133".to_owned(),
+        }
+        .into()
+    })
+}
+
+/// Deregisters a scope name from a scope registry.
+///
+/// Only succeeds if the provided DID matches the scope entry owner.
+///
+/// # Arguments
+///
+/// * `scope_context_id` -- The context ID hosting the scope registry.
+/// * `name` -- The scope name to deregister.
+/// * `did` -- The registrant's DID (must match the entry owner).
+///
+/// # Returns
+///
+/// A JSON string with `removed` (bool).
+///
+/// # Errors
+///
+/// Raises `ValidationError` on serialization failure.
+#[pyfunction]
+#[pyo3(name = "scope_deregister")]
+pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyResult<String> {
+    let mut guard =
+        petname_helpers::scope_registries()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("scope registry lock poisoned: {e}"),
+                code: "SCP-VALID-7130".to_owned(),
+            })?;
+
+    let result = guard.get_mut(scope_context_id).map_or_else(
+        || scp_core::discovery::ScopeDeregisterResult { removed: false },
+        |registry| {
+            registry.deregister(&scp_core::discovery::ScopeDeregisterParams {
+                name: name.to_owned(),
+                did: DID::from(did),
+            })
+        },
+    );
+
+    serde_json::to_string(&result).map_err(|e| {
+        ScpPyError::ValidationError {
+            message: format!("failed to serialize scope deregister result: {e}"),
+            code: "SCP-VALID-7134".to_owned(),
+        }
+        .into()
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Address resolve bridge function (§22.8)
 // ---------------------------------------------------------------------------
 
@@ -852,7 +1029,7 @@ pub fn py_address_resolve(
         .into());
     }
 
-    let known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
+    let mut known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
         serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid known_contexts_json: {e}"),
             code: "SCP-VALID-7090".to_owned(),
@@ -867,6 +1044,12 @@ pub fn py_address_resolve(
             })?;
         guard.keys().map(|k| (k.clone(), k.clone())).collect()
     };
+
+    // Merge scope registry contexts into known_contexts for two-hop resolution (§22.3.5).
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    for (name, ctx_id) in scope_contexts {
+        known_contexts.entry(name).or_insert(ctx_id);
+    }
 
     let known_domains: Vec<&str> = Vec::new();
 
@@ -944,6 +1127,10 @@ pub fn register_discovery(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_handle_register, m)?)?;
     m.add_function(wrap_pyfunction!(py_handle_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(py_handle_deregister, m)?)?;
+    // Scope registry operations (§22.3.5, ADR-043)
+    m.add_function(wrap_pyfunction!(py_scope_register, m)?)?;
+    m.add_function(wrap_pyfunction!(py_scope_lookup, m)?)?;
+    m.add_function(wrap_pyfunction!(py_scope_deregister, m)?)?;
     // Address resolution (§22.8)
     m.add_function(wrap_pyfunction!(py_address_resolve, m)?)?;
     Ok(())

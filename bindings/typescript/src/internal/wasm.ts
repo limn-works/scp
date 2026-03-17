@@ -188,6 +188,18 @@ interface WasmModule {
     typeFilter: string | undefined,
   ) => string;
   handle_deregister: (discoveryContextId: string, handle: string, did: string) => string;
+  // Scope Registry (§22.3.5, ADR-043)
+  scope_register: (
+    scopeContextId: string,
+    name: string,
+    targetContextId: string,
+    relayUrlsJson: string,
+    registrantDid: string,
+    description: string | undefined,
+    tagsJson: string | undefined,
+  ) => string;
+  scope_lookup: (scopeContextId: string, name: string) => string;
+  scope_deregister: (scopeContextId: string, name: string, did: string) => string;
   // Address Resolution (§22.8)
   address_resolve: (
     ownerDid: string,
@@ -1512,6 +1524,38 @@ export function createWasmBridge(): Bridge {
     handleDeregister(discoveryContextId: string, handle: string, did: string): string {
       const wasm = getWasm();
       return wasm.handle_deregister(discoveryContextId, handle, did);
+    },
+
+    // Scope Registry (§22.3.5, ADR-043)
+    scopeRegister(
+      scopeContextId: string,
+      name: string,
+      targetContextId: string,
+      relayUrls: string[],
+      registrantDid: string,
+      description: string | undefined,
+      tags: string[] | undefined,
+    ): string {
+      const wasm = getWasm();
+      return wasm.scope_register(
+        scopeContextId,
+        name,
+        targetContextId,
+        JSON.stringify(relayUrls),
+        registrantDid,
+        description,
+        tags ? JSON.stringify(tags) : undefined,
+      );
+    },
+
+    scopeLookup(scopeContextId: string, name: string): string {
+      const wasm = getWasm();
+      return wasm.scope_lookup(scopeContextId, name);
+    },
+
+    scopeDeregister(scopeContextId: string, name: string, did: string): string {
+      const wasm = getWasm();
+      return wasm.scope_deregister(scopeContextId, name, did);
     },
 
     // Address Resolution (§22.8)
