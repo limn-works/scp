@@ -279,7 +279,7 @@ impl NapiNodeHandle {
             author_did,
         );
 
-        let adm = match admission.as_str() {
+        let adm = match admission.to_lowercase().as_str() {
             "open" => scp_core::context::broadcast::BroadcastAdmission::Open,
             "gated" => scp_core::context::broadcast::BroadcastAdmission::Gated,
             other => {
