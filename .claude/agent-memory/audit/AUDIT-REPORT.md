@@ -10,7 +10,7 @@
 
 The SCP codebase is remarkably mature for its scope. **Zero `todo!()` or `unimplemented!()` macros exist** in the entire Rust codebase. **Zero `NotImplementedError` in Python**. The scp-core library (`crates/scp-core/`) is production-quality with comprehensive implementations across identity, context lifecycle, cryptography (MLS, UCAN, sender keys, access keys), trust scoring, discovery, economy, sync, and provenance. The PyO3 bridge (reference bridge) has the most complete FFI coverage.
 
-However, the audit identified **13 confirmed findings** — primarily **cross-bridge parity gaps** where functionality implemented in one bridge is stubbed or missing in another. The most critical finding is the UniFFI bridge's no-op crypto provider, which means messages in the mobile SDK path are not MLS-encrypted.
+However, the audit identified **17 confirmed findings** — primarily **cross-bridge parity gaps** where functionality implemented in one bridge is stubbed or missing in another. The most critical finding is the UniFFI bridge's no-op crypto provider, which means messages in the mobile SDK path are not MLS-encrypted.
 
 ### Finding Summary
 
@@ -29,8 +29,12 @@ However, the audit identified **13 confirmed findings** — primarily **cross-br
 | 011 | Moderate | Wiring gap | Swift SDK MCP functions throw "not yet wired" errors |
 | 012 | Minor | Wiring gap | Provenance advanced functions unwrapped in all 4 SDKs |
 | 013 | Moderate | Bug | UDP/DTLS adapter query() truncates multi-blob results |
+| 014 | **Major** | Wiring gap | NAPI tool invocation is echo-only stub — no handler dispatch or schema validation |
+| 015 | Moderate | Wiring gap | NAPI bridge credential lifecycle entirely missing (6+ functions) |
+| 016 | Moderate | Wiring gap | NAPI missing UCAN delegation and context discovery |
+| 017 | Moderate | Wiring gap | UniFFI bridge covers only ~33% of PyO3 exports (missing MCP, discovery, economy, media, provenance) |
 
-**By severity:** 3 Major, 7 Moderate, 3 Minor
+**By severity:** 4 Major, 9 Moderate, 4 Minor
 
 ---
 
@@ -230,18 +234,87 @@ Most are acceptable fire-and-forget patterns. The `let _ = forward_handle.await`
 
 ---
 
+### Finding 014: NAPI tool invocation is echo-only stub
+**Severity:** Major | **Category:** wiring-gap
+
+**File:** `crates/scp-ffi/napi/src/tools.rs`
+
+The NAPI bridge's tool invocation path returns echo mode without real handler dispatch. Missing:
+- JSON schema validation against tool input/output schemas
+- Handler dispatch to registered tool handlers
+- Cross-context tool invocation (`tool_invoke_cross_context`)
+- Tool session management (`tool_session_create`, `tool_session_invoke`, `tool_session_close`)
+
+**Comparison:** PyO3 (`crates/scp-ffi/src/tools.rs:py_tool_invoke`) performs full UCAN validation, schema validation, handler dispatch, and output schema validation.
+
+**Impact:** Tools cannot be meaningfully invoked through the TypeScript SDK — invocations return the input as output without executing tool logic.
+
+---
+
+### Finding 015: NAPI bridge credential lifecycle entirely missing
+**Severity:** Moderate | **Category:** wiring-gap
+
+**File:** `crates/scp-ffi/napi/src/bridge_connector.rs`
+
+The NAPI bridge only exports `bridge_evaluate_trust`, `bridge_register`, and `bridge_create_shadow`. Missing entirely:
+- `bridge_claim_shadow` — claim a shadow identity
+- `bridge_seal_shadow_envelope` / `bridge_open_shadow_envelope` — envelope encryption
+- `bridge_credential_provision` / `bridge_credential_rotate` / `bridge_credential_revoke` — credential lifecycle
+- `bridge_oauth_generate_pkce` / `bridge_oauth_build_auth_url` / `bridge_oauth_scopes_for_mode` — OAuth PKCE flow
+
+**Comparison:** PyO3 (`crates/scp-ffi/src/bridge_connector.rs`) exports 12+ bridge connector functions covering the full lifecycle.
+
+**Impact:** TypeScript SDK users cannot configure bridge connectors, manage credentials, or use OAuth PKCE flows.
+
+---
+
+### Finding 016: NAPI missing UCAN delegation and context discovery
+**Severity:** Moderate | **Category:** wiring-gap
+
+**Files:**
+- `crates/scp-ffi/napi/src/ucan.rs` — has `ucan_validate`, `ucan_mint`, `ucan_revoke` but no `ucan_delegate`
+- `crates/scp-ffi/napi/src/discovery.rs` — has address parsing and petname set/remove but no `context_discover()` or `address_resolve()`
+
+**Impact:**
+- UCAN delegation chains cannot be created in TypeScript SDK
+- Context discovery from DIDs/addresses unavailable in TypeScript SDK
+
+---
+
+### Finding 017: UniFFI bridge covers only ~33% of PyO3 exports
+**Severity:** Moderate | **Category:** wiring-gap
+
+**File:** `crates/scp-ffi/uniffi/src/bridge.rs`
+
+UniFFI exports ~40 functions vs PyO3's 122. Missing entire categories:
+- MCP (server and client) — 0 functions
+- Discovery (context discovery, address resolution) — 0 functions
+- Economy (cost estimation, budgets, pricing) — 0 functions
+- Media (session lifecycle, signaling) — 0 functions
+- Provenance (quality evaluation, attachment) — 0 functions
+- Bridge connector credentialing — 0 functions
+- Tool cross-context invocation and sessions — 0 functions
+
+**Impact:** Swift and Kotlin SDKs lack MCP, discovery, economy, media, and provenance capabilities. These features are unavailable on mobile platforms.
+
+---
+
 ## Cross-Layer Coverage Matrix
 
 See `matrix.md` for the full operations × targets matrix.
 
 **Key gaps identified:**
 - NAPI MCP: 7/7 ContextProvider methods are stubs
+- NAPI tools: Tool invocation is echo-only (no handler dispatch or schema validation)
+- NAPI bridge: Missing entire credential lifecycle and OAuth PKCE (9 functions)
+- NAPI discovery: Missing context discovery and address resolution
 - PyO3+UniFFI crypto: No-op MLS group ops (NAPI only bridge with real MlsCryptoProvider)
 - WASM capability: No role-based checks on tool invocation
 - Broadcast UCAN: NoOp validators in 3/4 bridges
 - SSE transport: Missing in 2/4 bridges
 - Resource subscriptions: No delivery in 4/4 bridges
 - Trust event counts: Stub in 1/4 bridges
+- UniFFI coverage: Only ~33% of PyO3 exports (missing MCP, discovery, economy, media, provenance)
 
 ## Code Quality Assessment
 
@@ -276,19 +349,23 @@ See `matrix.md` for the full operations × targets matrix.
 1. **Wire real MLS crypto in PyO3 and UniFFI bridges** (Finding 009) — NAPI pattern (#1294) is the template
 2. **Add capability checks to WASM tool invocation** (Finding 005) — Security gap
 3. **Wire NAPI MCP ContextProvider** (Finding 001) — Functional gap blocking TypeScript MCP
+4. **Wire NAPI tool invocation to real handler dispatch** (Finding 014) — Tools non-functional in TypeScript SDK
 
 ### Short-term (P1)
 
-4. **Wire real UCAN validators for broadcast subscription** (Finding 003) — All non-WASM bridges
-5. **Replace placeholder DID in PyO3 tool definitions** (Finding 002)
-6. **Wire UniFFI trust event counts to real data** (Finding 004)
-7. **Port SSE transport to NAPI/UniFFI** (Finding 006) — Or extract to scp-ffi-common
+5. **Wire real UCAN validators for broadcast subscription** (Finding 003) — All non-WASM bridges
+6. **Replace placeholder DID in PyO3 tool definitions** (Finding 002)
+7. **Wire UniFFI trust event counts to real data** (Finding 004)
+8. **Port SSE transport to NAPI/UniFFI** (Finding 006) — Or extract to scp-ffi-common
+9. **Complete NAPI bridge credential lifecycle** (Finding 015) — 9 missing functions
+10. **Add NAPI UCAN delegation and context discovery** (Finding 016)
 
 ### Medium-term (P2)
 
-8. **Implement MCP resource subscription delivery** (Finding 007) — Requires transport integration
-9. **Wire Swift MCP to UniFFI bridge** (Finding 011) — 4 public methods throw "not yet wired"
-10. **Fix UDP/DTLS query truncation** (Finding 013) — Add read loop matching other adapters
-11. **Clean up `#[allow(dead_code)]` annotations** (Finding 008)
-12. **Wrap provenance privacy functions in all 4 SDKs** (Finding 012)
-13. **Add logging for discarded Results** (Finding 010)
+11. **Expand UniFFI bridge to cover MCP, discovery, economy, media, provenance** (Finding 017)
+12. **Implement MCP resource subscription delivery** (Finding 007) — Requires transport integration
+13. **Wire Swift MCP to UniFFI bridge** (Finding 011) — 4 public methods throw "not yet wired"
+14. **Fix UDP/DTLS query truncation** (Finding 013) — Add read loop matching other adapters
+15. **Clean up `#[allow(dead_code)]` annotations** (Finding 008)
+16. **Wrap provenance privacy functions in all 4 SDKs** (Finding 012)
+17. **Add logging for discarded Results** (Finding 010)
