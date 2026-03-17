@@ -10,7 +10,7 @@
 
 The SCP codebase is remarkably mature for its scope. **Zero `todo!()` or `unimplemented!()` macros exist** in the entire Rust codebase. **Zero `NotImplementedError` in Python**. The scp-core library (`crates/scp-core/`) is production-quality with comprehensive implementations across identity, context lifecycle, cryptography (MLS, UCAN, sender keys, access keys), trust scoring, discovery, economy, sync, and provenance. The PyO3 bridge (reference bridge) has the most complete FFI coverage.
 
-However, the audit identified **18 confirmed findings** — primarily **cross-bridge parity gaps** where functionality implemented in one bridge is stubbed or missing in another. The most critical finding is the UniFFI bridge's no-op crypto provider, which means messages in the mobile SDK path are not MLS-encrypted.
+However, the audit identified **19 confirmed findings** — primarily **cross-bridge parity gaps** where functionality implemented in one bridge is stubbed or missing in another. The most critical finding is the UniFFI bridge's no-op crypto provider, which means messages in the mobile SDK path are not MLS-encrypted.
 
 ### Finding Summary
 
@@ -34,8 +34,9 @@ However, the audit identified **18 confirmed findings** — primarily **cross-br
 | 016 | Moderate | Wiring gap | NAPI missing UCAN delegation and context discovery |
 | 017 | Moderate | Wiring gap | UniFFI bridge covers only ~33% of PyO3 exports (missing MCP, discovery, economy, media, provenance) |
 | 018 | Moderate | Wiring gap | Kotlin SDK missing high-level type-safe API classes (Identity, Context, Message) |
+| 019 | Minor | Wiring gap | TransportType enum missing Nostr and WebRtc variants — cannot participate in ConnectionPool |
 
-**By severity:** 4 Major, 10 Moderate, 4 Minor
+**By severity:** 4 Major, 10 Moderate, 5 Minor
 
 ---
 
