@@ -52,6 +52,9 @@ pub const MAX_RELAY_URL_LEN: usize = 2048;
 /// Maximum length for a transport mode string.
 pub const MAX_TRANSPORT_MODE_LEN: usize = 64;
 
+/// Maximum length for a deploy ID (matches `scp-core::context::broadcast_content::MAX_DEPLOY_ID_BYTES`).
+pub const MAX_DEPLOY_ID_LEN: usize = 128;
+
 // ---------------------------------------------------------------------------
 // String emptiness and length
 // ---------------------------------------------------------------------------
@@ -113,6 +116,40 @@ pub fn validate_context_id(context_id: &str) -> Result<(), ScpPyError> {
         return Err(ScpPyError::validation(format!(
             "context_id contains invalid characters: expected alphanumeric, \
              hyphens, or underscores, got {context_id:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Deploy ID validation
+// ---------------------------------------------------------------------------
+
+/// Validates a deploy ID string.
+///
+/// Deploy IDs are 1-128 byte ASCII identifiers used by broadcast content
+/// delivery (spec §18.11.9). Validation enforces:
+/// - Non-empty
+/// - Length <= [`MAX_DEPLOY_ID_LEN`] (128 bytes)
+/// - ASCII alphanumeric + hyphens + underscores only
+/// - No control characters
+///
+/// # Errors
+///
+/// Returns [`ScpPyError::ValidationError`] if the deploy ID is empty, too long,
+/// contains control characters, or contains invalid characters.
+pub fn validate_deploy_id(deploy_id: &str) -> Result<(), ScpPyError> {
+    validate_non_empty(deploy_id, "deploy_id", MAX_DEPLOY_ID_LEN)?;
+    reject_control_chars(deploy_id, "deploy_id")?;
+
+    if !deploy_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(ScpPyError::validation(format!(
+            "deploy_id contains invalid characters: expected alphanumeric, \
+             hyphens, or underscores, got {deploy_id:?}"
         )));
     }
 
@@ -412,6 +449,49 @@ mod tests {
         let long_id = "a".repeat(MAX_CONTEXT_ID_LEN + 1);
         let err = validate_context_id(&long_id).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum length"));
+    }
+
+    // -- Deploy ID --
+
+    #[test]
+    fn valid_deploy_id() {
+        assert!(validate_deploy_id("deploy-abc-123").is_ok());
+    }
+
+    #[test]
+    fn valid_deploy_id_with_underscores() {
+        assert!(validate_deploy_id("deploy_v2_final").is_ok());
+    }
+
+    #[test]
+    fn empty_deploy_id_rejected() {
+        let err = validate_deploy_id("").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn deploy_id_with_special_chars_rejected() {
+        let err = validate_deploy_id("deploy/abc").unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn deploy_id_with_control_chars_rejected() {
+        let err = validate_deploy_id("deploy\0id").unwrap_err();
+        assert!(err.to_string().contains("control character"));
+    }
+
+    #[test]
+    fn deploy_id_too_long_rejected() {
+        let long_id = "a".repeat(MAX_DEPLOY_ID_LEN + 1);
+        let err = validate_deploy_id(&long_id).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn deploy_id_at_max_length_accepted() {
+        let id = "a".repeat(MAX_DEPLOY_ID_LEN);
+        assert!(validate_deploy_id(&id).is_ok());
     }
 
     // -- DID --

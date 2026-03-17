@@ -18,9 +18,11 @@ use napi_derive::napi;
 use zeroize::Zeroizing;
 
 use scp_ffi_common::server::{self, RunningRelay, ServerError};
+use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 
+use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -262,6 +264,8 @@ impl NapiNodeHandle {
         deploy_retention_count: Option<u32>,
         csp_override: Option<String>,
     ) -> napi::Result<()> {
+        validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         let key_vec = Zeroizing::new(
             hex::decode(&broadcast_key_hex)
                 .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?,
@@ -328,6 +332,8 @@ impl NapiNodeHandle {
     /// Returns the number of assets in the committed deploy.
     #[napi]
     pub async fn commit_deploy(&self, context_id: String, deploy_id: String) -> napi::Result<u32> {
+        validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        validate_deploy_id(&deploy_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         let count = self
             .inner
             .commit_deploy(&context_id, &deploy_id)
@@ -340,6 +346,8 @@ impl NapiNodeHandle {
     /// Rolls back to a previous deploy for a projected context (section 18.11.11).
     #[napi]
     pub async fn rollback_deploy(&self, context_id: String, deploy_id: String) -> napi::Result<()> {
+        validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        validate_deploy_id(&deploy_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         self.inner
             .rollback_deploy(&context_id, &deploy_id)
             .await
@@ -349,6 +357,7 @@ impl NapiNodeHandle {
     /// Deactivates HTTP broadcast projection for the given context.
     #[napi]
     pub async fn disable_site_projection(&self, context_id: String) -> napi::Result<()> {
+        validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         self.inner.disable_broadcast_projection(&context_id).await;
         Ok(())
     }

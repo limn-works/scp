@@ -1512,14 +1512,16 @@ public struct SiteConfig: Sendable, Equatable {
 
 /// Validates an admission policy string before FFI.
 ///
-/// Must be `"open"` or `"gated"`.
+/// Accepts both casings (`"open"`/`"Open"`, `"gated"`/`"Gated"`) because
+/// the Rust bridge normalizes via `.to_lowercase()`.
 ///
 /// - Parameter admission: The admission policy string.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if admission is not valid.
 public func validateAdmission(_ admission: String) throws {
-    guard admission == "open" || admission == "gated" else {
+    let lower = admission.lowercased()
+    guard lower == "open" || lower == "gated" else {
         throw ScpError.Validation(
-            msg: "admission must be \"open\" or \"gated\", got \"\(admission)\"",
+            msg: "admission must be \"open\" or \"gated\" (case-insensitive), got \"\(admission)\"",
             code: "SCP-VALID-7023"
         )
     }

@@ -269,6 +269,16 @@ class SiteConfigTest {
     }
 
     @Test
+    fun `valid admission Open title case accepted`() {
+        validateAdmission("Open")
+    }
+
+    @Test
+    fun `valid admission Gated title case accepted`() {
+        validateAdmission("Gated")
+    }
+
+    @Test
     fun `invalid admission rejected`() {
         assertFailsWith<IllegalArgumentException> {
             validateAdmission("closed")

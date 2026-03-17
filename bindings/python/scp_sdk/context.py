@@ -241,21 +241,25 @@ class SiteConfig:
 #: Regex for a valid 64-character hex string (32 bytes).
 _HEX_64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
-#: Valid admission policy values accepted by the FFI bridge.
+#: Valid admission policy values accepted by the FFI bridge (lowercase canonical).
 _VALID_ADMISSION_POLICIES: frozenset[str] = frozenset({"open", "gated"})
 
 
 def validate_admission(admission: str) -> None:
     """Validate an admission policy string before FFI.
 
+    Accepts both casings (``"open"``/``"Open"``, ``"gated"``/``"Gated"``)
+    because the Rust bridge normalizes via ``.to_lowercase()``.
+
     Args:
-        admission: Must be ``"open"`` or ``"gated"``.
+        admission: Must be ``"open"``/``"Open"`` or ``"gated"``/``"Gated"``.
 
     Raises:
         ValueError: If *admission* is not a recognized policy.
     """
-    if admission not in _VALID_ADMISSION_POLICIES:
-        raise ValueError(f'admission must be "open" or "gated", got "{admission}"')
+    if admission.lower() not in _VALID_ADMISSION_POLICIES:
+        msg = f'admission must be "open" or "gated" (case-insensitive), got "{admission}"'
+        raise ValueError(msg)
 
 
 def validate_broadcast_key_hex(broadcast_key_hex: str) -> None:

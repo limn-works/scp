@@ -308,7 +308,16 @@ class ScopedHandle internal constructor(
  * @property cspOverride Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`,
  *   `unsafe-hashes`, bare `*`, `data:`, `blob:`.
  */
-data class SiteConfig(
+/**
+ * Node-local site configuration for broadcast projection (spec section 18.11.12).
+ *
+ * This is intentionally NOT a data class: the auto-generated `copy()` method
+ * on data classes would allow callers to create a new instance that bypasses
+ * init validation (e.g., invalid hostname, out-of-range deployRetentionCount).
+ *
+ * Custom [equals], [hashCode], and [toString] are provided for testing ergonomics.
+ */
+class SiteConfig(
     val hostname: String,
     val indexPath: String = "/index.html",
     val maxAssetsPerDeploy: Int = 10_000,
@@ -327,6 +336,32 @@ data class SiteConfig(
             validateCsp(cspOverride)
         }
     }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is SiteConfig) return false
+        return hostname == other.hostname &&
+            indexPath == other.indexPath &&
+            maxAssetsPerDeploy == other.maxAssetsPerDeploy &&
+            maxDeploySizeBytes == other.maxDeploySizeBytes &&
+            deployRetentionCount == other.deployRetentionCount &&
+            cspOverride == other.cspOverride
+    }
+
+    override fun hashCode(): Int {
+        var result = hostname.hashCode()
+        result = 31 * result + indexPath.hashCode()
+        result = 31 * result + maxAssetsPerDeploy
+        result = 31 * result + maxDeploySizeBytes.hashCode()
+        result = 31 * result + deployRetentionCount
+        result = 31 * result + (cspOverride?.hashCode() ?: 0)
+        return result
+    }
+
+    override fun toString(): String =
+        "SiteConfig(hostname=$hostname, indexPath=$indexPath, " +
+            "maxAssetsPerDeploy=$maxAssetsPerDeploy, maxDeploySizeBytes=$maxDeploySizeBytes, " +
+            "deployRetentionCount=$deployRetentionCount, cspOverride=$cspOverride)"
 
     companion object {
         private val HOSTNAME_LABEL_REGEX = Regex("^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\$")
@@ -489,14 +524,16 @@ private val HEX_64_REGEX = Regex("^[0-9a-fA-F]{64}\$")
 /**
  * Validates an admission policy string before FFI.
  *
- * Must be `"open"` or `"gated"`.
+ * Accepts both casings (`"open"`/`"Open"`, `"gated"`/`"Gated"`) because
+ * the Rust bridge normalizes via `.to_lowercase()`.
  *
  * @param admission The admission policy string.
  * @throws IllegalArgumentException if admission is not valid.
  */
 fun validateAdmission(admission: String) {
-    require(admission == "open" || admission == "gated") {
-        "admission must be \"open\" or \"gated\", got \"$admission\""
+    val lower = admission.lowercase()
+    require(lower == "open" || lower == "gated") {
+        "admission must be \"open\" or \"gated\" (case-insensitive), got \"$admission\""
     }
 }
 

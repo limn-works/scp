@@ -269,6 +269,8 @@ impl PyNodeHandle {
         deploy_retention_count: Option<usize>,
         csp_override: Option<String>,
     ) -> PyResult<()> {
+        crate::validate::validate_context_id(&context_id)?;
+        crate::validate::validate_did(&author_did)?;
         let rt = crate::runtime()?;
 
         let key_vec = Zeroizing::new(hex::decode(&broadcast_key_hex).map_err(|e| {
@@ -336,6 +338,8 @@ impl PyNodeHandle {
         context_id: String,
         deploy_id: String,
     ) -> PyResult<usize> {
+        crate::validate::validate_context_id(&context_id)?;
+        crate::validate::validate_deploy_id(&deploy_id)?;
         let rt = crate::runtime()?;
         py.allow_threads(|| {
             rt.block_on(self.inner.commit_deploy(&context_id, &deploy_id))
@@ -353,6 +357,8 @@ impl PyNodeHandle {
         context_id: String,
         deploy_id: String,
     ) -> PyResult<()> {
+        crate::validate::validate_context_id(&context_id)?;
+        crate::validate::validate_deploy_id(&deploy_id)?;
         let rt = crate::runtime()?;
         py.allow_threads(|| {
             rt.block_on(self.inner.rollback_deploy(&context_id, &deploy_id))
@@ -365,6 +371,7 @@ impl PyNodeHandle {
     /// Removes the projected context from the registry and drops all
     /// retained epoch keys.
     fn disable_site_projection(&self, py: Python<'_>, context_id: String) -> PyResult<()> {
+        crate::validate::validate_context_id(&context_id)?;
         let rt = crate::runtime()?;
         py.allow_threads(|| {
             rt.block_on(self.inner.disable_broadcast_projection(&context_id));

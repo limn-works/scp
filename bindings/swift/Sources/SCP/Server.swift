@@ -290,6 +290,8 @@ public struct Node: Sendable {
         config: SiteConfig,
         enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
     ) async throws {
+        try validateAdmission(admission)
+        try validateBroadcastKeyHex(broadcastKeyHex)
         try await enableFn(
             handle,
             contextId,

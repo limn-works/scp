@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING
 
 import _scp_core
 
+from scp_sdk.context import validate_admission, validate_broadcast_key_hex
+
 if TYPE_CHECKING:
     from scp_sdk.context import SiteConfig
 
@@ -211,6 +213,8 @@ class Node:
             ValueError: If parameters are invalid.
             RuntimeError: If the underlying node operation fails.
         """
+        validate_admission(admission)
+        validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(
             self._handle.enable_site_projection,
             context_id,

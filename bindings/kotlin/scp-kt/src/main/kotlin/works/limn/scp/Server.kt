@@ -297,6 +297,8 @@ class Node internal constructor(
         admission: String,
         config: SiteConfig,
     ) {
+        validateAdmission(admission)
+        validateBroadcastKeyHex(broadcastKeyHex)
         bridge.enableSiteProjection(
             this,
             contextId,

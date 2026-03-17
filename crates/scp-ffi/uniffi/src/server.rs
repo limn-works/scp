@@ -18,6 +18,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use scp_ffi_common::server::{self, ServerError};
+use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 
@@ -298,6 +299,8 @@ impl NodeHandle {
         deploy_retention_count: Option<u32>,
         csp_override: Option<String>,
     ) -> Result<(), ScpError> {
+        validate_context_id(&context_id)?;
+        validate_did(&author_did)?;
         let key_vec =
             Zeroizing::new(
                 hex::decode(&broadcast_key_hex).map_err(|e| ScpError::Validation {
@@ -366,6 +369,8 @@ impl NodeHandle {
         context_id: String,
         deploy_id: String,
     ) -> Result<u32, ScpError> {
+        validate_context_id(&context_id)?;
+        validate_deploy_id(&deploy_id)?;
         let count = self
             .inner
             .commit_deploy(&context_id, &deploy_id)
@@ -383,6 +388,8 @@ impl NodeHandle {
         context_id: String,
         deploy_id: String,
     ) -> Result<(), ScpError> {
+        validate_context_id(&context_id)?;
+        validate_deploy_id(&deploy_id)?;
         self.inner
             .rollback_deploy(&context_id, &deploy_id)
             .await
@@ -391,6 +398,7 @@ impl NodeHandle {
 
     /// Deactivates HTTP broadcast projection for the given context.
     pub async fn disable_site_projection(&self, context_id: String) -> Result<(), ScpError> {
+        validate_context_id(&context_id)?;
         self.inner.disable_broadcast_projection(&context_id).await;
         Ok(())
     }
