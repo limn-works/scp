@@ -160,6 +160,5 @@ class SyncBridge internal constructor(
      *
      * @return [SyncPolicy] with the runtime's sync policy values.
      */
-    suspend fun getPolicy(): SyncPolicy =
-        bridge.ffiCall { bindings.syncGetPolicy() }
+    suspend fun getPolicy(): SyncPolicy = bridge.ffiCall { bindings.syncGetPolicy() }
 }

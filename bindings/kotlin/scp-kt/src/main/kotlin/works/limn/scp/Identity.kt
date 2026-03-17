@@ -144,8 +144,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param custody Key custody method.
      * @return Opaque identity handle with agent key.
      */
-    suspend fun createWithAgentKey(custody: CustodyType): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
+    suspend fun createWithAgentKey(custody: CustodyType): Long = bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
 
     /**
      * Creates a new identity with an agent signing key (ADR-039).
@@ -155,8 +154,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param custody Key custody method: "in_memory", "platform", or "software".
      * @return Opaque identity handle with agent key.
      */
-    suspend fun createWithAgentKey(custody: String = "in_memory"): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
+    suspend fun createWithAgentKey(custody: String = "in_memory"): Long = bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
 
     /**
      * Adds an agent signing key to an existing identity (ADR-039).
@@ -164,8 +162,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with agent key.
      */
-    suspend fun addAgentKey(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityAddAgentKey(identityHandle) }
+    suspend fun addAgentKey(identityHandle: Long): Long = bridge.ffiCall { bindings.identityAddAgentKey(identityHandle) }
 
     /**
      * Rotates the agent signing key for an identity (ADR-039).
@@ -173,8 +170,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with new agent key.
      */
-    suspend fun rotateAgentKey(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityRotateAgentKey(identityHandle) }
+    suspend fun rotateAgentKey(identityHandle: Long): Long = bridge.ffiCall { bindings.identityRotateAgentKey(identityHandle) }
 
     /**
      * Removes the agent signing key from an identity (ADR-039).
@@ -182,8 +178,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle without agent key.
      */
-    suspend fun removeAgentKey(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityRemoveAgentKey(identityHandle) }
+    suspend fun removeAgentKey(identityHandle: Long): Long = bridge.ffiCall { bindings.identityRemoveAgentKey(identityHandle) }
 
     /**
      * Migrates an identity to a new DID.
@@ -199,8 +194,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create.
      * @return Base64-encoded device attestation token.
      */
-    suspend fun attestDevice(identityHandle: Long): String =
-        bridge.ffiCall { bindings.identityAttestDevice(identityHandle) }
+    suspend fun attestDevice(identityHandle: Long): String = bridge.ffiCall { bindings.identityAttestDevice(identityHandle) }
 
     /**
      * Verifies a device attestation token.

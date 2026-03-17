@@ -299,8 +299,6 @@ internal fun parseAuthentication(json: String): ScpIdAuthentication {
     )
 }
 
-private fun JsonObject.stringField(key: String): String =
-    getValue(key).jsonPrimitive.content
+private fun JsonObject.stringField(key: String): String = getValue(key).jsonPrimitive.content
 
-private fun JsonObject.longField(key: String): Long =
-    getValue(key).jsonPrimitive.long
+private fun JsonObject.longField(key: String): Long = getValue(key).jsonPrimitive.long

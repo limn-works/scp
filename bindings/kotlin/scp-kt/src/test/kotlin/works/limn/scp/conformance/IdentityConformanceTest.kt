@@ -3,8 +3,6 @@
 
 package works.limn.scp.conformance
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -12,6 +10,8 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -37,11 +37,12 @@ class IdentityConformanceTest {
     fun setUp() {
         stubBindings = ConformanceStubBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
         dispatcher = ConformanceDispatcher(bridge)
     }
 
@@ -51,10 +52,11 @@ class IdentityConformanceTest {
         fun `identity_create with in_memory custody returns handle`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateResult = 42L
-                val result = dispatcher.dispatch(
-                    "identity_create",
-                    mapOf("custody" to "in_memory"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_create",
+                        mapOf("custody" to "in_memory"),
+                    )
                 assertEquals("42", result["handle"])
                 assertEquals("in_memory", result["custody_type"])
                 assertEquals("in_memory", stubBindings.identityCreateCustody)
@@ -64,10 +66,11 @@ class IdentityConformanceTest {
         fun `identity_create with platform custody returns handle`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateResult = 1L
-                val result = dispatcher.dispatch(
-                    "identity_create",
-                    mapOf("custody" to "platform"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_create",
+                        mapOf("custody" to "platform"),
+                    )
                 assertEquals("1", result["handle"])
                 assertEquals("platform", result["custody_type"])
             }
@@ -84,10 +87,11 @@ class IdentityConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.identityCreateError =
                     BridgeException("Custody not available", "SCP-IDENT-1001")
-                val result = dispatcher.dispatch(
-                    "identity_create",
-                    mapOf("custody" to "platform"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_create",
+                        mapOf("custody" to "platform"),
+                    )
                 assertEquals("SCP-IDENT-1001", result["error"])
             }
     }
@@ -98,10 +102,11 @@ class IdentityConformanceTest {
         fun `identity_load returns handle for valid DID`() =
             runTest(testDispatcher) {
                 stubBindings.identityLoadResult = 5L
-                val result = dispatcher.dispatch(
-                    "identity_load",
-                    mapOf("did" to "did:dht:z6MkTest"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_load",
+                        mapOf("did" to "did:dht:z6MkTest"),
+                    )
                 assertEquals("5", result["handle"])
                 assertEquals("did:dht:z6MkTest", result["did"])
             }
@@ -111,10 +116,11 @@ class IdentityConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.identityLoadError =
                     BridgeException("Identity not found", "SCP-IDENT-1002")
-                val result = dispatcher.dispatch(
-                    "identity_load",
-                    mapOf("did" to "did:dht:nonexistent"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_load",
+                        mapOf("did" to "did:dht:nonexistent"),
+                    )
                 assertEquals("SCP-IDENT-1002", result["error"])
             }
     }
@@ -126,10 +132,11 @@ class IdentityConformanceTest {
             runTest(testDispatcher) {
                 val docJson = """{"did":"did:dht:z6MkResolved","keys":[]}"""
                 stubBindings.identityResolveResult = docJson
-                val result = dispatcher.dispatch(
-                    "identity_resolve",
-                    mapOf("did" to "did:dht:z6MkResolved"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_resolve",
+                        mapOf("did" to "did:dht:z6MkResolved"),
+                    )
                 assertEquals("did:dht:z6MkResolved", result["did"])
                 assertEquals(docJson, result["document"])
             }
@@ -139,10 +146,11 @@ class IdentityConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.identityResolveError =
                     BridgeException("Resolution failed", "SCP-IDENT-1003")
-                val result = dispatcher.dispatch(
-                    "identity_resolve",
-                    mapOf("did" to "did:dht:unreachable"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_resolve",
+                        mapOf("did" to "did:dht:unreachable"),
+                    )
                 assertEquals("SCP-IDENT-1003", result["error"])
             }
     }
@@ -159,14 +167,15 @@ class IdentityConformanceTest {
         @Test
         fun `inline fixture matches dispatcher result`() =
             runTest(testDispatcher) {
-                val fixture = ConformanceFixture(
-                    testId = "identity-create-001",
-                    category = "identity",
-                    description = "Create identity with in-memory custody",
-                    operation = "identity_create",
-                    input = mapOf("custody" to "in_memory"),
-                    expected = mapOf("custody_type" to "in_memory"),
-                )
+                val fixture =
+                    ConformanceFixture(
+                        testId = "identity-create-001",
+                        category = "identity",
+                        description = "Create identity with in-memory custody",
+                        operation = "identity_create",
+                        input = mapOf("custody" to "in_memory"),
+                        expected = mapOf("custody_type" to "in_memory"),
+                    )
                 val result = dispatcher.dispatch(fixture.operation, fixture.input)
                 val mismatches = compareResults(result, fixture.expected)
                 assertTrue(

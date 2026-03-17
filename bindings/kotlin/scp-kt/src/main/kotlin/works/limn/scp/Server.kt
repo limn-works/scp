@@ -110,7 +110,6 @@ class Relay internal constructor(
     private val bridge: ServerBridge,
     internal val handleJson: String,
 ) : AutoCloseable {
-
     /** `true` if [shutdown] has already been called. */
     var isShutdown: Boolean = false
         private set
@@ -144,8 +143,7 @@ class Relay internal constructor(
          * @param bridge The [ServerBridge] providing FFI access.
          * @return A [Relay] whose [relayUrl] property contains the WebSocket URL.
          */
-        suspend fun startInMemory(bridge: ServerBridge): Relay =
-            bridge.startRelayInMemory()
+        suspend fun startInMemory(bridge: ServerBridge): Relay = bridge.startRelayInMemory()
 
         /**
          * Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -154,8 +152,10 @@ class Relay internal constructor(
          * @param dataDir Directory for persistent blob storage.
          * @return A [Relay] whose [relayUrl] property contains the WebSocket URL.
          */
-        suspend fun startLocal(bridge: ServerBridge, dataDir: String): Relay =
-            bridge.startRelayLocal(dataDir)
+        suspend fun startLocal(
+            bridge: ServerBridge,
+            dataDir: String,
+        ): Relay = bridge.startRelayLocal(dataDir)
     }
 }
 
@@ -184,7 +184,6 @@ class Node internal constructor(
     private val bridge: ServerBridge,
     internal val handleJson: String,
 ) : AutoCloseable {
-
     /** `true` if [shutdown] has already been called. */
     var isShutdown: Boolean = false
         private set
@@ -221,8 +220,7 @@ class Node internal constructor(
          * @param bridge The [ServerBridge] providing FFI access.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
-        suspend fun startInMemory(bridge: ServerBridge): Node =
-            bridge.startNodeInMemory()
+        suspend fun startInMemory(bridge: ServerBridge): Node = bridge.startNodeInMemory()
 
         /**
          * Starts a full application node with file-backed storage.
@@ -231,8 +229,10 @@ class Node internal constructor(
          * @param dataDir Directory for persistent storage.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
-        suspend fun startLocal(bridge: ServerBridge, dataDir: String): Node =
-            bridge.startNodeLocal(dataDir)
+        suspend fun startLocal(
+            bridge: ServerBridge,
+            dataDir: String,
+        ): Node = bridge.startNodeLocal(dataDir)
     }
 }
 
@@ -252,16 +252,17 @@ class ServerBridge internal constructor(
      *
      * @return A [Relay] whose [Relay.relayUrl] property contains the WebSocket URL.
      */
-    suspend fun startRelayInMemory(): Relay = bridge.ffiCall {
-        val json = bindings.relayStartInMemory()
-        val info = parseRelayInfo(json)
-        Relay(
-            relayUrl = info.relayUrl,
-            relayPort = info.relayPort,
-            bridge = this@ServerBridge,
-            handleJson = info.handleJson,
-        )
-    }
+    suspend fun startRelayInMemory(): Relay =
+        bridge.ffiCall {
+            val json = bindings.relayStartInMemory()
+            val info = parseRelayInfo(json)
+            Relay(
+                relayUrl = info.relayUrl,
+                relayPort = info.relayPort,
+                bridge = this@ServerBridge,
+                handleJson = info.handleJson,
+            )
+        }
 
     /**
      * Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -269,16 +270,17 @@ class ServerBridge internal constructor(
      * @param dataDir Directory for persistent blob storage.
      * @return A [Relay] whose [Relay.relayUrl] property contains the WebSocket URL.
      */
-    suspend fun startRelayLocal(dataDir: String): Relay = bridge.ffiCall {
-        val json = bindings.relayStartLocal(dataDir)
-        val info = parseRelayInfo(json)
-        Relay(
-            relayUrl = info.relayUrl,
-            relayPort = info.relayPort,
-            bridge = this@ServerBridge,
-            handleJson = info.handleJson,
-        )
-    }
+    suspend fun startRelayLocal(dataDir: String): Relay =
+        bridge.ffiCall {
+            val json = bindings.relayStartLocal(dataDir)
+            val info = parseRelayInfo(json)
+            Relay(
+                relayUrl = info.relayUrl,
+                relayPort = info.relayPort,
+                bridge = this@ServerBridge,
+                handleJson = info.handleJson,
+            )
+        }
 
     /**
      * Starts a full application node with in-memory storage.
@@ -288,17 +290,18 @@ class ServerBridge internal constructor(
      *
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
-    suspend fun startNodeInMemory(): Node = bridge.ffiCall {
-        val json = bindings.nodeStartInMemory()
-        val info = parseNodeInfo(json)
-        Node(
-            relayUrl = info.relayUrl,
-            relayPort = info.relayPort,
-            did = info.did,
-            bridge = this@ServerBridge,
-            handleJson = info.handleJson,
-        )
-    }
+    suspend fun startNodeInMemory(): Node =
+        bridge.ffiCall {
+            val json = bindings.nodeStartInMemory()
+            val info = parseNodeInfo(json)
+            Node(
+                relayUrl = info.relayUrl,
+                relayPort = info.relayPort,
+                did = info.did,
+                bridge = this@ServerBridge,
+                handleJson = info.handleJson,
+            )
+        }
 
     /**
      * Starts a full application node with file-backed storage.
@@ -306,39 +309,43 @@ class ServerBridge internal constructor(
      * @param dataDir Directory for persistent storage.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
-    suspend fun startNodeLocal(dataDir: String): Node = bridge.ffiCall {
-        val json = bindings.nodeStartLocal(dataDir)
-        val info = parseNodeInfo(json)
-        Node(
-            relayUrl = info.relayUrl,
-            relayPort = info.relayPort,
-            did = info.did,
-            bridge = this@ServerBridge,
-            handleJson = info.handleJson,
-        )
-    }
+    suspend fun startNodeLocal(dataDir: String): Node =
+        bridge.ffiCall {
+            val json = bindings.nodeStartLocal(dataDir)
+            val info = parseNodeInfo(json)
+            Node(
+                relayUrl = info.relayUrl,
+                relayPort = info.relayPort,
+                did = info.did,
+                bridge = this@ServerBridge,
+                handleJson = info.handleJson,
+            )
+        }
 
     /**
      * Shuts down a running relay. Idempotent.
      *
      * @param relay The relay to shut down.
      */
-    internal suspend fun shutdownRelay(relay: Relay) = bridge.ffiCall {
-        bindings.relayShutdown(relay.handleJson)
-    }
+    internal suspend fun shutdownRelay(relay: Relay) =
+        bridge.ffiCall {
+            bindings.relayShutdown(relay.handleJson)
+        }
 
     /**
      * Shuts down a running node (relay + background tasks). Idempotent.
      *
      * @param node The node to shut down.
      */
-    internal suspend fun shutdownNode(node: Node) = bridge.ffiCall {
-        bindings.nodeShutdown(node.handleJson)
-    }
+    internal suspend fun shutdownNode(node: Node) =
+        bridge.ffiCall {
+            bindings.nodeShutdown(node.handleJson)
+        }
 
     private fun parseRelayInfo(json: String): RelayInfo {
-        val obj = kotlinx.serialization.json.Json.parseToJsonElement(json)
-            .jsonObject
+        val obj =
+            kotlinx.serialization.json.Json.parseToJsonElement(json)
+                .jsonObject
         return RelayInfo(
             relayUrl = obj.requireString("relayUrl", "SCP-VALID-7050"),
             relayPort = obj.requireInt("relayPort", "SCP-VALID-7051"),
@@ -347,8 +354,9 @@ class ServerBridge internal constructor(
     }
 
     private fun parseNodeInfo(json: String): NodeInfo {
-        val obj = kotlinx.serialization.json.Json.parseToJsonElement(json)
-            .jsonObject
+        val obj =
+            kotlinx.serialization.json.Json.parseToJsonElement(json)
+                .jsonObject
         return NodeInfo(
             relayUrl = obj.requireString("relayUrl", "SCP-VALID-7052"),
             relayPort = obj.requireInt("relayPort", "SCP-VALID-7053"),
@@ -367,11 +375,13 @@ private val kotlinx.serialization.json.JsonElement.jsonPrimitive
 private fun kotlinx.serialization.json.JsonObject.requireString(
     key: String,
     errorCode: String,
-): String = this[key]?.jsonPrimitive?.content
-    ?: throw BridgeException("missing $key in handle JSON", errorCode)
+): String =
+    this[key]?.jsonPrimitive?.content
+        ?: throw BridgeException("missing $key in handle JSON", errorCode)
 
 private fun kotlinx.serialization.json.JsonObject.requireInt(
     key: String,
     errorCode: String,
-): Int = this[key]?.jsonPrimitive?.content?.toInt()
-    ?: throw BridgeException("missing $key in handle JSON", errorCode)
+): Int =
+    this[key]?.jsonPrimitive?.content?.toInt()
+        ?: throw BridgeException("missing $key in handle JSON", errorCode)

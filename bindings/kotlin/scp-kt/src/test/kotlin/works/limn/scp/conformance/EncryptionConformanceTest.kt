@@ -3,8 +3,6 @@
 
 package works.limn.scp.conformance
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -12,6 +10,8 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -37,11 +37,12 @@ class EncryptionConformanceTest {
     fun setUp() {
         stubBindings = ConformanceStubBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
         dispatcher = ConformanceDispatcher(bridge)
     }
 
@@ -50,14 +51,15 @@ class EncryptionConformanceTest {
         @Test
         fun `context_send succeeds with encrypted payload`() =
             runTest(testDispatcher) {
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf(
-                        "context_handle" to "10",
-                        "identity_handle" to "1",
-                        "payload" to "encrypted-content",
-                    ),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf(
+                            "context_handle" to "10",
+                            "identity_handle" to "1",
+                            "payload" to "encrypted-content",
+                        ),
+                    )
                 assertEquals("sent", result["status"])
                 assertEquals(
                     "encrypted-content",
@@ -70,14 +72,15 @@ class EncryptionConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextSendError =
                     BridgeException("MLS encryption failed", "SCP-CRYPTO-4001")
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf(
-                        "context_handle" to "10",
-                        "identity_handle" to "1",
-                        "payload" to "data",
-                    ),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf(
+                            "context_handle" to "10",
+                            "identity_handle" to "1",
+                            "payload" to "data",
+                        ),
+                    )
                 assertEquals("SCP-CRYPTO-4001", result["error"])
             }
     }
@@ -89,27 +92,30 @@ class EncryptionConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextSendError =
                     BridgeException("Sender key expired", "SCP-CRYPTO-4010")
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf(
-                        "context_handle" to "10",
-                        "identity_handle" to "1",
-                        "payload" to "data",
-                    ),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf(
+                            "context_handle" to "10",
+                            "identity_handle" to "1",
+                            "payload" to "data",
+                        ),
+                    )
                 assertEquals("SCP-CRYPTO-4010", result["error"])
             }
 
         @Test
-        fun `key destruction error on leave`() = runTest(testDispatcher) {
-            stubBindings.contextLeaveError =
-                BridgeException("Key cleanup failed", "SCP-CRYPTO-4011")
-            val result = dispatcher.dispatch(
-                "context_leave",
-                mapOf("context_handle" to "10", "identity_handle" to "1"),
-            )
-            assertEquals("SCP-CRYPTO-4011", result["error"])
-        }
+        fun `key destruction error on leave`() =
+            runTest(testDispatcher) {
+                stubBindings.contextLeaveError =
+                    BridgeException("Key cleanup failed", "SCP-CRYPTO-4011")
+                val result =
+                    dispatcher.dispatch(
+                        "context_leave",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
+                assertEquals("SCP-CRYPTO-4011", result["error"])
+            }
     }
 
     @Nested
@@ -119,14 +125,15 @@ class EncryptionConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextSendError =
                     BridgeException("Decryption failed", "SCP-CRYPTO-4002")
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf(
-                        "context_handle" to "10",
-                        "identity_handle" to "1",
-                        "payload" to "garbled",
-                    ),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf(
+                            "context_handle" to "10",
+                            "identity_handle" to "1",
+                            "payload" to "garbled",
+                        ),
+                    )
                 assertEquals("SCP-CRYPTO-4002", result["error"])
             }
     }
@@ -136,22 +143,25 @@ class EncryptionConformanceTest {
         @Test
         fun `encrypted send fixture matches dispatcher result`() =
             runTest(testDispatcher) {
-                val fixture = ConformanceFixture(
-                    testId = "encryption-send-001",
-                    category = "sender_keys",
-                    description = "Send encrypted message",
-                    operation = "context_send",
-                    input = mapOf(
-                        "context_handle" to "10",
-                        "identity_handle" to "1",
-                        "payload" to "hello-encrypted",
-                    ),
-                    expected = mapOf("status" to "sent"),
-                )
-                val result = dispatcher.dispatch(
-                    fixture.operation,
-                    fixture.input,
-                )
+                val fixture =
+                    ConformanceFixture(
+                        testId = "encryption-send-001",
+                        category = "sender_keys",
+                        description = "Send encrypted message",
+                        operation = "context_send",
+                        input =
+                            mapOf(
+                                "context_handle" to "10",
+                                "identity_handle" to "1",
+                                "payload" to "hello-encrypted",
+                            ),
+                        expected = mapOf("status" to "sent"),
+                    )
+                val result =
+                    dispatcher.dispatch(
+                        fixture.operation,
+                        fixture.input,
+                    )
                 val mismatches = compareResults(result, fixture.expected)
                 assertTrue(
                     mismatches.isEmpty(),

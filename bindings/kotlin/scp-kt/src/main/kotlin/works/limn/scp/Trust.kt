@@ -83,8 +83,9 @@ suspend fun aggregateTrustInput(
     cachedAttestationsJson: String = "[]",
     challengeResultsJson: String = "[]",
 ): String {
-    val trustBindings = bridge.extended.trust
-        ?: error("Trust bindings not configured — provide TrustBindings in ExtendedBindings")
+    val trustBindings =
+        bridge.extended.trust
+            ?: error("Trust bindings not configured — provide TrustBindings in ExtendedBindings")
     return bridge.ffiCall {
         trustBindings.aggregateTrustInput(
             contextId,

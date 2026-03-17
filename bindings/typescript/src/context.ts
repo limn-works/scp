@@ -18,6 +18,7 @@ import { getBridge, getBridgeSync } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
   AssetEntry,
+  BatchPublishResult,
   BroadcastAdmissionPolicy,
   ContextParams,
   GovernanceActionResult,
