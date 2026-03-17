@@ -63,6 +63,65 @@ interface ServerBindings {
      * @param handleJson JSON-encoded node handle.
      */
     fun nodeShutdown(handleJson: String)
+
+    // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
+
+    /**
+     * Activates HTTP broadcast projection for a context.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @param contextId The context ID to project.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string.
+     * @param authorDid DID of the broadcast key owner.
+     * @param admission "open" or "gated".
+     * @param hostname Virtual host hostname (RFC 1123).
+     * @param indexPath Default path for directory requests, or null for default "/index.html".
+     * @param maxAssetsPerDeploy Max assets per deploy, or null for default 10000.
+     * @param maxDeploySizeBytes Max total deploy size in bytes, or null for default 536870912.
+     * @param deployRetentionCount Deploys to retain (1-8), or null for default 2.
+     * @param cspOverride Optional Content-Security-Policy override.
+     */
+    @Suppress("LongParameterList")
+    fun nodeEnableSiteProjection(
+        handleJson: String,
+        contextId: String,
+        broadcastKeyHex: String,
+        authorDid: String,
+        admission: String,
+        hostname: String,
+        indexPath: String?,
+        maxAssetsPerDeploy: Int?,
+        maxDeploySizeBytes: Long?,
+        deployRetentionCount: Int?,
+        cspOverride: String?,
+    )
+
+    /**
+     * Commits a deploy for a projected context.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @param contextId The projected context ID.
+     * @param deployId The deploy identifier (hex).
+     * @return The number of assets in the committed deploy.
+     */
+    fun nodeCommitDeploy(handleJson: String, contextId: String, deployId: String): Int
+
+    /**
+     * Rolls back to a previous deploy for a projected context.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @param contextId The projected context ID.
+     * @param deployId The deploy identifier to roll back to.
+     */
+    fun nodeRollbackDeploy(handleJson: String, contextId: String, deployId: String)
+
+    /**
+     * Deactivates HTTP broadcast projection for a context.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @param contextId The context ID to stop projecting.
+     */
+    fun nodeDisableSiteProjection(handleJson: String, contextId: String)
 }
 
 /**
@@ -208,6 +267,77 @@ class Node internal constructor(
         runBlocking { shutdown() }
     }
 
+    // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
+
+    /**
+     * Activates HTTP broadcast projection for a context.
+     *
+     * Registers a broadcast context for HTTP content delivery.
+     *
+     * @param contextId The context ID to project.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as a 64-char hex string.
+     * @param authorDid DID of the broadcast key owner.
+     * @param admission "open" or "gated".
+     * @param config [SiteConfig] with hostname, index path, and deploy limits.
+     * @throws BridgeException if parameters are invalid or operation fails.
+     */
+    @Suppress("LongParameterList")
+    suspend fun enableSiteProjection(
+        contextId: String,
+        broadcastKeyHex: String,
+        authorDid: String,
+        admission: String,
+        config: SiteConfig,
+    ) {
+        bridge.enableSiteProjection(
+            this,
+            contextId,
+            broadcastKeyHex,
+            authorDid,
+            admission,
+            config,
+        )
+    }
+
+    /**
+     * Commits a deploy for a projected context (section 18.11.11).
+     *
+     * Scans blobs matching the [deployId], decrypts each to extract metadata,
+     * builds an immutable path index, and atomically swaps the serving pointer.
+     *
+     * @param contextId The projected context ID.
+     * @param deployId The deploy identifier (hex, from publish).
+     * @return The number of assets in the committed deploy.
+     * @throws BridgeException if the context is not projected or commit fails.
+     */
+    suspend fun commitDeploy(contextId: String, deployId: String): Int =
+        bridge.commitDeploy(this, contextId, deployId)
+
+    /**
+     * Rolls back to a previous deploy for a projected context (section 18.11.11).
+     *
+     * Sets the path index pointer to a previous deploy within the retention window.
+     *
+     * @param contextId The projected context ID.
+     * @param deployId The deploy identifier to roll back to.
+     * @throws BridgeException if the context is not projected or deploy not found.
+     */
+    suspend fun rollbackDeploy(contextId: String, deployId: String) {
+        bridge.rollbackDeploy(this, contextId, deployId)
+    }
+
+    /**
+     * Deactivates HTTP broadcast projection for a context.
+     *
+     * Removes the projected context from the registry and drops all retained
+     * epoch keys. Idempotent -- calling on a non-projected context is a no-op.
+     *
+     * @param contextId The context ID to stop projecting.
+     */
+    suspend fun disableSiteProjection(contextId: String) {
+        bridge.disableSiteProjection(this, contextId)
+    }
+
     override fun toString(): String = "Node(relayUrl=$relayUrl, did=$did)"
 
     companion object {
@@ -341,6 +471,86 @@ class ServerBridge internal constructor(
         bridge.ffiCall {
             bindings.nodeShutdown(node.handleJson)
         }
+
+    // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
+
+    /**
+     * Activates HTTP broadcast projection for a context.
+     *
+     * @param node The running node.
+     * @param contextId The context ID to project.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string.
+     * @param authorDid DID of the broadcast key owner.
+     * @param admission "open" or "gated".
+     * @param config [SiteConfig] with hostname, index path, and deploy limits.
+     */
+    @Suppress("LongParameterList")
+    internal suspend fun enableSiteProjection(
+        node: Node,
+        contextId: String,
+        broadcastKeyHex: String,
+        authorDid: String,
+        admission: String,
+        config: SiteConfig,
+    ) = bridge.ffiCall {
+        bindings.nodeEnableSiteProjection(
+            node.handleJson,
+            contextId,
+            broadcastKeyHex,
+            authorDid,
+            admission,
+            config.hostname,
+            if (config.indexPath == "/index.html") null else config.indexPath,
+            if (config.maxAssetsPerDeploy == 10_000) null else config.maxAssetsPerDeploy,
+            if (config.maxDeploySizeBytes == 536_870_912L) null else config.maxDeploySizeBytes,
+            if (config.deployRetentionCount == 2) null else config.deployRetentionCount,
+            config.cspOverride,
+        )
+    }
+
+    /**
+     * Commits a deploy for a projected context.
+     *
+     * @param node The running node.
+     * @param contextId The projected context ID.
+     * @param deployId The deploy identifier (hex).
+     * @return The number of assets in the committed deploy.
+     */
+    internal suspend fun commitDeploy(
+        node: Node,
+        contextId: String,
+        deployId: String,
+    ): Int = bridge.ffiCall {
+        bindings.nodeCommitDeploy(node.handleJson, contextId, deployId)
+    }
+
+    /**
+     * Rolls back to a previous deploy for a projected context.
+     *
+     * @param node The running node.
+     * @param contextId The projected context ID.
+     * @param deployId The deploy identifier to roll back to.
+     */
+    internal suspend fun rollbackDeploy(
+        node: Node,
+        contextId: String,
+        deployId: String,
+    ) = bridge.ffiCall {
+        bindings.nodeRollbackDeploy(node.handleJson, contextId, deployId)
+    }
+
+    /**
+     * Deactivates HTTP broadcast projection for a context.
+     *
+     * @param node The running node.
+     * @param contextId The context ID to stop projecting.
+     */
+    internal suspend fun disableSiteProjection(
+        node: Node,
+        contextId: String,
+    ) = bridge.ffiCall {
+        bindings.nodeDisableSiteProjection(node.handleJson, contextId)
+    }
 
     private fun parseRelayInfo(json: String): RelayInfo {
         val obj =

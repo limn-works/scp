@@ -15,6 +15,18 @@ shutdown:
     async with await Node.start_in_memory() as node:
         print(node.relay_url, node.did)
 
+:class:`Node` also exposes broadcast deployment lifecycle methods
+(SCP-296, spec §18.11.8):
+
+.. code-block:: python
+
+    async with await Node.start_in_memory() as node:
+        await node.enable_site_projection(context_id, broadcast_key_hex,
+                                          author_did, "open", config)
+        count = await node.commit_deploy(context_id, deploy_id)
+        await node.rollback_deploy(context_id, deploy_id)
+        await node.disable_site_projection(context_id)
+
 Gated behind the ``server`` feature in ``scp-ffi-common``. Not available
 for WASM (ADR-034).
 """
@@ -23,8 +35,12 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
+from typing import TYPE_CHECKING
 
 import _scp_core
+
+if TYPE_CHECKING:
+    from scp_sdk.context import SiteConfig
 
 
 class Relay:
@@ -165,6 +181,102 @@ class Node:
 
     async def __aenter__(self) -> Node:
         return self
+
+    # ------------------------------------------------------------------
+    # Broadcast deployment lifecycle (SCP-296, spec §18.11.8)
+    # ------------------------------------------------------------------
+
+    async def enable_site_projection(
+        self,
+        context_id: str,
+        broadcast_key_hex: str,
+        author_did: str,
+        admission: str,
+        config: SiteConfig | None = None,
+    ) -> None:
+        """Activate HTTP broadcast projection for a context.
+
+        Registers a broadcast context for HTTP content delivery.
+
+        Args:
+            context_id: The context ID to project.
+            broadcast_key_hex: 32-byte AES-256 broadcast key as a
+                64-character hex string.
+            author_did: DID of the broadcast key owner.
+            admission: ``"open"`` or ``"gated"``.
+            config: Optional :class:`~scp_sdk.context.SiteConfig` with
+                hostname, index path, and deploy limits. When ``None``,
+                a ``ValueError`` is raised — ``config`` is required to
+                establish the hostname binding.
+
+        Raises:
+            ValueError: If parameters are invalid or ``config`` is None.
+            RuntimeError: If the underlying node operation fails.
+        """
+        if config is None:
+            raise ValueError("config is required for enable_site_projection")
+
+        await asyncio.to_thread(
+            self._handle.enable_site_projection,
+            context_id,
+            broadcast_key_hex,
+            author_did,
+            admission,
+            config.hostname,
+            config.index_path if config.index_path != "/index.html" else None,
+            config.max_assets_per_deploy if config.max_assets_per_deploy != 10_000 else None,
+            config.max_deploy_size_bytes if config.max_deploy_size_bytes != 536_870_912 else None,
+            config.deploy_retention_count if config.deploy_retention_count != 2 else None,
+            config.csp_override,
+        )
+
+    async def commit_deploy(self, context_id: str, deploy_id: str) -> int:
+        """Commit a deploy for a projected context (§18.11.11).
+
+        Scans blobs matching the ``deploy_id``, decrypts each to extract
+        metadata, builds an immutable path index, and atomically swaps the
+        serving pointer.
+
+        Args:
+            context_id: The projected context ID.
+            deploy_id: The deploy identifier (hex, from publish).
+
+        Returns:
+            The number of assets in the committed deploy.
+
+        Raises:
+            RuntimeError: If the context is not projected or commit fails.
+        """
+        return await asyncio.to_thread(  # type: ignore[no-any-return]
+            self._handle.commit_deploy, context_id, deploy_id
+        )
+
+    async def rollback_deploy(self, context_id: str, deploy_id: str) -> None:
+        """Roll back to a previous deploy for a projected context (§18.11.11).
+
+        Sets the path index pointer to a previous deploy within the
+        retention window.
+
+        Args:
+            context_id: The projected context ID.
+            deploy_id: The deploy identifier to roll back to.
+
+        Raises:
+            RuntimeError: If the context is not projected or deploy not found.
+        """
+        await asyncio.to_thread(self._handle.rollback_deploy, context_id, deploy_id)
+
+    async def disable_site_projection(self, context_id: str) -> None:
+        """Deactivate HTTP broadcast projection for a context.
+
+        Removes the projected context from the registry and drops all
+        retained epoch keys. Idempotent — calling on a non-projected
+        context is a no-op.
+
+        Args:
+            context_id: The context ID to stop projecting.
+        """
+        await asyncio.to_thread(self._handle.disable_site_projection, context_id)
 
     async def __aexit__(
         self,
