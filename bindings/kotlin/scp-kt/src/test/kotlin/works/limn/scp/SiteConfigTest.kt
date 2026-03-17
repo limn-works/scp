@@ -255,4 +255,70 @@ class SiteConfigTest {
 
         assertEquals("default-src 'self'", obj["csp_override"]?.jsonPrimitive?.content)
     }
+
+    // MARK: - Admission Validation (SCP-296)
+
+    @Test
+    fun `valid admission open accepted`() {
+        validateAdmission("open")
+    }
+
+    @Test
+    fun `valid admission gated accepted`() {
+        validateAdmission("gated")
+    }
+
+    @Test
+    fun `invalid admission rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            validateAdmission("closed")
+        }.also { assertTrue(it.message!!.contains("admission must be")) }
+    }
+
+    @Test
+    fun `empty admission rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            validateAdmission("")
+        }.also { assertTrue(it.message!!.contains("admission must be")) }
+    }
+
+    // MARK: - BroadcastKeyHex Validation (SCP-296)
+
+    @Test
+    fun `valid 64-char hex accepted`() {
+        validateBroadcastKeyHex("ab".repeat(32))
+    }
+
+    @Test
+    fun `uppercase hex accepted`() {
+        validateBroadcastKeyHex("AB".repeat(32))
+    }
+
+    @Test
+    fun `too short hex rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            validateBroadcastKeyHex("abcd")
+        }.also { assertTrue(it.message!!.contains("broadcastKeyHex must be exactly 64 hex characters")) }
+    }
+
+    @Test
+    fun `too long hex rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            validateBroadcastKeyHex("ab".repeat(33))
+        }.also { assertTrue(it.message!!.contains("broadcastKeyHex must be exactly 64 hex characters")) }
+    }
+
+    @Test
+    fun `invalid hex chars rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            validateBroadcastKeyHex("zz".repeat(32))
+        }.also { assertTrue(it.message!!.contains("broadcastKeyHex must be exactly 64 hex characters")) }
+    }
+
+    @Test
+    fun `empty hex rejected`() {
+        assertFailsWith<IllegalArgumentException> {
+            validateBroadcastKeyHex("")
+        }.also { assertTrue(it.message!!.contains("broadcastKeyHex must be exactly 64 hex characters")) }
+    }
 }

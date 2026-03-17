@@ -1544,4 +1544,71 @@ struct SiteConfigTests {
         let config = try SiteConfig(hostname: "example.com", maxDeploySizeBytes: 1)
         #expect(config.maxDeploySizeBytes == 1)
     }
+
+    @Test func maxAssetsPerDeployUInt32MaxAccepted() throws {
+        let config = try SiteConfig(hostname: "example.com", maxAssetsPerDeploy: Int(UInt32.max))
+        #expect(config.maxAssetsPerDeploy == Int(UInt32.max))
+    }
+
+    @Test func maxAssetsPerDeployExceedsUInt32Rejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", maxAssetsPerDeploy: Int(UInt32.max) + 1)
+        }
+    }
+}
+
+// MARK: - Projection Parameter Validation Tests (SCP-296)
+
+struct ProjectionValidationTests {
+    // MARK: - Admission Validation
+
+    @Test func validAdmissionOpen() throws {
+        try validateAdmission("open")
+    }
+
+    @Test func validAdmissionGated() throws {
+        try validateAdmission("gated")
+    }
+
+    @Test func invalidAdmissionRejected() {
+        #expect(throws: ScpError.self) {
+            try validateAdmission("closed")
+        }
+    }
+
+    @Test func emptyAdmissionRejected() {
+        #expect(throws: ScpError.self) {
+            try validateAdmission("")
+        }
+    }
+
+    // MARK: - BroadcastKeyHex Validation
+
+    @Test func validBroadcastKeyHex() throws {
+        try validateBroadcastKeyHex(String(repeating: "ab", count: 32))
+    }
+
+    @Test func broadcastKeyHexTooShort() {
+        #expect(throws: ScpError.self) {
+            try validateBroadcastKeyHex("abcd")
+        }
+    }
+
+    @Test func broadcastKeyHexTooLong() {
+        #expect(throws: ScpError.self) {
+            try validateBroadcastKeyHex(String(repeating: "ab", count: 33))
+        }
+    }
+
+    @Test func broadcastKeyHexInvalidChars() {
+        #expect(throws: ScpError.self) {
+            try validateBroadcastKeyHex(String(repeating: "zz", count: 32))
+        }
+    }
+
+    @Test func broadcastKeyHexEmpty() {
+        #expect(throws: ScpError.self) {
+            try validateBroadcastKeyHex("")
+        }
+    }
 }

@@ -111,6 +111,10 @@ let _addon: ServerAddon | null = null;
 function loadServerAddon(): ServerAddon {
   if (_addon !== null) return _addon;
 
+  if (typeof process === "undefined" || typeof process.platform !== "string") {
+    throw new TransportError("Server operations not available in browser/WASM", "SCP-TRANS-5002");
+  }
+
   const packageName = resolveNapiPackage();
   try {
     const req = createRequire(import.meta.url);

@@ -287,7 +287,7 @@ export type {
   VerificationMethod,
 } from "./types";
 
-export { validateSiteConfig } from "./types";
+export { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // Storage

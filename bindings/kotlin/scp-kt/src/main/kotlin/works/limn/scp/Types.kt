@@ -479,3 +479,37 @@ data class TestVector(
     val input: String,
     val expectedOutput: String,
 )
+
+// ---------------------------------------------------------------------------
+// Projection Parameter Validation (SCP-296 post-merge audit)
+// ---------------------------------------------------------------------------
+
+private val HEX_64_REGEX = Regex("^[0-9a-fA-F]{64}\$")
+
+/**
+ * Validates an admission policy string before FFI.
+ *
+ * Must be `"open"` or `"gated"`.
+ *
+ * @param admission The admission policy string.
+ * @throws IllegalArgumentException if admission is not valid.
+ */
+fun validateAdmission(admission: String) {
+    require(admission == "open" || admission == "gated") {
+        "admission must be \"open\" or \"gated\", got \"$admission\""
+    }
+}
+
+/**
+ * Validates a broadcast key hex string before FFI.
+ *
+ * Must be exactly 64 hex characters (32 bytes AES-256 key).
+ *
+ * @param broadcastKeyHex Hex-encoded 32-byte broadcast key.
+ * @throws IllegalArgumentException if the string is not valid.
+ */
+fun validateBroadcastKeyHex(broadcastKeyHex: String) {
+    require(HEX_64_REGEX.matches(broadcastKeyHex)) {
+        "broadcastKeyHex must be exactly 64 hex characters (32 bytes)"
+    }
+}

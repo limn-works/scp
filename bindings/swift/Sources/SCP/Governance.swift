@@ -1403,6 +1403,12 @@ public struct SiteConfig: Sendable, Equatable {
                 code: "SCP-VALID-7020"
             )
         }
+        guard maxAssetsPerDeploy <= Int(UInt32.max) else {
+            throw ScpError.Validation(
+                msg: "maxAssetsPerDeploy must be <= \(UInt32.max)",
+                code: "SCP-VALID-7022"
+            )
+        }
         guard maxDeploySizeBytes > 0 else {
             throw ScpError.Validation(
                 msg: "maxDeploySizeBytes must be >= 1, got \(maxDeploySizeBytes)",
@@ -1499,5 +1505,38 @@ public struct SiteConfig: Sendable, Equatable {
                 )
             }
         }
+    }
+}
+
+// MARK: - Projection Parameter Validation (SCP-296 post-merge audit)
+
+/// Validates an admission policy string before FFI.
+///
+/// Must be `"open"` or `"gated"`.
+///
+/// - Parameter admission: The admission policy string.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if admission is not valid.
+public func validateAdmission(_ admission: String) throws {
+    guard admission == "open" || admission == "gated" else {
+        throw ScpError.Validation(
+            msg: "admission must be \"open\" or \"gated\", got \"\(admission)\"",
+            code: "SCP-VALID-7023"
+        )
+    }
+}
+
+/// Validates a broadcast key hex string before FFI.
+///
+/// Must be exactly 64 hex characters (32 bytes AES-256 key).
+///
+/// - Parameter broadcastKeyHex: Hex-encoded 32-byte broadcast key.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the string is not valid.
+public func validateBroadcastKeyHex(_ broadcastKeyHex: String) throws {
+    guard broadcastKeyHex.count == 64,
+          broadcastKeyHex.allSatisfy({ $0.isHexDigit }) else {
+        throw ScpError.Validation(
+            msg: "broadcastKeyHex must be exactly 64 hex characters (32 bytes)",
+            code: "SCP-VALID-7024"
+        )
     }
 }
