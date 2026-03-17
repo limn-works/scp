@@ -801,6 +801,15 @@ pub struct ContextParams {
     /// Encoded as `(major << 8) | minor`, e.g., `0x0100` for SCP/1.0.
     /// `0` means no minimum (defaults to SCP/1.0).
     pub min_protocol_version: u16,
+    /// Maximum cross-context chain depth (spec §24.4, ADR-043).
+    /// `None` uses the protocol default (8).
+    pub max_chain_depth: Option<u8>,
+    /// Maximum nesting depth for sub-contexts (spec §5.6, ADR-043).
+    /// `None` means unbounded.
+    pub max_nesting_depth: Option<u32>,
+    /// Per-caller session cap (spec §6.2.1, ADR-043).
+    /// `None` uses the protocol default (1000).
+    pub session_cap: Option<u32>,
 }
 
 /// A message received from an SCP context.
@@ -3360,12 +3369,19 @@ pub async fn tool_invoke_cross_context(
             }
             drop(target_state);
 
-            // Validate chain depth.
-            if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+            // Validate chain depth (context-configurable, default 8 per ADR-043).
+            let max_chain_depth = {
+                let mgr = crate::runtime::context_manager()?;
+                let source_max = mgr
+                    .context_params(&source_handle.context_id)
+                    .await
+                    .and_then(|p| p.max_chain_depth);
+                scp_core::provenance::attach::effective_max_chain_depth(source_max)
+            };
+            if chain_depth > max_chain_depth {
                 return Err(ScpError::Tool {
                     msg: format!(
-                        "cross-context chain depth {chain_depth} exceeds maximum {}",
-                        scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+                        "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
                     ),
                     code: "SCP-TOOL-6012".to_owned(),
                 });
@@ -3455,7 +3471,7 @@ pub async fn tool_invoke_cross_context(
 /// Creates a stateful tool session.
 ///
 /// Sessions enable multi-turn workflows with TTL and per-caller caps
-/// (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+/// (default: 1000 concurrent sessions per caller, per spec §6.2.1 and ADR-043).
 ///
 /// # Returns
 ///
@@ -3483,15 +3499,20 @@ pub async fn tool_session_create(
 
             let mut store = handle.session_store.lock().await;
 
-            // Enforce per-caller session cap.
+            // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
+            let cap = {
+                let mgr = crate::runtime::context_manager()?;
+                mgr.context_params(&handle.context_id)
+                    .await
+                    .and_then(|p| p.session_cap)
+                    .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                    as usize
+            };
             let current = store.count_by_source(&source_context_id);
-            if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+            if current >= cap {
                 return Err(ScpError::Tool {
                     msg: format!(
-                        "session cap exceeded for caller '{}': {} active (max {})",
-                        source_context_id,
-                        current,
-                        scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+                        "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
                     ),
                     code: "SCP-TOOL-6015".to_owned(),
                 });
@@ -8161,6 +8182,9 @@ fn bridge_params_to_core(params: &ContextParams) -> scp_core::context::ContextPa
         ttl,
         promotion_policy,
         min_protocol_version,
+        max_chain_depth: params.max_chain_depth,
+        max_nesting_depth: params.max_nesting_depth,
+        session_cap: params.session_cap,
         ..scp_core::context::ContextParams::default()
     }
 }

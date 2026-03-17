@@ -198,16 +198,20 @@ pub const TIER_1_THRESHOLD_SECS: u64 = 14_400;
 /// Tier 2 upper bound: 7 days in seconds.
 pub const TIER_2_THRESHOLD_SECS: u64 = 604_800;
 /// Gap timeout for the reorder buffer: 30 seconds.
+/// Implementation recommended default, configurable via `SyncPolicy` (ADR-043).
 pub const GAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of messages held in the reorder buffer.
 pub const REORDER_BUFFER_CAPACITY: usize = 100;
 /// Maximum number of sequential MLS Commits processed during epoch catch-up.
+/// Implementation recommended default, configurable via `SyncPolicy` (ADR-043).
 pub const MAX_SEQUENTIAL_COMMITS: u64 = 100;
 /// Per-Commit processing timeout during epoch catch-up.
 pub const COMMIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Timeout for sender key re-acquisition after missed rotations.
+/// Implementation recommended default, configurable via `SyncPolicy` (ADR-043).
 pub const SENDER_KEY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Multi-device reconnection deduplication window.
+/// Implementation recommended default, configurable via `SyncPolicy` (ADR-043).
 pub const RECONNECTION_DEDUP_WINDOW: Duration = Duration::from_secs(30);
 /// Maximum event signature failures from a single peer before aborting
 /// reconciliation with that peer (§23.13 criterion 2, §23.14).

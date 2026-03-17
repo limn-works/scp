@@ -20,7 +20,7 @@ The bridge follows the bidirectional consent protocol (section 6.2.0.1):
 3. **Create an `InterfaceOffer`** via `create_interface_offer`. This captures the full tool schema and has a 7-day expiry. In production, a shared member carries the offer to Context B.
 4. **Accept the interface** in Context B using `accept_tool_interface`. This sets the `InboundPolicy` (allowed source roles, response size limits, spending UCAN requirements). Both sides are now approved.
 5. **Invoke across contexts** using `invoke_cross_context`. The bridge enforces:
-   - Chain depth limit (default 3, hard max 5) to prevent amplification
+   - Chain depth limit (default 8, context-configurable per ADR-043) to prevent amplification
    - Bidirectional approval check
    - Per-interface rate limit (default 60 calls/min)
    - Per-caller rate limit (default 10 calls/min)
@@ -54,7 +54,7 @@ Both `OutboundPolicy.max_calls_per_minute` and `InboundPolicy.max_calls_per_minu
 
 ### Chain depth
 
-Set `ContextParams.max_chain_depth` on the source context to control how many hops a cross-context call can traverse. The protocol hard maximum is 5; the recommended default is 3.
+Set `ContextParams.max_chain_depth` on the source context to control how many hops a cross-context call can traverse. There is no protocol hard maximum; the default is 8 (ADR-043).
 
 ### Stateful sessions
 

@@ -522,13 +522,17 @@ fn conf_012_nested_context() {
     let parent_ceiling =
         CapabilityCeiling::new(vec![Capability::MessagesRead, Capability::MessagesWrite]);
 
-    print_step(1, "Verify nesting depth <= MAX_NESTING_DEPTH (3)");
-    use scp_core::context::nesting::{
-        MAX_NESTING_DEPTH, OnSeverPolicy, ParentGovernanceConfig, ParentRef,
-    };
-    assert!(validate_nesting_depth(1).is_ok());
-    assert!(validate_nesting_depth(MAX_NESTING_DEPTH).is_ok());
-    assert!(validate_nesting_depth(MAX_NESTING_DEPTH + 1).is_err());
+    print_step(
+        1,
+        "Verify nesting depth is unbounded by default, context-configurable (ADR-043)",
+    );
+    use scp_core::context::nesting::{OnSeverPolicy, ParentGovernanceConfig, ParentRef};
+    // Unbounded when no limit set.
+    assert!(validate_nesting_depth(1, None).is_ok());
+    assert!(validate_nesting_depth(100, None).is_ok());
+    // Context-configurable limit enforced.
+    assert!(validate_nesting_depth(5, Some(5)).is_ok());
+    assert!(validate_nesting_depth(6, Some(5)).is_err());
 
     print_step(2, "Verify parent ceiling intersection");
     let parent_ref = ParentRef {

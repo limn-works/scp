@@ -876,7 +876,7 @@ interface ToolBindings {
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param chainDepth Current cross-context chain depth (0 for first hop).
-     *   Context-configurable max (default 3), protocol hard max 5 (spec §24.4).
+     *   Context-configurable max (default 8), range 0-255 (ADR-043, spec §24.4).
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @return JSON-encoded tool output.
      * @throws BridgeException with `SCP-TOOL-6010` if source context not active,
@@ -899,7 +899,7 @@ interface ToolBindings {
      * Creates a stateful tool session (spec section 6.2.1).
      *
      * Sessions enable multi-turn workflows with state preservation across
-     * invocations. Subject to per-caller caps (default: 5 concurrent sessions).
+     * invocations. Subject to per-caller caps (default: 1000 concurrent sessions, ADR-043).
      *
      * @param contextHandle Opaque handle for the context containing the tool.
      * @param toolId The tool to create a session for.
@@ -1721,7 +1721,7 @@ class ToolBridge internal constructor(
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param chainDepth Current cross-context chain depth (0 for first hop).
-     *   Context-configurable max (default 3), protocol hard max 5 (spec §24.4).
+     *   Context-configurable max (default 8), range 0-255 (ADR-043, spec §24.4).
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @return JSON-encoded tool output.
      */

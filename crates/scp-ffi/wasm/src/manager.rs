@@ -468,11 +468,12 @@ impl WasmToolSession {
     }
 }
 
-/// Maximum concurrent sessions per calling context (spec section 6.2.1).
-const WASM_SESSION_CAP_PER_CALLER: usize = 5;
+/// Maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
+const WASM_SESSION_CAP_PER_CALLER: usize = 1000;
 
 /// Maximum concurrent sessions across all callers (global cap).
-const WASM_SESSION_GLOBAL_CAP: usize = 100;
+/// Must be >= `WASM_SESSION_CAP_PER_CALLER` so the per-caller cap is meaningful.
+const WASM_SESSION_GLOBAL_CAP: usize = 10_000;
 
 /// Maximum number of nonces tracked per context before triggering eviction.
 const WASM_NONCE_CAP: usize = 10_000;

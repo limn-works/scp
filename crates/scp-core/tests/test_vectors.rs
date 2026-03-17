@@ -502,6 +502,9 @@ fn vector_14_payload_too_large() {
     println!("  Error: {:?}", result.unwrap_err());
 }
 
+/// Bucket sizes are protocol invariants (normative, ADR-043). All implementations
+/// MUST use identical bucket sizes — otherwise relays distinguish implementations
+/// by ciphertext size, defeating padding.
 #[test]
 fn padding_bucket_sizes_are_correct() {
     println!("=== Padding Bucket Sizes ===");

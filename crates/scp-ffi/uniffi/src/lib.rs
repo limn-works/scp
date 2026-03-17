@@ -758,6 +758,9 @@ mod tests {
             ttl_seconds: 0,
             promotable: false,
             min_protocol_version: 0,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
         };
 
         let handle = rt
@@ -812,6 +815,9 @@ mod tests {
             ttl_seconds: 0,
             promotable: false,
             min_protocol_version: 0,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
         };
 
         let handle = rt

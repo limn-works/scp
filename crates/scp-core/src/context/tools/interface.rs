@@ -922,7 +922,7 @@ pub fn accept_tool_interface(
 /// # Errors
 ///
 /// Returns [`ToolError::ChainDepthExceeded`] if `chain_depth` exceeds the
-/// source context's effective max chain depth (default 3, hard max 5).
+/// source context's effective max chain depth (default 8 per ADR-043).
 /// Returns [`ToolError::InterfaceNotApproved`] if either context has not
 /// approved the interface.
 /// Returns [`ToolError::InterfaceRateLimited`] if either the per-interface
@@ -957,8 +957,7 @@ where
     F: FnOnce(&serde_json::Value) -> Result<serde_json::Value, String>,
 {
     // 0. Enforce chain depth limit from the source context's configured max
-    // (spec §24.4). Falls back to DEFAULT_MAX_CHAIN_DEPTH (3) when unconfigured,
-    // clamped to PROTOCOL_HARD_MAX_CHAIN_DEPTH (5).
+    // (spec §24.4). Falls back to DEFAULT_MAX_CHAIN_DEPTH (8) when unconfigured (ADR-043).
     let max_depth = effective_max_chain_depth(source_context.params().max_chain_depth);
     if chain_depth > max_depth {
         return Err(ToolError::ChainDepthExceeded {
@@ -1997,7 +1996,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        // Chain depth 4 exceeds DEFAULT_MAX_CHAIN_DEPTH (3).
+        // Chain depth 9 exceeds DEFAULT_MAX_CHAIN_DEPTH (8).
         let result = invoke_cross_context(
             &source_context,
             &mut interface,
@@ -2005,7 +2004,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
-            4,
+            9,
             add_executor,
         );
 
@@ -2015,8 +2014,8 @@ mod tests {
             matches!(
                 err,
                 ToolError::ChainDepthExceeded {
-                    depth: 4,
-                    max_depth: 3,
+                    depth: 9,
+                    max_depth: 8,
                 }
             ),
             "expected ChainDepthExceeded, got {err:?}"
@@ -2043,7 +2042,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        // Chain depth 3 == DEFAULT_MAX_CHAIN_DEPTH, should succeed.
+        // Chain depth 8 == DEFAULT_MAX_CHAIN_DEPTH, should succeed.
         let result = invoke_cross_context(
             &source_context,
             &mut interface,
@@ -2051,7 +2050,7 @@ mod tests {
             &DID::from(admin_did),
             &source_role_state,
             &target_registry,
-            3,
+            8,
             add_executor,
         );
 

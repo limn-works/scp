@@ -27,11 +27,8 @@ use zeroize::Zeroizing;
 // Constants (mirror scp-core::provenance::attach)
 // ---------------------------------------------------------------------------
 
-/// Protocol default maximum chain depth (3 hops).
-const DEFAULT_MAX_CHAIN_DEPTH: u32 = 3;
-
-/// Protocol hard maximum chain depth (5 hops).
-const PROTOCOL_HARD_MAX_CHAIN_DEPTH: u32 = 5;
+/// Default maximum chain depth (8 hops, ADR-043).
+const DEFAULT_MAX_CHAIN_DEPTH: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // Local enums (mirror scp-core::provenance)
@@ -173,21 +170,20 @@ fn compute_quality(
 /// Checks whether a given chain depth is within the allowed limit.
 ///
 /// Returns `true` if `depth <= max_depth_override` (or `depth <= DEFAULT_MAX_CHAIN_DEPTH`
-/// when no override is provided). The effective max is clamped to
-/// `PROTOCOL_HARD_MAX_CHAIN_DEPTH` (5).
+/// when no override is provided). No protocol hard max — the u8 range
+/// [0, 255] is the natural bound (ADR-043).
 ///
 /// # JS usage
 ///
 /// ```js
-/// const ok = provenance_check_chain_depth(2, null); // true (default max = 3)
-/// const bad = provenance_check_chain_depth(4, null); // false
-/// const custom = provenance_check_chain_depth(4, 5); // true
+/// const ok = provenance_check_chain_depth(2, null); // true (default max = 8)
+/// const bad = provenance_check_chain_depth(9, null); // false
+/// const custom = provenance_check_chain_depth(9, 10); // true
 /// ```
 #[must_use]
 #[wasm_bindgen]
 pub fn provenance_check_chain_depth(depth: u32, max_depth_override: Option<u32>) -> bool {
-    let context_or_default = max_depth_override.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH);
-    let effective_max = context_or_default.min(PROTOCOL_HARD_MAX_CHAIN_DEPTH);
+    let effective_max = max_depth_override.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH);
     depth <= effective_max
 }
 

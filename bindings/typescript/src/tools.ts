@@ -102,12 +102,12 @@ export function defineToolDefinition(params: {
  * @param inputJson - Input data as a JSON string matching the tool's input schema.
  * @param invokerDid - The DID of the participant invoking the tool.
  * @param ucanToken - JWT-encoded UCAN token authorizing the invocation.
- * @param chainDepth - Current cross-context chain depth (0 for first hop). Must be 0-5
- *   (protocol hard maximum per spec §24.4). Individual contexts may configure a lower
- *   limit via `max_chain_depth` (recommended default: 3).
+ * @param chainDepth - Current cross-context chain depth (0 for first hop). Must be 0-255
+ *   (u8 range per ADR-043). Individual contexts may configure a limit via `max_chain_depth`
+ *   (default: 8).
  * @param proofTokens - Optional list of encoded parent UCAN token strings.
  * @returns A {@link CrossContextInvocationResult} with the tool output and provenance.
- * @throws {ValidationError} If chainDepth is out of range (0-5).
+ * @throws {ValidationError} If chainDepth is out of range (0-255).
  * @throws {ToolError} If the bridge call fails (inactive context, rate limit, etc.).
  */
 export async function toolInvokeCrossContext(
@@ -120,12 +120,12 @@ export async function toolInvokeCrossContext(
   chainDepth = 0,
   proofTokens?: readonly string[],
 ): Promise<CrossContextInvocationResult> {
-  // Protocol hard maximum is 5 hops (spec §24.4). Context-configurable max defaults
-  // to 3 but can be set up to 5. Values above 5 are always rejected by core, so
+  // Chain depth is context-configurable (ADR-043). The u8 type in core bounds
+  // the range to [0, 255]. Values above 255 are always rejected by core, so
   // we catch them early with a clear SDK-level message.
-  if (!Number.isInteger(chainDepth) || chainDepth < 0 || chainDepth > 5) {
+  if (!Number.isInteger(chainDepth) || chainDepth < 0 || chainDepth > 255) {
     throw new ValidationError(
-      `chainDepth must be an integer in range 0-5 (protocol hard max per spec §24.4), got ${chainDepth}`,
+      `chainDepth must be an integer in range 0-255 (u8 range per ADR-043), got ${chainDepth}`,
       "SCP-VALID-7002",
     );
   }

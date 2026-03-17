@@ -10441,7 +10441,7 @@ public func toolSessionClose(handle: ContextHandle, sessionId: String)async thro
  * Creates a stateful tool session.
  *
  * Sessions enable multi-turn workflows with TTL and per-caller caps
- * (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+ * (default: 1000 concurrent sessions per caller, per spec §6.2.1 and ADR-043).
  *
  * # Returns
  *

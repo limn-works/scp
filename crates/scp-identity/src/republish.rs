@@ -41,14 +41,40 @@ use super::resolution::did_routing_id;
 /// Republish interval for DHT: every 2 hours (in seconds).
 pub const REPUBLISH_INTERVAL_SECS: u64 = 2 * 60 * 60;
 
-/// Republish interval for SCP relays: every 6 days (in seconds).
+/// Default republish interval for SCP relays: every 6 days (in seconds).
 ///
 /// Relay blob TTL is 604800 seconds (7 days). Republishing every 6 days
 /// provides a 1-day safety margin before TTL expiry (§3.10.2).
+///
+/// This is the default value when `RepublishConfig::relay_blob_ttl_secs` is
+/// set to the default (7 days). Configurable via ADR-043.
 pub const RELAY_REPUBLISH_INTERVAL_SECS: u64 = 6 * 24 * 60 * 60;
 
-/// Relay blob TTL: 7 days (in seconds), per §3.10.2.
+/// Default relay blob TTL: 7 days (in seconds), per §3.10.2.
+///
+/// Configurable via `RepublishConfig::relay_blob_ttl_secs` (ADR-043).
 pub const RELAY_BLOB_TTL_SECS: u64 = 604_800;
+
+/// Derives the relay republish interval from a given TTL.
+///
+/// Formula: `max(ttl.saturating_sub(86400), ttl / 2, 60)` (ADR-043).
+/// - At 7-day TTL: 518400s (current default).
+/// - At 1-hour TTL: 1800s (half the TTL).
+/// - At TTL <= 1: 60s (floor prevents spin loop).
+#[must_use]
+pub const fn derive_republish_interval(ttl_secs: u64) -> u64 {
+    let margin = ttl_secs.saturating_sub(86_400);
+    let half = ttl_secs / 2;
+    // max(margin, half, 60) — implemented without std::cmp::max (not const)
+    let mut result = margin;
+    if half > result {
+        result = half;
+    }
+    if 60 > result {
+        result = 60;
+    }
+    result
+}
 
 /// Initial backoff on failure: 30 seconds.
 const INITIAL_BACKOFF_SECS: u64 = 30;
@@ -189,6 +215,9 @@ type LayerDisabledCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// By default, both DHT and relay layers are enabled per the anti-segmentation
 /// invariant (§3.10.6). Disabling either layer requires explicit opt-out and
 /// the SDK logs a warning.
+///
+/// The `relay_blob_ttl_secs` field is configurable per ADR-043. The republish
+/// interval is derived from the TTL via [`derive_republish_interval`].
 #[derive(Clone)]
 pub struct RepublishConfig {
     /// Whether DHT publishing is enabled.
@@ -197,6 +226,9 @@ pub struct RepublishConfig {
     relay_enabled: bool,
     /// Warning callback invoked when a layer is disabled.
     layer_disabled_callback: Option<LayerDisabledCallback>,
+    /// Relay blob TTL in seconds. Defaults to [`RELAY_BLOB_TTL_SECS`] (7 days).
+    /// Configurable by relay operators (ADR-043).
+    relay_blob_ttl_secs: u64,
 }
 
 impl std::fmt::Debug for RepublishConfig {
@@ -204,6 +236,7 @@ impl std::fmt::Debug for RepublishConfig {
         f.debug_struct("RepublishConfig")
             .field("dht_enabled", &self.dht_enabled)
             .field("relay_enabled", &self.relay_enabled)
+            .field("relay_blob_ttl_secs", &self.relay_blob_ttl_secs)
             .field(
                 "layer_disabled_callback",
                 &self.layer_disabled_callback.as_ref().map(|_| "..."),
@@ -218,6 +251,7 @@ impl Default for RepublishConfig {
             dht_enabled: true,
             relay_enabled: true,
             layer_disabled_callback: None,
+            relay_blob_ttl_secs: RELAY_BLOB_TTL_SECS,
         }
     }
 }
@@ -273,6 +307,27 @@ impl RepublishConfig {
     #[must_use]
     pub const fn is_relay_enabled(&self) -> bool {
         self.relay_enabled
+    }
+
+    /// Sets the relay blob TTL (in seconds) and derives the republish interval.
+    ///
+    /// Defaults to [`RELAY_BLOB_TTL_SECS`] (7 days). Configurable per ADR-043.
+    #[must_use]
+    pub const fn with_relay_blob_ttl_secs(mut self, ttl_secs: u64) -> Self {
+        self.relay_blob_ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Returns the configured relay blob TTL in seconds.
+    #[must_use]
+    pub const fn relay_blob_ttl_secs(&self) -> u64 {
+        self.relay_blob_ttl_secs
+    }
+
+    /// Returns the derived relay republish interval in seconds.
+    #[must_use]
+    pub const fn relay_republish_interval_secs(&self) -> u64 {
+        derive_republish_interval(self.relay_blob_ttl_secs)
     }
 }
 
@@ -502,8 +557,16 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
             let did = entry.did.clone();
             let relay_warning_cb = self.relay_warning_callback.clone();
 
-            let join_handle =
-                tokio::spawn(relay_republish_loop(relay_pub, entry, relay_warning_cb));
+            let blob_ttl = self.config.relay_blob_ttl_secs;
+            let republish_interval = self.config.relay_republish_interval_secs();
+
+            let join_handle = tokio::spawn(relay_republish_loop(
+                relay_pub,
+                entry,
+                relay_warning_cb,
+                blob_ttl,
+                republish_interval,
+            ));
 
             relay_tasks.insert(
                 did,
@@ -620,30 +683,29 @@ async fn dht_republish_loop<D: DhtClient>(
 ///
 /// Publishes immediately using the PUBLISH operation with:
 /// - `routing_id` = `did_routing_id(did_string)` (§3.10.2)
-/// - `blob_ttl` = 604800 (7 days, §3.10.2)
+/// - `blob_ttl` = config-derived TTL (default 604800 = 7 days, §3.10.2)
 /// - `blob` = BEP44-signed DID document bytes
 ///
-/// Then waits for the relay republish interval (6 days) before the next
-/// publish. On failure, retries with exponential backoff.
+/// Then waits for the derived republish interval before the next publish.
+/// On failure, retries with exponential backoff.
 async fn relay_republish_loop<R: RelayPublisher>(
     relay_publisher: Arc<R>,
     entry: RepublishEntry,
     warning_cb: Option<RelayWarningCallback>,
+    blob_ttl_secs: u64,
+    republish_interval_secs: u64,
 ) {
     let routing_id = did_routing_id(&entry.did);
     let mut consecutive_failures: u32 = 0;
 
     loop {
         let result = relay_publisher
-            .publish(&routing_id, RELAY_BLOB_TTL_SECS, &entry.document_bytes)
+            .publish(&routing_id, blob_ttl_secs, &entry.document_bytes)
             .await;
 
         if result.is_ok() {
             consecutive_failures = 0;
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                RELAY_REPUBLISH_INTERVAL_SECS,
-            ))
-            .await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(republish_interval_secs)).await;
         } else {
             consecutive_failures = consecutive_failures.saturating_add(1);
 
@@ -922,16 +984,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_publish_blob_ttl_is_seven_days() {
-        // Acceptance criterion: blob_ttl = 604800 (7 days).
+    async fn relay_publish_default_blob_ttl_is_seven_days() {
+        // Default blob_ttl = 604800 (7 days).
         assert_eq!(RELAY_BLOB_TTL_SECS, 604_800);
+        let config = RepublishConfig::new();
+        assert_eq!(config.relay_blob_ttl_secs(), RELAY_BLOB_TTL_SECS);
     }
 
     #[tokio::test]
-    async fn relay_republish_interval_is_six_days() {
-        // Acceptance criterion: republish timer fires at 6-day interval.
-        assert_eq!(RELAY_REPUBLISH_INTERVAL_SECS, 6 * 24 * 60 * 60);
+    async fn relay_default_republish_interval_is_six_days() {
+        // Default republish timer fires at 6-day interval.
+        let config = RepublishConfig::new();
+        assert_eq!(config.relay_republish_interval_secs(), 518_400);
         assert_eq!(RELAY_REPUBLISH_INTERVAL_SECS, 518_400);
+    }
+
+    #[tokio::test]
+    async fn relay_republish_interval_derived_from_custom_ttl() {
+        // TTL = 3600 (1 hour) → interval = max(3600-86400, 1800, 60) = 1800
+        let config = RepublishConfig::new().with_relay_blob_ttl_secs(3600);
+        assert_eq!(config.relay_republish_interval_secs(), 1800);
+    }
+
+    #[tokio::test]
+    async fn relay_republish_interval_floor_prevents_spin_loop() {
+        // TTL = 1 → interval = max(1-86400, 0, 60) = 60 (floor)
+        let config = RepublishConfig::new().with_relay_blob_ttl_secs(1);
+        assert_eq!(config.relay_republish_interval_secs(), 60);
+    }
+
+    #[tokio::test]
+    async fn relay_republish_interval_zero_ttl_uses_floor() {
+        // TTL = 0 → interval = max(0, 0, 60) = 60
+        let config = RepublishConfig::new().with_relay_blob_ttl_secs(0);
+        assert_eq!(config.relay_republish_interval_secs(), 60);
     }
 
     #[tokio::test]

@@ -3123,6 +3123,20 @@ impl ContextManager {
             .and_then(|ctx| ctx.role_state.assignments.get(did).cloned())
     }
 
+    /// Returns a clone of the context's creation parameters, or `None` if the
+    /// context is not registered with this manager.
+    ///
+    /// Used by FFI bridges to read context-configured limits (e.g.
+    /// `session_cap`, `max_chain_depth`, `max_nesting_depth`) instead of
+    /// hardcoding protocol defaults.
+    pub async fn context_params(&self, context_id: &str) -> Option<ContextParams> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .map(|ctx| ctx.handle.params().clone())
+    }
+
     /// Returns a clone of the role state for a context, or `None` if the
     /// context is not registered.
     ///

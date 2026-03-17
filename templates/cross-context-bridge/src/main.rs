@@ -306,8 +306,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
 
     println!("\n--- Chain depth enforcement ---");
-    // Default max chain depth is 3; protocol hard max is 5.
-    // Attempting chain_depth=4 should fail with the default configuration.
+    // Default max chain depth is 8 (ADR-043). Context-configurable, no protocol ceiling.
+    // Attempting chain_depth=9 should fail with the default configuration.
     let deep_result = invoke_cross_context(
         &ctx_a,
         &mut interface,
@@ -315,12 +315,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &operator_did,
         &role_state_a,
         &registry_b,
-        4, // chain_depth: exceeds default max of 3
+        9, // chain_depth: exceeds default max of 8 (ADR-043)
         |_| Ok(serde_json::json!({})),
     );
     match deep_result {
-        Err(e) => println!("  Chain depth 4 rejected: {e}"),
-        Ok(_) => println!("  Chain depth 4 accepted (max_chain_depth may be configured higher)"),
+        Err(e) => println!("  Chain depth 9 rejected: {e}"),
+        Ok(_) => println!("  Chain depth 9 accepted (max_chain_depth may be configured higher)"),
     }
 
     println!("\nCross-context bridge complete.");

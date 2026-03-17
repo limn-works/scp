@@ -133,8 +133,8 @@ pub use memory_scope::{
 
 // Re-export nesting types (SCP-134, spec section 5.13).
 pub use nesting::{
-    ApprovalRequirement, ContextNesting, MAX_NESTING_DEPTH, MlsGroupContextExtension, NestingError,
-    OnSeverPolicy, ParentGovernanceConfig, ParentRef, SeverAction, compute_ceiling_intersection,
+    ApprovalRequirement, ContextNesting, MlsGroupContextExtension, NestingError, OnSeverPolicy,
+    ParentGovernanceConfig, ParentRef, SeverAction, compute_ceiling_intersection,
     validate_child_ttl, validate_nesting_depth,
 };
 

@@ -397,7 +397,7 @@ public extension Context {
     /// Creates a stateful tool session for repeated invocations.
     ///
     /// Delegates to the UniFFI ``toolSessionCreate`` bridge function.
-    /// Sessions have an optional TTL and a per-caller cap (5 concurrent).
+    /// Sessions have an optional TTL and a per-caller cap (default 1000, ADR-043).
     ///
     /// - Parameters:
     ///   - toolId: The tool ID to create a session for.

@@ -684,14 +684,28 @@ pub struct ContextParams {
     pub discoverable: bool,
     /// Maximum cross-context chain depth for provenance enforcement (spec §24.4).
     ///
-    /// When `None`, the protocol default of 3 hops applies. The effective limit
-    /// is always clamped to the protocol hard maximum of 5 via
-    /// [`effective_max_chain_depth`](crate::provenance::attach::effective_max_chain_depth).
+    /// When `None`, the default of 8 hops applies (ADR-043). The u8 type
+    /// naturally bounds the range to [0, 255].
     ///
     /// This bounds the worst-case amplification factor for cross-context tool
     /// call chains originating from or passing through this context.
     #[serde(default)]
     pub max_chain_depth: Option<u8>,
+
+    /// Maximum nesting depth for child contexts (spec §5.13.8, ADR-043).
+    ///
+    /// When `None`, nesting depth is unbounded (no limit). When `Some(n)`,
+    /// child contexts at depth > n are rejected. Immutable after creation.
+    #[serde(default)]
+    pub max_nesting_depth: Option<u32>,
+
+    /// Maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
+    ///
+    /// When `None`, the default of 1000 applies. When `Some(n)`, at most `n`
+    /// concurrent sessions per caller are allowed. Uses `u32` (not `usize`)
+    /// for cross-platform serialization compatibility (`wasm32`, `UniFFI`).
+    #[serde(default)]
+    pub session_cap: Option<u32>,
 
     /// Counterparty privacy policy for outbound provenance (§7.7.1, §24.3.1).
     ///
@@ -767,6 +781,8 @@ impl Default for ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
@@ -982,6 +998,8 @@ mod tests {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
@@ -1101,6 +1119,8 @@ mod tests {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
@@ -1159,6 +1179,8 @@ mod tests {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
