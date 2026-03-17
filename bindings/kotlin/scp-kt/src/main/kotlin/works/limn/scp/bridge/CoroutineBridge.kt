@@ -36,6 +36,8 @@ import works.limn.scp.MetadataBindings
 import works.limn.scp.MetadataBridge
 import works.limn.scp.ProvenanceBindings
 import works.limn.scp.ProvenanceBridge
+import works.limn.scp.ServerBindings
+import works.limn.scp.ServerBridge
 import works.limn.scp.PublishResult
 import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
@@ -1228,6 +1230,7 @@ data class ExtendedBindings(
     val metadata: MetadataBindings? = null,
     val economy: EconomyBindings? = null,
     val invitation: InvitationBindings? = null,
+    val server: ServerBindings? = null,
 )
 
 /**
@@ -1336,6 +1339,12 @@ class CoroutineBridge(
     val economy: EconomyBridge? =
         extendedBindings?.economy?.let {
             EconomyBridge(it, this)
+        }
+
+    /** Server lifecycle operations — FFI on IO. Null if bindings not provided. */
+    val server: ServerBridge? =
+        extendedBindings?.server?.let {
+            ServerBridge(it, this)
         }
 
     /**

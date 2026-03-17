@@ -83,14 +83,59 @@ pub struct SourcedRelayUrl {
 // Validation
 // ---------------------------------------------------------------------------
 
+/// Returns `true` if the given URL targets a loopback address.
+///
+/// Recognizes `127.0.0.1`, `[::1]`, and `localhost` as loopback hosts.
+/// Plaintext `ws://` is safe for these addresses because loopback traffic
+/// cannot be intercepted by network attackers.
+fn is_loopback_url(url: &str) -> bool {
+    // Strip scheme prefix to get the authority portion.
+    let after_scheme = if let Some(rest) = url.strip_prefix("ws://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("wss://") {
+        rest
+    } else {
+        return false;
+    };
+
+    // The authority extends to the first `/` or the end of the string.
+    let authority = after_scheme.split('/').next().unwrap_or("");
+
+    // Strip userinfo (RFC 3986 §3.2.1) to prevent bypass via
+    // `ws://127.0.0.1:password@evil.com` — the `@` is a userinfo
+    // separator, so the actual connection target is `evil.com`.
+    let authority = authority
+        .rfind('@')
+        .map_or(authority, |at_pos| &authority[at_pos + 1..]);
+
+    // Strip port suffix (if present) to isolate the host.
+    // Handle IPv6 bracket notation: `[::1]:8080` → host is `[::1]`.
+    let host = if authority.starts_with('[') {
+        // IPv6 literal: everything up to and including `]`.
+        authority
+            .split(']')
+            .next()
+            .map_or(authority, |h| h.strip_prefix('[').unwrap_or(h))
+    } else {
+        // IPv4 or hostname: strip `:port` suffix.
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
+}
+
 /// Validates whether a relay URL is permitted given its discovery source.
 ///
 /// Enforces the transport security rules from spec section 10.12.6:
 ///
 /// - `wss://` is always permitted regardless of source.
-/// - `ws://` is permitted only when `source` is [`RelayUrlSource::DhtResolved`].
-/// - `ws://` from any other source is rejected to prevent downgrade attacks
-///   where an attacker substitutes `ws://` URLs in HTTP-based discovery.
+/// - `ws://` is permitted for loopback addresses (`127.0.0.1`, `[::1]`,
+///   `localhost`) regardless of source — loopback traffic cannot be
+///   intercepted by network attackers.
+/// - `ws://` is permitted for [`RelayUrlSource::DhtResolved`] URLs
+///   (self-hosted relays with BEP44-signed DID documents).
+/// - `ws://` from any other source to a non-loopback host is rejected to
+///   prevent downgrade attacks.
 ///
 /// # Errors
 ///
@@ -111,12 +156,19 @@ pub fn validate_relay_url(url: &str, source: &RelayUrlSource) -> Result<(), Tran
         return Ok(());
     }
 
-    // ws:// is only permitted from DHT-resolved DID documents.
+    // ws:// to loopback addresses is always safe — traffic stays on-host.
+    if is_loopback_url(url) {
+        return Ok(());
+    }
+
+    // ws:// to non-loopback hosts is only permitted from DHT-resolved DID
+    // documents.
     match source {
         RelayUrlSource::DhtResolved => Ok(()),
         other => Err(TransportError::ProtocolError(format!(
             "ws:// relay URL rejected: plaintext WebSocket is only permitted for \
-             DHT-resolved DID documents (§10.12.6), but source is {other}. \
+             loopback addresses or DHT-resolved DID documents (§10.12.6), but \
+             source is {other} and host is not loopback. \
              Use wss:// or verify via DHT."
         ))),
     }
@@ -271,5 +323,126 @@ mod tests {
             &RelayUrlSource::DhtResolved,
         );
         assert!(result.is_ok());
+    }
+
+    // --- Loopback ws:// exemption ---
+
+    #[test]
+    fn ws_localhost_explicit_is_permitted() {
+        // ws:// to 127.0.0.1 is safe regardless of source — loopback
+        // traffic cannot be intercepted.
+        let result = validate_relay_url("ws://127.0.0.1:9000/scp/v1", &RelayUrlSource::Explicit);
+        assert!(
+            result.is_ok(),
+            "ws://127.0.0.1 should be permitted for any source"
+        );
+    }
+
+    #[test]
+    fn ws_localhost_hostname_explicit_is_permitted() {
+        let result = validate_relay_url("ws://localhost:9000/scp/v1", &RelayUrlSource::Explicit);
+        assert!(
+            result.is_ok(),
+            "ws://localhost should be permitted for any source"
+        );
+    }
+
+    #[test]
+    fn ws_ipv6_loopback_explicit_is_permitted() {
+        let result = validate_relay_url("ws://[::1]:9000/scp/v1", &RelayUrlSource::Explicit);
+        assert!(
+            result.is_ok(),
+            "ws://[::1] should be permitted for any source"
+        );
+    }
+
+    #[test]
+    fn ws_localhost_well_known_is_permitted() {
+        let result = validate_relay_url("ws://127.0.0.1:8080/scp/v1", &RelayUrlSource::WellKnown);
+        assert!(
+            result.is_ok(),
+            "ws://127.0.0.1 should be permitted even for WellKnown"
+        );
+    }
+
+    #[test]
+    fn ws_localhost_peer_discovered_is_permitted() {
+        let result = validate_relay_url(
+            "ws://localhost:8080/scp/v1",
+            &RelayUrlSource::PeerDiscovered,
+        );
+        assert!(
+            result.is_ok(),
+            "ws://localhost should be permitted even for PeerDiscovered"
+        );
+    }
+
+    #[test]
+    fn ws_non_loopback_explicit_is_still_rejected() {
+        // Non-loopback ws:// from Explicit must still be rejected.
+        let result =
+            validate_relay_url("ws://192.168.1.100:9000/scp/v1", &RelayUrlSource::Explicit);
+        assert!(
+            result.is_err(),
+            "ws:// to non-loopback from Explicit must be rejected"
+        );
+    }
+
+    // --- is_loopback_url unit tests ---
+
+    #[test]
+    fn is_loopback_ipv4() {
+        assert!(is_loopback_url("ws://127.0.0.1:9000/scp/v1"));
+        assert!(is_loopback_url("ws://127.0.0.1/scp/v1"));
+        assert!(is_loopback_url("wss://127.0.0.1:443/scp/v1"));
+    }
+
+    #[test]
+    fn is_loopback_localhost() {
+        assert!(is_loopback_url("ws://localhost:9000/scp/v1"));
+        assert!(is_loopback_url("ws://localhost/scp/v1"));
+        assert!(is_loopback_url("ws://LOCALHOST:9000/scp/v1")); // case insensitive
+    }
+
+    #[test]
+    fn is_loopback_ipv6() {
+        assert!(is_loopback_url("ws://[::1]:9000/scp/v1"));
+        assert!(is_loopback_url("ws://[::1]/scp/v1"));
+    }
+
+    #[test]
+    fn is_not_loopback() {
+        assert!(!is_loopback_url("ws://192.168.1.1:9000/scp/v1"));
+        assert!(!is_loopback_url("ws://relay.example.com/scp/v1"));
+        assert!(!is_loopback_url("ws://10.0.0.1:9000/scp/v1"));
+        assert!(!is_loopback_url("ftp://127.0.0.1/file")); // wrong scheme
+    }
+
+    // --- Userinfo bypass (CVE-style) ---
+
+    #[test]
+    fn is_loopback_rejects_userinfo_bypass() {
+        // The `@` is a userinfo separator per RFC 3986 §3.2.1.
+        // `ws://127.0.0.1:password@evil.com` connects to evil.com, not 127.0.0.1.
+        assert!(!is_loopback_url("ws://127.0.0.1:password@evil.com/scp/v1"));
+        assert!(!is_loopback_url("ws://127.0.0.1@evil.com:9000/scp/v1"));
+    }
+
+    #[test]
+    fn is_loopback_allows_userinfo_to_loopback() {
+        // After stripping userinfo, the host is still 127.0.0.1 — safe.
+        // The userinfo would be sent as HTTP Basic Auth in the upgrade request.
+        assert!(is_loopback_url("ws://user:pass@127.0.0.1:9000/scp/v1"));
+    }
+
+    // --- Non-primary loopback and wildcard addresses ---
+
+    #[test]
+    fn is_not_loopback_secondary_and_wildcard() {
+        // 127.0.0.2 is technically loopback on Linux, but we only allow
+        // 127.0.0.1 — matching the canonical loopback address.
+        assert!(!is_loopback_url("ws://127.0.0.2:9000/scp/v1"));
+        // 0.0.0.0 binds all interfaces — not a safe loopback target.
+        assert!(!is_loopback_url("ws://0.0.0.0:9000/scp/v1"));
     }
 }

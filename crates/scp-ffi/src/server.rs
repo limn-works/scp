@@ -54,7 +54,7 @@ impl PyRelayHandle {
 
     /// Returns the port the relay is listening on.
     #[getter]
-    fn port(&self) -> u16 {
+    fn relay_port(&self) -> u16 {
         self.inner.bound_addr().port()
     }
 
@@ -168,16 +168,6 @@ impl PyNodeHandle {
     #[getter]
     fn did(&self) -> String {
         self.inner.did().to_owned()
-    }
-
-    /// Returns the HTTP URL if the HTTP server is running.
-    ///
-    /// Currently always returns ``None`` because `start_node_in_memory` and
-    /// `start_node_local` do not start the HTTP server.
-    #[getter]
-    #[allow(clippy::unused_self)]
-    fn http_url(&self) -> Option<String> {
-        None
     }
 
     /// Returns ``True`` if shutdown has already been signaled.

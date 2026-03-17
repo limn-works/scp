@@ -258,13 +258,22 @@ mod tests {
     }
 
     #[test]
-    fn transport_connect_rejects_invalid_url() {
+    fn transport_connect_fails_for_unreachable_localhost() {
         // Connecting to an unreachable URL should fail with TransportError.
         // We need the tokio runtime to be initialized first.
         crate::init_runtime().ok();
-        // ws:// from "explicit" source is rejected per §10.12.6 (only
-        // DHT-resolved URLs may use plaintext WebSocket).
+        // ws:// to loopback passes scheme validation (loopback exemption),
+        // but the connection fails because nothing is listening on port 1.
         let result = py_transport_connect("ws://127.0.0.1:1/nonexistent", "explicit");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transport_connect_rejects_ws_to_remote_host() {
+        crate::init_runtime().ok();
+        // ws:// to a non-loopback address from "explicit" source is
+        // rejected by the transport layer per §10.12.6.
+        let result = py_transport_connect("ws://203.0.113.42:9000/scp/v1", "explicit");
         assert!(result.is_err());
     }
 

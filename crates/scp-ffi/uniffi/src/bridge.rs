@@ -3958,13 +3958,15 @@ pub async fn tool_interface_revoke(
 /// Connects to an SCP relay.
 ///
 /// Establishes a WebSocket connection to the specified relay URL using
-/// `NativeRelayAdapter::connect_sourced` with `Explicit` source
-/// (requires `wss://`). The adapter is stored in the returned
-/// `TransportManager` handle.
+/// `NativeRelayAdapter::connect_sourced` with `Explicit` source.
+/// Remote hosts require `wss://`; plaintext `ws://` is permitted for
+/// loopback addresses (`127.0.0.1`, `[::1]`, `localhost`) since
+/// loopback traffic cannot be intercepted.
 ///
 /// # Arguments
 ///
-/// * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`).
+/// * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`
+///   or `"ws://127.0.0.1:9000/scp/v1"` for local development).
 ///
 /// # Returns
 ///
@@ -3973,25 +3975,20 @@ pub async fn tool_interface_revoke(
 /// # Errors
 ///
 /// Returns `ScpError::Transport` if the URL scheme is not permitted
-/// (only `wss://` is accepted for explicit connections) or if the
-/// WebSocket connection cannot be established (unreachable relay,
-/// protocol mismatch, timeout, authentication failure).
+/// (remote hosts require `wss://`) or if the WebSocket connection
+/// cannot be established (unreachable relay, protocol mismatch,
+/// timeout, authentication failure).
 #[uniffi::export]
 pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager>, ScpError> {
     use scp_transport::native::adapter::NativeRelayAdapter;
     use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
     validate_relay_url(&relay_url)?;
-    if !relay_url.starts_with("wss://") {
-        return Err(ScpError::Transport {
-            msg: format!(
-                "relay URL must use wss:// scheme, got: {relay_url:?} — \
-                 plain-text ws:// is not permitted; use TLS"
-            ),
-            code: "SCP-TRANS-5001".to_owned(),
-        });
-    }
 
+    // Transport-layer validation enforces ws:// restrictions: loopback
+    // addresses are always allowed; non-loopback requires wss:// or
+    // DHT-resolved provenance. Using Explicit source here means only
+    // wss:// and ws://localhost pass.
     runtime()
         .spawn(async move {
             let sourced = SourcedRelayUrl {

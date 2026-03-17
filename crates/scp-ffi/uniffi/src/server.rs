@@ -78,7 +78,7 @@ impl RelayHandle {
     /// Returns the port the relay is listening on.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn port(&self) -> u16 {
+    pub fn relay_port(&self) -> u16 {
         self.inner.bound_addr().port()
     }
 
@@ -187,16 +187,6 @@ impl NodeHandle {
     #[must_use]
     pub fn did(&self) -> String {
         self.inner.did().to_owned()
-    }
-
-    /// Returns the HTTP URL if the HTTP server is running.
-    ///
-    /// Currently always returns `None` because `start_node_in_memory` and
-    /// `start_node_local` do not start the HTTP server.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn http_url(&self) -> Option<String> {
-        None
     }
 
     /// Returns `true` if shutdown has already been signaled.
@@ -308,7 +298,7 @@ mod tests {
         let relay = rt().block_on(relay_start_in_memory()).unwrap();
         assert!(relay.relay_url().starts_with("ws://127.0.0.1:"));
         assert!(relay.relay_url().ends_with("/scp/v1"));
-        assert!(relay.port() > 0);
+        assert!(relay.relay_port() > 0);
         assert!(!relay.is_shutdown());
         relay.shutdown();
         assert!(relay.is_shutdown());
@@ -322,7 +312,7 @@ mod tests {
             .block_on(relay_start_local(tmp.to_string_lossy().into_owned()))
             .unwrap();
         assert!(relay.relay_url().starts_with("ws://127.0.0.1:"));
-        assert!(relay.port() > 0);
+        assert!(relay.relay_port() > 0);
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -337,7 +327,7 @@ mod tests {
         );
         assert!(node.did().starts_with("did:"));
         assert!(node.relay_port() > 0);
-        assert!(node.http_url().is_none());
+
         assert!(!node.is_shutdown());
         node.shutdown();
         assert!(node.is_shutdown());
@@ -356,7 +346,7 @@ mod tests {
         );
         assert!(node.did().starts_with("did:"));
         assert!(node.relay_port() > 0);
-        assert!(node.http_url().is_none());
+
         node.shutdown();
         let _ = std::fs::remove_dir_all(&tmp);
     }
