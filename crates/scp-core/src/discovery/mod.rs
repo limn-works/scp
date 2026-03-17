@@ -151,7 +151,7 @@ pub struct DiscoveryQuery {
 pub struct DiscoveryResult {
     /// The discovery result entries, ranked by relevance score (descending).
     pub entries: Vec<DiscoveryResultEntry>,
-    /// The bootstrap context IDs that were queried to produce these results.
+    /// The context IDs that were queried to produce these results.
     pub sources: Vec<ContextId>,
 }
 

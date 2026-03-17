@@ -165,7 +165,7 @@ pub struct ResolutionPath {
 pub enum ResolutionLayer {
     /// Resolved via local petname lookup.
     Petname,
-    /// Resolved via a context with discovery tools handle lookup.
+    /// Resolved via context handle lookup.
     DiscoveryContext,
     /// Resolved via attestation-backed handle reverse-lookup.
     Attestation,

@@ -37,7 +37,7 @@ pub fn petname_maps() -> &'static Mutex<HashMap<String, PetnameMap>> {
     MAPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Global handle registries keyed by bootstrap context ID.
+/// Global handle registries keyed by context ID.
 /// Each context has its own handle registry (§22.3.1).
 pub fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
     static REGISTRIES: OnceLock<Mutex<HashMap<String, HandleRegistry>>> = OnceLock::new();

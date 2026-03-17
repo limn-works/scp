@@ -1014,7 +1014,7 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 | `MultiLayerCorroborated` | `"MultiLayerCorroborated"` | `sources: Vec<ResolutionPath>` | Multiple independent resolution paths agree. |
 | `DomainVerified` | `"DomainVerified"` | — | Resolved via `.well-known/scp`. HTTPS-dependent. |
 | `AttestationVerified` | `"AttestationVerified"` | — | Resolved via identity attestation. Platform-dependent. |
-| `DiscoveryContextVerified` | `"DiscoveryContextVerified"` | — | Resolved via context with discovery tools handle. Community-governed. |
+| `DiscoveryContextVerified` | `"DiscoveryContextVerified"` | — | Resolved via context handle lookup. Community-governed. |
 
 **`ResolutionPath`** — Provenance for the resolution itself.
 

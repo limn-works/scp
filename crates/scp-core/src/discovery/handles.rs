@@ -181,7 +181,7 @@ pub struct HandleDeregisterResult {
 /// See §22.3.1 Handle Tools and §22.3.2 Scope Naming.
 #[derive(Debug)]
 pub struct HandleRegistry {
-    /// The bootstrap context ID this registry belongs to.
+    /// The context ID this registry belongs to.
     context_id: ContextId,
     /// Handle entries keyed by normalized local-part.
     entries: HashMap<String, HandleEntry>,
@@ -200,7 +200,7 @@ impl HandleRegistry {
         }
     }
 
-    /// Returns the bootstrap context ID this registry belongs to.
+    /// Returns the context ID this registry belongs to.
     #[must_use]
     pub const fn context_id(&self) -> &ContextId {
         &self.context_id

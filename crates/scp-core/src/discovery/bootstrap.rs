@@ -221,7 +221,7 @@ impl BootstrapResolver {
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryError::DidResolutionFailed`] if no discovery
+    /// Returns [`DiscoveryError::DidResolutionFailed`] if no bootstrap
     /// contexts are configured and fallback is disabled.
     pub fn resolve_with_fallback(&self, did: &str) -> Result<Vec<ContextId>, DiscoveryError> {
         let contexts = self.resolve_contexts();
