@@ -48,8 +48,6 @@ class CustodyType(enum.Enum):
     #: Ephemeral in-memory key store, suitable for testing or short-lived
     #: agents.  Keys are lost on process exit.
     IN_MEMORY = "in_memory"
-    #: Software-backed file-based key store with passphrase protection.
-    SOFTWARE = "software"
 
 
 class BridgeMode(enum.Enum):
