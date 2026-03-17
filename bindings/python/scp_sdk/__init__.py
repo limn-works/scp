@@ -55,6 +55,8 @@ from scp_sdk.context import (
     Membership,
     PublishResult,
     SiteConfig,
+    validate_admission,
+    validate_broadcast_key_hex,
 )
 from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
 from scp_sdk.economy import (
@@ -356,6 +358,8 @@ __all__ = [
     "session_create",
     "session_invoke",
     "validate",
+    "validate_admission",
+    "validate_broadcast_key_hex",
     "validate_policy_change",
     "verify_participation_requirements",
     "withdraw_governance_vote",

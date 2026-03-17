@@ -784,3 +784,89 @@ class TestSiteConfigDeployLimitsValidation:
 
         config = SiteConfig(hostname="example.com", max_deploy_size_bytes=1)
         assert config.max_deploy_size_bytes == 1
+
+
+# -----------------------------------------------------------------------
+# Admission validation tests (SCP-296 post-merge audit)
+# -----------------------------------------------------------------------
+
+
+class TestAdmissionValidation:
+    """Tests for validate_admission."""
+
+    def test_open_accepted(self) -> None:
+        from scp_sdk.context import validate_admission
+
+        validate_admission("open")
+
+    def test_gated_accepted(self) -> None:
+        from scp_sdk.context import validate_admission
+
+        validate_admission("gated")
+
+    def test_invalid_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import validate_admission
+
+        with pytest.raises(ValueError, match='admission must be "open" or "gated"'):
+            validate_admission("closed")
+
+    def test_empty_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import validate_admission
+
+        with pytest.raises(ValueError, match='admission must be "open" or "gated"'):
+            validate_admission("")
+
+
+# -----------------------------------------------------------------------
+# BroadcastKeyHex validation tests (SCP-296 post-merge audit)
+# -----------------------------------------------------------------------
+
+
+class TestBroadcastKeyHexValidation:
+    """Tests for validate_broadcast_key_hex."""
+
+    def test_valid_64_char_hex(self) -> None:
+        from scp_sdk.context import validate_broadcast_key_hex
+
+        validate_broadcast_key_hex("ab" * 32)
+
+    def test_uppercase_hex(self) -> None:
+        from scp_sdk.context import validate_broadcast_key_hex
+
+        validate_broadcast_key_hex("AB" * 32)
+
+    def test_too_short_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import validate_broadcast_key_hex
+
+        with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
+            validate_broadcast_key_hex("abcd")
+
+    def test_too_long_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import validate_broadcast_key_hex
+
+        with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
+            validate_broadcast_key_hex("ab" * 33)
+
+    def test_invalid_chars_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import validate_broadcast_key_hex
+
+        with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
+            validate_broadcast_key_hex("zz" * 32)
+
+    def test_empty_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import validate_broadcast_key_hex
+
+        with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
+            validate_broadcast_key_hex("")

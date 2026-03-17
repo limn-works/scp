@@ -25,7 +25,7 @@ import type {
   TrustLevel,
   UcanToken,
 } from "../src/types";
-import { validateSiteConfig } from "../src/types";
+import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "../src/types";
 
 describe("type definitions", () => {
   it("ContextParams has required ceiling field", () => {
@@ -525,5 +525,65 @@ describe("validateSiteConfig", () => {
     expect(() =>
       validateSiteConfig({ hostname: "example.com", maxDeploySizeBytes: 1 }),
     ).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admission validation (SCP-296)
+// ---------------------------------------------------------------------------
+
+describe("validateAdmission", () => {
+  it("accepts Open", () => {
+    expect(() => validateAdmission("Open")).not.toThrow();
+  });
+
+  it("accepts Gated", () => {
+    expect(() => validateAdmission("Gated")).not.toThrow();
+  });
+
+  it("rejects invalid admission", () => {
+    expect(() => validateAdmission("closed")).toThrow('admission must be "Open" or "Gated"');
+  });
+
+  it("rejects empty admission", () => {
+    expect(() => validateAdmission("")).toThrow('admission must be "Open" or "Gated"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BroadcastKeyHex validation (SCP-296)
+// ---------------------------------------------------------------------------
+
+describe("validateBroadcastKeyHex", () => {
+  it("accepts valid 64-char hex string", () => {
+    expect(() => validateBroadcastKeyHex("ab".repeat(32))).not.toThrow();
+  });
+
+  it("accepts uppercase hex", () => {
+    expect(() => validateBroadcastKeyHex("AB".repeat(32))).not.toThrow();
+  });
+
+  it("rejects too short", () => {
+    expect(() => validateBroadcastKeyHex("abcd")).toThrow(
+      "broadcastKeyHex must be exactly 64 hex characters",
+    );
+  });
+
+  it("rejects too long", () => {
+    expect(() => validateBroadcastKeyHex("ab".repeat(33))).toThrow(
+      "broadcastKeyHex must be exactly 64 hex characters",
+    );
+  });
+
+  it("rejects invalid characters", () => {
+    expect(() => validateBroadcastKeyHex("zz".repeat(32))).toThrow(
+      "broadcastKeyHex must be exactly 64 hex characters",
+    );
+  });
+
+  it("rejects empty string", () => {
+    expect(() => validateBroadcastKeyHex("")).toThrow(
+      "broadcastKeyHex must be exactly 64 hex characters",
+    );
   });
 });

@@ -744,6 +744,32 @@ function validateHostname(hostname: string): void {
 }
 
 /**
+ * Validates an admission policy string before FFI.
+ *
+ * Must be `"Open"` or `"Gated"` (matching {@link BroadcastAdmissionPolicy}).
+ *
+ * @throws {Error} If admission is not a valid policy.
+ */
+export function validateAdmission(admission: string): void {
+  if (admission !== "Open" && admission !== "Gated") {
+    throw new Error(`admission must be "Open" or "Gated", got "${admission}"`);
+  }
+}
+
+/**
+ * Validates a broadcast key hex string before FFI.
+ *
+ * Must be exactly 64 hex characters (32 bytes AES-256 key).
+ *
+ * @throws {Error} If the string is not a valid 64-char hex string.
+ */
+export function validateBroadcastKeyHex(broadcastKeyHex: string): void {
+  if (!/^[0-9a-fA-F]{64}$/.test(broadcastKeyHex)) {
+    throw new Error("broadcastKeyHex must be exactly 64 hex characters (32 bytes)");
+  }
+}
+
+/**
  * Validates a CSP override string.
  *
  * Rejects `unsafe-eval`, `unsafe-inline`, `unsafe-hashes`, bare `*`,
