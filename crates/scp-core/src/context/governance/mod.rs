@@ -1995,8 +1995,9 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    /// Returns all 28 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
-    /// and 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`)
+    /// Returns all 30 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
+    /// 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`,
+    /// and 2 migration: `ProposeContextMigration`, `CancelContextMigration`)
     /// for serialization testing. Split into two helpers to stay within the
     /// function line limit.
     fn all_governance_actions() -> Vec<GovernanceAction> {
@@ -2143,6 +2144,13 @@ mod tests {
                 purpose: "tool costs".to_owned(),
             },
             GovernanceAction::LockEconomicPolicy,
+            GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(crate::context::params::ContextParams::default()),
+                reason: "protocol upgrade".to_owned(),
+                grace_period_secs: 604_800,
+                auto_invite: true,
+            },
+            GovernanceAction::CancelContextMigration,
         ]
     }
 
@@ -2150,10 +2158,10 @@ mod tests {
     fn governance_action_serialization_roundtrip() {
         let actions = all_governance_actions();
 
-        // Verify all 28 variants are covered (24 per ADR-031 + BlockAuthor + 3 economic).
+        // Verify all 30 variants are covered.
         assert_eq!(
             actions.len(),
-            28,
+            30,
             "all GovernanceAction variants must be tested"
         );
 
