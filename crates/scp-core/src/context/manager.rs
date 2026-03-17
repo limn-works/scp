@@ -2062,6 +2062,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if validation fails (unsupported version,
     /// Merkle mismatch, tampered events) or the context already exists.
+    #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
     pub async fn import_context(
         &self,
         export: super::export_import::ContextExport,
@@ -2072,13 +2073,41 @@ impl ContextManager {
         let context_id = export.snapshot.context_id.clone();
         let ctx_id_bytes = super::context_id_bytes(&context_id);
 
-        // 2. Import event log data if present.
+        // 2. Check context existence BEFORE importing event log data.
+        //    If the context is Active, we must reject early — otherwise the
+        //    event log import at step 3 would overwrite the Active context's
+        //    Merkle chain before we discover the conflict.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(existing) = contexts.get(&context_id) {
+                let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
+                    matches!(
+                        s,
+                        ContextState::Closing
+                            | ContextState::Closed
+                            | ContextState::Expired
+                            | ContextState::Tombstoned
+                    )
+                });
+                if !is_replaceable {
+                    return Err(ContextError::MembershipFailed(format!(
+                        "context '{context_id}' already exists — cannot import"
+                    )));
+                }
+                // Clean up old crypto state before reimport
+                let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
+                let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
+            }
+        }
+        // Lock dropped — safe to proceed with event log import.
+
+        // 3. Import event log data if present.
         if !export.event_log_data.is_empty() {
             self.event_log
                 .import_event_log_data(&ctx_id_bytes, &export.event_log_data)?;
         }
 
-        // 3. Reconstruct the ContextHandle.
+        // 4. Reconstruct the ContextHandle.
         let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
 
         // Transition to the state from the snapshot.
@@ -2096,11 +2125,11 @@ impl ContextManager {
             }
         }
 
-        // 4. Reconstruct governance engine from snapshot.
+        // 5. Reconstruct governance engine from snapshot.
         let governance_engine =
             restore_governance_engine_from_snapshot(&export.snapshot, self.key_resolver.clone())?;
 
-        // 5. Build PerContextState from the snapshot.
+        // 6. Build PerContextState from the snapshot.
         let initial_members: HashSet<DID> = export
             .snapshot
             .membership
@@ -2146,21 +2175,20 @@ impl ContextManager {
             migration_state: None,
         };
 
-        // 6. Register the context.
+        // 7. Register the context.
+        //    Existence was already checked at step 2 — if the context was
+        //    replaceable its crypto state was cleaned up there. Here we just
+        //    remove the stale entry (if any) and insert the new one.
         {
             let mut contexts = self.contexts.lock().await;
-            if contexts.contains_key(&context_id) {
-                return Err(ContextError::MembershipFailed(format!(
-                    "context '{context_id}' already exists — cannot import"
-                )));
-            }
+            contexts.remove(&context_id);
             contexts.insert(context_id.clone(), per_context);
         }
 
         // Start governance timeout task (ADR-031 §5).
         self.start_governance_timeout_task(&context_id).await;
 
-        // 7. Persist if persistence is configured.
+        // 8. Persist if persistence is configured.
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
@@ -2170,7 +2198,7 @@ impl ContextManager {
             }
         }
 
-        // 8. Re-spawn TTL timer if there was remaining TTL.
+        // 9. Re-spawn TTL timer if there was remaining TTL.
         if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
             let duration = std::time::Duration::from_secs(remaining_secs);
             self.spawn_ttl_timer(&context_id, duration, handle.clone())
@@ -3025,6 +3053,29 @@ impl ContextManager {
             .get_mut(context_id)
             .map(|ctx| ctx.receive_buffer.drain())
             .unwrap_or_default()
+    }
+
+    /// Returns the Merkle event log entries for a context.
+    ///
+    /// Delegates to `self.event_log.event_log_entries()`. Returns `Ok(None)`
+    /// if no log exists for the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the event log provider fails.
+    pub fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<super::providers::event_log::EventLogEntry>>, ContextError> {
+        self.event_log.event_log_entries(context_id)
+    }
+
+    /// Returns the event log provider for direct Merkle tree access.
+    ///
+    /// Primarily intended for the FFI layer to query event counts and
+    /// Merkle roots without duplicating event log state.
+    pub fn event_log_provider(&self) -> &dyn ContextEventLogProvider {
+        self.event_log.as_ref()
     }
 
     /// Reports that a received envelope triggered degraded mode (§13.6) for a

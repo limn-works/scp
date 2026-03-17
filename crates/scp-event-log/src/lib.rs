@@ -438,8 +438,18 @@ impl EventLog {
     /// tail log from existing leaf hashes without re-verifying events.
     /// It bypasses event verification and signature checking.
     ///
-    /// **Internal use only.** Not part of the public append API.
-    pub(crate) fn push_leaf_raw(&mut self, leaf_hash: [u8; 32]) {
+    /// Also used by FFI bridges to populate the UCAN-state `EventLog` from
+    /// `ContextManager` event entries, enabling Merkle inclusion proofs
+    /// (e.g., `prove_inclusion`) against the same tree that tracks lifecycle
+    /// events.
+    ///
+    /// # Safety (logical)
+    ///
+    /// The caller is responsible for ensuring the leaf hash was computed
+    /// from a verified event. Injecting arbitrary hashes produces Merkle
+    /// proofs for events that never occurred. Only call with hashes from
+    /// trusted sources (e.g., `ContextManager`'s `MerkleEventLogProvider`).
+    pub fn push_leaf_raw(&mut self, leaf_hash: [u8; 32]) {
         let leaf_index = self.leaves.len() as u64;
         self.leaves.push(leaf_hash);
         self.sorted_leaves.insert((leaf_hash, leaf_index));
