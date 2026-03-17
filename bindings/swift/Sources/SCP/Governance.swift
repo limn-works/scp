@@ -427,16 +427,16 @@ private func rejectForbiddenPathChars(_ path: String) throws {
 /// Mirrors the Rust `is_unicode_formatting` helper.
 private func isUnicodeFormatting(_ codePoint: UInt32) -> Bool {
     switch codePoint {
-    case 0x00A0,          // NBSP
-         0x1680,          // Ogham space mark
-         0x2000...0x200F, // Typographic spaces (2000-200A) + ZWSP..RLM (200B-200F)
-         0x2028...0x2029, // Line/paragraph separators
-         0x202A...0x202F, // Bidi embedding controls + narrow no-break space
-         0x205F,          // Medium mathematical space
-         0x2060...0x206F, // Word joiner, invisible operators
-         0x3000,          // Ideographic space
-         0xFEFF,          // BOM / ZWNBSP
-         0xFFFE...0xFFFF: // Non-characters
+    case 0x00A0, // NBSP
+         0x1680, // Ogham space mark
+         0x2000 ... 0x200F, // Typographic spaces (2000-200A) + ZWSP..RLM (200B-200F)
+         0x2028 ... 0x2029, // Line/paragraph separators
+         0x202A ... 0x202F, // Bidi embedding controls + narrow no-break space
+         0x205F, // Medium mathematical space
+         0x2060 ... 0x206F, // Word joiner, invisible operators
+         0x3000, // Ideographic space
+         0xFEFF, // BOM / ZWNBSP
+         0xFFFE ... 0xFFFF: // Non-characters
         return true
     default:
         return false
@@ -476,7 +476,7 @@ private func rejectPathControlChars(_ path: String) throws {
 private func rejectPathUnicodeFormatting(_ path: String) throws {
     for scalar in path.unicodeScalars {
         let codePoint = scalar.value
-        if codePoint > 0x7F && isUnicodeFormatting(codePoint) {
+        if codePoint > 0x7F, isUnicodeFormatting(codePoint) {
             throw contentPathError(
                 "ContentPath must not contain non-ASCII whitespace/formatting U+\(String(format: "%04X", codePoint))"
             )
