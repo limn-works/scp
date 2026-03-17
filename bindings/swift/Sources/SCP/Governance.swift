@@ -1532,8 +1532,8 @@ public func validateAdmission(_ admission: String) throws {
 /// - Parameter broadcastKeyHex: Hex-encoded 32-byte broadcast key.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if the string is not valid.
 public func validateBroadcastKeyHex(_ broadcastKeyHex: String) throws {
-    let hexPattern = /^[0-9a-fA-F]{64}$/
-    guard broadcastKeyHex.wholeMatch(of: hexPattern) != nil else {
+    guard broadcastKeyHex.count == 64,
+          broadcastKeyHex.allSatisfy({ $0.isHexDigit }) else {
         throw ScpError.Validation(
             msg: "broadcastKeyHex must be exactly 64 hex characters (32 bytes)",
             code: "SCP-VALID-7024"
