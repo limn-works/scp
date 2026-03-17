@@ -592,7 +592,11 @@ pub fn scope_register(
             context_id: target_context_id,
             relay_urls,
         },
-        metadata: Some(scp_core::discovery::ScopeMetadata { description, tags }),
+        metadata: if description.is_some() || tags.is_some() {
+            Some(scp_core::discovery::ScopeMetadata { description, tags })
+        } else {
+            None
+        },
     };
 
     let mut guard = petname_helpers::scope_registries().lock().map_err(|e| {
@@ -634,12 +638,19 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<Stri
         })
     })?;
 
-    let result = guard.get(&scope_context_id).map_or_else(
-        || scp_core::discovery::ScopeLookupResult {
+    let result = match guard.get(&scope_context_id) {
+        Some(registry) => registry
+            .lookup(&scp_core::discovery::ScopeLookupParams { name })
+            .map_err(|e| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!("scope lookup failed: {e}"),
+                    code: "SCP-VALID-7133".to_owned(),
+                })
+            })?,
+        None => scp_core::discovery::ScopeLookupResult {
             results: Vec::new(),
         },
-        |registry| registry.lookup(&scp_core::discovery::ScopeLookupParams { name }),
-    );
+    };
 
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -664,15 +675,20 @@ pub fn scope_deregister(
         })
     })?;
 
-    let result = guard.get_mut(&scope_context_id).map_or_else(
-        || scp_core::discovery::ScopeDeregisterResult { removed: false },
-        |registry| {
-            registry.deregister(&scp_core::discovery::ScopeDeregisterParams {
+    let result = match guard.get_mut(&scope_context_id) {
+        Some(registry) => registry
+            .deregister(&scp_core::discovery::ScopeDeregisterParams {
                 name,
                 did: DID::from(did.as_str()),
             })
-        },
-    );
+            .map_err(|e| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!("scope deregister failed: {e}"),
+                    code: "SCP-VALID-7134".to_owned(),
+                })
+            })?,
+        None => scp_core::discovery::ScopeDeregisterResult { removed: false },
+    };
 
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {

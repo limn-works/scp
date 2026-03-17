@@ -45,6 +45,9 @@ const MAX_SCOPE_TAGS_COUNT: usize = 20;
 /// Maximum length for a single tag in scope metadata (§22.3.5).
 const MAX_SCOPE_TAG_LENGTH: usize = 64;
 
+/// Maximum number of entries in a single scope registry (§22.3.5).
+const MAX_SCOPE_ENTRIES: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // ScopeRegisterParams / ScopeRegisterResult (§22.3.5)
 // ---------------------------------------------------------------------------
@@ -56,6 +59,7 @@ const MAX_SCOPE_TAG_LENGTH: usize = 64;
 ///
 /// See §22.3.5 Scope Tools and ADR-043.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeRegisterParams {
     /// The scope name to register (e.g., `"cooking-community"`).
     /// Must match `[a-z0-9-]`, max 64 chars, no leading/trailing hyphens.
@@ -68,6 +72,7 @@ pub struct ScopeRegisterParams {
 
 /// Optional metadata attached to a scope registration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeMetadata {
     /// Human-readable description of the scope (max 1024 chars).
     pub description: Option<String>,
@@ -111,6 +116,7 @@ pub enum ScopeRegisterStatus {
 ///
 /// See §22.3.5 Scope Tools.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeLookupParams {
     /// The scope name to look up (e.g., `"cooking-community"`).
     pub name: String,
@@ -135,6 +141,7 @@ pub struct ScopeLookupResult {
 ///
 /// See §22.3.5 Scope Tools.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeDeregisterParams {
     /// The scope name to deregister.
     pub name: String,
@@ -158,6 +165,7 @@ pub struct ScopeDeregisterResult {
 /// Maps a scope name to a context ID with relay URLs. Context-only by
 /// construction — `ScopeTarget` has no identity variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeEntry {
     /// The scope name (normalized, validated).
     pub name: String,
@@ -176,6 +184,7 @@ pub struct ScopeEntry {
 /// What a scope name resolves to. Context-only by construction — has no
 /// identity variant. See ADR-043.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeTarget {
     /// The context ID the scope points to.
     pub context_id: ContextId,
@@ -190,7 +199,9 @@ pub struct ScopeTarget {
 /// Events produced by scope operations in the context event log.
 ///
 /// These are scope-specific event types distinct from handle registration
-/// events and governance events.
+/// events and governance events. Events are produced by the calling layer
+/// when recording scope operations in the context event log, not by
+/// `ScopeRegistry` methods directly (matching `HandleRegistry` pattern).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ScopeRegistrationEvent {
@@ -396,6 +407,13 @@ impl ScopeRegistry {
             });
         }
 
+        // Capacity check before new registration
+        if self.entries.len() >= MAX_SCOPE_ENTRIES {
+            return Err(ScopeRegistryError::Validation(
+                "scope registry capacity exceeded (max 10,000 entries)".to_owned(),
+            ));
+        }
+
         // New registration
         let entry_id = format!("scope-{}", self.next_entry_id);
         self.next_entry_id += 1;
@@ -421,29 +439,44 @@ impl ScopeRegistry {
     ///
     /// Returns matching entries. All entries are context targets by
     /// `ScopeTarget` construction.
-    #[must_use]
-    pub fn lookup(&self, params: &ScopeLookupParams) -> ScopeLookupResult {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeRegistryError`] if the scope name is invalid.
+    pub fn lookup(
+        &self,
+        params: &ScopeLookupParams,
+    ) -> Result<ScopeLookupResult, ScopeRegistryError> {
+        validate_scope_name(&params.name)?;
         let normalized = params.name.to_lowercase();
 
         let results = self.entries.get(&normalized).cloned().into_iter().collect();
 
-        ScopeLookupResult { results }
+        Ok(ScopeLookupResult { results })
     }
 
     /// Deregisters a scope name.
     ///
     /// Only succeeds if the provided DID matches the entry owner.
-    pub fn deregister(&mut self, params: &ScopeDeregisterParams) -> ScopeDeregisterResult {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeRegistryError`] if the scope name is invalid.
+    pub fn deregister(
+        &mut self,
+        params: &ScopeDeregisterParams,
+    ) -> Result<ScopeDeregisterResult, ScopeRegistryError> {
+        validate_scope_name(&params.name)?;
         let normalized = params.name.to_lowercase();
 
         if let Some(entry) = self.entries.get(&normalized)
             && entry.owner_did == params.did
         {
             self.entries.remove(&normalized);
-            return ScopeDeregisterResult { removed: true };
+            return Ok(ScopeDeregisterResult { removed: true });
         }
 
-        ScopeDeregisterResult { removed: false }
+        Ok(ScopeDeregisterResult { removed: false })
     }
 
     /// Returns the number of registered scopes.
@@ -785,9 +818,11 @@ mod tests {
         assert_eq!(registry.len(), 1);
 
         // Verify the entry was updated
-        let lookup = registry.lookup(&ScopeLookupParams {
-            name: "cooking-community".to_owned(),
-        });
+        let lookup = registry
+            .lookup(&ScopeLookupParams {
+                name: "cooking-community".to_owned(),
+            })
+            .unwrap();
         assert_eq!(lookup.results.len(), 1);
         assert_eq!(lookup.results[0].target.context_id, "ctx-cooking-v2");
         assert_eq!(
@@ -920,9 +955,11 @@ mod tests {
             )
             .unwrap();
 
-        let lookup = registry.lookup(&ScopeLookupParams {
-            name: "cooking-community".to_owned(),
-        });
+        let lookup = registry
+            .lookup(&ScopeLookupParams {
+                name: "cooking-community".to_owned(),
+            })
+            .unwrap();
         assert_eq!(lookup.results.len(), 1);
         assert_eq!(lookup.results[0].name, "cooking-community");
         assert_eq!(lookup.results[0].target.context_id, "ctx-cooking");
@@ -932,9 +969,11 @@ mod tests {
     #[test]
     fn lookup_nonexistent_scope_returns_empty() {
         let registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
-        let lookup = registry.lookup(&ScopeLookupParams {
-            name: "nonexistent".to_owned(),
-        });
+        let lookup = registry
+            .lookup(&ScopeLookupParams {
+                name: "nonexistent".to_owned(),
+            })
+            .unwrap();
         assert!(lookup.results.is_empty());
     }
 
@@ -956,10 +995,12 @@ mod tests {
             )
             .unwrap();
 
-        let result = registry.deregister(&ScopeDeregisterParams {
-            name: "cooking".to_owned(),
-            did: admin_did,
-        });
+        let result = registry
+            .deregister(&ScopeDeregisterParams {
+                name: "cooking".to_owned(),
+                did: admin_did,
+            })
+            .unwrap();
         assert!(result.removed);
         assert!(registry.is_empty());
     }
@@ -981,10 +1022,12 @@ mod tests {
             )
             .unwrap();
 
-        let result = registry.deregister(&ScopeDeregisterParams {
-            name: "cooking".to_owned(),
-            did: eve_did,
-        });
+        let result = registry
+            .deregister(&ScopeDeregisterParams {
+                name: "cooking".to_owned(),
+                did: eve_did,
+            })
+            .unwrap();
         assert!(!result.removed);
         assert_eq!(registry.len(), 1);
     }
@@ -992,10 +1035,12 @@ mod tests {
     #[test]
     fn deregister_nonexistent_scope_returns_false() {
         let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
-        let result = registry.deregister(&ScopeDeregisterParams {
-            name: "nonexistent".to_owned(),
-            did: DID::from("did:dht:zAdmin"),
-        });
+        let result = registry
+            .deregister(&ScopeDeregisterParams {
+                name: "nonexistent".to_owned(),
+                did: DID::from("did:dht:zAdmin"),
+            })
+            .unwrap();
         assert!(!result.removed);
     }
 
@@ -1018,10 +1063,12 @@ mod tests {
             )
             .unwrap();
 
-        registry.deregister(&ScopeDeregisterParams {
-            name: "cooking".to_owned(),
-            did: admin_did,
-        });
+        registry
+            .deregister(&ScopeDeregisterParams {
+                name: "cooking".to_owned(),
+                did: admin_did,
+            })
+            .unwrap();
 
         let result = registry
             .register(

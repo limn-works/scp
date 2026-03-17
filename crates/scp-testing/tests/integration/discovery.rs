@@ -563,9 +563,11 @@ fn scope_registry_crud() {
     assert!(result.entry_id.is_some());
 
     // Lookup the scope
-    let lookup = registry.lookup(&ScopeLookupParams {
-        name: "cooking-community".to_owned(),
-    });
+    let lookup = registry
+        .lookup(&ScopeLookupParams {
+            name: "cooking-community".to_owned(),
+        })
+        .unwrap();
     assert_eq!(lookup.results.len(), 1);
     assert_eq!(lookup.results[0].target.context_id, "ctx-cooking");
     assert_eq!(
@@ -575,10 +577,12 @@ fn scope_registry_crud() {
     assert_eq!(lookup.results[0].owner_did, admin_did);
 
     // Deregister the scope
-    let deregister = registry.deregister(&ScopeDeregisterParams {
-        name: "cooking-community".to_owned(),
-        did: admin_did,
-    });
+    let deregister = registry
+        .deregister(&ScopeDeregisterParams {
+            name: "cooking-community".to_owned(),
+            did: admin_did,
+        })
+        .unwrap();
     assert!(deregister.removed);
     assert!(registry.is_empty());
 }
@@ -630,9 +634,11 @@ fn scope_registry_isolation_from_handle_registry() {
     assert_eq!(handle_registry.len(), 1);
 
     // Scope lookup returns scope entry, not handle entry
-    let scope_lookup = scope_registry.lookup(&ScopeLookupParams {
-        name: "cooking".to_owned(),
-    });
+    let scope_lookup = scope_registry
+        .lookup(&ScopeLookupParams {
+            name: "cooking".to_owned(),
+        })
+        .unwrap();
     assert_eq!(scope_lookup.results.len(), 1);
     assert_eq!(scope_lookup.results[0].target.context_id, "ctx-cooking");
 
@@ -688,9 +694,11 @@ fn scope_same_owner_update_is_atomic() {
 
     // Only one entry, with updated target
     assert_eq!(registry.len(), 1);
-    let lookup = registry.lookup(&ScopeLookupParams {
-        name: "cooking".to_owned(),
-    });
+    let lookup = registry
+        .lookup(&ScopeLookupParams {
+            name: "cooking".to_owned(),
+        })
+        .unwrap();
     assert_eq!(lookup.results[0].target.context_id, "ctx-v2");
 }
 
