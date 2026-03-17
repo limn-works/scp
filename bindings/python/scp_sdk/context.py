@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -67,6 +68,28 @@ _MAX_DEPLOY_ID_BYTES: int = 128
 # ---------------------------------------------------------------------------
 
 
+def _is_unicode_formatting(ch: str) -> bool:
+    """Return True for Unicode formatting/invisible characters.
+
+    Mirrors the Rust ``is_unicode_formatting`` helper. Covers NBSP, Ogham
+    space, typographic spaces, zero-width chars, bidi controls, word joiners,
+    invisible operators, BOM, and non-characters.
+    """
+    cp = ord(ch)
+    return (
+        cp == 0x00A0  # NBSP
+        or cp == 0x1680  # Ogham space mark
+        or 0x2000 <= cp <= 0x200F  # Typographic spaces + ZWSP..RLM
+        or cp in (0x2028, 0x2029)  # Line/paragraph separators
+        or 0x202A <= cp <= 0x202F  # Bidi controls + narrow no-break space
+        or cp == 0x205F  # Medium mathematical space
+        or 0x2060 <= cp <= 0x206F  # Word joiner, invisible operators
+        or cp == 0x3000  # Ideographic space
+        or cp == 0xFEFF  # BOM / ZWNBSP
+        or cp in (0xFFFE, 0xFFFF)  # Non-characters
+    )
+
+
 def validate_content_path(path: str) -> None:
     """Validate a content path before FFI crossing (SCP-297).
 
@@ -77,6 +100,8 @@ def validate_content_path(path: str) -> None:
         ValidationError: If the path is invalid, with a message
             describing the specific violation.
     """
+    # NFC-normalize before validation (Fix 3)
+    path = unicodedata.normalize("NFC", path)
     if not path.startswith("/"):
         raise ValidationError(
             "ContentPath must start with '/'",
@@ -114,9 +139,19 @@ def validate_content_path(path: str) -> None:
         )
     for ch in path:
         cp = ord(ch)
-        if 0x00 <= cp <= 0x1F or cp == 0x7F:
+        # C0 controls (U+0000-U+001F), DEL (U+007F), and C1 controls (U+0080-U+009F)
+        if cp <= 0x1F or cp == 0x7F or (0x80 <= cp <= 0x9F):
             raise ValidationError(
                 f"ContentPath must not contain control character U+{cp:04X}",
+                code="SCP-VALID-7010",
+            )
+    # Reject non-ASCII whitespace, bidi, and formatting characters
+    for ch in path:
+        if not ch.isascii() and (
+            unicodedata.category(ch) in ("Cc", "Zs") or _is_unicode_formatting(ch)
+        ):
+            raise ValidationError(
+                f"ContentPath must not contain non-ASCII whitespace/formatting U+{ord(ch):04X}",
                 code="SCP-VALID-7010",
             )
     if "//" in path:
@@ -142,6 +177,15 @@ def validate_content_path(path: str) -> None:
             )
 
 
+def _is_mime_tchar(ch: str) -> bool:
+    """Return True if ``ch`` is a valid RFC 7230 tchar (minus ``%``).
+
+    tchar = ALPHA / DIGIT / ``!`` / ``#`` / ``$`` / ``&`` / ``'`` /
+    ``*`` / ``+`` / ``-`` / ``.`` / ``^`` / ``_`` / backtick / ``|`` / ``~``
+    """
+    return ch.isascii() and (ch.isalnum() or ch in "!#$&'*+-.^_`|~")
+
+
 def validate_mime_type(content_type: str) -> None:
     """Validate a MIME type before FFI crossing (SCP-297).
 
@@ -158,9 +202,11 @@ def validate_mime_type(content_type: str) -> None:
             code="SCP-VALID-7011",
         )
     for ch in content_type:
-        if ord(ch) <= 0x1F or ord(ch) == 0x7F:
+        cp = ord(ch)
+        # C0 controls (U+0000-U+001F), DEL (U+007F), and C1 controls (U+0080-U+009F)
+        if cp <= 0x1F or cp == 0x7F or (0x80 <= cp <= 0x9F):
             raise ValidationError(
-                f"MimeType must not contain control character U+{ord(ch):04X}",
+                f"MimeType must not contain control character U+{cp:04X}",
                 code="SCP-VALID-7011",
             )
     if ";" in content_type:
@@ -177,6 +223,17 @@ def validate_mime_type(content_type: str) -> None:
     if not type_part or not subtype_part:
         raise ValidationError(
             "MimeType type and subtype must both be non-empty",
+            code="SCP-VALID-7011",
+        )
+    # RFC 7230 §3.2.6 tchar validation
+    if not all(_is_mime_tchar(c) for c in type_part):
+        raise ValidationError(
+            "MimeType type part contains invalid characters",
+            code="SCP-VALID-7011",
+        )
+    if not all(_is_mime_tchar(c) for c in subtype_part):
+        raise ValidationError(
+            "MimeType subtype part contains invalid characters",
             code="SCP-VALID-7011",
         )
 

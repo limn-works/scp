@@ -93,6 +93,31 @@ class TestValidateContentPath:
         with pytest.raises(ValidationError, match="directory traversal"):
             validate_content_path("/path/../etc/passwd")
 
+    def test_rejects_c1_control_char(self) -> None:
+        """Fix 4: C1 control range U+0080-U+009F."""
+        with pytest.raises(ValidationError, match="control character U\\+0085"):
+            validate_content_path("/path\u0085file")
+
+    def test_rejects_zero_width_space(self) -> None:
+        """Fix 1: Zero-width space U+200B."""
+        with pytest.raises(ValidationError, match="whitespace/formatting U\\+200B"):
+            validate_content_path("/path\u200bfile")
+
+    def test_rejects_bidi_override(self) -> None:
+        """Fix 1: Bidi override U+202E."""
+        with pytest.raises(ValidationError, match="whitespace/formatting U\\+202E"):
+            validate_content_path("/path\u202efile")
+
+    def test_rejects_nbsp(self) -> None:
+        """Fix 1: Non-breaking space U+00A0."""
+        with pytest.raises(ValidationError, match="whitespace/formatting U\\+00A0"):
+            validate_content_path("/path\u00a0file")
+
+    def test_nfc_normalization(self) -> None:
+        """Fix 3: NFC normalization — decomposed e-acute accepted after normalization."""
+        # U+0065 U+0301 (e + combining acute) normalizes to U+00E9 (e-acute)
+        validate_content_path("/caf\u0065\u0301")
+
     def test_error_code(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
             validate_content_path("no-slash")
@@ -151,6 +176,25 @@ class TestValidateMimeType:
     def test_rejects_null(self) -> None:
         with pytest.raises(ValidationError, match="control character"):
             validate_mime_type("text/\x00html")
+
+    def test_rejects_c1_control_char(self) -> None:
+        """Fix 4: C1 control range U+0080-U+009F in MIME type."""
+        with pytest.raises(ValidationError, match="control character U\\+0085"):
+            validate_mime_type("text/\u0085html")
+
+    def test_rejects_non_tchar_in_type(self) -> None:
+        """Fix 2: Non-tchar character in type part."""
+        with pytest.raises(ValidationError, match="type part contains invalid"):
+            validate_mime_type("te xt/html")
+
+    def test_rejects_non_tchar_in_subtype(self) -> None:
+        """Fix 2: Non-tchar character in subtype part."""
+        with pytest.raises(ValidationError, match="subtype part contains invalid"):
+            validate_mime_type("text/ht ml")
+
+    def test_accepts_tchar_special_chars(self) -> None:
+        """Fix 2: tchar special characters are accepted."""
+        validate_mime_type("application/vnd.foo+bar")
 
     def test_error_code(self) -> None:
         with pytest.raises(ValidationError) as exc_info:

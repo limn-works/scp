@@ -130,6 +130,40 @@ struct ValidationTests {
         }
     }
 
+    @Test("rejects C1 control character (Fix 4)")
+    func contentPathC1Control() throws {
+        #expect(throws: ScpError.self) {
+            try validateContentPath("/path\u{85}file")
+        }
+    }
+
+    @Test("rejects zero-width space (Fix 1)")
+    func contentPathZeroWidthSpace() throws {
+        #expect(throws: ScpError.self) {
+            try validateContentPath("/path\u{200B}file")
+        }
+    }
+
+    @Test("rejects bidi override (Fix 1)")
+    func contentPathBidiOverride() throws {
+        #expect(throws: ScpError.self) {
+            try validateContentPath("/path\u{202E}file")
+        }
+    }
+
+    @Test("rejects NBSP (Fix 1)")
+    func contentPathNBSP() throws {
+        #expect(throws: ScpError.self) {
+            try validateContentPath("/path\u{00A0}file")
+        }
+    }
+
+    @Test("NFC normalizes before validation (Fix 3)")
+    func contentPathNFCNormalization() throws {
+        // U+0065 U+0301 (e + combining acute) normalizes to U+00E9 (e-acute)
+        try validateContentPath("/caf\u{0065}\u{0301}")
+    }
+
     // MARK: - MimeType
 
     @Test("valid text/html accepted")
@@ -208,6 +242,32 @@ struct ValidationTests {
         #expect(throws: ScpError.self) {
             try validateMimeType("text/\0html")
         }
+    }
+
+    @Test("rejects C1 control character in MIME type (Fix 4)")
+    func mimeTypeC1Control() throws {
+        #expect(throws: ScpError.self) {
+            try validateMimeType("text/\u{85}html")
+        }
+    }
+
+    @Test("rejects non-tchar in type part (Fix 2)")
+    func mimeTypeNonTcharType() throws {
+        #expect(throws: ScpError.self) {
+            try validateMimeType("te xt/html")
+        }
+    }
+
+    @Test("rejects non-tchar in subtype part (Fix 2)")
+    func mimeTypeNonTcharSubtype() throws {
+        #expect(throws: ScpError.self) {
+            try validateMimeType("text/ht ml")
+        }
+    }
+
+    @Test("accepts tchar special characters (Fix 2)")
+    func mimeTypeTcharSpecialChars() throws {
+        try validateMimeType("application/vnd.foo+bar")
     }
 
     // MARK: - deploy_id

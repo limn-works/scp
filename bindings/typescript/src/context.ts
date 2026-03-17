@@ -98,6 +98,82 @@ const MAX_CONTENT_PATH_BYTES = 1024;
 const MAX_DEPLOY_ID_BYTES = 128;
 
 /**
+ * Returns true for Unicode formatting/invisible characters.
+ * Mirrors the Rust `is_unicode_formatting` helper.
+ */
+function _isUnicodeFormatting(cp: number): boolean {
+  return (
+    cp === 0x00a0 || // NBSP
+    cp === 0x1680 || // Ogham space mark
+    (cp >= 0x2000 && cp <= 0x200f) || // Typographic spaces (2000-200A) + ZWSP..RLM (200B-200F)
+    cp === 0x2028 ||
+    cp === 0x2029 ||
+    (cp >= 0x202a && cp <= 0x202f) || // Bidi embedding controls + narrow no-break space
+    cp === 0x205f ||
+    (cp >= 0x2060 && cp <= 0x206f) ||
+    cp === 0x3000 ||
+    cp === 0xfeff ||
+    cp === 0xfffe ||
+    cp === 0xffff
+  );
+}
+
+/** RFC 7230 §3.2.6 tchar test (minus '%'). */
+const TCHAR_RE = /^[a-zA-Z0-9!#$&'*+\-.^_`|~]+$/;
+
+/** Forbidden substrings in content paths, paired with error messages. */
+const _CONTENT_PATH_FORBIDDEN: [string, string][] = [
+  ["\\", "ContentPath must not contain backslashes"],
+  ["%", "ContentPath must not contain percent-encoded bytes"],
+  ["?", "ContentPath must not contain query strings ('?')"],
+  ["#", "ContentPath must not contain fragments ('#')"],
+  ["\0", "ContentPath must not contain null bytes"],
+  ["//", "ContentPath must not contain '//'"],
+];
+
+/** Formats a code point as a zero-padded uppercase hex string. */
+function _cpHex(cp: number): string {
+  return cp.toString(16).toUpperCase().padStart(4, "0");
+}
+
+/** Checks for forbidden substrings, control characters, and formatting chars. */
+function _contentPathCharError(path: string): string | null {
+  for (const [sub, msg] of _CONTENT_PATH_FORBIDDEN) {
+    if (path.includes(sub)) return msg;
+  }
+  for (const ch of path) {
+    const cp = ch.codePointAt(0) ?? 0;
+    // C0 controls (U+0000-U+001F), DEL (U+007F), and C1 controls (U+0080-U+009F)
+    if (cp <= 0x1f || cp === 0x7f || (cp >= 0x80 && cp <= 0x9f)) {
+      return `ContentPath must not contain control character U+${_cpHex(cp)}`;
+    }
+  }
+  for (const ch of path) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp > 0x7f && _isUnicodeFormatting(cp)) {
+      return `ContentPath must not contain non-ASCII whitespace/formatting U+${_cpHex(cp)}`;
+    }
+  }
+  return null;
+}
+
+/** Checks structural rules (prefix, length, trailing slash, segments). */
+function _contentPathStructureError(path: string): string | null {
+  if (!path.startsWith("/")) return "ContentPath must start with '/'";
+  if (new TextEncoder().encode(path).length > MAX_CONTENT_PATH_BYTES) {
+    return `ContentPath exceeds ${MAX_CONTENT_PATH_BYTES} bytes`;
+  }
+  if (path.length > 1 && path.endsWith("/")) {
+    return "ContentPath must not have trailing slash (except root '/')";
+  }
+  for (const segment of path.split("/").slice(1)) {
+    if (segment === ".") return "ContentPath must not contain '.' segments";
+    if (segment === "..") return "ContentPath must not contain '..' segments (directory traversal)";
+  }
+  return null;
+}
+
+/**
  * Validates a content path before FFI crossing (SCP-297).
  *
  * Mirrors the Rust `ContentPath::new` validation from
@@ -107,62 +183,10 @@ const MAX_DEPLOY_ID_BYTES = 128;
  * @internal Exported for testing.
  */
 export function _validateContentPath(path: string): void {
-  if (!path.startsWith("/")) {
-    throw new ValidationError("ContentPath must start with '/'", "SCP-VALID-7010");
-  }
-  if (new TextEncoder().encode(path).length > MAX_CONTENT_PATH_BYTES) {
-    throw new ValidationError(
-      `ContentPath exceeds ${MAX_CONTENT_PATH_BYTES} bytes`,
-      "SCP-VALID-7010",
-    );
-  }
-  if (path.includes("\\")) {
-    throw new ValidationError("ContentPath must not contain backslashes", "SCP-VALID-7010");
-  }
-  if (path.includes("%")) {
-    throw new ValidationError(
-      "ContentPath must not contain percent-encoded bytes",
-      "SCP-VALID-7010",
-    );
-  }
-  if (path.includes("?")) {
-    throw new ValidationError("ContentPath must not contain query strings ('?')", "SCP-VALID-7010");
-  }
-  if (path.includes("#")) {
-    throw new ValidationError("ContentPath must not contain fragments ('#')", "SCP-VALID-7010");
-  }
-  if (path.includes("\0")) {
-    throw new ValidationError("ContentPath must not contain null bytes", "SCP-VALID-7010");
-  }
-  for (const ch of path) {
-    const cp = ch.codePointAt(0) ?? 0;
-    if ((cp >= 0x00 && cp <= 0x1f) || cp === 0x7f) {
-      throw new ValidationError(
-        `ContentPath must not contain control character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`,
-        "SCP-VALID-7010",
-      );
-    }
-  }
-  if (path.includes("//")) {
-    throw new ValidationError("ContentPath must not contain '//'", "SCP-VALID-7010");
-  }
-  if (path.length > 1 && path.endsWith("/")) {
-    throw new ValidationError(
-      "ContentPath must not have trailing slash (except root '/')",
-      "SCP-VALID-7010",
-    );
-  }
-  for (const segment of path.split("/").slice(1)) {
-    if (segment === ".") {
-      throw new ValidationError("ContentPath must not contain '.' segments", "SCP-VALID-7010");
-    }
-    if (segment === "..") {
-      throw new ValidationError(
-        "ContentPath must not contain '..' segments (directory traversal)",
-        "SCP-VALID-7010",
-      );
-    }
-  }
+  // NFC-normalize before validation
+  const normalized = path.normalize("NFC");
+  const error = _contentPathStructureError(normalized) ?? _contentPathCharError(normalized);
+  if (error) throw new ValidationError(error, "SCP-VALID-7010");
 }
 
 /**
@@ -180,7 +204,8 @@ export function _validateMimeType(contentType: string): void {
   }
   for (const ch of contentType) {
     const cp = ch.codePointAt(0) ?? 0;
-    if (cp <= 0x1f || cp === 0x7f) {
+    // C0 controls (U+0000-U+001F), DEL (U+007F), and C1 controls (U+0080-U+009F)
+    if (cp <= 0x1f || cp === 0x7f || (cp >= 0x80 && cp <= 0x9f)) {
       throw new ValidationError(
         `MimeType must not contain control character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`,
         "SCP-VALID-7011",
@@ -203,6 +228,16 @@ export function _validateMimeType(contentType: string): void {
   const [typePart, subtypePart] = contentType.split("/", 2);
   if (!typePart || !subtypePart) {
     throw new ValidationError("MimeType type and subtype must both be non-empty", "SCP-VALID-7011");
+  }
+  // RFC 7230 §3.2.6 tchar validation
+  if (!TCHAR_RE.test(typePart)) {
+    throw new ValidationError("MimeType type part contains invalid characters", "SCP-VALID-7011");
+  }
+  if (!TCHAR_RE.test(subtypePart)) {
+    throw new ValidationError(
+      "MimeType subtype part contains invalid characters",
+      "SCP-VALID-7011",
+    );
   }
 }
 

@@ -89,7 +89,29 @@ describe("validateContentPath (SCP-297)", () => {
     expect(() => _validateContentPath("/path/../etc/passwd")).toThrow(/directory traversal/);
   });
 
+  it("rejects C1 control character (Fix 4)", () => {
+    expect(() => _validateContentPath("/path\u0085file")).toThrow(/control character U\+0085/);
+  });
+
+  it("rejects zero-width space (Fix 1)", () => {
+    expect(() => _validateContentPath("/path\u200Bfile")).toThrow(/whitespace\/formatting U\+200B/);
+  });
+
+  it("rejects bidi override (Fix 1)", () => {
+    expect(() => _validateContentPath("/path\u202Efile")).toThrow(/whitespace\/formatting U\+202E/);
+  });
+
+  it("rejects NBSP (Fix 1)", () => {
+    expect(() => _validateContentPath("/path\u00A0file")).toThrow(/whitespace\/formatting U\+00A0/);
+  });
+
+  it("NFC normalizes before validation (Fix 3)", () => {
+    // U+0065 U+0301 (e + combining acute) normalizes to U+00E9 (e-acute)
+    expect(() => _validateContentPath("/caf\u0065\u0301")).not.toThrow();
+  });
+
   it("uses error code SCP-VALID-7010", () => {
+    expect.assertions(2);
     try {
       _validateContentPath("no-slash");
     } catch (e) {
@@ -152,7 +174,24 @@ describe("validateMimeType (SCP-297)", () => {
     expect(() => _validateMimeType("text/\x00html")).toThrow(/control character/);
   });
 
+  it("rejects C1 control character in MIME type (Fix 4)", () => {
+    expect(() => _validateMimeType("text/\u0085html")).toThrow(/control character U\+0085/);
+  });
+
+  it("rejects non-tchar in type part (Fix 2)", () => {
+    expect(() => _validateMimeType("te xt/html")).toThrow(/type part contains invalid/);
+  });
+
+  it("rejects non-tchar in subtype part (Fix 2)", () => {
+    expect(() => _validateMimeType("text/ht ml")).toThrow(/subtype part contains invalid/);
+  });
+
+  it("accepts tchar special characters (Fix 2)", () => {
+    expect(() => _validateMimeType("application/vnd.foo+bar")).not.toThrow();
+  });
+
   it("uses error code SCP-VALID-7011", () => {
+    expect.assertions(2);
     try {
       _validateMimeType("");
     } catch (e) {
@@ -204,6 +243,7 @@ describe("validateDeployId (SCP-297)", () => {
   });
 
   it("uses error code SCP-VALID-7012", () => {
+    expect.assertions(2);
     try {
       _validateDeployId("");
     } catch (e) {

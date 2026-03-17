@@ -123,6 +123,36 @@ class ValidationTest {
         assertContains(ex.message.orEmpty(), "directory traversal")
     }
 
+    @Test
+    fun `content path - rejects C1 control character`() {
+        val ex = assertThrows<BridgeException> { validateContentPath("/path\u0085file") }
+        assertContains(ex.message.orEmpty(), "control character U+0085")
+    }
+
+    @Test
+    fun `content path - rejects zero-width space`() {
+        val ex = assertThrows<BridgeException> { validateContentPath("/path\u200Bfile") }
+        assertContains(ex.message.orEmpty(), "whitespace/formatting U+200B")
+    }
+
+    @Test
+    fun `content path - rejects bidi override`() {
+        val ex = assertThrows<BridgeException> { validateContentPath("/path\u202Efile") }
+        assertContains(ex.message.orEmpty(), "whitespace/formatting U+202E")
+    }
+
+    @Test
+    fun `content path - rejects NBSP`() {
+        val ex = assertThrows<BridgeException> { validateContentPath("/path\u00A0file") }
+        assertContains(ex.message.orEmpty(), "whitespace/formatting U+00A0")
+    }
+
+    @Test
+    fun `content path - NFC normalizes before validation`() {
+        // U+0065 U+0301 (e + combining acute) normalizes to U+00E9 (e-acute)
+        assertDoesNotThrow { validateContentPath("/caf\u0065\u0301") }
+    }
+
     // -- MimeType -------------------------------------------------------------
 
     @Test
@@ -193,6 +223,29 @@ class ValidationTest {
     fun `mime type - rejects null byte`() {
         val ex = assertThrows<BridgeException> { validateMimeType("text/\u0000html") }
         assertContains(ex.message.orEmpty(), "control character")
+    }
+
+    @Test
+    fun `mime type - rejects C1 control character`() {
+        val ex = assertThrows<BridgeException> { validateMimeType("text/\u0085html") }
+        assertContains(ex.message.orEmpty(), "control character U+0085")
+    }
+
+    @Test
+    fun `mime type - rejects non-tchar in type part`() {
+        val ex = assertThrows<BridgeException> { validateMimeType("te xt/html") }
+        assertContains(ex.message.orEmpty(), "type part contains invalid")
+    }
+
+    @Test
+    fun `mime type - rejects non-tchar in subtype part`() {
+        val ex = assertThrows<BridgeException> { validateMimeType("text/ht ml") }
+        assertContains(ex.message.orEmpty(), "subtype part contains invalid")
+    }
+
+    @Test
+    fun `mime type - accepts tchar special characters`() {
+        assertDoesNotThrow { validateMimeType("application/vnd.foo+bar") }
     }
 
     // -- deploy_id ------------------------------------------------------------
