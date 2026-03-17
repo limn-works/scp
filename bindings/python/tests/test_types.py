@@ -524,3 +524,263 @@ class TestPackageReExports:
     def test_tools_accessible_from_top_level(self) -> None:
         assert scp_sdk.ToolDefinition is ToolDefinition
         assert scp_sdk.TestVector is TestVector
+
+    def test_site_config_accessible_from_top_level(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        assert scp_sdk.SiteConfig is SiteConfig
+
+
+# -----------------------------------------------------------------------
+# SiteConfig tests (SCP-293, spec §18.11.12)
+# -----------------------------------------------------------------------
+
+
+class TestSiteConfig:
+    """Tests for the SiteConfig dataclass."""
+
+    def test_construction_with_defaults(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com")
+        assert config.hostname == "example.com"
+        assert config.index_path == "/index.html"
+        assert config.max_assets_per_deploy == 10_000
+        assert config.max_deploy_size_bytes == 536_870_912
+        assert config.deploy_retention_count == 2
+        assert config.csp_override is None
+
+    def test_construction_with_all_fields(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(
+            hostname="cdn.example.com",
+            index_path="/home.html",
+            max_assets_per_deploy=5_000,
+            max_deploy_size_bytes=268_435_456,
+            deploy_retention_count=4,
+            csp_override="default-src 'self'",
+        )
+        assert config.hostname == "cdn.example.com"
+        assert config.index_path == "/home.html"
+        assert config.max_assets_per_deploy == 5_000
+        assert config.max_deploy_size_bytes == 268_435_456
+        assert config.deploy_retention_count == 4
+        assert config.csp_override == "default-src 'self'"
+
+    def test_frozen(self) -> None:
+        import dataclasses
+
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com")
+        with __import__("pytest").raises(dataclasses.FrozenInstanceError):
+            config.hostname = "other.com"  # type: ignore[misc]
+
+
+class TestSiteConfigHostnameValidation:
+    """Tests for hostname validation in SiteConfig."""
+
+    def test_valid_hostname(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        SiteConfig(hostname="example.com")
+        SiteConfig(hostname="my-site.example.com")
+        SiteConfig(hostname="localhost")
+        SiteConfig(hostname="a.b.c.d")
+
+    def test_empty_hostname(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="hostname must not be empty"):
+            SiteConfig(hostname="")
+
+    def test_hostname_exceeds_253_chars(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        long = "a" * 63 + "." + "b" * 63 + "." + "c" * 63 + "." + "d" * 63 + ".e"
+        with pytest.raises(ValueError, match="hostname exceeds 253 characters"):
+            SiteConfig(hostname=long)
+
+    def test_hostname_invalid_chars(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="hostname label contains invalid characters"):
+            SiteConfig(hostname="bad_host.com")
+
+    def test_hostname_label_leading_hyphen(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="hostname label contains invalid characters"):
+            SiteConfig(hostname="-bad.com")
+
+    def test_hostname_label_trailing_hyphen(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="hostname label contains invalid characters"):
+            SiteConfig(hostname="bad-.com")
+
+
+class TestSiteConfigRetentionCountValidation:
+    """Tests for deploy_retention_count bounds in SiteConfig."""
+
+    def test_retention_count_1(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com", deploy_retention_count=1)
+        assert config.deploy_retention_count == 1
+
+    def test_retention_count_8(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com", deploy_retention_count=8)
+        assert config.deploy_retention_count == 8
+
+    def test_retention_count_0_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(
+            ValueError,
+            match="deploy_retention_count must be an integer between 1 and 8",
+        ):
+            SiteConfig(hostname="example.com", deploy_retention_count=0)
+
+    def test_retention_count_9_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(
+            ValueError,
+            match="deploy_retention_count must be an integer between 1 and 8",
+        ):
+            SiteConfig(hostname="example.com", deploy_retention_count=9)
+
+
+class TestSiteConfigCspValidation:
+    """Tests for CSP validation in SiteConfig."""
+
+    def test_valid_csp(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        SiteConfig(hostname="example.com", csp_override="default-src 'self'")
+
+    def test_csp_unsafe_eval(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="CSP must not contain 'unsafe-eval'"):
+            SiteConfig(
+                hostname="example.com",
+                csp_override="script-src 'unsafe-eval'",
+            )
+
+    def test_csp_unsafe_inline(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="CSP must not contain 'unsafe-inline'"):
+            SiteConfig(
+                hostname="example.com",
+                csp_override="style-src 'unsafe-inline'",
+            )
+
+    def test_csp_unsafe_hashes(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="CSP must not contain 'unsafe-hashes'"):
+            SiteConfig(
+                hostname="example.com",
+                csp_override="script-src 'unsafe-hashes'",
+            )
+
+    def test_csp_bare_wildcard(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match=r"CSP must not contain bare wildcard '\*'"):
+            SiteConfig(hostname="example.com", csp_override="default-src *")
+
+    def test_csp_subdomain_wildcard_allowed(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        SiteConfig(
+            hostname="example.com",
+            csp_override="default-src *.example.com",
+        )
+
+    def test_csp_data_source(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="CSP must not contain 'data:' source"):
+            SiteConfig(hostname="example.com", csp_override="img-src data:")
+
+    def test_csp_blob_source(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="CSP must not contain 'blob:' source"):
+            SiteConfig(hostname="example.com", csp_override="worker-src blob:")
+
+    def test_csp_case_insensitive(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="CSP must not contain 'unsafe-eval'"):
+            SiteConfig(
+                hostname="example.com",
+                csp_override="script-src 'Unsafe-Eval'",
+            )
+
+
+class TestSiteConfigDeployLimitsValidation:
+    """Tests for max_assets_per_deploy and max_deploy_size_bytes bounds."""
+
+    def test_max_assets_per_deploy_zero_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="max_assets_per_deploy must be >= 1"):
+            SiteConfig(hostname="example.com", max_assets_per_deploy=0)
+
+    def test_max_deploy_size_bytes_negative_rejected(self) -> None:
+        import pytest
+
+        from scp_sdk.context import SiteConfig
+
+        with pytest.raises(ValueError, match="max_deploy_size_bytes must be >= 1"):
+            SiteConfig(hostname="example.com", max_deploy_size_bytes=-1)
+
+    def test_max_assets_per_deploy_one_accepted(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com", max_assets_per_deploy=1)
+        assert config.max_assets_per_deploy == 1
+
+    def test_max_deploy_size_bytes_one_accepted(self) -> None:
+        from scp_sdk.context import SiteConfig
+
+        config = SiteConfig(hostname="example.com", max_deploy_size_bytes=1)
+        assert config.max_deploy_size_bytes == 1

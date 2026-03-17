@@ -271,6 +271,7 @@ export type {
   RequireParticipation,
   ResolutionLayer,
   ResolutionPath,
+  SiteConfig,
   TestVector,
   ToolCost,
   ToolDefinition,
@@ -284,6 +285,8 @@ export type {
   UcanToken,
   VerificationMethod,
 } from "./types";
+
+export { validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // Storage

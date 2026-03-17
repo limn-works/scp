@@ -19,11 +19,13 @@ import type {
   Proof,
   RequireParticipation,
   ResolutionPath,
+  SiteConfig,
   ToolDefinition,
   TransportStatus,
   TrustLevel,
   UcanToken,
 } from "../src/types";
+import { validateSiteConfig } from "../src/types";
 
 describe("type definitions", () => {
   it("ContextParams has required ceiling field", () => {
@@ -327,5 +329,201 @@ describe("type definitions", () => {
     expect(requirement.fact).toBe("ToolInvocationCount");
     expect(requirement.maxAgeSecs).toBe(7200);
     expect(requirement.minContexts).toBe(3);
+  });
+
+  // -- SiteConfig types (SCP-293, §18.11.12) --------------------------------
+
+  it("SiteConfig with only hostname (defaults)", () => {
+    const config: SiteConfig = {
+      hostname: "mysite.example.com",
+    };
+    expect(config.hostname).toBe("mysite.example.com");
+    expect(config.indexPath).toBeUndefined();
+    expect(config.maxAssetsPerDeploy).toBeUndefined();
+    expect(config.maxDeploySizeBytes).toBeUndefined();
+    expect(config.deployRetentionCount).toBeUndefined();
+    expect(config.cspOverride).toBeUndefined();
+  });
+
+  it("SiteConfig with all fields", () => {
+    const config: SiteConfig = {
+      hostname: "cdn.example.com",
+      indexPath: "/home.html",
+      maxAssetsPerDeploy: 5000,
+      maxDeploySizeBytes: 268435456,
+      deployRetentionCount: 4,
+      cspOverride: "default-src 'self'",
+    };
+    expect(config.hostname).toBe("cdn.example.com");
+    expect(config.indexPath).toBe("/home.html");
+    expect(config.maxAssetsPerDeploy).toBe(5000);
+    expect(config.maxDeploySizeBytes).toBe(268435456);
+    expect(config.deployRetentionCount).toBe(4);
+    expect(config.cspOverride).toBe("default-src 'self'");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SiteConfig validation (SCP-293)
+// ---------------------------------------------------------------------------
+
+describe("validateSiteConfig", () => {
+  it("accepts valid config with hostname only", () => {
+    expect(() => validateSiteConfig({ hostname: "example.com" })).not.toThrow();
+  });
+
+  it("accepts valid config with all fields", () => {
+    expect(() =>
+      validateSiteConfig({
+        hostname: "cdn.example.com",
+        indexPath: "/home.html",
+        maxAssetsPerDeploy: 5000,
+        maxDeploySizeBytes: 268435456,
+        deployRetentionCount: 4,
+        cspOverride: "default-src 'self'",
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects empty hostname", () => {
+    expect(() => validateSiteConfig({ hostname: "" })).toThrow("hostname must not be empty");
+  });
+
+  it("rejects hostname exceeding 253 characters", () => {
+    const longHostname = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(63)}.e`;
+    expect(() => validateSiteConfig({ hostname: longHostname })).toThrow(
+      "hostname exceeds 253 characters",
+    );
+  });
+
+  it("rejects hostname label with invalid characters", () => {
+    expect(() => validateSiteConfig({ hostname: "bad_host.com" })).toThrow(
+      "hostname label contains invalid characters",
+    );
+  });
+
+  it("rejects hostname label starting with hyphen", () => {
+    expect(() => validateSiteConfig({ hostname: "-bad.com" })).toThrow(
+      "hostname label starts or ends with '-'",
+    );
+  });
+
+  it("rejects hostname label ending with hyphen", () => {
+    expect(() => validateSiteConfig({ hostname: "bad-.com" })).toThrow(
+      "hostname label starts or ends with '-'",
+    );
+  });
+
+  it("accepts hostname with hyphens in middle", () => {
+    expect(() => validateSiteConfig({ hostname: "my-site.example.com" })).not.toThrow();
+  });
+
+  it("accepts single-label hostname", () => {
+    expect(() => validateSiteConfig({ hostname: "localhost" })).not.toThrow();
+  });
+
+  it("rejects deployRetentionCount of 0", () => {
+    expect(() => validateSiteConfig({ hostname: "example.com", deployRetentionCount: 0 })).toThrow(
+      "deployRetentionCount must be an integer between 1 and 8",
+    );
+  });
+
+  it("rejects deployRetentionCount of 9", () => {
+    expect(() => validateSiteConfig({ hostname: "example.com", deployRetentionCount: 9 })).toThrow(
+      "deployRetentionCount must be an integer between 1 and 8",
+    );
+  });
+
+  it("accepts deployRetentionCount of 1", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", deployRetentionCount: 1 }),
+    ).not.toThrow();
+  });
+
+  it("accepts deployRetentionCount of 8", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", deployRetentionCount: 8 }),
+    ).not.toThrow();
+  });
+
+  it("rejects CSP with unsafe-eval", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "script-src 'unsafe-eval'" }),
+    ).toThrow("CSP must not contain 'unsafe-eval'");
+  });
+
+  it("rejects CSP with unsafe-inline", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "style-src 'unsafe-inline'" }),
+    ).toThrow("CSP must not contain 'unsafe-inline'");
+  });
+
+  it("rejects CSP with unsafe-hashes", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "script-src 'unsafe-hashes'" }),
+    ).toThrow("CSP must not contain 'unsafe-hashes'");
+  });
+
+  it("rejects CSP with bare wildcard", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "default-src *" }),
+    ).toThrow("CSP must not contain bare wildcard '*'");
+  });
+
+  it("allows CSP with subdomain wildcard", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "default-src *.example.com" }),
+    ).not.toThrow();
+  });
+
+  it("rejects CSP with data: source", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "img-src data:" }),
+    ).toThrow("CSP must not contain 'data:' source");
+  });
+
+  it("rejects CSP with blob: source", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "worker-src blob:" }),
+    ).toThrow("CSP must not contain 'blob:' source");
+  });
+
+  it("accepts valid CSP", () => {
+    expect(() =>
+      validateSiteConfig({
+        hostname: "example.com",
+        cspOverride: "default-src 'self'; script-src 'nonce-abc123'",
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects CSP with case-variant unsafe-eval", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", cspOverride: "script-src 'Unsafe-Eval'" }),
+    ).toThrow("CSP must not contain 'unsafe-eval'");
+  });
+
+  it("rejects maxAssetsPerDeploy of 0", () => {
+    expect(() => validateSiteConfig({ hostname: "example.com", maxAssetsPerDeploy: 0 })).toThrow(
+      "maxAssetsPerDeploy must be >= 1",
+    );
+  });
+
+  it("rejects maxDeploySizeBytes of -1", () => {
+    expect(() => validateSiteConfig({ hostname: "example.com", maxDeploySizeBytes: -1 })).toThrow(
+      "maxDeploySizeBytes must be >= 1",
+    );
+  });
+
+  it("accepts maxAssetsPerDeploy of 1", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", maxAssetsPerDeploy: 1 }),
+    ).not.toThrow();
+  });
+
+  it("accepts maxDeploySizeBytes of 1", () => {
+    expect(() =>
+      validateSiteConfig({ hostname: "example.com", maxDeploySizeBytes: 1 }),
+    ).not.toThrow();
   });
 });

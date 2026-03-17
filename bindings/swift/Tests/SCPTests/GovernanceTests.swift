@@ -1353,3 +1353,191 @@ struct GovernanceTests {
         #expect(receivedRequirements == "[{}]")
     }
 } // end GovernanceTests
+
+// MARK: - SiteConfig Tests (SCP-293, spec §18.11.12)
+
+struct SiteConfigTests {
+    // MARK: - Construction
+
+    @Test func constructionWithDefaults() throws {
+        let config = try SiteConfig(hostname: "example.com")
+        #expect(config.hostname == "example.com")
+        #expect(config.indexPath == "/index.html")
+        #expect(config.maxAssetsPerDeploy == 10000)
+        #expect(config.maxDeploySizeBytes == 536_870_912)
+        #expect(config.deployRetentionCount == 2)
+        #expect(config.cspOverride == nil)
+    }
+
+    @Test func constructionWithAllFields() throws {
+        let config = try SiteConfig(
+            hostname: "cdn.example.com",
+            indexPath: "/home.html",
+            maxAssetsPerDeploy: 5000,
+            maxDeploySizeBytes: 268_435_456,
+            deployRetentionCount: 4,
+            cspOverride: "default-src 'self'"
+        )
+        #expect(config.hostname == "cdn.example.com")
+        #expect(config.indexPath == "/home.html")
+        #expect(config.maxAssetsPerDeploy == 5000)
+        #expect(config.maxDeploySizeBytes == 268_435_456)
+        #expect(config.deployRetentionCount == 4)
+        #expect(config.cspOverride == "default-src 'self'")
+    }
+
+    @Test func equality() throws {
+        let config1 = try SiteConfig(hostname: "example.com")
+        let config2 = try SiteConfig(hostname: "example.com")
+        #expect(config1 == config2)
+    }
+
+    // MARK: - Hostname Validation
+
+    @Test func validHostnames() throws {
+        _ = try SiteConfig(hostname: "example.com")
+        _ = try SiteConfig(hostname: "my-site.example.com")
+        _ = try SiteConfig(hostname: "localhost")
+        _ = try SiteConfig(hostname: "a.b.c.d")
+    }
+
+    @Test func emptyHostnameRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "")
+        }
+    }
+
+    @Test func hostnameTooLongRejected() {
+        let longHostname = String(repeating: "a", count: 63) + "."
+            + String(repeating: "b", count: 63) + "."
+            + String(repeating: "c", count: 63) + "."
+            + String(repeating: "d", count: 63) + ".e"
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: longHostname)
+        }
+    }
+
+    @Test func hostnameInvalidCharsRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "bad_host.com")
+        }
+    }
+
+    @Test func hostnameLabelLeadingHyphenRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "-bad.com")
+        }
+    }
+
+    @Test func hostnameLabelTrailingHyphenRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "bad-.com")
+        }
+    }
+
+    // MARK: - Retention Count Validation
+
+    @Test func retentionCount1Accepted() throws {
+        let config = try SiteConfig(hostname: "example.com", deployRetentionCount: 1)
+        #expect(config.deployRetentionCount == 1)
+    }
+
+    @Test func retentionCount8Accepted() throws {
+        let config = try SiteConfig(hostname: "example.com", deployRetentionCount: 8)
+        #expect(config.deployRetentionCount == 8)
+    }
+
+    @Test func retentionCount0Rejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", deployRetentionCount: 0)
+        }
+    }
+
+    @Test func retentionCount9Rejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", deployRetentionCount: 9)
+        }
+    }
+
+    // MARK: - CSP Validation
+
+    @Test func validCspAccepted() throws {
+        _ = try SiteConfig(hostname: "example.com", cspOverride: "default-src 'self'")
+    }
+
+    @Test func cspUnsafeEvalRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "script-src 'unsafe-eval'")
+        }
+    }
+
+    @Test func cspUnsafeInlineRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "style-src 'unsafe-inline'")
+        }
+    }
+
+    @Test func cspUnsafeHashesRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "script-src 'unsafe-hashes'")
+        }
+    }
+
+    @Test func cspBareWildcardRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "default-src *")
+        }
+    }
+
+    @Test func cspSubdomainWildcardAccepted() throws {
+        _ = try SiteConfig(hostname: "example.com", cspOverride: "default-src *.example.com")
+    }
+
+    @Test func cspDataSourceRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "img-src data:")
+        }
+    }
+
+    @Test func cspBlobSourceRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "worker-src blob:")
+        }
+    }
+
+    @Test func cspCaseInsensitive() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "script-src 'Unsafe-Eval'")
+        }
+    }
+
+    @Test func cspTabSeparatedBareWildcardRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", cspOverride: "default-src\t*")
+        }
+    }
+
+    // MARK: - Deploy Limits Validation
+
+    @Test func maxAssetsPerDeployZeroRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", maxAssetsPerDeploy: 0)
+        }
+    }
+
+    @Test func maxDeploySizeBytesNegativeRejected() {
+        #expect(throws: ScpError.self) {
+            _ = try SiteConfig(hostname: "example.com", maxDeploySizeBytes: -1)
+        }
+    }
+
+    @Test func maxAssetsPerDeployOneAccepted() throws {
+        let config = try SiteConfig(hostname: "example.com", maxAssetsPerDeploy: 1)
+        #expect(config.maxAssetsPerDeploy == 1)
+    }
+
+    @Test func maxDeploySizeBytesOneAccepted() throws {
+        let config = try SiteConfig(hostname: "example.com", maxDeploySizeBytes: 1)
+        #expect(config.maxDeploySizeBytes == 1)
+    }
+}

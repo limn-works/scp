@@ -7406,6 +7406,12 @@ pub struct PublishResult {
     pub etag: String,
 }
 
+// NOTE: SiteConfig is defined at the SDK layer (Swift Governance.swift, Kotlin Types.kt)
+// with client-side validation. It is NOT a UniFFI record to avoid type ambiguity with
+// the auto-generated ScpBindings.swift. The SDK types will be mapped to the Rust
+// `scp_node::projection::SiteConfig` at the FFI call site when lifecycle methods
+// are wired (SCP-295).
+
 /// Publishes a single asset to a broadcast context as structured content (SCP-290).
 ///
 /// Constructs a `BroadcastContent` from the asset entry, computes an `ETag`,

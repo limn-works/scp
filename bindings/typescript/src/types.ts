@@ -642,6 +642,123 @@ export type AddressResolution =
     };
 
 // ---------------------------------------------------------------------------
+// Broadcast Site Configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Node-local site configuration for broadcast projection (spec section 18.11.12).
+ *
+ * Passed to `enableSiteProjection` to configure path-based HTTP serving of
+ * broadcast content. NOT part of governance -- deployment concern only.
+ *
+ * Mirrors `scp_node::projection::SiteConfig`.
+ */
+export interface SiteConfig {
+  /** Virtual host hostname (e.g., `"mysite.example.com"`). RFC 1123 validated. */
+  readonly hostname: string;
+  /** Default path for directory requests (default: `"/index.html"`). */
+  readonly indexPath?: string;
+  /** Maximum assets per deploy (default: 10,000). */
+  readonly maxAssetsPerDeploy?: number;
+  /** Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB). */
+  readonly maxDeploySizeBytes?: number;
+  /** Number of deploys to retain (default: 2, max 8). */
+  readonly deployRetentionCount?: number;
+  /** Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`, `unsafe-hashes`, bare `*`, `data:`, `blob:`. */
+  readonly cspOverride?: string;
+}
+
+/**
+ * Validates a {@link SiteConfig} at the SDK layer before FFI.
+ *
+ * Checks:
+ * - `hostname` is non-empty, valid RFC 1123 DNS name (max 253 chars, labels
+ *   max 63 chars, alphanumeric + hyphens, no leading/trailing hyphens).
+ * - `deployRetentionCount` is 1-8 (if provided).
+ * - `cspOverride` does not contain `unsafe-eval`, `unsafe-inline`,
+ *   `unsafe-hashes`, bare `*`, `data:`, or `blob:` (if provided).
+ *
+ * @throws {Error} If any field fails validation.
+ */
+export function validateSiteConfig(config: SiteConfig): void {
+  validateHostname(config.hostname);
+  if (config.maxAssetsPerDeploy !== undefined && config.maxAssetsPerDeploy < 1) {
+    throw new Error(`maxAssetsPerDeploy must be >= 1, got ${config.maxAssetsPerDeploy}`);
+  }
+  if (config.maxDeploySizeBytes !== undefined && config.maxDeploySizeBytes < 1) {
+    throw new Error(`maxDeploySizeBytes must be >= 1, got ${config.maxDeploySizeBytes}`);
+  }
+  if (config.deployRetentionCount !== undefined) {
+    if (
+      !Number.isInteger(config.deployRetentionCount) ||
+      config.deployRetentionCount < 1 ||
+      config.deployRetentionCount > 8
+    ) {
+      throw new Error(
+        `deployRetentionCount must be an integer between 1 and 8, got ${config.deployRetentionCount}`,
+      );
+    }
+  }
+  if (config.cspOverride !== undefined) {
+    validateCsp(config.cspOverride);
+  }
+}
+
+/**
+ * Validates a hostname per RFC 1123.
+ *
+ * @throws {Error} If the hostname is invalid.
+ */
+function validateHostname(hostname: string): void {
+  if (hostname.length === 0) {
+    throw new Error("hostname must not be empty");
+  }
+  if (hostname.length > 253) {
+    throw new Error("hostname exceeds 253 characters");
+  }
+  for (const label of hostname.split(".")) {
+    if (label.length === 0 || label.length > 63) {
+      throw new Error(`invalid hostname label: '${label}'`);
+    }
+    if (!/^[a-zA-Z0-9-]+$/.test(label)) {
+      throw new Error(`hostname label contains invalid characters: '${label}'`);
+    }
+    if (label.startsWith("-") || label.endsWith("-")) {
+      throw new Error(`hostname label starts or ends with '-': '${label}'`);
+    }
+  }
+}
+
+/**
+ * Validates a CSP override string.
+ *
+ * Rejects `unsafe-eval`, `unsafe-inline`, `unsafe-hashes`, bare `*`,
+ * `data:`, and `blob:` as sources.
+ *
+ * @throws {Error} If the CSP is invalid.
+ */
+function validateCsp(csp: string): void {
+  const FORBIDDEN_KEYWORDS = ["unsafe-eval", "unsafe-inline", "unsafe-hashes"];
+  const lower = csp.toLowerCase();
+  for (const keyword of FORBIDDEN_KEYWORDS) {
+    if (lower.includes(keyword)) {
+      throw new Error(`CSP must not contain '${keyword}'`);
+    }
+  }
+  for (const token of lower.split(/\s+/)) {
+    if (token === "*") {
+      throw new Error("CSP must not contain bare wildcard '*'");
+    }
+    if (token === "data:") {
+      throw new Error("CSP must not contain 'data:' source");
+    }
+    if (token === "blob:") {
+      throw new Error("CSP must not contain 'blob:' source");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
 

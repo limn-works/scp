@@ -1344,3 +1344,160 @@ public func verifyParticipationRequirementsBridge(
 ) throws -> Bool {
     try verifyFn(profileJson, requirementsJson)
 }
+
+// MARK: - SiteConfig (SCP-293, spec §18.11.12)
+
+/// Node-local site configuration for broadcast projection (spec section 18.11.12).
+///
+/// Passed to `enableSiteProjection` to configure path-based HTTP serving of
+/// broadcast content. NOT part of governance -- deployment concern only.
+///
+/// Mirrors `scp_node::projection::SiteConfig`.
+///
+/// ## Provenance
+///
+/// - Spec section 18.11.12 (Site Projection Configuration)
+/// - SCP-293
+public struct SiteConfig: Sendable, Equatable {
+    /// Virtual host hostname (e.g., `"mysite.example.com"`). RFC 1123 validated.
+    public let hostname: String
+
+    /// Default path for directory requests (default: `"/index.html"`).
+    public let indexPath: String
+
+    /// Maximum assets per deploy (default: 10,000).
+    public let maxAssetsPerDeploy: Int
+
+    /// Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB).
+    public let maxDeploySizeBytes: Int
+
+    /// Number of deploys to retain (default: 2, max 8).
+    public let deployRetentionCount: Int
+
+    /// Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`,
+    /// `unsafe-hashes`, bare `*`, `data:`, `blob:`.
+    public let cspOverride: String?
+
+    /// Creates a `SiteConfig` with the given hostname and optional overrides.
+    ///
+    /// - Parameters:
+    ///   - hostname: Virtual host hostname. Must be a valid RFC 1123 DNS name.
+    ///   - indexPath: Default path for directory requests.
+    ///   - maxAssetsPerDeploy: Maximum assets per deploy.
+    ///   - maxDeploySizeBytes: Maximum total deploy size in bytes.
+    ///   - deployRetentionCount: Number of deploys to retain (1-8).
+    ///   - cspOverride: Optional CSP override string.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` if any parameter is invalid.
+    public init(
+        hostname: String,
+        indexPath: String = "/index.html",
+        maxAssetsPerDeploy: Int = 10000,
+        maxDeploySizeBytes: Int = 536_870_912,
+        deployRetentionCount: Int = 2,
+        cspOverride: String? = nil
+    ) throws {
+        try SiteConfig.validateHostname(hostname)
+        guard maxAssetsPerDeploy > 0 else {
+            throw ScpError.Validation(
+                msg: "maxAssetsPerDeploy must be >= 1, got \(maxAssetsPerDeploy)",
+                code: "SCP-VALID-7020"
+            )
+        }
+        guard maxDeploySizeBytes > 0 else {
+            throw ScpError.Validation(
+                msg: "maxDeploySizeBytes must be >= 1, got \(maxDeploySizeBytes)",
+                code: "SCP-VALID-7021"
+            )
+        }
+        guard (1 ... 8).contains(deployRetentionCount) else {
+            throw ScpError.Validation(
+                msg: "deployRetentionCount must be between 1 and 8, got \(deployRetentionCount)",
+                code: "SCP-VALID-7010"
+            )
+        }
+        if let csp = cspOverride {
+            try SiteConfig.validateCsp(csp)
+        }
+        self.hostname = hostname
+        self.indexPath = indexPath
+        self.maxAssetsPerDeploy = maxAssetsPerDeploy
+        self.maxDeploySizeBytes = maxDeploySizeBytes
+        self.deployRetentionCount = deployRetentionCount
+        self.cspOverride = cspOverride
+    }
+
+    // MARK: - Hostname Validation
+
+    /// Validates a hostname per RFC 1123.
+    ///
+    /// - Throws: ``ScpError/Validation(msg:code:)`` if the hostname is invalid.
+    static func validateHostname(_ hostname: String) throws {
+        guard !hostname.isEmpty else {
+            throw ScpError.Validation(msg: "hostname must not be empty", code: "SCP-VALID-7011")
+        }
+        guard hostname.count <= 253 else {
+            throw ScpError.Validation(
+                msg: "hostname exceeds 253 characters", code: "SCP-VALID-7012"
+            )
+        }
+        for label in hostname.split(separator: ".", omittingEmptySubsequences: false) {
+            let labelStr = String(label)
+            guard !labelStr.isEmpty, labelStr.count <= 63 else {
+                throw ScpError.Validation(
+                    msg: "invalid hostname label: '\(labelStr)'", code: "SCP-VALID-7013"
+                )
+            }
+            guard labelStr.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") })
+            else {
+                throw ScpError.Validation(
+                    msg: "hostname label contains invalid characters: '\(labelStr)'",
+                    code: "SCP-VALID-7014"
+                )
+            }
+            guard !labelStr.hasPrefix("-"), !labelStr.hasSuffix("-") else {
+                throw ScpError.Validation(
+                    msg: "hostname label starts or ends with '-': '\(labelStr)'",
+                    code: "SCP-VALID-7015"
+                )
+            }
+        }
+    }
+
+    // MARK: - CSP Validation
+
+    /// Validates a CSP override string.
+    ///
+    /// Rejects `unsafe-eval`, `unsafe-inline`, `unsafe-hashes`, bare `*`,
+    /// `data:`, and `blob:` as sources.
+    ///
+    /// - Throws: ``ScpError/Validation(msg:code:)`` if the CSP is invalid.
+    static func validateCsp(_ csp: String) throws {
+        let lower = csp.lowercased()
+        let forbiddenKeywords = ["unsafe-eval", "unsafe-inline", "unsafe-hashes"]
+        for keyword in forbiddenKeywords {
+            guard !lower.contains(keyword) else {
+                throw ScpError.Validation(
+                    msg: "CSP must not contain '\(keyword)'", code: "SCP-VALID-7016"
+                )
+            }
+        }
+        for token in lower.split(whereSeparator: { $0.isWhitespace }) {
+            let tokenStr = String(token)
+            guard tokenStr != "*" else {
+                throw ScpError.Validation(
+                    msg: "CSP must not contain bare wildcard '*'", code: "SCP-VALID-7017"
+                )
+            }
+            guard tokenStr != "data:" else {
+                throw ScpError.Validation(
+                    msg: "CSP must not contain 'data:' source", code: "SCP-VALID-7018"
+                )
+            }
+            guard tokenStr != "blob:" else {
+                throw ScpError.Validation(
+                    msg: "CSP must not contain 'blob:' source", code: "SCP-VALID-7019"
+                )
+            }
+        }
+    }
+}
