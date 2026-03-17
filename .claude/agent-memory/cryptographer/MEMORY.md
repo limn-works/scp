@@ -156,6 +156,16 @@
 - [u8;16] nonce fields lack serde_bytes (integer array in msgpack, not binary blob) -- wire format interop risk
 - Block notification future-timestamp rejection added but no dedicated test for that code path
 
+### White Paper Crypto Review (2026-03-09)
+- Reviewed .docs/white-paper.md against specs. Substantially correct, no construction flaws.
+- MEDIUM: Paper omits that MLS ciphersuite uses AES-128-GCM (not 256). System security bounded at 128-bit.
+- MEDIUM: Sender keys do NOT provide forward secrecy (intentional, spec 9.16.5) -- paper omits this.
+- MEDIUM: HPKE info param has var-length concat ambiguity (pre-existing spec issue).
+- LOW: MessagePack listed as "Cryptographic Primitive" (it's a serialization format).
+- LOW: X25519, HMAC-SHA256 missing from Appendix A primitives table.
+- Composition: MLS epoch vs sender key epoch independence, 3-layer ordering load-bearing, UCAN-MLS gap window.
+- All RFC/NIST references correct. Formal analysis call in Section 14.1 is appropriate.
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs
