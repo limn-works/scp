@@ -1,9 +1,10 @@
-//! Standard tool schemas for contexts with discovery tools.
+//! Standard tool schemas, parameter/result types, and registration events for
+//! contexts with discovery tools.
 //!
-//! Contexts with discovery tools are standard SCP contexts with standardized
-//! tool schemas for search, registration, and deregistration. Two-tier
-//! membership separates writers (MLS members, bounded at 500) from readers
-//! (DID-authenticated, unbounded).
+//! Discovery contexts are standard SCP contexts equipped with standardized tool
+//! schemas for agent search, registration, and deregistration. This module
+//! defines the canonical tool names, typed parameters, result envelopes, and
+//! registration event payloads.
 //!
 //! Standard tool schemas (conventions per ADR-020):
 //! - `agent_search(query) -> { results }` -- search the registry.
