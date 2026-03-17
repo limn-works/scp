@@ -150,7 +150,7 @@ struct NodeLifecycleTests {
     @Test("commitDeploy propagates errors from bridge")
     func commitDeployPropagatesError() async throws {
         let mockCommit: ServerBridge.CommitDeployFn = { _, _, _ in
-            throw ScpError.context(message: "not projected", code: "SCP-CTX-1001")
+            throw ScpError.context(message: "not projected", code: "SCP-CTX-2080")
         }
         let node = try await Node.startInMemory(startFn: mockNodeStart)
 
@@ -189,7 +189,7 @@ struct NodeLifecycleTests {
     @Test("rollbackDeploy propagates errors from bridge")
     func rollbackDeployPropagatesError() async throws {
         let mockRollback: ServerBridge.RollbackDeployFn = { _, _, _ in
-            throw ScpError.context(message: "deploy not found", code: "SCP-CTX-1002")
+            throw ScpError.context(message: "deploy not found", code: "SCP-CTX-2081")
         }
         let node = try await Node.startInMemory(startFn: mockNodeStart)
 

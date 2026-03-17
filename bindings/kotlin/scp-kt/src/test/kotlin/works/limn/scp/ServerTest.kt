@@ -115,7 +115,7 @@ class ServerTest {
     @Test
     fun `commitDeploy propagates errors`() = runTest(testDispatcher) {
         val node = createNode()
-        stubBindings.commitDeployError = BridgeException("not projected", "SCP-CTX-1001")
+        stubBindings.commitDeployError = BridgeException("not projected", "SCP-CTX-2080")
 
         assertFailsWith<BridgeException> {
             node.commitDeploy("ctx-bad", "deploy-xyz")
@@ -139,7 +139,7 @@ class ServerTest {
     @Test
     fun `rollbackDeploy propagates errors`() = runTest(testDispatcher) {
         val node = createNode()
-        stubBindings.rollbackDeployError = BridgeException("deploy not found", "SCP-CTX-1002")
+        stubBindings.rollbackDeployError = BridgeException("deploy not found", "SCP-CTX-2081")
 
         assertFailsWith<BridgeException> {
             node.rollbackDeploy("ctx-bad", "deploy-nope")
