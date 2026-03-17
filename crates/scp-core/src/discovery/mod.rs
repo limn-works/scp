@@ -60,9 +60,9 @@ pub use addressing::{
 pub use bootstrap::{BootstrapConfig, BootstrapResolver, WellKnownBootstrapError};
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
-    AgentSearchParams, AgentSearchResult, DiscoveryContextError, MAX_WRITERS, MembershipTier,
-    RegistrationEvent, TOOL_AGENT_DEREGISTER, TOOL_AGENT_REGISTER, TOOL_AGENT_SEARCH,
-    agent_deregister_schema, agent_register_schema, agent_search_schema, is_standard_tool,
+    AgentSearchParams, AgentSearchResult, RegistrationEvent, TOOL_AGENT_DEREGISTER,
+    TOOL_AGENT_REGISTER, TOOL_AGENT_SEARCH, agent_deregister_schema, agent_register_schema,
+    agent_search_schema, is_standard_tool,
 };
 pub use dht_context::{
     ContextDiscoveryResult, ContextDiscoverySource, publish_context_to_did_document,

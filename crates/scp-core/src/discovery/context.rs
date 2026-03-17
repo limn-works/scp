@@ -23,9 +23,6 @@ use super::{DID, RegistrationEntry};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum number of writer-tier (MLS) members in a discovery context.
-pub const MAX_WRITERS: usize = 500;
-
 /// Standard tool name for agent search.
 pub const TOOL_AGENT_SEARCH: &str = "agent_search";
 
@@ -34,82 +31,6 @@ pub const TOOL_AGENT_REGISTER: &str = "agent_register";
 
 /// Standard tool name for agent deregistration.
 pub const TOOL_AGENT_DEREGISTER: &str = "agent_deregister";
-
-// ---------------------------------------------------------------------------
-// MembershipTier
-// ---------------------------------------------------------------------------
-
-/// Membership tier in a discovery context.
-///
-/// Writers are MLS group members who process registrations and manage the
-/// registry. Readers are DID-authenticated participants who can query via
-/// tool endpoints without joining the MLS group.
-///
-/// See ADR-020 acceptance criterion 4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MembershipTier {
-    /// MLS group member. Can process registrations and record events.
-    /// Bounded at [`MAX_WRITERS`].
-    Writer,
-    /// DID-authenticated reader. Can query via tool endpoints. Unbounded.
-    Reader,
-}
-
-// ---------------------------------------------------------------------------
-// DiscoveryContextError
-// ---------------------------------------------------------------------------
-
-/// Errors produced by discovery context operations.
-#[derive(Debug, thiserror::Error)]
-pub enum DiscoveryContextError {
-    /// The writer tier is at capacity.
-    #[error("writer tier full: maximum {MAX_WRITERS} writers allowed")]
-    WriterTierFull,
-
-    /// The DID is not authenticated (empty or malformed).
-    #[error("DID not authenticated: \"{did}\"")]
-    DidNotAuthenticated {
-        /// The DID that failed authentication.
-        did: String,
-    },
-
-    /// The agent is already registered.
-    #[error("agent already registered: \"{did}\"")]
-    AlreadyRegistered {
-        /// The DID that is already registered.
-        did: String,
-    },
-
-    /// The agent is not registered (for update/deregister operations).
-    #[error("agent not registered: \"{did}\"")]
-    NotRegistered {
-        /// The DID that is not registered.
-        did: String,
-    },
-
-    /// The requester DID does not match the entry owner DID and the requester
-    /// is not a context admin. Per §6.2.2B self-service update rule 5.
-    #[error(
-        "ownership violation: requester \"{requester}\" does not own entry for \"{owner}\" and is not a context admin"
-    )]
-    OwnershipViolation {
-        /// The DID of the requester.
-        requester: String,
-        /// The DID of the entry owner.
-        owner: String,
-    },
-
-    /// The requester is not a writer and cannot perform this operation.
-    #[error("writer tier required for this operation")]
-    WriterRequired,
-
-    /// A custom tool name conflicts with a standard tool name.
-    #[error("tool name \"{name}\" conflicts with standard discovery tool")]
-    StandardToolConflict {
-        /// The conflicting tool name.
-        name: String,
-    },
-}
 
 // ---------------------------------------------------------------------------
 // AgentSearchParams
@@ -340,7 +261,6 @@ mod tests {
     use super::*;
 
     const AGENT_A_DID: &str = "did:dht:z6MkAgentA";
-    const AGENT_B_DID: &str = "did:dht:z6MkAgentB";
     const WRITER_DID: &str = "did:dht:z6MkWriter";
 
     // -- Standard tool schemas --------------------------------------------
@@ -379,15 +299,6 @@ mod tests {
     }
 
     // -- Serialization roundtrips -----------------------------------------
-
-    #[test]
-    fn membership_tier_serialization_roundtrip() {
-        for tier in [MembershipTier::Writer, MembershipTier::Reader] {
-            let json = serde_json::to_string(&tier).unwrap();
-            let deserialized: MembershipTier = serde_json::from_str(&json).unwrap();
-            assert_eq!(tier, deserialized);
-        }
-    }
 
     #[test]
     fn agent_search_params_serialization_roundtrip() {
@@ -459,42 +370,6 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: RegistrationEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
-    }
-
-    // -- Error display messages -------------------------------------------
-
-    #[test]
-    fn error_display_messages() {
-        let err = DiscoveryContextError::WriterTierFull;
-        assert!(err.to_string().contains("500"));
-
-        let err = DiscoveryContextError::DidNotAuthenticated { did: "bad".into() };
-        assert!(err.to_string().contains("bad"));
-
-        let err = DiscoveryContextError::AlreadyRegistered {
-            did: AGENT_A_DID.into(),
-        };
-        assert!(err.to_string().contains(AGENT_A_DID));
-
-        let err = DiscoveryContextError::NotRegistered {
-            did: AGENT_A_DID.into(),
-        };
-        assert!(err.to_string().contains(AGENT_A_DID));
-
-        let err = DiscoveryContextError::OwnershipViolation {
-            requester: AGENT_B_DID.to_owned(),
-            owner: AGENT_A_DID.to_owned(),
-        };
-        assert!(err.to_string().contains(AGENT_B_DID));
-        assert!(err.to_string().contains(AGENT_A_DID));
-
-        let err = DiscoveryContextError::WriterRequired;
-        assert!(err.to_string().contains("writer"));
-
-        let err = DiscoveryContextError::StandardToolConflict {
-            name: "agent_search".to_owned(),
-        };
-        assert!(err.to_string().contains("agent_search"));
     }
 
     // -- is_standard_tool -------------------------------------------------
