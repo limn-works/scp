@@ -1595,16 +1595,7 @@ Scope tools share all handle types: `HandleRegisterParams`, `HandleRegisterResul
 
 Separate tool names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope tools are "the phone book for namespaces" (mapping scope names to context IDs), while handle tools are "the phone book for participants" (mapping names to DIDs or contexts within a single namespace). The separate names also provide a future divergence point — if scope registration eventually needs constraints that handle registration does not, the tool boundary is already in place.
 
-**Authorization model.** Governance of the hosting context controls who can register scopes (who is a writer). This is the same authorization model as handle registration (§22.3.1). There is no protocol-level verification that the registrant has any relationship to the target context. This is a deliberate design choice — the same model as DNS, where registrars do not verify that the registrant owns the IP address a domain points to. See Security Considerations below.
-
-**Resolution flow.** A context with scope tools functions as a scope registry — a "phone book for namespaces." The SDK ships with Limn's context ID in bootstrap defaults (§6.2.2B). The two-hop resolution:
-
-```
-1. bootstrap context → scope_lookup("cooking-community") → context ID + relay URLs
-2. resolved context → handle_lookup("alice") → DID
-```
-
-Any context can host scope tools alongside any combination of other tools (agent tools, handle tools, app tools). There is no special "scope registry" context type — it is just a context that happens to have scope tools registered.
+See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resolution flow, hosting model, and authorization model.
 
 ### Alternatives Considered
 
@@ -1619,54 +1610,40 @@ Any context can host scope tools alongside any combination of other tools (agent
 - **Future divergence point.** If scope registration eventually needs features that handle registration does not (e.g., scope-specific metadata fields, different governance models, or multi-registry federation), the tool boundary is already in place. The convention can evolve into a distinct system without breaking the API surface.
 - **DNS analogy.** DNS domain registration is a convention on top of the DNS record system — a domain name is a record that maps to an IP address, with constraints (registrar governance, TLD rules, conflict resolution). Scope registration is the same: a convention on handle records with constraints (context-only targets, no-dot names, registry governance).
 
+### Implementation
+
+- **Language:** Rust
+- **Crate:** `scp-core`
+- **Module:** `discovery/scope.rs`
+
+### Scope
+
+**Files:**
+
+| File | Purpose |
+|------|---------|
+| `crates/scp-core/src/discovery/scope.rs` | New — `validate_scope_name()`, scope tool delegation logic, tool constants |
+| `crates/scp-ffi/src/` | PyO3 bridge — `scope_register`, `scope_lookup`, `scope_deregister` |
+| `crates/scp-ffi/napi/` | NAPI bridge — scope tool wrappers |
+| `crates/scp-ffi/uniffi/` | UniFFI bridge — scope tool wrappers |
+| `crates/scp-ffi/wasm/` | WASM bridge — re-implements constraint logic locally per ADR-034 |
+| `bindings/python/` | Python SDK wrapper |
+| `bindings/typescript/` | TypeScript SDK wrapper |
+| `bindings/swift/` | Swift SDK wrapper |
+| `bindings/kotlin/` | Kotlin SDK wrapper |
+
 ### Security Considerations
 
-#### 1. Scope-as-Open-Redirect
+#### Inherited Handle-Tool Threats
 
-**Threat:** A writer in a scope registry registers `banking-app` pointing to a malicious context. Users resolving `banking-app` are directed to the attacker's context.
+Scope tools inherit all handle-tool security properties and threats because they delegate to handle tools. The following handle-tool threats apply unchanged to scope tools — see §22.3.1 for the DID-signed request scheme that mitigates them:
 
-**Mitigations:**
-- **(a) Governance controls writer access.** Curated registries (e.g., Limn's) select trusted writers. Only writers with the appropriate role and UCAN capabilities can call `scope_register`. Open-writer registries accept this risk as a governance tradeoff.
-- **(b) Target context has independent access control.** A redirect does not grant access. The target context has its own cryptographic identity, MLS group, and governance. Being directed to a context is not the same as joining it — the user's SDK must still authenticate and be admitted.
-- **(c) Resolution results carry provenance.** Every `HandleEntry` returned by `scope_lookup` carries metadata identifying which registry made the claim (`owner_did`, `registered_at`, `entry_id`). The `ResolutionPath` in `AddressResolution` (§22.8) identifies the resolution layer and source context. Consumers can inspect provenance before acting on a result.
-- **(d) Multi-registry cross-verification.** The resolver can query multiple registries for the same scope name. If Limn's registry and an independent registry both map `banking-app` to the same context ID, confidence increases. If they disagree, the resolver surfaces both results with provenance, enabling the consumer to make an informed choice.
+- **Open redirect via malicious registration** — a writer registers a scope name pointing to a malicious context. Mitigated by governance-controlled writer access, independent target-context access control, resolution provenance, and multi-registry cross-verification.
+- **No target-context verification** — the registrant has no verifiable relationship to the target context. This is a deliberate design choice (DNS analogy). Registries can opt into verification via governance policy.
+- **`relay_urls` as unvalidated redirect vector** — arbitrary URL strings in `HandleTarget::Context`. Mitigated by `validate_relay_url` (scheme allowlist, length limits) and MLS transport encryption. Note that scope entries have a **namespace-wide blast radius** compared to individual handle entries — a malicious relay URL in a scope entry affects every address resolved through that scope, not just a single identity lookup.
+- **DID from request body vs. authenticated session** — `HandleDeregisterParams.did` is an assertion, not authentication. The DID-signed request envelope (§22.3.1) provides the actual authentication; writers verify the signature matches the entry's `owner_did`.
 
-**Residual risk:** Open-writer registries accept scope-as-redirect as a governance tradeoff. Open registries SHOULD implement additional verification — for example, requiring the registrant to prove membership in the target context via a UCAN delegation chain from the target context's admin.
-
-#### 2. No Target-Context Verification
-
-**Threat:** The registrant has no verifiable relationship to the target context. Anyone can register `cooking-community` pointing to any context ID.
-
-**Design rationale:** This is a deliberate choice. "Ownership" of a context is a governance concept, not protocol-verifiable. The context's creator is not necessarily its owner — ownership may transfer via governance actions (§5.9). Requiring target-context consent (e.g., a signed approval from the target context's admin) would:
-- Require a protocol-level definition of "context owner" that does not exist.
-- Create a circular dependency: you need the target context's cooperation to register a scope name for it, but the target context may not know or care about scope registries.
-- Add a round-trip to every registration that most registries do not need.
-
-**Governance opt-in:** Registries that want target-context verification CAN implement it as a governance policy: require the registrant to present a UCAN from the target context's admin granting `scope:register` capability. This is a registry-level policy decision, not a protocol requirement.
-
-#### 3. relay_urls as Unvalidated Redirect Vector
-
-**Threat:** `HandleTarget::Context { relay_urls }` accepts arbitrary URL strings. A malicious registration points to an attacker-controlled relay, enabling metadata surveillance or relay-level attacks.
-
-**Mitigations:**
-- **(a) `validate_relay_url` exists.** The FFI bridge validation layer (`validate.rs`) already implements `validate_relay_url`: scheme allowlist (`wss://`, `ws://` for development), no control characters, length limits. Each FFI bridge's `scope_register` wrapper validates relay URLs via `validate_relay_url` before calling the core function — the same pattern as handle registration.
-- **(b) Transport security.** Relay connections use MLS encryption. A malicious relay can observe connection metadata (who connects, when, message sizes) but cannot decrypt message content. The relay is an untrusted pipe (protocol tenet: "Relays are untrusted dumb pipes").
-- **(c) Relay URL validation is defense-in-depth.** It prevents obviously malicious URLs (javascript:, data:, non-URL strings) but cannot prevent a well-formed `wss://` URL from pointing to a hostile server.
-
-**Residual risk:** Metadata surveillance via a hostile relay. Relay URL validation is defense-in-depth, not a complete mitigation. Users connecting to an unknown relay accept metadata exposure risk.
-
-#### 4. DID from Request Body vs. Authenticated Session
-
-**Threat:** `HandleDeregisterParams.did` is in the request body. A malicious caller supplies someone else's DID to deregister their scope entry.
-
-**Mitigation:** The `did` field in deregister params is an assertion, not an authentication mechanism. The actual authentication is performed at the transport layer via DID-signed request envelopes (§22.3.1). Writers MUST:
-1. Verify the DID-signed request signature using the requester's current DID document.
-2. Compare the authenticated DID (from the signature) against the entry's `owner_did`.
-3. Reject the request if the authenticated DID does not match the entry owner and the requester is not a context admin.
-
-The `did` parameter makes the ownership check explicit in the API surface — it is visible in the tool schema rather than being an implicit side effect of transport authentication.
-
-#### 5. Typosquatting Across Resolution Boundaries
+#### Typosquatting Across Resolution Boundaries
 
 **Threat:** `alice@limn` (scope-based, no dot) and `alice@limn.co` (domain-based, has dot) are different resolution paths that may resolve to different DIDs. A user may not distinguish between them.
 
@@ -1677,7 +1654,7 @@ The `did` parameter makes the ownership check explicit in the API surface — it
 
 **Classification:** UX hazard with SDK-level mitigations. Not a protocol-level vulnerability.
 
-#### 6. Scope Name Squatting
+#### Scope Name Squatting
 
 **Threat:** First-come-first-served in open registries enables squatting on valuable scope names (`banking`, `government`, `healthcare`).
 
@@ -1694,13 +1671,14 @@ The `did` parameter makes the ownership check explicit in the API surface — it
 - **ADR-020 (Tool-Interface Discovery):** Scope tools are registered in contexts that use the same discovery infrastructure.
 - **ADR-010 (Tool Registration/Invocation):** Scope tools follow the standard tool registration and invocation protocol.
 - **ADR-008 (Context Lifecycle):** The hosting context's governance controls scope registration authorization.
+- **ADR-034 (WASM Bridge Constraints):** The WASM bridge re-implements scope constraint logic locally per ADR-034 (AC #7).
 - **§22 (Human-Readable Addressing):** Scope tools extend the handle tool convention defined in §22.3.1.
 
 ### Acceptance Criteria
 
 1. **Scope tool aliases.** Three tool constants: `TOOL_SCOPE_REGISTER`, `TOOL_SCOPE_LOOKUP`, `TOOL_SCOPE_DEREGISTER`. Each delegates to the corresponding handle tool with the constraints below.
 
-2. **`validate_scope_name(name: &str) -> Result<(), AddressingError>`:** Validates that the name matches `[a-z0-9-]`, is 1-64 characters, and has no leading or trailing hyphens. Rejects names containing dots, underscores, or periods.
+2. **`validate_scope_name(name: &str) -> Result<(), AddressingError>`:** Validates that the name matches `[a-z0-9-]`, is 1-64 characters, and has no leading or trailing hyphens. Rejects names containing periods (dots) or underscores.
 
 3. **`scope_register` rejects `HandleTarget::Identity`.** Returns an error if the target is not `HandleTarget::Context`. Validates the scope name via `validate_scope_name`. Delegates to `HandleRegistry::register()`.
 

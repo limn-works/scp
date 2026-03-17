@@ -150,7 +150,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 **DID-signature verification scheme.** Handle tool requests use the same DID-authentication mechanism as discovery context reader requests (§6.2.2B). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
-2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse.
+2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse. Scope tools sign with their own tool name (e.g., `"scope_register"`), not the delegated handle tool name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
 3. **Signature algorithm.** Ed25519 using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation).
 4. **Transport.** The signature is carried as an additional field in the tool call request envelope:
    ```
@@ -171,21 +171,25 @@ Discovery contexts have a `name` field in their metadata (§5.7). The name used 
 
 Example: A discovery context with metadata name "Cooking Community" has canonical scope name `cooking-community`.
 
-The SDK ships with a mapping of default discovery context IDs to their canonical scope names. This mapping is configurable and extensible — apps can add domain-specific discovery contexts with their own scope names.
+The SDK ships with a mapping of default discovery context IDs to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific discovery contexts with their own scope names.
 
-**Scope name collisions.** Two discovery contexts may have the same canonical scope name. This is analogous to two email providers happening to exist — they are different namespaces with different content, and the resolver must distinguish them. The SDK maintains a local registry of known discovery contexts indexed by canonical scope name. If multiple contexts share a name, the SDK uses the most recently used or user-preferred context. Users can disambiguate by specifying a discovery context explicitly in client UI (selecting from a list rather than typing a scope name).
+**Scope name collisions.** Two contexts in different scope registries may register the same scope name. Intra-registry conflicts are prevented by `scope_register`'s conflict detection — a scope name maps to at most one context within a single registry (§22.3.5). Cross-registry conflicts are resolved by registry priority in the SDK's bootstrap configuration: the first matching registry in the priority order wins, with the resolution path metadata identifying which registry produced the result. Users can disambiguate by specifying a discovery context explicitly in client UI (selecting from a list rather than typing a scope name).
 
 ### 22.3.3 Resolution Flow
 
 ```
 1. Client receives "alice@cooking-community"
 2. Parse: local-part = "alice", scope = "cooking-community"
-3. Scope has no "." → discovery context handle
-4. Look up "cooking-community" in SDK's known discovery context registry
-5. Call handle_lookup("alice") on the matched discovery context
-6. Get result: Identity { did: "did:dht:z6MkAlice..." }
-7. Resolve DID via Mainline DHT (self-certifying, §9.6.1)
-8. Return AddressResolution::Identity {
+3. Scope has no "." → scope-based resolution (two-hop model, §22.3.5)
+4. Check SDK-local scope cache for "cooking-community"
+   a. Cache hit → use cached context ID (skip to step 6)
+   b. Cache miss → query bootstrap context(s) via scope_lookup("cooking-community") (§22.3.5)
+5. Get scope result: Context { context_id: "a1b2c3...", relay_urls: ["wss://..."] }
+   Update SDK-local scope cache with the result
+6. Connect to resolved context, call handle_lookup("alice")
+7. Get result: Identity { did: "did:dht:z6MkAlice..." }
+8. Resolve DID via Mainline DHT (self-certifying, §9.6.1)
+9. Return AddressResolution::Identity {
      did: "did:dht:z6MkAlice...",
      trust_level: DiscoveryContextVerified,
      resolution_path: { layer: "DiscoveryContext", context_name: "cooking-community", context_id: "..." }
@@ -239,40 +243,44 @@ Scope tools provide protocol-level registration of scope names — the mapping f
 **`scope_register` — register a scope name:**
 
 ```
-scope_register(handle, target, metadata?) → confirmation
+scope_register(name, target, metadata?) → confirmation
   input:  {
-    handle:   string,          // scope name to register (validated by validate_scope_name)
+    name:     string,          // scope name to register (validated by validate_scope_name)
     target:   HandleTarget,    // MUST be Context { context_id, relay_urls }
     metadata: HandleMetadata?  // optional descriptive metadata
   }
   output: HandleRegisterResult  // { status: "registered"|"conflict", entry_id? }
 
   Rejects HandleTarget::Identity with an error. Scope names map to contexts only.
+  The `name` parameter maps to the `handle` field in the underlying HandleRegisterParams
+  during delegation.
 ```
 
 **`scope_lookup` — look up a scope name:**
 
 ```
-scope_lookup(handle) → results
+scope_lookup(name) → results
   input:  {
-    handle: string             // scope name to look up
+    name: string               // scope name to look up
   }
   output: HandleLookupResult   // { results: [HandleEntry] } — context entries only
 
-  Equivalent to handle_lookup(handle, type_filter: "context").
+  Equivalent to handle_lookup(handle=name, type_filter: "context").
+  The `name` parameter maps to the `handle` field in HandleLookupParams during delegation.
 ```
 
 **`scope_deregister` — remove a scope registration:**
 
 ```
-scope_deregister(handle, did) → removal
+scope_deregister(name, did) → removal
   input:  {
-    handle: string,            // scope name to deregister
-    did:    DID                // must match entry owner (verified via transport auth)
+    name: string,              // scope name to deregister
+    did:  DID                  // must match entry owner (verified via transport auth)
   }
   output: HandleDeregisterResult  // { removed: bool }
 
   Equivalent to handle_deregister with scope name validation.
+  The `name` parameter maps to the `handle` field in HandleDeregisterParams during delegation.
 ```
 
 **Resolution flow — two-hop address resolution:**
@@ -530,7 +538,7 @@ The `AddressResolver` is an SDK-level type that implements multi-path resolution
 
 When the address includes a scope, the scope determines the resolution path:
 
-- **No `.` in scope** (`alice@cooking-community`): discovery context handle only. One namespace, one authority, one answer.
+- **No `.` in scope** (`alice@cooking-community`): two-hop scope-based resolution (§22.3.5). First, resolve the scope name to a context ID via `scope_lookup` on bootstrap context(s), with the SDK-local scope cache as a fast path. Then resolve the handle within the target context via `handle_lookup`. Multiple scope registries may be queried — the SDK's bootstrap configuration determines registry priority order. The first matching registry in priority order wins, but cross-registry disagreements are surfaced with provenance so consumers can make informed choices.
 - **`.` in scope** (`alice@example.com`): domain-first with attestation fallback (§22.6.2). If the domain serves `.well-known/scp` with the handle, that answer wins with `DomainVerified`. If not, attestation fallback is tried. The result carries its trust level, so the consumer knows which path succeeded.
 
 ### 22.8.2 Unscoped Resolution
