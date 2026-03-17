@@ -445,9 +445,9 @@ private func isUnicodeFormatting(_ codePoint: UInt32) -> Bool {
 
 /// Returns true if the character is a valid RFC 7230 tchar (minus '%').
 private func isMimeTchar(_ scalar: Unicode.Scalar) -> Bool {
-    let v = scalar.value
+    let codePoint = scalar.value
     // ASCII alphanumeric
-    if (v >= 0x30 && v <= 0x39) || (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A) {
+    if (codePoint >= 0x30 && codePoint <= 0x39) || (codePoint >= 0x41 && codePoint <= 0x5A) || (codePoint >= 0x61 && codePoint <= 0x7A) {
         return true
     }
     // !#$&'*+-.^_`|~
