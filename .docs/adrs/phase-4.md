@@ -1603,6 +1603,8 @@ ScopeLookupResult     { results: Vec<ScopeEntry> }
 ScopeDeregisterResult { removed: bool }
 ScopeEntry            { name: String, target: ScopeTarget, owner_did: DID, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
 ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
+ScopeTarget           { context_id: String, relay_urls: Vec<String> }
+ScopeRegisterStatus   :: Registered | Conflict | Updated
 ```
 
 Callers always use the `Scope*` names because scope operations are conceptually distinct from handle operations — scopes are namespace registrations, handles are participant registrations. The independent struct definitions reflect this distinction at the type level.

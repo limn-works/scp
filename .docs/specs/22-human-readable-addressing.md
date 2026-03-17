@@ -244,6 +244,8 @@ ScopeLookupResult     { results: Vec<ScopeEntry> }
 ScopeDeregisterResult { removed: bool }
 ScopeEntry            { name: String, target: ScopeTarget, owner_did: DID, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
 ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
+ScopeTarget           { context_id: String, relay_urls: Vec<String> }
+ScopeRegisterStatus   :: Registered | Conflict | Updated
 ```
 
 Callers always use the `Scope*` names. The independent struct definitions reflect the conceptual separation at the type level — no scope type shares a definition with any handle type.
@@ -322,7 +324,7 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
 
 **Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
 
-**Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, relay_urls, owner_did, entry_id, timestamp }`, `ScopeUpdated { name, context_id, relay_urls, owner_did, entry_id, timestamp }`, and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
+**Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, `ScopeUpdated { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
 
 **Relay URL validation.** `ScopeTarget.relay_urls` MUST contain at least one valid relay URL. `ScopeTarget.relay_urls` MUST use `wss://` scheme (or `ws://` in development). Implementations MUST validate relay URLs at registration time: `wss://` scheme required (`ws://` permitted in development mode only), no control characters, maximum URL length 2048.
 
@@ -975,14 +977,14 @@ Scope tools use independent structs for all types (see §22.3.5, ADR-043). All s
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `context_id` | `String` | Yes | Hex-encoded context ID. |
-| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. |
+| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. MUST be non-empty. Each URL MUST use wss:// scheme (ws:// in development only), no control characters, max 2048 characters. |
 
 **`ScopeRegistrationEvent`** — Tagged enum for scope registration lifecycle events (event log entries).
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `ScopeRegistered` | `"ScopeRegistered"` | `name: String`, `context_id: String`, `relay_urls: Vec<String>`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | New scope registration. |
-| `ScopeUpdated` | `"ScopeUpdated"` | `name: String`, `context_id: String`, `relay_urls: Vec<String>`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | Same-owner re-registration updated existing entry. |
+| `ScopeRegistered` | `"ScopeRegistered"` | `name: String`, `context_id: String`, `relay_urls: Vec<String>`, `owner_did: String`, `entry_id: String`, `metadata: ScopeMetadata`, `timestamp: u64` | New scope registration. |
+| `ScopeUpdated` | `"ScopeUpdated"` | `name: String`, `context_id: String`, `relay_urls: Vec<String>`, `owner_did: String`, `entry_id: String`, `metadata: ScopeMetadata`, `timestamp: u64` | Same-owner re-registration updated existing entry. |
 | `ScopeDeregistered` | `"ScopeDeregistered"` | `name: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | Removed scope registration. |
 
 Admin removal via governance produces standard governance events (§5.9), not `ScopeRegistrationEvent` variants.

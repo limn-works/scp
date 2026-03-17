@@ -1072,6 +1072,7 @@ Build:
   • scp-core/trust/ — four-layer evaluation, behavioral records
   • scp-core/context/ — advanced memory scope policies (basic TTL enforcement is Phase 2)
   • scp-core/discovery/ — tool-interface discovery (§6.2.2)
+  • scp-core/discovery/scope.rs — scope registration tools: ScopeRegistry, validate_scope_name, scope_register/lookup/deregister (§22.3.5, ADR-043)
   • scp-core/provenance/ — data provenance tagging
   • crates/scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
   • bindings/typescript/ — TypeScript SDK (wasm-bindgen for browser, napi-rs for Node)
