@@ -82,162 +82,176 @@ class RealFFITest {
     @Nested
     inner class IdentityTests {
         @Test
-        fun `create identity with in-memory custody`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val identity = uniffi.scp.identityCreate("in_memory")
-            val did = identity.did()
-            assertTrue(did.startsWith("did:dht:"), "DID should start with did:dht:, got: $did")
-            assertTrue(did.length > 20, "DID should be longer than 20 chars")
-        }
+        fun `create identity with in-memory custody`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val identity = uniffi.scp.identityCreate("in_memory")
+                val did = identity.did()
+                assertTrue(did.startsWith("did:dht:"), "DID should start with did:dht:, got: $did")
+                assertTrue(did.length > 20, "DID should be longer than 20 chars")
+            }
 
         @Test
-        fun `multiple identities have distinct DIDs`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val a = uniffi.scp.identityCreate("in_memory")
-            val b = uniffi.scp.identityCreate("in_memory")
-            assertNotEquals(a.did(), b.did())
-        }
+        fun `multiple identities have distinct DIDs`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val a = uniffi.scp.identityCreate("in_memory")
+                val b = uniffi.scp.identityCreate("in_memory")
+                assertNotEquals(a.did(), b.did())
+            }
 
         @Test
-        fun `reject unknown custody type`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val result = runCatching { uniffi.scp.identityCreate("magic") }
-            assertTrue(result.isFailure, "identityCreate with unknown custody should throw")
-        }
+        fun `reject unknown custody type`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val result = runCatching { uniffi.scp.identityCreate("magic") }
+                assertTrue(result.isFailure, "identityCreate with unknown custody should throw")
+            }
     }
 
     // ── Context ──────────────────────────────────────────────────
 
     @Nested
     inner class ContextTests {
-        private fun ephemeralParams(
-            ceiling: List<String> = listOf("messages:read"),
-        ): uniffi.scp.ContextParams = uniffi.scp.ContextParams(
-            ceiling = ceiling,
-            governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
-            memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
-            ttlSeconds = 0uL,
-            promotable = false,
-            minProtocolVersion = 0u,
-        )
-
-        @Test
-        fun `create context returns valid handle`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val identity = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(
-                identity,
-                ephemeralParams(listOf("messages:read", "messages:write")),
-            )
-            assertTrue(handle.contextId().isNotEmpty(), "Context ID should be non-empty")
-        }
-
-        @Test
-        fun `join and leave context`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val bob = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(
-                alice,
-                ephemeralParams(
-                    listOf(
-                        "messages:read",
-                        "messages:write",
-                        "role:assign",
-                        "member:invite",
-                        "member:remove",
-                    ),
-                ),
+        private fun ephemeralParams(ceiling: List<String> = listOf("messages:read")): uniffi.scp.ContextParams =
+            uniffi.scp.ContextParams(
+                ceiling = ceiling,
+                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                ttlSeconds = 0uL,
+                promotable = false,
+                minProtocolVersion = 0u,
             )
 
-            uniffi.scp.contextJoin(handle, bob.did())
-            assertEquals(2uL, uniffi.scp.contextMemberCount(handle), "count after join")
-            assertTrue(uniffi.scp.contextIsMember(handle, bob.did()))
-            val members = uniffi.scp.contextMemberDids(handle)
-            assertTrue(members.contains(bob.did()), "Members should include bob")
-            assertTrue(members.contains(alice.did()), "Members should include alice")
-
-            uniffi.scp.contextLeave(handle, bob.did())
-            assertEquals(1uL, uniffi.scp.contextMemberCount(handle), "count after leave")
-            assertFalse(uniffi.scp.contextIsMember(handle, bob.did()))
-        }
+        @Test
+        fun `create context returns valid handle`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val identity = uniffi.scp.identityCreate("in_memory")
+                val handle =
+                    uniffi.scp.contextCreate(
+                        identity,
+                        ephemeralParams(listOf("messages:read", "messages:write")),
+                    )
+                assertTrue(handle.contextId().isNotEmpty(), "Context ID should be non-empty")
+            }
 
         @Test
-        fun `close context`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(
-                alice,
-                ephemeralParams(listOf("messages:read", "context:close")),
-            )
-            uniffi.scp.contextClose(handle, alice.did())
-            val state = handle.state()
-            assertTrue(
-                state == "closed" || state == "closing",
-                "Context state after close should be closed or closing, got: $state",
-            )
-        }
+        fun `join and leave context`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val bob = uniffi.scp.identityCreate("in_memory")
+                val handle =
+                    uniffi.scp.contextCreate(
+                        alice,
+                        ephemeralParams(
+                            listOf(
+                                "messages:read",
+                                "messages:write",
+                                "role:assign",
+                                "member:invite",
+                                "member:remove",
+                            ),
+                        ),
+                    )
+
+                uniffi.scp.contextJoin(handle, bob.did())
+                assertEquals(2uL, uniffi.scp.contextMemberCount(handle), "count after join")
+                assertTrue(uniffi.scp.contextIsMember(handle, bob.did()))
+                val members = uniffi.scp.contextMemberDids(handle)
+                assertTrue(members.contains(bob.did()), "Members should include bob")
+                assertTrue(members.contains(alice.did()), "Members should include alice")
+
+                uniffi.scp.contextLeave(handle, bob.did())
+                assertEquals(1uL, uniffi.scp.contextMemberCount(handle), "count after leave")
+                assertFalse(uniffi.scp.contextIsMember(handle, bob.did()))
+            }
 
         @Test
-        fun `drain events returns list`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
-            val events = uniffi.scp.contextDrainEvents(handle)
-            assertNotNull(events)
-        }
+        fun `close context`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val handle =
+                    uniffi.scp.contextCreate(
+                        alice,
+                        ephemeralParams(listOf("messages:read", "context:close")),
+                    )
+                uniffi.scp.contextClose(handle, alice.did())
+                val state = handle.state()
+                assertTrue(
+                    state == "closed" || state == "closing",
+                    "Context state after close should be closed or closing, got: $state",
+                )
+            }
+
+        @Test
+        fun `drain events returns list`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
+                val events = uniffi.scp.contextDrainEvents(handle)
+                assertNotNull(events)
+            }
     }
 
     // ── Membership ─────────────────────────────────────────────
 
     @Nested
     inner class MembershipTests {
-        private fun ephemeralParams(): uniffi.scp.ContextParams = uniffi.scp.ContextParams(
-            ceiling = listOf("messages:read"),
-            governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
-            memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
-            ttlSeconds = 0uL,
-            promotable = false,
-            minProtocolVersion = 0u,
-        )
-
-        @Test
-        fun `member count after creation is 1`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
-            assertEquals(1uL, uniffi.scp.contextMemberCount(handle))
-        }
-
-        @Test
-        fun `creator is member`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
-            assertTrue(uniffi.scp.contextIsMember(handle, alice.did()))
-        }
-
-        @Test
-        fun `creator has admin role`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
-            val role = uniffi.scp.contextMemberRole(handle, alice.did())
-            assertNotNull(role, "Creator should have a role")
-            assertTrue(
-                role.lowercase().contains("admin"),
-                "Creator role should contain 'admin', got: $role",
+        private fun ephemeralParams(): uniffi.scp.ContextParams =
+            uniffi.scp.ContextParams(
+                ceiling = listOf("messages:read"),
+                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                ttlSeconds = 0uL,
+                promotable = false,
+                minProtocolVersion = 0u,
             )
-        }
 
         @Test
-        fun `member DIDs contains creator`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
-            val members = uniffi.scp.contextMemberDids(handle)
-            assertTrue(members.contains(alice.did()), "Member DIDs should contain creator")
-        }
+        fun `member count after creation is 1`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
+                assertEquals(1uL, uniffi.scp.contextMemberCount(handle))
+            }
+
+        @Test
+        fun `creator is member`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
+                assertTrue(uniffi.scp.contextIsMember(handle, alice.did()))
+            }
+
+        @Test
+        fun `creator has admin role`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
+                val role = uniffi.scp.contextMemberRole(handle, alice.did())
+                assertNotNull(role, "Creator should have a role")
+                assertTrue(
+                    role.lowercase().contains("admin"),
+                    "Creator role should contain 'admin', got: $role",
+                )
+            }
+
+        @Test
+        fun `member DIDs contains creator`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
+                val members = uniffi.scp.contextMemberDids(handle)
+                assertTrue(members.contains(alice.did()), "Member DIDs should contain creator")
+            }
     }
 
     // ── Tools ────────────────────────────────────────────────────
@@ -245,33 +259,36 @@ class RealFFITest {
     @Nested
     inner class ToolTests {
         @Test
-        fun `register and verify tool`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val params = uniffi.scp.ContextParams(
-                ceiling = listOf("messages:read", "tool:invoke:*", "tool:register"),
-                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
-                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
-                ttlSeconds = 0uL,
-                promotable = false,
-                minProtocolVersion = 0u,
-            )
-            val handle = uniffi.scp.contextCreate(alice, params)
-            val toolDef = uniffi.scp.ToolDefinition(
-                name = "test_tool",
-                description = "A test tool",
-                operatorDid = alice.did(),
-                inputSchemaJson = """{"type":"object","properties":{"query":{"type":"string"}}}""",
-                outputSchemaJson = """{"type":"object","properties":{"result":{"type":"string"}}}""",
-                testVectorsJson = null,
-                implementationHash = null,
-            )
-            val toolId = uniffi.scp.toolRegister(handle, toolDef)
-            assertTrue(toolId.isNotEmpty(), "Tool ID should be non-empty")
+        fun `register and verify tool`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val params =
+                    uniffi.scp.ContextParams(
+                        ceiling = listOf("messages:read", "tool:invoke:*", "tool:register"),
+                        governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                        memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                        ttlSeconds = 0uL,
+                        promotable = false,
+                        minProtocolVersion = 0u,
+                    )
+                val handle = uniffi.scp.contextCreate(alice, params)
+                val toolDef =
+                    uniffi.scp.ToolDefinition(
+                        name = "test_tool",
+                        description = "A test tool",
+                        operatorDid = alice.did(),
+                        inputSchemaJson = """{"type":"object","properties":{"query":{"type":"string"}}}""",
+                        outputSchemaJson = """{"type":"object","properties":{"result":{"type":"string"}}}""",
+                        testVectorsJson = null,
+                        implementationHash = null,
+                    )
+                val toolId = uniffi.scp.toolRegister(handle, toolDef)
+                assertTrue(toolId.isNotEmpty(), "Tool ID should be non-empty")
 
-            val result = uniffi.scp.toolVerify(handle, toolId)
-            assertTrue(result.passed, "Tool verification should pass")
-        }
+                val result = uniffi.scp.toolVerify(handle, toolId)
+                assertTrue(result.passed, "Tool verification should pass")
+            }
     }
 
     // ── UCAN ─────────────────────────────────────────────────────
@@ -279,52 +296,56 @@ class RealFFITest {
     @Nested
     inner class UcanTests {
         @Test
-        fun `mint UCAN token`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val bob = uniffi.scp.identityCreate("in_memory")
-            val params = uniffi.scp.ContextParams(
-                ceiling = listOf("messages:read", "messages:write"),
-                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
-                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
-                ttlSeconds = 0uL,
-                promotable = false,
-                minProtocolVersion = 0u,
-            )
-            val handle = uniffi.scp.contextCreate(alice, params)
-            val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
-            val tokenData = token.tokenData()
-            assertNotNull(tokenData, "Token data should be non-null")
-        }
+        fun `mint UCAN token`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val bob = uniffi.scp.identityCreate("in_memory")
+                val params =
+                    uniffi.scp.ContextParams(
+                        ceiling = listOf("messages:read", "messages:write"),
+                        governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                        memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                        ttlSeconds = 0uL,
+                        promotable = false,
+                        minProtocolVersion = 0u,
+                    )
+                val handle = uniffi.scp.contextCreate(alice, params)
+                val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
+                val tokenData = token.tokenData()
+                assertNotNull(tokenData, "Token data should be non-null")
+            }
 
         @Test
-        fun `revoke UCAN token`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val params = uniffi.scp.ContextParams(
-                ceiling = listOf("messages:read"),
-                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
-                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
-                ttlSeconds = 0uL,
-                promotable = false,
-                minProtocolVersion = 0u,
-            )
-            val handle = uniffi.scp.contextCreate(alice, params)
+        fun `revoke UCAN token`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val params =
+                    uniffi.scp.ContextParams(
+                        ceiling = listOf("messages:read"),
+                        governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                        memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                        ttlSeconds = 0uL,
+                        promotable = false,
+                        minProtocolVersion = 0u,
+                    )
+                val handle = uniffi.scp.contextCreate(alice, params)
 
-            // Mint a token so the UCAN state is fully initialised for this context.
-            val bob = uniffi.scp.identityCreate("in_memory")
-            val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
-            assertNotNull(token.tokenData(), "Minted token should have data")
+                // Mint a token so the UCAN state is fully initialised for this context.
+                val bob = uniffi.scp.identityCreate("in_memory")
+                val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
+                assertNotNull(token.tokenData(), "Minted token should have data")
 
-            // Revoke a valid UCAN token. The revoker is the context creator.
-            val testToken =
-                "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9." +
-                    "eyJpc3MiOiJkaWQ6ZGh0OnpUZXN0SXNzdWVyIiwiYXVkIjoiZGlkOmRodDp6" +
-                    "TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAw" +
-                    "LWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ." +
-                    "dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw"
-            uniffi.scp.ucanRevoke(handle, testToken, alice.did())
-        }
+                // Revoke a valid UCAN token. The revoker is the context creator.
+                val testToken =
+                    "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9." +
+                        "eyJpc3MiOiJkaWQ6ZGh0OnpUZXN0SXNzdWVyIiwiYXVkIjoiZGlkOmRodDp6" +
+                        "TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAw" +
+                        "LWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ." +
+                        "dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw"
+                uniffi.scp.ucanRevoke(handle, testToken, alice.did())
+            }
     }
 
     // ── Event Log ────────────────────────────────────────────────
@@ -332,21 +353,23 @@ class RealFFITest {
     @Nested
     inner class EventLogTests {
         @Test
-        fun `query returns events`() = runTest {
-            assumeTrue(nativeAvailable, skipReason)
-            val alice = uniffi.scp.identityCreate("in_memory")
-            val params = uniffi.scp.ContextParams(
-                ceiling = listOf("messages:read"),
-                governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
-                memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
-                ttlSeconds = 0uL,
-                promotable = false,
-                minProtocolVersion = 0u,
-            )
-            val handle = uniffi.scp.contextCreate(alice, params)
-            val events = uniffi.scp.eventLogQuery(handle, null)
-            assertNotNull(events)
-        }
+        fun `query returns events`() =
+            runTest {
+                assumeTrue(nativeAvailable, skipReason)
+                val alice = uniffi.scp.identityCreate("in_memory")
+                val params =
+                    uniffi.scp.ContextParams(
+                        ceiling = listOf("messages:read"),
+                        governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
+                        memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
+                        ttlSeconds = 0uL,
+                        promotable = false,
+                        minProtocolVersion = 0u,
+                    )
+                val handle = uniffi.scp.contextCreate(alice, params)
+                val events = uniffi.scp.eventLogQuery(handle, null)
+                assertNotNull(events)
+            }
     }
 
     // ── Discovery ────────────────────────────────────────────────
@@ -381,12 +404,13 @@ class RealFFITest {
         @Test
         fun `evaluate quality returns valid score`() {
             assumeTrue(nativeAvailable, skipReason)
-            val score = uniffi.scp.evaluateProvenanceQuality(
-                null,
-                "persistent",
-                "active",
-                emptyList(),
-            )
+            val score =
+                uniffi.scp.evaluateProvenanceQuality(
+                    null,
+                    "persistent",
+                    "active",
+                    emptyList(),
+                )
             assertTrue(score in 0u..3u, "Provenance quality score should be 0-3, got: $score")
         }
 

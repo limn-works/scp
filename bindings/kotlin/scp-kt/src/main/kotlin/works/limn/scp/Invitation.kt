@@ -81,17 +81,19 @@ suspend fun evaluateContextInvitation(
     spendingJson: String? = null,
     trustedDids: List<String> = emptyList(),
 ): InvitationEvaluationResult {
-    val invitationBindings = bridge.extended.invitation
-        ?: error("Invitation bindings not configured — provide InvitationBindings in ExtendedBindings")
+    val invitationBindings =
+        bridge.extended.invitation
+            ?: error("Invitation bindings not configured — provide InvitationBindings in ExtendedBindings")
     return bridge.ffiCall {
-        val decision = invitationBindings.evaluateInvitation(
-            paramsJson = paramsJson,
-            inviterDid = inviterDid,
-            identityDid = identityDid,
-            policyJson = policyJson,
-            spendingJson = spendingJson,
-            trustedDids = trustedDids,
-        )
+        val decision =
+            invitationBindings.evaluateInvitation(
+                paramsJson = paramsJson,
+                inviterDid = inviterDid,
+                identityDid = identityDid,
+                policyJson = policyJson,
+                spendingJson = spendingJson,
+                trustedDids = trustedDids,
+            )
         InvitationEvaluationResult(decision)
     }
 }

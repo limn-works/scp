@@ -209,13 +209,14 @@ class CoroutineBridgeTest {
         fun `ucanDelegate dispatches on IO`() =
             runTest(ioDispatcher) {
                 stubBindings.ucanDelegateResult = "delegated-token"
-                val result = bridge.ucan.delegate(
-                    10L,
-                    "did:dht:delegator",
-                    "did:dht:delegatee",
-                    "parent.token.sig",
-                    """["read"]""",
-                )
+                val result =
+                    bridge.ucan.delegate(
+                        10L,
+                        "did:dht:delegator",
+                        "did:dht:delegatee",
+                        "parent.token.sig",
+                        """["read"]""",
+                    )
                 assertEquals("delegated-token", result)
                 assertTrue(stubBindings.ucanDelegateCalled)
             }
@@ -239,9 +240,10 @@ class CoroutineBridgeTest {
         @Test
         fun `eventLogCheckpoint dispatches on IO`() =
             runTest(ioDispatcher) {
-                @Suppress("MaxLineLength")
                 val checkpointJson =
-                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
+                    """{"context_id":"ctx-1","sender_did":"did:dht:z6Mk",""" +
+                        """"event_count":10,"merkle_root":"abcdef",""" +
+                        """"epoch":5,"timestamp":1700000000,"signature":"deadbeef"}"""
                 stubBindings.eventLogCheckpointResult = checkpointJson
                 val result = bridge.infra.eventLogCheckpoint(1L, 2L, 5L)
                 assertEquals(checkpointJson, result)
@@ -281,16 +283,17 @@ class CoroutineBridgeTest {
         fun `invokeCrossContext dispatches on IO and forwards all arguments`() =
             runTest(ioDispatcher) {
                 stubBindings.toolInvokeCrossContextResult = """{"output":"xctx"}"""
-                val result = bridge.tools.invokeCrossContext(
-                    1L,
-                    2L,
-                    "tool-001",
-                    """{"query":"test"}""",
-                    42L,
-                    "ucan.tok.sig",
-                    1,
-                    listOf("proof1"),
-                )
+                val result =
+                    bridge.tools.invokeCrossContext(
+                        1L,
+                        2L,
+                        "tool-001",
+                        """{"query":"test"}""",
+                        42L,
+                        "ucan.tok.sig",
+                        1,
+                        listOf("proof1"),
+                    )
                 assertEquals("""{"output":"xctx"}""", result)
                 assertEquals(1L, stubBindings.lastCrossContextSourceHandle)
                 assertEquals(2L, stubBindings.lastCrossContextTargetHandle)
@@ -324,14 +327,15 @@ class CoroutineBridgeTest {
         fun `sessionInvoke dispatches on IO and forwards all arguments`() =
             runTest(ioDispatcher) {
                 stubBindings.toolSessionInvokeResult = """{"out":"ok"}"""
-                val result = bridge.tools.sessionInvoke(
-                    10L,
-                    "session-001",
-                    """{"input":"data"}""",
-                    42L,
-                    "ucan.tok",
-                    listOf("proof1", "proof2"),
-                )
+                val result =
+                    bridge.tools.sessionInvoke(
+                        10L,
+                        "session-001",
+                        """{"input":"data"}""",
+                        42L,
+                        "ucan.tok",
+                        listOf("proof1", "proof2"),
+                    )
                 assertEquals("""{"out":"ok"}""", result)
                 assertEquals("session-001", stubBindings.lastSessionInvokeSessionId)
                 assertEquals("""{"input":"data"}""", stubBindings.lastSessionInvokeInputJson)
@@ -593,25 +597,28 @@ class CoroutineBridgeTest {
                     BridgeException("not authorized", "SCP-PERM-3002")
 
                 val asset = works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray())
-                val exception = assertFailsWith<BridgeException> {
-                    bridge.broadcast.publishAsset(1L, 42L, asset)
-                }
+                val exception =
+                    assertFailsWith<BridgeException> {
+                        bridge.broadcast.publishAsset(1L, 42L, asset)
+                    }
                 assertEquals("SCP-PERM-3002", exception.code)
             }
 
         @Test
         fun `publishAssets batch dispatches and parses results`() =
             runTest(ioDispatcher) {
-                val assets = listOf(
-                    works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
-                    works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
-                )
-                val results = bridge.broadcast.publishAssets(1L, 42L, assets, "deploy-batch")
-                assertEquals(2, results.size)
-                assertEquals("blob-0", results[0].blobId)
-                assertEquals("etag-0", results[0].etag)
-                assertEquals("blob-1", results[1].blobId)
-                assertEquals("etag-1", results[1].etag)
+                val assets =
+                    listOf(
+                        works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
+                        works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
+                    )
+                val batch = bridge.broadcast.publishAssets(1L, 42L, assets, "deploy-batch")
+                assertEquals(2, batch.results.size)
+                assertEquals("blob-0", batch.results[0].blobId)
+                assertEquals("etag-0", batch.results[0].etag)
+                assertEquals("blob-1", batch.results[1].blobId)
+                assertEquals("etag-1", batch.results[1].etag)
+                assertEquals("deploy-batch", batch.deployId)
                 assertTrue(stubBindings.broadcastPublishAssetsCalled)
                 assertEquals("deploy-batch", stubBindings.lastPublishAssetsDeployId)
             }
@@ -622,12 +629,14 @@ class CoroutineBridgeTest {
                 stubBindings.broadcastPublishAssetsThrows =
                     BridgeException("batch too large", "SCP-CTX-2036")
 
-                val assets = listOf(
-                    works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray()),
-                )
-                val exception = assertFailsWith<BridgeException> {
-                    bridge.broadcast.publishAssets(1L, 42L, assets)
-                }
+                val assets =
+                    listOf(
+                        works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray()),
+                    )
+                val exception =
+                    assertFailsWith<BridgeException> {
+                        bridge.broadcast.publishAssets(1L, 42L, assets)
+                    }
                 assertEquals("SCP-CTX-2036", exception.code)
             }
 
@@ -646,12 +655,13 @@ class CoroutineBridgeTest {
         fun `publishAssets uses defaultIdentityHandle when identityHandle is null`() =
             runTest(ioDispatcher) {
                 bridge.broadcast.defaultIdentityHandle = 99L
-                val assets = listOf(
-                    works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
-                    works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
-                )
-                val results = bridge.broadcast.publishAssets(1L, assets = assets)
-                assertEquals(2, results.size)
+                val assets =
+                    listOf(
+                        works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
+                        works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
+                    )
+                val batch = bridge.broadcast.publishAssets(1L, assets = assets)
+                assertEquals(2, batch.results.size)
                 assertEquals(99L, stubBindings.lastPublishAssetsIdentityHandle)
                 bridge.broadcast.defaultIdentityHandle = null
             }
@@ -661,9 +671,10 @@ class CoroutineBridgeTest {
             runTest(ioDispatcher) {
                 bridge.broadcast.defaultIdentityHandle = null
                 val asset = works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray())
-                val exception = assertFailsWith<BridgeException> {
-                    bridge.broadcast.publishAsset(1L, asset = asset)
-                }
+                val exception =
+                    assertFailsWith<BridgeException> {
+                        bridge.broadcast.publishAsset(1L, asset = asset)
+                    }
                 assertEquals("SCP-IDENT-1060", exception.code)
             }
     }
@@ -677,9 +688,10 @@ class CoroutineBridgeTest {
         @Test
         fun `setEconomicPolicy then getEconomicPolicy roundtrip`() =
             runTest(ioDispatcher) {
-                @Suppress("MaxLineLength")
                 val policyJson =
-                    """{"locked":false,"cost_schedule":{"currency":[85,83,68,0]},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"""
+                    """{"locked":false,"cost_schedule":{"currency":[85,83,68,0]},""" +
+                        """"payment_adapters":[],"pricing_formula":null,""" +
+                        """"payee":"did:dht:z6MkPayee"}"""
 
                 // Initially null.
                 val initial = bridge.context.getEconomicPolicy(1L)
@@ -840,33 +852,75 @@ class StubNativeBindings : NativeBindings {
     }
 
     var lastEconomicPolicy: String? = null
-    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) {
+
+    override fun contextSetEconomicPolicy(
+        contextHandle: Long,
+        policyJson: String,
+    ) {
         lastEconomicPolicy = policyJson
     }
+
     override fun contextGetEconomicPolicy(contextHandle: Long): String? = lastEconomicPolicy
 
     // MembershipBindings
     override fun contextMemberCount(contextHandle: Long): Long? = 1L
-    override fun contextIsMember(contextHandle: Long, did: String): Boolean = true
+
+    override fun contextIsMember(
+        contextHandle: Long,
+        did: String,
+    ): Boolean = true
+
     override fun contextMemberDids(contextHandle: Long): List<String> = listOf("did:dht:stub")
-    override fun contextMemberRole(contextHandle: Long, did: String): String? = "admin"
+
+    override fun contextMemberRole(
+        contextHandle: Long,
+        did: String,
+    ): String? = "admin"
 
     // GovernanceBindings
-    override fun governanceExecute(contextHandle: Long, proposalJson: String): String =
-        """{"status":"executed"}"""
-    override fun governancePropose(contextHandle: Long, proposerDid: String, actionJson: String): String =
-        """{"proposal_id":"0000","status":"Pending","execution_result":null}"""
-    override fun governanceApprove(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
-        """{"status":"Pending"}"""
-    override fun governanceReject(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
-        """{"status":"Pending"}"""
-    override fun governanceWithdraw(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
-        """{"status":"Pending"}"""
-    override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
-        """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
+    override fun governanceExecute(
+        contextHandle: Long,
+        proposalJson: String,
+    ): String = """{"status":"executed"}"""
+
+    override fun governancePropose(
+        contextHandle: Long,
+        proposerDid: String,
+        actionJson: String,
+    ): String = """{"proposal_id":"0000","status":"Pending","execution_result":null}"""
+
+    override fun governanceApprove(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = """{"status":"Pending"}"""
+
+    override fun governanceReject(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = """{"status":"Pending"}"""
+
+    override fun governanceWithdraw(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = """{"status":"Pending"}"""
+
+    override fun governanceGetProposal(
+        contextHandle: Long,
+        proposalIdHex: String,
+    ): String = """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
+
     override fun governanceListProposals(contextHandle: Long): String = "[]"
-    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
+
+    override fun applyPendingCeilingModification(
+        contextHandle: Long,
+        currentTimestamp: Long,
+    ): Boolean = false
+
     override fun finalizeClose(contextHandle: Long) = Unit
+
     @Suppress("LongParameterList")
     override fun createGovernanceCheckpoint(
         contextHandle: Long,
@@ -878,13 +932,16 @@ class StubNativeBindings : NativeBindings {
         creatorDid: String,
         creatorSignatureHex: String,
     ): String = "{}"
+
     override fun addCheckpointCosignature(
         contextHandle: Long,
         checkpointJson: String,
         signerDid: String,
         signatureHex: String,
     ): String = "{}"
+
     override fun restoreContext(contextId: String) = Unit
+
     override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
@@ -895,24 +952,58 @@ class StubNativeBindings : NativeBindings {
     var lastUnblockSubscriberDid: String? = null
     var lastUnblockUnblockerDid: String? = null
     var broadcastUnblockThrows: Exception? = null
-    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
-    override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
-    override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
-    override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) {
+
+    override fun broadcastSubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+    ) = Unit
+
+    override fun broadcastUnsubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+        rotateKeys: Boolean,
+    ) = Unit
+
+    override fun broadcastPublish(
+        contextHandle: Long,
+        identityHandle: Long,
+        payload: ByteArray,
+    ) = Unit
+
+    override fun broadcastBlockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        blockerDid: String,
+    ) {
         broadcastBlockCalled = true
         lastBlockSubscriberDid = subscriberDid
         lastBlockBlockerDid = blockerDid
     }
-    override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) {
+
+    override fun broadcastUnblockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        unblockerDid: String,
+    ) {
         broadcastUnblockCalled = true
         lastUnblockSubscriberDid = subscriberDid
         lastUnblockUnblockerDid = unblockerDid
         broadcastUnblockThrows?.let { throw it }
     }
-    override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String =
-        """{"key":"stub"}"""
+
+    override fun broadcastHandleKeyRequest(
+        contextHandle: Long,
+        authorDid: String,
+        requesterDid: String,
+    ): String = """{"key":"stub"}"""
+
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
-    override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
+
+    override fun broadcastIsSubscriber(
+        contextHandle: Long,
+        did: String,
+    ): Boolean = false
+
     override fun broadcastAdmission(contextHandle: Long): String? = "Open"
 
     // Broadcast publish asset
@@ -920,8 +1011,9 @@ class StubNativeBindings : NativeBindings {
     var lastPublishAssetJson: String? = null
     var lastPublishAssetDeployId: String? = null
     var lastPublishAssetIdentityHandle: Long? = null
-    var broadcastPublishAssetResult = """{"blob_id":"abc123","etag":"def456"}"""
+    var broadcastPublishAssetResult = """{"blob_id":"abc123","etag":"def456","deploy_id":"deploy-1"}"""
     var broadcastPublishAssetThrows: Exception? = null
+
     override fun broadcastPublishAsset(
         contextHandle: Long,
         identityHandle: Long,
@@ -940,9 +1032,14 @@ class StubNativeBindings : NativeBindings {
     var lastPublishAssetsJson: String? = null
     var lastPublishAssetsDeployId: String? = null
     var lastPublishAssetsIdentityHandle: Long? = null
-    @Suppress("MaxLineLength")
-    var broadcastPublishAssetsResult = """[{"blob_id":"blob-0","etag":"etag-0"},{"blob_id":"blob-1","etag":"etag-1"}]"""
+
+    var broadcastPublishAssetsResult =
+        """{"results":[{"blob_id":"blob-0","etag":"etag-0",""" +
+            """"deploy_id":"deploy-batch"},{"blob_id":"blob-1",""" +
+            """"etag":"etag-1","deploy_id":"deploy-batch"}],""" +
+            """"deploy_id":"deploy-batch"}"""
     var broadcastPublishAssetsThrows: Exception? = null
+
     override fun broadcastPublishAssets(
         contextHandle: Long,
         identityHandle: Long,
@@ -1145,6 +1242,7 @@ class StubNativeBindings : NativeBindings {
     override fun transportStatus(transportHandle: Long): String = transportStatusResult
 
     var transportDisconnectCalled = false
+
     override fun transportDisconnect(transportHandle: Long) {
         transportDisconnectCalled = true
     }

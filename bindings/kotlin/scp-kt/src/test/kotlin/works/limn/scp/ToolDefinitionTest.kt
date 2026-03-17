@@ -21,16 +21,17 @@ import kotlin.test.assertTrue
 class ToolDefinitionTest {
     @Test
     fun `basic round-trip`() {
-        val def = ToolDefinition(
-            name = "calculator",
-            description = "Adds two numbers",
-            inputSchemaJson = """{"type":"object","properties":{"a":{"type":"number"}}}""",
-            outputSchemaJson = """{"type":"object","properties":{"sum":{"type":"number"}}}""",
-            operatorDid = "did:dht:operator123",
-            testVectorsJson = """[{"input":{"a":1},"output":{"sum":1}}]""",
-            implementationHashHex = "abcdef0123456789",
-            cost = ToolCost(amount = 100, currency = "USD", payee = "did:dht:payee456", costFormula = "flat"),
-        )
+        val def =
+            ToolDefinition(
+                name = "calculator",
+                description = "Adds two numbers",
+                inputSchemaJson = """{"type":"object","properties":{"a":{"type":"number"}}}""",
+                outputSchemaJson = """{"type":"object","properties":{"sum":{"type":"number"}}}""",
+                operatorDid = "did:dht:operator123",
+                testVectorsJson = """[{"input":{"a":1},"output":{"sum":1}}]""",
+                implementationHashHex = "abcdef0123456789",
+                cost = ToolCost(amount = 100, currency = "USD", payee = "did:dht:payee456", costFormula = "flat"),
+            )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
 
@@ -56,13 +57,14 @@ class ToolDefinitionTest {
 
     @Test
     fun `minimal definition`() {
-        val def = ToolDefinition(
-            name = "ping",
-            description = "health check",
-            inputSchemaJson = """{}""",
-            outputSchemaJson = """{}""",
-            operatorDid = "did:dht:op1",
-        )
+        val def =
+            ToolDefinition(
+                name = "ping",
+                description = "health check",
+                inputSchemaJson = """{}""",
+                outputSchemaJson = """{}""",
+                operatorDid = "did:dht:op1",
+            )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
 
@@ -76,13 +78,14 @@ class ToolDefinitionTest {
 
     @Test
     fun `special characters in name`() {
-        val def = ToolDefinition(
-            name = "tool\"with\\special\nchars",
-            description = "desc\twith\ttabs",
-            inputSchemaJson = """{}""",
-            outputSchemaJson = """{}""",
-            operatorDid = "did:dht:op",
-        )
+        val def =
+            ToolDefinition(
+                name = "tool\"with\\special\nchars",
+                description = "desc\twith\ttabs",
+                inputSchemaJson = """{}""",
+                outputSchemaJson = """{}""",
+                operatorDid = "did:dht:op",
+            )
         val json = def.toJson()
         // Must parse without exception — proves structural validity
         val obj = Json.parseToJsonElement(json).jsonObject
@@ -92,18 +95,20 @@ class ToolDefinitionTest {
 
     @Test
     fun `special characters in cost fields`() {
-        val def = ToolDefinition(
-            name = "tool",
-            description = "d",
-            inputSchemaJson = """{}""",
-            outputSchemaJson = """{}""",
-            operatorDid = "did:dht:op",
-            cost = ToolCost(
-                amount = 50,
-                currency = "US\"D",
-                payee = "did:dht:payee\u00e9\u00fc",
-            ),
-        )
+        val def =
+            ToolDefinition(
+                name = "tool",
+                description = "d",
+                inputSchemaJson = """{}""",
+                outputSchemaJson = """{}""",
+                operatorDid = "did:dht:op",
+                cost =
+                    ToolCost(
+                        amount = 50,
+                        currency = "US\"D",
+                        payee = "did:dht:payee\u00e9\u00fc",
+                    ),
+            )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
         val costObj = obj["cost"]?.jsonObject
@@ -130,14 +135,15 @@ class ToolDefinitionTest {
         assertEquals(Long.MAX_VALUE, cost.amount)
 
         // Verify it serializes correctly through toJson
-        val def = ToolDefinition(
-            name = "expensive",
-            description = "d",
-            inputSchemaJson = """{}""",
-            outputSchemaJson = """{}""",
-            operatorDid = "did:dht:op",
-            cost = cost,
-        )
+        val def =
+            ToolDefinition(
+                name = "expensive",
+                description = "d",
+                inputSchemaJson = """{}""",
+                outputSchemaJson = """{}""",
+                operatorDid = "did:dht:op",
+                cost = cost,
+            )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
         assertEquals(Long.MAX_VALUE, obj["cost"]?.jsonObject?.get("amount")?.jsonPrimitive?.long)
@@ -145,14 +151,15 @@ class ToolDefinitionTest {
 
     @Test
     fun `cost formula omission`() {
-        val def = ToolDefinition(
-            name = "tool",
-            description = "d",
-            inputSchemaJson = """{}""",
-            outputSchemaJson = """{}""",
-            operatorDid = "did:dht:op",
-            cost = ToolCost(amount = 10, currency = "USD", payee = "did:dht:p"),
-        )
+        val def =
+            ToolDefinition(
+                name = "tool",
+                description = "d",
+                inputSchemaJson = """{}""",
+                outputSchemaJson = """{}""",
+                operatorDid = "did:dht:op",
+                cost = ToolCost(amount = 10, currency = "USD", payee = "did:dht:p"),
+            )
         val json = def.toJson()
         val costObj = Json.parseToJsonElement(json).jsonObject["cost"]?.jsonObject
         assertFalse(costObj?.containsKey("cost_formula") == true)
@@ -162,13 +169,14 @@ class ToolDefinitionTest {
     fun `schema fields embedded as objects`() {
         val inputSchema = """{"type":"object","properties":{"x":{"type":"integer"}}}"""
         val outputSchema = """{"type":"array","items":{"type":"string"}}"""
-        val def = ToolDefinition(
-            name = "tool",
-            description = "d",
-            inputSchemaJson = inputSchema,
-            outputSchemaJson = outputSchema,
-            operatorDid = "did:dht:op",
-        )
+        val def =
+            ToolDefinition(
+                name = "tool",
+                description = "d",
+                inputSchemaJson = inputSchema,
+                outputSchemaJson = outputSchema,
+                operatorDid = "did:dht:op",
+            )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
 

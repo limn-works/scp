@@ -3,9 +3,6 @@
 
 package works.limn.scp.stream
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CancellationHandle
-import works.limn.scp.bridge.MessageCallback
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
@@ -21,6 +18,9 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CancellationHandle
+import works.limn.scp.bridge.MessageCallback
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -42,90 +42,100 @@ class StreamsTest {
     @Nested
     inner class ColdStreamFactoryTests {
         @Test
-        fun `eventLogPages emits pages until empty result`() = runTest(testDispatcher) {
-            stubInfra.eventLogQueryResults = mutableListOf(
-                """[{"event":"joined"},{"event":"left"}]""",
-                """[{"event":"message"}]""",
-                "[]",
-            )
+        fun `eventLogPages emits pages until empty result`() =
+            runTest(testDispatcher) {
+                stubInfra.eventLogQueryResults =
+                    mutableListOf(
+                        """[{"event":"joined"},{"event":"left"}]""",
+                        """[{"event":"message"}]""",
+                        "[]",
+                    )
 
-            val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val pages = factory.eventLogPages(1L, "{}").toList()
+                val factory = ColdStreamFactory(stubInfra, testDispatcher)
+                val pages = factory.eventLogPages(1L, "{}").toList()
 
-            assertEquals(2, pages.size)
-            assertEquals("""[{"event":"joined"},{"event":"left"}]""", pages[0])
-            assertEquals("""[{"event":"message"}]""", pages[1])
-        }
-
-        @Test
-        fun `eventLogPages emits nothing for empty query`() = runTest(testDispatcher) {
-            stubInfra.eventLogQueryResults = mutableListOf("[]")
-
-            val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val pages = factory.eventLogPages(1L, "{}").toList()
-
-            assertTrue(pages.isEmpty())
-        }
+                assertEquals(2, pages.size)
+                assertEquals("""[{"event":"joined"},{"event":"left"}]""", pages[0])
+                assertEquals("""[{"event":"message"}]""", pages[1])
+            }
 
         @Test
-        fun `eventLogPages passes pagination parameters`() = runTest(testDispatcher) {
-            stubInfra.eventLogQueryResults = mutableListOf(
-                """[{"event":"joined"}]""",
-                "[]",
-            )
+        fun `eventLogPages emits nothing for empty query`() =
+            runTest(testDispatcher) {
+                stubInfra.eventLogQueryResults = mutableListOf("[]")
 
-            val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            factory.eventLogPages(1L, """{"type":"joined"}""", pageSize = 25).toList()
+                val factory = ColdStreamFactory(stubInfra, testDispatcher)
+                val pages = factory.eventLogPages(1L, "{}").toList()
 
-            assertEquals(2, stubInfra.capturedFilters.size)
-            assertTrue(stubInfra.capturedFilters[0].contains("\"_offset\":0"))
-            assertTrue(stubInfra.capturedFilters[0].contains("\"_limit\":25"))
-            assertTrue(stubInfra.capturedFilters[1].contains("\"_offset\":25"))
-        }
+                assertTrue(pages.isEmpty())
+            }
 
         @Test
-        fun `messageHistoryPages emits pages until empty result`() = runTest(testDispatcher) {
-            stubInfra.eventLogQueryResults = mutableListOf(
-                """[{"msg":"hello"},{"msg":"world"}]""",
-                "[]",
-            )
+        fun `eventLogPages passes pagination parameters`() =
+            runTest(testDispatcher) {
+                stubInfra.eventLogQueryResults =
+                    mutableListOf(
+                        """[{"event":"joined"}]""",
+                        "[]",
+                    )
 
-            val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val pages = factory.messageHistoryPages(1L, "{}").toList()
+                val factory = ColdStreamFactory(stubInfra, testDispatcher)
+                factory.eventLogPages(1L, """{"type":"joined"}""", pageSize = 25).toList()
 
-            assertEquals(1, pages.size)
-            assertEquals("""[{"msg":"hello"},{"msg":"world"}]""", pages[0])
-        }
-
-        @Test
-        fun `cold flow is lazy and does not query until collected`() = runTest(testDispatcher) {
-            stubInfra.eventLogQueryResults = mutableListOf("[]")
-
-            val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val flow = factory.eventLogPages(1L, "{}")
-
-            assertEquals(0, stubInfra.queryCount)
-
-            flow.toList()
-
-            assertEquals(1, stubInfra.queryCount)
-        }
+                assertEquals(2, stubInfra.capturedFilters.size)
+                assertTrue(stubInfra.capturedFilters[0].contains("\"_offset\":0"))
+                assertTrue(stubInfra.capturedFilters[0].contains("\"_limit\":25"))
+                assertTrue(stubInfra.capturedFilters[1].contains("\"_offset\":25"))
+            }
 
         @Test
-        fun `cold flow cancellation stops pagination`() = runTest(testDispatcher) {
-            stubInfra.eventLogQueryResults = mutableListOf(
-                """[{"event":"1"}]""",
-                """[{"event":"2"}]""",
-                """[{"event":"3"}]""",
-                "[]",
-            )
+        fun `messageHistoryPages emits pages until empty result`() =
+            runTest(testDispatcher) {
+                stubInfra.eventLogQueryResults =
+                    mutableListOf(
+                        """[{"msg":"hello"},{"msg":"world"}]""",
+                        "[]",
+                    )
 
-            val factory = ColdStreamFactory(stubInfra, testDispatcher)
-            val firstPage = factory.eventLogPages(1L, "{}").first()
+                val factory = ColdStreamFactory(stubInfra, testDispatcher)
+                val pages = factory.messageHistoryPages(1L, "{}").toList()
 
-            assertEquals("""[{"event":"1"}]""", firstPage)
-            assertEquals(1, stubInfra.queryCount)
-        }
+                assertEquals(1, pages.size)
+                assertEquals("""[{"msg":"hello"},{"msg":"world"}]""", pages[0])
+            }
+
+        @Test
+        fun `cold flow is lazy and does not query until collected`() =
+            runTest(testDispatcher) {
+                stubInfra.eventLogQueryResults = mutableListOf("[]")
+
+                val factory = ColdStreamFactory(stubInfra, testDispatcher)
+                val flow = factory.eventLogPages(1L, "{}")
+
+                assertEquals(0, stubInfra.queryCount)
+
+                flow.toList()
+
+                assertEquals(1, stubInfra.queryCount)
+            }
+
+        @Test
+        fun `cold flow cancellation stops pagination`() =
+            runTest(testDispatcher) {
+                stubInfra.eventLogQueryResults =
+                    mutableListOf(
+                        """[{"event":"1"}]""",
+                        """[{"event":"2"}]""",
+                        """[{"event":"3"}]""",
+                        "[]",
+                    )
+
+                val factory = ColdStreamFactory(stubInfra, testDispatcher)
+                val firstPage = factory.eventLogPages(1L, "{}").first()
+
+                assertEquals("""[{"event":"1"}]""", firstPage)
+                assertEquals(1, stubInfra.queryCount)
+            }
     }
 
     @Nested
@@ -140,275 +150,301 @@ class StreamsTest {
         }
 
         @AfterEach
-        fun tearDown() = runTest {
-            factory.stopAll()
-        }
-
-        @Test
-        fun `contextEvents returns SharedFlow that emits events`() = runTest {
-            val flow = factory.contextEvents(42L)
-            val events = mutableListOf<String>()
-
-            val job = launch {
-                flow.take(2).toList().also { events.addAll(it) }
+        fun tearDown() =
+            runTest {
+                factory.stopAll()
             }
 
-            advanceUntilIdle()
-
-            val callback = stubBindings.lastEventCallback
-            assertNotNull(callback)
-            callback.onEvent("""{"type":"member_joined","did":"did:dht:alice"}""")
-            callback.onEvent("""{"type":"member_left","did":"did:dht:bob"}""")
-
-            advanceUntilIdle()
-            job.join()
-
-            assertEquals(2, events.size)
-            assertTrue(events[0].contains("member_joined"))
-            assertTrue(events[1].contains("member_left"))
-        }
-
         @Test
-        fun `contextEvents returns same SharedFlow for same context handle`() = runTest {
-            val flow1 = factory.contextEvents(42L)
-            val flow2 = factory.contextEvents(42L)
+        fun `contextEvents returns SharedFlow that emits events`() =
+            runTest {
+                val flow = factory.contextEvents(42L)
+                val events = mutableListOf<String>()
 
-            assertEquals(flow1, flow2)
-            assertEquals(1, stubBindings.eventSubscribeCount)
-        }
+                val job =
+                    launch {
+                        flow.take(2).toList().also { events.addAll(it) }
+                    }
 
-        @Test
-        fun `contextEvents with different handles creates separate streams`() = runTest {
-            factory.contextEvents(42L)
-            factory.contextEvents(43L)
+                advanceUntilIdle()
 
-            assertEquals(2, stubBindings.eventSubscribeCount)
-        }
+                val callback = stubBindings.lastEventCallback
+                assertNotNull(callback)
+                callback.onEvent("""{"type":"member_joined","did":"did:dht:alice"}""")
+                callback.onEvent("""{"type":"member_left","did":"did:dht:bob"}""")
 
-        @Test
-        fun `stopContextEvents unsubscribes from Rust engine`() = runTest {
-            factory.contextEvents(42L)
-            factory.stopContextEvents(42L)
+                advanceUntilIdle()
+                job.join()
 
-            assertTrue(stubBindings.eventUnsubscribeCalled)
-            assertEquals(200L, stubBindings.lastEventUnsubscribeHandle)
-        }
-
-        @Test
-        fun `stopContextEvents is safe to call when no subscription exists`() = runTest {
-            factory.stopContextEvents(999L)
-            assertFalse(stubBindings.eventUnsubscribeCalled)
-        }
-
-        @Test
-        fun `incomingMessages returns SharedFlow that emits messages`() = runTest {
-            val flow = factory.incomingMessages(42L)
-            val messages = mutableListOf<String>()
-
-            val job = launch {
-                flow.take(2).toList().also { messages.addAll(it) }
+                assertEquals(2, events.size)
+                assertTrue(events[0].contains("member_joined"))
+                assertTrue(events[1].contains("member_left"))
             }
 
-            advanceUntilIdle()
-
-            val callback = stubBindings.lastMessageCallback
-            assertNotNull(callback)
-            callback.onMessage("""{"seq":1,"text":"hello"}""")
-            callback.onMessage("""{"seq":2,"text":"world"}""")
-
-            advanceUntilIdle()
-            job.join()
-
-            assertEquals(2, messages.size)
-            assertEquals("""{"seq":1,"text":"hello"}""", messages[0])
-            assertEquals("""{"seq":2,"text":"world"}""", messages[1])
-        }
-
         @Test
-        fun `incomingMessages returns same SharedFlow for same context handle`() = runTest {
-            val flow1 = factory.incomingMessages(42L)
-            val flow2 = factory.incomingMessages(42L)
+        fun `contextEvents returns same SharedFlow for same context handle`() =
+            runTest {
+                val flow1 = factory.contextEvents(42L)
+                val flow2 = factory.contextEvents(42L)
 
-            assertEquals(flow1, flow2)
-            assertEquals(1, stubBindings.messageSubscribeCount)
-        }
-
-        @Test
-        fun `stopMessageStream unsubscribes from Rust engine`() = runTest {
-            factory.incomingMessages(42L)
-            factory.stopMessageStream(42L)
-
-            assertTrue(stubBindings.contextUnsubscribeCalled)
-            assertEquals(300L, stubBindings.lastUnsubscribeHandle)
-        }
-
-        @Test
-        fun `stopAll cleans up all subscriptions`() = runTest {
-            factory.contextEvents(42L)
-            factory.contextEvents(43L)
-            factory.incomingMessages(42L)
-
-            factory.stopAll()
-
-            assertEquals(2, stubBindings.eventUnsubscribeCount)
-            assertEquals(1, stubBindings.messageUnsubscribeCount)
-        }
-
-        @Test
-        fun `hot stream error callback emits error event`() = runTest {
-            val flow = factory.contextEvents(42L)
-            val events = mutableListOf<String>()
-
-            val job = launch {
-                flow.take(1).toList().also { events.addAll(it) }
+                assertEquals(flow1, flow2)
+                assertEquals(1, stubBindings.eventSubscribeCount)
             }
 
-            advanceUntilIdle()
-
-            stubBindings.lastEventCallback?.onError("SCP-CTX-2500", "Internal error")
-
-            advanceUntilIdle()
-            job.join()
-
-            assertEquals(1, events.size)
-            assertTrue(events[0].contains("SCP-CTX-2500"))
-        }
-
         @Test
-        fun `hot stream with replay caches events for late subscribers`() = runTest {
-            val flow = factory.contextEvents(42L, replay = 2)
+        fun `contextEvents with different handles creates separate streams`() =
+            runTest {
+                factory.contextEvents(42L)
+                factory.contextEvents(43L)
 
-            stubBindings.lastEventCallback?.onEvent("""{"seq":1}""")
-            stubBindings.lastEventCallback?.onEvent("""{"seq":2}""")
-            stubBindings.lastEventCallback?.onEvent("""{"seq":3}""")
-
-            val events = mutableListOf<String>()
-            val job = launch {
-                flow.take(2).toList().also { events.addAll(it) }
+                assertEquals(2, stubBindings.eventSubscribeCount)
             }
 
-            advanceUntilIdle()
-            job.join()
+        @Test
+        fun `stopContextEvents unsubscribes from Rust engine`() =
+            runTest {
+                factory.contextEvents(42L)
+                factory.stopContextEvents(42L)
 
-            assertEquals(2, events.size)
-            assertEquals("""{"seq":2}""", events[0])
-            assertEquals("""{"seq":3}""", events[1])
-        }
+                assertTrue(stubBindings.eventUnsubscribeCalled)
+                assertEquals(200L, stubBindings.lastEventUnsubscribeHandle)
+            }
+
+        @Test
+        fun `stopContextEvents is safe to call when no subscription exists`() =
+            runTest {
+                factory.stopContextEvents(999L)
+                assertFalse(stubBindings.eventUnsubscribeCalled)
+            }
+
+        @Test
+        fun `incomingMessages returns SharedFlow that emits messages`() =
+            runTest {
+                val flow = factory.incomingMessages(42L)
+                val messages = mutableListOf<String>()
+
+                val job =
+                    launch {
+                        flow.take(2).toList().also { messages.addAll(it) }
+                    }
+
+                advanceUntilIdle()
+
+                val callback = stubBindings.lastMessageCallback
+                assertNotNull(callback)
+                callback.onMessage("""{"seq":1,"text":"hello"}""")
+                callback.onMessage("""{"seq":2,"text":"world"}""")
+
+                advanceUntilIdle()
+                job.join()
+
+                assertEquals(2, messages.size)
+                assertEquals("""{"seq":1,"text":"hello"}""", messages[0])
+                assertEquals("""{"seq":2,"text":"world"}""", messages[1])
+            }
+
+        @Test
+        fun `incomingMessages returns same SharedFlow for same context handle`() =
+            runTest {
+                val flow1 = factory.incomingMessages(42L)
+                val flow2 = factory.incomingMessages(42L)
+
+                assertEquals(flow1, flow2)
+                assertEquals(1, stubBindings.messageSubscribeCount)
+            }
+
+        @Test
+        fun `stopMessageStream unsubscribes from Rust engine`() =
+            runTest {
+                factory.incomingMessages(42L)
+                factory.stopMessageStream(42L)
+
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(300L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `stopAll cleans up all subscriptions`() =
+            runTest {
+                factory.contextEvents(42L)
+                factory.contextEvents(43L)
+                factory.incomingMessages(42L)
+
+                factory.stopAll()
+
+                assertEquals(2, stubBindings.eventUnsubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
+            }
+
+        @Test
+        fun `hot stream error callback emits error event`() =
+            runTest {
+                val flow = factory.contextEvents(42L)
+                val events = mutableListOf<String>()
+
+                val job =
+                    launch {
+                        flow.take(1).toList().also { events.addAll(it) }
+                    }
+
+                advanceUntilIdle()
+
+                stubBindings.lastEventCallback?.onError("SCP-CTX-2500", "Internal error")
+
+                advanceUntilIdle()
+                job.join()
+
+                assertEquals(1, events.size)
+                assertTrue(events[0].contains("SCP-CTX-2500"))
+            }
+
+        @Test
+        fun `hot stream with replay caches events for late subscribers`() =
+            runTest {
+                val flow = factory.contextEvents(42L, replay = 2)
+
+                stubBindings.lastEventCallback?.onEvent("""{"seq":1}""")
+                stubBindings.lastEventCallback?.onEvent("""{"seq":2}""")
+                stubBindings.lastEventCallback?.onEvent("""{"seq":3}""")
+
+                val events = mutableListOf<String>()
+                val job =
+                    launch {
+                        flow.take(2).toList().also { events.addAll(it) }
+                    }
+
+                advanceUntilIdle()
+                job.join()
+
+                assertEquals(2, events.size)
+                assertEquals("""{"seq":2}""", events[0])
+                assertEquals("""{"seq":3}""", events[1])
+            }
     }
 
     @Nested
     inner class ColdMessageFlowTests {
         @Test
-        fun `ColdMessageFlow emits messages from callback`() = runTest(testDispatcher) {
-            stubBindings.contextSubscribeResult = 100L
+        fun `ColdMessageFlow emits messages from callback`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
 
-            val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
-            val messages = mutableListOf<String>()
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+                val messages = mutableListOf<String>()
 
-            val job = launch {
-                flow.take(2).toList().also { messages.addAll(it) }
-            }
-
-            advanceUntilIdle()
-
-            stubBindings.lastMessageCallback?.onMessage("""{"seq":1}""")
-            stubBindings.lastMessageCallback?.onMessage("""{"seq":2}""")
-
-            advanceUntilIdle()
-            job.join()
-
-            assertEquals(2, messages.size)
-            assertEquals("""{"seq":1}""", messages[0])
-            assertEquals("""{"seq":2}""", messages[1])
-        }
-
-        @Test
-        fun `ColdMessageFlow completes on onComplete callback`() = runTest(testDispatcher) {
-            stubBindings.contextSubscribeResult = 100L
-
-            val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
-            val messages = mutableListOf<String>()
-
-            val job = launch {
-                flow.toList().also { messages.addAll(it) }
-            }
-
-            advanceUntilIdle()
-
-            stubBindings.lastMessageCallback?.onMessage("""{"seq":1}""")
-            stubBindings.lastMessageCallback?.onComplete()
-
-            advanceUntilIdle()
-            job.join()
-
-            assertEquals(1, messages.size)
-        }
-
-        @Test
-        fun `ColdMessageFlow closes with BridgeException on error`() = runTest(testDispatcher) {
-            stubBindings.contextSubscribeResult = 100L
-
-            val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
-
-            var caughtException: Throwable? = null
-            supervisorScope {
-                val job = launch {
-                    try {
-                        flow.first()
-                    } catch (e: BridgeException) {
-                        caughtException = e
+                val job =
+                    launch {
+                        flow.take(2).toList().also { messages.addAll(it) }
                     }
-                }
 
                 advanceUntilIdle()
 
-                stubBindings.lastMessageCallback?.onError("SCP-CTX-2001", "Context closed")
+                stubBindings.lastMessageCallback?.onMessage("""{"seq":1}""")
+                stubBindings.lastMessageCallback?.onMessage("""{"seq":2}""")
 
                 advanceUntilIdle()
                 job.join()
-            }
 
-            assertTrue(caughtException is BridgeException)
-            assertEquals("SCP-CTX-2001", (caughtException as BridgeException).code)
-        }
+                assertEquals(2, messages.size)
+                assertEquals("""{"seq":1}""", messages[0])
+                assertEquals("""{"seq":2}""", messages[1])
+            }
 
         @Test
-        fun `ColdMessageFlow calls unsubscribe on cancellation`() = runTest(testDispatcher) {
-            stubBindings.contextSubscribeResult = 100L
+        fun `ColdMessageFlow completes on onComplete callback`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
 
-            val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+                val messages = mutableListOf<String>()
 
-            val job = launch {
-                flow.collect {}
+                val job =
+                    launch {
+                        flow.toList().also { messages.addAll(it) }
+                    }
+
+                advanceUntilIdle()
+
+                stubBindings.lastMessageCallback?.onMessage("""{"seq":1}""")
+                stubBindings.lastMessageCallback?.onComplete()
+
+                advanceUntilIdle()
+                job.join()
+
+                assertEquals(1, messages.size)
             }
-
-            advanceUntilIdle()
-            job.cancelAndJoin()
-
-            assertTrue(stubBindings.contextUnsubscribeCalled)
-            assertEquals(100L, stubBindings.lastUnsubscribeHandle)
-        }
 
         @Test
-        fun `ColdMessageFlow has no double buffering`() = runTest(testDispatcher) {
-            stubBindings.contextSubscribeResult = 100L
+        fun `ColdMessageFlow closes with BridgeException on error`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
 
-            val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
 
-            val messages = mutableListOf<String>()
-            val job = launch {
-                flow.take(1).toList().also { messages.addAll(it) }
+                var caughtException: Throwable? = null
+                supervisorScope {
+                    val job =
+                        launch {
+                            try {
+                                flow.first()
+                            } catch (e: BridgeException) {
+                                caughtException = e
+                            }
+                        }
+
+                    advanceUntilIdle()
+
+                    stubBindings.lastMessageCallback?.onError("SCP-CTX-2001", "Context closed")
+
+                    advanceUntilIdle()
+                    job.join()
+                }
+
+                assertTrue(caughtException is BridgeException)
+                assertEquals("SCP-CTX-2001", (caughtException as BridgeException).code)
             }
 
-            advanceUntilIdle()
+        @Test
+        fun `ColdMessageFlow calls unsubscribe on cancellation`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
 
-            stubBindings.lastMessageCallback?.onMessage("""{"seq":1}""")
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
 
-            advanceUntilIdle()
-            job.join()
+                val job =
+                    launch {
+                        flow.collect {}
+                    }
 
-            assertEquals(1, messages.size)
-        }
+                advanceUntilIdle()
+                job.cancelAndJoin()
+
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `ColdMessageFlow has no double buffering`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+
+                val messages = mutableListOf<String>()
+                val job =
+                    launch {
+                        flow.take(1).toList().also { messages.addAll(it) }
+                    }
+
+                advanceUntilIdle()
+
+                stubBindings.lastMessageCallback?.onMessage("""{"seq":1}""")
+
+                advanceUntilIdle()
+                job.join()
+
+                assertEquals(1, messages.size)
+            }
     }
 
     @Nested
@@ -458,25 +494,44 @@ class StubEventContextBindings : EventContextBindings {
     var eventUnsubscribeCount = 0
     var messageUnsubscribeCount = 0
 
-    override fun contextCreate(identityHandle: Long, paramsJson: String): Long = contextCreateResult
+    override fun contextCreate(
+        identityHandle: Long,
+        paramsJson: String,
+    ): Long = contextCreateResult
 
-    override fun contextJoin(contextHandle: Long, identityHandle: Long) {
+    override fun contextJoin(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         // no-op
     }
 
-    override fun contextLeave(contextHandle: Long, identityHandle: Long) {
+    override fun contextLeave(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         contextLeaveCalled = true
     }
 
-    override fun contextClose(contextHandle: Long, identityHandle: Long) {
+    override fun contextClose(
+        contextHandle: Long,
+        identityHandle: Long,
+    ) {
         contextCloseCalled = true
     }
 
-    override fun contextSend(contextHandle: Long, identityHandle: Long, payload: ByteArray) {
+    override fun contextSend(
+        contextHandle: Long,
+        identityHandle: Long,
+        payload: ByteArray,
+    ) {
         contextSendCalled = true
     }
 
-    override fun contextSubscribe(contextHandle: Long, callback: MessageCallback): Long {
+    override fun contextSubscribe(
+        contextHandle: Long,
+        callback: MessageCallback,
+    ): Long {
         lastMessageCallback = callback
         messageSubscribeCount++
         return contextSubscribeResult
@@ -488,10 +543,17 @@ class StubEventContextBindings : EventContextBindings {
         messageUnsubscribeCount++
     }
 
-    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) = Unit
+    override fun contextSetEconomicPolicy(
+        contextHandle: Long,
+        policyJson: String,
+    ) = Unit
+
     override fun contextGetEconomicPolicy(contextHandle: Long): String? = null
 
-    override fun contextSubscribeEvents(contextHandle: Long, callback: EventCallback): Long {
+    override fun contextSubscribeEvents(
+        contextHandle: Long,
+        callback: EventCallback,
+    ): Long {
         lastEventCallback = callback
         eventSubscribeCount++
         return contextSubscribeEventsResult
@@ -512,20 +574,28 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
     var queryCount = 0
     var capturedFilters = mutableListOf<String>()
 
-    override fun eventLogQuery(contextHandle: Long, filterJson: String): String {
+    override fun eventLogQuery(
+        contextHandle: Long,
+        filterJson: String,
+    ): String {
         queryCount++
         capturedFilters.add(filterJson)
         return if (eventLogQueryResults.isNotEmpty()) eventLogQueryResults.removeAt(0) else "[]"
     }
 
-    override fun eventLogVerify(contextHandle: Long, claimJson: String): Boolean = eventLogVerifyResult
+    override fun eventLogVerify(
+        contextHandle: Long,
+        claimJson: String,
+    ): Boolean = eventLogVerifyResult
 
-    @Suppress("MaxLineLength")
     override fun eventLogCheckpoint(
         contextHandle: Long,
         identityHandle: Long,
         epoch: Long,
-    ): String = """{"context_id":"ctx-stub","sender_did":"did:dht:stub","event_count":0,"merkle_root":"00","epoch":0,"timestamp":0,"signature":"00"}"""
+    ): String =
+        """{"context_id":"ctx-stub","sender_did":"did:dht:stub",""" +
+            """"event_count":0,"merkle_root":"00","epoch":0,""" +
+            """"timestamp":0,"signature":"00"}"""
 
     override fun transportConnect(
         configJson: String,

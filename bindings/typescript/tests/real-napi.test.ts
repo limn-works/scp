@@ -1549,8 +1549,10 @@ if (bridge === null) {
         // If publish succeeds (transport configured), verify result shape.
         expect(result).toHaveProperty("blobId");
         expect(result).toHaveProperty("etag");
+        expect(result).toHaveProperty("deployId");
         expect(typeof result.blobId).toBe("string");
         expect(result.blobId.length).toBe(64);
+        expect(result.deployId).toBe("deploy-napi-1");
       } catch (e: unknown) {
         const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
         const isTransportError = msg.includes("transport") || msg.includes("not configured");
@@ -1585,16 +1587,18 @@ if (bridge === null) {
       ];
 
       try {
-        const results = await napi.broadcastPublishAssets(
+        const batch = await napi.broadcastPublishAssets(
           ctx,
           identity.did,
           assets,
           "deploy-napi-batch",
         );
-        expect(results.length).toBe(2);
-        for (const r of results) {
+        expect(batch.results.length).toBe(2);
+        expect(batch.deployId).toBe("deploy-napi-batch");
+        for (const r of batch.results) {
           expect(r).toHaveProperty("blobId");
           expect(r).toHaveProperty("etag");
+          expect(r).toHaveProperty("deployId");
         }
       } catch (e: unknown) {
         const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();

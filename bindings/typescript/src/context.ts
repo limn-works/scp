@@ -18,6 +18,7 @@ import { getBridge, getBridgeSync } from "./internal/bridge";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
   AssetEntry,
+  BatchPublishResult,
   BroadcastAdmissionPolicy,
   ContextParams,
   GovernanceActionResult,
@@ -561,14 +562,14 @@ export class Context implements AsyncDisposable {
         { path: asset.path, contentType: asset.contentType, body: Array.from(asset.body) },
         deployId ?? null,
       );
-      return { blobId: result.blobId, etag: result.etag };
+      return { blobId: result.blobId, etag: result.etag, deployId: result.deployId };
     } catch (error) {
       throw mapBridgeError(error);
     }
   }
 
   /**
-   * Publishes multiple assets to this broadcast context as structured content (SCP-290).
+   * Publishes multiple assets to this broadcast context as structured content (SCP-290, SCP-292).
    *
    * All assets are published with the same deployId (auto-generated if not provided).
    *
@@ -576,14 +577,14 @@ export class Context implements AsyncDisposable {
    * @param authorDid - The DID of the author publishing the assets.
    *   Defaults to the identity that created/joined the context.
    * @param deployId - Optional deploy ID to group assets into atomic deploys.
-   * @returns A list of PublishResult objects with blobId and etag.
+   * @returns A BatchPublishResult with per-asset results and the shared deployId.
    * @throws {ContextError} If any asset fails validation or publish.
    */
   async broadcastPublishAssets(
     assets: AssetEntry[],
     authorDid?: string,
     deployId?: string,
-  ): Promise<PublishResult[]> {
+  ): Promise<BatchPublishResult> {
     this.assertActive();
     try {
       const bridge = await getBridge();
@@ -592,16 +593,20 @@ export class Context implements AsyncDisposable {
         contentType: a.contentType,
         body: Array.from(a.body),
       }));
-      const results = await bridge.broadcastPublishAssets(
+      const batch = await bridge.broadcastPublishAssets(
         this._handle,
         authorDid ?? this._identityDid,
         napiAssets,
         deployId ?? null,
       );
-      return results.map((r: { blobId: string; etag: string }) => ({
-        blobId: r.blobId,
-        etag: r.etag,
-      }));
+      return {
+        results: batch.results.map((r: { blobId: string; etag: string; deployId: string }) => ({
+          blobId: r.blobId,
+          etag: r.etag,
+          deployId: r.deployId,
+        })),
+        deployId: batch.deployId,
+      };
     } catch (error) {
       throw mapBridgeError(error);
     }

@@ -167,31 +167,32 @@ data class ToolDefinition(
      * Uses [buildJsonObject] from kotlinx.serialization to produce structurally
      * valid JSON, preventing injection via untrusted string fields.
      */
-    fun toJson(): String = Json.encodeToString(
-        buildJsonObject {
-            put("name", name)
-            put("description", description)
-            put("input_schema_json", Json.parseToJsonElement(inputSchemaJson))
-            put("output_schema_json", Json.parseToJsonElement(outputSchemaJson))
-            put("operator_did", operatorDid)
-            if (testVectorsJson != null) {
-                put("test_vectors_json", Json.parseToJsonElement(testVectorsJson))
-            }
-            if (implementationHashHex != null) {
-                put("implementation_hash", implementationHashHex)
-            }
-            if (cost != null) {
-                putJsonObject("cost") {
-                    put("amount", cost.amount)
-                    put("currency", cost.currency)
-                    put("payee", cost.payee)
-                    if (cost.costFormula != null) {
-                        put("cost_formula", cost.costFormula)
+    fun toJson(): String =
+        Json.encodeToString(
+            buildJsonObject {
+                put("name", name)
+                put("description", description)
+                put("input_schema_json", Json.parseToJsonElement(inputSchemaJson))
+                put("output_schema_json", Json.parseToJsonElement(outputSchemaJson))
+                put("operator_did", operatorDid)
+                if (testVectorsJson != null) {
+                    put("test_vectors_json", Json.parseToJsonElement(testVectorsJson))
+                }
+                if (implementationHashHex != null) {
+                    put("implementation_hash", implementationHashHex)
+                }
+                if (cost != null) {
+                    putJsonObject("cost") {
+                        put("amount", cost.amount)
+                        put("currency", cost.currency)
+                        put("payee", cost.payee)
+                        if (cost.costFormula != null) {
+                            put("cost_formula", cost.costFormula)
+                        }
                     }
                 }
-            }
-        },
-    )
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +282,8 @@ class ScopedHandle internal constructor(
     }
 
     override fun toString(): String =
-        "ScopedHandle(contextId=$contextId, appDid=$appDid, capabilities=${grantedCapabilities.size})"
+        "ScopedHandle(contextId=$contextId, appDid=$appDid, " +
+            "capabilities=${grantedCapabilities.size})"
 }
 
 // ---------------------------------------------------------------------------
@@ -428,19 +430,31 @@ class AssetEntry(
         return result
     }
 
-    override fun toString(): String =
-        "AssetEntry(path=$path, contentType=$contentType, bodySize=${body.size})"
+    override fun toString(): String = "AssetEntry(path=$path, contentType=$contentType, bodySize=${body.size})"
 }
 
 /**
- * Result of publishing an asset to a broadcast context (SCP-290).
+ * Result of publishing an asset to a broadcast context (SCP-290, SCP-292).
  *
  * @property blobId Hex-encoded SHA-256 of the serialized broadcast envelope.
  * @property etag Hex-encoded SHA-256 of the asset body.
+ * @property deployId The deploy ID for this asset (auto-generated or caller-provided).
  */
 data class PublishResult(
     val blobId: String,
     val etag: String,
+    val deployId: String,
+)
+
+/**
+ * Result of publishing multiple assets to a broadcast context (SCP-292).
+ *
+ * @property results Per-asset publish results.
+ * @property deployId The shared deploy ID for this batch.
+ */
+data class BatchPublishResult(
+    val results: List<PublishResult>,
+    val deployId: String,
 )
 
 // ---------------------------------------------------------------------------

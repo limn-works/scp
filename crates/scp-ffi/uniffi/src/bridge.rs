@@ -7397,13 +7397,26 @@ pub struct AssetEntry {
     pub body: Vec<u8>,
 }
 
-/// Result of publishing an asset to a broadcast context (SCP-290).
+/// Result of publishing an asset to a broadcast context (SCP-290, SCP-292).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PublishResult {
     /// Hex-encoded SHA-256 of the serialized broadcast envelope.
     pub blob_id: String,
     /// Hex-encoded SHA-256 of the asset body.
     pub etag: String,
+    /// The deploy ID for this asset (auto-generated or caller-provided).
+    pub deploy_id: String,
+}
+
+/// Result of publishing multiple assets to a broadcast context (SCP-292).
+///
+/// Groups per-asset results with the shared deploy ID used across the batch.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BatchPublishResult {
+    /// Per-asset publish results.
+    pub results: Vec<PublishResult>,
+    /// The shared deploy ID for this batch.
+    pub deploy_id: String,
 }
 
 // NOTE: SiteConfig is defined at the SDK layer (Swift Governance.swift, Kotlin Types.kt)
@@ -7484,6 +7497,8 @@ pub async fn broadcast_publish_asset(
             }
 
             let etag = scp_core::context::compute_etag(&asset.body);
+            // Capture deploy_id string before moving into BroadcastContent (SCP-292).
+            let deploy_id_str = deploy_id.clone().unwrap_or_default();
             let content = scp_core::context::BroadcastContent {
                 version: scp_core::context::BROADCAST_CONTENT_VERSION,
                 metadata: scp_core::context::ContentMetadata {
@@ -7553,7 +7568,11 @@ pub async fn broadcast_publish_asset(
                 hex::encode(Sha256::digest(&envelope_bytes))
             };
 
-            Ok(PublishResult { blob_id, etag })
+            Ok(PublishResult {
+                blob_id,
+                etag,
+                deploy_id: deploy_id_str,
+            })
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -7577,7 +7596,7 @@ pub async fn broadcast_publish_assets(
     identity: Arc<Identity>,
     assets: Vec<AssetEntry>,
     deploy_id: Option<String>,
-) -> Result<Vec<PublishResult>, ScpError> {
+) -> Result<BatchPublishResult, ScpError> {
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(ScpError::Context {
@@ -7704,10 +7723,17 @@ pub async fn broadcast_publish_assets(
                     hex::encode(Sha256::digest(&envelope_bytes))
                 };
 
-                results.push(PublishResult { blob_id, etag });
+                results.push(PublishResult {
+                    blob_id,
+                    etag,
+                    deploy_id: deploy_id_val.clone(),
+                });
             }
 
-            Ok(results)
+            Ok(BatchPublishResult {
+                results,
+                deploy_id: deploy_id_val,
+            })
         })
         .await
         .map_err(|e| ScpError::Context {

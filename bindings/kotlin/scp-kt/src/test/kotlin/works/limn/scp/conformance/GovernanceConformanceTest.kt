@@ -3,8 +3,6 @@
 
 package works.limn.scp.conformance
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -12,6 +10,8 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -36,11 +36,12 @@ class GovernanceConformanceTest {
     fun setUp() {
         stubBindings = ConformanceStubBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
         dispatcher = ConformanceDispatcher(bridge)
     }
 
@@ -51,10 +52,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextSendError =
                     BridgeException("Write capability required", "SCP-PERM-3020")
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
+                    )
                 assertEquals("SCP-PERM-3020", result["error"])
             }
 
@@ -63,10 +65,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextCloseError =
                     BridgeException("Admin capability required", "SCP-PERM-3021")
-                val result = dispatcher.dispatch(
-                    "context_close",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_close",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("SCP-PERM-3021", result["error"])
             }
 
@@ -75,10 +78,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.toolRegisterError =
                     BridgeException("Insufficient capability", "SCP-PERM-3022")
-                val result = dispatcher.dispatch(
-                    "tool_register",
-                    mapOf("context_handle" to "10", "definition" to "{}"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "tool_register",
+                        mapOf("context_handle" to "10", "definition" to "{}"),
+                    )
                 assertEquals("SCP-PERM-3022", result["error"])
             }
     }
@@ -90,14 +94,15 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.ucanMintError =
                     BridgeException("Exceeds context ceiling", "SCP-PERM-3012")
-                val result = dispatcher.dispatch(
-                    "ucan_mint",
-                    mapOf(
-                        "context_handle" to "10",
-                        "audience_did" to "did:dht:z6MkMember",
-                        "capabilities" to """["admin"]""",
-                    ),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "ucan_mint",
+                        mapOf(
+                            "context_handle" to "10",
+                            "audience_did" to "did:dht:z6MkMember",
+                            "capabilities" to """["admin"]""",
+                        ),
+                    )
                 assertEquals("SCP-PERM-3012", result["error"])
             }
 
@@ -106,14 +111,15 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.ucanValidateError =
                     BridgeException("Capability above ceiling", "SCP-PERM-3013")
-                val result = dispatcher.dispatch(
-                    "ucan_validate",
-                    mapOf(
-                        "context_handle" to "10",
-                        "encoded" to "overcapped.token",
-                        "capability" to "admin",
-                    ),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "ucan_validate",
+                        mapOf(
+                            "context_handle" to "10",
+                            "encoded" to "overcapped.token",
+                            "capability" to "admin",
+                        ),
+                    )
                 assertEquals("SCP-PERM-3013", result["error"])
             }
     }
@@ -125,10 +131,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.identityCreateError =
                     BridgeException("test", "SCP-IDENT-1001")
-                val result = dispatcher.dispatch(
-                    "identity_create",
-                    mapOf("custody" to "in_memory"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "identity_create",
+                        mapOf("custody" to "in_memory"),
+                    )
                 assertEquals("SCP-IDENT-1001", result["error"])
             }
 
@@ -137,10 +144,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextCreateError =
                     BridgeException("test", "SCP-CTX-2001")
-                val result = dispatcher.dispatch(
-                    "context_create",
-                    mapOf("identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_create",
+                        mapOf("identity_handle" to "1"),
+                    )
                 assertEquals("SCP-CTX-2001", result["error"])
             }
 
@@ -149,10 +157,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.ucanValidateError =
                     BridgeException("test", "SCP-PERM-3001")
-                val result = dispatcher.dispatch(
-                    "ucan_validate",
-                    mapOf("context_handle" to "10", "encoded" to "t"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "ucan_validate",
+                        mapOf("context_handle" to "10", "encoded" to "t"),
+                    )
                 assertEquals("SCP-PERM-3001", result["error"])
             }
 
@@ -161,10 +170,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.transportConnectError =
                     BridgeException("test", "SCP-TRANS-5001")
-                val result = dispatcher.dispatch(
-                    "transport_connect",
-                    mapOf("relay_url" to "wss://test"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_connect",
+                        mapOf("relay_url" to "wss://test"),
+                    )
                 assertEquals("SCP-TRANS-5001", result["error"])
             }
 
@@ -173,10 +183,11 @@ class GovernanceConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.toolInvokeError =
                     BridgeException("test", "SCP-TOOL-6001")
-                val result = dispatcher.dispatch(
-                    "tool_invoke",
-                    mapOf("context_handle" to "1", "tool_id" to "t"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "tool_invoke",
+                        mapOf("context_handle" to "1", "tool_id" to "t"),
+                    )
                 assertEquals("SCP-TOOL-6001", result["error"])
             }
 
@@ -201,10 +212,11 @@ class GovernanceConformanceTest {
         @Test
         fun `unknown operation returns unsupported_operation error`() =
             runTest(testDispatcher) {
-                val result = dispatcher.dispatch(
-                    "nonexistent_operation",
-                    emptyMap(),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "nonexistent_operation",
+                        emptyMap(),
+                    )
                 assertEquals("unsupported_operation", result["error"])
             }
     }

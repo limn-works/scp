@@ -3,8 +3,6 @@
 
 package works.limn.scp.conformance
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
@@ -18,6 +16,8 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -42,11 +42,12 @@ class MessagingConformanceTest {
     fun setUp() {
         stubBindings = ConformanceStubBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
         dispatcher = ConformanceDispatcher(bridge)
     }
 
@@ -55,10 +56,11 @@ class MessagingConformanceTest {
         @Test
         fun `context_send succeeds with payload`() =
             runTest(testDispatcher) {
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
+                    )
                 assertEquals("sent", result["status"])
                 assertTrue(stubBindings.contextSendCalled)
             }
@@ -81,10 +83,11 @@ class MessagingConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextSendError =
                     BridgeException("Context closed", "SCP-CTX-2010")
-                val result = dispatcher.dispatch(
-                    "context_send",
-                    mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_send",
+                        mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
+                    )
                 assertEquals("SCP-CTX-2010", result["error"])
             }
     }
@@ -97,9 +100,10 @@ class MessagingConformanceTest {
                 val messages = mutableListOf<String>()
                 val flow = bridge.context.subscribe(42L)
 
-                val job = launch {
-                    flow.take(3).toList().also { messages.addAll(it) }
-                }
+                val job =
+                    launch {
+                        flow.take(3).toList().also { messages.addAll(it) }
+                    }
 
                 advanceUntilIdle()
 
@@ -122,9 +126,10 @@ class MessagingConformanceTest {
                 val messages = mutableListOf<String>()
                 val flow = bridge.context.subscribe(42L)
 
-                val job = launch {
-                    flow.toList().also { messages.addAll(it) }
-                }
+                val job =
+                    launch {
+                        flow.toList().also { messages.addAll(it) }
+                    }
 
                 advanceUntilIdle()
 
@@ -142,9 +147,10 @@ class MessagingConformanceTest {
             runTest(testDispatcher) {
                 val flow = bridge.context.subscribe(42L)
 
-                val deferred = async {
-                    runCatching { flow.first() }
-                }
+                val deferred =
+                    async {
+                        runCatching { flow.first() }
+                    }
 
                 advanceUntilIdle()
 
@@ -171,9 +177,10 @@ class MessagingConformanceTest {
                 val messages = mutableListOf<String>()
                 val flow = bridge.context.subscribe(42L)
 
-                val job = launch {
-                    flow.take(5).toList().also { messages.addAll(it) }
-                }
+                val job =
+                    launch {
+                        flow.take(5).toList().also { messages.addAll(it) }
+                    }
 
                 advanceUntilIdle()
 
@@ -196,22 +203,25 @@ class MessagingConformanceTest {
         @Test
         fun `send message fixture matches dispatcher result`() =
             runTest(testDispatcher) {
-                val fixture = ConformanceFixture(
-                    testId = "messaging-send-001",
-                    category = "messaging",
-                    description = "Send a message to a context",
-                    operation = "context_send",
-                    input = mapOf(
-                        "context_handle" to "10",
-                        "identity_handle" to "1",
-                        "payload" to "hello world",
-                    ),
-                    expected = mapOf("status" to "sent"),
-                )
-                val result = dispatcher.dispatch(
-                    fixture.operation,
-                    fixture.input,
-                )
+                val fixture =
+                    ConformanceFixture(
+                        testId = "messaging-send-001",
+                        category = "messaging",
+                        description = "Send a message to a context",
+                        operation = "context_send",
+                        input =
+                            mapOf(
+                                "context_handle" to "10",
+                                "identity_handle" to "1",
+                                "payload" to "hello world",
+                            ),
+                        expected = mapOf("status" to "sent"),
+                    )
+                val result =
+                    dispatcher.dispatch(
+                        fixture.operation,
+                        fixture.input,
+                    )
                 val mismatches = compareResults(result, fixture.expected)
                 assertTrue(
                     mismatches.isEmpty(),

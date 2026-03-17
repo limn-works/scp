@@ -462,7 +462,7 @@ public enum BroadcastBridge {
         _ identity: Identity,
         _ assets: [AssetEntry],
         _ deployId: String?
-    ) async throws -> [PublishResult]
+    ) async throws -> BatchPublishResult
 
     public static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
         try await broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
@@ -990,7 +990,7 @@ public extension Context {
         identity: Identity? = nil,
         deployId: String? = nil,
         publishAssetsFn: BroadcastBridge.PublishAssetsFn = BroadcastBridge.defaultPublishAssets
-    ) async throws -> [PublishResult] {
+    ) async throws -> BatchPublishResult {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }

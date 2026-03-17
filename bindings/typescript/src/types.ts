@@ -88,6 +88,20 @@ export interface PublishResult {
   readonly blobId: string;
   /** Hex-encoded SHA-256 of the asset body. */
   readonly etag: string;
+  /** The deploy ID for this asset (auto-generated or caller-provided). */
+  readonly deployId: string;
+}
+
+/**
+ * Result of publishing multiple assets to a broadcast context (SCP-292).
+ *
+ * Returned by \`broadcastPublishAssets\`.
+ */
+export interface BatchPublishResult {
+  /** Per-asset publish results. */
+  readonly results: PublishResult[];
+  /** The shared deploy ID for this batch. */
+  readonly deployId: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -311,14 +311,14 @@ export function createNativeBridge(): Bridge {
       authorDid: string,
       asset: { path: string; contentType: string; body: number[] },
       deployId: string | null,
-    ): Promise<{ blobId: string; etag: string }> {
+    ): Promise<{ blobId: string; etag: string; deployId: string }> {
       return await (
         addon.broadcastPublishAsset as (
           h: BridgeContextHandle,
           d: string,
           a: { path: string; contentType: string; body: number[] },
           did: string | null,
-        ) => Promise<{ blobId: string; etag: string }>
+        ) => Promise<{ blobId: string; etag: string; deployId: string }>
       )(handle, authorDid, asset, deployId);
     },
 
@@ -327,14 +327,20 @@ export function createNativeBridge(): Bridge {
       authorDid: string,
       assets: { path: string; contentType: string; body: number[] }[],
       deployId: string | null,
-    ): Promise<{ blobId: string; etag: string }[]> {
+    ): Promise<{
+      results: { blobId: string; etag: string; deployId: string }[];
+      deployId: string;
+    }> {
       return await (
         addon.broadcastPublishAssets as (
           h: BridgeContextHandle,
           d: string,
           a: { path: string; contentType: string; body: number[] }[],
           did: string | null,
-        ) => Promise<{ blobId: string; etag: string }[]>
+        ) => Promise<{
+          results: { blobId: string; etag: string; deployId: string }[];
+          deployId: string;
+        }>
       )(handle, authorDid, assets, deployId);
     },
 

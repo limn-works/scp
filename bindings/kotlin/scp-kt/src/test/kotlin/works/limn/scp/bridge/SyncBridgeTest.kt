@@ -18,7 +18,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import works.limn.scp.SyncBindings
-import works.limn.scp.SyncBridge
 import works.limn.scp.SyncPolicy
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -97,12 +96,13 @@ class SyncBridgeTest {
             runTest(ioDispatcher) {
                 stubSyncBindings.classifyOfflineCustomResult = "short"
 
-                val result = bridge.sync!!.classifyOfflineCustom(
-                    lastRelayContact = 1000L,
-                    now = 2000L,
-                    tier1ThresholdSecs = 3600L,
-                    tier2ThresholdSecs = 86400L,
-                )
+                val result =
+                    bridge.sync!!.classifyOfflineCustom(
+                        lastRelayContact = 1000L,
+                        now = 2000L,
+                        tier1ThresholdSecs = 3600L,
+                        tier2ThresholdSecs = 86400L,
+                    )
 
                 assertEquals("short", result)
                 assertTrue(stubSyncBindings.classifyOfflineCustomCalled)
@@ -117,12 +117,13 @@ class SyncBridgeTest {
             runTest(ioDispatcher) {
                 stubSyncBindings.classifyOfflineCustomResult = "extended"
 
-                val result = bridge.sync!!.classifyOfflineCustom(
-                    lastRelayContact = 0L,
-                    now = 7200L,
-                    tier1ThresholdSecs = 1800L,
-                    tier2ThresholdSecs = 3600L,
-                )
+                val result =
+                    bridge.sync!!.classifyOfflineCustom(
+                        lastRelayContact = 0L,
+                        now = 7200L,
+                        tier1ThresholdSecs = 1800L,
+                        tier2ThresholdSecs = 3600L,
+                    )
 
                 assertEquals("extended", result)
                 assertEquals(1800L, stubSyncBindings.lastCustomTier1)
@@ -139,16 +140,17 @@ class SyncBridgeTest {
         @Test
         fun `getPolicy delegates to syncGetPolicy and returns result`() =
             runTest(ioDispatcher) {
-                val customPolicy = SyncPolicy(
-                    tier1ThresholdSecs = 7200L,
-                    tier2ThresholdSecs = 302_400L,
-                    gapTimeoutSecs = 15L,
-                    reorderBufferCapacity = 50,
-                    maxSequentialCommits = 200L,
-                    commitProcessTimeoutSecs = 10L,
-                    senderKeyTimeoutSecs = 120L,
-                    reconnectionDedupWindowSecs = 60L,
-                )
+                val customPolicy =
+                    SyncPolicy(
+                        tier1ThresholdSecs = 7200L,
+                        tier2ThresholdSecs = 302_400L,
+                        gapTimeoutSecs = 15L,
+                        reorderBufferCapacity = 50,
+                        maxSequentialCommits = 200L,
+                        commitProcessTimeoutSecs = 10L,
+                        senderKeyTimeoutSecs = 120L,
+                        reconnectionDedupWindowSecs = 60L,
+                    )
                 stubSyncBindings.getPolicyResult = customPolicy
 
                 val result = bridge.sync!!.getPolicy()
@@ -160,16 +162,17 @@ class SyncBridgeTest {
         @Test
         fun `getPolicy returns runtime values not hardcoded defaults`() =
             runTest(ioDispatcher) {
-                val nonDefaultPolicy = SyncPolicy(
-                    tier1ThresholdSecs = 999L,
-                    tier2ThresholdSecs = 888L,
-                    gapTimeoutSecs = 777L,
-                    reorderBufferCapacity = 666,
-                    maxSequentialCommits = 555L,
-                    commitProcessTimeoutSecs = 444L,
-                    senderKeyTimeoutSecs = 333L,
-                    reconnectionDedupWindowSecs = 222L,
-                )
+                val nonDefaultPolicy =
+                    SyncPolicy(
+                        tier1ThresholdSecs = 999L,
+                        tier2ThresholdSecs = 888L,
+                        gapTimeoutSecs = 777L,
+                        reorderBufferCapacity = 666,
+                        maxSequentialCommits = 555L,
+                        commitProcessTimeoutSecs = 444L,
+                        senderKeyTimeoutSecs = 333L,
+                        reconnectionDedupWindowSecs = 222L,
+                    )
                 stubSyncBindings.getPolicyResult = nonDefaultPolicy
 
                 val result = bridge.sync!!.getPolicy()

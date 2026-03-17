@@ -72,28 +72,54 @@ interface DiscoveryBindings {
     // Petname operations (§22.4)
 
     /** Sets a petname for a DID. */
-    fun petnameSet(ownerDid: String, targetDid: String, name: String)
+    fun petnameSet(
+        ownerDid: String,
+        targetDid: String,
+        name: String,
+    )
 
     /** Removes a petname from a DID. */
-    fun petnameRemove(ownerDid: String, targetDid: String)
+    fun petnameRemove(
+        ownerDid: String,
+        targetDid: String,
+    )
 
     /** Sets a petname for a context. */
-    fun petnameSetContext(ownerDid: String, contextId: String, name: String)
+    fun petnameSetContext(
+        ownerDid: String,
+        contextId: String,
+        name: String,
+    )
 
     /** Removes a petname from a context. */
-    fun petnameRemoveContext(ownerDid: String, contextId: String)
+    fun petnameRemoveContext(
+        ownerDid: String,
+        contextId: String,
+    )
 
     /** Resolves a petname to DIDs. Returns a JSON array of DID strings. */
-    fun petnameResolveDid(ownerDid: String, name: String): String
+    fun petnameResolveDid(
+        ownerDid: String,
+        name: String,
+    ): String
 
     /** Resolves a petname to context IDs. Returns a JSON array of strings. */
-    fun petnameResolveContext(ownerDid: String, name: String): String
+    fun petnameResolveContext(
+        ownerDid: String,
+        name: String,
+    ): String
 
     /** Gets the petname for a DID. Returns null if none. */
-    fun petnameGetForDid(ownerDid: String, targetDid: String): String?
+    fun petnameGetForDid(
+        ownerDid: String,
+        targetDid: String,
+    ): String?
 
     /** Gets the petname for a context. Returns null if none. */
-    fun petnameGetForContext(ownerDid: String, contextId: String): String?
+    fun petnameGetForContext(
+        ownerDid: String,
+        contextId: String,
+    ): String?
 
     // Handle registry operations (§22.3.1)
 
@@ -192,8 +218,7 @@ class DiscoveryBridge internal constructor(
      * @param query A DID string (e.g., `"did:dht:z6Mk..."`) or an `scp://` URI.
      * @return JSON string with an array of discovery results.
      */
-    suspend fun discover(query: String): String =
-        bridge.ffiCall { bindings.contextDiscover(query) }
+    suspend fun discover(query: String): String = bridge.ffiCall { bindings.contextDiscover(query) }
 
     // Petname operations (§22.4)
 
@@ -204,7 +229,11 @@ class DiscoveryBridge internal constructor(
      * @param targetDid DID to assign the petname to.
      * @param name The petname string.
      */
-    suspend fun petnameSet(ownerDid: String, targetDid: String, name: String) {
+    suspend fun petnameSet(
+        ownerDid: String,
+        targetDid: String,
+        name: String,
+    ) {
         bridge.ffiCall { bindings.petnameSet(ownerDid, targetDid, name) }
     }
 
@@ -214,7 +243,10 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity that owns this petname map.
      * @param targetDid DID to remove the petname from.
      */
-    suspend fun petnameRemove(ownerDid: String, targetDid: String) {
+    suspend fun petnameRemove(
+        ownerDid: String,
+        targetDid: String,
+    ) {
         bridge.ffiCall { bindings.petnameRemove(ownerDid, targetDid) }
     }
 
@@ -225,7 +257,11 @@ class DiscoveryBridge internal constructor(
      * @param contextId Context ID to assign the petname to.
      * @param name The petname string.
      */
-    suspend fun petnameSetContext(ownerDid: String, contextId: String, name: String) {
+    suspend fun petnameSetContext(
+        ownerDid: String,
+        contextId: String,
+        name: String,
+    ) {
         bridge.ffiCall { bindings.petnameSetContext(ownerDid, contextId, name) }
     }
 
@@ -235,7 +271,10 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity that owns this petname map.
      * @param contextId Context ID to remove the petname from.
      */
-    suspend fun petnameRemoveContext(ownerDid: String, contextId: String) {
+    suspend fun petnameRemoveContext(
+        ownerDid: String,
+        contextId: String,
+    ) {
         bridge.ffiCall { bindings.petnameRemoveContext(ownerDid, contextId) }
     }
 
@@ -246,7 +285,10 @@ class DiscoveryBridge internal constructor(
      * @param name The petname to resolve.
      * @return List of DID strings.
      */
-    suspend fun petnameResolveDid(ownerDid: String, name: String): List<String> {
+    suspend fun petnameResolveDid(
+        ownerDid: String,
+        name: String,
+    ): List<String> {
         val json = bridge.ffiCall { bindings.petnameResolveDid(ownerDid, name) }
         return parseJsonStringArray(json)
     }
@@ -258,7 +300,10 @@ class DiscoveryBridge internal constructor(
      * @param name The petname to resolve.
      * @return List of context ID strings.
      */
-    suspend fun petnameResolveContext(ownerDid: String, name: String): List<String> {
+    suspend fun petnameResolveContext(
+        ownerDid: String,
+        name: String,
+    ): List<String> {
         val json = bridge.ffiCall { bindings.petnameResolveContext(ownerDid, name) }
         return parseJsonStringArray(json)
     }
@@ -270,8 +315,10 @@ class DiscoveryBridge internal constructor(
      * @param targetDid DID to look up.
      * @return The petname string, or null if no petname is assigned.
      */
-    suspend fun petnameGetForDid(ownerDid: String, targetDid: String): String? =
-        bridge.ffiCall { bindings.petnameGetForDid(ownerDid, targetDid) }
+    suspend fun petnameGetForDid(
+        ownerDid: String,
+        targetDid: String,
+    ): String? = bridge.ffiCall { bindings.petnameGetForDid(ownerDid, targetDid) }
 
     /**
      * Gets the petname assigned to a context, if any.
@@ -280,8 +327,10 @@ class DiscoveryBridge internal constructor(
      * @param contextId Context ID to look up.
      * @return The petname string, or null if no petname is assigned.
      */
-    suspend fun petnameGetForContext(ownerDid: String, contextId: String): String? =
-        bridge.ffiCall { bindings.petnameGetForContext(ownerDid, contextId) }
+    suspend fun petnameGetForContext(
+        ownerDid: String,
+        contextId: String,
+    ): String? = bridge.ffiCall { bindings.petnameGetForContext(ownerDid, contextId) }
 
     // Handle registry operations (§22.3.1)
 
@@ -307,7 +356,12 @@ class DiscoveryBridge internal constructor(
     ): String =
         bridge.ffiCall {
             bindings.handleRegister(
-                discoveryContextId, handle, targetJson, registrantDid, description, tags,
+                discoveryContextId,
+                handle,
+                targetJson,
+                registrantDid,
+                description,
+                tags,
             )
         }
 
@@ -360,9 +414,10 @@ class DiscoveryBridge internal constructor(
         address: String,
         knownContextsJson: String? = null,
     ): List<JsonElement> {
-        val json = bridge.ffiCall {
-            bindings.addressResolve(ownerDid, address, knownContextsJson)
-        }
+        val json =
+            bridge.ffiCall {
+                bindings.addressResolve(ownerDid, address, knownContextsJson)
+            }
         return Json.parseToJsonElement(json).jsonArray.toList()
     }
 }

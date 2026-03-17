@@ -39,12 +39,13 @@ data class ConformanceFixture(
 object ConformanceFixtureLoader {
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val searchPaths = listOf(
-        "tests/conformance",
-        "../../tests/conformance",
-        "../../../../tests/conformance",
-        "../../../../../tests/conformance",
-    )
+    private val searchPaths =
+        listOf(
+            "tests/conformance",
+            "../../tests/conformance",
+            "../../../../tests/conformance",
+            "../../../../../tests/conformance",
+        )
 
     fun loadFixtures(): List<ConformanceFixture> {
         for (relativePath in searchPaths) {
@@ -100,4 +101,5 @@ fun compareResults(
 }
 
 private fun isTimestampOrNonce(key: String): Boolean =
-    key.contains("timestamp") || key.contains("nonce") || key.contains("created_at")
+    key.contains("timestamp") || key.contains("nonce") ||
+        key.contains("created_at")

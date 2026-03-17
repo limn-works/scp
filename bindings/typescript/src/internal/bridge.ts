@@ -102,13 +102,16 @@ export interface Bridge {
     authorDid: string,
     asset: { path: string; contentType: string; body: number[] },
     deployId: string | null,
-  ): Promise<{ blobId: string; etag: string }>;
+  ): Promise<{ blobId: string; etag: string; deployId: string }>;
   broadcastPublishAssets(
     handle: BridgeContextHandle,
     authorDid: string,
     assets: { path: string; contentType: string; body: number[] }[],
     deployId: string | null,
-  ): Promise<{ blobId: string; etag: string }[]>;
+  ): Promise<{
+    results: { blobId: string; etag: string; deployId: string }[];
+    deployId: string;
+  }>;
   broadcastBlockSubscriber(
     handle: BridgeContextHandle,
     subscriberDid: string,

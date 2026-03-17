@@ -3,8 +3,6 @@
 
 package works.limn.scp.conformance
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -12,6 +10,8 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -35,58 +35,66 @@ class ContextConformanceTest {
     fun setUp() {
         stubBindings = ConformanceStubBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
         dispatcher = ConformanceDispatcher(bridge)
     }
 
     @Nested
     inner class ContextCreate {
         @Test
-        fun `context_create returns handle`() = runTest(testDispatcher) {
-            stubBindings.contextCreateResult = 100L
-            val result = dispatcher.dispatch(
-                "context_create",
-                mapOf(
-                    "identity_handle" to "1",
-                    "params" to """{"ceiling":["read","write"]}""",
-                ),
-            )
-            assertEquals("100", result["handle"])
-        }
+        fun `context_create returns handle`() =
+            runTest(testDispatcher) {
+                stubBindings.contextCreateResult = 100L
+                val result =
+                    dispatcher.dispatch(
+                        "context_create",
+                        mapOf(
+                            "identity_handle" to "1",
+                            "params" to """{"ceiling":["read","write"]}""",
+                        ),
+                    )
+                assertEquals("100", result["handle"])
+            }
 
         @Test
-        fun `context_create propagates error`() = runTest(testDispatcher) {
-            stubBindings.contextCreateError =
-                BridgeException("Invalid params", "SCP-CTX-2001")
-            val result = dispatcher.dispatch(
-                "context_create",
-                mapOf("identity_handle" to "1", "params" to "{}"),
-            )
-            assertEquals("SCP-CTX-2001", result["error"])
-        }
+        fun `context_create propagates error`() =
+            runTest(testDispatcher) {
+                stubBindings.contextCreateError =
+                    BridgeException("Invalid params", "SCP-CTX-2001")
+                val result =
+                    dispatcher.dispatch(
+                        "context_create",
+                        mapOf("identity_handle" to "1", "params" to "{}"),
+                    )
+                assertEquals("SCP-CTX-2001", result["error"])
+            }
 
         @Test
-        fun `context_create fixture comparison`() = runTest(testDispatcher) {
-            stubBindings.contextCreateResult = 50L
-            val fixture = ConformanceFixture(
-                testId = "context-create-001",
-                category = "context",
-                description = "Create context with read/write ceiling",
-                operation = "context_create",
-                input = mapOf(
-                    "identity_handle" to "1",
-                    "params" to """{"ceiling":["read","write"]}""",
-                ),
-                expected = mapOf("handle" to "50"),
-            )
-            val result = dispatcher.dispatch(fixture.operation, fixture.input)
-            val mismatches = compareResults(result, fixture.expected)
-            assertTrue(mismatches.isEmpty(), fixture.testId + ": " + mismatches)
-        }
+        fun `context_create fixture comparison`() =
+            runTest(testDispatcher) {
+                stubBindings.contextCreateResult = 50L
+                val fixture =
+                    ConformanceFixture(
+                        testId = "context-create-001",
+                        category = "context",
+                        description = "Create context with read/write ceiling",
+                        operation = "context_create",
+                        input =
+                            mapOf(
+                                "identity_handle" to "1",
+                                "params" to """{"ceiling":["read","write"]}""",
+                            ),
+                        expected = mapOf("handle" to "50"),
+                    )
+                val result = dispatcher.dispatch(fixture.operation, fixture.input)
+                val mismatches = compareResults(result, fixture.expected)
+                assertTrue(mismatches.isEmpty(), fixture.testId + ": " + mismatches)
+            }
     }
 
     @Nested
@@ -94,10 +102,11 @@ class ContextConformanceTest {
         @Test
         fun `context_join succeeds for valid context`() =
             runTest(testDispatcher) {
-                val result = dispatcher.dispatch(
-                    "context_join",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_join",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("joined", result["status"])
             }
 
@@ -106,10 +115,11 @@ class ContextConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextJoinError =
                     BridgeException("Context not found", "SCP-CTX-2002")
-                val result = dispatcher.dispatch(
-                    "context_join",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_join",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("SCP-CTX-2002", result["error"])
             }
     }
@@ -119,10 +129,11 @@ class ContextConformanceTest {
         @Test
         fun `context_leave succeeds for active context`() =
             runTest(testDispatcher) {
-                val result = dispatcher.dispatch(
-                    "context_leave",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_leave",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("left", result["status"])
                 assertTrue(stubBindings.contextLeaveCalled)
             }
@@ -132,10 +143,11 @@ class ContextConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.contextLeaveError =
                     BridgeException("Not a member", "SCP-CTX-2003")
-                val result = dispatcher.dispatch(
-                    "context_leave",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_leave",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("SCP-CTX-2003", result["error"])
             }
     }
@@ -143,24 +155,27 @@ class ContextConformanceTest {
     @Nested
     inner class ContextClose {
         @Test
-        fun `context_close succeeds for admin`() = runTest(testDispatcher) {
-            val result = dispatcher.dispatch(
-                "context_close",
-                mapOf("context_handle" to "10", "identity_handle" to "1"),
-            )
-            assertEquals("closed", result["status"])
-            assertTrue(stubBindings.contextCloseCalled)
-        }
+        fun `context_close succeeds for admin`() =
+            runTest(testDispatcher) {
+                val result =
+                    dispatcher.dispatch(
+                        "context_close",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
+                assertEquals("closed", result["status"])
+                assertTrue(stubBindings.contextCloseCalled)
+            }
 
         @Test
         fun `context_close propagates permission error`() =
             runTest(testDispatcher) {
                 stubBindings.contextCloseError =
                     BridgeException("Not authorized", "SCP-PERM-3001")
-                val result = dispatcher.dispatch(
-                    "context_close",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "context_close",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("SCP-PERM-3001", result["error"])
             }
     }
@@ -171,32 +186,36 @@ class ContextConformanceTest {
         fun `context lifecycle - create then leave`() =
             runTest(testDispatcher) {
                 stubBindings.contextCreateResult = 10L
-                val createResult = dispatcher.dispatch(
-                    "context_create",
-                    mapOf("identity_handle" to "1", "params" to "{}"),
-                )
+                val createResult =
+                    dispatcher.dispatch(
+                        "context_create",
+                        mapOf("identity_handle" to "1", "params" to "{}"),
+                    )
                 assertEquals("10", createResult["handle"])
 
-                val leaveResult = dispatcher.dispatch(
-                    "context_leave",
-                    mapOf("context_handle" to "10", "identity_handle" to "1"),
-                )
+                val leaveResult =
+                    dispatcher.dispatch(
+                        "context_leave",
+                        mapOf("context_handle" to "10", "identity_handle" to "1"),
+                    )
                 assertEquals("left", leaveResult["status"])
             }
 
         @Test
         fun `context lifecycle - join then close`() =
             runTest(testDispatcher) {
-                val joinResult = dispatcher.dispatch(
-                    "context_join",
-                    mapOf("context_handle" to "20", "identity_handle" to "1"),
-                )
+                val joinResult =
+                    dispatcher.dispatch(
+                        "context_join",
+                        mapOf("context_handle" to "20", "identity_handle" to "1"),
+                    )
                 assertEquals("joined", joinResult["status"])
 
-                val closeResult = dispatcher.dispatch(
-                    "context_close",
-                    mapOf("context_handle" to "20", "identity_handle" to "1"),
-                )
+                val closeResult =
+                    dispatcher.dispatch(
+                        "context_close",
+                        mapOf("context_handle" to "20", "identity_handle" to "1"),
+                    )
                 assertEquals("closed", closeResult["status"])
             }
     }

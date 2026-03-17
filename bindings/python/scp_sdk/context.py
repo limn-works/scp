@@ -114,6 +114,23 @@ class PublishResult:
     #: Hex-encoded SHA-256 of the asset body.
     etag: str
 
+    #: Deploy ID grouping this asset into an atomic deploy.
+    deploy_id: str
+
+
+@dataclass(frozen=True)
+class BatchPublishResult:
+    """Result of publishing multiple assets to a broadcast context (SCP-292).
+
+    Returned by :meth:`Context.broadcast_publish_assets`.
+    """
+
+    #: Individual publish results for each asset.
+    results: list[PublishResult]
+
+    #: Shared deploy ID for the batch.
+    deploy_id: str
+
 
 # ---------------------------------------------------------------------------
 # SiteConfig — broadcast projection site configuration (SCP-293)
@@ -861,15 +878,19 @@ class Context:
             asset.body,
             deploy_id,
         )
-        return PublishResult(blob_id=result["blob_id"], etag=result["etag"])
+        return PublishResult(
+            blob_id=result["blob_id"],
+            etag=result["etag"],
+            deploy_id=result["deploy_id"],
+        )
 
     async def broadcast_publish_assets(
         self,
         assets: list[AssetEntry],
         identity: Identity | None = None,
         deploy_id: str | None = None,
-    ) -> list[PublishResult]:
-        """Publish multiple assets to this broadcast context (SCP-290).
+    ) -> BatchPublishResult:
+        """Publish multiple assets to this broadcast context (SCP-290, SCP-292).
 
         All assets are published with the same deploy_id (auto-generated if
         not provided).
@@ -881,7 +902,7 @@ class Context:
             deploy_id: Optional deploy ID to group assets into atomic deploys.
 
         Returns:
-            A list of PublishResult objects with blob_id and etag.
+            A BatchPublishResult with results and the shared deploy_id.
 
         Raises:
             ContextError: If any asset fails validation or publish.
@@ -896,14 +917,24 @@ class Context:
 
         author_did = identity.did if identity is not None else self._creator_did
         asset_tuples = [(a.path, a.content_type, a.body) for a in assets]
-        results = await asyncio.to_thread(
+        batch = await asyncio.to_thread(
             _scp_core.py_broadcast_publish_assets,
             self._handle,
             author_did,
             asset_tuples,
             deploy_id,
         )
-        return [PublishResult(blob_id=r["blob_id"], etag=r["etag"]) for r in results]
+        # Bridge returns {"results": [...], "deploy_id": "..."}.
+        shared_deploy_id = batch["deploy_id"]
+        results = [
+            PublishResult(
+                blob_id=r["blob_id"],
+                etag=r["etag"],
+                deploy_id=r["deploy_id"],
+            )
+            for r in batch["results"]
+        ]
+        return BatchPublishResult(results=results, deploy_id=shared_deploy_id)
 
     async def broadcast_block_subscriber(
         self,

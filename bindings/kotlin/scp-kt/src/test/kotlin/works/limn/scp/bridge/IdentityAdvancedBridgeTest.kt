@@ -102,14 +102,21 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         return attestDeviceResult
     }
 
-    override fun identityVerifyDeviceAttestation(did: String, tokenBase64: String): Boolean {
+    override fun identityVerifyDeviceAttestation(
+        did: String,
+        tokenBase64: String,
+    ): Boolean {
         verifyDeviceAttestationCalled = true
         lastDid = did
         lastTokenBase64 = tokenBase64
         return verifyDeviceAttestationResult
     }
 
-    override fun identityExecuteRecovery(did: String, tier: String, contextIds: List<String>): String {
+    override fun identityExecuteRecovery(
+        did: String,
+        tier: String,
+        contextIds: List<String>,
+    ): String {
         executeRecoveryCalled = true
         lastDid = did
         lastTier = tier
@@ -118,7 +125,11 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         return executeRecoveryResult
     }
 
-    override fun identityExecuteCustodyMigration(did: String, target: String, contextIds: List<String>): String {
+    override fun identityExecuteCustodyMigration(
+        did: String,
+        target: String,
+        contextIds: List<String>,
+    ): String {
         executeCustodyMigrationCalled = true
         lastDid = did
         lastTarget = target
@@ -141,167 +152,184 @@ class IdentityAdvancedBridgeTest {
         stubBindings = StubNativeBindings()
         stubAdvanced = StubIdentityAdvancedBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-            extendedBindings = ExtendedBindings(identityAdvanced = stubAdvanced),
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+                extendedBindings = ExtendedBindings(identityAdvanced = stubAdvanced),
+            )
         advancedBridge = bridge.identityAdvanced!!
     }
 
     @Nested
     inner class CreateWithAgentKey {
         @Test
-        fun `createWithAgentKey delegates to bindings with custody string`() = runTest(testDispatcher) {
-            val result = advancedBridge.createWithAgentKey("in_memory")
-            assertTrue(stubAdvanced.createWithAgentKeyCalled)
-            assertEquals("in_memory", stubAdvanced.lastCustody)
-            assertEquals(100L, result)
-        }
+        fun `createWithAgentKey delegates to bindings with custody string`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.createWithAgentKey("in_memory")
+                assertTrue(stubAdvanced.createWithAgentKeyCalled)
+                assertEquals("in_memory", stubAdvanced.lastCustody)
+                assertEquals(100L, result)
+            }
 
         @Test
-        fun `createWithAgentKey propagates bridge error`() = runTest(testDispatcher) {
-            stubAdvanced.createWithAgentKeyError = BridgeException("custody not available", "SCP-IDENT-1020")
-            assertFailsWith<BridgeException> {
-                advancedBridge.createWithAgentKey("platform")
+        fun `createWithAgentKey propagates bridge error`() =
+            runTest(testDispatcher) {
+                stubAdvanced.createWithAgentKeyError = BridgeException("custody not available", "SCP-IDENT-1020")
+                assertFailsWith<BridgeException> {
+                    advancedBridge.createWithAgentKey("platform")
+                }
             }
-        }
     }
 
     @Nested
     inner class AddAgentKey {
         @Test
-        fun `addAgentKey delegates handle to bindings`() = runTest(testDispatcher) {
-            val result = advancedBridge.addAgentKey(42L)
-            assertTrue(stubAdvanced.addAgentKeyCalled)
-            assertEquals(42L, stubAdvanced.lastIdentityHandle)
-            assertEquals(101L, result)
-        }
+        fun `addAgentKey delegates handle to bindings`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.addAgentKey(42L)
+                assertTrue(stubAdvanced.addAgentKeyCalled)
+                assertEquals(42L, stubAdvanced.lastIdentityHandle)
+                assertEquals(101L, result)
+            }
     }
 
     @Nested
     inner class RotateAgentKey {
         @Test
-        fun `rotateAgentKey delegates handle to bindings`() = runTest(testDispatcher) {
-            val result = advancedBridge.rotateAgentKey(42L)
-            assertTrue(stubAdvanced.rotateAgentKeyCalled)
-            assertEquals(42L, stubAdvanced.lastIdentityHandle)
-            assertEquals(102L, result)
-        }
+        fun `rotateAgentKey delegates handle to bindings`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.rotateAgentKey(42L)
+                assertTrue(stubAdvanced.rotateAgentKeyCalled)
+                assertEquals(42L, stubAdvanced.lastIdentityHandle)
+                assertEquals(102L, result)
+            }
     }
 
     @Nested
     inner class RemoveAgentKey {
         @Test
-        fun `removeAgentKey delegates handle to bindings`() = runTest(testDispatcher) {
-            val result = advancedBridge.removeAgentKey(42L)
-            assertTrue(stubAdvanced.removeAgentKeyCalled)
-            assertEquals(42L, stubAdvanced.lastIdentityHandle)
-            assertEquals(103L, result)
-        }
+        fun `removeAgentKey delegates handle to bindings`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.removeAgentKey(42L)
+                assertTrue(stubAdvanced.removeAgentKeyCalled)
+                assertEquals(42L, stubAdvanced.lastIdentityHandle)
+                assertEquals(103L, result)
+            }
     }
 
     @Nested
     inner class Migrate {
         @Test
-        fun `migrate delegates handle to bindings`() = runTest(testDispatcher) {
-            val result = advancedBridge.migrate(42L)
-            assertTrue(stubAdvanced.migrateCalled)
-            assertEquals(42L, stubAdvanced.lastIdentityHandle)
-            assertEquals(104L, result)
-        }
+        fun `migrate delegates handle to bindings`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.migrate(42L)
+                assertTrue(stubAdvanced.migrateCalled)
+                assertEquals(42L, stubAdvanced.lastIdentityHandle)
+                assertEquals(104L, result)
+            }
     }
 
     @Nested
     inner class AttestDevice {
         @Test
-        fun `attestDevice delegates handle and returns token`() = runTest(testDispatcher) {
-            val result = advancedBridge.attestDevice(42L)
-            assertTrue(stubAdvanced.attestDeviceCalled)
-            assertEquals(42L, stubAdvanced.lastIdentityHandle)
-            assertEquals("dGVzdC1hdHRlc3RhdGlvbg==", result)
-        }
+        fun `attestDevice delegates handle and returns token`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.attestDevice(42L)
+                assertTrue(stubAdvanced.attestDeviceCalled)
+                assertEquals(42L, stubAdvanced.lastIdentityHandle)
+                assertEquals("dGVzdC1hdHRlc3RhdGlvbg==", result)
+            }
     }
 
     @Nested
     inner class VerifyDeviceAttestation {
         @Test
-        fun `verifyDeviceAttestation delegates did and token`() = runTest(testDispatcher) {
-            val result = advancedBridge.verifyDeviceAttestation("did:dht:z6MkTest", "dGVzdA==")
-            assertTrue(stubAdvanced.verifyDeviceAttestationCalled)
-            assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
-            assertEquals("dGVzdA==", stubAdvanced.lastTokenBase64)
-            assertTrue(result)
-        }
+        fun `verifyDeviceAttestation delegates did and token`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.verifyDeviceAttestation("did:dht:z6MkTest", "dGVzdA==")
+                assertTrue(stubAdvanced.verifyDeviceAttestationCalled)
+                assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
+                assertEquals("dGVzdA==", stubAdvanced.lastTokenBase64)
+                assertTrue(result)
+            }
 
         @Test
-        fun `verifyDeviceAttestation returns false for invalid token`() = runTest(testDispatcher) {
-            stubAdvanced.verifyDeviceAttestationResult = false
-            val result = advancedBridge.verifyDeviceAttestation("did:dht:z6MkTest", "aW52YWxpZA==")
-            assertEquals(false, result)
-        }
+        fun `verifyDeviceAttestation returns false for invalid token`() =
+            runTest(testDispatcher) {
+                stubAdvanced.verifyDeviceAttestationResult = false
+                val result = advancedBridge.verifyDeviceAttestation("did:dht:z6MkTest", "aW52YWxpZA==")
+                assertEquals(false, result)
+            }
     }
 
     @Nested
     inner class ExecuteRecovery {
         @Test
-        fun `executeRecovery delegates did, tier, and contextIds`() = runTest(testDispatcher) {
-            val result = advancedBridge.executeRecovery("did:dht:z6MkTest", "agent", listOf("ctx-1"))
-            assertTrue(stubAdvanced.executeRecoveryCalled)
-            assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
-            assertEquals("agent", stubAdvanced.lastTier)
-            assertEquals(listOf("ctx-1"), stubAdvanced.lastContextIds)
-            assertTrue(result.contains("key_rotation_completed"))
-        }
+        fun `executeRecovery delegates did, tier, and contextIds`() =
+            runTest(testDispatcher) {
+                val result = advancedBridge.executeRecovery("did:dht:z6MkTest", "agent", listOf("ctx-1"))
+                assertTrue(stubAdvanced.executeRecoveryCalled)
+                assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
+                assertEquals("agent", stubAdvanced.lastTier)
+                assertEquals(listOf("ctx-1"), stubAdvanced.lastContextIds)
+                assertTrue(result.contains("key_rotation_completed"))
+            }
 
         @Test
-        fun `executeRecovery propagates bridge error`() = runTest(testDispatcher) {
-            stubAdvanced.executeRecoveryError = BridgeException("recovery failed", "SCP-IDENT-1030")
-            assertFailsWith<BridgeException> {
-                advancedBridge.executeRecovery("did:dht:z6MkFail", "identity_key")
+        fun `executeRecovery propagates bridge error`() =
+            runTest(testDispatcher) {
+                stubAdvanced.executeRecoveryError = BridgeException("recovery failed", "SCP-IDENT-1030")
+                assertFailsWith<BridgeException> {
+                    advancedBridge.executeRecovery("did:dht:z6MkFail", "identity_key")
+                }
             }
-        }
     }
 
     @Nested
     inner class ExecuteCustodyMigration {
         @Test
-        fun `executeCustodyMigration delegates did, target, and contextIds`() = runTest(testDispatcher) {
-            val result = advancedBridge.executeCustodyMigration(
-                "did:dht:z6MkTest",
-                "hardware",
-                listOf("ctx-1", "ctx-2"),
-            )
-            assertTrue(stubAdvanced.executeCustodyMigrationCalled)
-            assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
-            assertEquals("hardware", stubAdvanced.lastTarget)
-            assertEquals(listOf("ctx-1", "ctx-2"), stubAdvanced.lastContextIds)
-            assertTrue(result.contains("key_generated"))
-            assertTrue(result.contains("authorized"))
-        }
-
-        @Test
-        fun `executeCustodyMigration with empty contextIds`() = runTest(testDispatcher) {
-            advancedBridge.executeCustodyMigration("did:dht:z6MkTest", "software")
-            assertEquals(emptyList(), stubAdvanced.lastContextIds)
-        }
-
-        @Test
-        fun `executeCustodyMigration propagates bridge error`() = runTest(testDispatcher) {
-            stubAdvanced.executeCustodyMigrationError =
-                BridgeException("backend not configured", "SCP-IDENT-1025")
-            assertFailsWith<BridgeException> {
-                advancedBridge.executeCustodyMigration("did:dht:z6MkFail", "hardware")
+        fun `executeCustodyMigration delegates did, target, and contextIds`() =
+            runTest(testDispatcher) {
+                val result =
+                    advancedBridge.executeCustodyMigration(
+                        "did:dht:z6MkTest",
+                        "hardware",
+                        listOf("ctx-1", "ctx-2"),
+                    )
+                assertTrue(stubAdvanced.executeCustodyMigrationCalled)
+                assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
+                assertEquals("hardware", stubAdvanced.lastTarget)
+                assertEquals(listOf("ctx-1", "ctx-2"), stubAdvanced.lastContextIds)
+                assertTrue(result.contains("key_generated"))
+                assertTrue(result.contains("authorized"))
             }
-        }
 
         @Test
-        fun `executeCustodyMigration supports all target types`() = runTest(testDispatcher) {
-            for (target in listOf("platform_managed", "hardware", "software", "in_memory")) {
-                advancedBridge.executeCustodyMigration("did:dht:z6MkTest", target)
-                assertEquals(target, stubAdvanced.lastTarget)
+        fun `executeCustodyMigration with empty contextIds`() =
+            runTest(testDispatcher) {
+                advancedBridge.executeCustodyMigration("did:dht:z6MkTest", "software")
+                assertEquals(emptyList(), stubAdvanced.lastContextIds)
             }
-        }
+
+        @Test
+        fun `executeCustodyMigration propagates bridge error`() =
+            runTest(testDispatcher) {
+                stubAdvanced.executeCustodyMigrationError =
+                    BridgeException("backend not configured", "SCP-IDENT-1025")
+                assertFailsWith<BridgeException> {
+                    advancedBridge.executeCustodyMigration("did:dht:z6MkFail", "hardware")
+                }
+            }
+
+        @Test
+        fun `executeCustodyMigration supports all target types`() =
+            runTest(testDispatcher) {
+                for (target in listOf("platform_managed", "hardware", "software", "in_memory")) {
+                    advancedBridge.executeCustodyMigration("did:dht:z6MkTest", target)
+                    assertEquals(target, stubAdvanced.lastTarget)
+                }
+            }
     }
 }

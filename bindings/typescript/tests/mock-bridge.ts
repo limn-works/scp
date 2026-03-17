@@ -1053,12 +1053,13 @@ export function createMockBridge(): Bridge & {
       _authorDid: string,
       _asset: { path: string; contentType: string; body: number[] },
       _deployId: string | null,
-    ): Promise<{ blobId: string; etag: string }> {
+    ): Promise<{ blobId: string; etag: string; deployId: string }> {
       const ctx = getContext(handle);
       if (ctx.mode !== "Broadcast") {
         throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
       }
-      return { blobId: `mock-blob-id-${ctx.eventLog.length}`, etag: "mock-etag" };
+      const did = _deployId ?? `mock-deploy-${Date.now().toString(16)}`;
+      return { blobId: `mock-blob-id-${ctx.eventLog.length}`, etag: "mock-etag", deployId: did };
     },
 
     async broadcastPublishAssets(
@@ -1066,13 +1067,17 @@ export function createMockBridge(): Bridge & {
       authorDid: string,
       assets: { path: string; contentType: string; body: number[] }[],
       deployId: string | null,
-    ): Promise<{ blobId: string; etag: string }[]> {
-      const results: { blobId: string; etag: string }[] = [];
+    ): Promise<{
+      results: { blobId: string; etag: string; deployId: string }[];
+      deployId: string;
+    }> {
+      const did = deployId ?? `mock-deploy-${Date.now().toString(16)}`;
+      const results: { blobId: string; etag: string; deployId: string }[] = [];
       for (const asset of assets) {
-        const result = await this.broadcastPublishAsset(handle, authorDid, asset, deployId);
+        const result = await this.broadcastPublishAsset(handle, authorDid, asset, did);
         results.push(result);
       }
-      return results;
+      return { results, deployId: did };
     },
 
     async broadcastBlockSubscriber(

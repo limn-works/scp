@@ -67,7 +67,10 @@ interface MediaBindings {
      * @return Updated session JSON string.
      * @throws BridgeException if session has ended.
      */
-    fun mediaJoinSession(sessionJson: String, participantDid: String): String
+    fun mediaJoinSession(
+        sessionJson: String,
+        participantDid: String,
+    ): String
 
     /**
      * Ends a media session and returns metadata for event log recording.
@@ -77,7 +80,10 @@ interface MediaBindings {
      * @return JSON string with session and metadata keys.
      * @throws BridgeException if session already ended.
      */
-    fun mediaEndSession(sessionJson: String, timestamp: Long): String
+    fun mediaEndSession(
+        sessionJson: String,
+        timestamp: Long,
+    ): String
 
     /**
      * Creates an SDP offer signaling message.
@@ -87,7 +93,11 @@ interface MediaBindings {
      * @param senderDid DID of the participant creating the offer.
      * @return JSON string with session_id and message keys.
      */
-    fun mediaCreateOffer(sessionId: String, sdp: String, senderDid: String): String
+    fun mediaCreateOffer(
+        sessionId: String,
+        sdp: String,
+        senderDid: String,
+    ): String
 
     /**
      * Creates an SDP answer signaling message.
@@ -97,7 +107,11 @@ interface MediaBindings {
      * @param senderDid DID of the participant creating the answer.
      * @return JSON string with session_id and message keys.
      */
-    fun mediaCreateAnswer(sessionId: String, sdp: String, senderDid: String): String
+    fun mediaCreateAnswer(
+        sessionId: String,
+        sdp: String,
+        senderDid: String,
+    ): String
 
     /**
      * Creates an ICE candidate signaling message.
@@ -124,7 +138,10 @@ interface MediaBindings {
      * @param senderDid DID of the participant ending the session.
      * @return JSON string with session_id and message keys.
      */
-    fun mediaCreateSessionEnd(sessionId: String, senderDid: String): String
+    fun mediaCreateSessionEnd(
+        sessionId: String,
+        senderDid: String,
+    ): String
 
     /**
      * Serializes a signaling message and returns payload bytes with message type.
@@ -143,7 +160,10 @@ interface MediaBindings {
      * @return `true` if valid.
      * @throws BridgeException if sender DID does not match.
      */
-    fun mediaVerifySenderAttribution(signalingJson: String, envelopeSenderDid: String): Boolean
+    fun mediaVerifySenderAttribution(
+        signalingJson: String,
+        envelopeSenderDid: String,
+    ): Boolean
 }
 
 /**
@@ -212,7 +232,10 @@ class MediaBridge internal constructor(
      * @param participantDid DID of the participant to add.
      * @return Updated session JSON string.
      */
-    suspend fun joinSession(sessionJson: String, participantDid: String): String =
+    suspend fun joinSession(
+        sessionJson: String,
+        participantDid: String,
+    ): String =
         bridge.ffiCall {
             bindings.mediaJoinSession(sessionJson, participantDid)
         }
@@ -224,7 +247,10 @@ class MediaBridge internal constructor(
      * @param timestamp Unix timestamp (seconds) when the session ended.
      * @return JSON string with session and metadata keys.
      */
-    suspend fun endSession(sessionJson: String, timestamp: Long): String =
+    suspend fun endSession(
+        sessionJson: String,
+        timestamp: Long,
+    ): String =
         bridge.ffiCall {
             bindings.mediaEndSession(sessionJson, timestamp)
         }
@@ -237,7 +263,11 @@ class MediaBridge internal constructor(
      * @param senderDid DID of the participant creating the offer.
      * @return JSON string with session_id and message keys.
      */
-    suspend fun createOffer(sessionId: String, sdp: String, senderDid: String): String =
+    suspend fun createOffer(
+        sessionId: String,
+        sdp: String,
+        senderDid: String,
+    ): String =
         bridge.ffiCall {
             bindings.mediaCreateOffer(sessionId, sdp, senderDid)
         }
@@ -250,7 +280,11 @@ class MediaBridge internal constructor(
      * @param senderDid DID of the participant creating the answer.
      * @return JSON string with session_id and message keys.
      */
-    suspend fun createAnswer(sessionId: String, sdp: String, senderDid: String): String =
+    suspend fun createAnswer(
+        sessionId: String,
+        sdp: String,
+        senderDid: String,
+    ): String =
         bridge.ffiCall {
             bindings.mediaCreateAnswer(sessionId, sdp, senderDid)
         }
@@ -283,7 +317,10 @@ class MediaBridge internal constructor(
      * @param senderDid DID of the participant ending the session.
      * @return JSON string with session_id and message keys.
      */
-    suspend fun createSessionEnd(sessionId: String, senderDid: String): String =
+    suspend fun createSessionEnd(
+        sessionId: String,
+        senderDid: String,
+    ): String =
         bridge.ffiCall {
             bindings.mediaCreateSessionEnd(sessionId, senderDid)
         }
@@ -306,7 +343,10 @@ class MediaBridge internal constructor(
      * @param envelopeSenderDid The DID from the authenticated SCP envelope.
      * @return `true` if valid.
      */
-    suspend fun verifySenderAttribution(signalingJson: String, envelopeSenderDid: String): Boolean =
+    suspend fun verifySenderAttribution(
+        signalingJson: String,
+        envelopeSenderDid: String,
+    ): Boolean =
         bridge.ffiCall {
             bindings.mediaVerifySenderAttribution(signalingJson, envelopeSenderDid)
         }

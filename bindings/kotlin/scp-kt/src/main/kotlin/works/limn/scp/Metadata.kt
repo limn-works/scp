@@ -87,7 +87,6 @@ class MetadataBridge internal constructor(
     private val bindings: MetadataBindings,
     private val bridge: CoroutineBridge,
 ) {
-
     /**
      * Serializes a MetadataRecord to a JSON string.
      *
@@ -102,46 +101,56 @@ class MetadataBridge internal constructor(
         structuralJson: String,
         operationalJson: String,
         signatureHex: String,
-    ): String = bridge.ffiCall {
-        bindings.metadataRecordToJson(
-            contextId, sequence, signerDid, timestamp,
-            structuralJson, operationalJson, signatureHex,
-        )
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.metadataRecordToJson(
+                contextId,
+                sequence,
+                signerDid,
+                timestamp,
+                structuralJson,
+                operationalJson,
+                signatureHex,
+            )
+        }
 
     /**
      * Deserializes a MetadataRecord from a JSON string.
      *
      * @see MetadataBindings.metadataRecordFromJson
      */
-    suspend fun metadataRecordFromJson(jsonStr: String): String = bridge.ffiCall {
-        bindings.metadataRecordFromJson(jsonStr)
-    }
+    suspend fun metadataRecordFromJson(jsonStr: String): String =
+        bridge.ffiCall {
+            bindings.metadataRecordFromJson(jsonStr)
+        }
 
     /**
      * Returns the canonical ContextParams for a given template ID as JSON.
      *
      * @see MetadataBindings.templateGetParams
      */
-    suspend fun templateGetParams(templateId: String): String = bridge.ffiCall {
-        bindings.templateGetParams(templateId)
-    }
+    suspend fun templateGetParams(templateId: String): String =
+        bridge.ffiCall {
+            bindings.templateGetParams(templateId)
+        }
 
     /**
      * Validates that ContextParams match their template definition.
      *
      * @see MetadataBindings.validateAgainstTemplate
      */
-    suspend fun validateAgainstTemplate(paramsJson: String): String? = bridge.ffiCall {
-        bindings.validateAgainstTemplate(paramsJson)
-    }
+    suspend fun validateAgainstTemplate(paramsJson: String): String? =
+        bridge.ffiCall {
+            bindings.validateAgainstTemplate(paramsJson)
+        }
 
     /**
      * Validates cross-field invariants for ContextParams.
      *
      * @see MetadataBindings.validateContextParams
      */
-    suspend fun validateContextParams(paramsJson: String): String? = bridge.ffiCall {
-        bindings.validateContextParams(paramsJson)
-    }
+    suspend fun validateContextParams(paramsJson: String): String? =
+        bridge.ffiCall {
+            bindings.validateContextParams(paramsJson)
+        }
 }

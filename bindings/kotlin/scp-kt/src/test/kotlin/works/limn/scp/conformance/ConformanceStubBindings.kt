@@ -25,7 +25,6 @@ import works.limn.scp.bridge.NativeBindings
  */
 @Suppress("TooManyFunctions")
 class ConformanceStubBindings : NativeBindings {
-
     var identityCreateResult: Long = 1L
     var identityCreateError: BridgeException? = null
     var identityCreateCustody: String? = null
@@ -77,9 +76,11 @@ class ConformanceStubBindings : NativeBindings {
     var eventLogQueryError: BridgeException? = null
     var eventLogVerifyResult: Boolean = true
     var eventLogVerifyError: BridgeException? = null
-    @Suppress("MaxLineLength")
+
     var eventLogCheckpointResult: String =
-        """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1710000000,"signature":"c2lnbmVk"}"""
+        """{"context_id":"ctx-1","sender_did":"did:dht:stub",""" +
+            """"event_count":10,"merkle_root":"abcdef","epoch":5,""" +
+            """"timestamp":1710000000,"signature":"c2lnbmVk"}"""
     var eventLogCheckpointError: BridgeException? = null
 
     var transportConnectResult: Long = 99L
@@ -156,30 +157,71 @@ class ConformanceStubBindings : NativeBindings {
     }
 
     override fun contextUnsubscribe(subscriptionHandle: Long) = Unit
-    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) = Unit
+
+    override fun contextSetEconomicPolicy(
+        contextHandle: Long,
+        policyJson: String,
+    ) = Unit
+
     override fun contextGetEconomicPolicy(contextHandle: Long): String? = null
 
     // MembershipBindings
     override fun contextMemberCount(contextHandle: Long): Long? = 1L
-    override fun contextIsMember(contextHandle: Long, did: String): Boolean = true
+
+    override fun contextIsMember(
+        contextHandle: Long,
+        did: String,
+    ): Boolean = true
+
     override fun contextMemberDids(contextHandle: Long): List<String> = listOf("did:dht:stub")
-    override fun contextMemberRole(contextHandle: Long, did: String): String? = "admin"
+
+    override fun contextMemberRole(
+        contextHandle: Long,
+        did: String,
+    ): String? = "admin"
 
     // GovernanceBindings
-    override fun governanceExecute(contextHandle: Long, proposalJson: String): String =
-        """{"status":"executed"}"""
-    override fun governancePropose(contextHandle: Long, proposerDid: String, actionJson: String): String =
-        """{"proposal_id":"0000","status":"Pending","execution_result":null}"""
-    override fun governanceApprove(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
-        """{"status":"Pending"}"""
-    override fun governanceReject(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
-        """{"status":"Pending"}"""
-    override fun governanceWithdraw(contextHandle: Long, voterDid: String, proposalIdHex: String): String =
-        """{"status":"Pending"}"""
-    override fun governanceGetProposal(contextHandle: Long, proposalIdHex: String): String =
-        """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
+    override fun governanceExecute(
+        contextHandle: Long,
+        proposalJson: String,
+    ): String = """{"status":"executed"}"""
+
+    override fun governancePropose(
+        contextHandle: Long,
+        proposerDid: String,
+        actionJson: String,
+    ): String = """{"proposal_id":"0000","status":"Pending","execution_result":null}"""
+
+    override fun governanceApprove(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = """{"status":"Pending"}"""
+
+    override fun governanceReject(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = """{"status":"Pending"}"""
+
+    override fun governanceWithdraw(
+        contextHandle: Long,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String = """{"status":"Pending"}"""
+
+    override fun governanceGetProposal(
+        contextHandle: Long,
+        proposalIdHex: String,
+    ): String = """{"proposal_id":"0000","status":"Pending","action":"{}","proposer_did":"did:dht:stub","votes":{}}"""
+
     override fun governanceListProposals(contextHandle: Long): String = "[]"
-    override fun applyPendingCeilingModification(contextHandle: Long, currentTimestamp: Long): Boolean = false
+
+    override fun applyPendingCeilingModification(
+        contextHandle: Long,
+        currentTimestamp: Long,
+    ): Boolean = false
+
     override fun finalizeClose(contextHandle: Long) = Unit
 
     @Suppress("LongParameterList")
@@ -202,31 +244,69 @@ class ConformanceStubBindings : NativeBindings {
     ): String = "{}"
 
     override fun restoreContext(contextId: String) = Unit
+
     override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
-    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
-    override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
-    override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
-    override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
-    override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) = Unit
-    override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String =
-        """{"key":"stub"}"""
+    override fun broadcastSubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+    ) = Unit
+
+    override fun broadcastUnsubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+        rotateKeys: Boolean,
+    ) = Unit
+
+    override fun broadcastPublish(
+        contextHandle: Long,
+        identityHandle: Long,
+        payload: ByteArray,
+    ) = Unit
+
+    override fun broadcastBlockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        blockerDid: String,
+    ) = Unit
+
+    override fun broadcastUnblockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        unblockerDid: String,
+    ) = Unit
+
+    override fun broadcastHandleKeyRequest(
+        contextHandle: Long,
+        authorDid: String,
+        requesterDid: String,
+    ): String = """{"key":"stub"}"""
+
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
-    override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
+
+    override fun broadcastIsSubscriber(
+        contextHandle: Long,
+        did: String,
+    ): Boolean = false
+
     override fun broadcastAdmission(contextHandle: Long): String? = "Open"
+
     override fun broadcastPublishAsset(
         contextHandle: Long,
         identityHandle: Long,
         assetJson: String,
         deployId: String?,
-    ): String = """{"blob_id":"stub-blob","etag":"stub-etag"}"""
+    ): String = """{"blob_id":"stub-blob","etag":"stub-etag","deploy_id":"stub-deploy"}"""
+
     override fun broadcastPublishAssets(
         contextHandle: Long,
         identityHandle: Long,
         assetsJson: String,
         deployId: String?,
-    ): String = """[{"blob_id":"stub-blob","etag":"stub-etag"}]"""
+    ): String = """{"results":[{"blob_id":"stub-blob",""" +
+        """"etag":"stub-etag","deploy_id":"stub-deploy"}],""" +
+        """"deploy_id":"stub-deploy"}"""
 
     override fun toolRegister(
         contextHandle: Long,
@@ -261,15 +341,16 @@ class ConformanceStubBindings : NativeBindings {
         toolId: String,
         targetContextId: String,
         rateLimitJson: String?,
-    ): String = Json.encodeToString(
-        buildJsonObject {
-            put("source_context", "ctx-src")
-            put("target_context", targetContextId)
-            put("tool_id", toolId)
-            put("approved_by_source", true)
-            put("approved_by_target", false)
-        },
-    )
+    ): String =
+        Json.encodeToString(
+            buildJsonObject {
+                put("source_context", "ctx-src")
+                put("target_context", targetContextId)
+                put("tool_id", toolId)
+                put("approved_by_source", true)
+                put("approved_by_target", false)
+            },
+        )
 
     override fun toolInterfaceAccept(
         contextHandle: Long,
@@ -279,13 +360,14 @@ class ConformanceStubBindings : NativeBindings {
     override fun toolInterfaceRevoke(
         contextHandle: Long,
         interfaceIdHex: String,
-    ): String = Json.encodeToString(
-        buildJsonObject {
-            put("interface_id", interfaceIdHex)
-            put("revoking_context", "ctx-revoker")
-            put("revoked_at", 1700000000000)
-        },
-    )
+    ): String =
+        Json.encodeToString(
+            buildJsonObject {
+                put("interface_id", interfaceIdHex)
+                put("revoking_context", "ctx-revoker")
+                put("revoked_at", 1700000000000)
+            },
+        )
 
     @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(
@@ -457,9 +539,10 @@ class ConformanceStubBindings : NativeBindings {
         eventLogQueryError = null
         eventLogVerifyResult = true
         eventLogVerifyError = null
-        @Suppress("MaxLineLength")
         eventLogCheckpointResult =
-            """{"context_id":"ctx-1","sender_did":"did:dht:stub","event_count":10,"merkle_root":"abcdef","epoch":5,"timestamp":1710000000,"signature":"c2lnbmVk"}"""
+            """{"context_id":"ctx-1","sender_did":"did:dht:stub",""" +
+            """"event_count":10,"merkle_root":"abcdef","epoch":5,""" +
+            """"timestamp":1710000000,"signature":"c2lnbmVk"}"""
         eventLogCheckpointError = null
         transportConnectResult = 99L
         transportConnectError = null

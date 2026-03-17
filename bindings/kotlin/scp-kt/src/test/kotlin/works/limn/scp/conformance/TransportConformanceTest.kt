@@ -3,8 +3,6 @@
 
 package works.limn.scp.conformance
 
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -12,6 +10,8 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.bridge.BridgeException
+import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -36,11 +36,12 @@ class TransportConformanceTest {
     fun setUp() {
         stubBindings = ConformanceStubBindings()
         testDispatcher = StandardTestDispatcher()
-        bridge = CoroutineBridge(
-            nativeBindings = stubBindings,
-            ioDispatcher = testDispatcher,
-            cpuDispatcher = testDispatcher,
-        )
+        bridge =
+            CoroutineBridge(
+                nativeBindings = stubBindings,
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
         dispatcher = ConformanceDispatcher(bridge)
     }
 
@@ -50,10 +51,11 @@ class TransportConformanceTest {
         fun `transport_connect returns handle`() =
             runTest(testDispatcher) {
                 stubBindings.transportConnectResult = 99L
-                val result = dispatcher.dispatch(
-                    "transport_connect",
-                    mapOf("relay_url" to "wss://relay.example.com/scp/v1"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_connect",
+                        mapOf("relay_url" to "wss://relay.example.com/scp/v1"),
+                    )
                 assertEquals("99", result["handle"])
                 assertEquals("connected", result["status"])
             }
@@ -63,10 +65,11 @@ class TransportConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.transportConnectError =
                     BridgeException("Connection refused", "SCP-TRANS-5001")
-                val result = dispatcher.dispatch(
-                    "transport_connect",
-                    mapOf("relay_url" to "wss://unreachable.example.com"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_connect",
+                        mapOf("relay_url" to "wss://unreachable.example.com"),
+                    )
                 assertEquals("SCP-TRANS-5001", result["error"])
             }
 
@@ -75,10 +78,11 @@ class TransportConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.transportConnectError =
                     BridgeException("TLS handshake failed", "SCP-TRANS-5010")
-                val result = dispatcher.dispatch(
-                    "transport_connect",
-                    mapOf("relay_url" to "wss://bad-cert.example.com"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_connect",
+                        mapOf("relay_url" to "wss://bad-cert.example.com"),
+                    )
                 assertEquals("SCP-TRANS-5010", result["error"])
             }
     }
@@ -88,10 +92,11 @@ class TransportConformanceTest {
         @Test
         fun `transport_disconnect returns disconnected`() =
             runTest(testDispatcher) {
-                val result = dispatcher.dispatch(
-                    "transport_disconnect",
-                    mapOf("transport_handle" to "99"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_disconnect",
+                        mapOf("transport_handle" to "99"),
+                    )
                 assertEquals("disconnected", result["status"])
                 assertTrue(stubBindings.transportDisconnectCalled)
             }
@@ -101,10 +106,11 @@ class TransportConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.transportDisconnectError =
                     BridgeException("Transport not connected", "SCP-TRANS-5003")
-                val result = dispatcher.dispatch(
-                    "transport_disconnect",
-                    mapOf("transport_handle" to "99"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_disconnect",
+                        mapOf("transport_handle" to "99"),
+                    )
                 assertEquals("SCP-TRANS-5003", result["error"])
             }
 
@@ -112,17 +118,19 @@ class TransportConformanceTest {
         fun `transport connect then disconnect lifecycle`() =
             runTest(testDispatcher) {
                 stubBindings.transportConnectResult = 42L
-                val connectResult = dispatcher.dispatch(
-                    "transport_connect",
-                    mapOf("relay_url" to "wss://relay.example.com/scp/v1"),
-                )
+                val connectResult =
+                    dispatcher.dispatch(
+                        "transport_connect",
+                        mapOf("relay_url" to "wss://relay.example.com/scp/v1"),
+                    )
                 assertEquals("42", connectResult["handle"])
                 assertEquals("connected", connectResult["status"])
 
-                val disconnectResult = dispatcher.dispatch(
-                    "transport_disconnect",
-                    mapOf("transport_handle" to "42"),
-                )
+                val disconnectResult =
+                    dispatcher.dispatch(
+                        "transport_disconnect",
+                        mapOf("transport_handle" to "42"),
+                    )
                 assertEquals("disconnected", disconnectResult["status"])
                 assertTrue(stubBindings.transportDisconnectCalled)
             }
@@ -134,10 +142,11 @@ class TransportConformanceTest {
         fun `transport_status returns status JSON`() =
             runTest(testDispatcher) {
                 stubBindings.transportStatusResult = """{"connected":true,"latency_ms":42}"""
-                val result = dispatcher.dispatch(
-                    "transport_status",
-                    mapOf("transport_handle" to "99"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_status",
+                        mapOf("transport_handle" to "99"),
+                    )
                 assertEquals(
                     """{"connected":true,"latency_ms":42}""",
                     result["status_json"],
@@ -149,10 +158,11 @@ class TransportConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.transportStatusError =
                     BridgeException("Transport not found", "SCP-TRANS-5002")
-                val result = dispatcher.dispatch(
-                    "transport_status",
-                    mapOf("transport_handle" to "0"),
-                )
+                val result =
+                    dispatcher.dispatch(
+                        "transport_status",
+                        mapOf("transport_handle" to "0"),
+                    )
                 assertEquals("SCP-TRANS-5002", result["error"])
             }
     }
@@ -164,18 +174,20 @@ class TransportConformanceTest {
             runTest(testDispatcher) {
                 stubBindings.transportConnectError =
                     BridgeException("Connection refused", "SCP-TRANS-5001")
-                val fixture = ConformanceFixture(
-                    testId = "transport-connect-001",
-                    category = "transport",
-                    description = "Connect to relay (stub returns error)",
-                    operation = "transport_connect",
-                    input = mapOf("relay_url" to "wss://relay.test/scp/v1"),
-                    expected = mapOf("error" to "SCP-TRANS-5001"),
-                )
-                val result = dispatcher.dispatch(
-                    fixture.operation,
-                    fixture.input,
-                )
+                val fixture =
+                    ConformanceFixture(
+                        testId = "transport-connect-001",
+                        category = "transport",
+                        description = "Connect to relay (stub returns error)",
+                        operation = "transport_connect",
+                        input = mapOf("relay_url" to "wss://relay.test/scp/v1"),
+                        expected = mapOf("error" to "SCP-TRANS-5001"),
+                    )
+                val result =
+                    dispatcher.dispatch(
+                        fixture.operation,
+                        fixture.input,
+                    )
                 val mismatches = compareResults(result, fixture.expected)
                 assertTrue(
                     mismatches.isEmpty(),

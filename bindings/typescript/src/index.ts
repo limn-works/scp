@@ -247,6 +247,7 @@ export type {
   AddressResolution,
   AssetEntry,
   AttestationSummary,
+  BatchPublishResult,
   BehavioralRecord,
   BroadcastAdmissionPolicy,
   Capability,

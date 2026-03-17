@@ -308,6 +308,7 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        continue-on-error: true
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $ANDROID_HOME/licenses
@@ -338,6 +339,7 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        continue-on-error: true
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $ANDROID_HOME/licenses

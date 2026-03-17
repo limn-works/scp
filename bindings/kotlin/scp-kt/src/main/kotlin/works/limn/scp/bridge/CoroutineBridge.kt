@@ -22,36 +22,7 @@
 
 package works.limn.scp.bridge
 
-import works.limn.scp.AssetEntry
-import works.limn.scp.BridgeConnectorBindings
-import works.limn.scp.BridgeConnectorBridge
-import works.limn.scp.DiscoveryBindings
-import works.limn.scp.DiscoveryBridge
-import works.limn.scp.EconomyBindings
-import works.limn.scp.EconomyBridge
-import works.limn.scp.IdentityAdvancedBindings
-import works.limn.scp.InvitationBindings
-import works.limn.scp.IdentityAdvancedBridge
-import works.limn.scp.MetadataBindings
-import works.limn.scp.MetadataBridge
-import works.limn.scp.ProvenanceBindings
-import works.limn.scp.ProvenanceBridge
-import works.limn.scp.ServerBindings
-import works.limn.scp.ServerBridge
-import works.limn.scp.PublishResult
-import works.limn.scp.SyncBindings
-import works.limn.scp.SyncBridge
-import works.limn.scp.TrustBindings
-import works.limn.scp.auth.ScpIdBindings
-import works.limn.scp.auth.ScpIdBridge
 import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.ensureActive
@@ -60,6 +31,37 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import works.limn.scp.AssetEntry
+import works.limn.scp.BatchPublishResult
+import works.limn.scp.BridgeConnectorBindings
+import works.limn.scp.BridgeConnectorBridge
+import works.limn.scp.DiscoveryBindings
+import works.limn.scp.DiscoveryBridge
+import works.limn.scp.EconomyBindings
+import works.limn.scp.EconomyBridge
+import works.limn.scp.IdentityAdvancedBindings
+import works.limn.scp.IdentityAdvancedBridge
+import works.limn.scp.InvitationBindings
+import works.limn.scp.MetadataBindings
+import works.limn.scp.MetadataBridge
+import works.limn.scp.ProvenanceBindings
+import works.limn.scp.ProvenanceBridge
+import works.limn.scp.PublishResult
+import works.limn.scp.ServerBindings
+import works.limn.scp.ServerBridge
+import works.limn.scp.SyncBindings
+import works.limn.scp.SyncBridge
+import works.limn.scp.TrustBindings
+import works.limn.scp.auth.ScpIdBindings
+import works.limn.scp.auth.ScpIdBridge
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -1275,6 +1277,7 @@ class CoroutineBridge(
 ) {
     /** Raw extended bindings for direct access by domain wrappers. */
     internal val extended: ExtendedBindings = extendedBindings ?: ExtendedBindings()
+
     /** Identity operations — all FFI, dispatched on IO. */
     val identity = IdentityBridge(nativeBindings, this)
 
@@ -1635,16 +1638,17 @@ class ToolBridge internal constructor(
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>? = null,
-    ): String = bridge.ffiCall {
-        bindings.toolInvoke(
-            contextHandle,
-            toolId,
-            inputJson,
-            identityHandle,
-            ucanToken,
-            proofTokens,
-        )
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolInvoke(
+                contextHandle,
+                toolId,
+                inputJson,
+                identityHandle,
+                ucanToken,
+                proofTokens,
+            )
+        }
 
     /**
      * Verify a tool's registration status in a context.
@@ -1672,9 +1676,10 @@ class ToolBridge internal constructor(
         toolId: String,
         targetContextId: String,
         rateLimitJson: String? = null,
-    ): String = bridge.ffiCall {
-        bindings.toolInterfaceExpose(contextHandle, toolId, targetContextId, rateLimitJson)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolInterfaceExpose(contextHandle, toolId, targetContextId, rateLimitJson)
+        }
 
     /**
      * Accept a cross-context tool interface (§6.2.0.1 step 4).
@@ -1686,9 +1691,10 @@ class ToolBridge internal constructor(
     suspend fun interfaceAccept(
         contextHandle: Long,
         interfaceJson: String,
-    ): String = bridge.ffiCall {
-        bindings.toolInterfaceAccept(contextHandle, interfaceJson)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolInterfaceAccept(contextHandle, interfaceJson)
+        }
 
     /**
      * Revoke a cross-context tool interface (§6.2.0.1 step 5).
@@ -1700,9 +1706,10 @@ class ToolBridge internal constructor(
     suspend fun interfaceRevoke(
         contextHandle: Long,
         interfaceIdHex: String,
-    ): String = bridge.ffiCall {
-        bindings.toolInterfaceRevoke(contextHandle, interfaceIdHex)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolInterfaceRevoke(contextHandle, interfaceIdHex)
+        }
 
     /**
      * Invoke a tool across context boundaries (spec section 6.2).
@@ -1728,18 +1735,19 @@ class ToolBridge internal constructor(
         ucanToken: String,
         chainDepth: Int,
         proofTokens: List<String>? = null,
-    ): String = bridge.ffiCall {
-        bindings.toolInvokeCrossContext(
-            sourceContextHandle,
-            targetContextHandle,
-            toolId,
-            inputJson,
-            identityHandle,
-            ucanToken,
-            chainDepth,
-            proofTokens,
-        )
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolInvokeCrossContext(
+                sourceContextHandle,
+                targetContextHandle,
+                toolId,
+                inputJson,
+                identityHandle,
+                ucanToken,
+                chainDepth,
+                proofTokens,
+            )
+        }
 
     /**
      * Create a stateful tool session (spec section 6.2.1).
@@ -1755,9 +1763,10 @@ class ToolBridge internal constructor(
         toolId: String,
         sourceContextId: String,
         ttlSeconds: Long? = null,
-    ): String = bridge.ffiCall {
-        bindings.toolSessionCreate(contextHandle, toolId, sourceContextId, ttlSeconds)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolSessionCreate(contextHandle, toolId, sourceContextId, ttlSeconds)
+        }
 
     /**
      * Invoke a tool within an active session.
@@ -1778,16 +1787,17 @@ class ToolBridge internal constructor(
         identityHandle: Long,
         ucanToken: String,
         proofTokens: List<String>? = null,
-    ): String = bridge.ffiCall {
-        bindings.toolSessionInvoke(
-            contextHandle,
-            sessionId,
-            inputJson,
-            identityHandle,
-            ucanToken,
-            proofTokens,
-        )
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.toolSessionInvoke(
+                contextHandle,
+                sessionId,
+                inputJson,
+                identityHandle,
+                ucanToken,
+                proofTokens,
+            )
+        }
 
     /**
      * Close a stateful tool session.
@@ -1798,9 +1808,10 @@ class ToolBridge internal constructor(
     suspend fun sessionClose(
         contextHandle: Long,
         sessionId: String,
-    ): Unit = bridge.ffiCall {
-        bindings.toolSessionClose(contextHandle, sessionId)
-    }
+    ): Unit =
+        bridge.ffiCall {
+            bindings.toolSessionClose(contextHandle, sessionId)
+        }
 }
 
 /**
@@ -1826,9 +1837,10 @@ class UcanBridge internal constructor(
         capability: String,
         presentingAgentDid: String? = null,
         proofTokens: List<String>? = null,
-    ): Unit = bridge.ffiCall {
-        bindings.ucanValidate(contextHandle, token, capability, presentingAgentDid, proofTokens)
-    }
+    ): Unit =
+        bridge.ffiCall {
+            bindings.ucanValidate(contextHandle, token, capability, presentingAgentDid, proofTokens)
+        }
 
     /**
      * Mint a UCAN token delegating capabilities to a member DID.
@@ -1881,15 +1893,16 @@ class UcanBridge internal constructor(
         delegateeDid: String,
         parentToken: String,
         capabilitiesJson: String,
-    ): String = bridge.ffiCall {
-        bindings.ucanDelegate(
-            contextHandle,
-            delegatorDid,
-            delegateeDid,
-            parentToken,
-            capabilitiesJson,
-        )
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.ucanDelegate(
+                contextHandle,
+                delegatorDid,
+                delegateeDid,
+                parentToken,
+                capabilitiesJson,
+            )
+        }
 }
 
 /**
@@ -1905,8 +1918,7 @@ class MembershipBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return The member count, or null if the context is not registered.
      */
-    suspend fun memberCount(contextHandle: Long): Long? =
-        bridge.ffiCall { bindings.contextMemberCount(contextHandle) }
+    suspend fun memberCount(contextHandle: Long): Long? = bridge.ffiCall { bindings.contextMemberCount(contextHandle) }
 
     /**
      * Check whether a DID is a member of a context.
@@ -1976,9 +1988,10 @@ class GovernanceBridgeOps internal constructor(
         contextHandle: Long,
         proposerDid: String,
         actionJson: String,
-    ): String = bridge.ffiCall {
-        bindings.governancePropose(contextHandle, proposerDid, actionJson)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.governancePropose(contextHandle, proposerDid, actionJson)
+        }
 
     /**
      * Cast an approval vote on a pending governance proposal (#621).
@@ -1992,9 +2005,10 @@ class GovernanceBridgeOps internal constructor(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
-    ): String = bridge.ffiCall {
-        bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
+        }
 
     /**
      * Cast a rejection vote on a pending governance proposal (#621).
@@ -2008,9 +2022,10 @@ class GovernanceBridgeOps internal constructor(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
-    ): String = bridge.ffiCall {
-        bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
+        }
 
     /**
      * Withdraw a previously cast vote on a pending governance proposal (#621).
@@ -2024,9 +2039,10 @@ class GovernanceBridgeOps internal constructor(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
-    ): String = bridge.ffiCall {
-        bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
+        }
 
     /**
      * Retrieve a single governance proposal by hex-encoded ID (#621).
@@ -2038,9 +2054,10 @@ class GovernanceBridgeOps internal constructor(
     suspend fun getProposal(
         contextHandle: Long,
         proposalIdHex: String,
-    ): String = bridge.ffiCall {
-        bindings.governanceGetProposal(contextHandle, proposalIdHex)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.governanceGetProposal(contextHandle, proposalIdHex)
+        }
 
     /**
      * List all governance proposals for a context (#621).
@@ -2048,9 +2065,10 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @return JSON array of proposals.
      */
-    suspend fun listProposals(contextHandle: Long): String = bridge.ffiCall {
-        bindings.governanceListProposals(contextHandle)
-    }
+    suspend fun listProposals(contextHandle: Long): String =
+        bridge.ffiCall {
+            bindings.governanceListProposals(contextHandle)
+        }
 
     /**
      * Apply a pending ceiling modification (#559).
@@ -2062,18 +2080,20 @@ class GovernanceBridgeOps internal constructor(
     suspend fun applyPendingCeilingModification(
         contextHandle: Long,
         currentTimestamp: Long,
-    ): Boolean = bridge.ffiCall {
-        bindings.applyPendingCeilingModification(contextHandle, currentTimestamp)
-    }
+    ): Boolean =
+        bridge.ffiCall {
+            bindings.applyPendingCeilingModification(contextHandle, currentTimestamp)
+        }
 
     /**
      * Finalize the cooperative close flow (#559).
      *
      * @param contextHandle Handle from context create.
      */
-    suspend fun finalizeClose(contextHandle: Long): Unit = bridge.ffiCall {
-        bindings.finalizeClose(contextHandle)
-    }
+    suspend fun finalizeClose(contextHandle: Long): Unit =
+        bridge.ffiCall {
+            bindings.finalizeClose(contextHandle)
+        }
 
     /**
      * Create a governance checkpoint (ADR-031 section 9, #559).
@@ -2098,12 +2118,19 @@ class GovernanceBridgeOps internal constructor(
         stateSnapshotHashHex: String,
         creatorDid: String,
         creatorSignatureHex: String,
-    ): String = bridge.ffiCall {
-        bindings.createGovernanceCheckpoint(
-            contextHandle, checkpointSeq, merkleRootHex, eventCount,
-            lastEventHashHex, stateSnapshotHashHex, creatorDid, creatorSignatureHex,
-        )
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.createGovernanceCheckpoint(
+                contextHandle,
+                checkpointSeq,
+                merkleRootHex,
+                eventCount,
+                lastEventHashHex,
+                stateSnapshotHashHex,
+                creatorDid,
+                creatorSignatureHex,
+            )
+        }
 
     /**
      * Add a cosignature to an existing checkpoint (ADR-031 section 9, #559).
@@ -2119,27 +2146,30 @@ class GovernanceBridgeOps internal constructor(
         checkpointJson: String,
         signerDid: String,
         signatureHex: String,
-    ): String = bridge.ffiCall {
-        bindings.addCheckpointCosignature(contextHandle, checkpointJson, signerDid, signatureHex)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.addCheckpointCosignature(contextHandle, checkpointJson, signerDid, signatureHex)
+        }
 
     /**
      * Restore a single persisted context (#559).
      *
      * @param contextId The context ID to restore.
      */
-    suspend fun restoreContext(contextId: String): Unit = bridge.ffiCall {
-        bindings.restoreContext(contextId)
-    }
+    suspend fun restoreContext(contextId: String): Unit =
+        bridge.ffiCall {
+            bindings.restoreContext(contextId)
+        }
 
     /**
      * Restore all persisted contexts (#559).
      *
      * @return JSON array of restored context ID strings.
      */
-    suspend fun restoreAllContexts(): String = bridge.ffiCall {
-        bindings.restoreAllContexts()
-    }
+    suspend fun restoreAllContexts(): String =
+        bridge.ffiCall {
+            bindings.restoreAllContexts()
+        }
 }
 
 /**
@@ -2161,6 +2191,7 @@ class BroadcastBridgeOps internal constructor(
      * the handle on every call (SCP-294b).
      */
     var defaultIdentityHandle: Long? = null
+
     /**
      * Subscribe a DID to a broadcast context.
      *
@@ -2183,9 +2214,10 @@ class BroadcastBridgeOps internal constructor(
         contextHandle: Long,
         subscriberDid: String,
         rotateKeys: Boolean = false,
-    ): Unit = bridge.ffiCall {
-        bindings.broadcastUnsubscribe(contextHandle, subscriberDid, rotateKeys)
-    }
+    ): Unit =
+        bridge.ffiCall {
+            bindings.broadcastUnsubscribe(contextHandle, subscriberDid, rotateKeys)
+        }
 
     /**
      * Publish a message to a broadcast context.
@@ -2212,9 +2244,10 @@ class BroadcastBridgeOps internal constructor(
         contextHandle: Long,
         subscriberDid: String,
         blockerDid: String,
-    ): Unit = bridge.ffiCall {
-        bindings.broadcastBlockSubscriber(contextHandle, subscriberDid, blockerDid)
-    }
+    ): Unit =
+        bridge.ffiCall {
+            bindings.broadcastBlockSubscriber(contextHandle, subscriberDid, blockerDid)
+        }
 
     /**
      * Unblock a previously blocked subscriber in a broadcast context (§9.16.8).
@@ -2230,9 +2263,10 @@ class BroadcastBridgeOps internal constructor(
         contextHandle: Long,
         subscriberDid: String,
         unblockerDid: String,
-    ): Unit = bridge.ffiCall {
-        bindings.broadcastUnblockSubscriber(contextHandle, subscriberDid, unblockerDid)
-    }
+    ): Unit =
+        bridge.ffiCall {
+            bindings.broadcastUnblockSubscriber(contextHandle, subscriberDid, unblockerDid)
+        }
 
     /**
      * Handle a broadcast key request from a subscriber.
@@ -2246,9 +2280,10 @@ class BroadcastBridgeOps internal constructor(
         contextHandle: Long,
         authorDid: String,
         requesterDid: String,
-    ): String = bridge.ffiCall {
-        bindings.broadcastHandleKeyRequest(contextHandle, authorDid, requesterDid)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.broadcastHandleKeyRequest(contextHandle, authorDid, requesterDid)
+        }
 
     /**
      * Return the number of broadcast subscribers for a context.
@@ -2277,8 +2312,7 @@ class BroadcastBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return The policy string ("Open" or "Gated"), or null if not broadcast.
      */
-    suspend fun admission(contextHandle: Long): String? =
-        bridge.ffiCall { bindings.broadcastAdmission(contextHandle) }
+    suspend fun admission(contextHandle: Long): String? = bridge.ffiCall { bindings.broadcastAdmission(contextHandle) }
 
     /**
      * Publish a single asset to a broadcast context as structured content (SCP-290).
@@ -2300,9 +2334,10 @@ class BroadcastBridgeOps internal constructor(
     ): PublishResult {
         val resolved = resolveIdentityHandle(identityHandle)
         val assetJson = serializeAsset(asset)
-        val resultJson = bridge.ffiCall {
-            bindings.broadcastPublishAsset(contextHandle, resolved, assetJson, deployId)
-        }
+        val resultJson =
+            bridge.ffiCall {
+                bindings.broadcastPublishAsset(contextHandle, resolved, assetJson, deployId)
+            }
         return parsePublishResult(resultJson)
     }
 
@@ -2317,7 +2352,7 @@ class BroadcastBridgeOps internal constructor(
      *   Defaults to [defaultIdentityHandle] when null (SCP-294b).
      * @param assets The assets to publish.
      * @param deployId Optional deploy ID to group assets into atomic deploys.
-     * @return A list of [PublishResult] values, one per asset.
+     * @return A [BatchPublishResult] with per-asset results and the shared deploy ID.
      * @throws BridgeException if no identity handle is provided and
      *   [defaultIdentityHandle] is not set.
      */
@@ -2326,12 +2361,13 @@ class BroadcastBridgeOps internal constructor(
         identityHandle: Long? = null,
         assets: List<AssetEntry>,
         deployId: String? = null,
-    ): List<PublishResult> {
+    ): BatchPublishResult {
         val resolved = resolveIdentityHandle(identityHandle)
         val assetsJson = serializeAssets(assets)
-        val resultJson = bridge.ffiCall {
-            bindings.broadcastPublishAssets(contextHandle, resolved, assetsJson, deployId)
-        }
+        val resultJson =
+            bridge.ffiCall {
+                bindings.broadcastPublishAssets(contextHandle, resolved, assetsJson, deployId)
+            }
         return parsePublishResults(resultJson)
     }
 
@@ -2358,62 +2394,81 @@ class BroadcastBridgeOps internal constructor(
  * valid JSON, preventing injection via untrusted string fields. The body
  * is encoded as a Base64 string for safe JSON transport.
  */
-internal fun serializeAsset(asset: AssetEntry): String = Json.encodeToString(
-    buildJsonObject {
-        put("path", asset.path)
-        put("content_type", asset.contentType)
-        put("body", java.util.Base64.getEncoder().encodeToString(asset.body))
-    },
-)
+internal fun serializeAsset(asset: AssetEntry): String =
+    Json.encodeToString(
+        buildJsonObject {
+            put("path", asset.path)
+            put("content_type", asset.contentType)
+            put("body", java.util.Base64.getEncoder().encodeToString(asset.body))
+        },
+    )
 
 /**
  * Serializes a list of [AssetEntry] values to a JSON array string.
  */
-internal fun serializeAssets(assets: List<AssetEntry>): String = Json.encodeToString(
-    kotlinx.serialization.json.buildJsonArray {
-        for (asset in assets) {
-            add(
-                buildJsonObject {
-                    put("path", asset.path)
-                    put("content_type", asset.contentType)
-                    put("body", java.util.Base64.getEncoder().encodeToString(asset.body))
-                },
-            )
-        }
-    },
+internal fun serializeAssets(assets: List<AssetEntry>): String =
+    Json.encodeToString(
+        kotlinx.serialization.json.buildJsonArray {
+            for (asset in assets) {
+                add(
+                    buildJsonObject {
+                        put("path", asset.path)
+                        put("content_type", asset.contentType)
+                        put("body", java.util.Base64.getEncoder().encodeToString(asset.body))
+                    },
+                )
+            }
+        },
+    )
+
+/** Extracts a required string field from a [JsonObject], throwing on absence. */
+private fun JsonObject.requireString(
+    field: String,
+    context: String,
+): String =
+    this[field]?.jsonPrimitive?.content
+        ?: throw BridgeException(
+            "missing $field in $context",
+            "SCP-CTX-2036",
+        )
+
+/** Parses a [JsonObject] into a [PublishResult], throwing on missing fields. */
+private fun JsonObject.toPublishResult(
+    context: String = "publish result",
+): PublishResult = PublishResult(
+    blobId = requireString("blob_id", context),
+    etag = requireString("etag", context),
+    deployId = requireString("deploy_id", context),
 )
 
 /**
  * Parses a JSON publish result string into a [PublishResult].
  *
- * Expected format: `{"blob_id":"...","etag":"..."}`.
+ * Expected format: `{"blob_id":"...","etag":"...","deploy_id":"..."}`.
  *
  * @throws BridgeException if the JSON is malformed or missing required fields.
  */
-internal fun parsePublishResult(json: String): PublishResult {
-    val obj = Json.parseToJsonElement(json).jsonObject
-    val blobId = obj["blob_id"]?.jsonPrimitive?.content
-        ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
-    val etag = obj["etag"]?.jsonPrimitive?.content
-        ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
-    return PublishResult(blobId = blobId, etag = etag)
-}
+internal fun parsePublishResult(json: String): PublishResult =
+    Json.parseToJsonElement(json).jsonObject.toPublishResult()
 
 /**
- * Parses a JSON array of publish results into a list of [PublishResult].
+ * Parses a JSON batch publish result into a [BatchPublishResult].
+ *
+ * Expected format: `{"results":[...],"deploy_id":"..."}`.
  *
  * @throws BridgeException if the JSON is malformed.
  */
-internal fun parsePublishResults(json: String): List<PublishResult> {
-    val array = Json.parseToJsonElement(json).jsonArray
-    return array.map { element ->
-        val obj = element.jsonObject
-        val blobId = obj["blob_id"]?.jsonPrimitive?.content
-            ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
-        val etag = obj["etag"]?.jsonPrimitive?.content
-            ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
-        PublishResult(blobId = blobId, etag = etag)
-    }
+internal fun parsePublishResults(json: String): BatchPublishResult {
+    val obj = Json.parseToJsonElement(json).jsonObject
+    val deployId = obj.requireString("deploy_id", "batch publish result")
+    val resultsArray =
+        obj["results"]?.jsonArray
+            ?: throw BridgeException(
+                "missing results in batch publish result",
+                "SCP-CTX-2036",
+            )
+    val results = resultsArray.map { it.jsonObject.toPublishResult() }
+    return BatchPublishResult(results = results, deployId = deployId)
 }
 
 /**
@@ -2469,9 +2524,10 @@ class InfraBridge internal constructor(
         contextHandle: Long,
         identityHandle: Long,
         epoch: Long,
-    ): String = bridge.ffiCall {
-        bindings.eventLogCheckpoint(contextHandle, identityHandle, epoch)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.eventLogCheckpoint(contextHandle, identityHandle, epoch)
+        }
 
     /**
      * Connect to a transport relay.

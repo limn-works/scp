@@ -3,8 +3,6 @@
 
 package works.limn.scp.stream
 
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
@@ -26,6 +24,8 @@ import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.ContextBindings
 import works.limn.scp.bridge.InfraBindings
 import works.limn.scp.bridge.MessageCallback
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Callback interface for real-time context events from the Rust engine.
