@@ -25,7 +25,7 @@
 import { createRequire } from "node:module";
 import { TransportError } from "./errors";
 import type { SiteConfig } from "./types";
-import { validateSiteConfig } from "./types";
+import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // Native addon access — server operations bypass the Bridge interface
@@ -290,6 +290,8 @@ export class Node implements AsyncDisposable {
     admission: string,
     config: SiteConfig,
   ): Promise<void> {
+    validateAdmission(admission);
+    validateBroadcastKeyHex(broadcastKeyHex);
     validateSiteConfig(config);
     await this.#handle.enableSiteProjection(
       contextId,

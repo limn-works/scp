@@ -746,13 +746,15 @@ function validateHostname(hostname: string): void {
 /**
  * Validates an admission policy string before FFI.
  *
- * Must be `"Open"` or `"Gated"` (matching {@link BroadcastAdmissionPolicy}).
+ * Accepts both casings (`"Open"`/`"open"`, `"Gated"`/`"gated"`) because
+ * the Rust bridge normalizes via `.to_lowercase()`.
  *
  * @throws {Error} If admission is not a valid policy.
  */
 export function validateAdmission(admission: string): void {
-  if (admission !== "Open" && admission !== "Gated") {
-    throw new Error(`admission must be "Open" or "Gated", got "${admission}"`);
+  const lower = admission.toLowerCase();
+  if (lower !== "open" && lower !== "gated") {
+    throw new Error(`admission must be "Open" or "Gated" (case-insensitive), got "${admission}"`);
   }
 }
 

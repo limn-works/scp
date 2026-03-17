@@ -541,12 +541,20 @@ describe("validateAdmission", () => {
     expect(() => validateAdmission("Gated")).not.toThrow();
   });
 
+  it("accepts lowercase open", () => {
+    expect(() => validateAdmission("open")).not.toThrow();
+  });
+
+  it("accepts lowercase gated", () => {
+    expect(() => validateAdmission("gated")).not.toThrow();
+  });
+
   it("rejects invalid admission", () => {
-    expect(() => validateAdmission("closed")).toThrow('admission must be "Open" or "Gated"');
+    expect(() => validateAdmission("closed")).toThrow("admission must be");
   });
 
   it("rejects empty admission", () => {
-    expect(() => validateAdmission("")).toThrow('admission must be "Open" or "Gated"');
+    expect(() => validateAdmission("")).toThrow("admission must be");
   });
 });
 

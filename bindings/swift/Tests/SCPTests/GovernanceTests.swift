@@ -1570,6 +1570,14 @@ struct ProjectionValidationTests {
         try validateAdmission("gated")
     }
 
+    @Test func validAdmissionOpenTitleCase() throws {
+        try validateAdmission("Open")
+    }
+
+    @Test func validAdmissionGatedTitleCase() throws {
+        try validateAdmission("Gated")
+    }
+
     @Test func invalidAdmissionRejected() {
         #expect(throws: ScpError.self) {
             try validateAdmission("closed")

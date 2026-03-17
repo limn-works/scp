@@ -804,12 +804,22 @@ class TestAdmissionValidation:
 
         validate_admission("gated")
 
+    def test_open_title_case_accepted(self) -> None:
+        from scp_sdk.context import validate_admission
+
+        validate_admission("Open")
+
+    def test_gated_title_case_accepted(self) -> None:
+        from scp_sdk.context import validate_admission
+
+        validate_admission("Gated")
+
     def test_invalid_rejected(self) -> None:
         import pytest
 
         from scp_sdk.context import validate_admission
 
-        with pytest.raises(ValueError, match='admission must be "open" or "gated"'):
+        with pytest.raises(ValueError, match="admission must be"):
             validate_admission("closed")
 
     def test_empty_rejected(self) -> None:
@@ -817,7 +827,7 @@ class TestAdmissionValidation:
 
         from scp_sdk.context import validate_admission
 
-        with pytest.raises(ValueError, match='admission must be "open" or "gated"'):
+        with pytest.raises(ValueError, match="admission must be"):
             validate_admission("")
 
 
