@@ -281,7 +281,9 @@ class ScopedHandle internal constructor(
         return result
     }
 
-    override fun toString(): String = "ScopedHandle(contextId=$contextId, appDid=$appDid, capabilities=${grantedCapabilities.size})"
+    override fun toString(): String =
+        "ScopedHandle(contextId=$contextId, appDid=$appDid, " +
+            "capabilities=${grantedCapabilities.size})"
 }
 
 // ---------------------------------------------------------------------------

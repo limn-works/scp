@@ -33,6 +33,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -1426,7 +1427,8 @@ class IdentityBridge internal constructor(
      * @param custody Key custody method.
      * @return Opaque identity handle for use in subsequent operations.
      */
-    suspend fun create(custody: works.limn.scp.CustodyType): Long = bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
+    suspend fun create(custody: works.limn.scp.CustodyType): Long =
+        bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
 
     /**
      * Create a new identity with the specified custody method.
@@ -1538,7 +1540,8 @@ class ContextBridge internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return JSON-encoded economic policy, or null if none is set.
      */
-    suspend fun getEconomicPolicy(contextHandle: Long): String? = bridge.ffiCall { bindings.contextGetEconomicPolicy(contextHandle) }
+    suspend fun getEconomicPolicy(contextHandle: Long): String? =
+        bridge.ffiCall { bindings.contextGetEconomicPolicy(contextHandle) }
 
     /**
      * Subscribe to incoming messages on a context as a cold [Flow].
@@ -1935,7 +1938,8 @@ class MembershipBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return List of DID strings.
      */
-    suspend fun memberDids(contextHandle: Long): List<String> = bridge.ffiCall { bindings.contextMemberDids(contextHandle) }
+    suspend fun memberDids(contextHandle: Long): List<String> =
+        bridge.ffiCall { bindings.contextMemberDids(contextHandle) }
 
     /**
      * Return the role of a member in a context.
@@ -2287,7 +2291,8 @@ class BroadcastBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return The subscriber count, or null if not a broadcast context.
      */
-    suspend fun subscriberCount(contextHandle: Long): Long? = bridge.ffiCall { bindings.broadcastSubscriberCount(contextHandle) }
+    suspend fun subscriberCount(contextHandle: Long): Long? =
+        bridge.ffiCall { bindings.broadcastSubscriberCount(contextHandle) }
 
     /**
      * Check whether a DID is a broadcast subscriber.
@@ -2416,6 +2421,26 @@ internal fun serializeAssets(assets: List<AssetEntry>): String =
         },
     )
 
+/** Extracts a required string field from a [JsonObject], throwing on absence. */
+private fun JsonObject.requireString(
+    field: String,
+    context: String,
+): String =
+    this[field]?.jsonPrimitive?.content
+        ?: throw BridgeException(
+            "missing $field in $context",
+            "SCP-CTX-2036",
+        )
+
+/** Parses a [JsonObject] into a [PublishResult], throwing on missing fields. */
+private fun JsonObject.toPublishResult(
+    context: String = "publish result",
+): PublishResult = PublishResult(
+    blobId = requireString("blob_id", context),
+    etag = requireString("etag", context),
+    deployId = requireString("deploy_id", context),
+)
+
 /**
  * Parses a JSON publish result string into a [PublishResult].
  *
@@ -2423,19 +2448,8 @@ internal fun serializeAssets(assets: List<AssetEntry>): String =
  *
  * @throws BridgeException if the JSON is malformed or missing required fields.
  */
-internal fun parsePublishResult(json: String): PublishResult {
-    val obj = Json.parseToJsonElement(json).jsonObject
-    val blobId =
-        obj["blob_id"]?.jsonPrimitive?.content
-            ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
-    val etag =
-        obj["etag"]?.jsonPrimitive?.content
-            ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
-    val deployId =
-        obj["deploy_id"]?.jsonPrimitive?.content
-            ?: throw BridgeException("missing deploy_id in publish result", "SCP-CTX-2036")
-    return PublishResult(blobId = blobId, etag = etag, deployId = deployId)
-}
+internal fun parsePublishResult(json: String): PublishResult =
+    Json.parseToJsonElement(json).jsonObject.toPublishResult()
 
 /**
  * Parses a JSON batch publish result into a [BatchPublishResult].
@@ -2446,26 +2460,14 @@ internal fun parsePublishResult(json: String): PublishResult {
  */
 internal fun parsePublishResults(json: String): BatchPublishResult {
     val obj = Json.parseToJsonElement(json).jsonObject
-    val deployId =
-        obj["deploy_id"]?.jsonPrimitive?.content
-            ?: throw BridgeException("missing deploy_id in batch publish result", "SCP-CTX-2036")
+    val deployId = obj.requireString("deploy_id", "batch publish result")
     val resultsArray =
         obj["results"]?.jsonArray
-            ?: throw BridgeException("missing results in batch publish result", "SCP-CTX-2036")
-    val results =
-        resultsArray.map { element ->
-            val resultObj = element.jsonObject
-            val blobId =
-                resultObj["blob_id"]?.jsonPrimitive?.content
-                    ?: throw BridgeException("missing blob_id in publish result", "SCP-CTX-2036")
-            val etag =
-                resultObj["etag"]?.jsonPrimitive?.content
-                    ?: throw BridgeException("missing etag in publish result", "SCP-CTX-2036")
-            val resultDeployId =
-                resultObj["deploy_id"]?.jsonPrimitive?.content
-                    ?: throw BridgeException("missing deploy_id in publish result", "SCP-CTX-2036")
-            PublishResult(blobId = blobId, etag = etag, deployId = resultDeployId)
-        }
+            ?: throw BridgeException(
+                "missing results in batch publish result",
+                "SCP-CTX-2036",
+            )
+    val results = resultsArray.map { it.jsonObject.toPublishResult() }
     return BatchPublishResult(results = results, deployId = deployId)
 }
 

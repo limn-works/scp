@@ -660,8 +660,8 @@ class CoroutineBridgeTest {
                         works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
                         works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
                     )
-                val results = bridge.broadcast.publishAssets(1L, assets = assets)
-                assertEquals(2, results.size)
+                val batch = bridge.broadcast.publishAssets(1L, assets = assets)
+                assertEquals(2, batch.results.size)
                 assertEquals(99L, stubBindings.lastPublishAssetsIdentityHandle)
                 bridge.broadcast.defaultIdentityHandle = null
             }

@@ -267,65 +267,58 @@ class ConformanceRunnerTest {
 
     @Nested
     inner class FixtureRoundtrip {
+        private val ctx = mapOf(
+            "context_handle" to "10",
+            "identity_handle" to "1",
+        )
+
+        private val roundtripFixtures = listOf(
+            ConformanceFixture(
+                testId = "roundtrip-identity-001",
+                category = "identity",
+                description = "Create identity",
+                operation = "identity_create",
+                input = mapOf("custody" to "in_memory"),
+                expected = mapOf("custody_type" to "in_memory"),
+            ),
+            ConformanceFixture(
+                testId = "roundtrip-context-001",
+                category = "context",
+                description = "Leave context",
+                operation = "context_leave",
+                input = ctx,
+                expected = mapOf("status" to "left"),
+            ),
+            ConformanceFixture(
+                testId = "roundtrip-send-001",
+                category = "messaging",
+                description = "Send message",
+                operation = "context_send",
+                input = ctx + ("payload" to "hello"),
+                expected = mapOf("status" to "sent"),
+            ),
+            ConformanceFixture(
+                testId = "roundtrip-tool-001",
+                category = "tools",
+                description = "Register tool",
+                operation = "tool_register",
+                input = mapOf(
+                    "context_handle" to "10",
+                    "definition" to "{}",
+                ),
+                expected = mapOf("tool_id" to "tool-001"),
+            ),
+        )
+
         @Test
         fun `inline fixtures run through full pipeline`() =
             runTest(testDispatcher) {
-                val fixtures =
-                    listOf(
-                        ConformanceFixture(
-                            testId = "roundtrip-identity-001",
-                            category = "identity",
-                            description = "Create identity",
-                            operation = "identity_create",
-                            input = mapOf("custody" to "in_memory"),
-                            expected = mapOf("custody_type" to "in_memory"),
-                        ),
-                        ConformanceFixture(
-                            testId = "roundtrip-context-001",
-                            category = "context",
-                            description = "Leave context",
-                            operation = "context_leave",
-                            input =
-                                mapOf(
-                                    "context_handle" to "10",
-                                    "identity_handle" to "1",
-                                ),
-                            expected = mapOf("status" to "left"),
-                        ),
-                        ConformanceFixture(
-                            testId = "roundtrip-send-001",
-                            category = "messaging",
-                            description = "Send message",
-                            operation = "context_send",
-                            input =
-                                mapOf(
-                                    "context_handle" to "10",
-                                    "identity_handle" to "1",
-                                    "payload" to "hello",
-                                ),
-                            expected = mapOf("status" to "sent"),
-                        ),
-                        ConformanceFixture(
-                            testId = "roundtrip-tool-001",
-                            category = "tools",
-                            description = "Register tool",
-                            operation = "tool_register",
-                            input =
-                                mapOf(
-                                    "context_handle" to "10",
-                                    "definition" to "{}",
-                                ),
-                            expected = mapOf("tool_id" to "tool-001"),
-                        ),
+                for (fixture in roundtripFixtures) {
+                    val result = dispatcher.dispatch(
+                        fixture.operation, fixture.input,
                     )
-
-                for (fixture in fixtures) {
-                    val result =
-                        dispatcher.dispatch(
-                            fixture.operation,
-                            fixture.input,
-                        )
-                    val mismatches = compareResults(result, fixture.expected)
+                    val mismatches =
+                        compareResults(result, fixture.expected)
                     assertTrue(
                         mismatches.isEmpty(),
                         "Fixture ${fixture.testId}: $mismatches",

@@ -304,7 +304,9 @@ class ConformanceStubBindings : NativeBindings {
         identityHandle: Long,
         assetsJson: String,
         deployId: String?,
-    ): String = """{"results":[{"blob_id":"stub-blob","etag":"stub-etag","deploy_id":"stub-deploy"}],"deploy_id":"stub-deploy"}"""
+    ): String = """{"results":[{"blob_id":"stub-blob",""" +
+        """"etag":"stub-etag","deploy_id":"stub-deploy"}],""" +
+        """"deploy_id":"stub-deploy"}"""
 
     override fun toolRegister(
         contextHandle: Long,

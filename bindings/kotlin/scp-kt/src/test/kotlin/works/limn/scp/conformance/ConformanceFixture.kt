@@ -64,7 +64,8 @@ object ConformanceFixtureLoader {
         return emptyList()
     }
 
-    fun loadFixturesByCategory(category: String): List<ConformanceFixture> = loadFixtures().filter { it.category == category }
+    fun loadFixturesByCategory(category: String): List<ConformanceFixture> =
+        loadFixtures().filter { it.category == category }
 }
 
 /**
@@ -99,4 +100,6 @@ fun compareResults(
     return mismatches
 }
 
-private fun isTimestampOrNonce(key: String): Boolean = key.contains("timestamp") || key.contains("nonce") || key.contains("created_at")
+private fun isTimestampOrNonce(key: String): Boolean =
+    key.contains("timestamp") || key.contains("nonce") ||
+        key.contains("created_at")
