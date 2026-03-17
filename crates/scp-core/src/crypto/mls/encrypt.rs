@@ -30,6 +30,43 @@ use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTra
 use super::error::MlsError;
 use super::group::ScpMlsGroup;
 
+/// The result of decrypting an MLS protocol message.
+///
+/// MLS messages are not limited to application data — they may also be Commits
+/// (epoch changes) or Proposals (deferred operations cached by `OpenMLS`). This
+/// enum allows callers to distinguish message types and handle each correctly:
+///
+/// - `Application` — user-generated plaintext with a sender DID.
+/// - `Commit` — epoch advancement; the group has been updated via
+///   `merge_staged_commit`. No plaintext is produced.
+/// - `Proposal` — a deferred operation cached by `OpenMLS` during
+///   `process_message`. No plaintext is produced.
+///
+/// Callers that only expect application messages should match on `Application`
+/// and treat `Commit`/`Proposal` as control messages (no user payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecryptedContent {
+    /// An application message carrying user plaintext.
+    Application {
+        /// The decrypted payload bytes.
+        plaintext: Vec<u8>,
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+    /// A Commit message that advanced the MLS group epoch.
+    /// `merge_staged_commit` has already been called.
+    Commit {
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+    /// A Proposal message cached by `OpenMLS` during `process_message`.
+    /// No explicit merge is needed — `OpenMLS` caches proposals automatically.
+    Proposal {
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+}
+
 /// Encrypts plaintext as an MLS `PrivateMessage` (application message).
 ///
 /// The returned [`MlsMessageOut`] is a fully encrypted MLS message that
@@ -217,6 +254,121 @@ pub fn decrypt_with_sender_key(
             Ok((app_msg.into_bytes(), sender_signature_key))
         }
         _ => Err(MlsError::NotApplicationMessage),
+    }
+}
+
+/// Decrypts an MLS `PrivateMessage` and returns a [`DecryptedContent`] enum
+/// distinguishing application messages, commits, and proposals.
+///
+/// This function resolves the sender's identity by parsing the `ScpCredential`
+/// from the `BasicCredential` embedded in the sender's leaf node. This is the
+/// key primitive for the receive bridge: the caller gets both the decrypted
+/// content and the DID of the sender without any out-of-band lookup.
+///
+/// # Message Type Handling
+///
+/// - **`ApplicationMessage`** — returns `DecryptedContent::Application` with
+///   the plaintext and sender DID.
+/// - **`StagedCommitMessage`** — calls `merge_staged_commit` to apply the
+///   epoch change (preventing MLS group corruption), then returns
+///   `DecryptedContent::Commit` with the sender DID.
+/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** — proposals are
+///   cached by `OpenMLS` during `process_message` automatically. Returns
+///   `DecryptedContent::Proposal` with the sender DID.
+///
+/// # Arguments
+///
+/// * `group` - The MLS group to decrypt within. Must be active.
+/// * `ciphertext` - The serialized MLS ciphertext bytes.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+/// Returns [`MlsError::DecryptionFailed`] if decryption or sender resolution
+/// fails (including credential parsing failure).
+/// Returns [`MlsError::CommitProcessingFailed`] if a staged commit cannot be
+/// merged after processing.
+pub fn decrypt_with_sender_did(
+    group: &mut ScpMlsGroup,
+    ciphertext: &[u8],
+) -> Result<DecryptedContent, MlsError> {
+    if group.group.is_none() {
+        return Err(MlsError::GroupDestroyed);
+    }
+
+    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
+
+    let protocol_message = message_in
+        .try_into_protocol_message()
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
+
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
+
+    // Extract the sender's leaf index before consuming the ProcessedMessage.
+    let sender = processed.sender().clone();
+    let Sender::Member(sender_leaf_index) = sender else {
+        return Err(MlsError::DecryptionFailed(
+            "sender is not a group member".to_string(),
+        ));
+    };
+
+    // Look up the sender's credential from the group member list and parse
+    // the SCP credential to extract the DID.
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let sender_did = g
+        .members()
+        .find(|m| m.index == sender_leaf_index)
+        .ok_or_else(|| {
+            MlsError::DecryptionFailed(format!(
+                "sender leaf index {sender_leaf_index:?} not found in group members"
+            ))
+        })
+        .and_then(|m| {
+            let basic_cred = BasicCredential::try_from(m.credential).map_err(|e| {
+                MlsError::DecryptionFailed(format!("extracting BasicCredential: {e}"))
+            })?;
+            let scp_cred = super::credential::ScpCredential::from_bytes(basic_cred.identity())
+                .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
+            Ok(scp_cred.did)
+        })?;
+
+    // Dispatch based on the processed message content type.
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(DecryptedContent::Application {
+            plaintext: app_msg.into_bytes(),
+            sender_did,
+        }),
+        ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            // Merge the staged commit to advance the group epoch. Without
+            // this call, process_message has consumed the message but the
+            // group state is not updated, corrupting the MLS group.
+            let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+            g.merge_staged_commit(&group.provider, *staged_commit)
+                .map_err(|e| {
+                    MlsError::CommitProcessingFailed(format!("merging staged commit: {e}"))
+                })?;
+            Ok(DecryptedContent::Commit { sender_did })
+        }
+        ProcessedMessageContent::ProposalMessage(_)
+        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+            // Proposals are cached by OpenMLS automatically during
+            // process_message — no explicit action needed.
+            Ok(DecryptedContent::Proposal { sender_did })
+        }
     }
 }
 
@@ -468,6 +620,102 @@ mod tests {
             decrypted, good_plaintext,
             "group must remain usable after a caught decrypt panic"
         );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_with_sender_did_returns_application_variant() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+
+        let plaintext = b"hello from alice";
+        let ct_msg = encrypt(&mut alice_group, plaintext).unwrap();
+        let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
+
+        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes).unwrap();
+        assert!(
+            matches!(&content, DecryptedContent::Application { .. }),
+            "expected Application variant"
+        );
+        if let DecryptedContent::Application {
+            plaintext: pt,
+            sender_did,
+        } = content
+        {
+            assert_eq!(pt, plaintext, "plaintext must roundtrip");
+            assert!(
+                sender_did.starts_with("did:dht:z6Mk"),
+                "sender_did must be a DID, got: {sender_did}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_with_sender_did_handles_commit_without_corruption() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
+
+        let add_result = add_member(&mut alice_group, bob_kp).unwrap();
+        let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+
+        // Record Bob's epoch before Alice's update.
+        let bob_epoch_before = bob_group.group.as_ref().unwrap().epoch().as_u64();
+
+        // Alice proposes an update and commits it, producing a Commit message.
+        let alice_g = alice_group.group.as_mut().unwrap();
+        let alice_signer = alice_group.signer.as_ref().unwrap();
+        let bundle = alice_g
+            .self_update(
+                &alice_group.provider,
+                alice_signer,
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        let commit_msg = bundle.into_commit();
+        // Re-borrow after consuming bundle to avoid aliasing.
+        let alice_g = alice_group.group.as_mut().unwrap();
+        alice_g.merge_pending_commit(&alice_group.provider).unwrap();
+
+        // Serialize the Commit message for Bob.
+        let commit_bytes = commit_msg.tls_serialize_detached().unwrap();
+
+        // Bob processes the Commit through decrypt_with_sender_did.
+        let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
+        assert!(
+            matches!(&content, DecryptedContent::Commit { .. }),
+            "expected Commit variant"
+        );
+        if let DecryptedContent::Commit { sender_did } = &content {
+            assert!(
+                sender_did.starts_with("did:dht:z6Mk"),
+                "sender_did must be a DID, got: {sender_did}"
+            );
+        }
+
+        // Verify the epoch advanced — proves merge_staged_commit was called.
+        let bob_epoch_after = bob_group.group.as_ref().unwrap().epoch().as_u64();
+        assert_eq!(
+            bob_epoch_after,
+            bob_epoch_before + 1,
+            "Bob's epoch must advance after processing a Commit"
+        );
+
+        // Verify the group is still functional after processing the Commit.
+        let plaintext = b"post-commit message";
+        let ct_msg = encrypt(&mut alice_group, plaintext).unwrap();
+        let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes).unwrap();
+        assert!(
+            matches!(&content, DecryptedContent::Application { .. }),
+            "expected Application variant after Commit"
+        );
+        if let DecryptedContent::Application { plaintext: pt, .. } = content {
+            assert_eq!(pt, plaintext, "must decrypt after Commit processing");
+        }
     }
 
     mod proptest_tests {

@@ -82,6 +82,17 @@ fn has_relay_adapter() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns a clone of the current relay adapter, if one is connected.
+///
+/// Used by the context module to subscribe to relay messages for incoming
+/// message delivery.
+pub(crate) fn get_relay_adapter() -> Option<Arc<NativeRelayAdapter>> {
+    relay_adapter_state()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
 // ---------------------------------------------------------------------------
 // NapiTransportStatus — connection status record
 // ---------------------------------------------------------------------------

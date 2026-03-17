@@ -30,7 +30,7 @@ use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::credential::ScpCredential;
-use super::encrypt::{encrypt, serialize_ciphertext};
+use super::encrypt::{DecryptedContent, decrypt_with_sender_did, encrypt, serialize_ciphertext};
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use crate::context::ContextError;
 use crate::context::builder::{ContextCreationError, ContextCryptoProvider};
@@ -778,6 +778,70 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             Ok(ciphertext)
+        })
+    }
+
+    fn decrypt_message(
+        &self,
+        context_id: &[u8; 32],
+        ciphertext: &[u8],
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, String), ContextError> {
+        self.with_context(context_id, |state| {
+            let ctx_str = hex::encode(context_id);
+
+            // Step 1: MLS decrypt and extract sender DID from credential.
+            // `decrypt_with_sender_did` returns a `DecryptedContent` enum that
+            // distinguishes application messages, commits, and proposals.
+            let content = decrypt_with_sender_did(&mut state.mls_group, ciphertext)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+            match content {
+                DecryptedContent::Application {
+                    plaintext: mls_decrypted,
+                    sender_did,
+                } => {
+                    // Step 2: Look up the sender's key from the sender key store.
+                    let sender_key = state
+                        .sender_key_store
+                        .get(&ctx_str, &sender_did)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ContextError::CryptoFailed(format!(
+                                "no sender key for {sender_did} in context {ctx_str}"
+                            ))
+                        })?;
+
+                    // Step 3: Sender key decrypt (AES-256-GCM, ADR-007).
+                    let plaintext = crate::crypto::sender_keys::decrypt_sender_layer(
+                        &sender_key,
+                        &mls_decrypted,
+                        &ctx_str,
+                        &sender_did,
+                        epoch,
+                        sequence,
+                    )
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                    Ok((plaintext, sender_did))
+                }
+                DecryptedContent::Commit { sender_did } => {
+                    // Commit messages advance the MLS epoch. `decrypt_with_sender_did`
+                    // has already called `merge_staged_commit` to apply the epoch
+                    // change. Signal to the caller that no application payload exists.
+                    Err(ContextError::CryptoFailed(format!(
+                        "received MLS Commit from {sender_did} — epoch advanced, no application payload"
+                    )))
+                }
+                DecryptedContent::Proposal { sender_did } => {
+                    // Proposals are cached by OpenMLS during process_message.
+                    // No application payload to return.
+                    Err(ContextError::CryptoFailed(format!(
+                        "received MLS Proposal from {sender_did} — cached, no application payload"
+                    )))
+                }
+            }
         })
     }
 
