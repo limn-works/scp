@@ -130,7 +130,7 @@ These spec findings **block** existing implementation work. Implementing the cod
 | Finding A | Finding B | Conflict |
 |---|---|---|
 | 9.10.3/9.10.6 (bucket size) | — | Internal spec contradiction. Must pick one scheme. Factor-of-4 matches implementation. |
-| H-18 (chain depth hard vs configurable) | — | 3-way spec contradiction. Must pick: hard limit in SS9, or configurable in SS24. |
+| H-18 (chain depth hard vs configurable) | — | 3-way spec contradiction. **Resolved by ADR-043**: context-configurable (default 8), no protocol hard max. |
 | H-13 (TTL "all parties" vs "all members") | — | Spec self-contradiction. "All members" is correct for governance; "all parties" is ambiguous. |
 | H-07 (KeyPackage signing key) | — | SS9 line 287 vs 332. Active Signing Key (#active) is correct per RFC 9420. |
 
@@ -451,7 +451,7 @@ Phase 11 spec→code gap audit COMPLETE — found 3 CRITICAL, 25 HIGH, 19 MEDIUM
 ### Phase 13: Spec→Code Gap Fixes (depends on Phase 11) — MOSTLY COMPLETE
 
 **CRITICALs (3) — ALL COMPLETE:**
-- C1: Chain depth hard max 3→5 + ContextParams.max_chain_depth — **COMPLETE** → de42d1f3
+- C1: Chain depth hard max removed + ContextParams.max_chain_depth (default 8, ADR-043) — **COMPLETE** → de42d1f3
 - C2: BroadcastEnvelope signature content_hash + provenance_hash — **COMPLETE** → de42d1f3 + 828464d7 (content_hash omitted per ADR-038 confirmation oracle)
 - C3: Merkle tree RFC 6962 hash construction — **COMPLETE** → de42d1f3 (domain-separated leaf/interior hashing)
 

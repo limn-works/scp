@@ -316,7 +316,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 - **Category**: Missing edge cases
 - **Location**: §5.13.5, lines 725-748
 - **What's missing**: When a parent closes and triggers `cascade_close` on a child that itself has children, what is the ordering? Depth-first? Breadth-first? Does the parent's close complete before the child's cascade begins? Are cascades atomic (either the entire tree closes or nothing does)? What happens if a cascade partially fails (parent closes, child cascade starts, grandchild cascade fails)?
-- **Why it matters**: With the maximum nesting depth of 3, cascading close affects up to 3 levels. Without defined ordering, event log entries from different implementations will record cascades in different orders, breaking event log interoperability.
+- **Why it matters**: With nesting depth unbounded by default (context-configurable via `ContextParams::max_nesting_depth`, ADR-043), cascading close can affect arbitrary levels. Without defined ordering, event log entries from different implementations will record cascades in different orders, breaking event log interoperability.
 - **Severity**: MEDIUM
 
 ### [5.13.5] Lifecycle Event Log Entry Wire Format
@@ -330,6 +330,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 - **Category**: Vague requirements
 - **Location**: §5.13.8, lines 790-797
 - **What's missing**: "The protocol enforces a maximum nesting depth (suggested default: 3 levels)." Then: "The nesting depth limit is a protocol constant, not configurable per context." These contradict: is it a "suggested default" or a "protocol constant"? If it's a constant, state the value with MUST language. If it's configurable, state the range and default.
+- **Resolution (ADR-043)**: Nesting depth is now unbounded by default and context-configurable via `ContextParams::max_nesting_depth`. The contradiction is resolved — there is no protocol constant, only an optional per-context limit.
 - **Why it matters**: This affects relay validation logic. If some implementations use 3 and others use 5, child context creation will succeed on some relays and fail on others.
 - **Severity**: MEDIUM
 

@@ -4062,13 +4062,13 @@
       "files": [
         "crates/scp-core/provenance/attach.rs"
       ],
-      "description": "Implement automatic provenance attachment on cross-context data flows and chain depth enforcement. Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms (tool interfaces §6.2, structured messages). Chain depth is tracked and limited to prevent unbounded cross-context traversal (default max: 3 hops).",
+      "description": "Implement automatic provenance attachment on cross-context data flows and chain depth enforcement. Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms (tool interfaces §6.2, structured messages). Chain depth is tracked and limited to prevent unbounded cross-context traversal (default max: 8 hops (ADR-043)).",
       "acceptanceCriteria": [
         "attach_provenance(source_context, target_context, data) -> DataProvenance called automatically on cross-context tool interface calls",
         "attach_provenance populates all fields from source context state",
         "attach_provenance increments chain_depth from any existing provenance on the data",
         "attach_provenance populates counterparties from source context membership roster at time of data flow",
-        "check_chain_depth(provenance, max_depth) -> Result<(), ProvenanceError> with protocol default max depth of 3 hops",
+        "check_chain_depth(provenance, max_depth) -> Result<(), ProvenanceError> with protocol default max depth of 8 hops",
         "Call at max depth cannot trigger further cross-context calls",
         "Returns ProvenanceError::ChainDepthExceeded if limit reached",
         "chain_path optionally records ordered list of intermediary context IDs",
@@ -4081,7 +4081,7 @@
         "Implement chain_depth incrementing from existing provenance on data",
         "Implement counterparties population from source context membership roster",
         "Implement chain_path recording for intermediary context IDs",
-        "Implement check_chain_depth with configurable max_depth (default 3)",
+        "Implement check_chain_depth with configurable max_depth (default 8)",
         "Return ProvenanceError::ChainDepthExceeded on limit",
         "Implement event log recording in both source and target contexts",
         "Write unit tests for attachment, chain depth checking, and chain path recording"
@@ -4100,9 +4100,9 @@
       "details": {
         "module": "scp-core/provenance/attach.rs",
         "estimatedFunctions": "~3 public functions, ~2 internal helpers",
-        "defaultMaxChainDepth": 3
+        "defaultMaxChainDepth": 8
       },
-      "result": "Provenance attachment with chain depth checking (max 3 hops). 34 new tests."
+      "result": "Provenance attachment with chain depth checking (max 8 hops). 34 new tests."
     },
     {
       "id": "SCP-072",

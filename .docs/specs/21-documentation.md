@@ -23,7 +23,7 @@ An agent with no prior context should be able to visit the SCP repository, under
 | 11 | Protocol constants registry | §9.18 (16 subsections, ~100 constants) | Domain separators, key derivation labels, sizes, timeouts |
 | 12 | Cryptographic test vectors | §25 (18 subsections) | All crypto operations; hex outputs pending (§25.18) |
 | 13 | Conformance suite spec | §26 | Language-independent test case definitions |
-| 14 | GovernanceAction table | §9.5.2 | All 28 variants with signed structure fields |
+| 14 | GovernanceAction table | §9.5.2 | All 30 variants with signed structure fields |
 | 15 | ContextParams table | §9.5.2 | All 17 fields tabulated |
 | 16 | Domain separators | §9.18.2 | 30 separators registered, code-verified |
 | 17 | Key derivation labels | §9.18.3 | HPKE info, HKDF salt/info, HMAC domains, MLS exporter |
@@ -516,7 +516,7 @@ This requires that every protocol-level behavior is specified with enough precis
 | Protocol constants | §9.18 (16 subsections, ~100 constants) | Complete |
 | Relay wire protocol | §10.5 | Complete |
 | Bridge connectors | §12 | Complete |
-| Governance | §5.6, §9.5.2 (28 GovernanceAction variants) | Complete |
+| Governance | §5.6, §9.5.2 (30 GovernanceAction variants) | Complete |
 | Sync and offline recovery | §23, §23.16 (wire formats) | Complete |
 | Discovery and addressing | §22, §22.11 (wire formats) | Complete |
 | Economy | §19, §19.15 (wire formats) | Complete |

@@ -628,7 +628,7 @@ Contexts can form parent-child relationships (spec §5.13, ADR-008). A child con
 
 **Cryptographic binding.** Parent context IDs and the content hash of the parent governance configuration are included in the MLS `group_context` extensions field. The child's `group_id` is derived from this `group_context`, making the parent lineage part of the cryptographic group identity. Lineage is unforgeable — claiming different parents would require a different MLS group. Two independent verification paths (MLS `group_context` and Merkle-tree event log) must both be compromised to forge lineage.
 
-**Depth limit.** The protocol enforces a maximum nesting depth as a protocol constant (suggested default: 3 levels). This bounds governance complexity, ceiling narrowing (deep nesting converges on empty ceilings), lifecycle cascade depth, and provenance evaluation cost.
+**Depth limit.** Nesting depth is unbounded by default — contexts that need deep hierarchies (organizational structures, layered communities) simply nest. Contexts wanting to bound complexity set an explicit limit via `ContextParams::max_nesting_depth` (e.g., `Some(3)` for the previous behavior). See ADR-043. Ceiling intersection naturally constrains what deep nesting can achieve, and lifecycle cascade depth is bounded by the hierarchy itself.
 
 ### 2.5 Abstraction Boundaries and Replaceable Subsystems
 
