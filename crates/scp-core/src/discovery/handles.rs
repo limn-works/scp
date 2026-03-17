@@ -1,6 +1,6 @@
 //! Context handle tools: register, lookup, and deregister.
 //!
-//! Implements §22.3.1 Handle Tools: three standard tool schemas for discovery
+//! Implements §22.3.1 Handle Tools: three standard tool schemas for
 //! contexts that support human-readable handles. These follow the same two-tier
 //! architecture as existing discovery tools (§6.2.2B): writers (MLS members)
 //! process registrations, readers (DID-authenticated, unbounded) perform lookups.

@@ -92,7 +92,7 @@ Major version changes use a new URL path (`/scp/v2`). A relay MAY serve multiple
 
 ## 13.3 Version Advertisement
 
-Implementations advertise their supported protocol version through three mechanisms, each serving a different context:
+Implementations advertise their supported protocol version through three mechanisms, each serving a different discovery scenario:
 
 ### 13.3.1 DID Document Service Endpoint
 
