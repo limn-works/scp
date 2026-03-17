@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -112,6 +113,104 @@ class PublishResult:
 
     #: Hex-encoded SHA-256 of the asset body.
     etag: str
+
+
+# ---------------------------------------------------------------------------
+# SiteConfig — broadcast projection site configuration (SCP-293)
+# ---------------------------------------------------------------------------
+
+# RFC 1123 label pattern: alphanumeric + hyphens, 1-63 chars, no leading/trailing hyphens.
+_HOSTNAME_LABEL_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+
+# CSP keywords that must never appear in a CSP override.
+_CSP_FORBIDDEN_KEYWORDS: tuple[str, ...] = (
+    "unsafe-eval",
+    "unsafe-inline",
+    "unsafe-hashes",
+)
+
+
+def _validate_hostname(hostname: str) -> None:
+    """Validate *hostname* per RFC 1123.
+
+    Raises :class:`ValueError` if the hostname is invalid.
+    """
+    if not hostname:
+        raise ValueError("hostname must not be empty")
+    if len(hostname) > 253:
+        raise ValueError("hostname exceeds 253 characters")
+    for label in hostname.split("."):
+        if not label or len(label) > 63:
+            raise ValueError(f"invalid hostname label: '{label}'")
+        if not _HOSTNAME_LABEL_RE.match(label):
+            raise ValueError(f"hostname label contains invalid characters: '{label}'")
+
+
+def _validate_csp(csp: str) -> None:
+    """Validate a CSP override string.
+
+    Rejects ``unsafe-eval``, ``unsafe-inline``, ``unsafe-hashes``, bare
+    ``*``, ``data:``, and ``blob:`` as sources.
+
+    Raises :class:`ValueError` if the CSP is invalid.
+    """
+    lower = csp.lower()
+    for keyword in _CSP_FORBIDDEN_KEYWORDS:
+        if keyword in lower:
+            raise ValueError(f"CSP must not contain '{keyword}'")
+    for token in lower.split():
+        if token == "*":
+            raise ValueError("CSP must not contain bare wildcard '*'")
+        if token == "data:":
+            raise ValueError("CSP must not contain 'data:' source")
+        if token == "blob:":
+            raise ValueError("CSP must not contain 'blob:' source")
+
+
+@dataclass(frozen=True)
+class SiteConfig:
+    """Node-local site configuration for broadcast projection (spec §18.11.12).
+
+    Passed to ``enable_site_projection`` to configure path-based HTTP serving
+    of broadcast content.  NOT part of governance — deployment concern only.
+
+    Mirrors ``scp_node::projection::SiteConfig``.
+
+    Construction validates ``hostname``, ``deploy_retention_count``, and
+    ``csp_override``.  Invalid values raise :class:`ValueError`.
+    """
+
+    #: Virtual host hostname (e.g., ``"mysite.example.com"``).
+    #: RFC 1123 validated.
+    hostname: str
+
+    #: Default path for directory requests (default: ``"/index.html"``).
+    index_path: str = "/index.html"
+
+    #: Maximum assets per deploy (default: 10,000).
+    max_assets_per_deploy: int = 10_000
+
+    #: Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB).
+    max_deploy_size_bytes: int = 536_870_912
+
+    #: Number of deploys to retain (default: 2, max 8).
+    deploy_retention_count: int = 2
+
+    #: Optional CSP override. Validated: no ``unsafe-eval``, ``unsafe-inline``,
+    #: ``unsafe-hashes``, bare ``*``, ``data:``, ``blob:``.
+    csp_override: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_hostname(self.hostname)
+        if not isinstance(self.deploy_retention_count, int) or not (
+            1 <= self.deploy_retention_count <= 8
+        ):
+            raise ValueError(
+                f"deploy_retention_count must be an integer between 1 and 8, "
+                f"got {self.deploy_retention_count}"
+            )
+        if self.csp_override is not None:
+            _validate_csp(self.csp_override)
 
 
 # ---------------------------------------------------------------------------

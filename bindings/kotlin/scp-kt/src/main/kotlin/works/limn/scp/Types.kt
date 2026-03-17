@@ -285,6 +285,111 @@ class ScopedHandle internal constructor(
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast Site Configuration (SCP-293, spec §18.11.12)
+// ---------------------------------------------------------------------------
+
+/**
+ * Node-local site configuration for broadcast projection (spec section 18.11.12).
+ *
+ * Passed to `enableSiteProjection` to configure path-based HTTP serving of
+ * broadcast content. NOT part of governance -- deployment concern only.
+ *
+ * Mirrors `scp_node::projection::SiteConfig`.
+ *
+ * Construction validates [hostname], [deployRetentionCount], and [cspOverride].
+ *
+ * @property hostname Virtual host hostname (e.g., `"mysite.example.com"`). RFC 1123 validated.
+ * @property indexPath Default path for directory requests (default: `"/index.html"`).
+ * @property maxAssetsPerDeploy Maximum assets per deploy (default: 10,000).
+ * @property maxDeploySizeBytes Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB).
+ * @property deployRetentionCount Number of deploys to retain (default: 2, max 8).
+ * @property cspOverride Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`,
+ *   `unsafe-hashes`, bare `*`, `data:`, `blob:`.
+ */
+data class SiteConfig(
+    val hostname: String,
+    val indexPath: String = "/index.html",
+    val maxAssetsPerDeploy: Int = 10_000,
+    val maxDeploySizeBytes: Long = 536_870_912L,
+    val deployRetentionCount: Int = 2,
+    val cspOverride: String? = null,
+) {
+    init {
+        validateHostname(hostname)
+        require(deployRetentionCount in 1..8) {
+            "deployRetentionCount must be between 1 and 8, got $deployRetentionCount"
+        }
+        if (cspOverride != null) {
+            validateCsp(cspOverride)
+        }
+    }
+
+    companion object {
+        private val HOSTNAME_LABEL_REGEX = Regex("^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\$")
+        private val FORBIDDEN_CSP_KEYWORDS = listOf("unsafe-eval", "unsafe-inline", "unsafe-hashes")
+
+        /**
+         * Validates a hostname per RFC 1123.
+         *
+         * @throws IllegalArgumentException if the hostname is invalid.
+         */
+        fun validateHostname(hostname: String) {
+            require(hostname.isNotEmpty()) { "hostname must not be empty" }
+            require(hostname.length <= 253) { "hostname exceeds 253 characters" }
+            for (label in hostname.split(".")) {
+                require(label.isNotEmpty() && label.length <= 63) {
+                    "invalid hostname label: '$label'"
+                }
+                require(HOSTNAME_LABEL_REGEX.matches(label)) {
+                    "hostname label contains invalid characters: '$label'"
+                }
+            }
+        }
+
+        /**
+         * Validates a CSP override string.
+         *
+         * Rejects `unsafe-eval`, `unsafe-inline`, `unsafe-hashes`, bare `*`,
+         * `data:`, and `blob:` as sources.
+         *
+         * @throws IllegalArgumentException if the CSP is invalid.
+         */
+        fun validateCsp(csp: String) {
+            val lower = csp.lowercase()
+            for (keyword in FORBIDDEN_CSP_KEYWORDS) {
+                require(!lower.contains(keyword)) {
+                    "CSP must not contain '$keyword'"
+                }
+            }
+            for (token in lower.split("\\s+".toRegex())) {
+                require(token != "*") { "CSP must not contain bare wildcard '*'" }
+                require(token != "data:") { "CSP must not contain 'data:' source" }
+                require(token != "blob:") { "CSP must not contain 'blob:' source" }
+            }
+        }
+    }
+
+    /**
+     * Serializes this configuration to a JSON string suitable for the FFI bridge.
+     *
+     * Uses [buildJsonObject] from kotlinx.serialization to produce structurally
+     * valid JSON, preventing injection via untrusted string fields.
+     */
+    fun toJson(): String = Json.encodeToString(
+        buildJsonObject {
+            put("hostname", hostname)
+            put("index_path", indexPath)
+            put("max_assets_per_deploy", maxAssetsPerDeploy)
+            put("max_deploy_size_bytes", maxDeploySizeBytes)
+            put("deploy_retention_count", deployRetentionCount)
+            if (cspOverride != null) {
+                put("csp_override", cspOverride)
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast Asset Publishing (SCP-290, ADR-035)
 // ---------------------------------------------------------------------------
 
