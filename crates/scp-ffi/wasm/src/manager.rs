@@ -1858,9 +1858,9 @@ impl WasmContextManager {
             .params_json
             .get("maxChainDepth")
             .and_then(serde_json::Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
+            .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(crate::provenance::DEFAULT_MAX_CHAIN_DEPTH);
-        if u32::from(chain_depth) > max_chain_depth {
+        if chain_depth > max_chain_depth {
             return Err(ScpWasmError::Tool {
                 message: format!(
                     "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"

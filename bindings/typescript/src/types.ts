@@ -39,6 +39,12 @@ export interface ContextParams {
    * Omit for default SCP/1.0 baseline.
    */
   readonly minProtocolVersion?: readonly [number, number];
+  /** Maximum cross-context chain depth (ADR-043). Default 8, range [1, 255]. */
+  readonly maxChainDepth?: number;
+  /** Maximum context nesting depth (§5.13.8). Omit for unbounded. */
+  readonly maxNestingDepth?: number;
+  /** Per-caller session cap (§6.2.1). Default 1000. */
+  readonly sessionCap?: number;
 }
 
 // ---------------------------------------------------------------------------
