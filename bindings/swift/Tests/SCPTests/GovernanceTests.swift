@@ -1387,9 +1387,9 @@ struct SiteConfigTests {
     }
 
     @Test func equality() throws {
-        let a = try SiteConfig(hostname: "example.com")
-        let b = try SiteConfig(hostname: "example.com")
-        #expect(a == b)
+        let config1 = try SiteConfig(hostname: "example.com")
+        let config2 = try SiteConfig(hostname: "example.com")
+        #expect(config1 == config2)
     }
 
     // MARK: - Hostname Validation
