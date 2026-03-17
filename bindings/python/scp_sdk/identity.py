@@ -146,8 +146,6 @@ class Identity:
                 - :attr:`CustodyType.IN_MEMORY` / ``"in_memory"`` --
                   ephemeral in-memory key store, suitable for testing or
                   short-lived agents.
-                - :attr:`CustodyType.SOFTWARE` / ``"software"`` --
-                  software-backed file-based key store.
 
         Returns:
             A new :class:`Identity` instance.
@@ -216,8 +214,7 @@ class Identity:
         Args:
             custody: Key custody type.  Accepts a
                 :class:`~scp_sdk.types.CustodyType` enum member or a
-                raw string (``"file"``, ``"platform"``, ``"in_memory"``,
-                ``"software"``).
+                raw string (``"file"``, ``"platform"``, ``"in_memory"``).
 
         Returns:
             A new :class:`Identity` instance with an agent key.
