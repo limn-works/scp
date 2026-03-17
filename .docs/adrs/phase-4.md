@@ -370,7 +370,7 @@ Implement `scp-core/provenance/` module. `DataProvenance` struct is attached aut
 
 - **Automatic attachment over manual tagging:** Agents should not need to remember to tag provenance. The protocol attaches it at tool interface boundaries and cross-context message boundaries. Manual tagging is error-prone and inconsistent.
 - **Quality tiers over binary trust:** Provenance quality is a spectrum (§7.7.2). `PersistentVerifiable` (source still verifiable) is stronger than `EphemeralKnownParties` (source keys destroyed, parties known) which is stronger than `NoProvenance` (unknown origin). Agents use quality in their trust evaluation.
-- **Chain depth limit:** Unlimited cross-context hops create accountability laundering — data traverses enough contexts that its origin becomes meaningless. The protocol default of 3 hops bounds this.
+- **Chain depth limit:** Unlimited cross-context hops create accountability laundering — data traverses enough contexts that its origin becomes meaningless. The context-configurable default of 8 hops bounds this (raised from 3, no protocol hard max per ADR-043).
 
 ### Implementation
 
@@ -436,7 +436,7 @@ pub enum ProvenanceQuality {
    - Populates `counterparties` from source context membership roster at time of data flow.
 
 3. **`check_chain_depth(provenance, max_depth) -> Result<(), ProvenanceError>`**
-   - Protocol default max depth: 3 hops.
+   - Context-configurable max depth: default 8 hops (ADR-043).
    - Call at max depth cannot trigger further cross-context calls.
    - Returns `ProvenanceError::ChainDepthExceeded` if limit reached.
 
