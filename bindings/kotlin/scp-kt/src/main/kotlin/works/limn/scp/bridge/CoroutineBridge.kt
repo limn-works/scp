@@ -2135,11 +2135,23 @@ class GovernanceBridgeOps internal constructor(
 
 /**
  * Broadcast operations bridge. Wraps broadcast-related FFI calls as suspend functions.
+ *
+ * Set [defaultIdentityHandle] to avoid passing the identity handle to every
+ * publish call. When a publish method receives `identityHandle = null`, it
+ * falls back to [defaultIdentityHandle]. If both are null, a
+ * [BridgeException] is thrown. Callers typically set this once after
+ * identity creation (SCP-294b).
  */
 class BroadcastBridgeOps internal constructor(
     private val bindings: BroadcastBindings,
     private val bridge: CoroutineBridge,
 ) {
+    /**
+     * Default identity handle used when publish methods receive a null
+     * `identityHandle`. Set this after identity creation to avoid passing
+     * the handle on every call (SCP-294b).
+     */
+    var defaultIdentityHandle: Long? = null
     /**
      * Subscribe a DID to a broadcast context.
      *
@@ -2264,19 +2276,23 @@ class BroadcastBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create or join.
      * @param identityHandle Handle from identity create or load for the publishing author.
+     *   Defaults to [defaultIdentityHandle] when null (SCP-294b).
      * @param asset The asset to publish (path, content type, body).
      * @param deployId Optional deploy ID to group assets into atomic deploys.
      * @return A [PublishResult] with blob ID and ETag.
+     * @throws BridgeException if no identity handle is provided and
+     *   [defaultIdentityHandle] is not set.
      */
     suspend fun publishAsset(
         contextHandle: Long,
-        identityHandle: Long,
+        identityHandle: Long? = null,
         asset: AssetEntry,
         deployId: String? = null,
     ): PublishResult {
+        val resolved = resolveIdentityHandle(identityHandle)
         val assetJson = serializeAsset(asset)
         val resultJson = bridge.ffiCall {
-            bindings.broadcastPublishAsset(contextHandle, identityHandle, assetJson, deployId)
+            bindings.broadcastPublishAsset(contextHandle, resolved, assetJson, deployId)
         }
         return parsePublishResult(resultJson)
     }
@@ -2289,22 +2305,37 @@ class BroadcastBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create or join.
      * @param identityHandle Handle from identity create or load for the publishing author.
+     *   Defaults to [defaultIdentityHandle] when null (SCP-294b).
      * @param assets The assets to publish.
      * @param deployId Optional deploy ID to group assets into atomic deploys.
      * @return A list of [PublishResult] values, one per asset.
+     * @throws BridgeException if no identity handle is provided and
+     *   [defaultIdentityHandle] is not set.
      */
     suspend fun publishAssets(
         contextHandle: Long,
-        identityHandle: Long,
+        identityHandle: Long? = null,
         assets: List<AssetEntry>,
         deployId: String? = null,
     ): List<PublishResult> {
+        val resolved = resolveIdentityHandle(identityHandle)
         val assetsJson = serializeAssets(assets)
         val resultJson = bridge.ffiCall {
-            bindings.broadcastPublishAssets(contextHandle, identityHandle, assetsJson, deployId)
+            bindings.broadcastPublishAssets(contextHandle, resolved, assetsJson, deployId)
         }
         return parsePublishResults(resultJson)
     }
+
+    /**
+     * Resolves the effective identity handle from an explicit value or the
+     * [defaultIdentityHandle] fallback (SCP-294b).
+     */
+    private fun resolveIdentityHandle(explicit: Long?): Long =
+        explicit ?: defaultIdentityHandle ?: throw BridgeException(
+            "identityHandle is required: pass it explicitly or set " +
+                "BroadcastBridgeOps.defaultIdentityHandle",
+            "SCP-IDENT-1060",
+        )
 }
 
 // ---------------------------------------------------------------------------

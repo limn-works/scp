@@ -630,6 +630,42 @@ class CoroutineBridgeTest {
                 }
                 assertEquals("SCP-CTX-2036", exception.code)
             }
+
+        @Test
+        fun `publishAsset uses defaultIdentityHandle when identityHandle is null`() =
+            runTest(ioDispatcher) {
+                bridge.broadcast.defaultIdentityHandle = 99L
+                val asset = works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray())
+                val result = bridge.broadcast.publishAsset(1L, asset = asset)
+                assertEquals("abc123", result.blobId)
+                assertEquals(99L, stubBindings.lastPublishAssetIdentityHandle)
+                bridge.broadcast.defaultIdentityHandle = null
+            }
+
+        @Test
+        fun `publishAssets uses defaultIdentityHandle when identityHandle is null`() =
+            runTest(ioDispatcher) {
+                bridge.broadcast.defaultIdentityHandle = 99L
+                val assets = listOf(
+                    works.limn.scp.AssetEntry("/index.html", "text/html", "hi".toByteArray()),
+                    works.limn.scp.AssetEntry("/style.css", "text/css", "body{}".toByteArray()),
+                )
+                val results = bridge.broadcast.publishAssets(1L, assets = assets)
+                assertEquals(2, results.size)
+                assertEquals(99L, stubBindings.lastPublishAssetsIdentityHandle)
+                bridge.broadcast.defaultIdentityHandle = null
+            }
+
+        @Test
+        fun `publishAsset throws when no identity handle available`() =
+            runTest(ioDispatcher) {
+                bridge.broadcast.defaultIdentityHandle = null
+                val asset = works.limn.scp.AssetEntry("/a.html", "text/html", "x".toByteArray())
+                val exception = assertFailsWith<BridgeException> {
+                    bridge.broadcast.publishAsset(1L, asset = asset)
+                }
+                assertEquals("SCP-IDENT-1060", exception.code)
+            }
     }
 
     // -------------------------------------------------------------------

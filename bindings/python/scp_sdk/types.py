@@ -27,10 +27,23 @@ class CustodyType(enum.Enum):
 
     Determines where cryptographic keys are stored and managed.
     Mirrors ``scp_core::identity::CustodyType``.
+
+    The bridge layer accepts both ``"file"`` and ``"platform"`` for
+    file-backed custody (:attr:`FILE` and :attr:`PLATFORM` respectively).
+    ``"platform"`` is a backward-compatible alias — both resolve to
+    ``FileKeyCustody`` (Argon2id + AES-256-GCM encrypted key file at
+    ``$HOME/.scp/keys.bin``).  Prefer :attr:`FILE` for new code.
+
+    See SCP-294a.
     """
 
-    #: Platform-native secure storage (Keychain on macOS/iOS, Keystore
-    #: on Android, credential manager on Windows/Linux).  Default.
+    #: Encrypted file-backed key custody (Argon2id + AES-256-GCM).
+    #: Canonical name for what was previously called ``"platform"``.
+    #: Requires the ``SCP_KEY_PASSPHRASE`` environment variable.
+    FILE = "file"
+    #: Backward-compatible alias for :attr:`FILE`.  Both resolve to
+    #: ``FileKeyCustody`` in the bridge layer.  Prefer :attr:`FILE`
+    #: for new code.
     PLATFORM = "platform"
     #: Ephemeral in-memory key store, suitable for testing or short-lived
     #: agents.  Keys are lost on process exit.

@@ -988,6 +988,53 @@ struct GovernanceTests {
         }
     }
 
+    // MARK: - Optional identity parameter tests (SCP-294b)
+
+    @Test("broadcastPublishAsset defaults to context identity when identity is nil")
+    func broadcastPublishAssetDefaultIdentity() async throws {
+        let context = makeActiveContext()
+
+        var receivedIdentity: Identity?
+        let mockPublishAsset: BroadcastBridge.PublishAssetFn = { _, identity, _, _ in
+            receivedIdentity = identity
+            return PublishResult(blobId: "abc", etag: "def")
+        }
+
+        let asset = AssetEntry(
+            path: "/index.html",
+            contentType: "text/html",
+            body: Data("<h1>Hello</h1>".utf8)
+        )
+        // Call without explicit identity — should use context's self.identity
+        let result = try await context.broadcastPublishAsset(
+            asset: asset,
+            publishAssetFn: mockPublishAsset
+        )
+        #expect(result.blobId == "abc")
+        #expect(receivedIdentity != nil)
+    }
+
+    @Test("broadcastPublishAssets defaults to context identity when identity is nil")
+    func broadcastPublishAssetsDefaultIdentity() async throws {
+        let context = makeActiveContext()
+
+        var receivedIdentity: Identity?
+        let mockPublishAssets: BroadcastBridge.PublishAssetsFn = { _, identity, assets, _ in
+            receivedIdentity = identity
+            return assets.map { _ in PublishResult(blobId: "b", etag: "e") }
+        }
+
+        let assets = [
+            AssetEntry(path: "/index.html", contentType: "text/html", body: Data("hi".utf8))
+        ]
+        let results = try await context.broadcastPublishAssets(
+            assets: assets,
+            publishAssetsFn: mockPublishAssets
+        )
+        #expect(results.count == 1)
+        #expect(receivedIdentity != nil)
+    }
+
     // MARK: - Bridge error propagation tests
 
     @Test("memberCount propagates bridge errors")

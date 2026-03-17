@@ -951,6 +951,7 @@ public extension Context {
     /// - Parameters:
     ///   - asset: The asset to publish (path, content type, body).
     ///   - identity: The identity of the author publishing the asset.
+    ///     Defaults to the context creator's identity (SCP-294b).
     ///   - deployId: Optional deploy ID to group assets into atomic deploys.
     ///   - publishAssetFn: Bridge function override for testing.
     /// - Returns: A ``PublishResult`` with `blobId` and `etag`.
@@ -958,7 +959,7 @@ public extension Context {
     ///   active or publishing fails.
     func broadcastPublishAsset(
         asset: AssetEntry,
-        identity: Identity,
+        identity: Identity? = nil,
         deployId: String? = nil,
         publishAssetFn: BroadcastBridge.PublishAssetFn = BroadcastBridge.defaultPublishAsset
     ) async throws -> PublishResult {
@@ -966,7 +967,8 @@ public extension Context {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await publishAssetFn(handle, identity, asset, deployId)
+        let resolvedIdentity = identity ?? self.identity
+        return try await publishAssetFn(handle, resolvedIdentity, asset, deployId)
     }
 
     /// Publishes multiple assets to this broadcast context as structured content (SCP-290).
@@ -977,6 +979,7 @@ public extension Context {
     /// - Parameters:
     ///   - assets: The assets to publish.
     ///   - identity: The identity of the author publishing the assets.
+    ///     Defaults to the context creator's identity (SCP-294b).
     ///   - deployId: Optional deploy ID to group assets into atomic deploys.
     ///   - publishAssetsFn: Bridge function override for testing.
     /// - Returns: An array of ``PublishResult`` values, one per asset.
@@ -984,7 +987,7 @@ public extension Context {
     ///   active or publishing fails.
     func broadcastPublishAssets(
         assets: [AssetEntry],
-        identity: Identity,
+        identity: Identity? = nil,
         deployId: String? = nil,
         publishAssetsFn: BroadcastBridge.PublishAssetsFn = BroadcastBridge.defaultPublishAssets
     ) async throws -> [PublishResult] {
@@ -992,7 +995,8 @@ public extension Context {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await publishAssetsFn(handle, identity, assets, deployId)
+        let resolvedIdentity = identity ?? self.identity
+        return try await publishAssetsFn(handle, resolvedIdentity, assets, deployId)
     }
 }
 
