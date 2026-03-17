@@ -29,6 +29,11 @@ let package = Package(
                 // Use Swift 5 language mode to downgrade these to warnings until
                 // UniFFI updates its Swift codegen for Swift 6 compatibility.
                 .swiftLanguageMode(.v5)
+            ],
+            linkerSettings: [
+                // The `whoami` crate (transitive dep via scp-node) calls
+                // SCDynamicStoreCopyComputerName on macOS/iOS.
+                .linkedFramework("SystemConfiguration")
             ]
         ),
         .testTarget(

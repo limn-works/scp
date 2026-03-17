@@ -94,6 +94,11 @@ pub mod transport;
 pub mod trust;
 pub mod ucan;
 
+// Server startup (relay + application node) — behind the `server` feature on
+// scp-ffi-common. Not available for WASM (ADR-034).
+#[cfg(feature = "server")]
+pub mod server;
+
 // ---------------------------------------------------------------------------
 // Tokio runtime
 // ---------------------------------------------------------------------------

@@ -337,6 +337,7 @@ impl Storage for FilesystemStorage {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

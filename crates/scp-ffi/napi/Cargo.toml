@@ -11,8 +11,10 @@ publish = false
 crate-type = ["cdylib", "lib"]
 
 [features]
-default = []
+default = ["server"]
 allow_in_memory_custody = ["scp-platform/testing"]
+# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+server = ["scp-ffi-common/server", "dep:scp-node"]
 
 [dependencies]
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt", "async", "error_anyhow"] }
@@ -37,7 +39,8 @@ scp-media = { path = "../../scp-media" }
 scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
-scp-platform = { path = "../../scp-platform", features = ["encrypting"] }
+scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+scp-platform = { path = "../../scp-platform", features = ["encrypting", "filesystem"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 

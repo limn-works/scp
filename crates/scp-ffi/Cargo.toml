@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 # used by maturin when building the Python extension module.
 
 [features]
+default = ["server"]
 # extension-module suppresses Python symbol linking — required for cdylib
 # but incompatible with test binaries. Maturin passes this explicitly.
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
@@ -24,6 +25,8 @@ extension-module = ["pyo3/extension-module"]
 # feature is always enabled in deps (needed for `InMemoryStorage`), so this
 # feature is a pure code-level gate. See issue #394 and ADR-006.
 allow_in_memory_custody = ["scp-platform/testing"]
+# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+server = ["scp-ffi-common/server", "dep:scp-node"]
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["experimental-async"] }
@@ -32,8 +35,9 @@ scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 scp-event-log = { path = "../scp-event-log" }
 scp-ffi-common = { path = "common" }
+scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-mcp = { path = "../scp-mcp" }
-scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "testing", "encrypting"] }
+scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "testing", "encrypting", "filesystem"] }
 scp-media = { path = "../scp-media" }
 scp-transport = { path = "../scp-transport" }
 serde_json = { workspace = true }
