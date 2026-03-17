@@ -1,0 +1,9 @@
+name: "SCP CodeQL Configuration"
+
+paths-ignore:
+  - "**/tests/**"
+  - "**/test/**"
+  - "crates/scp-testing/**"
+  - "**/node_modules/**"
+  - "**/target/**"
+  - ".claude/**"
