@@ -7207,6 +7207,13 @@ mod tests {
             "text/html"
         );
         assert_security_headers(&headers);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
         assert_eq!(&body[..], b"<h1>V1</h1>");
 
         // Verify v1 CSS.
@@ -7216,6 +7223,7 @@ mod tests {
             headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
             "text/css"
         );
+        assert_security_headers(&headers);
         assert_eq!(&body[..], b"body{color:red}");
 
         // Publish v2 HTML, commit v2.
@@ -7230,14 +7238,28 @@ mod tests {
         );
 
         // Verify v2 body.
-        let (status, _, body) = site_get(&state, &routing_hex, "index.html", None).await;
+        let (status, headers, body) = site_get(&state, &routing_hex, "index.html", None).await;
         assert_eq!(status, HttpStatus::OK);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
         assert_eq!(&body[..], b"<h1>V2</h1>");
 
         // Rollback to v1, verify v1 body restored.
         assert!(rollback_via_state(&state, routing_id, "deploy-v1").await);
         let (status, headers, body) = site_get(&state, &routing_hex, "index.html", None).await;
         assert_eq!(status, HttpStatus::OK);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
         assert_eq!(&body[..], b"<h1>V1</h1>");
         assert_security_headers(&headers);
     }
@@ -7294,6 +7316,13 @@ mod tests {
             "text/html"
         );
         assert_security_headers(&headers);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
         assert_eq!(&body[..], b"<h1>Gated V1</h1>");
 
         // Publish and commit v2.
@@ -7306,8 +7335,16 @@ mod tests {
         // Verify v2.
         let token = build_signed_test_ucan(context_id, &signing_key);
         let auth = format!("Bearer {token}");
-        let (status, _, body) = site_get(&state, &routing_hex, "index.html", Some(&auth)).await;
+        let (status, headers, body) =
+            site_get(&state, &routing_hex, "index.html", Some(&auth)).await;
         assert_eq!(status, HttpStatus::OK);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
         assert_eq!(&body[..], b"<h1>Gated V2</h1>");
 
         // Rollback to v1.
@@ -7324,6 +7361,13 @@ mod tests {
             site_get(&state, &routing_hex, "index.html", Some(&auth)).await;
         assert_eq!(status, HttpStatus::OK);
         assert_security_headers(&headers);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "private, max-age=0, must-revalidate");
+        assert!(headers.get(axum::http::header::ETAG).is_some());
         assert_eq!(&body[..], b"<h1>Gated V1</h1>");
     }
 }
