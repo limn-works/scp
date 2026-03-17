@@ -65,8 +65,8 @@ name = "harness_meta"
 path = "tests/integration/harness_meta.rs"
 
 [[test]]
-name = "phase1"
-path = "tests/integration/phase1.rs"
+name = "encrypted_relay_roundtrip"
+path = "tests/integration/encrypted_relay_roundtrip.rs"
 
 [[test]]
 name = "persistence"
@@ -145,8 +145,8 @@ name = "compromise_recovery"
 path = "tests/integration/compromise_recovery.rs"
 
 [[test]]
-name = "demo"
-path = "tests/integration/demo.rs"
+name = "network_simulation"
+path = "tests/integration/network_simulation.rs"
 
 [[test]]
 name = "fullstack"

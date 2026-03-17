@@ -15,6 +15,7 @@
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+use zeroize::Zeroizing;
 
 use scp_ffi_common::server::{self, RunningRelay, ServerError};
 use scp_node::NodeError;
@@ -261,17 +262,19 @@ impl NapiNodeHandle {
         deploy_retention_count: Option<u32>,
         csp_override: Option<String>,
     ) -> napi::Result<()> {
-        let key_bytes: [u8; 32] = hex::decode(&broadcast_key_hex)
-            .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?
-            .try_into()
-            .map_err(|_| {
-                NapiError::from_reason(
-                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                )
-            })?;
+        let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            hex::decode(&broadcast_key_hex)
+                .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?
+                .try_into()
+                .map_err(|_| {
+                    NapiError::from_reason(
+                        "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                    )
+                })?,
+        );
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(key_bytes),
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
             0,
             author_did,
         );

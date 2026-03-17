@@ -14,6 +14,7 @@
 //! WASM (ADR-034).
 
 use pyo3::prelude::*;
+use zeroize::Zeroizing;
 
 use scp_ffi_common::server::{self, RunningRelay, ServerError};
 use scp_node::NodeError;
@@ -270,19 +271,23 @@ impl PyNodeHandle {
     ) -> PyResult<()> {
         let rt = crate::runtime()?;
 
-        let key_bytes: [u8; 32] = hex::decode(&broadcast_key_hex)
-            .map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!("invalid broadcast_key_hex: {e}"))
-            })?
-            .try_into()
-            .map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                )
-            })?;
+        let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+            hex::decode(&broadcast_key_hex)
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid broadcast_key_hex: {e}"
+                    ))
+                })?
+                .try_into()
+                .map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                    )
+                })?,
+        );
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(key_bytes),
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
             0,
             author_did,
         );

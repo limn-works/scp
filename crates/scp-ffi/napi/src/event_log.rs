@@ -133,7 +133,7 @@ pub async fn event_log_query(
             .filter(|(_idx, entry)| event_type_filter.as_ref().is_none_or(|f| entry.event == *f))
             .map(|(idx, entry)| NapiEvent {
                 event_type: entry.event.clone(),
-                actor_did: context_id_str.clone(),
+                actor_did: String::new(), // EventLogEntry does not carry actor DID
                 timestamp: entry.timestamp as f64,
                 payload_json: serde_json::json!({
                     "hash": hex::encode(entry.hash),

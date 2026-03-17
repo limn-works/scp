@@ -494,7 +494,7 @@ async fn receive_envelope(
 /// 9. Verify Merkle event chain integrity
 ///
 /// This combines the crypto depth of fullstack tests (real MLS + sender keys through
-/// `ContextManager`) with the transport depth of phase1 tests (real WebSocket relay).
+/// `ContextManager`) with the transport depth of `encrypted_relay_roundtrip` tests (real WebSocket relay).
 #[tokio::test]
 // Integration test exercises full stack through relay; splitting would fragment
 // the sequential scenario.
