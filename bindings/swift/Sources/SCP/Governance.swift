@@ -396,6 +396,205 @@ public enum MembershipBridge {
     }
 }
 
+// MARK: - Client-side Validation (SCP-297, spec §18.11.9)
+
+/// Maximum content path length in bytes.
+private let maxContentPathBytes = 1024
+
+/// Maximum deploy ID length in bytes.
+private let maxDeployIdBytes = 128
+
+/// Throws ``ScpError/Validation`` with code `SCP-VALID-7010`.
+private func contentPathError(_ message: String) -> ScpError {
+    ScpError.Validation(msg: message, code: "SCP-VALID-7010")
+}
+
+/// Rejects forbidden single-character patterns in a content path.
+private func rejectForbiddenPathChars(_ path: String) throws {
+    let forbidden: [(Character, String)] = [
+        ("\\", "ContentPath must not contain backslashes"),
+        ("%", "ContentPath must not contain percent-encoded bytes"),
+        ("?", "ContentPath must not contain query strings ('?')"),
+        ("#", "ContentPath must not contain fragments ('#')"),
+        ("\0", "ContentPath must not contain null bytes")
+    ]
+    for (char, msg) in forbidden where path.contains(char) {
+        throw contentPathError(msg)
+    }
+}
+
+/// Returns true for Unicode formatting/invisible characters.
+/// Mirrors the Rust `is_unicode_formatting` helper.
+private func isUnicodeFormatting(_ codePoint: UInt32) -> Bool {
+    switch codePoint {
+    case 0x00A0, // NBSP
+         0x1680, // Ogham space mark
+         0x2000 ... 0x200F, // Typographic spaces (2000-200A) + ZWSP..RLM (200B-200F)
+         0x2028 ... 0x2029, // Line/paragraph separators
+         0x202A ... 0x202F, // Bidi embedding controls + narrow no-break space
+         0x205F, // Medium mathematical space
+         0x2060 ... 0x206F, // Word joiner, invisible operators
+         0x3000, // Ideographic space
+         0xFEFF, // BOM / ZWNBSP
+         0xFFFE ... 0xFFFF: // Non-characters
+        return true
+    default:
+        return false
+    }
+}
+
+/// Returns true if the character is a valid RFC 7230 tchar (minus '%').
+private func isMimeTchar(_ scalar: Unicode.Scalar) -> Bool {
+    let codePoint = scalar.value
+    // ASCII alphanumeric
+    if (codePoint >= 0x30 && codePoint <= 0x39) || (codePoint >= 0x41 && codePoint <= 0x5A) || (codePoint >= 0x61 && codePoint <= 0x7A) {
+        return true
+    }
+    // !#$&'*+-.^_`|~
+    switch scalar {
+    case "!", "#", "$", "&", "'", "*", "+", "-", ".", "^", "_", "`", "|", "~":
+        return true
+    default:
+        return false
+    }
+}
+
+/// Rejects control characters (U+0000-U+001F, U+007F, U+0080-U+009F) in a content path.
+private func rejectPathControlChars(_ path: String) throws {
+    for scalar in path.unicodeScalars {
+        let codePoint = scalar.value
+        // C0 controls, DEL, and C1 controls
+        if codePoint <= 0x1F || codePoint == 0x7F || (codePoint >= 0x80 && codePoint <= 0x9F) {
+            throw contentPathError(
+                "ContentPath must not contain control character U+\(String(format: "%04X", codePoint))"
+            )
+        }
+    }
+}
+
+/// Rejects non-ASCII whitespace, bidi, and formatting characters in a content path.
+private func rejectPathUnicodeFormatting(_ path: String) throws {
+    for scalar in path.unicodeScalars {
+        let codePoint = scalar.value
+        if codePoint > 0x7F, isUnicodeFormatting(codePoint) {
+            throw contentPathError(
+                "ContentPath must not contain non-ASCII whitespace/formatting U+\(String(format: "%04X", codePoint))"
+            )
+        }
+    }
+}
+
+/// Validates a content path before FFI crossing (SCP-297).
+///
+/// Mirrors the Rust `ContentPath::new` validation from
+/// `crates/scp-core/src/context/broadcast_content.rs`.
+///
+/// - Parameter path: The content path to validate.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the path is invalid.
+func validateContentPath(_ rawPath: String) throws {
+    // NFC-normalize before validation (Fix 3)
+    let path = rawPath.precomposedStringWithCanonicalMapping
+    guard path.hasPrefix("/") else { throw contentPathError("ContentPath must start with '/'") }
+    guard path.utf8.count <= maxContentPathBytes else {
+        throw contentPathError("ContentPath exceeds \(maxContentPathBytes) bytes")
+    }
+    try rejectForbiddenPathChars(path)
+    try rejectPathControlChars(path)
+    try rejectPathUnicodeFormatting(path)
+    if path.contains("//") { throw contentPathError("ContentPath must not contain '//'") }
+    if path.count > 1, path.hasSuffix("/") {
+        throw contentPathError("ContentPath must not have trailing slash (except root '/')")
+    }
+    for segment in path.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
+        if segment == "." { throw contentPathError("ContentPath must not contain '.' segments") }
+        if segment == ".." {
+            throw contentPathError("ContentPath must not contain '..' segments (directory traversal)")
+        }
+    }
+}
+
+/// Validates a MIME type before FFI crossing (SCP-297).
+///
+/// Mirrors the Rust `MimeType::new` validation from
+/// `crates/scp-core/src/context/broadcast_content.rs`.
+///
+/// - Parameter contentType: The MIME type to validate.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the MIME type is invalid.
+func validateMimeType(_ contentType: String) throws {
+    guard !contentType.isEmpty else {
+        throw ScpError.Validation(msg: "MimeType must not be empty", code: "SCP-VALID-7011")
+    }
+    for scalar in contentType.unicodeScalars {
+        let codePoint = scalar.value
+        // C0 controls, DEL, and C1 controls
+        if codePoint <= 0x1F || codePoint == 0x7F || (codePoint >= 0x80 && codePoint <= 0x9F) {
+            throw ScpError.Validation(
+                msg: "MimeType must not contain control character U+\(String(format: "%04X", codePoint))",
+                code: "SCP-VALID-7011"
+            )
+        }
+    }
+    if contentType.contains(";") {
+        throw ScpError.Validation(
+            msg: "MimeType must not contain parameters (';' not allowed)",
+            code: "SCP-VALID-7011"
+        )
+    }
+    let slashCount = contentType.filter { $0 == "/" }.count
+    guard slashCount == 1 else {
+        throw ScpError.Validation(
+            msg: "MimeType must be 'type/subtype' (exactly one '/')",
+            code: "SCP-VALID-7011"
+        )
+    }
+    let parts = contentType.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+    if parts.count != 2 || parts[0].isEmpty || parts[1].isEmpty {
+        throw ScpError.Validation(
+            msg: "MimeType type and subtype must both be non-empty",
+            code: "SCP-VALID-7011"
+        )
+    }
+    // RFC 7230 §3.2.6 tchar validation
+    if !parts[0].unicodeScalars.allSatisfy({ isMimeTchar($0) }) {
+        throw ScpError.Validation(
+            msg: "MimeType type part contains invalid characters",
+            code: "SCP-VALID-7011"
+        )
+    }
+    if !parts[1].unicodeScalars.allSatisfy({ isMimeTchar($0) }) {
+        throw ScpError.Validation(
+            msg: "MimeType subtype part contains invalid characters",
+            code: "SCP-VALID-7011"
+        )
+    }
+}
+
+/// Validates a deploy ID before FFI crossing (SCP-297).
+///
+/// Mirrors the Rust `validate_deploy_id` from
+/// `crates/scp-core/src/context/broadcast_content.rs`.
+///
+/// - Parameter deployId: The deploy ID to validate.
+/// - Throws: ``ScpError/Validation(msg:code:)`` if the deploy ID is invalid.
+func validateDeployId(_ deployId: String) throws {
+    guard !deployId.isEmpty else {
+        throw ScpError.Validation(msg: "deploy_id must not be empty", code: "SCP-VALID-7012")
+    }
+    guard deployId.utf8.count <= maxDeployIdBytes else {
+        throw ScpError.Validation(
+            msg: "deploy_id exceeds \(maxDeployIdBytes) bytes",
+            code: "SCP-VALID-7012"
+        )
+    }
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+    guard deployId.unicodeScalars.allSatisfy({ $0.isASCII && allowed.contains($0) }) else {
+        throw ScpError.Validation(
+            msg: "deploy_id must be ASCII alphanumeric, '-', or '_'",
+            code: "SCP-VALID-7012"
+        )
+    }
+}
+
 // MARK: - BroadcastBridge
 
 /// Namespace for UniFFI bridge function references used by broadcast operations.
@@ -967,6 +1166,13 @@ public extension Context {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
+        // SCP-297: Client-side validation before FFI crossing.
+        try validateContentPath(asset.path)
+        try validateMimeType(asset.contentType)
+        if let id = deployId {
+            try validateDeployId(id)
+        }
+
         let resolvedIdentity = identity ?? self.identity
         return try await publishAssetFn(handle, resolvedIdentity, asset, deployId)
     }
@@ -984,7 +1190,8 @@ public extension Context {
     ///   - publishAssetsFn: Bridge function override for testing.
     /// - Returns: An array of ``PublishResult`` values, one per asset.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
-    ///   active or publishing fails.
+    ///   active or publishing fails. ``ScpError/Validation(msg:code:)``
+    ///   if path, contentType, or deployId is invalid (SCP-297).
     func broadcastPublishAssets(
         assets: [AssetEntry],
         identity: Identity? = nil,
@@ -993,6 +1200,15 @@ public extension Context {
     ) async throws -> BatchPublishResult {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
+        }
+
+        // SCP-297: Client-side validation before FFI crossing.
+        for asset in assets {
+            try validateContentPath(asset.path)
+            try validateMimeType(asset.contentType)
+        }
+        if let id = deployId {
+            try validateDeployId(id)
         }
 
         let resolvedIdentity = identity ?? self.identity
