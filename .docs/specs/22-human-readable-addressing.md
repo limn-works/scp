@@ -213,6 +213,87 @@ Template: "scp:template/handle-registry"
 
 This template is a starting point. Discovery contexts can customize governance, add tools (reputation scoring, category browsing), or restrict registration policies via context governance. The template follows the two-tier model: bounded registrars/admins (MLS members), unbounded readers.
 
+### 22.3.5 Scope Tools (Namespace Registration)
+
+Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools are **aliases for handle tools** with two constraints enforced at the tool boundary. They reuse all handle types (`HandleRegisterParams`, `HandleEntry`, `HandleTarget`, etc.) and operate on the same `HandleRegistry` instances. No new types are introduced. See ADR-043 for the design decision and security analysis.
+
+**Scope tools as handle aliases:**
+
+| Scope Tool | Delegates To | Additional Constraints |
+|------------|-------------|----------------------|
+| `scope_register` | `handle_register` | Rejects `HandleTarget::Identity`; validates scope name via `validate_scope_name()` |
+| `scope_lookup` | `handle_lookup` | Applies `type_filter: Context` (returns only context targets) |
+| `scope_deregister` | `handle_deregister` | Validates scope name via `validate_scope_name()` |
+
+**`validate_scope_name()` rules.** Scope names are more constrained than general handle local-parts (§22.2):
+
+| Rule | Rationale |
+|------|-----------|
+| Charset: `[a-z0-9-]` only | Matches §22.3.2 normalization output. No underscores (stripped by normalization), no periods (see below). |
+| No periods (`.`) | Periods are the syntactic discriminator between scope-based and domain-based resolution (§22.8.1). A scope name containing a dot would be misrouted to the domain resolution path. |
+| Length: 1-64 characters | Consistent with handle local-part maximum (§22.2). |
+| No leading or trailing hyphens | Consistent with DNS label conventions and general handle rules. |
+
+**Charset choice: `[a-z0-9-]` without underscores.** The handle local-part charset is `[a-z0-9._-]` (§22.2). Scope names exclude both `.` (resolution discriminator) and `_` (underscore). Underscores are excluded because §22.3.2 normalization strips non-alphanumeric characters except hyphens — a scope name containing an underscore would normalize to a different string, creating a mismatch between the registered name and the normalized form used for resolution. The scope charset is the exact output alphabet of §22.3.2 normalization.
+
+**`scope_register` — register a scope name:**
+
+```
+scope_register(handle, target, metadata?) → confirmation
+  input:  {
+    handle:   string,          // scope name to register (validated by validate_scope_name)
+    target:   HandleTarget,    // MUST be Context { context_id, relay_urls }
+    metadata: HandleMetadata?  // optional descriptive metadata
+  }
+  output: HandleRegisterResult  // { status: "registered"|"conflict", entry_id? }
+
+  Rejects HandleTarget::Identity with an error. Scope names map to contexts only.
+```
+
+**`scope_lookup` — look up a scope name:**
+
+```
+scope_lookup(handle) → results
+  input:  {
+    handle: string             // scope name to look up
+  }
+  output: HandleLookupResult   // { results: [HandleEntry] } — context entries only
+
+  Equivalent to handle_lookup(handle, type_filter: "context").
+```
+
+**`scope_deregister` — remove a scope registration:**
+
+```
+scope_deregister(handle, did) → removal
+  input:  {
+    handle: string,            // scope name to deregister
+    did:    DID                // must match entry owner (verified via transport auth)
+  }
+  output: HandleDeregisterResult  // { removed: bool }
+
+  Equivalent to handle_deregister with scope name validation.
+```
+
+**Resolution flow — two-hop address resolution:**
+
+```
+1. Client receives "alice@cooking-community"
+2. Parse: local-part = "alice", scope = "cooking-community"
+3. Scope has no "." → scope-based resolution
+4. Query bootstrap context(s) via scope_lookup("cooking-community")
+5. Get result: Context { context_id: "a1b2c3...", relay_urls: ["wss://..."] }
+6. Connect to resolved context, call handle_lookup("alice")
+7. Get result: Identity { did: "did:dht:z6MkAlice..." }
+8. Resolve DID via Mainline DHT (self-certifying, §9.6.1)
+```
+
+Step 4 is the scope resolution hop — the "phone book for namespaces." Step 6 is the handle resolution hop — the "phone book for participants." The SDK ships Limn's context ID in bootstrap defaults, providing the initial scope registry. Apps can add additional scope registries via configuration.
+
+**Hosting model.** Any context can host scope tools. A context with scope tools is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its tool set. A single context can combine scope tools with handle tools, agent tools, and any other tools. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously.
+
+**Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
+
 ## 22.4 Petnames (Local Floor)
 
 Petnames are locally-assigned names for contacts and contexts. They are private, immediate, and require zero infrastructure. Petnames are the resolution floor — the addressing capability that always works regardless of what else is available.
@@ -943,6 +1024,9 @@ The following tool names are normative — independent implementations MUST use 
 | `handle_lookup` | Reader (DID-authenticated query) | §22.3.1 |
 | `handle_deregister` | Writer (MLS member write) | §22.3.1 |
 | `attestation_lookup` | Reader (DID-authenticated query) | §22.5.1 |
+| `scope_register` | Writer (MLS member write) | §22.3.5 |
+| `scope_lookup` | Reader (DID-authenticated query) | §22.3.5 |
+| `scope_deregister` | Writer (MLS member write) | §22.3.5 |
 
 ### 22.11.8 DID Document Service Types
 
