@@ -1690,6 +1690,10 @@ Scope tools inherit all handle-tool security properties (see §22.3.1 for the DI
 
 **Classification:** Governance policy decision, not a protocol flaw. The protocol provides the mechanisms (multi-registry, governance, attestation) to mitigate squatting at the governance layer.
 
+#### Scope Registry Surveillance
+
+Scope registries, as first-hop resolution points, see resolution metadata for every scoped address lookup. A scope registry operator observes which scope names are queried, by which DIDs, and at what frequency. Privacy-sensitive deployments should consider the implications of centralized scope registries. The mitigations from §22.10.5 (Query Surveillance) apply: distribute lookups across multiple registries, leverage SDK caching, and note that the protocol does not mandate query logging beyond registration events.
+
 ### Dependencies
 
 - **ADR-020 (Tool-Interface Discovery):** Scope tools are registered in contexts that use the same discovery infrastructure.

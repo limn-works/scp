@@ -297,7 +297,8 @@ scope_lookup(params: ScopeLookupParams) → ScopeLookupResult
   }
   output: ScopeLookupResult    // { results: [ScopeEntry] } — context entries only
 
-  Queries the ScopeRegistry (not HandleRegistry). Returns only context targets.
+  Validates the scope name via `validate_scope_name()`. Queries the ScopeRegistry
+  (not HandleRegistry). Returns only context targets.
 ```
 
 **`scope_deregister` — remove a scope registration:**
@@ -311,8 +312,9 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
   output: ScopeDeregisterResult  // { removed: bool }
 
   Removes from ScopeRegistry with scope name validation.
-  Governance admins (admin role in the hosting context) MAY deregister any scope entry
-  regardless of owner DID. This is logged as a governance action in the event log.
+  Admin-level scope entry removal is a governance action processed through the context's
+  governance engine (§5.9), not through the `scope_deregister` tool. The governance engine
+  can remove any entry regardless of owner DID, logged as a governance action in the event log.
 ```
 
 **Resolution flow — two-hop address resolution.** See §22.3.3 for the complete resolution flow. Steps 4-5 use `scope_lookup` on bootstrap context(s) to resolve the scope name to a context ID (the "phone book for namespaces" hop). Step 6 uses `handle_lookup` within the resolved context (the "phone book for participants" hop). The SDK ships Limn's context ID in bootstrap defaults, providing the initial scope registry. Apps can add additional scope registries via configuration.
@@ -320,6 +322,10 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
 **Hosting model.** Any context can host scope tools. A context with scope tools is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its tool set. A single context can combine scope tools with handle tools, agent tools, and any other tools. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-DID mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously, with each backed by its own storage.
 
 **Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
+
+**Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, owner_did, entry_id, timestamp }` and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
+
+**Relay URL validation.** `ScopeTarget.relay_urls` MUST use `wss://` scheme (or `ws://` in development). Implementations MUST validate relay URLs at registration time (scheme allowlist, no control characters, per §18.5.1).
 
 **Capacity limits.** `ScopeRegistry` implementations SHOULD enforce a configurable `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit are rejected with a capacity error. The limit is configurable per hosting context via governance parameters.
 
@@ -636,7 +642,7 @@ SCP.Address.setContextPetname(name: "recipes", contextID: recipesCtx)
 SCP.Address.registerScope(
   name: "cooking-community",
   scopeRegistry: bootstrapContextID,
-  target: .context(contextID: cookingCtx, relayURLs: [...]),
+  target: ScopeTarget(contextID: cookingCtx, relayURLs: [...]),
   metadata: { description: "Cooking enthusiast community" }?
 ) → { status: "registered" | "conflict", entryID: string? }
 
@@ -892,6 +898,91 @@ These types are the tool call schemas for the standard discovery context tools d
 |---------|-----|--------|-----------|
 | `Identity` | `"Identity"` | `did: String` | Handle points to a DID. |
 | `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>` | Handle points to a context. |
+
+### 22.11.2a Scope Registration and Lookup
+
+Scope tools use thin wrapper structs for inputs and type aliases for outputs (see §22.3.5, ADR-043). All scope types below are the wire-level representation; implementations that use type aliases for outputs MUST serialize identically to the corresponding handle types.
+
+**`ScopeRegisterParams`** — Input for `scope_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | Scope name to register. Must match `[a-z0-9-]`, max 64 chars, no leading/trailing hyphens (§22.3.5). |
+| `target` | `ScopeTarget` | Yes | Context the scope name resolves to. |
+| `metadata` | `ScopeMetadata` | No | Optional descriptive metadata. |
+
+**`ScopeRegisterResult`** — Output from `scope_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `status` | `ScopeRegisterStatus` | Yes | Registration outcome. |
+| `entry_id` | `String` | No | Present when `status` = `Registered`. Unique entry ID. |
+
+**`ScopeRegisterStatus`** — Enum for scope registration outcomes.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Registered` | `"registered"` | Scope registered successfully. |
+| `Conflict` | `"conflict"` | Another DID already holds this scope name. |
+
+**`ScopeMetadata`** — Optional descriptive metadata for scopes.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `description` | `String` | No | Human-readable description. |
+| `tags` | `Vec<String>` | No | Categorization tags. |
+
+**`ScopeLookupParams`** — Input for `scope_lookup` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | Scope name to look up. |
+
+**`ScopeLookupResult`** — Output from `scope_lookup` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `results` | `Vec<ScopeEntry>` | Yes | Matching scope entries. All entries have context targets per ScopeTarget constraints. |
+
+**`ScopeEntry`** — A resolved scope record.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | The scope name. |
+| `target` | `ScopeTarget` | Yes | Context the scope points to. |
+| `owner_did` | `String` (DID) | Yes | DID of the scope entry owner. |
+| `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `metadata` | `ScopeMetadata` | Yes | Descriptive metadata. May have all fields absent. |
+| `entry_id` | `String` | Yes | Unique entry identifier. |
+
+**`ScopeDeregisterParams`** — Input for `scope_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `name` | `String` | Yes | Scope name to deregister. |
+| `did` | `String` (DID) | Yes | Must match the scope entry owner. |
+
+**`ScopeDeregisterResult`** — Output from `scope_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `removed` | `bool` | Yes | `true` if the scope entry was found and removed. |
+
+**`ScopeTarget`** — What a scope name resolves to. Context-only (identity targets are rejected at registration time).
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `context_id` | `String` | Yes | Hex-encoded context ID. |
+| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. |
+
+**`ScopeRegistrationEvent`** — Tagged enum for scope registration lifecycle events (event log entries).
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `ScopeRegistered` | `"ScopeRegistered"` | `name: String`, `context_id: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | New scope registration. |
+| `ScopeDeregistered` | `"ScopeDeregistered"` | `name: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | Removed scope registration. |
+
+Admin removal via governance produces standard governance events (§5.9), not `ScopeRegistrationEvent` variants.
 
 ### 22.11.3 Address Resolution
 
