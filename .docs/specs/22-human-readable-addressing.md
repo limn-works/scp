@@ -230,25 +230,23 @@ This template is a starting point. Discovery contexts can customize governance, 
 
 ### 22.3.5 Scope Tools (Namespace Registration)
 
-Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools use **thin wrapper structs for inputs and type aliases for outputs**, with separate storage. See ADR-043 for the design decision and security analysis.
+Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools use **independent structs for all types**, with separate storage. See ADR-043 for the design decision and security analysis.
 
-**Types.** Scope tool input params are thin wrapper structs (to use `name` instead of `handle`). Output types and entries are type aliases to handle types (their fields don't need renaming):
+**Types.** All scope types are independent structs. Scope types are conceptually distinct from handle types — scopes are namespace registrations ("the phone book for namespaces"), while handles are participant registrations ("the phone book for participants"). Every scope type has its own struct definition:
 
 ```
-// Thin wrapper structs for inputs — use `name` instead of `handle`
-ScopeRegisterParams   { name: String, target: HandleTarget, metadata: Option<ScopeMetadata> }
+// All scope types are independent structs
+ScopeRegisterParams   { name: String, target: ScopeTarget, metadata: Option<ScopeMetadata> }
 ScopeLookupParams     { name: String }
 ScopeDeregisterParams { name: String, did: DID }
-
-// Type aliases for outputs and entries — fields match as-is
-ScopeRegisterResult   = HandleRegisterResult
-ScopeLookupResult     = HandleLookupResult
-ScopeDeregisterResult = HandleDeregisterResult
-ScopeEntry            = HandleEntry
-ScopeMetadata         = HandleMetadata
+ScopeRegisterResult   { status: ScopeRegisterStatus, entry_id: Option<String> }
+ScopeLookupResult     { results: Vec<ScopeEntry> }
+ScopeDeregisterResult { removed: bool }
+ScopeEntry            { name: String, target: ScopeTarget, owner_did: DID, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
+ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
 ```
 
-Callers always use the `Scope*` names. Scope operations are conceptually distinct from handle operations — scopes are namespace registrations ("the phone book for namespaces"), while handles are participant registrations ("the phone book for participants"). The separate input structs reflect this distinction at the type level.
+Callers always use the `Scope*` names. The independent struct definitions reflect the conceptual separation at the type level — no scope type shares a definition with any handle type.
 
 **Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope tools and handle tools has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-DID/context mappings. This eliminates cross-type namespace collision by construction.
 
@@ -256,7 +254,7 @@ Callers always use the `Scope*` names. Scope operations are conceptually distinc
 
 | Scope Tool | Handle Analogue | Additional Constraints |
 |------------|----------------|----------------------|
-| `scope_register` | `handle_register` | Rejects `HandleTarget::Identity`; validates scope name via `validate_scope_name()` |
+| `scope_register` | `handle_register` | `ScopeTarget` is context-only by construction; validates scope name via `validate_scope_name()` |
 | `scope_lookup` | `handle_lookup` | Returns only context targets (enforced by `ScopeRegistry` construction) |
 | `scope_deregister` | `handle_deregister` | Validates scope name via `validate_scope_name()` |
 
@@ -279,13 +277,14 @@ Callers always use the `Scope*` names. Scope operations are conceptually distinc
 scope_register(params: ScopeRegisterParams) → ScopeRegisterResult
   input:  ScopeRegisterParams {
     name:     string,          // scope name to register (validated by validate_scope_name)
-    target:   HandleTarget,    // MUST be Context { context_id, relay_urls }
-    metadata: ScopeMetadata?   // optional descriptive metadata (= HandleMetadata)
+    target:   ScopeTarget,     // context-only by construction { context_id, relay_urls }
+    metadata: ScopeMetadata?   // optional descriptive metadata
   }
-  output: ScopeRegisterResult  // { status: "registered"|"conflict", entry_id? }
+  output: ScopeRegisterResult  // { status: "registered"|"conflict"|"updated", entry_id? }
 
-  ScopeRegistry::register() validates the scope name and rejects HandleTarget::Identity.
-  Scope names map to contexts only.
+  ScopeRegistry::register() validates the scope name. ScopeTarget is context-only by
+  construction — no identity variant exists. Same-owner re-registration atomically updates
+  the existing entry and returns status "updated" with the existing entry_id.
 ```
 
 **`scope_lookup` — look up a scope name:**
@@ -323,9 +322,9 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
 
 **Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
 
-**Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, owner_did, entry_id, timestamp }` and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
+**Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, owner_did, entry_id, timestamp }`, `ScopeUpdated { name, context_id, owner_did, entry_id, timestamp }`, and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
 
-**Relay URL validation.** `ScopeTarget.relay_urls` MUST use `wss://` scheme (or `ws://` in development). Implementations MUST validate relay URLs at registration time (scheme allowlist, no control characters, per §18.5.1).
+**Relay URL validation.** `ScopeTarget.relay_urls` MUST use `wss://` scheme (or `ws://` in development). Implementations MUST validate relay URLs at registration time: `wss://` scheme required (`ws://` permitted in development mode only), no control characters, maximum URL length 2048.
 
 **Capacity limits.** `ScopeRegistry` implementations SHOULD enforce a configurable `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit are rejected with a capacity error. The limit is configurable per hosting context via governance parameters.
 
@@ -644,7 +643,7 @@ SCP.Address.registerScope(
   scopeRegistry: bootstrapContextID,
   target: ScopeTarget(contextID: cookingCtx, relayURLs: [...]),
   metadata: { description: "Cooking enthusiast community" }?
-) → { status: "registered" | "conflict", entryID: string? }
+) → { status: "registered" | "conflict" | "updated", entryID: string? }
 
 SCP.Address.lookupScope(
   name: "cooking-community",
@@ -901,7 +900,7 @@ These types are the tool call schemas for the standard discovery context tools d
 
 ### 22.11.2a Scope Registration and Lookup
 
-Scope tools use thin wrapper structs for inputs and type aliases for outputs (see §22.3.5, ADR-043). All scope types below are the wire-level representation; implementations that use type aliases for outputs MUST serialize identically to the corresponding handle types.
+Scope tools use independent structs for all types (see §22.3.5, ADR-043). All scope types below are the wire-level representation.
 
 **`ScopeRegisterParams`** — Input for `scope_register` tool.
 
@@ -916,7 +915,7 @@ Scope tools use thin wrapper structs for inputs and type aliases for outputs (se
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `status` | `ScopeRegisterStatus` | Yes | Registration outcome. |
-| `entry_id` | `String` | No | Present when `status` = `Registered`. Unique entry ID. |
+| `entry_id` | `String` | No | Present when `status` = `Registered` or `Updated`. Unique entry ID. |
 
 **`ScopeRegisterStatus`** — Enum for scope registration outcomes.
 
@@ -924,6 +923,7 @@ Scope tools use thin wrapper structs for inputs and type aliases for outputs (se
 |---------|-----------|-----------|
 | `Registered` | `"registered"` | Scope registered successfully. |
 | `Conflict` | `"conflict"` | Another DID already holds this scope name. |
+| `Updated` | `"updated"` | Same-owner re-registration atomically updated the existing entry (target/metadata changed). |
 
 **`ScopeMetadata`** — Optional descriptive metadata for scopes.
 
@@ -980,6 +980,7 @@ Scope tools use thin wrapper structs for inputs and type aliases for outputs (se
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
 | `ScopeRegistered` | `"ScopeRegistered"` | `name: String`, `context_id: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | New scope registration. |
+| `ScopeUpdated` | `"ScopeUpdated"` | `name: String`, `context_id: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | Same-owner re-registration updated existing entry. |
 | `ScopeDeregistered` | `"ScopeDeregistered"` | `name: String`, `owner_did: String`, `entry_id: String`, `timestamp: u64` | Removed scope registration. |
 
 Admin removal via governance produces standard governance events (§5.9), not `ScopeRegistrationEvent` variants.
