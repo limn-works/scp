@@ -1585,30 +1585,53 @@ The existing handle tools already support `HandleTarget::Context`, which maps a 
 
 ### Decision
 
-Scope registration is a **convention on handle tools**, not a parallel type system. Three scope tools — `scope_register`, `scope_lookup`, `scope_deregister` — are aliases that delegate to the corresponding handle tools with two constraints enforced at the tool boundary:
+Scope registration uses **type aliases over handle types with separate storage**. Three scope tools — `scope_register`, `scope_lookup`, `scope_deregister` — delegate to the corresponding handle tools with two constraints enforced at the registry level:
 
 1. **Context-only targets.** `scope_register` rejects `HandleTarget::Identity`. Scope names map to contexts, not to individual DIDs. Identity resolution within a context uses handle tools directly.
 
 2. **No dots in scope names.** `validate_scope_name()` enforces the charset `[a-z0-9-]` (matching §22.3.2 normalization output), max 64 characters, no leading or trailing hyphens. Dots are forbidden because the presence of a dot in the scope portion of an address is the syntactic discriminator that routes resolution to the domain path (§22.8.1). Underscores are excluded to match the normalization output of §22.3.2, which strips non-alphanumeric characters except hyphens.
 
-Scope tools share all handle types: `HandleRegisterParams`, `HandleRegisterResult`, `HandleEntry`, `HandleTarget`, `HandleMetadata`, `HandleDeregisterParams`, `HandleDeregisterResult`, `HandleLookupParams`, `HandleLookupResult`, `HandleTypeFilter`. No new types are introduced. The scope tools reuse the same `HandleRegistry` instances — no separate `ScopeRegistry` is needed.
+**Type aliases, not shared types.** Scope tools define type aliases for all callsite types:
 
-Separate tool names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope tools are "the phone book for namespaces" (mapping scope names to context IDs), while handle tools are "the phone book for participants" (mapping names to DIDs or contexts within a single namespace). The separate names also provide a future divergence point — if scope registration eventually needs constraints that handle registration does not, the tool boundary is already in place.
+```
+ScopeRegisterParams   = HandleRegisterParams
+ScopeRegisterResult   = HandleRegisterResult
+ScopeLookupParams     = HandleLookupParams
+ScopeLookupResult     = HandleLookupResult
+ScopeDeregisterParams = HandleDeregisterParams
+ScopeDeregisterResult = HandleDeregisterResult
+ScopeEntry            = HandleEntry
+```
+
+Callers always use the `Scope*` names. Today these are aliases to handle types. They can diverge into distinct types later without changing callsites. This is the future divergence point.
+
+**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. This eliminates cross-type namespace collision by construction — a handle registration cannot block or shadow a scope registration.
+
+**Constraint enforcement at the registry level.** `ScopeRegistry::register()` enforces:
+- `validate_scope_name()` (no dots, `[a-z0-9-]`, max 64 chars)
+- Context-only targets (rejects `HandleTarget::Identity`)
+
+These constraints are built into the registry, not just the tool wrapper.
+
+Separate tool names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope tools are "the phone book for namespaces" (mapping scope names to context IDs), while handle tools are "the phone book for participants" (mapping names to DIDs or contexts within a single namespace).
 
 See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resolution flow, hosting model, and authorization model.
 
 ### Alternatives Considered
 
-1. **Separate `ScopeRegistry` type system.** A parallel set of types — `ScopeEntry`, `ScopeTarget`, `ScopeRegisterParams`, `ScopeRegisterResult`, `ScopeLookupParams`, `ScopeLookupResult`, `ScopeDeregisterParams`, `ScopeDeregisterResult`, `ScopeMetadata`, `ScopeRegistry` — mirroring the handle types with the two constraints baked in. This would require ~10 new types in scp-core, ~12 new FFI bridge functions (3 per bridge x 4 bridges), and ~4 SDK wrapper implementations. All of this duplication enforces exactly two constraints (no dots, context-only). Rejected because the cost-to-constraint ratio is unacceptable — a convention on existing handle tools achieves the same result with zero new types.
+1. **Full parallel type system with independent struct definitions.** A fully independent set of types — `ScopeEntry`, `ScopeTarget`, `ScopeRegisterParams`, `ScopeRegisterResult`, `ScopeLookupParams`, `ScopeLookupResult`, `ScopeDeregisterParams`, `ScopeDeregisterResult`, `ScopeMetadata`, `ScopeRegistry` — with independent struct definitions that duplicate every field from handle types. This would require maintaining two parallel type hierarchies across scp-core, all FFI bridges, and all SDK wrappers. Rejected because the types are structurally identical today — the only differences are constraints (charset, target type), not shape. Type aliases provide the same callsite isolation with zero duplication. If the types need to diverge structurally in the future, the aliases can be replaced with independent structs without changing any callsite.
 
-2. **SDK-local-only scope mapping.** No protocol-level scope registration. Each SDK maintains a local map of scope names to context IDs, populated by bootstrap defaults and manual configuration. Rejected because this provides no protocol-level conflict detection (two contexts claiming the same scope name), no multi-registry resolution (checking multiple registries for the same scope), and no mechanism for contexts to advertise their scope names to the network.
+2. **Shared `HandleRegistry` storage (no separate `ScopeRegistry`).** Scope tools operate on the same `HandleRegistry` instances as handle tools. Rejected because shared storage creates cross-type namespace collision — a handle registration for "cooking-community" would block a scope registration for the same name. Separate storage eliminates this by construction. The storage separation also makes it clear at the data level that scope entries and handle entries are independent namespaces, even though their types are aliases.
+
+3. **SDK-local-only scope mapping.** No protocol-level scope registration. Each SDK maintains a local map of scope names to context IDs, populated by bootstrap defaults and manual configuration. Rejected because this provides no protocol-level conflict detection (two contexts claiming the same scope name), no multi-registry resolution (checking multiple registries for the same scope), and no mechanism for contexts to advertise their scope names to the network.
 
 ### Rationale
 
-- **Handles already support `HandleTarget::Context`.** The existing handle system can already map a name to a context ID with relay URLs. Scope registration is a subset of handle registration (context targets only, restricted charset). Adding a parallel system duplicates infrastructure for two constraints.
-- **Separate tool names provide semantic clarity without type duplication.** Users and agents think of scope lookup ("find me the cooking community") differently from handle lookup ("find me Alice in the cooking community"). Separate tool names reflect this mental model. But the underlying data model is identical — a name that maps to a context ID.
-- **Future divergence point.** If scope registration eventually needs features that handle registration does not (e.g., scope-specific metadata fields, different governance models, or multi-registry federation), the tool boundary is already in place. The convention can evolve into a distinct system without breaking the API surface.
-- **DNS analogy.** DNS domain registration is a convention on top of the DNS record system — a domain name is a record that maps to an IP address, with constraints (registrar governance, TLD rules, conflict resolution). Scope registration is the same: a convention on handle records with constraints (context-only targets, no-dot names, registry governance).
+- **Handles already support `HandleTarget::Context`.** The existing handle system can already map a name to a context ID with relay URLs. Scope registration is a subset of handle registration (context targets only, restricted charset). Type aliases reuse handle type definitions without duplication.
+- **Separate storage eliminates cross-type collision.** Scope entries and handle entries occupy independent namespaces. A handle "cooking-community" and a scope "cooking-community" coexist without conflict. This is enforced by construction (separate `HashMap` instances), not by convention.
+- **Type aliases provide callsite isolation with zero duplication.** Callers use `ScopeRegisterParams`, `ScopeEntry`, etc. — never raw handle types. If scope types need to diverge structurally in the future, the aliases can be replaced with independent structs without changing any callsite. This is the future divergence point.
+- **Separate tool names provide semantic clarity.** Users and agents think of scope lookup ("find me the cooking community") differently from handle lookup ("find me Alice in the cooking community"). Separate tool names reflect this mental model.
+- **DNS analogy.** DNS domain registration is a convention on top of the DNS record system — a domain name is a record that maps to an IP address, with constraints (registrar governance, TLD rules, conflict resolution). Scope registration is the same: a convention on handle records with constraints (context-only targets, no-dot names, registry governance), with separate storage (like separate zone files).
 
 ### Implementation
 
@@ -1622,7 +1645,7 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 | File | Purpose |
 |------|---------|
-| `crates/scp-core/src/discovery/scope.rs` | New — `validate_scope_name()`, scope tool delegation logic, tool constants |
+| `crates/scp-core/src/discovery/scope.rs` | New — type aliases (`ScopeEntry`, `ScopeRegisterParams`, etc.), `ScopeRegistry` struct with own `HashMap<String, ScopeEntry>`, `validate_scope_name()`, scope tool delegation logic, tool constants |
 | `crates/scp-ffi/src/` | PyO3 bridge — `scope_register`, `scope_lookup`, `scope_deregister` |
 | `crates/scp-ffi/napi/` | NAPI bridge — scope tool wrappers |
 | `crates/scp-ffi/uniffi/` | UniFFI bridge — scope tool wrappers |
@@ -1636,12 +1659,14 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 #### Inherited Handle-Tool Threats
 
-Scope tools inherit all handle-tool security properties and threats because they delegate to handle tools. The following handle-tool threats apply unchanged to scope tools — see §22.3.1 for the DID-signed request scheme that mitigates them:
+Scope tools inherit handle-tool security properties and threats because they delegate to handle tools (via type aliases). The following handle-tool threats apply to scope tools — see §22.3.1 for the DID-signed request scheme that mitigates them:
 
 - **Open redirect via malicious registration** — a writer registers a scope name pointing to a malicious context. Mitigated by governance-controlled writer access, independent target-context access control, resolution provenance, and multi-registry cross-verification.
 - **No target-context verification** — the registrant has no verifiable relationship to the target context. This is a deliberate design choice (DNS analogy). Registries can opt into verification via governance policy.
 - **`relay_urls` as unvalidated redirect vector** — arbitrary URL strings in `HandleTarget::Context`. Mitigated by `validate_relay_url` (scheme allowlist, length limits) and MLS transport encryption. Note that scope entries have a **namespace-wide blast radius** compared to individual handle entries — a malicious relay URL in a scope entry affects every address resolved through that scope, not just a single identity lookup.
 - **DID from request body vs. authenticated session** — `HandleDeregisterParams.did` is an assertion, not authentication. The DID-signed request envelope (§22.3.1) provides the actual authentication; writers verify the signature matches the entry's `owner_did`.
+
+**Cross-type namespace collision: eliminated.** Because `ScopeRegistry` uses separate storage from `HandleRegistry`, a handle registration cannot block, shadow, or interfere with a scope registration (and vice versa). Shared-namespace attacks — where an attacker registers a handle name to prevent a legitimate scope registration, or uses constraint bypass on handles to inject invalid scope entries — are eliminated by construction. Each registry enforces its own constraints independently.
 
 #### Typosquatting Across Resolution Boundaries
 
@@ -1671,7 +1696,7 @@ Scope tools inherit all handle-tool security properties and threats because they
 - **ADR-020 (Tool-Interface Discovery):** Scope tools are registered in contexts that use the same discovery infrastructure.
 - **ADR-010 (Tool Registration/Invocation):** Scope tools follow the standard tool registration and invocation protocol.
 - **ADR-008 (Context Lifecycle):** The hosting context's governance controls scope registration authorization.
-- **ADR-034 (WASM Bridge Constraints):** The WASM bridge re-implements scope constraint logic locally per ADR-034 (AC #7).
+- **ADR-034 (WASM Bridge Constraints):** The WASM bridge re-implements scope constraint logic locally per ADR-034 (AC #8).
 - **§22 (Human-Readable Addressing):** Scope tools extend the handle tool convention defined in §22.3.1.
 
 ### Acceptance Criteria
@@ -1680,14 +1705,16 @@ Scope tools inherit all handle-tool security properties and threats because they
 
 2. **`validate_scope_name(name: &str) -> Result<(), AddressingError>`:** Validates that the name matches `[a-z0-9-]`, is 1-64 characters, and has no leading or trailing hyphens. Rejects names containing periods (dots) or underscores.
 
-3. **`scope_register` rejects `HandleTarget::Identity`.** Returns an error if the target is not `HandleTarget::Context`. Validates the scope name via `validate_scope_name`. Delegates to `HandleRegistry::register()`.
+3. **`scope_register` rejects `HandleTarget::Identity`.** Returns an error if the target is not `HandleTarget::Context`. Validates the scope name via `validate_scope_name`. Operates on `ScopeRegistry` (not `HandleRegistry`).
 
-4. **`scope_lookup` applies `type_filter: Context`.** Delegates to `HandleRegistry::lookup()` with `type_filter: Some(HandleTypeFilter::Context)`.
+4. **`scope_lookup` returns context entries only.** Queries `ScopeRegistry::lookup()`. All entries in a `ScopeRegistry` are context targets by construction.
 
-5. **`scope_deregister` delegates directly.** Calls `HandleRegistry::deregister()` with no additional constraints beyond scope name validation.
+5. **`scope_deregister` removes from `ScopeRegistry`.** Calls `ScopeRegistry::deregister()` with scope name validation and owner verification.
 
-6. **No new types.** Scope tools reuse `HandleRegisterParams`, `HandleRegisterResult`, `HandleEntry`, `HandleTarget`, `HandleMetadata`, `HandleDeregisterParams`, `HandleDeregisterResult`, `HandleLookupParams`, `HandleLookupResult`, `HandleTypeFilter`.
+6. **Type aliases, not direct handle type usage.** Scope tools define type aliases: `ScopeRegisterParams = HandleRegisterParams`, `ScopeRegisterResult = HandleRegisterResult`, `ScopeLookupParams = HandleLookupParams`, `ScopeLookupResult = HandleLookupResult`, `ScopeDeregisterParams = HandleDeregisterParams`, `ScopeDeregisterResult = HandleDeregisterResult`, `ScopeEntry = HandleEntry`. All callsites use the `Scope*` names.
 
-7. **FFI bridges.** All four bridges (PyO3, NAPI, UniFFI, WASM) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. The WASM bridge re-implements the constraint logic locally per ADR-034.
+7. **Separate `ScopeRegistry` storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. Constraint enforcement (`validate_scope_name()`, context-only targets) is built into `ScopeRegistry::register()`.
 
-8. **Resolution integration.** Each FFI bridge's `address_resolve` function builds `known_contexts` from scope entries (entries with `HandleTarget::Context` targets) in addition to existing handle registry keys.
+8. **FFI bridges.** All four bridges (PyO3, NAPI, UniFFI, WASM) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. Each bridge has a `scope_registries()` global singleton separate from `handle_registries()`. The WASM bridge re-implements the constraint logic locally per ADR-034.
+
+9. **Resolution integration.** Each FFI bridge's `address_resolve` function builds `known_contexts` from scope entries (entries with `HandleTarget::Context` targets) in the scope registries, in addition to existing handle registry keys.

@@ -28,7 +28,7 @@ All SCP human-readable addresses use a single canonical text format:
 
 **`local-part`:** The name portion. Case-insensitive, Unicode-normalized (NFC). Restricted to lowercase ASCII letters, digits, hyphens, underscores, and periods: `[a-z0-9._-]`. Maximum 64 characters. Leading and trailing hyphens/periods are not allowed. Consecutive periods are not allowed.
 
-**`scope`:** The resolution context — determines how the local-part is resolved. Either a DNS domain or a discovery context name.
+**`scope`:** The resolution context — determines how the local-part is resolved. Either a DNS domain or a scope name. Scope names (non-domain scopes) are constrained to `[a-z0-9-]`, max 64 characters, no leading or trailing hyphens (§22.3.5). The absence of a dot (`.`) in the scope is the syntactic discriminator that routes to scope-based resolution rather than domain-based resolution.
 
 **Scope disambiguation.** Scope type is determined by syntactic inspection:
 
@@ -219,14 +219,30 @@ This template is a starting point. Discovery contexts can customize governance, 
 
 ### 22.3.5 Scope Tools (Namespace Registration)
 
-Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools are **aliases for handle tools** with two constraints enforced at the tool boundary. They reuse all handle types (`HandleRegisterParams`, `HandleEntry`, `HandleTarget`, etc.) and operate on the same `HandleRegistry` instances. No new types are introduced. See ADR-043 for the design decision and security analysis.
+Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools use **type aliases over handle types with separate storage**. See ADR-043 for the design decision and security analysis.
 
-**Scope tools as handle aliases:**
+**Type aliases.** Scope tools define type aliases for all callsite types:
 
-| Scope Tool | Delegates To | Additional Constraints |
-|------------|-------------|----------------------|
+```
+ScopeRegisterParams   = HandleRegisterParams
+ScopeRegisterResult   = HandleRegisterResult
+ScopeLookupParams     = HandleLookupParams
+ScopeLookupResult     = HandleLookupResult
+ScopeDeregisterParams = HandleDeregisterParams
+ScopeDeregisterResult = HandleDeregisterResult
+ScopeEntry            = HandleEntry
+```
+
+Callers always use the `Scope*` names. Today these are aliases to handle types. They can diverge into distinct types later without changing callsites.
+
+**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope tools and handle tools has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-DID mappings. This eliminates cross-type namespace collision by construction.
+
+**Scope tools (operate on `ScopeRegistry`):**
+
+| Scope Tool | Handle Analogue | Additional Constraints |
+|------------|----------------|----------------------|
 | `scope_register` | `handle_register` | Rejects `HandleTarget::Identity`; validates scope name via `validate_scope_name()` |
-| `scope_lookup` | `handle_lookup` | Applies `type_filter: Context` (returns only context targets) |
+| `scope_lookup` | `handle_lookup` | Returns only context targets (enforced by `ScopeRegistry` construction) |
 | `scope_deregister` | `handle_deregister` | Validates scope name via `validate_scope_name()` |
 
 **`validate_scope_name()` rules.** Scope names are more constrained than general handle local-parts (§22.2):
@@ -243,44 +259,41 @@ Scope tools provide protocol-level registration of scope names — the mapping f
 **`scope_register` — register a scope name:**
 
 ```
-scope_register(name, target, metadata?) → confirmation
-  input:  {
+scope_register(params: ScopeRegisterParams) → ScopeRegisterResult
+  input:  ScopeRegisterParams {
     name:     string,          // scope name to register (validated by validate_scope_name)
     target:   HandleTarget,    // MUST be Context { context_id, relay_urls }
     metadata: HandleMetadata?  // optional descriptive metadata
   }
-  output: HandleRegisterResult  // { status: "registered"|"conflict", entry_id? }
+  output: ScopeRegisterResult  // { status: "registered"|"conflict", entry_id? }
 
-  Rejects HandleTarget::Identity with an error. Scope names map to contexts only.
-  The `name` parameter maps to the `handle` field in the underlying HandleRegisterParams
-  during delegation.
+  ScopeRegistry::register() validates the scope name and rejects HandleTarget::Identity.
+  Scope names map to contexts only.
 ```
 
 **`scope_lookup` — look up a scope name:**
 
 ```
-scope_lookup(name) → results
-  input:  {
+scope_lookup(params: ScopeLookupParams) → ScopeLookupResult
+  input:  ScopeLookupParams {
     name: string               // scope name to look up
   }
-  output: HandleLookupResult   // { results: [HandleEntry] } — context entries only
+  output: ScopeLookupResult    // { results: [ScopeEntry] } — context entries only
 
-  Equivalent to handle_lookup(handle=name, type_filter: "context").
-  The `name` parameter maps to the `handle` field in HandleLookupParams during delegation.
+  Queries the ScopeRegistry (not HandleRegistry). Returns only context targets.
 ```
 
 **`scope_deregister` — remove a scope registration:**
 
 ```
-scope_deregister(name, did) → removal
-  input:  {
+scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
+  input:  ScopeDeregisterParams {
     name: string,              // scope name to deregister
     did:  DID                  // must match entry owner (verified via transport auth)
   }
-  output: HandleDeregisterResult  // { removed: bool }
+  output: ScopeDeregisterResult  // { removed: bool }
 
-  Equivalent to handle_deregister with scope name validation.
-  The `name` parameter maps to the `handle` field in HandleDeregisterParams during delegation.
+  Removes from ScopeRegistry with scope name validation.
 ```
 
 **Resolution flow — two-hop address resolution:**
@@ -298,7 +311,7 @@ scope_deregister(name, did) → removal
 
 Step 4 is the scope resolution hop — the "phone book for namespaces." Step 6 is the handle resolution hop — the "phone book for participants." The SDK ships Limn's context ID in bootstrap defaults, providing the initial scope registry. Apps can add additional scope registries via configuration.
 
-**Hosting model.** Any context can host scope tools. A context with scope tools is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its tool set. A single context can combine scope tools with handle tools, agent tools, and any other tools. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously.
+**Hosting model.** Any context can host scope tools. A context with scope tools is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its tool set. A single context can combine scope tools with handle tools, agent tools, and any other tools. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-DID mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously, with each backed by its own storage.
 
 **Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
 
@@ -567,7 +580,7 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
 
 ### 22.8.3 Collision and Disambiguation
 
-**Scoped addresses: no collision possible.** Each scope is its own namespace with its own authority. `alice@example.com` has exactly one answer (domain operator controls it). `alice@cooking-community` has exactly one answer (discovery context enforces uniqueness via `handle_register`).
+**Scoped addresses: no collision within a single registry.** Each scope is its own namespace with its own authority. Within a single scope registry, `cooking-community` has exactly one entry (the `ScopeRegistry` enforces uniqueness). Within a single handle registry, `alice` has exactly one entry. However, across registries, collisions are possible — two different scope registries may map `cooking-community` to different context IDs. These cross-registry collisions are resolved by provenance: each resolution result carries `ResolutionPath` metadata identifying which registry made the claim, and the resolver returns all results for consumer disambiguation.
 
 **Cross-scope: not a collision.** `alice@example.com` and `alice@cooking-community` may be different people. These are different addresses — like `alice@gmail.com` and `alice@yahoo.com` in email. No disambiguation needed.
 
