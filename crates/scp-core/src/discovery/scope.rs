@@ -302,8 +302,8 @@ pub fn validate_scope_name(name: &str) -> Result<(), AddressingError> {
 
 /// Validates a context ID for scope registration.
 ///
-/// Context IDs must be non-empty, at most 256 characters, and free of control
-/// characters (bytes < 0x20).
+/// Context IDs must be non-empty, at most 256 characters, and contain only
+/// ASCII alphanumeric characters, hyphens, or underscores.
 ///
 /// # Errors
 ///
@@ -319,9 +319,13 @@ fn validate_scope_context_id(context_id: &str) -> Result<(), ScopeRegistryError>
             "context_id exceeds 256 characters".into(),
         ));
     }
-    if context_id.bytes().any(|b| b < 0x20) {
+    if !context_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(ScopeRegistryError::Validation(
-            "context_id contains control characters".into(),
+            "context_id contains invalid characters: expected alphanumeric, hyphens, or underscores"
+                .into(),
         ));
     }
     Ok(())
@@ -998,8 +1002,47 @@ mod tests {
     }
 
     #[test]
-    fn register_scope_rejects_context_id_with_control_chars() {
+    fn register_scope_rejects_context_id_with_invalid_chars() {
         let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+        // Spaces are not allowed
+        let result = registry.register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx with spaces".to_owned(),
+                    relay_urls: vec!["wss://r.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("context_id contains invalid characters"),
+            "{err}"
+        );
+
+        // Slashes are not allowed
+        let result = registry.register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx/path".to_owned(),
+                    relay_urls: vec!["wss://r.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("context_id contains invalid characters"),
+            "{err}"
+        );
+
+        // Control characters are not allowed
         let result = registry.register(
             &ScopeRegisterParams {
                 name: "cooking".to_owned(),
@@ -1014,7 +1057,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("context_id contains control characters"),
+            err.contains("context_id contains invalid characters"),
             "{err}"
         );
     }
