@@ -1585,25 +1585,29 @@ The existing handle tools already support `HandleTarget::Context`, which maps a 
 
 ### Decision
 
-Scope registration uses **type aliases over handle types with separate storage**. Three scope tools — `scope_register`, `scope_lookup`, `scope_deregister` — delegate to the corresponding handle tools with two constraints enforced at the registry level:
+Scope registration uses **thin wrapper structs for inputs and type aliases for outputs**, with separate storage. Three scope tools — `scope_register`, `scope_lookup`, `scope_deregister` — mirror the corresponding handle tool logic with two constraints enforced at the registry level:
 
 1. **Context-only targets.** `scope_register` rejects `HandleTarget::Identity`. Scope names map to contexts, not to individual DIDs. Identity resolution within a context uses handle tools directly.
 
 2. **No dots in scope names.** `validate_scope_name()` enforces the charset `[a-z0-9-]` (matching §22.3.2 normalization output), max 64 characters, no leading or trailing hyphens. Dots are forbidden because the presence of a dot in the scope portion of an address is the syntactic discriminator that routes resolution to the domain path (§22.8.1). Underscores are excluded to match the normalization output of §22.3.2, which strips non-alphanumeric characters except hyphens.
 
-**Type aliases, not shared types.** Scope tools define type aliases for all callsite types:
+**Thin wrapper structs for inputs, type aliases for outputs.** Scope tool input params use thin wrapper structs (to use `name` instead of `handle`). Output types and entries are type aliases (their fields don't need renaming):
 
 ```
-ScopeRegisterParams   = HandleRegisterParams
+// Thin wrapper structs for inputs — use `name` instead of `handle`
+ScopeRegisterParams   { name: String, target: HandleTarget, metadata: Option<ScopeMetadata> }
+ScopeLookupParams     { name: String }
+ScopeDeregisterParams { name: String, did: DID }
+
+// Type aliases for outputs and entries — fields match as-is
 ScopeRegisterResult   = HandleRegisterResult
-ScopeLookupParams     = HandleLookupParams
 ScopeLookupResult     = HandleLookupResult
-ScopeDeregisterParams = HandleDeregisterParams
 ScopeDeregisterResult = HandleDeregisterResult
 ScopeEntry            = HandleEntry
+ScopeMetadata         = HandleMetadata
 ```
 
-Callers always use the `Scope*` names. Today these are aliases to handle types. They can diverge into distinct types later without changing callsites. This is the future divergence point.
+Callers always use the `Scope*` names because scope operations are conceptually distinct from handle operations — scopes are namespace registrations, handles are participant registrations. The separate input structs reflect this distinction at the type level.
 
 **Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. This eliminates cross-type namespace collision by construction — a handle registration cannot block or shadow a scope registration.
 
@@ -1619,7 +1623,7 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 ### Alternatives Considered
 
-1. **Full parallel type system with independent struct definitions.** A fully independent set of types — `ScopeEntry`, `ScopeTarget`, `ScopeRegisterParams`, `ScopeRegisterResult`, `ScopeLookupParams`, `ScopeLookupResult`, `ScopeDeregisterParams`, `ScopeDeregisterResult`, `ScopeMetadata`, `ScopeRegistry` — with independent struct definitions that duplicate every field from handle types. This would require maintaining two parallel type hierarchies across scp-core, all FFI bridges, and all SDK wrappers. Rejected because the types are structurally identical today — the only differences are constraints (charset, target type), not shape. Type aliases provide the same callsite isolation with zero duplication. If the types need to diverge structurally in the future, the aliases can be replaced with independent structs without changing any callsite.
+1. **Full parallel type system with independent struct definitions.** A fully independent set of types — `ScopeEntry`, `ScopeTarget`, `ScopeRegisterParams`, `ScopeRegisterResult`, `ScopeLookupParams`, `ScopeLookupResult`, `ScopeDeregisterParams`, `ScopeDeregisterResult`, `ScopeMetadata`, `ScopeRegistry` — with independent struct definitions that duplicate every field from handle types. This would require maintaining two parallel type hierarchies across scp-core, all FFI bridges, and all SDK wrappers. Rejected because the output types are structurally identical — the only differences are constraints (charset, target type), not shape. Thin wrapper structs for inputs (where field names differ) and type aliases for outputs provide the same callsite isolation with minimal duplication.
 
 2. **Shared `HandleRegistry` storage (no separate `ScopeRegistry`).** Scope tools operate on the same `HandleRegistry` instances as handle tools. Rejected because shared storage creates cross-type namespace collision — a handle registration for "cooking-community" would block a scope registration for the same name. Separate storage eliminates this by construction. The storage separation also makes it clear at the data level that scope entries and handle entries are independent namespaces, even though their types are aliases.
 
@@ -1627,9 +1631,9 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 ### Rationale
 
-- **Handles already support `HandleTarget::Context`.** The existing handle system can already map a name to a context ID with relay URLs. Scope registration is a subset of handle registration (context targets only, restricted charset). Type aliases reuse handle type definitions without duplication.
+- **Handles already support `HandleTarget::Context`.** The existing handle system can already map a name to a context ID with relay URLs. Scope registration is a subset of handle registration (context targets only, restricted charset). Thin wrapper structs for inputs and type aliases for outputs reuse handle type definitions with minimal duplication.
 - **Separate storage eliminates cross-type collision.** Scope entries and handle entries occupy independent namespaces. A handle "cooking-community" and a scope "cooking-community" coexist without conflict. This is enforced by construction (separate `HashMap` instances), not by convention.
-- **Type aliases provide callsite isolation with zero duplication.** Callers use `ScopeRegisterParams`, `ScopeEntry`, etc. — never raw handle types. If scope types need to diverge structurally in the future, the aliases can be replaced with independent structs without changing any callsite. This is the future divergence point.
+- **Thin wrapper structs and type aliases provide callsite isolation with minimal duplication.** Callers use `ScopeRegisterParams`, `ScopeEntry`, etc. — never raw handle types. Input structs use `name` instead of `handle`, reflecting the semantic distinction between scope and handle operations.
 - **Separate tool names provide semantic clarity.** Users and agents think of scope lookup ("find me the cooking community") differently from handle lookup ("find me Alice in the cooking community"). Separate tool names reflect this mental model.
 - **DNS analogy.** DNS domain registration is a convention on top of the DNS record system — a domain name is a record that maps to an IP address, with constraints (registrar governance, TLD rules, conflict resolution). Scope registration is the same: a convention on handle records with constraints (context-only targets, no-dot names, registry governance), with separate storage (like separate zone files).
 
@@ -1645,7 +1649,7 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 | File | Purpose |
 |------|---------|
-| `crates/scp-core/src/discovery/scope.rs` | New — type aliases (`ScopeEntry`, `ScopeRegisterParams`, etc.), `ScopeRegistry` struct with own `HashMap<String, ScopeEntry>`, `validate_scope_name()`, scope tool delegation logic, tool constants |
+| `crates/scp-core/src/discovery/scope.rs` | New — thin wrapper structs (`ScopeRegisterParams`, `ScopeLookupParams`, `ScopeDeregisterParams`), type aliases (`ScopeEntry`, `ScopeRegisterResult`, etc.), `ScopeRegistry` struct with own `HashMap<String, ScopeEntry>`, `validate_scope_name()`, scope tool logic, tool constants |
 | `crates/scp-ffi/src/` | PyO3 bridge — `scope_register`, `scope_lookup`, `scope_deregister` |
 | `crates/scp-ffi/napi/` | NAPI bridge — scope tool wrappers |
 | `crates/scp-ffi/uniffi/` | UniFFI bridge — scope tool wrappers |
@@ -1659,14 +1663,9 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 #### Inherited Handle-Tool Threats
 
-Scope tools inherit handle-tool security properties and threats because they delegate to handle tools (via type aliases). The following handle-tool threats apply to scope tools — see §22.3.1 for the DID-signed request scheme that mitigates them:
+Scope tools inherit all handle-tool security properties (see §22.3.1 for the DID-signed request scheme and full threat analysis) because they mirror handle tool logic. The scope-specific difference: a malicious relay URL in a scope entry has **namespace-wide blast radius** — it affects every address resolved through that scope, not just a single identity lookup.
 
-- **Open redirect via malicious registration** — a writer registers a scope name pointing to a malicious context. Mitigated by governance-controlled writer access, independent target-context access control, resolution provenance, and multi-registry cross-verification.
-- **No target-context verification** — the registrant has no verifiable relationship to the target context. This is a deliberate design choice (DNS analogy). Registries can opt into verification via governance policy.
-- **`relay_urls` as unvalidated redirect vector** — arbitrary URL strings in `HandleTarget::Context`. Mitigated by `validate_relay_url` (scheme allowlist, length limits) and MLS transport encryption. Note that scope entries have a **namespace-wide blast radius** compared to individual handle entries — a malicious relay URL in a scope entry affects every address resolved through that scope, not just a single identity lookup.
-- **DID from request body vs. authenticated session** — `HandleDeregisterParams.did` is an assertion, not authentication. The DID-signed request envelope (§22.3.1) provides the actual authentication; writers verify the signature matches the entry's `owner_did`.
-
-**Cross-type namespace collision: eliminated.** Because `ScopeRegistry` uses separate storage from `HandleRegistry`, a handle registration cannot block, shadow, or interfere with a scope registration (and vice versa). Shared-namespace attacks — where an attacker registers a handle name to prevent a legitimate scope registration, or uses constraint bypass on handles to inject invalid scope entries — are eliminated by construction. Each registry enforces its own constraints independently.
+**Cross-type namespace collision: eliminated.** Because `ScopeRegistry` uses separate storage from `HandleRegistry`, a handle registration cannot block, shadow, or interfere with a scope registration (and vice versa). Each registry enforces its own constraints independently.
 
 #### Typosquatting Across Resolution Boundaries
 
@@ -1701,7 +1700,7 @@ Scope tools inherit handle-tool security properties and threats because they del
 
 ### Acceptance Criteria
 
-1. **Scope tool aliases.** Three tool constants: `TOOL_SCOPE_REGISTER`, `TOOL_SCOPE_LOOKUP`, `TOOL_SCOPE_DEREGISTER`. Each delegates to the corresponding handle tool with the constraints below.
+1. **Scope tool constants.** Three tool constants: `TOOL_SCOPE_REGISTER`, `TOOL_SCOPE_LOOKUP`, `TOOL_SCOPE_DEREGISTER`. Each mirrors the corresponding handle tool logic with the constraints below.
 
 2. **`validate_scope_name(name: &str) -> Result<(), AddressingError>`:** Validates that the name matches `[a-z0-9-]`, is 1-64 characters, and has no leading or trailing hyphens. Rejects names containing periods (dots) or underscores.
 
@@ -1711,9 +1710,9 @@ Scope tools inherit handle-tool security properties and threats because they del
 
 5. **`scope_deregister` removes from `ScopeRegistry`.** Calls `ScopeRegistry::deregister()` with scope name validation and owner verification.
 
-6. **Type aliases, not direct handle type usage.** Scope tools define type aliases: `ScopeRegisterParams = HandleRegisterParams`, `ScopeRegisterResult = HandleRegisterResult`, `ScopeLookupParams = HandleLookupParams`, `ScopeLookupResult = HandleLookupResult`, `ScopeDeregisterParams = HandleDeregisterParams`, `ScopeDeregisterResult = HandleDeregisterResult`, `ScopeEntry = HandleEntry`. All callsites use the `Scope*` names.
+6. **Thin wrapper structs for inputs, type aliases for outputs.** Scope tool input params are thin wrapper structs: `ScopeRegisterParams { name, target, metadata }`, `ScopeLookupParams { name }`, `ScopeDeregisterParams { name, did }`. Output types and entries are type aliases: `ScopeRegisterResult = HandleRegisterResult`, `ScopeLookupResult = HandleLookupResult`, `ScopeDeregisterResult = HandleDeregisterResult`, `ScopeEntry = HandleEntry`, `ScopeMetadata = HandleMetadata`. All callsites use the `Scope*` names.
 
-7. **Separate `ScopeRegistry` storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. Constraint enforcement (`validate_scope_name()`, context-only targets) is built into `ScopeRegistry::register()`.
+7. **Separate `ScopeRegistry` storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. Constraint enforcement (`validate_scope_name()`, context-only targets) is built into `ScopeRegistry::register()`. Since `ScopeRegistry` only accepts `HandleTarget::Context` targets, the identity ownership check from `HandleRegistry` does not apply — there is no DID-to-handle binding to verify at registration time. Deregistration still verifies that the requester's DID matches the entry's `owner_did`.
 
 8. **FFI bridges.** All four bridges (PyO3, NAPI, UniFFI, WASM) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. Each bridge has a `scope_registries()` global singleton separate from `handle_registries()`. The WASM bridge re-implements the constraint logic locally per ADR-034.
 
