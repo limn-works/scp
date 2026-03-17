@@ -17,6 +17,7 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 
 use scp_ffi_common::server::{self, RunningRelay, ServerError};
+use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 
 use crate::{decrement_handle_count, increment_handle_count};
@@ -26,6 +27,10 @@ use crate::{decrement_handle_count, increment_handle_count};
 // ---------------------------------------------------------------------------
 
 fn server_err(e: ServerError) -> NapiError {
+    NapiError::from_reason(e.to_string())
+}
+
+fn node_err(e: NodeError) -> NapiError {
     NapiError::from_reason(e.to_string())
 }
 
@@ -134,6 +139,58 @@ impl NodeInner {
             Self::Filesystem(n) => n.shutdown(),
         }
     }
+
+    async fn enable_broadcast_projection_with_site(
+        &self,
+        context_id: &str,
+        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+        admission: scp_core::context::broadcast::BroadcastAdmission,
+        site_config: Option<scp_node::projection::SiteConfig>,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::InMemory(n) => {
+                n.enable_broadcast_projection_with_site(
+                    context_id,
+                    broadcast_key,
+                    admission,
+                    None,
+                    site_config,
+                )
+                .await
+            }
+            Self::Filesystem(n) => {
+                n.enable_broadcast_projection_with_site(
+                    context_id,
+                    broadcast_key,
+                    admission,
+                    None,
+                    site_config,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn commit_deploy(&self, context_id: &str, deploy_id: &str) -> Result<usize, NodeError> {
+        match self {
+            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
+            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
+        }
+    }
+
+    async fn rollback_deploy(&self, context_id: &str, deploy_id: &str) -> Result<(), NodeError> {
+        match self {
+            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
+            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
+        }
+    }
+
+    async fn disable_broadcast_projection(&self, context_id: &str) {
+        match self {
+            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
+            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
+        }
+    }
 }
 
 /// Opaque handle to a running SCP application node.
@@ -182,6 +239,115 @@ impl NapiNodeHandle {
     #[napi]
     pub fn shutdown(&self) {
         self.inner.shutdown();
+    }
+
+    /// Activates HTTP broadcast projection with site configuration.
+    ///
+    /// `broadcastKeyHex` is the 32-byte AES-256 broadcast key as a 64-char
+    /// hex string. `authorDid` is the DID of the key owner. `admission` is
+    /// `"open"` or `"gated"`. `hostname` is the virtual host (RFC 1123).
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enable_site_projection(
+        &self,
+        context_id: String,
+        broadcast_key_hex: String,
+        author_did: String,
+        admission: String,
+        hostname: String,
+        index_path: Option<String>,
+        max_assets_per_deploy: Option<u32>,
+        max_deploy_size_bytes: Option<i64>,
+        deploy_retention_count: Option<u32>,
+        csp_override: Option<String>,
+    ) -> napi::Result<()> {
+        let key_bytes: [u8; 32] = hex::decode(&broadcast_key_hex)
+            .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?
+            .try_into()
+            .map_err(|_| {
+                NapiError::from_reason(
+                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                )
+            })?;
+
+        let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(key_bytes),
+            0,
+            author_did,
+        );
+
+        let adm = match admission.as_str() {
+            "open" => scp_core::context::broadcast::BroadcastAdmission::Open,
+            "gated" => scp_core::context::broadcast::BroadcastAdmission::Gated,
+            other => {
+                return Err(NapiError::from_reason(format!(
+                    "admission must be \"open\" or \"gated\", got \"{other}\""
+                )));
+            }
+        };
+
+        let idx_path_str = index_path.as_deref().unwrap_or("/index.html");
+        let content_path = scp_core::context::broadcast_content::ContentPath::new(idx_path_str)
+            .map_err(|e| NapiError::from_reason(format!("invalid index_path: {e}")))?;
+
+        let deploy_size = match max_deploy_size_bytes {
+            Some(v) if v < 0 => {
+                return Err(NapiError::from_reason(
+                    "max_deploy_size_bytes must be non-negative",
+                ));
+            }
+            Some(v) => v.unsigned_abs(),
+            None => 512 * 1024 * 1024,
+        };
+
+        let site_config = scp_node::projection::SiteConfig {
+            hostname,
+            index_path: content_path,
+            max_assets_per_deploy: max_assets_per_deploy.map_or(10_000, |v| v as usize),
+            max_deploy_size_bytes: deploy_size,
+            deploy_retention_count: deploy_retention_count.map_or(2, |v| v as usize),
+            csp_override,
+        };
+
+        self.inner
+            .enable_broadcast_projection_with_site(
+                &context_id,
+                broadcast_key,
+                adm,
+                Some(site_config),
+            )
+            .await
+            .map_err(node_err)
+    }
+
+    /// Commits a deploy for a projected context (section 18.11.11).
+    ///
+    /// Returns the number of assets in the committed deploy.
+    #[napi]
+    pub async fn commit_deploy(&self, context_id: String, deploy_id: String) -> napi::Result<u32> {
+        let count = self
+            .inner
+            .commit_deploy(&context_id, &deploy_id)
+            .await
+            .map_err(node_err)?;
+        u32::try_from(count)
+            .map_err(|_| NapiError::from_reason(format!("asset count {count} exceeds u32::MAX")))
+    }
+
+    /// Rolls back to a previous deploy for a projected context (section 18.11.11).
+    #[napi]
+    pub async fn rollback_deploy(&self, context_id: String, deploy_id: String) -> napi::Result<()> {
+        self.inner
+            .rollback_deploy(&context_id, &deploy_id)
+            .await
+            .map_err(node_err)
+    }
+
+    /// Deactivates HTTP broadcast projection for the given context.
+    #[napi]
+    pub async fn disable_site_projection(&self, context_id: String) -> napi::Result<()> {
+        self.inner.disable_broadcast_projection(&context_id).await;
+        Ok(())
     }
 }
 
@@ -384,5 +550,59 @@ mod tests {
         node.shutdown();
         // Second shutdown should not panic.
         node.shutdown();
+    }
+
+    #[test]
+    fn enable_site_projection_dispatches_through_node_inner() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = NodeInner::InMemory(node);
+        let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
+            0,
+            "did:dht:napi-test".to_owned(),
+        );
+        let site_config =
+            scp_node::projection::SiteConfig::with_hostname("napi.example.com").unwrap();
+        let result = rt().block_on(inner.enable_broadcast_projection_with_site(
+            "napi-ctx",
+            key,
+            scp_core::context::broadcast::BroadcastAdmission::Open,
+            Some(site_config),
+        ));
+        assert!(result.is_ok(), "enable should succeed: {result:?}");
+        inner.shutdown();
+    }
+
+    #[test]
+    fn commit_deploy_returns_error_for_unprojected_context() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = NodeInner::InMemory(node);
+        let result = rt().block_on(inner.commit_deploy("no-such-ctx", "deploy-1"));
+        assert!(
+            result.is_err(),
+            "commit_deploy should fail for unprojected context"
+        );
+        inner.shutdown();
+    }
+
+    #[test]
+    fn rollback_deploy_returns_error_for_unprojected_context() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = NodeInner::InMemory(node);
+        let result = rt().block_on(inner.rollback_deploy("no-such-ctx", "deploy-1"));
+        assert!(
+            result.is_err(),
+            "rollback_deploy should fail for unprojected context"
+        );
+        inner.shutdown();
+    }
+
+    #[test]
+    fn disable_site_projection_is_noop_for_unprojected_context() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = NodeInner::InMemory(node);
+        rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
+        // Should not panic.
+        inner.shutdown();
     }
 }
