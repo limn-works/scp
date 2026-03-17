@@ -180,6 +180,45 @@ pub fn init_context_manager(local_did: &str) {
     });
 }
 
+/// Initializes the global [`ContextManager`] with [`LocalTransportProvider`].
+///
+/// Identical to [`init_context_manager`] except the transport provider is
+/// `LocalTransportProvider` (silently succeeds on all send/publish calls)
+/// instead of `NotConfiguredTransportProvider` (rejects everything).
+///
+/// **Must be called before any `context_create` / `context_join` /
+/// `context_import`** — those functions call `init_context_manager` which
+/// will win the `OnceLock` race if called first.
+///
+/// Exposed to JS/TS via [`crate::transport::configure_local_transport`] so
+/// that E2E tests can exercise `contextSend` and `broadcastPublish` without
+/// a real relay server.
+///
+/// Subsequent calls are no-ops (`OnceLock`).
+pub fn init_context_manager_with_local_transport(local_did: &str) {
+    if CONTEXT_MANAGER.get().is_some() {
+        tracing::warn!(
+            requested_did = %local_did,
+            "init_context_manager already initialized — ignoring local-transport init"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_core::context::LocalTransportProvider);
+        let event_log = build_event_log_provider();
+        let persistence = Box::new(NapiBridgePersistence::new());
+        Arc::new(ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            not_configured_key_resolver(),
+        ))
+    });
+}
+
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///

@@ -53,6 +53,7 @@ interface ServerAddon {
   nodeStartInMemory(): Promise<NativeNodeHandle>;
   nodeStartLocal(dataDir: string): Promise<NativeNodeHandle>;
   transportConnect(relayUrl: string): Promise<unknown>;
+  configureLocalTransport(localDid: string): void;
 }
 
 /**
@@ -276,4 +277,30 @@ export class Node implements AsyncDisposable {
 export async function connectLocalTransport(relayUrl: string): Promise<void> {
   const addon = loadServerAddon();
   await addon.transportConnect(relayUrl);
+}
+
+// ---------------------------------------------------------------------------
+// Local transport configuration (test helper)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pre-configures the SDK's `ContextManager` with `LocalTransportProvider`.
+ *
+ * With this provider, `contextSend` and `broadcastPublish` succeed locally
+ * without a running relay server. The encrypted-and-signed pipeline still
+ * executes in full (MLS group encryption, sender key signing, inner envelope
+ * construction); only the final relay publish step is stubbed.
+ *
+ * **Must be called before any `identityCreate` followed by `contextCreate`.**
+ * The `ContextManager` is initialized once per process (`OnceLock`), so the
+ * first initialization call wins. If `configureLocalTransport` is called
+ * after a `contextCreate`, the call is a no-op and the transport provider
+ * remains `NotConfiguredTransportProvider`.
+ *
+ * @param localDid - A valid `did:dht:` DID string used as the MLS credential
+ * identity. Typically the DID of the first identity created in the test.
+ */
+export function configureLocalTransport(localDid: string): void {
+  const addon = loadServerAddon();
+  addon.configureLocalTransport(localDid);
 }

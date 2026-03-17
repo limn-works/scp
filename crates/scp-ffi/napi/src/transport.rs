@@ -309,6 +309,32 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
     Ok(())
 }
 
+/// Pre-configures the [`ContextManager`] with [`LocalTransportProvider`].
+///
+/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
+/// Once the `ContextManager` is initialized (by whichever call arrives first),
+/// the transport provider is locked in for the lifetime of the process.
+///
+/// With `LocalTransportProvider`, `contextSend` and `broadcastPublish`
+/// succeed locally without requiring a running relay. This is the correct
+/// setup for single-process E2E tests that exercise the full
+/// encrypt → sign → send pipeline.
+///
+/// The `local_did` parameter is used as the MLS credential identity for the
+/// `MlsCryptoProvider`. Pass any valid `did:dht:` string (typically the
+/// DID of the first identity you plan to create).
+///
+/// # Errors
+///
+/// Returns an error only if `local_did` fails DID format validation.
+#[napi(js_name = "configureLocalTransport")]
+pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
+    scp_ffi_common::validate::validate_did(&local_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    crate::runtime::init_context_manager_with_local_transport(&local_did);
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

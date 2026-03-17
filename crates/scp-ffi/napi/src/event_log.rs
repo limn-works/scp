@@ -97,20 +97,66 @@ pub async fn event_log_query(
         None => None,
     };
 
-    let context_id = handle.context_id();
-    let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id, |rt| {
-        let count = scp_event_log::tree::event_count(&rt.event_log);
-        let root = scp_event_log::tree::root(&rt.event_log);
-        Ok((count, hex::encode(root)))
-    })
-    .map_err(napi::Error::from)?;
-
     #[allow(clippy::cast_possible_truncation)] // Event limit is always small; truncation is safe.
     let limit = filter
         .as_ref()
         .and_then(|f| f.get("limit"))
         .and_then(serde_json::Value::as_u64)
         .map(|l| l as usize);
+
+    let event_type_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("event_type").or_else(|| f.get("eventType")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+
+    // Query the ContextManager's event log provider for real Merkle entries.
+    // The UCAN state event log is a separate per-context instance; the
+    // ContextManager's MerkleEventLogProvider is the authoritative source.
+    let context_id_str = handle.context_id();
+    let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
+
+    let manager_entries = crate::runtime::context_manager()
+        .ok()
+        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten());
+
+    if let Some(entries) = manager_entries
+        && !entries.is_empty()
+    {
+        // Build NapiEvent list from the ContextManager's Merkle entries.
+        // EventLogEntry has: event (name), timestamp, prev_hash, hash.
+        // Map event → event_type, no actor_did (unknown), index → sequence.
+        #[allow(clippy::cast_precision_loss)]
+        let events: Vec<NapiEvent> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_idx, entry)| event_type_filter.as_ref().is_none_or(|f| entry.event == *f))
+            .map(|(idx, entry)| NapiEvent {
+                event_type: entry.event.clone(),
+                actor_did: context_id_str.clone(),
+                timestamp: entry.timestamp as f64,
+                payload_json: serde_json::json!({
+                    "hash": hex::encode(entry.hash),
+                })
+                .to_string(),
+                sequence: idx as f64,
+            })
+            .collect();
+
+        return if let Some(lim) = limit {
+            Ok(events.into_iter().take(lim).collect())
+        } else {
+            Ok(events)
+        };
+    }
+
+    // Fallback: read from the per-context UCAN state event log.
+    let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id_str, |rt| {
+        let count = scp_event_log::tree::event_count(&rt.event_log);
+        let root = scp_event_log::tree::root(&rt.event_log);
+        Ok((count, hex::encode(root)))
+    })
+    .map_err(napi::Error::from)?;
 
     if event_count == 0 {
         return Ok(Vec::new());
@@ -198,6 +244,44 @@ pub async fn event_log_verify(
         .map_err(napi::Error::from)?;
 
     let context_id = handle.context_id();
+
+    // Sync ContextManager's Merkle event log entries into the UCAN-state
+    // EventLog so that prove_inclusion / prove_absence operate on the same
+    // tree that tracks lifecycle events. The UCAN-state EventLog starts
+    // empty; this populates it from the authoritative MerkleEventLogProvider.
+    let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id);
+    if let Some(entries) = crate::runtime::context_manager()
+        .ok()
+        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
+    {
+        crate::runtime::with_context(&context_id, |rt| {
+            let existing_leaves = rt.event_log.leaves();
+            let existing_count = existing_leaves.len();
+
+            // Prefix consistency check: if existing leaves diverge from the
+            // source (e.g. after reimport), clear and re-sync the entire tree.
+            let prefix_matches = existing_leaves
+                .iter()
+                .zip(entries.iter())
+                .all(|(leaf, entry)| *leaf == entry.hash);
+
+            if !prefix_matches && existing_count > 0 {
+                // Leaves diverge — rebuild from scratch.
+                let ctx_id = rt.event_log.context_id().to_owned();
+                rt.event_log = scp_event_log::EventLog::new(ctx_id);
+                for entry in &entries {
+                    rt.event_log.push_leaf_raw(entry.hash);
+                }
+            } else {
+                // Append-only: push entries that haven't been synced yet.
+                for entry in entries.iter().skip(existing_count) {
+                    rt.event_log.push_leaf_raw(entry.hash);
+                }
+            }
+            Ok(())
+        })
+        .map_err(napi::Error::from)?;
+    }
 
     match claim_type {
         "inclusion" => {
