@@ -148,6 +148,33 @@ interface DiscoveryBindings {
         did: String,
     ): String
 
+    // Scope registry operations (§22.3.5, ADR-043)
+
+    /** Registers a scope name in a scope registry. Returns JSON result. */
+    @Suppress("LongParameterList")
+    fun scopeRegister(
+        scopeContextId: String,
+        name: String,
+        targetContextId: String,
+        relayUrls: List<String>,
+        registrantDid: String,
+        description: String?,
+        tags: List<String>?,
+    ): String
+
+    /** Looks up a scope name in a scope registry. Returns JSON result. */
+    fun scopeLookup(
+        scopeContextId: String,
+        name: String,
+    ): String
+
+    /** Deregisters a scope name from a scope registry. Returns JSON result. */
+    fun scopeDeregister(
+        scopeContextId: String,
+        name: String,
+        did: String,
+    ): String
+
     // Address resolution (§22.8)
 
     /** Resolves an address via multi-path resolution. Returns JSON array. */
@@ -397,6 +424,68 @@ class DiscoveryBridge internal constructor(
     ): String =
         bridge.ffiCall {
             bindings.handleDeregister(discoveryContextId, handle, did)
+        }
+
+    // Scope registry operations (§22.3.5, ADR-043)
+
+    /**
+     * Registers a scope name in a scope registry.
+     *
+     * @param scopeContextId ID of the context hosting the scope registry.
+     * @param name Scope name to register.
+     * @param targetContextId Context ID the scope name resolves to.
+     * @param relayUrls Relay URLs for the target context.
+     * @param registrantDid DID of the registrant.
+     * @param description Optional human-readable description.
+     * @param tags Optional list of tag strings.
+     * @return JSON string with the registration result.
+     */
+    @Suppress("LongParameterList")
+    suspend fun scopeRegister(
+        scopeContextId: String,
+        name: String,
+        targetContextId: String,
+        relayUrls: List<String>,
+        registrantDid: String,
+        description: String? = null,
+        tags: List<String>? = null,
+    ): String =
+        bridge.ffiCall {
+            bindings.scopeRegister(
+                scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags,
+            )
+        }
+
+    /**
+     * Looks up a scope name in a scope registry.
+     *
+     * @param scopeContextId ID of the context hosting the scope registry.
+     * @param name The scope name to look up.
+     * @return JSON string with a results array of matching scope entries.
+     */
+    suspend fun scopeLookup(
+        scopeContextId: String,
+        name: String,
+    ): String =
+        bridge.ffiCall {
+            bindings.scopeLookup(scopeContextId, name)
+        }
+
+    /**
+     * Deregisters a scope name from a scope registry.
+     *
+     * @param scopeContextId ID of the context hosting the scope registry.
+     * @param name The scope name to deregister.
+     * @param did DID of the registrant requesting deregistration.
+     * @return JSON string with a removed boolean.
+     */
+    suspend fun scopeDeregister(
+        scopeContextId: String,
+        name: String,
+        did: String,
+    ): String =
+        bridge.ffiCall {
+            bindings.scopeDeregister(scopeContextId, name, did)
         }
 
     // Address resolution (§22.8)

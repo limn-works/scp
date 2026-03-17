@@ -1102,9 +1102,13 @@ pub fn handle_register(
     let normalized = handle.to_lowercase();
     let now = crate::time::now_secs();
 
-    let tags: Option<Vec<String>> = tags_json
-        .as_deref()
-        .map(|s| serde_json::from_str(s).unwrap_or_default());
+    let tags: Option<Vec<String>> = match tags_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid tags_json: {e}")))?,
+        ),
+        None => None,
+    };
 
     let entry_id = {
         let mut guard = wasm_handle_registries()
@@ -1200,6 +1204,413 @@ pub fn handle_deregister(
 
     let result = serde_json::json!({"removed": removed});
     Ok(result.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Scope registry (§22.3.5, ADR-043) — WASM reimplementation per ADR-034
+// ---------------------------------------------------------------------------
+
+/// Validates a DID string at the WASM scope boundary (defense-in-depth).
+/// Non-empty, starts with "did:", no control characters.
+fn wasm_validate_scope_did(did: &str) -> Result<(), JsError> {
+    if did.is_empty() {
+        return Err(JsError::new("[SCP-VALID-7136] DID must not be empty"));
+    }
+    if did.len() > 512 {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID exceeds maximum length of 512 characters",
+        ));
+    }
+    if !did.starts_with("did:") {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID must start with \"did:\"",
+        ));
+    }
+    let rest = &did[4..];
+    if !rest.contains(':') {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID must match 'did:<method>:<id>' format",
+        ));
+    }
+    let method = rest.split(':').next().unwrap_or("");
+    if method.is_empty()
+        || !method
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID method must be non-empty lowercase alphanumeric",
+        ));
+    }
+    if did.bytes().any(|b| b < 0x20) {
+        return Err(JsError::new(
+            "[SCP-VALID-7136] DID contains control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a context ID at the WASM scope boundary (defense-in-depth).
+/// Non-empty, no control characters.
+fn wasm_validate_scope_context_id(context_id: &str) -> Result<(), JsError> {
+    if context_id.is_empty() {
+        return Err(JsError::new(
+            "[SCP-VALID-7137] context_id must not be empty",
+        ));
+    }
+    if context_id.len() > 256 {
+        return Err(JsError::new(
+            "[SCP-VALID-7137] context_id exceeds 256 characters",
+        ));
+    }
+    if !context_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(JsError::new(
+            "[SCP-VALID-7137] context_id contains invalid characters: expected alphanumeric, hyphens, or underscores",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a scope name per §22.3.5 rules (WASM-local reimplementation).
+/// Charset: [a-z0-9-], max 64 chars, no leading/trailing hyphens, non-empty.
+fn wasm_validate_scope_name(name: &str) -> Result<(), JsError> {
+    if name.is_empty() {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] scope name must not be empty",
+        ));
+    }
+    if name.len() > 64 {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] scope name exceeds maximum length of 64 characters",
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] scope name contains invalid characters: only [a-z0-9-] allowed",
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] scope name must not start or end with a hyphen",
+        ));
+    }
+    Ok(())
+}
+
+/// What a WASM scope entry resolves to. Nested under `WasmScopeEntry` to match
+/// the scp-core `ScopeTarget` wire format (context-only by construction).
+#[derive(Clone, serde::Serialize)]
+struct WasmScopeTarget {
+    context_id: String,
+    relay_urls: Vec<String>,
+}
+
+/// Typed scope metadata for WASM bridge.
+#[derive(Clone, serde::Serialize)]
+struct WasmScopeMetadata {
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+}
+
+/// In-memory scope entry for WASM bridge.
+#[derive(Clone, serde::Serialize)]
+struct WasmScopeEntry {
+    name: String,
+    target: WasmScopeTarget,
+    owner_did: String,
+    registered_at: u64,
+    metadata: WasmScopeMetadata,
+    entry_id: String,
+}
+
+/// Maximum number of entries in a single WASM scope registry (mirrors scp-core).
+const MAX_WASM_SCOPE_ENTRIES: usize = 10_000;
+
+/// In-memory scope registry for one context.
+struct WasmScopeRegistry {
+    entries: HashMap<String, WasmScopeEntry>,
+    next_id: u64,
+}
+
+impl WasmScopeRegistry {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_id: 1,
+        }
+    }
+}
+
+thread_local! {
+    /// Per-context scope registries. WASM is single-threaded, so `RefCell` is
+    /// sufficient — no `Mutex` needed. Matches the `thread_local!` pattern
+    /// used by `IDENTITY_REGISTRY`, `RATE_LIMIT_TRACKERS`, and `MANAGER`.
+    static WASM_SCOPE_REGISTRIES: std::cell::RefCell<HashMap<String, WasmScopeRegistry>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Collects scope name -> context ID mappings for WASM address resolution.
+///
+/// **Cross-context note:** Merges all scope registries globally, matching
+/// how handle registries are merged in `resolve_via_handles`. A future
+/// refinement could scope to caller-provided trusted registry context IDs.
+fn wasm_known_contexts_from_scope_registries() -> HashMap<String, String> {
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let guard = registries.borrow();
+        let mut result = HashMap::new();
+        for registry in guard.values() {
+            for entry in registry.entries.values() {
+                result
+                    .entry(entry.name.clone())
+                    .or_insert_with(|| entry.target.context_id.clone());
+            }
+        }
+        result
+    })
+}
+
+/// Parsed and validated scope-register inputs.
+struct ValidatedScopeRegisterInput {
+    relay_urls: Vec<String>,
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+}
+
+/// Validates and parses `scope_register` inputs (relay URLs, metadata).
+fn wasm_validate_scope_register_input(
+    relay_urls_json: &str,
+    description: Option<String>,
+    tags_json: Option<&str>,
+) -> Result<ValidatedScopeRegisterInput, JsError> {
+    let relay_urls: Vec<String> = serde_json::from_str(relay_urls_json)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7135] invalid relay_urls_json: {e}")))?;
+
+    if relay_urls.is_empty() {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] relay_urls must contain at least one URL",
+        ));
+    }
+    if relay_urls.len() > 10 {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] relay_urls exceeds maximum count of 10",
+        ));
+    }
+    for url in &relay_urls {
+        if !(url.starts_with("ws://")
+            || url.starts_with("wss://")
+            || url.starts_with("http://")
+            || url.starts_with("https://"))
+        {
+            return Err(JsError::new(&format!(
+                "[SCP-VALID-7135] relay URL must start with ws://, wss://, http://, or https://, got {url:?}"
+            )));
+        }
+        if url.len() > 2048 {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] relay URL exceeds 2048 characters",
+            ));
+        }
+        if url.bytes().any(|b| b == b'\r' || b == b'\n' || b < 0x20) {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] relay URL contains control characters",
+            ));
+        }
+    }
+
+    if let Some(ref desc) = description
+        && desc.len() > 1024
+    {
+        return Err(JsError::new(
+            "[SCP-VALID-7131] description exceeds maximum length of 1024 characters",
+        ));
+    }
+    let tags: Option<Vec<String>> = match tags_json {
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| JsError::new(&format!("[SCP-VALID-7131] invalid tags_json: {e}")))?,
+        ),
+        None => None,
+    };
+    if let Some(ref t) = tags {
+        if t.len() > 20 {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] tags exceed maximum count of 20",
+            ));
+        }
+        for tag in t {
+            if tag.is_empty() {
+                return Err(JsError::new("[SCP-VALID-7138] tag must not be empty"));
+            }
+            if tag.len() > 64 {
+                return Err(JsError::new(
+                    "[SCP-VALID-7131] tag exceeds maximum length of 64 characters",
+                ));
+            }
+        }
+    }
+
+    Ok(ValidatedScopeRegisterInput {
+        relay_urls,
+        description,
+        tags,
+    })
+}
+
+/// Registers a scope name in a scope registry. Returns JSON result.
+///
+/// # Errors
+///
+/// Returns `JsError` if validation fails or the lock is poisoned.
+#[wasm_bindgen]
+pub fn scope_register(
+    scope_context_id: String,
+    name: String,
+    target_context_id: String,
+    relay_urls_json: String,
+    registrant_did: String,
+    description: Option<String>,
+    tags_json: Option<String>,
+) -> Result<String, JsError> {
+    wasm_validate_scope_context_id(&scope_context_id)?;
+    wasm_validate_scope_context_id(&target_context_id)?;
+    wasm_validate_scope_did(&registrant_did)?;
+    wasm_validate_scope_name(&name)?;
+
+    let input =
+        wasm_validate_scope_register_input(&relay_urls_json, description, tags_json.as_deref())?;
+    let normalized = name.to_lowercase();
+    let now = crate::time::now_secs();
+
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let mut guard = registries.borrow_mut();
+        let registry = guard
+            .entry(scope_context_id)
+            .or_insert_with(WasmScopeRegistry::new);
+
+        // Same-owner re-registration -> atomic update
+        if let Some(existing) = registry.entries.get_mut(&normalized) {
+            if existing.owner_did == registrant_did {
+                existing.target = WasmScopeTarget {
+                    context_id: target_context_id,
+                    relay_urls: input.relay_urls,
+                };
+                existing.metadata = WasmScopeMetadata {
+                    description: input.description,
+                    tags: input.tags,
+                };
+                existing.registered_at = now;
+                let result =
+                    serde_json::json!({"status": "updated", "entry_id": existing.entry_id});
+                return Ok(result.to_string());
+            }
+            let result = serde_json::json!({"status": "conflict", "entry_id": null});
+            return Ok(result.to_string());
+        }
+
+        // Capacity check before new registration
+        if registry.entries.len() >= MAX_WASM_SCOPE_ENTRIES {
+            return Err(JsError::new(
+                "[SCP-VALID-7131] scope registry capacity exceeded (max 10,000 entries)",
+            ));
+        }
+
+        let eid = format!("scope-{}", registry.next_id);
+        registry.next_id += 1;
+
+        let entry = WasmScopeEntry {
+            name: normalized.clone(),
+            target: WasmScopeTarget {
+                context_id: target_context_id,
+                relay_urls: input.relay_urls,
+            },
+            owner_did: registrant_did,
+            registered_at: now,
+            metadata: WasmScopeMetadata {
+                description: input.description,
+                tags: input.tags,
+            },
+            entry_id: eid.clone(),
+        };
+
+        registry.entries.insert(normalized, entry);
+
+        let result = serde_json::json!({"status": "registered", "entry_id": eid});
+        Ok(result.to_string())
+    })
+}
+
+/// Looks up a scope name in a scope registry. Returns JSON result.
+///
+/// # Errors
+///
+/// Returns `JsError` if validation fails or the lock is poisoned.
+#[wasm_bindgen]
+pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, JsError> {
+    wasm_validate_scope_context_id(&scope_context_id)?;
+    wasm_validate_scope_name(&name)?;
+    let normalized = name.to_lowercase();
+
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let guard = registries.borrow();
+        let results: Vec<serde_json::Value> = guard
+            .get(&scope_context_id)
+            .and_then(|registry| registry.entries.get(&normalized))
+            .map(|entry| {
+                serde_json::to_value(entry).map_err(|e| {
+                    JsError::new(&format!(
+                        "[SCP-VALID-7133] scope entry serialization failed: {e}"
+                    ))
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+
+        let result = serde_json::json!({"results": results});
+        Ok(result.to_string())
+    })
+}
+
+/// Deregisters a scope name from a scope registry. Returns JSON result.
+///
+/// # Errors
+///
+/// Returns `JsError` if validation fails or the lock is poisoned.
+#[wasm_bindgen]
+pub fn scope_deregister(
+    scope_context_id: String,
+    name: String,
+    did: String,
+) -> Result<String, JsError> {
+    wasm_validate_scope_context_id(&scope_context_id)?;
+    wasm_validate_scope_did(&did)?;
+    wasm_validate_scope_name(&name)?;
+    let normalized = name.to_lowercase();
+
+    WASM_SCOPE_REGISTRIES.with(|registries| {
+        let mut guard = registries.borrow_mut();
+        let removed = guard.get_mut(&scope_context_id).is_some_and(|registry| {
+            if registry
+                .entries
+                .get(&normalized)
+                .is_some_and(|entry| entry.owner_did == did)
+            {
+                registry.entries.remove(&normalized);
+                true
+            } else {
+                false
+            }
+        });
+
+        let result = serde_json::json!({"removed": removed});
+        Ok(result.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,7 +1717,7 @@ fn resolve_via_handles(
         (&normalized[..at_pos], Some(&normalized[at_pos + 1..]))
     });
 
-    let known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
+    let mut known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
         serde_json::from_str(json).map_err(|e| {
             JsError::new(&format!(
                 "[SCP-VALID-7090] invalid known_contexts_json: {e}"
@@ -1320,6 +1731,12 @@ fn resolve_via_handles(
             .map(|k| (k.clone(), k.clone()))
             .collect()
     };
+
+    // Merge scope registry contexts for two-hop resolution (§22.3.5).
+    let scope_contexts = wasm_known_contexts_from_scope_registries();
+    for (name, ctx_id) in scope_contexts {
+        known_contexts.entry(name).or_insert(ctx_id);
+    }
 
     let mut results = Vec::new();
     let guard = wasm_handle_registries()

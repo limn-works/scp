@@ -128,6 +128,12 @@ export type {
   HandleLookupResult,
   HandleRegisterResult,
   ParsedAddress,
+  ScopeDeregisterResult,
+  ScopeEntry,
+  ScopeLookupResult,
+  ScopeMetadata,
+  ScopeRegisterResult,
+  ScopeTarget,
 } from "./discovery";
 export {
   addressResolve,
@@ -147,6 +153,9 @@ export {
   petnameSet,
   petnameSetContext,
   resolveAddress,
+  scopeDeregister,
+  scopeLookup,
+  scopeRegister,
 } from "./discovery";
 
 // ---------------------------------------------------------------------------

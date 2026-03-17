@@ -20,6 +20,10 @@ use scp_core::discovery::{
 use scp_core::discovery::{
     HandleDeregisterParams, HandleLookupParams, HandleRegisterParams, HandleRegistry,
 };
+use scp_core::discovery::{
+    ScopeDeregisterParams, ScopeLookupParams, ScopeRegisterParams, ScopeRegisterStatus,
+    ScopeRegistry, ScopeTarget, validate_scope_name,
+};
 use scp_identity::document::DidDocument;
 use scp_identity::{DID, DidDht, DidMethod};
 use scp_platform::testing::InMemoryKeyCustody;
@@ -534,4 +538,201 @@ async fn parse_address_errors() {
 
     // Bare @ is empty.
     assert!(parse_address("@").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Scope registry integration tests (§22.3.5, ADR-043)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scope_registry_crud() {
+    let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+    let admin_did = DID::from("did:dht:zAdmin");
+
+    // Register a scope
+    let params = ScopeRegisterParams {
+        name: "cooking-community".to_owned(),
+        target: ScopeTarget {
+            context_id: "ctx-cooking".to_owned(),
+            relay_urls: vec!["wss://relay.example.com".to_owned()],
+        },
+        metadata: None,
+    };
+    let result = registry.register(&params, &admin_did).unwrap();
+    assert_eq!(result.status, ScopeRegisterStatus::Registered);
+    assert!(result.entry_id.is_some());
+
+    // Lookup the scope
+    let lookup = registry
+        .lookup(&ScopeLookupParams {
+            name: "cooking-community".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(lookup.results.len(), 1);
+    assert_eq!(lookup.results[0].target.context_id, "ctx-cooking");
+    assert_eq!(
+        lookup.results[0].target.relay_urls,
+        vec!["wss://relay.example.com"]
+    );
+    assert_eq!(lookup.results[0].owner_did, admin_did);
+
+    // Deregister the scope
+    let deregister = registry
+        .deregister(&ScopeDeregisterParams {
+            name: "cooking-community".to_owned(),
+            did: admin_did,
+        })
+        .unwrap();
+    assert!(deregister.removed);
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn scope_registry_validate_scope_name_rejects_dots_and_underscores() {
+    assert!(validate_scope_name("cooking.community").is_err());
+    assert!(validate_scope_name("cooking_community").is_err());
+    assert!(validate_scope_name("cooking-community").is_ok());
+    assert!(validate_scope_name("abc123").is_ok());
+}
+
+#[test]
+fn scope_registry_isolation_from_handle_registry() {
+    let mut scope_registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+    let mut handle_registry = HandleRegistry::new("ctx-bootstrap".to_owned());
+    let admin_did = DID::from("did:dht:zAdmin");
+
+    // Register the same name in both registries — no collision
+    scope_registry
+        .register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx-cooking".to_owned(),
+                    relay_urls: vec!["wss://relay.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &admin_did,
+        )
+        .unwrap();
+
+    handle_registry
+        .register(
+            &HandleRegisterParams {
+                handle: "cooking".to_owned(),
+                target: HandleTarget::Identity {
+                    did: admin_did.clone(),
+                },
+                metadata: None,
+            },
+            &admin_did,
+        )
+        .unwrap();
+
+    // Both registries have one entry — independent
+    assert_eq!(scope_registry.len(), 1);
+    assert_eq!(handle_registry.len(), 1);
+
+    // Scope lookup returns scope entry, not handle entry
+    let scope_lookup = scope_registry
+        .lookup(&ScopeLookupParams {
+            name: "cooking".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(scope_lookup.results.len(), 1);
+    assert_eq!(scope_lookup.results[0].target.context_id, "ctx-cooking");
+
+    // Handle lookup returns handle entry, not scope entry
+    let handle_lookup = handle_registry.lookup(&HandleLookupParams {
+        handle: "cooking".to_owned(),
+        type_filter: None,
+    });
+    assert_eq!(handle_lookup.results.len(), 1);
+    assert!(matches!(
+        handle_lookup.results[0].target,
+        HandleTarget::Identity { .. }
+    ));
+}
+
+#[test]
+fn scope_same_owner_update_is_atomic() {
+    let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+    let admin_did = DID::from("did:dht:zAdmin");
+
+    // First registration
+    let r1 = registry
+        .register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx-v1".to_owned(),
+                    relay_urls: vec!["wss://r1.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &admin_did,
+        )
+        .unwrap();
+    assert_eq!(r1.status, ScopeRegisterStatus::Registered);
+
+    // Same-owner re-registration → Updated, not Conflict
+    let r2 = registry
+        .register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx-v2".to_owned(),
+                    relay_urls: vec!["wss://r2.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &admin_did,
+        )
+        .unwrap();
+    assert_eq!(r2.status, ScopeRegisterStatus::Updated);
+    assert_eq!(r2.entry_id, r1.entry_id);
+
+    // Only one entry, with updated target
+    assert_eq!(registry.len(), 1);
+    let lookup = registry
+        .lookup(&ScopeLookupParams {
+            name: "cooking".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(lookup.results[0].target.context_id, "ctx-v2");
+}
+
+#[test]
+fn scope_different_owner_conflict() {
+    let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+
+    registry
+        .register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx-cooking".to_owned(),
+                    relay_urls: vec!["wss://relay.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        )
+        .unwrap();
+
+    let conflict = registry
+        .register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx-evil".to_owned(),
+                    relay_urls: vec!["wss://evil.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zEve"),
+        )
+        .unwrap();
+    assert_eq!(conflict.status, ScopeRegisterStatus::Conflict);
+    assert!(conflict.entry_id.is_none());
 }

@@ -912,3 +912,94 @@ class TestMigrate:
         # raise IdentityError because the DID is no longer registered.
         with pytest.raises(_scp_core.IdentityError, match="not found in registry"):
             _scp_core.py_identity_migrate(old_handle)
+
+
+# ---------------------------------------------------------------------------
+# Scope registry (§22.3.5, ADR-043)
+# ---------------------------------------------------------------------------
+
+
+class TestScopeRegistry:
+    """Scope register/lookup/deregister round-trip through the real FFI bridge."""
+
+    def test_scope_register_lookup_deregister(self) -> None:
+        """Round-trip: register a scope, look it up, deregister it."""
+        result = _scp_core.scope_register(
+            "test-ctx",
+            "my-scope",
+            "target-ctx",
+            ["wss://relay.example.com"],
+            "did:dht:zTest",
+            None,
+            None,
+        )
+        import json
+
+        parsed = json.loads(result)
+        assert parsed["status"] == "registered"
+        assert parsed["entry_id"] is not None
+
+        lookup_result = _scp_core.scope_lookup("test-ctx", "my-scope")
+        lookup = json.loads(lookup_result)
+        assert len(lookup["results"]) == 1
+        assert lookup["results"][0]["name"] == "my-scope"
+        assert lookup["results"][0]["target"]["context_id"] == "target-ctx"
+
+        dereg_result = _scp_core.scope_deregister("test-ctx", "my-scope", "did:dht:zTest")
+        dereg = json.loads(dereg_result)
+        assert dereg["removed"] is True
+
+        # Verify it's gone
+        lookup_after = json.loads(_scp_core.scope_lookup("test-ctx", "my-scope"))
+        assert len(lookup_after["results"]) == 0
+
+    def test_scope_register_conflict(self) -> None:
+        """Different DID cannot overwrite an existing scope registration."""
+        import json
+
+        _scp_core.scope_register(
+            "conflict-ctx",
+            "taken-scope",
+            "target-ctx",
+            ["wss://relay.example.com"],
+            "did:dht:zAlice",
+            None,
+            None,
+        )
+
+        result = json.loads(
+            _scp_core.scope_register(
+                "conflict-ctx",
+                "taken-scope",
+                "other-ctx",
+                ["wss://relay.example.com"],
+                "did:dht:zEve",
+                None,
+                None,
+            )
+        )
+        assert result["status"] == "conflict"
+        assert result["entry_id"] is None
+
+    def test_scope_register_with_metadata(self) -> None:
+        """Register a scope with description and tags."""
+        import json
+
+        result = json.loads(
+            _scp_core.scope_register(
+                "meta-ctx",
+                "meta-scope",
+                "target-ctx",
+                ["wss://relay.example.com"],
+                "did:dht:zMeta",
+                "A test scope",
+                ["test", "example"],
+            )
+        )
+        assert result["status"] == "registered"
+
+        lookup = json.loads(_scp_core.scope_lookup("meta-ctx", "meta-scope"))
+        assert len(lookup["results"]) == 1
+        entry = lookup["results"][0]
+        assert entry["metadata"]["description"] == "A test scope"
+        assert entry["metadata"]["tags"] == ["test", "example"]

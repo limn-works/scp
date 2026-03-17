@@ -363,6 +363,99 @@ def address_resolve(
     return json.loads(result)
 
 
+# ---------------------------------------------------------------------------
+# Scope registry operations (spec section 22.3.5, ADR-043)
+# ---------------------------------------------------------------------------
+
+
+def scope_register(
+    scope_context_id: str,
+    name: str,
+    target_context_id: str,
+    relay_urls: list[str],
+    registrant_did: str,
+    *,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Register a scope name in a scope registry.
+
+    Scope tools use independent structs and separate storage from handle tools.
+    The target is context-only by construction (no identity variant).
+
+    Args:
+        scope_context_id: ID of the context hosting the scope registry.
+        name: Scope name to register (``[a-z0-9-]``, max 64 chars).
+        target_context_id: Context ID the scope name resolves to.
+        relay_urls: Relay URLs for the target context.
+        registrant_did: DID of the registrant.
+        description: Optional human-readable description.
+        tags: Optional list of tag strings.
+
+    Returns:
+        A dict with ``status`` (``"registered"``, ``"conflict"``, or
+        ``"updated"``) and optional ``entry_id``.
+
+    Raises:
+        ValidationError: If the scope name or relay URLs are invalid.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.scope_register(
+        scope_context_id,
+        name,
+        target_context_id,
+        relay_urls,
+        registrant_did,
+        description,
+        tags,
+    )
+    return json.loads(result)
+
+
+def scope_lookup(
+    scope_context_id: str,
+    name: str,
+) -> dict[str, Any]:
+    """Look up a scope name in a scope registry.
+
+    Args:
+        scope_context_id: ID of the context hosting the scope registry.
+        name: The scope name to look up.
+
+    Returns:
+        A dict with a ``results`` list of matching scope entries.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.scope_lookup(scope_context_id, name)
+    return json.loads(result)
+
+
+def scope_deregister(
+    scope_context_id: str,
+    name: str,
+    did: str,
+) -> dict[str, Any]:
+    """Deregister a scope name from a scope registry.
+
+    Args:
+        scope_context_id: ID of the context hosting the scope registry.
+        name: The scope name to deregister.
+        did: DID of the registrant requesting deregistration.
+
+    Returns:
+        A dict with a ``removed`` boolean.
+    """
+    bridge = _bridge()
+    import json
+
+    result = bridge.scope_deregister(scope_context_id, name, did)
+    return json.loads(result)
+
+
 __all__ = [
     "address_resolve",
     "create_query",
@@ -380,4 +473,7 @@ __all__ = [
     "petname_resolve_did",
     "petname_set",
     "petname_set_context",
+    "scope_deregister",
+    "scope_lookup",
+    "scope_register",
 ]
