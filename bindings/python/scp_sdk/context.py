@@ -114,6 +114,23 @@ class PublishResult:
     #: Hex-encoded SHA-256 of the asset body.
     etag: str
 
+    #: Deploy ID grouping this asset into an atomic deploy.
+    deploy_id: str
+
+
+@dataclass(frozen=True)
+class BatchPublishResult:
+    """Result of publishing multiple assets to a broadcast context (SCP-292).
+
+    Returned by :meth:`Context.broadcast_publish_assets`.
+    """
+
+    #: Individual publish results for each asset.
+    results: list[PublishResult]
+
+    #: Shared deploy ID for the batch.
+    deploy_id: str
+
 
 # ---------------------------------------------------------------------------
 # SiteConfig — broadcast projection site configuration (SCP-293)
@@ -907,17 +924,16 @@ class Context:
             asset_tuples,
             deploy_id,
         )
-        # Bridge returns list of dicts, each with blob_id, etag, deploy_id.
-        # All items share the same deploy_id.
+        # Bridge returns {"results": [...], "deploy_id": "..."}.
+        shared_deploy_id = batch["deploy_id"]
         results = [
             PublishResult(
                 blob_id=r["blob_id"],
                 etag=r["etag"],
                 deploy_id=r["deploy_id"],
             )
-            for r in batch
+            for r in batch["results"]
         ]
-        shared_deploy_id = results[0].deploy_id if results else ""
         return BatchPublishResult(results=results, deploy_id=shared_deploy_id)
 
     async def broadcast_block_subscriber(

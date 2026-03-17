@@ -48,7 +48,7 @@ from scp_sdk.bridge import (
 from scp_sdk.bridge import (
     register as bridge_register,
 )
-from scp_sdk.context import AssetEntry, Context, Membership, PublishResult, SiteConfig
+from scp_sdk.context import AssetEntry, BatchPublishResult, Context, Membership, PublishResult, SiteConfig
 from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
 from scp_sdk.economy import (
     RelayPriceAdjustment,

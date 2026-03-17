@@ -2801,12 +2801,38 @@ fn py_broadcast_publish_asset(
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
 }
 
+/// Converts batch publish results into a Python dict `{"results": [...], "deploy_id": "..."}`.
+fn build_batch_publish_dict(
+    results: Vec<HashMap<String, String>>,
+    deploy_id: &str,
+) -> Result<PyObject, crate::error::ScpPyError> {
+    Python::with_gil(|py| {
+        use pyo3::IntoPyObjectExt;
+        let outer = PyDict::new(py);
+        outer
+            .set_item(
+                "results",
+                results.into_py_any(py).map_err(|e| {
+                    crate::error::ScpPyError::context(format!("failed to convert results: {e}"))
+                })?,
+            )
+            .map_err(|e| {
+                crate::error::ScpPyError::context(format!("failed to build result dict: {e}"))
+            })?;
+        outer.set_item("deploy_id", deploy_id).map_err(|e| {
+            crate::error::ScpPyError::context(format!("failed to build result dict: {e}"))
+        })?;
+        Ok(outer.into_any().unbind())
+    })
+}
+
 /// Publishes multiple assets to a broadcast context as structured content (SCP-290).
 ///
 /// Each asset is an `(path, content_type, body)` tuple. All assets are published
 /// with the same `deploy_id` (generated if not provided).
 ///
-/// Returns a list of dicts, each with `blob_id` and `etag`.
+/// Returns a dict with `results` (list of dicts, each with `blob_id`, `etag`,
+/// `deploy_id`) and `deploy_id` (shared deploy ID for the batch).
 ///
 /// # Errors
 ///
@@ -2818,7 +2844,7 @@ fn py_broadcast_publish_assets(
     author_did: &str,
     assets: Vec<(String, String, Vec<u8>)>,
     deploy_id: Option<&str>,
-) -> PyResult<Vec<HashMap<String, String>>> {
+) -> PyResult<PyObject> {
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(PyRuntimeError::new_err(format!(
@@ -2915,7 +2941,9 @@ fn py_broadcast_publish_assets(
                 results.push(result);
             }
 
-            Ok(results)
+            // Return {"results": [...], "deploy_id": "..."} matching NAPI/UniFFI/WASM.
+            let outer = build_batch_publish_dict(results, &deploy_id_owned)?;
+            Ok(outer)
         })
     })
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
