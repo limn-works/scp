@@ -632,7 +632,7 @@ Key points for the paper:
 - MessagePack: deterministic serialization
 
 ### D. Glossary
-- Context, DID, UCAN, MLS, Epoch, Sender Key, Routing ID, Capability Ceiling, Governance Model, Event Log, Provenance, Attestation, Bootstrap Context, etc.
+- Context, DID, UCAN, MLS, Epoch, Sender Key, Routing ID, Capability Ceiling, Governance Model, Event Log, Provenance, Attestation, etc.
 
 ---
 

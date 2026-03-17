@@ -626,7 +626,7 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
 ///
 /// # Arguments
 ///
-/// * `discovery_context_id` -- The bootstrap context ID.
+/// * `discovery_context_id` -- The context ID.
 /// * `handle` -- The local-part to register (e.g., `"alice"`).
 /// * `target_json` -- JSON string describing the target. Either
 ///   `{"type": "identity", "did": "did:..."}` or
@@ -693,7 +693,7 @@ pub fn py_handle_register(
 ///
 /// # Arguments
 ///
-/// * `discovery_context_id` -- The bootstrap context ID.
+/// * `discovery_context_id` -- The context ID.
 /// * `handle` -- The local-part to look up.
 /// * `type_filter` -- Optional type filter: `"identity"` or `"context"`.
 ///
@@ -759,7 +759,7 @@ pub fn py_handle_lookup(
 ///
 /// # Arguments
 ///
-/// * `discovery_context_id` -- The bootstrap context ID.
+/// * `discovery_context_id` -- The context ID.
 /// * `handle` -- The local-part to deregister.
 /// * `did` -- The registrant's DID (must match the handle owner).
 ///
@@ -1022,7 +1022,7 @@ pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyR
 /// * `owner_did` -- The DID of the identity whose petname map to use.
 /// * `address` -- The address string to resolve.
 /// * `known_contexts_json` -- Optional JSON object mapping scope names to
-///   bootstrap context IDs, e.g., `{"cooking": "ctx-abc"}`. If absent,
+///   context IDs, e.g., `{"cooking": "ctx-abc"}`. If absent,
 ///   all known handle registries are used with their context IDs as scope
 ///   names.
 ///

@@ -555,7 +555,7 @@ Each `AddressResolution` also carries a `ResolutionPath` — structured metadata
 ResolutionPath {
   layer:                  "Petname" | "DiscoveryContext" | "Attestation" | "Domain",
   source:                 string,     // context name, domain, platform
-  source_id:              string?,    // bootstrap context ID (hex, for DiscoveryContext layer)
+  source_id:              string?,    // context ID (hex, for DiscoveryContext layer)
   scope_registry_id:      string?,    // context ID of the scope registry (if two-hop resolution)
   scope_registry_source:  string?,    // human-readable name of the scope registry
   resolved_at:            timestamp,
