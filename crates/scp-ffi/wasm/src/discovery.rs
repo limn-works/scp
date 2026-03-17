@@ -1528,7 +1528,14 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, Js
         .map_err(|e| JsError::new(&format!("[SCP-VALID-7130] lock poisoned: {e}")))?
         .get(&scope_context_id)
         .and_then(|registry| registry.entries.get(&normalized))
-        .map(|entry| serde_json::to_value(entry).unwrap_or_default())
+        .map(|entry| {
+            serde_json::to_value(entry).map_err(|e| {
+                JsError::new(&format!(
+                    "[SCP-VALID-7133] scope entry serialization failed: {e}"
+                ))
+            })
+        })
+        .transpose()?
         .into_iter()
         .collect();
 

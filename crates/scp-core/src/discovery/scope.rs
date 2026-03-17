@@ -128,6 +128,7 @@ pub struct ScopeLookupParams {
 
 /// Output of the `scope_lookup` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeLookupResult {
     /// The lookup results. All entries are context targets (enforced by
     /// `ScopeTarget` construction).
@@ -155,6 +156,7 @@ pub struct ScopeDeregisterParams {
 
 /// Output of the `scope_deregister` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeDeregisterResult {
     /// Whether the scope was actually removed.
     pub removed: bool,
@@ -295,6 +297,37 @@ pub fn validate_scope_name(name: &str) -> Result<(), AddressingError> {
 }
 
 // ---------------------------------------------------------------------------
+// validate_scope_context_id
+// ---------------------------------------------------------------------------
+
+/// Validates a context ID for scope registration.
+///
+/// Context IDs must be non-empty, at most 256 characters, and free of control
+/// characters (bytes < 0x20).
+///
+/// # Errors
+///
+/// Returns [`ScopeRegistryError::Validation`] if the context ID is invalid.
+fn validate_scope_context_id(context_id: &str) -> Result<(), ScopeRegistryError> {
+    if context_id.is_empty() {
+        return Err(ScopeRegistryError::Validation(
+            "context_id must not be empty".into(),
+        ));
+    }
+    if context_id.len() > 256 {
+        return Err(ScopeRegistryError::Validation(
+            "context_id exceeds 256 characters".into(),
+        ));
+    }
+    if context_id.bytes().any(|b| b < 0x20) {
+        return Err(ScopeRegistryError::Validation(
+            "context_id contains control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ScopeRegistry (in-memory reference implementation)
 // ---------------------------------------------------------------------------
 
@@ -357,6 +390,9 @@ impl ScopeRegistry {
     ) -> Result<ScopeRegisterResult, ScopeRegistryError> {
         // Validate the scope name
         validate_scope_name(&params.name)?;
+
+        // Validate context_id
+        validate_scope_context_id(&params.target.context_id)?;
 
         // Validate relay_urls non-empty
         if params.target.relay_urls.is_empty() {
@@ -640,6 +676,22 @@ mod tests {
         assert_eq!(result, deserialized);
     }
 
+    // -- deny_unknown_fields enforcement --------------------------------------
+
+    #[test]
+    fn scope_lookup_result_rejects_unknown_fields() {
+        let json = r#"{"results": [], "extra_field": true}"#;
+        let result = serde_json::from_str::<ScopeLookupResult>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scope_deregister_result_rejects_unknown_fields() {
+        let json = r#"{"removed": true, "extra_field": true}"#;
+        let result = serde_json::from_str::<ScopeDeregisterResult>(json);
+        assert!(result.is_err());
+    }
+
     // -- ScopeRegistrationEvent serialization ---------------------------------
 
     #[test]
@@ -905,6 +957,83 @@ mod tests {
             &DID::from("did:dht:zAdmin"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn register_scope_rejects_empty_context_id() {
+        let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+        let result = registry.register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: String::new(),
+                    relay_urls: vec!["wss://r.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("context_id must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn register_scope_rejects_context_id_too_long() {
+        let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+        let result = registry.register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "x".repeat(257),
+                    relay_urls: vec!["wss://r.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("context_id exceeds 256 characters"), "{err}");
+    }
+
+    #[test]
+    fn register_scope_rejects_context_id_with_control_chars() {
+        let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+        let result = registry.register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "ctx\x00evil".to_owned(),
+                    relay_urls: vec!["wss://r.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("context_id contains control characters"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn register_scope_accepts_max_length_context_id() {
+        let mut registry = ScopeRegistry::new("ctx-bootstrap".to_owned());
+        let result = registry.register(
+            &ScopeRegisterParams {
+                name: "cooking".to_owned(),
+                target: ScopeTarget {
+                    context_id: "x".repeat(256),
+                    relay_urls: vec!["wss://r.example.com".to_owned()],
+                },
+                metadata: None,
+            },
+            &DID::from("did:dht:zAdmin"),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
