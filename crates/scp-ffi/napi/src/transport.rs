@@ -170,8 +170,9 @@ impl Drop for NapiTransportManager {
 /// Connects to an SCP relay.
 ///
 /// Establishes a transport connection to the specified relay URL. The relay
-/// must use the `wss://` scheme (TLS-secured WebSocket). Plaintext `ws://`
-/// connections are rejected to prevent credential exposure.
+/// must use the `wss://` scheme (TLS-secured WebSocket) for remote hosts.
+/// Plaintext `ws://` is permitted for loopback addresses (`127.0.0.1`,
+/// `[::1]`, `localhost`) since loopback traffic cannot be intercepted.
 ///
 /// **Note:** Calling this while already connected silently replaces the
 /// stored adapter. Any previously returned [`NapiTransportManager`] handles
@@ -182,8 +183,8 @@ impl Drop for NapiTransportManager {
 ///
 /// # Arguments
 ///
-/// * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`).
-///   Must use the `wss://` scheme.
+/// * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`
+///   or `"ws://127.0.0.1:9000/scp/v1"` for local development).
 ///
 /// # Returns
 ///
@@ -191,25 +192,18 @@ impl Drop for NapiTransportManager {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VALID-7000` if `relay_url` does not start with `wss://`.
+/// - Rejects with `SCP-VALID-7000` if `relay_url` uses `ws://` with a
+///   non-loopback host.
 /// - Rejects with `SCP-TRANS-5001` if the connection fails (unreachable relay,
 ///   protocol mismatch, timeout, authentication failure) in the full runtime.
 #[napi]
 pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportManager> {
     validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    if !relay_url.starts_with("wss://") {
-        return Err(ScpNapiError::Validation {
-            message: format!(
-                "relay URL must use wss:// scheme (got {relay_url:?}) — \
-                 plaintext ws:// connections are not permitted"
-            ),
-            code: "SCP-VALID-7000".to_owned(),
-        }
-        .into());
-    }
-
-    // Attempt a real WebSocket connection via scp-transport.
+    // Transport-layer validation enforces ws:// restrictions: loopback
+    // addresses are always allowed; non-loopback requires wss:// or
+    // DHT-resolved provenance. Using Explicit source here means only
+    // wss:// and ws://localhost pass.
     let sourced = scp_transport::relay::connection::SourcedRelayUrl {
         url: relay_url.clone(),
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
@@ -321,25 +315,37 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // transport_connect rejects non-wss URLs
+    // transport_connect scheme validation
     // -----------------------------------------------------------------------
 
     #[test]
-    fn transport_connect_rejects_plaintext_ws_url() {
-        // The bridge validates scheme synchronously before any async I/O.
+    fn transport_connect_rejects_plaintext_ws_to_remote_host() {
+        // ws:// to a non-loopback host from Explicit source is rejected
+        // by the transport layer.
         let url = "ws://relay.example.com";
+        let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+            url: url.to_owned(),
+            source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+        };
         assert!(
-            !url.starts_with("wss://"),
-            "plaintext ws:// URL must be rejected by the bridge"
+            scp_transport::relay::connection::validate_relay_url(&sourced.url, &sourced.source)
+                .is_err(),
+            "plaintext ws:// to remote host must be rejected"
         );
     }
 
     #[test]
-    fn transport_connect_rejects_http_url() {
-        let url = "http://relay.example.com";
+    fn transport_connect_accepts_ws_to_localhost() {
+        // ws:// to 127.0.0.1 is permitted (loopback exemption).
+        let url = "ws://127.0.0.1:9000/scp/v1";
+        let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+            url: url.to_owned(),
+            source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+        };
         assert!(
-            !url.starts_with("wss://"),
-            "http:// URL must be rejected by the bridge"
+            scp_transport::relay::connection::validate_relay_url(&sourced.url, &sourced.source)
+                .is_ok(),
+            "ws:// to 127.0.0.1 must be permitted"
         );
     }
 

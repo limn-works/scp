@@ -536,8 +536,9 @@ async fn native_relay_adapter_send_receive_roundtrip() {
 ///
 /// Tests that the `connect_sourced` path:
 /// 1. Permits ws:// from DHT-resolved sources (self-hosted relay behind NAT)
-/// 2. Rejects ws:// from non-DHT sources at runtime (not just in unit tests)
-/// 3. Delivers messages end-to-end over a ws:// relay when provenance is valid
+/// 2. Permits ws:// to loopback from any source (loopback exemption, §10.12.6)
+/// 3. Rejects ws:// to non-loopback hosts from non-DHT sources
+/// 4. Delivers messages end-to-end over a ws:// relay when provenance is valid
 ///
 /// This ensures `validate_relay_url` is wired into the actual connection path,
 /// not just exercised in isolation by unit tests.
@@ -581,43 +582,45 @@ async fn ws_relay_connect_sourced_validation_scp234() {
     assert_eq!(got.routing_id, outer.routing_id);
     assert_eq!(got.encrypted_blob, outer.encrypted_blob);
 
-    // --- 2. ws:// from WellKnown is rejected at runtime ---
-    let wellknown_sourced = SourcedRelayUrl {
-        url: relay_url.clone(),
-        source: RelayUrlSource::WellKnown,
-    };
-    let result = NativeRelayAdapter::connect_sourced(&wellknown_sourced).await;
-    assert!(
-        result.is_err(),
-        "ws:// from WellKnown must be rejected at runtime"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("ws://") && err.contains("WellKnown"),
-        "error must describe the rejection reason, got: {err}"
-    );
+    // --- 2. ws:// to loopback is permitted from ANY source (loopback exemption) ---
+    // The relay binds to 127.0.0.1, so all these sources should succeed.
+    for (source, label) in [
+        (RelayUrlSource::WellKnown, "WellKnown"),
+        (RelayUrlSource::Explicit, "Explicit"),
+        (RelayUrlSource::PeerDiscovered, "PeerDiscovered"),
+    ] {
+        let sourced = SourcedRelayUrl {
+            url: relay_url.clone(),
+            source,
+        };
+        NativeRelayAdapter::connect_sourced(&sourced)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("ws:// to loopback from {label} should be permitted (loopback exemption), got: {e}")
+            });
+    }
 
-    // --- 3. ws:// from Explicit is rejected at runtime ---
-    let explicit_sourced = SourcedRelayUrl {
-        url: relay_url.clone(),
-        source: RelayUrlSource::Explicit,
-    };
-    let result = NativeRelayAdapter::connect_sourced(&explicit_sourced).await;
-    assert!(
-        result.is_err(),
-        "ws:// from Explicit must be rejected at runtime"
-    );
-
-    // --- 4. ws:// from PeerDiscovered is rejected at runtime ---
-    let peer_sourced = SourcedRelayUrl {
-        url: relay_url,
-        source: RelayUrlSource::PeerDiscovered,
-    };
-    let result = NativeRelayAdapter::connect_sourced(&peer_sourced).await;
-    assert!(
-        result.is_err(),
-        "ws:// from PeerDiscovered must be rejected at runtime"
-    );
+    // --- 3. ws:// to non-loopback from non-DHT sources is still rejected ---
+    // We can't connect to a fake host, but `validate_relay_url` is the gate
+    // wired into `connect_sourced`, so exercising it directly proves the rule.
+    let non_loopback = "ws://203.0.113.1:9999/scp/v1";
+    for (source, label) in [
+        (RelayUrlSource::WellKnown, "WellKnown"),
+        (RelayUrlSource::Explicit, "Explicit"),
+        (RelayUrlSource::PeerDiscovered, "PeerDiscovered"),
+    ] {
+        let result = scp_transport::relay::connection::validate_relay_url(non_loopback, &source);
+        assert!(
+            result.is_err(),
+            "ws:// to non-loopback from {label} must be rejected"
+        );
+    }
+    // DHT-resolved to non-loopback is still allowed.
+    scp_transport::relay::connection::validate_relay_url(
+        non_loopback,
+        &RelayUrlSource::DhtResolved,
+    )
+    .expect("ws:// to non-loopback from DhtResolved should be permitted");
 }
 
 // ---------------------------------------------------------------------------

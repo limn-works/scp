@@ -57,7 +57,7 @@ impl NapiRelayHandle {
 
     /// Returns the port the relay is listening on.
     #[napi(getter)]
-    pub fn port(&self) -> u16 {
+    pub fn relay_port(&self) -> u16 {
         self.inner.bound_addr().port()
     }
 
@@ -167,17 +167,6 @@ impl NapiNodeHandle {
     #[napi(getter)]
     pub fn did(&self) -> String {
         self.inner.did().to_owned()
-    }
-
-    /// Returns the HTTP URL if the HTTP server is running.
-    ///
-    /// Currently always returns `None` because `start_node_in_memory` and
-    /// `start_node_local` do not start the HTTP server. Call
-    /// `ApplicationNode::serve` to start it (not yet exposed via FFI).
-    #[napi(getter)]
-    pub fn http_url(&self) -> Option<String> {
-        // HTTP server is not started by the shared startup functions.
-        None
     }
 
     /// Returns `true` if shutdown has already been signaled.
@@ -317,7 +306,7 @@ mod tests {
             "expected /scp/v1 suffix, got: {}",
             relay.relay_url()
         );
-        assert!(relay.port() > 0, "port should be assigned");
+        assert!(relay.relay_port() > 0, "port should be assigned");
         assert!(!relay.is_shutdown());
         relay.shutdown();
         assert!(relay.is_shutdown());
@@ -334,7 +323,7 @@ mod tests {
             "expected ws:// URL, got: {}",
             relay.relay_url()
         );
-        assert!(relay.port() > 0);
+        assert!(relay.relay_port() > 0);
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -353,7 +342,7 @@ mod tests {
             node.did()
         );
         assert!(node.relay_port() > 0);
-        assert!(node.http_url().is_none());
+
         assert!(!node.is_shutdown());
         node.shutdown();
         assert!(node.is_shutdown());
@@ -376,7 +365,7 @@ mod tests {
             node.did()
         );
         assert!(node.relay_port() > 0);
-        assert!(node.http_url().is_none());
+
         node.shutdown();
         let _ = std::fs::remove_dir_all(&tmp);
     }

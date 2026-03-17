@@ -214,6 +214,12 @@ export type { SyncPolicy } from "./sync";
 export { classifyOffline, classifyOfflineCustom, getSyncPolicy } from "./sync";
 
 // ---------------------------------------------------------------------------
+// Server (relay + node lifecycle)
+// ---------------------------------------------------------------------------
+
+export { connectLocalTransport, Node, Relay } from "./server";
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 

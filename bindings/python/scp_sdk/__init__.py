@@ -153,6 +153,7 @@ from scp_sdk.provenance import (
     check_chain_depth,
     evaluate_provenance_quality,
 )
+from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
     TestVector,
@@ -239,6 +240,7 @@ __all__ = [
     "Membership",
     "MemoryScope",
     "Message",
+    "Node",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
@@ -247,6 +249,7 @@ __all__ = [
     "Provenance",
     "ProvenanceQuality",
     "PublishResult",
+    "Relay",
     "RelayPriceAdjustment",
     "RequireParticipation",
     "ScpError",
