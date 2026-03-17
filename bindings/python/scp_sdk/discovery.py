@@ -403,8 +403,13 @@ def scope_register(
     import json
 
     result = bridge.scope_register(
-        scope_context_id, name, target_context_id, relay_urls,
-        registrant_did, description, tags,
+        scope_context_id,
+        name,
+        target_context_id,
+        relay_urls,
+        registrant_did,
+        description,
+        tags,
     )
     return json.loads(result)
 

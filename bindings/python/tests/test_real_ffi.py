@@ -945,9 +945,7 @@ class TestScopeRegistry:
         assert lookup["results"][0]["name"] == "my-scope"
         assert lookup["results"][0]["target"]["context_id"] == "target-ctx"
 
-        dereg_result = _scp_core.scope_deregister(
-            "test-ctx", "my-scope", "did:dht:zTest"
-        )
+        dereg_result = _scp_core.scope_deregister("test-ctx", "my-scope", "did:dht:zTest")
         dereg = json.loads(dereg_result)
         assert dereg["removed"] is True
 
