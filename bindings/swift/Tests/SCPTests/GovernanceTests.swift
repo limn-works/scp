@@ -1000,7 +1000,7 @@ struct GovernanceTests {
         var receivedIdentity: Identity?
         let mockPublishAsset: BroadcastBridge.PublishAssetFn = { _, identity, _, _ in
             receivedIdentity = identity
-            return PublishResult(blobId: "abc", etag: "def")
+            return PublishResult(blobId: "abc", etag: "def", deployId: "auto")
         }
 
         let asset = AssetEntry(
@@ -1024,7 +1024,8 @@ struct GovernanceTests {
         var receivedIdentity: Identity?
         let mockPublishAssets: BroadcastBridge.PublishAssetsFn = { _, identity, assets, _ in
             receivedIdentity = identity
-            return assets.map { _ in PublishResult(blobId: "b", etag: "e") }
+            let results = assets.map { _ in PublishResult(blobId: "b", etag: "e", deployId: "auto") }
+            return BatchPublishResult(results: results, deployId: "auto")
         }
 
         let assets = [
@@ -1034,7 +1035,7 @@ struct GovernanceTests {
             assets: assets,
             publishAssetsFn: mockPublishAssets
         )
-        #expect(results.count == 1)
+        #expect(results.results.count == 1)
         #expect(receivedIdentity != nil)
     }
 
