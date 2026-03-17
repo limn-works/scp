@@ -307,7 +307,6 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: android-actions/setup-android@v3
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $ANDROID_HOME/licenses
@@ -318,6 +317,7 @@ jobs:
           echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > $ANDROID_HOME/licenses/android-googletv-license
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
+      - uses: android-actions/setup-android@v3
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
@@ -337,7 +337,6 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: android-actions/setup-android@v3
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $ANDROID_HOME/licenses
@@ -348,6 +347,7 @@ jobs:
           echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > $ANDROID_HOME/licenses/android-googletv-license
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
+      - uses: android-actions/setup-android@v3
       - run: sdkmanager "platforms;android-35"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
