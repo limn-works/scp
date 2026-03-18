@@ -14,8 +14,8 @@
 //! configuration, trust level ordering, and handle target variants.
 
 use scp_core::discovery::{
-    BootstrapConfig, DataProvenance, DiscoveryQuery, HandleTarget, ParsedAddress, PetnameMap,
-    RegistrationEntry, TrustLevel, normalize_address, parse_address,
+    BootstrapConfig, BootstrapContextEntry, DataProvenance, DiscoveryQuery, HandleTarget,
+    ParsedAddress, PetnameMap, RegistrationEntry, TrustLevel, normalize_address, parse_address,
 };
 use scp_core::discovery::{
     HandleDeregisterParams, HandleLookupParams, HandleRegisterParams, HandleRegistry,
@@ -394,37 +394,40 @@ async fn did_routing_id_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. bootstrap_config: with_defaults, add_custom_context, all_context_ids
+// 16. bootstrap_config: with_defaults, add_custom_context, all_contexts
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn bootstrap_config() {
     // Default config.
     let default_config = BootstrapConfig::default();
-    assert!(default_config.default_context_ids.is_empty());
-    assert!(default_config.custom_context_ids.is_empty());
+    assert!(default_config.default_contexts.is_empty());
+    assert!(default_config.custom_contexts.is_empty());
     assert!(default_config.should_auto_query());
     assert!(default_config.should_fallback());
 
-    // with_defaults.
+    // with_defaults using BootstrapContextEntry.
     let config = BootstrapConfig::with_defaults(vec![
-        "ctx-discovery-1".to_owned(),
-        "ctx-discovery-2".to_owned(),
+        BootstrapContextEntry::new("ctx-discovery-1".to_owned(), DID::from("did:dht:zCreator1")),
+        BootstrapContextEntry::new("ctx-discovery-2".to_owned(), DID::from("did:dht:zCreator2")),
     ]);
-    assert_eq!(config.default_context_ids.len(), 2);
-    assert!(config.custom_context_ids.is_empty());
+    assert_eq!(config.default_contexts.len(), 2);
+    assert!(config.custom_contexts.is_empty());
 
     // add_custom_context.
     let mut config = config;
-    config.add_custom_context("ctx-custom-1".to_owned());
-    assert_eq!(config.custom_context_ids.len(), 1);
+    config.add_custom_context(BootstrapContextEntry::new(
+        "ctx-custom-1".to_owned(),
+        DID::from("did:dht:zCustom1"),
+    ));
+    assert_eq!(config.custom_contexts.len(), 1);
 
-    // all_context_ids combines defaults and custom.
-    let all = config.all_context_ids();
+    // all_contexts combines defaults and custom.
+    let all = config.all_contexts();
     assert_eq!(all.len(), 3);
-    assert_eq!(*all[0], "ctx-discovery-1");
-    assert_eq!(*all[1], "ctx-discovery-2");
-    assert_eq!(*all[2], "ctx-custom-1");
+    assert_eq!(all[0].context_id, "ctx-discovery-1");
+    assert_eq!(all[1].context_id, "ctx-discovery-2");
+    assert_eq!(all[2].context_id, "ctx-custom-1");
 }
 
 // ---------------------------------------------------------------------------
