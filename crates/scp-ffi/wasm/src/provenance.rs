@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 // ---------------------------------------------------------------------------
 
 /// Default maximum chain depth (8 hops, ADR-043).
-pub(crate) const DEFAULT_MAX_CHAIN_DEPTH: u32 = 8;
+pub(crate) const DEFAULT_MAX_CHAIN_DEPTH: u8 = 8;
 
 // ---------------------------------------------------------------------------
 // Local enums (mirror scp-core::provenance)
@@ -182,7 +182,7 @@ fn compute_quality(
 /// ```
 #[must_use]
 #[wasm_bindgen]
-pub fn provenance_check_chain_depth(depth: u32, max_depth_override: Option<u32>) -> bool {
+pub fn provenance_check_chain_depth(depth: u8, max_depth_override: Option<u8>) -> bool {
     let effective_max = max_depth_override.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH);
     depth <= effective_max
 }

@@ -1687,6 +1687,12 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Default key package min buffer | 10 | Minimum MLS key packages to keep available | §9.7 |
 | Key package replenish threshold | 5 | Trigger replenishment when buffer drops below this | §9.7 |
 
+#### 9.18.17 External Constraints
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| DHT republish interval | 7200s (2h) | External constraint (BEP44 expiry). Not configurable — the DHT requires periodic republishing within its expiry window. | §3.3 |
+
 ### 9.18.B Configurable Parameters
 
 The following constants have protocol-defined mechanisms and acceptable ranges, but the actual value is set by the context creator, relay operator, or deployer. Defaults are provided for when no explicit value is configured. Per ADR-043.
@@ -1698,7 +1704,6 @@ The following constants have protocol-defined mechanisms and acceptable ranges, 
 | Session cap per caller | 1000 | [1, u32 max] | `ContextParams::session_cap`. `None` = use default. | §6.2.1 |
 | Relay blob TTL | 604,800s (7d) | [1, infinity] | Relay operator configuration. | §10.5 |
 | Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived from TTL | Computed from relay blob TTL. Floor of 60s prevents spin loop at very small TTLs. | §10.5 |
-| DHT republish interval | 7200s (2h) | Fixed (BEP44) | BEP44 constraint. Listed here because the value is externally imposed, but functionally invariant. | §3.3 |
 
 ### 9.18.C Implementation Recommendations
 

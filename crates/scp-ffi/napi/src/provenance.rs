@@ -110,21 +110,29 @@ pub fn provenance_attach(
         counterparty_policy: cp,
     };
 
-    #[allow(clippy::cast_possible_truncation)]
-    let existing_prov = existing_chain_depth.map(|depth| DataProvenance {
-        source_context: String::new(),
-        source_type: SourceType::Persistent,
-        counterparties: vec![],
-        purpose: None,
-        discovery_method: DiscoveryMethod::OutOfBand,
-        age: std::time::Duration::from_secs(0),
-        memory_scope: MemoryScope::Full,
-        chain_depth: depth as u8,
-        chain_path: None,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
-    });
+    let existing_prov = existing_chain_depth
+        .map(|depth| -> napi::Result<DataProvenance> {
+            let chain_depth = u8::try_from(depth).map_err(|_| {
+                napi::Error::from_reason(format!(
+                    "existing_chain_depth {depth} exceeds u8 range (max 255)"
+                ))
+            })?;
+            Ok(DataProvenance {
+                source_context: String::new(),
+                source_type: SourceType::Persistent,
+                counterparties: vec![],
+                purpose: None,
+                discovery_method: DiscoveryMethod::OutOfBand,
+                age: std::time::Duration::from_secs(0),
+                memory_scope: MemoryScope::Full,
+                chain_depth,
+                chain_path: None,
+                payment_amount: None,
+                payment_adapter: None,
+                payment_receipt_id: None,
+            })
+        })
+        .transpose()?;
 
     let prov = attach_provenance(
         &source_info,
@@ -210,12 +218,21 @@ pub fn provenance_attach(
 ///
 /// Returns `true` if within limit, `false` otherwise.
 #[napi]
-#[must_use]
-pub fn provenance_check_chain_depth(chain_depth: u32, max_depth: Option<u32>) -> bool {
-    #[allow(clippy::cast_possible_truncation)]
-    let depth = chain_depth as u8;
-    #[allow(clippy::cast_possible_truncation)]
-    let max = max_depth.map_or(DEFAULT_MAX_CHAIN_DEPTH, |d| d as u8);
+pub fn provenance_check_chain_depth(
+    chain_depth: u32,
+    max_depth: Option<u32>,
+) -> napi::Result<bool> {
+    let depth = u8::try_from(chain_depth).map_err(|_| {
+        napi::Error::from_reason(format!(
+            "chain_depth {chain_depth} exceeds u8 range (max 255)"
+        ))
+    })?;
+    let max = match max_depth {
+        Some(d) => u8::try_from(d).map_err(|_| {
+            napi::Error::from_reason(format!("max_depth {d} exceeds u8 range (max 255)"))
+        })?,
+        None => DEFAULT_MAX_CHAIN_DEPTH,
+    };
     let prov = DataProvenance {
         source_context: String::new(),
         source_type: SourceType::Persistent,
@@ -230,7 +247,7 @@ pub fn provenance_check_chain_depth(chain_depth: u32, max_depth: Option<u32>) ->
         payment_adapter: None,
         payment_receipt_id: None,
     };
-    check_chain_depth(&prov, max).is_ok()
+    Ok(check_chain_depth(&prov, max).is_ok())
 }
 
 /// Redacts counterparties from a provenance record (§24.3.5).
@@ -511,14 +528,20 @@ mod tests {
 
     #[test]
     fn check_chain_depth_within_limit() {
-        assert!(provenance_check_chain_depth(0, None));
-        assert!(provenance_check_chain_depth(8, None)); // default is 8 (ADR-043)
+        assert!(provenance_check_chain_depth(0, None).unwrap());
+        assert!(provenance_check_chain_depth(8, None).unwrap()); // default is 8 (ADR-043)
     }
 
     #[test]
     fn check_chain_depth_exceeds_limit() {
-        assert!(!provenance_check_chain_depth(9, None)); // 9 > default 8
-        assert!(!provenance_check_chain_depth(2, Some(1)));
+        assert!(!provenance_check_chain_depth(9, None).unwrap()); // 9 > default 8
+        assert!(!provenance_check_chain_depth(2, Some(1)).unwrap());
+    }
+
+    #[test]
+    fn check_chain_depth_rejects_out_of_u8_range() {
+        assert!(provenance_check_chain_depth(256, None).is_err());
+        assert!(provenance_check_chain_depth(0, Some(256)).is_err());
     }
 
     #[test]
