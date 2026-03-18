@@ -35,7 +35,7 @@
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
 use super::IdentityError;
-use super::attestation::ScpKeyCustodyAttestation;
+use super::attestation::{ScpIdentityLinkService, ScpKeyCustodyAttestation};
 use serde::{Deserialize, Serialize};
 
 /// Custom serde module for `[u8; 64]` fields.
@@ -593,6 +593,72 @@ impl DidDocument {
         let service = attestation.to_service_entry(&self.id)?;
         self.service.push(service);
         Ok(())
+    }
+
+    /// Returns all identity link attestations from this DID document.
+    ///
+    /// Searches the service entries for those with type
+    /// `ScpIdentityLinkAttestation` and parses each one. Returns an empty
+    /// `Vec` if none exist. Malformed entries are silently skipped — a single
+    /// corrupt entry should not prevent reading the others.
+    ///
+    /// See spec §3.5.3.
+    #[must_use]
+    pub fn identity_link_attestations(&self) -> Vec<ScpIdentityLinkService> {
+        self.service
+            .iter()
+            .filter(|s| s.service_type == "ScpIdentityLinkAttestation")
+            .filter_map(|s| ScpIdentityLinkService::from_service_entry(s).ok())
+            .collect()
+    }
+
+    /// Sets (adds) an identity link attestation in this DID document.
+    ///
+    /// If an existing entry with the same `attestation_id` exists, it is
+    /// replaced. Otherwise the new entry is appended. Other service entries
+    /// are preserved.
+    ///
+    /// See spec §3.5.3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentSerializationError`] if the attestation
+    /// cannot be serialized.
+    pub fn set_identity_link_attestation(
+        &mut self,
+        attestation: &ScpIdentityLinkService,
+    ) -> Result<(), IdentityError> {
+        // Remove any existing entry with the same attestation_id.
+        let target_id = &attestation.attestation_id;
+        self.service.retain(|s| {
+            if s.service_type != "ScpIdentityLinkAttestation" {
+                return true;
+            }
+            ScpIdentityLinkService::from_service_entry(s)
+                .map_or(true, |parsed| parsed.attestation_id != *target_id)
+        });
+
+        let service = attestation.to_service_entry(&self.id)?;
+        self.service.push(service);
+        Ok(())
+    }
+
+    /// Removes an identity link attestation from this DID document by attestation ID.
+    ///
+    /// Returns `true` if an entry was removed, `false` if no matching entry
+    /// was found.
+    ///
+    /// See spec §3.5.3.
+    pub fn remove_identity_link_attestation(&mut self, attestation_id: &str) -> bool {
+        let before = self.service.len();
+        self.service.retain(|s| {
+            if s.service_type != "ScpIdentityLinkAttestation" {
+                return true;
+            }
+            ScpIdentityLinkService::from_service_entry(s)
+                .map_or(true, |parsed| parsed.attestation_id != attestation_id)
+        });
+        self.service.len() < before
     }
 
     /// Returns the device attestation token from this DID document, if present.
@@ -2066,5 +2132,183 @@ mod tests {
 
         let result = doc.device_attestation_token();
         assert!(result.is_err());
+    }
+
+    // ===================================================================
+    // Identity link attestation document methods
+    // ===================================================================
+
+    fn test_link_attestation(
+        platform: crate::attestation::IdentityLinkPlatform,
+        id: &str,
+    ) -> crate::attestation::ScpIdentityLinkService {
+        crate::attestation::ScpIdentityLinkService {
+            attestation_id: id.to_owned(),
+            platform,
+            platform_handle: "@test".to_owned(),
+            platform_id: None,
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: crate::attestation::ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+        }
+    }
+
+    #[test]
+    fn identity_link_attestations_empty_by_default() {
+        let doc = DidDocument::new("did:dht:zNoLinks", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.identity_link_attestations().is_empty());
+    }
+
+    #[test]
+    fn set_and_get_identity_link_attestation() {
+        let mut doc = DidDocument::new("did:dht:zLinks1", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let att =
+            test_link_attestation(crate::attestation::IdentityLinkPlatform::Github, "abcdef01");
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        let links = doc.identity_link_attestations();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0], att);
+    }
+
+    #[test]
+    fn set_identity_link_replaces_same_id() {
+        let mut doc = DidDocument::new("did:dht:zLinks2", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let att1 = crate::attestation::ScpIdentityLinkService {
+            attestation_id: "same_id_12345678".to_owned(),
+            platform: crate::attestation::IdentityLinkPlatform::Github,
+            platform_handle: "@alice".to_owned(),
+            platform_id: None,
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: "active".to_owned(),
+        };
+        doc.set_identity_link_attestation(&att1).unwrap();
+
+        let att2 = crate::attestation::ScpIdentityLinkService {
+            attestation_id: "same_id_12345678".to_owned(),
+            platform: crate::attestation::IdentityLinkPlatform::Github,
+            platform_handle: "@alice_updated".to_owned(),
+            platform_id: Some("9999".to_owned()),
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_001,
+            revocation_status: "active".to_owned(),
+        };
+        doc.set_identity_link_attestation(&att2).unwrap();
+
+        let links = doc.identity_link_attestations();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].platform_handle, "@alice_updated");
+        assert_eq!(links[0].verified_at, 1_700_000_001);
+    }
+
+    #[test]
+    fn multiple_attestations_same_platform() {
+        let mut doc = DidDocument::new("did:dht:zLinks3", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let att1 = test_link_attestation(
+            crate::attestation::IdentityLinkPlatform::Mastodon,
+            "mastodon_id_1111",
+        );
+        let att2 = crate::attestation::ScpIdentityLinkService {
+            attestation_id: "mastodon_id_2222".to_owned(),
+            platform: crate::attestation::IdentityLinkPlatform::Mastodon,
+            platform_handle: "@bob@mastodon.social".to_owned(),
+            platform_id: None,
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: "active".to_owned(),
+        };
+
+        doc.set_identity_link_attestation(&att1).unwrap();
+        doc.set_identity_link_attestation(&att2).unwrap();
+
+        let links = doc.identity_link_attestations();
+        assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn remove_identity_link_attestation_returns_true() {
+        let mut doc = DidDocument::new("did:dht:zLinks4", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let att = test_link_attestation(
+            crate::attestation::IdentityLinkPlatform::Discord,
+            "discord_id_01234",
+        );
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        assert!(doc.remove_identity_link_attestation("discord_id_01234"));
+        assert!(doc.identity_link_attestations().is_empty());
+    }
+
+    #[test]
+    fn remove_identity_link_attestation_returns_false_when_absent() {
+        let mut doc = DidDocument::new("did:dht:zLinks5", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(!doc.remove_identity_link_attestation("nonexistent"));
+    }
+
+    #[test]
+    fn identity_link_preserves_other_services() {
+        let did = "did:dht:zLinks6";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.add_relay_service("wss://relay.example.com/scp/v1")
+            .unwrap();
+
+        let att =
+            test_link_attestation(crate::attestation::IdentityLinkPlatform::X, "x_id_12345678");
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        // Should have: PreRotationCommitment + SCPRelay + ScpIdentityLinkAttestation.
+        assert_eq!(doc.service.len(), 3);
+        assert!(doc.pre_rotation_service().is_some());
+        assert_eq!(doc.relay_service_urls().len(), 1);
+        assert_eq!(doc.identity_link_attestations().len(), 1);
+    }
+
+    #[test]
+    fn identity_link_attestations_skip_malformed() {
+        let did = "did:dht:zLinks7";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        // Add a valid one.
+        let att = test_link_attestation(
+            crate::attestation::IdentityLinkPlatform::Apple,
+            "apple_id_12345678",
+        );
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        // Manually add a malformed one.
+        doc.service.push(Service {
+            id: format!("{did}#attestation-bad-entry"),
+            service_type: "ScpIdentityLinkAttestation".to_owned(),
+            service_endpoint: "not valid json".to_owned(),
+        });
+
+        // Should return only the valid one, silently skipping the malformed.
+        let links = doc.identity_link_attestations();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].attestation_id, "apple_id_12345678");
+    }
+
+    #[test]
+    fn identity_link_survives_json_roundtrip() {
+        let did = "did:dht:zLinks8";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let att = crate::attestation::ScpIdentityLinkService {
+            attestation_id: "roundtrip_test_id".to_owned(),
+            platform: crate::attestation::IdentityLinkPlatform::Google,
+            platform_handle: "user@gmail.com".to_owned(),
+            platform_id: Some("oidc-sub-abc".to_owned()),
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: "active".to_owned(),
+        };
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        let links = parsed.identity_link_attestations();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0], att);
     }
 }
