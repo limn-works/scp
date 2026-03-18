@@ -203,8 +203,12 @@ pub enum FreshnessStatus {
 /// (`total_attestors`) must provide attestations of a given type, and the
 /// minimum independence score required among those attestors.
 ///
+/// All `f64` fields must be finite (not NaN or infinity). Deserialization
+/// rejects non-finite values via `TryFrom<ThresholdRequirementRaw>`.
+///
 /// See ADR-017 acceptance criterion 7.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(into = "ThresholdRequirementRaw")]
 pub struct ThresholdRequirement {
     /// The minimum number of valid attestations required (N).
     pub required_count: u32,
@@ -215,16 +219,69 @@ pub struct ThresholdRequirement {
     pub independence_threshold: f64,
     /// Independence penalty per shared context membership between a pair of
     /// attestors. Default: 0.1. Capped at `shared_context_penalty_cap` total.
-    #[serde(default = "default_shared_context_penalty")]
     pub shared_context_penalty: f64,
     /// Maximum total penalty from shared context memberships for a single
     /// pair. Default: 0.5.
-    #[serde(default = "default_shared_context_penalty_cap")]
     pub shared_context_penalty_cap: f64,
     /// Independence penalty per mutual endorsement direction (A endorsed B
     /// = one direction, B endorsed A = another). Default: 0.2.
-    #[serde(default = "default_mutual_endorsement_penalty")]
     pub mutual_endorsement_penalty: f64,
+}
+
+/// Raw deserialization helper for [`ThresholdRequirement`].
+///
+/// Carries `#[serde(default)]` annotations for backward-compatible
+/// deserialization, then validates f64 fields via `TryFrom`.
+#[derive(Deserialize, Serialize)]
+struct ThresholdRequirementRaw {
+    required_count: u32,
+    total_attestors: u32,
+    independence_threshold: f64,
+    #[serde(default = "default_shared_context_penalty")]
+    shared_context_penalty: f64,
+    #[serde(default = "default_shared_context_penalty_cap")]
+    shared_context_penalty_cap: f64,
+    #[serde(default = "default_mutual_endorsement_penalty")]
+    mutual_endorsement_penalty: f64,
+}
+
+impl From<ThresholdRequirement> for ThresholdRequirementRaw {
+    fn from(t: ThresholdRequirement) -> Self {
+        Self {
+            required_count: t.required_count,
+            total_attestors: t.total_attestors,
+            independence_threshold: t.independence_threshold,
+            shared_context_penalty: t.shared_context_penalty,
+            shared_context_penalty_cap: t.shared_context_penalty_cap,
+            mutual_endorsement_penalty: t.mutual_endorsement_penalty,
+        }
+    }
+}
+
+impl TryFrom<ThresholdRequirementRaw> for ThresholdRequirement {
+    type Error = String;
+
+    fn try_from(raw: ThresholdRequirementRaw) -> Result<Self, Self::Error> {
+        let t = Self {
+            required_count: raw.required_count,
+            total_attestors: raw.total_attestors,
+            independence_threshold: raw.independence_threshold,
+            shared_context_penalty: raw.shared_context_penalty,
+            shared_context_penalty_cap: raw.shared_context_penalty_cap,
+            mutual_endorsement_penalty: raw.mutual_endorsement_penalty,
+        };
+        t.validate().map(|()| t)
+    }
+}
+
+impl<'de> Deserialize<'de> for ThresholdRequirement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = ThresholdRequirementRaw::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 const fn default_shared_context_penalty() -> f64 {
@@ -241,6 +298,10 @@ const fn default_mutual_endorsement_penalty() -> f64 {
 
 impl ThresholdRequirement {
     /// Creates a new `ThresholdRequirement` with default penalty values.
+    ///
+    /// This constructor is `const` for use in static/const contexts. The caller
+    /// is responsible for passing finite f64 values. For runtime construction
+    /// with validation, use [`ThresholdRequirement::try_new`].
     #[must_use]
     pub const fn new(
         required_count: u32,
@@ -255,6 +316,50 @@ impl ThresholdRequirement {
             shared_context_penalty_cap: default_shared_context_penalty_cap(),
             mutual_endorsement_penalty: default_mutual_endorsement_penalty(),
         }
+    }
+
+    /// Creates a new `ThresholdRequirement` with validation.
+    ///
+    /// Returns an error if any f64 field is NaN or infinite.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the invalid field if validation fails.
+    pub fn try_new(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+    ) -> Result<Self, String> {
+        let t = Self::new(required_count, total_attestors, independence_threshold);
+        t.validate().map(|()| t)
+    }
+
+    /// Validates that all f64 fields are finite (not NaN or infinity).
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first non-finite field found.
+    pub fn validate(&self) -> Result<(), String> {
+        let fields: &[(&str, f64)] = &[
+            ("independence_threshold", self.independence_threshold),
+            ("shared_context_penalty", self.shared_context_penalty),
+            (
+                "shared_context_penalty_cap",
+                self.shared_context_penalty_cap,
+            ),
+            (
+                "mutual_endorsement_penalty",
+                self.mutual_endorsement_penalty,
+            ),
+        ];
+        for &(name, value) in fields {
+            if !value.is_finite() {
+                return Err(format!(
+                    "ThresholdRequirement::{name} must be finite, got {value}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1595,5 +1700,78 @@ mod tests {
         // Valid prefix but garbage z-base-32
         let result = resolver.resolve_public_key("did:dht:z!@#$%^&*");
         assert!(result.is_err());
+    }
+
+    // --- ThresholdRequirement NaN / Infinity guard tests ---
+
+    #[test]
+    fn threshold_requirement_validate_rejects_nan_independence() {
+        let t = ThresholdRequirement::new(2, 3, f64::NAN);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("independence_threshold"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_validate_rejects_infinity() {
+        let t = ThresholdRequirement {
+            required_count: 2,
+            total_attestors: 3,
+            independence_threshold: 0.5,
+            shared_context_penalty: f64::INFINITY,
+            shared_context_penalty_cap: 0.5,
+            mutual_endorsement_penalty: 0.2,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("shared_context_penalty"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_validate_rejects_neg_infinity() {
+        let t = ThresholdRequirement {
+            required_count: 2,
+            total_attestors: 3,
+            independence_threshold: 0.5,
+            shared_context_penalty: 0.1,
+            shared_context_penalty_cap: 0.5,
+            mutual_endorsement_penalty: f64::NEG_INFINITY,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("mutual_endorsement_penalty"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_validate_accepts_finite_values() {
+        let t = ThresholdRequirement::new(2, 3, 0.5);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_serde_roundtrip_finite() {
+        let t = ThresholdRequirement::new(2, 3, 0.5);
+        let json = serde_json::to_string(&t).unwrap();
+        let back: ThresholdRequirement = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn threshold_requirement_serde_backward_compat_defaults() {
+        // Deserialize without optional penalty fields — should use defaults.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5}"#;
+        let t: ThresholdRequirement = serde_json::from_str(json).unwrap();
+        assert_eq!(t.required_count, 2);
+        assert_eq!(t.total_attestors, 3);
+        assert!((t.independence_threshold - 0.5).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty - 0.1).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty_cap - 0.5).abs() < f64::EPSILON);
+        assert!((t.mutual_endorsement_penalty - 0.2).abs() < f64::EPSILON);
     }
 }

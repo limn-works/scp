@@ -845,7 +845,24 @@ pub fn evaluate_sybil_resistance(
                         .into(),
                 },
             )?;
-        let result = check_threshold_attestation(&AttestationType::Endorsement, att, threshold);
+        // Filter attestors to only those whose attestation subject matches the
+        // DID being evaluated. Without this, an attacker could submit
+        // endorsement attestations for a completely different DID and have them
+        // count toward this subject's independence check.
+        let subject_attestors: Vec<AttestorInfo> = att
+            .iter()
+            .filter(|a| {
+                a.attestation
+                    .as_ref()
+                    .is_some_and(|att| att.subject == assessment.subject_did)
+            })
+            .cloned()
+            .collect();
+        let result = check_threshold_attestation(
+            &AttestationType::Endorsement,
+            &subject_attestors,
+            threshold,
+        );
         if !result.met {
             return Err(SybilResistanceError::EndorsementIndependenceInsufficient {
                 reason: format!(
@@ -1809,5 +1826,196 @@ mod tests {
         let assessment = IdentityDepthAssessment::new(did("did:dht:z6MkStandard"), signals, now());
         let policy = ContextSybilPolicy::standard();
         assert!(evaluate_sybil_resistance(&assessment, &policy, now(), None).is_ok());
+    }
+
+    // --- Subject binding tests (endorsement attestation subject must match) ---
+
+    #[test]
+    fn endorsement_attestations_for_different_subject_are_ignored() {
+        // Attestors provide endorsements for a DIFFERENT DID than the subject
+        // being evaluated. These must be filtered out, causing the independence
+        // check to fail (zero valid attestations for the actual subject).
+        let assessment = make_deep_assessment(now());
+        let wrong_subject = "did:dht:z6MkWrongSubject";
+
+        let attestors = vec![
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserA"),
+                context_memberships: HashSet::from(["ctx-alpha".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserA",
+                    wrong_subject,
+                    now() - 3600,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserB"),
+                context_memberships: HashSet::from(["ctx-beta".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserB",
+                    wrong_subject,
+                    now() - 7200,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserC"),
+                context_memberships: HashSet::from(["ctx-gamma".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserC",
+                    wrong_subject,
+                    now() - 10800,
+                )),
+            },
+        ];
+
+        let policy = ContextSybilPolicy::high_trust();
+        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "attestations for a different subject must be filtered out: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_subject_attestations_only_count_correct_subject() {
+        // Mix of attestations: some for the correct subject, some for a
+        // different one. Only those for the correct subject should count.
+        // With threshold requiring 2 of 3, having only 1 valid should fail.
+        let assessment = make_deep_assessment(now());
+        let correct_subject = "did:dht:z6MkDeepIdentity";
+        let wrong_subject = "did:dht:z6MkWrongSubject";
+
+        let attestors = vec![
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserA"),
+                context_memberships: HashSet::from(["ctx-alpha".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserA",
+                    correct_subject,
+                    now() - 3600,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserB"),
+                context_memberships: HashSet::from(["ctx-beta".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserB",
+                    wrong_subject,
+                    now() - 7200,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserC"),
+                context_memberships: HashSet::from(["ctx-gamma".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserC",
+                    wrong_subject,
+                    now() - 10800,
+                )),
+            },
+        ];
+
+        let policy = ContextSybilPolicy::high_trust();
+        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        // high_trust requires 2 of 3, but only 1 attestation is for the correct subject
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "only 1 of 3 attestations is for the correct subject, should fail: {result:?}"
+        );
+    }
+
+    // --- ThresholdRequirement NaN guard tests ---
+
+    #[test]
+    fn threshold_requirement_rejects_nan_on_validation() {
+        // serde_json doesn't support NaN literals, so we test via validate().
+        let t = ThresholdRequirement::new(2, 3, f64::NAN);
+        assert!(
+            t.validate().is_err(),
+            "NaN independence_threshold must fail validation"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_infinity_on_validation() {
+        let t = ThresholdRequirement::new(2, 3, f64::INFINITY);
+        assert!(
+            t.validate().is_err(),
+            "infinite independence_threshold must fail validation"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_try_new_rejects_nan() {
+        let result = ThresholdRequirement::try_new(2, 3, f64::NAN);
+        assert!(result.is_err(), "try_new with NaN must return Err");
+    }
+
+    #[test]
+    fn threshold_requirement_try_new_accepts_finite() {
+        let result = ThresholdRequirement::try_new(2, 3, 0.5);
+        assert!(result.is_ok(), "try_new with finite value must succeed");
+    }
+
+    // --- Edge case: min_strength 0 with threshold_requirement ---
+
+    #[test]
+    fn zero_min_strength_still_runs_independence_check() {
+        // Even when min_strength is 0 (trivially met), the endorsement
+        // independence check must still run when threshold_requirement is set.
+        let assessment = make_deep_assessment(now());
+        let colluding_attestors = make_colluding_attestors(now());
+
+        let mut policy = ContextSybilPolicy::casual();
+        policy.required_signals = vec![RequiredSignal {
+            category: TrustSignalCategory::Endorsement,
+            min_strength: 0, // trivially met
+            max_age_secs: 365 * 24 * 3600,
+            threshold_requirement: Some(ThresholdRequirement::new(2, 3, 0.5)),
+        }];
+
+        let result =
+            evaluate_sybil_resistance(&assessment, &policy, now(), Some(&colluding_attestors));
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "min_strength=0 must not bypass independence check: {result:?}"
+        );
+    }
+
+    #[test]
+    fn zero_min_strength_passes_with_independent_attestors() {
+        // Confirm that min_strength=0 with independent attestors passes.
+        let assessment = make_deep_assessment(now());
+        let independent_attestors = make_independent_attestors(now());
+
+        let mut policy = ContextSybilPolicy::casual();
+        policy.required_signals = vec![RequiredSignal {
+            category: TrustSignalCategory::Endorsement,
+            min_strength: 0, // trivially met
+            max_age_secs: 365 * 24 * 3600,
+            threshold_requirement: Some(ThresholdRequirement::new(2, 3, 0.5)),
+        }];
+
+        let result =
+            evaluate_sybil_resistance(&assessment, &policy, now(), Some(&independent_attestors));
+        assert!(
+            result.is_ok(),
+            "min_strength=0 with independent attestors should pass: {result:?}"
+        );
     }
 }
