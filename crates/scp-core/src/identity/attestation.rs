@@ -475,6 +475,8 @@ impl IdentityLinkAttestation {
     /// - `issuer` equals `subject` (self-attestation).
     /// - `id` matches the computed deterministic ID.
     /// - `claim.link_type` is `"self_attestation"`.
+    /// - If revoked, `revoked_by` equals `issuer` (§7.4.1: only the issuer
+    ///   can revoke their own attestation).
     ///
     /// Returns a list of validation errors. Empty list means structurally valid.
     #[must_use]
@@ -511,6 +513,19 @@ impl IdentityLinkAttestation {
             errors.push(Cow::Owned(format!(
                 "link_type must be \"self_attestation\", got {:?}",
                 self.claim.link_type,
+            )));
+        }
+
+        // §7.4.1: only the issuer can revoke their own attestation.
+        // Defense in depth — signature verification prevents tampering, but
+        // structural validation catches malformed attestations early.
+        if let crate::trust::attestation::RevocationStatus::Revoked { revoked_by, .. } =
+            &self.revocation_status
+            && *revoked_by != self.issuer
+        {
+            errors.push(Cow::Owned(format!(
+                "revoked_by {} does not match issuer {}",
+                revoked_by, self.issuer,
             )));
         }
 
@@ -807,6 +822,37 @@ mod tests {
         attestation.claim.link_type = Cow::Borrowed("other_attestation");
         let errors = attestation.validate_structure();
         assert!(errors.iter().any(|e| e.contains("link_type")));
+    }
+
+    #[test]
+    fn attestation_validate_structure_revoked_by_non_issuer() {
+        let mut attestation = make_attestation();
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            revoked_at: 1_700_000_100_000,
+            reason: None,
+            revoked_by: did("did:dht:z6MkMallory"),
+        };
+        let errors = attestation.validate_structure();
+        assert!(
+            errors.iter().any(|e| e.contains("revoked_by")),
+            "expected revoked_by mismatch error, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn attestation_validate_structure_revoked_by_issuer_ok() {
+        let mut attestation = make_attestation();
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            revoked_at: 1_700_000_100_000,
+            reason: None,
+            revoked_by: attestation.issuer.clone(),
+        };
+        let errors = attestation.validate_structure();
+        // No revoked_by error — only issuer can revoke.
+        assert!(
+            !errors.iter().any(|e| e.contains("revoked_by")),
+            "unexpected revoked_by error: {errors:?}",
+        );
     }
 
     #[test]
