@@ -470,6 +470,169 @@ class Identity:
         )
         return json.loads(result_json)
 
+    # -- Identity Link Attestations (§3.5) -----------------------------------
+
+    async def create_attestation(
+        self,
+        platform: str,
+        handle: str,
+        proof: str,
+        platform_id: str | None = None,
+    ) -> IdentityAttestation:
+        """Create an identity link attestation for an external platform (§3.5).
+
+        Cryptographically binds this DID to an external platform identity.
+        The proof is platform-specific evidence of ownership (e.g., a
+        signed challenge token, DNS TXT record value, or OAuth token).
+
+        Args:
+            platform: Platform identifier (e.g. ``"github.com"``,
+                ``"x.com"``, ``"linkedin.com"``).
+            handle: Platform-specific handle or username.
+            proof: Platform-specific proof of ownership.
+            platform_id: Optional platform-assigned unique identifier
+                (e.g. numeric user ID). If not provided, only the
+                handle is recorded.
+
+        Returns:
+            The created :class:`IdentityAttestation`.
+
+        Raises:
+            scp_sdk.IdentityError: If attestation creation fails or
+                the bridge function is not available.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_create_attestation"):
+            raise IdentityError(
+                "Identity link attestation creation is not yet available in the bridge",
+                "SCP-ATTEST-9001",
+            )
+        result_json = await asyncio.to_thread(
+            _scp_core.py_identity_create_attestation,
+            self.did,
+            platform,
+            handle,
+            proof,
+            platform_id,
+        )
+        import json
+
+        data = json.loads(result_json)
+        return IdentityAttestation._from_dict(data)
+
+    @property
+    def attestations(self) -> list[IdentityAttestation]:
+        """List all identity link attestations for this identity.
+
+        This is a synchronous property that returns the cached list of
+        attestations from the bridge layer. For the async variant, use
+        :meth:`list_attestations`.
+
+        Returns:
+            A list of :class:`IdentityAttestation` objects.
+
+        Raises:
+            scp_sdk.IdentityError: If the bridge function is not
+                available.
+        """
+        return run_sync(self.list_attestations())
+
+    async def list_attestations(self) -> list[IdentityAttestation]:
+        """List all identity link attestations for this identity (async).
+
+        Returns:
+            A list of :class:`IdentityAttestation` objects.
+
+        Raises:
+            scp_sdk.IdentityError: If listing fails or the bridge
+                function is not available.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_list_attestations"):
+            raise IdentityError(
+                "Identity link attestation listing is not yet available in the bridge",
+                "SCP-ATTEST-9002",
+            )
+        import json
+
+        result_json = await asyncio.to_thread(
+            _scp_core.py_identity_list_attestations,
+            self.did,
+        )
+        items = json.loads(result_json)
+        return [IdentityAttestation._from_dict(item) for item in items]
+
+    async def remove_attestation(self, attestation_id: str) -> bool:
+        """Remove an identity link attestation by ID.
+
+        Revokes and removes the attestation from this identity's
+        attestation set. The revocation is published so verifiers
+        can detect stale attestations.
+
+        Args:
+            attestation_id: The deterministic attestation ID to remove.
+
+        Returns:
+            ``True`` if the attestation was found and removed,
+            ``False`` if no attestation with that ID exists.
+
+        Raises:
+            scp_sdk.IdentityError: If removal fails or the bridge
+                function is not available.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_remove_attestation"):
+            raise IdentityError(
+                "Identity link attestation removal is not yet available in the bridge",
+                "SCP-ATTEST-9003",
+            )
+        return await asyncio.to_thread(
+            _scp_core.py_identity_remove_attestation,
+            self.did,
+            attestation_id,
+        )
+
+    async def renew_attestation(
+        self,
+        attestation: IdentityAttestation,
+    ) -> IdentityAttestation:
+        """Renew an identity link attestation with a fresh ``verified_at``.
+
+        Re-creates the attestation with a new verification timestamp,
+        resetting the renewal interval countdown (§3.5.2). The proof
+        must be re-verified by the platform.
+
+        Args:
+            attestation: The attestation to renew.
+
+        Returns:
+            A new :class:`IdentityAttestation` with updated
+            ``verified_at`` timestamp.
+
+        Raises:
+            scp_sdk.IdentityError: If renewal fails or the bridge
+                function is not available.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_renew_attestation"):
+            raise IdentityError(
+                "Identity link attestation renewal is not yet available in the bridge",
+                "SCP-ATTEST-9004",
+            )
+        import json
+
+        result_json = await asyncio.to_thread(
+            _scp_core.py_identity_renew_attestation,
+            self.did,
+            attestation.id,
+        )
+        data = json.loads(result_json)
+        return IdentityAttestation._from_dict(data)
+
     # -- Dunder methods ------------------------------------------------------
 
     def __repr__(self) -> str:
@@ -479,7 +642,114 @@ class Identity:
         return self.did
 
 
+# ---------------------------------------------------------------------------
+# IdentityAttestation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IdentityAttestation:
+    """An identity link attestation binding a DID to an external platform (§3.5).
+
+    Represents a cryptographically signed claim that the DID owner also
+    controls an identity on an external platform (e.g. GitHub, X, LinkedIn).
+
+    The ``id`` is deterministically derived as
+    ``hex(SHA-256(issuer || platform || handle || issued_at))``.
+    """
+
+    #: Deterministic attestation ID.
+    id: str
+
+    #: Platform identifier (e.g. ``"github.com"``).
+    platform: str
+
+    #: Platform handle or username.
+    platform_handle: str
+
+    #: DID verification method that signed this attestation
+    #: (e.g. ``"did:dht:z6Mk...#active"``).
+    verification_method: str
+
+    #: Unix timestamp (seconds) when the evidence was last verified.
+    verified_at: float
+
+    #: Revocation status: ``"active"``, ``"revoked"``, or ``"expired"``.
+    revocation_status: str = "active"
+
+    #: Optional platform-assigned unique identifier.
+    platform_id: str | None = None
+
+    async def verify(self) -> bool:
+        """Verify this attestation's signature and validity.
+
+        Delegates to the bridge's ``trust_verify_attestation`` function
+        which checks:
+
+        1. Ed25519 signature against the issuer's signing key.
+        2. Deterministic ID correctness.
+        3. Expiry and revocation status.
+        4. Evidence freshness (§3.5.2).
+
+        Returns:
+            ``True`` if the attestation is valid, ``False`` otherwise.
+
+        Raises:
+            scp_sdk.IdentityError: If the bridge function is not
+                available or the attestation cannot be verified.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_verify_attestation"):
+            raise IdentityError(
+                "Identity attestation verification is not yet available in the bridge",
+                "SCP-ATTEST-9005",
+            )
+        import json
+
+        attestation_json = json.dumps(self._to_bridge_dict())
+        result = await asyncio.to_thread(
+            _scp_core.py_identity_verify_attestation,
+            attestation_json,
+        )
+        return bool(result.get("valid", False)) if isinstance(result, dict) else False
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict for bridge serialization."""
+        d: dict[str, Any] = {
+            "id": self.id,
+            "platform": self.platform,
+            "platform_handle": self.platform_handle,
+            "verification_method": self.verification_method,
+            "verified_at": self.verified_at,
+            "revocation_status": self.revocation_status,
+        }
+        if self.platform_id is not None:
+            d["platform_id"] = self.platform_id
+        return d
+
+    @classmethod
+    def _from_dict(cls, data: dict[str, Any]) -> IdentityAttestation:
+        """Construct from a dict returned by the bridge."""
+        return cls(
+            id=data["id"],
+            platform=data["platform"],
+            platform_handle=data["platform_handle"],
+            verification_method=data["verification_method"],
+            verified_at=data["verified_at"],
+            revocation_status=data.get("revocation_status", "active"),
+            platform_id=data.get("platform_id"),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"IdentityAttestation(id={self.id!r}, platform={self.platform!r}, "
+            f"handle={self.platform_handle!r}, status={self.revocation_status!r})"
+        )
+
+
 __all__ = [
     "DIDDocument",
     "Identity",
+    "IdentityAttestation",
 ]

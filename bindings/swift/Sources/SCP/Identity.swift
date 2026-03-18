@@ -524,3 +524,229 @@ public func executeCustodyMigration(
 ) async throws -> String {
     try await executeCustodyMigrationFn(did, target, contextIds)
 }
+
+// MARK: - IdentityAttestation
+
+/// An identity link attestation binding a DID to an external platform (§3.5).
+///
+/// Represents a cryptographically signed claim that the DID owner also
+/// controls an identity on an external platform (e.g., GitHub, X, LinkedIn).
+///
+/// The ``id`` is deterministically derived as
+/// `hex(SHA-256(issuer || platform || handle || issued_at))`.
+public struct IdentityAttestation: Sendable, Equatable {
+    /// Deterministic attestation ID.
+    public let id: String
+
+    /// Platform identifier (e.g., `"github.com"`).
+    public let platform: String
+
+    /// Platform handle or username.
+    public let platformHandle: String
+
+    /// DID verification method that signed this attestation.
+    public let verificationMethod: String
+
+    /// Unix timestamp (seconds) when the evidence was last verified.
+    public let verifiedAt: Double
+
+    /// Revocation status: `"active"`, `"revoked"`, or `"expired"`.
+    public let revocationStatus: String
+
+    /// Optional platform-assigned unique identifier.
+    public let platformId: String?
+
+    /// Creates an attestation from its component fields.
+    public init(
+        id: String,
+        platform: String,
+        platformHandle: String,
+        verificationMethod: String,
+        verifiedAt: Double,
+        revocationStatus: String = "active",
+        platformId: String? = nil
+    ) {
+        self.id = id
+        self.platform = platform
+        self.platformHandle = platformHandle
+        self.verificationMethod = verificationMethod
+        self.verifiedAt = verifiedAt
+        self.revocationStatus = revocationStatus
+        self.platformId = platformId
+    }
+
+    /// Verifies this attestation's signature and validity.
+    ///
+    /// Delegates to the bridge's trust verification function.
+    ///
+    /// - Returns: `true` if the attestation is valid.
+    /// - Throws: ``ScpError`` if verification is not available.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 3.5 (Identity Link Attestations)
+    public func verify() async throws -> Bool {
+        // Bridge function not yet available — throw not-implemented
+        throw ScpError.Identity(
+            msg: "Attestation verification is not yet available in the bridge",
+            code: "SCP-ATTEST-9005"
+        )
+    }
+}
+
+// MARK: - Identity Attestation Bridge
+
+/// Namespace for identity link attestation bridge function references.
+///
+/// Bridge functions for attestation CRUD are not yet available in the
+/// UniFFI layer. These type aliases and defaults throw not-implemented
+/// errors until the Rust bridge is wired.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public enum IdentityAttestationBridge {
+    /// Create an identity link attestation.
+    public typealias CreateFn = @Sendable (
+        _ did: String,
+        _ platform: String,
+        _ handle: String,
+        _ proof: String,
+        _ platformId: String?
+    ) async throws -> IdentityAttestation
+
+    /// List attestations for an identity.
+    public typealias ListFn = @Sendable (
+        _ did: String
+    ) async throws -> [IdentityAttestation]
+
+    /// Remove an attestation by ID.
+    public typealias RemoveFn = @Sendable (
+        _ did: String,
+        _ attestationId: String
+    ) async throws -> Bool
+
+    /// Renew an attestation.
+    public typealias RenewFn = @Sendable (
+        _ did: String,
+        _ attestationId: String
+    ) async throws -> IdentityAttestation
+
+    /// Default create function — not yet available.
+    public static let defaultCreate: CreateFn = { _, _, _, _, _ in
+        throw ScpError.Identity(
+            msg: "Identity link attestation creation is not yet available in the bridge",
+            code: "SCP-ATTEST-9001"
+        )
+    }
+
+    /// Default list function — not yet available.
+    public static let defaultList: ListFn = { _ in
+        throw ScpError.Identity(
+            msg: "Identity link attestation listing is not yet available in the bridge",
+            code: "SCP-ATTEST-9002"
+        )
+    }
+
+    /// Default remove function — not yet available.
+    public static let defaultRemove: RemoveFn = { _, _ in
+        throw ScpError.Identity(
+            msg: "Identity link attestation removal is not yet available in the bridge",
+            code: "SCP-ATTEST-9003"
+        )
+    }
+
+    /// Default renew function — not yet available.
+    public static let defaultRenew: RenewFn = { _, _ in
+        throw ScpError.Identity(
+            msg: "Identity link attestation renewal is not yet available in the bridge",
+            code: "SCP-ATTEST-9004"
+        )
+    }
+}
+
+// MARK: - Identity Attestation Public API
+
+/// Creates an identity link attestation for an external platform (§3.5).
+///
+/// - Parameters:
+///   - did: The DID claiming the external identity.
+///   - platform: Platform identifier (e.g., `"github.com"`).
+///   - handle: Platform-specific handle or username.
+///   - proof: Platform-specific proof of ownership.
+///   - platformId: Optional platform-assigned unique identifier.
+///   - createFn: Bridge function override for testing.
+/// - Returns: The created ``IdentityAttestation``.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if creation fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public func createIdentityAttestation(
+    did: String,
+    platform: String,
+    handle: String,
+    proof: String,
+    platformId: String? = nil,
+    createFn: IdentityAttestationBridge.CreateFn = IdentityAttestationBridge.defaultCreate
+) async throws -> IdentityAttestation {
+    try await createFn(did, platform, handle, proof, platformId)
+}
+
+/// Lists all identity link attestations for an identity.
+///
+/// - Parameters:
+///   - did: The DID to list attestations for.
+///   - listFn: Bridge function override for testing.
+/// - Returns: An array of ``IdentityAttestation`` objects.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if listing fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public func listIdentityAttestations(
+    did: String,
+    listFn: IdentityAttestationBridge.ListFn = IdentityAttestationBridge.defaultList
+) async throws -> [IdentityAttestation] {
+    try await listFn(did)
+}
+
+/// Removes an identity link attestation by ID.
+///
+/// - Parameters:
+///   - did: The DID that owns the attestation.
+///   - attestationId: The deterministic attestation ID to remove.
+///   - removeFn: Bridge function override for testing.
+/// - Returns: `true` if the attestation was found and removed.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if removal fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public func removeIdentityAttestation(
+    did: String,
+    attestationId: String,
+    removeFn: IdentityAttestationBridge.RemoveFn = IdentityAttestationBridge.defaultRemove
+) async throws -> Bool {
+    try await removeFn(did, attestationId)
+}
+
+/// Renews an identity link attestation with a fresh `verifiedAt`.
+///
+/// - Parameters:
+///   - did: The DID that owns the attestation.
+///   - attestationId: The attestation ID to renew.
+///   - renewFn: Bridge function override for testing.
+/// - Returns: A new ``IdentityAttestation`` with updated `verifiedAt`.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if renewal fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public func renewIdentityAttestation(
+    did: String,
+    attestationId: String,
+    renewFn: IdentityAttestationBridge.RenewFn = IdentityAttestationBridge.defaultRenew
+) async throws -> IdentityAttestation {
+    try await renewFn(did, attestationId)
+}

@@ -106,7 +106,7 @@ from scp_sdk.governance import (
     restore_context,
     withdraw_governance_vote,
 )
-from scp_sdk.identity import DIDDocument, Identity
+from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation
 from scp_sdk.mcp import (
     McpClient,
     McpProvenance,
@@ -240,6 +240,7 @@ __all__ = [
     "EventLog",
     "GovernanceActionResult",
     "Identity",
+    "IdentityAttestation",
     "IdentityError",
     "McpClient",
     "McpProvenance",
