@@ -556,7 +556,7 @@ The reconnection protocol proceeds in six phases: relay catch-up, MLS epoch reco
 
 ### 10.1 Protocol-Level Discovery
 
-Discovery contexts are standard SCP contexts with open join policies and standardized tool schemas (`agent_search`, `agent_register`, `agent_deregister`). They use a two-tier membership model: MLS members (bounded writers who process registrations and maintain governance) and DID-authenticated readers (unbounded, query via tool endpoints without MLS membership).
+Contexts with discovery tools are standard SCP contexts with open join policies and standardized tool schemas (`agent_search`, `agent_register`, `agent_deregister`). They use a two-tier membership model: MLS members (bounded writers who process registrations and maintain governance) and DID-authenticated readers (unbounded, query via tool endpoints without MLS membership).
 
 The SDK ships with default bootstrap context IDs, analogous to DNS root servers. These are starting points, not privileged authorities — anyone can create and operate a context with discovery tools.
 
@@ -860,7 +860,7 @@ Constants are organized into three tiers per ADR-043.
 
 **Attestation.** A signed claim by an identity about something — identity links, capability delegations, endorsements, tool integrity, participation records.
 
-**Discovery Context.** A standard SCP context with open join policies and standardized discovery tools. Provides searchable registries for agents, contexts, and handles.
+**Context (with discovery tools).** A standard SCP context with open join policies and standardized discovery tools. Provides searchable registries for agents, contexts, and handles.
 
 **Bridge Connector.** A protocol entity that translates between an external platform's protocol and SCP's protocol semantics. Operated by accountable identities.
 
