@@ -388,7 +388,7 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
 ///   for TXT records at `{record_name}.{domain}`, checks one contains the DID.
 ///
 /// Other methods (e.g., `"oauth"`, `"challenge_response"`) are Cryptographic-class
-/// and are not verifiable via fetch — the promise rejects with `SCP-TRUST-8010`.
+/// and are not verifiable via fetch — the promise rejects with `SCP-ATTEST-9010`.
 ///
 /// # JS usage
 ///
@@ -437,7 +437,7 @@ pub fn verify_reference_attestation(attestation_json: String) -> Promise {
                              via fetch — use WebCrypto in the TypeScript wrapper layer",
                         input.method
                     ),
-                    code: "SCP-TRUST-8010".to_owned(),
+                    code: "SCP-ATTEST-9010".to_owned(),
                 }
                 .into_js()
                 .into());
