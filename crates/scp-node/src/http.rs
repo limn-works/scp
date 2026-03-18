@@ -830,13 +830,17 @@ async fn virtual_host_fallback(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Strip port (e.g., "localhost:8080" -> "localhost") and lowercase.
-    // Borrow through port-stripping, then allocate once with `to_ascii_lowercase()`.
-    let hostname = host_raw
-        .split(':')
-        .next()
-        .unwrap_or(host_raw)
-        .to_ascii_lowercase();
+    // Strip port and lowercase.
+    // IPv6 bracket notation (e.g., "[::1]:8080") requires finding the closing
+    // bracket first; plain hostnames/IPv4 just split on ':'.
+    let hostname = if host_raw.starts_with('[') {
+        // IPv6 bracket notation: find closing bracket
+        host_raw.find(']').map_or(host_raw, |i| &host_raw[..=i])
+    } else {
+        // IPv4 or plain hostname: strip optional ":port"
+        host_raw.split(':').next().unwrap_or(host_raw)
+    }
+    .to_ascii_lowercase();
 
     // Look up in the hostname index.
     let routing_id = {

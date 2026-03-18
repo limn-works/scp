@@ -246,6 +246,9 @@ pub struct ApplicationNode<S: Storage> {
     /// Used by [`serve_background`](Self::serve_background) to prevent double-serve.
     /// Wrapped in `Arc` so the spawned background task can clear it on exit.
     serving: Arc<AtomicBool>,
+    /// Whether the projection rate-limit cleanup task has been spawned.
+    /// Guards against duplicate cleanup tasks on restart.
+    rate_limit_cleanup_spawned: Arc<AtomicBool>,
     /// The bound address of the background HTTP server, if running.
     /// Set by [`serve_background`](Self::serve_background) after successful bind.
     /// Wrapped in `Arc` so the spawned background task can clear it on exit.
@@ -550,11 +553,18 @@ impl<S: Storage> ApplicationNode<S> {
         }
 
         // Spawn the projection rate limiter cleanup only after a successful
-        // bind — avoids leaking a background task on bind failure.
-        http::spawn_projection_rate_limit_cleanup(
-            self.state.projection_rate_limiter.clone(),
-            shutdown_token.clone(),
-        );
+        // bind — avoids leaking a background task on bind failure, and guards
+        // against duplicate tasks if serve_background is called more than once.
+        if self
+            .rate_limit_cleanup_spawned
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            http::spawn_projection_rate_limit_cleanup(
+                self.state.projection_rate_limiter.clone(),
+                shutdown_token.clone(),
+            );
+        }
 
         let serving_flag = Arc::clone(&self.serving);
         let serving_addr_ref = Arc::clone(&self.serving_addr);
@@ -3316,6 +3326,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         #[cfg(feature = "http3")]
         http3_config,
         serving: Arc::new(AtomicBool::new(false)),
+        rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
         serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
@@ -3452,6 +3463,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         #[cfg(feature = "http3")]
         http3_config: None,
         serving: Arc::new(AtomicBool::new(false)),
+        rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
         serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
