@@ -60,6 +60,26 @@ pub const RENEWAL_INTERVAL_CHALLENGE_RESPONSE_DAYS: u32 = 60;
 pub const MS_PER_DAY: u64 = 86_400_000;
 
 // ---------------------------------------------------------------------------
+// AttestationClass (§3.5.2)
+// ---------------------------------------------------------------------------
+
+/// Classification of verification methods by their proof model (§3.5.2).
+///
+/// Determines cache TTLs and verification strategy:
+/// - **Cryptographic** — self-verifying via cryptographic proof (OAuth tokens,
+///   challenge-response signatures). Can be verified offline. Cache TTL: 24h.
+/// - **Reference** — requires fetching an external resource to verify (signed
+///   posts, DNS records). Verification requires network access. Cache TTL: 1h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationClass {
+    /// Self-verifying via cryptographic proof (OAuth, challenge-response).
+    Cryptographic,
+    /// Requires fetching external resource to verify (signed post, DNS).
+    Reference,
+}
+
+// ---------------------------------------------------------------------------
 // VerificationMethod (§3.5.2)
 // ---------------------------------------------------------------------------
 
@@ -141,6 +161,114 @@ impl VerificationMethod {
             Self::ChallengeResponse => "challenge_response",
         }
     }
+
+    /// Returns the attestation class for this verification method (§3.5.2).
+    ///
+    /// - `Oauth` and `ChallengeResponse` are **Cryptographic** — self-verifying
+    ///   via cryptographic proof, verifiable offline.
+    /// - `SignedPost` and `DnsRecord` are **Reference** — require fetching an
+    ///   external resource to verify.
+    #[must_use]
+    pub const fn attestation_class(self) -> AttestationClass {
+        match self {
+            Self::Oauth | Self::ChallengeResponse => AttestationClass::Cryptographic,
+            Self::SignedPost | Self::DnsRecord => AttestationClass::Reference,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AttestationProof (§3.5.2)
+// ---------------------------------------------------------------------------
+
+/// Typed proof data for an identity link attestation (§3.5.2).
+///
+/// Each variant corresponds to one [`VerificationMethod`] and carries only the
+/// fields relevant to that method. The `type` tag in the JSON/msgpack wire
+/// format discriminates variants using `snake_case` names.
+///
+/// # Variant–method correspondence
+///
+/// | Variant                      | VerificationMethod   |
+/// |------------------------------|----------------------|
+/// | `OauthVerified`              | `Oauth`              |
+/// | `SignedPostVerified`         | `SignedPost`         |
+/// | `DnsRecordVerified`          | `DnsRecord`          |
+/// | `ChallengeResponseVerified`  | `ChallengeResponse`  |
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AttestationProof {
+    /// OAuth 2.0 verification proof (§3.5.2).
+    ///
+    /// Contains the provider name, the platform-specific subject ID returned
+    /// by the OAuth provider, and the verification timestamp (seconds).
+    OauthVerified {
+        /// OAuth provider identifier (e.g., `"github.com"`, `"google.com"`).
+        provider: String,
+        /// Platform-specific user/subject ID from the OAuth token.
+        subject_id: String,
+        /// Unix timestamp (seconds) when the OAuth verification occurred.
+        verified_at: u64,
+    },
+
+    /// Signed post verification proof (§3.5.2).
+    ///
+    /// The user posted a message containing their DID and a nonce on the
+    /// target platform. Verifiers fetch the post to confirm authorship.
+    SignedPostVerified {
+        /// Full URL of the post containing the DID and nonce.
+        post_url: String,
+        /// Random nonce included in the post to prevent replay.
+        nonce: String,
+        /// Unix timestamp (seconds) when the post was created.
+        posted_at: u64,
+    },
+
+    /// DNS TXT record verification proof (§3.5.2).
+    ///
+    /// The user added a TXT record at `_scp-verify.<domain>` containing
+    /// their DID. Verifiers perform a DNS lookup to confirm.
+    DnsRecordVerified {
+        /// Domain where the TXT record was placed.
+        domain: String,
+        /// DNS record name (e.g., `"_scp-verify"`).
+        record_name: String,
+    },
+
+    /// Challenge-response verification proof (§3.5.2).
+    ///
+    /// A verifier sent a challenge through the platform; the user signed it
+    /// with their SCP identity key.
+    ChallengeResponseVerified {
+        /// The challenge string sent by the verifier.
+        challenge: String,
+        /// Ed25519 signature over the challenge, hex-encoded.
+        response_signature: String,
+    },
+}
+
+impl AttestationProof {
+    /// Returns the [`VerificationMethod`] that this proof variant corresponds to.
+    ///
+    /// This is the inverse of the variant–method mapping: given a proof, you
+    /// can determine which verification method produced it.
+    #[must_use]
+    pub const fn expected_method(&self) -> VerificationMethod {
+        match self {
+            Self::OauthVerified { .. } => VerificationMethod::Oauth,
+            Self::SignedPostVerified { .. } => VerificationMethod::SignedPost,
+            Self::DnsRecordVerified { .. } => VerificationMethod::DnsRecord,
+            Self::ChallengeResponseVerified { .. } => VerificationMethod::ChallengeResponse,
+        }
+    }
+
+    /// Returns the [`AttestationClass`] for this proof type.
+    ///
+    /// Delegates to the corresponding [`VerificationMethod::attestation_class`].
+    #[must_use]
+    pub const fn attestation_class(&self) -> AttestationClass {
+        self.expected_method().attestation_class()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,21 +323,25 @@ impl AttestationClaim {
 
 /// Evidence supporting an identity link attestation (§3.5.1).
 ///
-/// Contains the verification method, method-specific proof data, the
-/// timestamp of last verification, and an optional third-party verifier DID.
+/// Contains the verification method, typed proof data, the timestamp of
+/// last verification, and an optional third-party verifier DID.
+///
+/// The `proof` field is a discriminated union ([`AttestationProof`]) whose
+/// variant MUST match the `method` field. Use [`AttestationEvidence::validate_proof_method`]
+/// to check this invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationEvidence {
     /// Verification method used to establish the link.
     pub method: VerificationMethod,
 
-    /// Method-specific proof data (§3.5.2).
+    /// Typed, method-specific proof data (§3.5.2).
     ///
-    /// Contents depend on `method`:
-    /// - OAuth: signed ID token (JWT) or signed provider assertion.
-    /// - Signed post: `{ "post_url", "nonce", "posted_at" }`.
-    /// - DNS record: `{ "domain", "record_name" }`.
-    /// - Challenge-response: `{ "challenge", "response_signature", "verifier_did" }`.
-    pub proof: String,
+    /// The variant MUST correspond to `method`:
+    /// - `Oauth` → [`AttestationProof::OauthVerified`]
+    /// - `SignedPost` → [`AttestationProof::SignedPostVerified`]
+    /// - `DnsRecord` → [`AttestationProof::DnsRecordVerified`]
+    /// - `ChallengeResponse` → [`AttestationProof::ChallengeResponseVerified`]
+    pub proof: AttestationProof,
 
     /// Unix timestamp (milliseconds) of last verification.
     pub verified_at: u64,
@@ -229,6 +361,26 @@ impl AttestationEvidence {
     #[must_use]
     pub const fn is_expired(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.verified_at) > self.method.renewal_interval_ms()
+    }
+
+    /// Validates that the proof variant matches the declared verification method.
+    ///
+    /// Returns `Ok(())` if the proof variant corresponds to `self.method`,
+    /// or an error describing the mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if `proof.expected_method() != method`.
+    pub fn validate_proof_method(&self) -> Result<(), Cow<'static, str>> {
+        let expected = self.proof.expected_method();
+        if expected == self.method {
+            Ok(())
+        } else {
+            Err(Cow::Owned(format!(
+                "proof variant expects method {:?}, but evidence declares {:?}",
+                expected, self.method,
+            )))
+        }
     }
 }
 
@@ -477,6 +629,7 @@ impl IdentityLinkAttestation {
     /// - `claim.link_type` is `"self_attestation"`.
     /// - If revoked, `revoked_by` equals `issuer` (§7.4.1: only the issuer
     ///   can revoke their own attestation).
+    /// - `evidence.proof` variant matches `evidence.method`.
     ///
     /// Returns a list of validation errors. Empty list means structurally valid.
     #[must_use]
@@ -527,6 +680,10 @@ impl IdentityLinkAttestation {
                 "revoked_by {} does not match issuer {}",
                 revoked_by, self.issuer,
             )));
+        }
+
+        if let Err(e) = self.evidence.validate_proof_method() {
+            errors.push(e);
         }
 
         errors
@@ -583,8 +740,11 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: r#"{"provider":"github.com","subject":"12345","issued_at":1700000000}"#
-                    .to_owned(),
+                proof: AttestationProof::OauthVerified {
+                    provider: "github.com".to_owned(),
+                    subject_id: "12345".to_owned(),
+                    verified_at: 1_700_000_000,
+                },
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
@@ -690,7 +850,11 @@ mod tests {
     fn attestation_evidence_not_expired() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "jwt-token".to_owned(),
+            proof: AttestationProof::OauthVerified {
+                provider: "github.com".to_owned(),
+                subject_id: "12345".to_owned(),
+                verified_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000_000,
             verifier_did: None,
         };
@@ -703,7 +867,11 @@ mod tests {
     fn attestation_evidence_expired() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "jwt-token".to_owned(),
+            proof: AttestationProof::OauthVerified {
+                provider: "github.com".to_owned(),
+                subject_id: "12345".to_owned(),
+                verified_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000_000,
             verifier_did: None,
         };
@@ -716,7 +884,11 @@ mod tests {
     fn attestation_evidence_exactly_at_boundary() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::SignedPost,
-            proof: "post-data".to_owned(),
+            proof: AttestationProof::SignedPostVerified {
+                post_url: "https://x.com/alice/123".to_owned(),
+                nonce: "abc123".to_owned(),
+                posted_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000_000,
             verifier_did: None,
         };
@@ -729,7 +901,10 @@ mod tests {
     fn attestation_evidence_serialization_roundtrip() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::ChallengeResponse,
-            proof: r#"{"challenge":"abc","response_signature":"def","verifier_did":"did:dht:z6MkVerifier"}"#.to_owned(),
+            proof: AttestationProof::ChallengeResponseVerified {
+                challenge: "abc".to_owned(),
+                response_signature: "def".to_owned(),
+            },
             verified_at: 1_700_000_000_000,
             verifier_did: Some(did("did:dht:z6MkVerifier")),
         };
@@ -980,7 +1155,11 @@ mod tests {
     fn attestation_evidence_ignores_unknown_fields() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "proof-data".to_owned(),
+            proof: AttestationProof::OauthVerified {
+                provider: "github.com".to_owned(),
+                subject_id: "12345".to_owned(),
+                verified_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000_000,
             verifier_did: None,
         };
@@ -1045,8 +1224,11 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: r#"{"provider":"github.com","subject":"12345","issued_at":1700000000}"#
-                    .to_owned(),
+                proof: AttestationProof::OauthVerified {
+                    provider: "github.com".to_owned(),
+                    subject_id: "12345".to_owned(),
+                    verified_at: 1_700_000_000,
+                },
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
@@ -1239,9 +1421,11 @@ mod tests {
             claim: AttestationClaim::new(platform.to_owned(), handle.to_owned(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::SignedPost,
-                proof:
-                    r#"{"post_url":"https://x.com/alice/123","nonce":"abc","posted_at":1700000000}"#
-                        .to_owned(),
+                proof: AttestationProof::SignedPostVerified {
+                    post_url: "https://x.com/alice/123".to_owned(),
+                    nonce: "abc".to_owned(),
+                    posted_at: 1_700_000_000,
+                },
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
@@ -1264,5 +1448,269 @@ mod tests {
         let bytes1 = attestation.canonical_signing_bytes().unwrap();
         let bytes2 = attestation.canonical_signing_bytes().unwrap();
         assert_eq!(bytes1, bytes2, "canonical bytes must be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationClass
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attestation_class_from_verification_method() {
+        assert_eq!(
+            VerificationMethod::Oauth.attestation_class(),
+            AttestationClass::Cryptographic
+        );
+        assert_eq!(
+            VerificationMethod::ChallengeResponse.attestation_class(),
+            AttestationClass::Cryptographic
+        );
+        assert_eq!(
+            VerificationMethod::SignedPost.attestation_class(),
+            AttestationClass::Reference
+        );
+        assert_eq!(
+            VerificationMethod::DnsRecord.attestation_class(),
+            AttestationClass::Reference
+        );
+    }
+
+    #[test]
+    fn attestation_class_serialization_roundtrip() {
+        let classes = [AttestationClass::Cryptographic, AttestationClass::Reference];
+        for class in &classes {
+            let json = serde_json::to_string(class).unwrap();
+            let deserialized: AttestationClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(class, &deserialized);
+        }
+    }
+
+    #[test]
+    fn attestation_class_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&AttestationClass::Cryptographic).unwrap(),
+            "\"cryptographic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AttestationClass::Reference).unwrap(),
+            "\"reference\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationProof
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attestation_proof_expected_method() {
+        let oauth = AttestationProof::OauthVerified {
+            provider: "g".to_owned(),
+            subject_id: "1".to_owned(),
+            verified_at: 0,
+        };
+        assert_eq!(oauth.expected_method(), VerificationMethod::Oauth);
+
+        let signed_post = AttestationProof::SignedPostVerified {
+            post_url: "u".to_owned(),
+            nonce: "n".to_owned(),
+            posted_at: 0,
+        };
+        assert_eq!(
+            signed_post.expected_method(),
+            VerificationMethod::SignedPost
+        );
+
+        let dns = AttestationProof::DnsRecordVerified {
+            domain: "d".to_owned(),
+            record_name: "r".to_owned(),
+        };
+        assert_eq!(dns.expected_method(), VerificationMethod::DnsRecord);
+
+        let cr = AttestationProof::ChallengeResponseVerified {
+            challenge: "c".to_owned(),
+            response_signature: "s".to_owned(),
+        };
+        assert_eq!(cr.expected_method(), VerificationMethod::ChallengeResponse);
+    }
+
+    #[test]
+    fn attestation_proof_attestation_class() {
+        let oauth = AttestationProof::OauthVerified {
+            provider: "g".to_owned(),
+            subject_id: "1".to_owned(),
+            verified_at: 0,
+        };
+        assert_eq!(oauth.attestation_class(), AttestationClass::Cryptographic);
+
+        let dns = AttestationProof::DnsRecordVerified {
+            domain: "d".to_owned(),
+            record_name: "r".to_owned(),
+        };
+        assert_eq!(dns.attestation_class(), AttestationClass::Reference);
+    }
+
+    #[test]
+    fn attestation_proof_serialization_roundtrip_all_variants() {
+        let proofs = [
+            AttestationProof::OauthVerified {
+                provider: "github.com".to_owned(),
+                subject_id: "12345".to_owned(),
+                verified_at: 1_700_000_000,
+            },
+            AttestationProof::SignedPostVerified {
+                post_url: "https://x.com/alice/123".to_owned(),
+                nonce: "abc123".to_owned(),
+                posted_at: 1_700_000_000,
+            },
+            AttestationProof::DnsRecordVerified {
+                domain: "example.com".to_owned(),
+                record_name: "_scp-verify".to_owned(),
+            },
+            AttestationProof::ChallengeResponseVerified {
+                challenge: "random-challenge".to_owned(),
+                response_signature: "deadbeef".to_owned(),
+            },
+        ];
+
+        for proof in &proofs {
+            // JSON roundtrip
+            let json = serde_json::to_string(proof).unwrap();
+            let deserialized: AttestationProof = serde_json::from_str(&json).unwrap();
+            assert_eq!(proof, &deserialized, "JSON roundtrip failed for {proof:?}");
+
+            // MessagePack roundtrip
+            let bytes = rmp_serde::to_vec_named(proof).unwrap();
+            let deserialized: AttestationProof = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(
+                proof, &deserialized,
+                "MessagePack roundtrip failed for {proof:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_proof_json_has_type_tag() {
+        let proof = AttestationProof::OauthVerified {
+            provider: "github.com".to_owned(),
+            subject_id: "12345".to_owned(),
+            verified_at: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        assert!(
+            json.contains("\"type\":\"oauth_verified\""),
+            "expected type tag in JSON: {json}"
+        );
+
+        let proof = AttestationProof::DnsRecordVerified {
+            domain: "example.com".to_owned(),
+            record_name: "_scp-verify".to_owned(),
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        assert!(
+            json.contains("\"type\":\"dns_record_verified\""),
+            "expected type tag in JSON: {json}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proof-method validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_proof_method_matching() {
+        let evidence = AttestationEvidence {
+            method: VerificationMethod::Oauth,
+            proof: AttestationProof::OauthVerified {
+                provider: "g".to_owned(),
+                subject_id: "1".to_owned(),
+                verified_at: 0,
+            },
+            verified_at: 0,
+            verifier_did: None,
+        };
+        assert!(evidence.validate_proof_method().is_ok());
+    }
+
+    #[test]
+    fn validate_proof_method_mismatched() {
+        let evidence = AttestationEvidence {
+            method: VerificationMethod::DnsRecord,
+            proof: AttestationProof::OauthVerified {
+                provider: "g".to_owned(),
+                subject_id: "1".to_owned(),
+                verified_at: 0,
+            },
+            verified_at: 0,
+            verifier_did: None,
+        };
+        let err = evidence.validate_proof_method().unwrap_err();
+        assert!(
+            err.contains("Oauth") && err.contains("DnsRecord"),
+            "error should mention both methods: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_structure_catches_proof_method_mismatch() {
+        let mut attestation = make_attestation();
+        // Method is Oauth from make_attestation; change method to DnsRecord to create mismatch
+        attestation.evidence.method = VerificationMethod::DnsRecord;
+        let errors = attestation.validate_structure();
+        assert!(
+            errors.iter().any(|e| e.contains("proof variant expects")),
+            "validate_structure should catch proof-method mismatch: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn all_verification_methods_have_matching_proof_variant() {
+        let pairs: [(VerificationMethod, AttestationProof); 4] = [
+            (
+                VerificationMethod::Oauth,
+                AttestationProof::OauthVerified {
+                    provider: "p".to_owned(),
+                    subject_id: "s".to_owned(),
+                    verified_at: 0,
+                },
+            ),
+            (
+                VerificationMethod::SignedPost,
+                AttestationProof::SignedPostVerified {
+                    post_url: "u".to_owned(),
+                    nonce: "n".to_owned(),
+                    posted_at: 0,
+                },
+            ),
+            (
+                VerificationMethod::DnsRecord,
+                AttestationProof::DnsRecordVerified {
+                    domain: "d".to_owned(),
+                    record_name: "r".to_owned(),
+                },
+            ),
+            (
+                VerificationMethod::ChallengeResponse,
+                AttestationProof::ChallengeResponseVerified {
+                    challenge: "c".to_owned(),
+                    response_signature: "s".to_owned(),
+                },
+            ),
+        ];
+        for (method, proof) in &pairs {
+            assert_eq!(
+                proof.expected_method(),
+                *method,
+                "proof {proof:?} should map to {method:?}"
+            );
+            let evidence = AttestationEvidence {
+                method: *method,
+                proof: proof.clone(),
+                verified_at: 0,
+                verifier_did: None,
+            };
+            assert!(
+                evidence.validate_proof_method().is_ok(),
+                "expected valid for method {method:?}"
+            );
+        }
     }
 }

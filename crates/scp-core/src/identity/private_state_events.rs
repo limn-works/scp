@@ -1113,7 +1113,11 @@ mod tests {
                     ),
                     evidence: super::super::attestation::AttestationEvidence {
                         method: super::super::attestation::VerificationMethod::Oauth,
-                        proof: "proof".to_owned(),
+                        proof: super::super::attestation::AttestationProof::OauthVerified {
+                            provider: "github.com".to_owned(),
+                            subject_id: "12345".to_owned(),
+                            verified_at: 1_700_000_000,
+                        },
                         verified_at: 1_700_000_000_000,
                         verifier_did: None,
                     },
