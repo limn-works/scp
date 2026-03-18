@@ -298,7 +298,18 @@ fn validate_claim_request(
     }
 
     // 5. Validate the attestation is not revoked.
-    if let RevocationStatus::Revoked { .. } = &request.identity_attestation.revocation_status {
+    // Per §7.4.1, only the issuer can revoke their own attestation.
+    if let RevocationStatus::Revoked { revoked_by, .. } =
+        &request.identity_attestation.revocation_status
+    {
+        if *revoked_by != request.identity_attestation.issuer {
+            return Err(ClaimError::AttestationInvalid {
+                reason: format!(
+                    "attestation revoked_by {} does not match issuer {}",
+                    revoked_by, request.identity_attestation.issuer,
+                ),
+            });
+        }
         return Err(ClaimError::AttestationInvalid {
             reason: "attestation has been revoked".to_owned(),
         });
@@ -799,6 +810,34 @@ mod tests {
         let err = claim_shadow(&mut registry, &request).unwrap_err();
 
         assert!(matches!(err, ClaimError::AttestationInvalid { .. }));
+    }
+
+    #[test]
+    fn claim_shadow_fails_when_revoked_by_non_issuer() {
+        let mut registry = make_registry();
+        create_test_shadow(&mut registry);
+
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut attestation = make_identity_attestation(&did, HANDLE, &signing_key);
+        attestation.revocation_status = RevocationStatus::Revoked {
+            revoked_at: 1_700_000_250,
+            reason: Some("forged revocation".to_owned()),
+            revoked_by: "did:key:mallory".into(),
+        };
+
+        let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
+        let err = claim_shadow(&mut registry, &request).unwrap_err();
+
+        match &err {
+            ClaimError::AttestationInvalid { reason } => {
+                assert!(
+                    reason.contains("revoked_by"),
+                    "expected revoked_by mismatch error, got: {reason}",
+                );
+            }
+            other => panic!("expected AttestationInvalid, got {other:?}"),
+        }
     }
 
     // -------------------------------------------------------------------

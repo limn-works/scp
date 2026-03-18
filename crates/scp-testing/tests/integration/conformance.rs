@@ -217,21 +217,31 @@ fn conf_004_agent_binding_attestation() {
     let human_key = make_signing_key(0x01);
     let agent_key = make_signing_key(0x02);
 
+    // Use did:key:{hex} format so IdentityDidPublicKeyResolver can resolve
+    // the issuer's public key during cross-verification.
+    let human_did = format!("did:key:{}", hex(&human_key.verifying_key().to_bytes()));
+    let agent_did = format!("did:key:{}", hex(&agent_key.verifying_key().to_bytes()));
+
+    let claim = serde_json::json!({"platform": "agent-binding"});
+    let claim_str = claim.to_string();
+
     print_step(1, "Create identity attestation binding agent to human");
     // RevocationStatus::Active serialized as MessagePack.
     let revocation_active_bytes =
         rmp_serde::to_vec(&scp_core::trust::RevocationStatus::Active).unwrap();
+    // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
+    // evidence, issued_at, expires_at, revocation_status.
     let attestation_payload = canonical_hash_bytes(
         b"SCP-ATTESTATION-V2:",
         &[
             CanonicalField::VarBytes(b"agent-binding-001"),
-            CanonicalField::U16(0x0001), // IdentityLink
-            CanonicalField::VarBytes(b"did:dht:z6MkHuman"),
-            CanonicalField::VarBytes(b"did:dht:z6MkAgent"),
-            CanonicalField::VarBytes(&agent_key.verifying_key().to_bytes()),
+            CanonicalField::U16(0x0000), // IdentityLink = tag 0
+            CanonicalField::VarBytes(human_did.as_bytes()),
+            CanonicalField::VarBytes(agent_did.as_bytes()),
+            CanonicalField::VarBytes(claim_str.as_bytes()),
             CanonicalField::Absent, // no evidence
             CanonicalField::U64(1_700_000_000),
-            CanonicalField::U64(0),
+            CanonicalField::Absent, // expires_at: None → Absent per V2 spec
             CanonicalField::VarBytes(&revocation_active_bytes),
         ],
     );
@@ -240,13 +250,39 @@ fn conf_004_agent_binding_attestation() {
     print_step(2, "Sign attestation with human's active key");
     let signature = human_key.sign(&hash);
 
-    print_step(3, "Verify attestation signature");
+    print_step(3, "Verify attestation signature (manual)");
     human_key
         .verifying_key()
         .verify(&hash, &signature)
         .expect("attestation must verify");
 
-    print_step(4, "Verify agent key matches attestation");
+    print_step(
+        4,
+        "Cross-verify: manual canonical bytes match verify_attestation()",
+    );
+    // Build an Attestation struct with the same fields and verify it through
+    // the production verify_attestation() code path. This ensures the manual
+    // canonical construction above matches canonical_attestation_bytes().
+    let attestation = scp_core::trust::Attestation {
+        id: "agent-binding-001".to_owned(),
+        attestation_type: scp_core::trust::AttestationType::IdentityLink,
+        issuer: DID::from(human_did.as_str()),
+        subject: DID::from(agent_did.as_str()),
+        claim,
+        evidence: None,
+        issued_at: 1_700_000_000,
+        expires_at: None,
+        renewal_interval: None,
+        renewed_at: None,
+        revocation_status: scp_core::trust::RevocationStatus::Active,
+        signature: signature.to_bytes().to_vec(),
+    };
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::TestClock::new(1_700_000_000);
+    scp_core::trust::verify_attestation(&attestation, &resolver, &clock)
+        .expect("cross-verification: manual bytes must match canonical_attestation_bytes()");
+
+    print_step(5, "Verify agent key matches attestation");
     let agent_pub = agent_key.verifying_key().to_bytes();
     assert_eq!(agent_pub.len(), 32);
 
