@@ -146,10 +146,13 @@ class Node:
         """The node's DID string (e.g. ``did:dht:z6Mk...``)."""
         return self._handle.did  # type: ignore[no-any-return]
 
-    @property
-    def http_url(self) -> str | None:
-        """The HTTP URL of the background server, or ``None`` if not serving."""
-        return self._handle.http_url  # type: ignore[no-any-return]
+    async def http_url(self) -> str | None:
+        """Return the HTTP URL of the background server, or ``None`` if not serving.
+
+        Returns the literal bind address, which may contain ``0.0.0.0`` if the
+        server was bound to the unspecified address.
+        """
+        return await asyncio.to_thread(self._handle.http_url)  # type: ignore[no-any-return]
 
     @property
     def is_shutdown(self) -> bool:
@@ -184,6 +187,14 @@ class Node:
 
         If ``bind_addr`` is ``None``, defaults to ``127.0.0.1:8443``
         (loopback only). Pass ``"0.0.0.0:PORT"`` for network access.
+
+        Returns the actual bound address as a raw string (e.g.
+        ``"127.0.0.1:8080"``). Use :meth:`http_url` for the full URL
+        form (``"http://127.0.0.1:8080"``).
+
+        Note: The background server does not support TLS. For production
+        deployments requiring encryption, use the node binary's
+        ``serve()`` with TLS configuration.
 
         Args:
             bind_addr: Socket address to bind (e.g. ``"127.0.0.1:8080"``).

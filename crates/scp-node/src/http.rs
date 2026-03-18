@@ -591,14 +591,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             self.state.shutdown_token.clone(),
         );
 
-        let cors = build_cors_layer(&self.state.cors_origins);
-
-        // Apply CORS to public endpoints only. The WebSocket relay endpoint
-        // uses its own origin mechanism; the dev API is localhost-only.
-        let well_known = well_known_router(Arc::clone(&self.state)).layer(cors.clone());
-        let relay_rt = relay_router(Arc::clone(&self.state));
-        let projection =
-            crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
+        // Build the full merged router via the shared helper.
+        let merged = self.build_scp_router(app_router);
 
         let dev_router = self
             .state
@@ -610,23 +604,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         #[cfg(feature = "http3")]
         let http3_config = self.http3_config;
 
-        let (bridge, bridge_webhook) =
-            build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
         let relay = self.relay;
         let state = self.state;
-
-        // SCP routes take precedence: merge them last so they override
-        // any conflicting paths in app_router. ACME challenge router is
-        // included for renewal support (issue #305).
-        let merged = build_merged_router(
-            app_router,
-            well_known,
-            relay_rt,
-            projection,
-            bridge,
-            bridge_webhook,
-            state.acme_challenges.as_ref(),
-        );
 
         let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 

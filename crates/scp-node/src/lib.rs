@@ -403,7 +403,39 @@ impl<S: Storage> ApplicationNode<S> {
         }
     }
 
+    /// Builds the merged SCP protocol router (well-known, relay, projection,
+    /// bridge, ACME challenge routes) for use by both [`serve`](Self::serve)
+    /// and [`serve_background`](Self::serve_background).
+    ///
+    /// `app_router` is the caller-supplied application router that SCP routes
+    /// are merged onto. Pass `axum::Router::new()` when there is no
+    /// application router (e.g. `serve_background`).
+    fn build_scp_router(&self, app_router: axum::Router) -> axum::Router {
+        let cors = http::build_cors_layer(&self.state.cors_origins);
+        let well_known = http::well_known_router(Arc::clone(&self.state)).layer(cors.clone());
+        let relay_rt = http::relay_router(Arc::clone(&self.state));
+        let projection =
+            crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
+        let (bridge, bridge_webhook) =
+            http::build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
+
+        http::build_merged_router(
+            app_router,
+            well_known,
+            relay_rt,
+            projection,
+            bridge,
+            bridge_webhook,
+            self.state.acme_challenges.as_ref(),
+        )
+    }
+
     /// Returns the HTTP URL of the background server, if running.
+    ///
+    /// Returns the literal bind address, which may contain `0.0.0.0` if the
+    /// server was bound to the unspecified address. Callers should replace
+    /// `0.0.0.0` with the appropriate interface address when constructing
+    /// user-facing URLs.
     ///
     /// Returns `Some("http://<addr>")` when [`serve_background`](Self::serve_background)
     /// has been called and the server is actively listening. Returns `None`
@@ -427,6 +459,18 @@ impl<S: Storage> ApplicationNode<S> {
     /// is used, since exposing the HTTP server to the network may have
     /// security implications.
     ///
+    /// ## TLS
+    ///
+    /// The background server does **not** use TLS — all HTTP traffic is
+    /// plaintext. For production deployments requiring encryption, use the
+    /// node binary's [`serve`](Self::serve) method with TLS configuration.
+    ///
+    /// ## Dev API
+    ///
+    /// The dev API listener (spec §18.10) is intentionally **not** spawned
+    /// by this method. It is designed for the node binary's `serve()` flow,
+    /// not for SDK consumers using `serve_background()`.
+    ///
     /// ## Double-serve prevention
     ///
     /// Calling this method more than once returns an error without starting
@@ -441,6 +485,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// # Errors
     ///
     /// Returns [`NodeError::Serve`] if:
+    /// - The node has already been shut down.
     /// - The server is already running (double-serve).
     /// - The TCP listener cannot bind.
     /// - The bound address cannot be retrieved.
@@ -448,6 +493,14 @@ impl<S: Storage> ApplicationNode<S> {
         &self,
         bind_addr: Option<SocketAddr>,
     ) -> Result<SocketAddr, NodeError> {
+        // Reject if the node has already been shut down — the cancellation
+        // token is already cancelled so the server would exit immediately.
+        if self.state.shutdown_token.is_cancelled() {
+            return Err(NodeError::Serve(
+                "node has been shut down; cannot start background HTTP server".into(),
+            ));
+        }
+
         // Prevent double-serve.
         if self
             .serving
@@ -466,37 +519,15 @@ impl<S: Storage> ApplicationNode<S> {
             tracing::warn!(
                 bind_addr = %addr,
                 "serve_background binding to non-loopback address — \
-                 HTTP server will be accessible from the network"
+                 HTTP traffic is unencrypted (no TLS) and will be \
+                 accessible from the network"
             );
         }
 
-        let state = Arc::clone(&self.state);
         let shutdown_token = self.state.shutdown_token.clone();
 
         // Build the full merged router (same as serve()).
-        let cors = http::build_cors_layer(&state.cors_origins);
-        let well_known = http::well_known_router(Arc::clone(&state)).layer(cors.clone());
-        let relay_rt = http::relay_router(Arc::clone(&state));
-        let projection =
-            crate::projection::broadcast_projection_router(Arc::clone(&state)).layer(cors);
-        let (bridge, bridge_webhook) =
-            http::build_bridge_routers(&state.bridge_state, state.bridge_lookup.as_ref());
-
-        let merged = http::build_merged_router(
-            axum::Router::new(),
-            well_known,
-            relay_rt,
-            projection,
-            bridge,
-            bridge_webhook,
-            state.acme_challenges.as_ref(),
-        );
-
-        // Spawn the projection rate limiter cleanup.
-        http::spawn_projection_rate_limit_cleanup(
-            state.projection_rate_limiter.clone(),
-            shutdown_token.clone(),
-        );
+        let merged = self.build_scp_router(axum::Router::new());
 
         // Bind the TCP listener before spawning so we can report errors
         // and the bound address synchronously.
@@ -517,6 +548,13 @@ impl<S: Storage> ApplicationNode<S> {
             let mut guard = self.serving_addr.lock().await;
             *guard = Some(local_addr);
         }
+
+        // Spawn the projection rate limiter cleanup only after a successful
+        // bind — avoids leaking a background task on bind failure.
+        http::spawn_projection_rate_limit_cleanup(
+            self.state.projection_rate_limiter.clone(),
+            shutdown_token.clone(),
+        );
 
         let serving_flag = Arc::clone(&self.serving);
         let serving_addr_ref = Arc::clone(&self.serving_addr);
@@ -2923,17 +2961,6 @@ fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
     Zeroizing::new(bytes)
 }
 
-/// Creates a field-by-field copy of an [`ScpIdentity`] (does not derive Clone).
-fn clone_identity(id: &ScpIdentity) -> ScpIdentity {
-    ScpIdentity {
-        identity_key: id.identity_key,
-        active_signing_key: id.active_signing_key,
-        agent_signing_key: id.agent_signing_key,
-        pre_rotation_commitment: id.pre_rotation_commitment,
-        did: id.did.clone(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Dev API token generation (spec §18.10.2)
 // ---------------------------------------------------------------------------
@@ -3300,7 +3327,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         inner: Arc::clone(&did_method),
     });
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
-    let bg_identity = clone_identity(&identity);
+    let bg_identity = identity.clone();
     let tier_reeval = spawn_tier_reevaluation(
         nat_strategy,
         network_detector,

@@ -47,7 +47,7 @@ interface NativeNodeHandle {
   readonly isShutdown: boolean;
   shutdown(): void;
   serve(bindAddr: string | null): Promise<string>;
-  readonly httpUrl: Promise<string | null>;
+  httpUrl(): Promise<string | null>;
   enableSiteProjection(
     contextId: string,
     broadcastKeyHex: string,
@@ -275,6 +275,13 @@ export class Node implements AsyncDisposable {
    * Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is not
    * provided. Pass `"0.0.0.0:PORT"` for network access.
    *
+   * Returns the actual bound address as a raw string (e.g. `"127.0.0.1:8443"`).
+   * Use {@link httpUrl} for the full URL form (`"http://127.0.0.1:8443"`).
+   *
+   * **Note:** The background server does not support TLS. For production
+   * deployments requiring encryption, use the node binary's `serve()` with
+   * TLS configuration.
+   *
    * @param bindAddr - Socket address to bind (e.g. `"127.0.0.1:8080"`).
    * @returns The actual bound address as a string.
    * @throws {Error} If the server is already running or binding fails.
@@ -285,9 +292,12 @@ export class Node implements AsyncDisposable {
 
   /**
    * The HTTP URL of the background server, or `null` if not serving.
+   *
+   * Returns the literal bind address, which may contain `0.0.0.0` if the
+   * server was bound to the unspecified address.
    */
-  get httpUrl(): Promise<string | null> {
-    return this.#handle.httpUrl;
+  async httpUrl(): Promise<string | null> {
+    return this.#handle.httpUrl();
   }
 
   // -------------------------------------------------------------------------

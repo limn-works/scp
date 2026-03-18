@@ -296,6 +296,10 @@ public struct Node: Sendable {
     /// Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is nil.
     /// Pass `"0.0.0.0:PORT"` for network access.
     ///
+    /// **Note:** The background server does not support TLS. All HTTP traffic is
+    /// plaintext. For production deployments requiring encryption, use the node
+    /// binary's `serve()` with TLS configuration.
+    ///
     /// - Parameters:
     ///   - bindAddr: Socket address to bind (e.g. `"127.0.0.1:8080"`).
     ///   - serveFn: Bridge function override for testing.

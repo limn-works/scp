@@ -266,15 +266,23 @@ impl NapiNodeHandle {
     /// Starts the HTTP server in the background on the given bind address.
     ///
     /// Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is not
-    /// provided. Returns the actual bound address as a string.
+    /// provided. Returns the actual bound address as a raw string
+    /// (e.g. `"127.0.0.1:8443"`). Use [`http_url`](NapiNodeHandle::http_url)
+    /// for the full URL form (`"http://127.0.0.1:8443"`).
+    ///
+    /// **Note:** The background server does not support TLS. For production
+    /// deployments requiring encryption, use the node binary's `serve()`
+    /// with TLS configuration.
     ///
     /// Throws if the server is already running or binding fails.
     #[napi]
     pub async fn serve(&self, bind_addr: Option<String>) -> napi::Result<String> {
         let addr = bind_addr
             .map(|s| {
-                s.parse::<std::net::SocketAddr>()
-                    .map_err(|e| NapiError::from_reason(format!("invalid bind_addr: {e}")))
+                s.parse::<std::net::SocketAddr>().map_err(|e| {
+                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    NapiError::from_reason(format!("invalid bind_addr \"{display}\": {e}"))
+                })
             })
             .transpose()?;
         self.inner
@@ -285,7 +293,10 @@ impl NapiNodeHandle {
     }
 
     /// Returns the HTTP URL of the background server, or `null` if not serving.
-    #[napi(getter)]
+    ///
+    /// Returns the literal bind address, which may contain `0.0.0.0` if the
+    /// server was bound to the unspecified address.
+    #[napi]
     pub async fn http_url(&self) -> Option<String> {
         self.inner.http_url().await
     }
