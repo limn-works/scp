@@ -1,19 +1,25 @@
 //! Discovery bootstrap and fallback configuration.
 //!
-//! Provides configurable default bootstrap context IDs (analogous to DNS root
+//! Provides configurable default bootstrap context entries (analogous to DNS root
 //! servers) and a resolver that combines context queries with
 //! fallback to direct DID resolution.
+//!
+//! Each bootstrap context entry pairs a context ID with the expected creator DID,
+//! enabling post-join verification that defends against context ID substitution
+//! attacks (§22.13.2).
 //!
 //! The SDK ships with configurable defaults that are auto-queried on first
 //! identity creation (opt-out). Users can add custom contexts with discovery tools and
 //! configure fallback behavior.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md`, acceptance criterion 8.
+//! See §22.13 for bootstrap context governance.
 
+use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::well_known::{WellKnownScp, WellKnownValidationError};
-use scp_identity::{DID, DidMethod};
+use scp_identity::DidMethod;
 
 use super::{ContextId, DiscoveryError};
 
@@ -21,29 +27,65 @@ use super::{ContextId, DiscoveryError};
 // BootstrapContextEntry
 // ---------------------------------------------------------------------------
 
-/// A bootstrap context entry pairing a context ID with the expected creator DID.
+/// A bootstrap context with expected creator DID for post-join verification.
 ///
-/// The `expected_creator_did` enables the SDK to verify that the context was
-/// indeed created by the expected operator (spec §22.13), preventing a
-/// hijacked context ID from impersonating a bootstrap context.
+/// Pairs a `context_id` with an `expected_creator_did`. After the SDK joins a
+/// bootstrap context via MLS group join, it MUST verify that the context's
+/// creator DID matches the `expected_creator_did`. The creator DID is available
+/// from the context's event log (the first event in any context is the creation
+/// event, signed by the creator's DID). If the creator DID does not match, the
+/// SDK MUST leave the context and treat the entry as failed — the context may
+/// have been substituted by an attacker.
 ///
-/// **Caller responsibility:** The bootstrap resolver does not enforce creator
-/// DID verification automatically — the creator DID is only available after
-/// joining the context (from the creation event in the event log). Callers
-/// MUST verify that the resolved context's creator DID matches
-/// `expected_creator_did` after joining. If the creator DID does not match,
-/// the caller MUST leave the context and treat the entry as compromised
-/// (spec §22.13.2).
+/// See §22.13.2 for the full verification protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapContextEntry {
-    /// The context ID to bootstrap from.
+    /// The bootstrap context's ID (hex-encoded).
     pub context_id: ContextId,
-
-    /// The expected DID of the context creator. The SDK MUST verify this
-    /// against the actual context creator after joining, before trusting any
-    /// bootstrap data. See spec §22.13.2 for the post-join verification
-    /// protocol.
+    /// The DID of the expected context creator. SDK MUST verify this matches the
+    /// actual context creator after joining (§22.13.2).
     pub expected_creator_did: DID,
+}
+
+impl BootstrapContextEntry {
+    /// Creates a new `BootstrapContextEntry`.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The bootstrap context's ID.
+    /// * `expected_creator_did` -- The DID of the expected context creator.
+    #[must_use]
+    pub const fn new(context_id: ContextId, expected_creator_did: DID) -> Self {
+        Self {
+            context_id,
+            expected_creator_did,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BootstrapVerificationError
+// ---------------------------------------------------------------------------
+
+/// Errors produced when verifying a bootstrap context's creator DID.
+#[derive(Debug, thiserror::Error)]
+pub enum BootstrapVerificationError {
+    /// The actual creator DID does not match the expected creator DID from
+    /// the bootstrap configuration.
+    ///
+    /// This indicates a potential context ID substitution attack (§22.13.2).
+    /// The SDK MUST leave the context when this error is returned.
+    #[error(
+        "bootstrap context creator mismatch for {context_id}: expected {expected}, got {actual}"
+    )]
+    CreatorMismatch {
+        /// The context ID that was verified.
+        context_id: ContextId,
+        /// The expected creator DID from the bootstrap configuration.
+        expected: DID,
+        /// The actual creator DID from the context's event log.
+        actual: DID,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -57,10 +99,13 @@ pub struct BootstrapContextEntry {
 /// direct DID resolution when contexts with discovery tools are unavailable.
 ///
 /// Analogous to DNS root servers: the SDK ships with configurable default
-/// bootstrap context entries. Users can add custom contexts with discovery tools. If
-/// defaults are unreachable, direct DID resolution still works.
+/// bootstrap context entries. Users can add custom contexts with discovery tools.
+/// If defaults are unreachable, direct DID resolution still works.
 ///
-/// See ADR-020 acceptance criterion 8, spec §22.13.
+/// Each context entry includes the expected creator DID for post-join
+/// verification (§22.13.2).
+///
+/// See ADR-020 acceptance criterion 8, §22.13.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapConfig {
     /// Default bootstrap context entries shipped with the SDK.
@@ -104,19 +149,19 @@ impl Default for BootstrapConfig {
 }
 
 impl BootstrapConfig {
-    /// Creates a new `BootstrapConfig` with the given default bootstrap
-    /// context entries.
+    /// Creates a new `BootstrapConfig` with the given default bootstrap context
+    /// entries.
     ///
     /// All other fields are set to their defaults: auto-query enabled,
     /// fallback enabled, no custom contexts.
     ///
     /// # Arguments
     ///
-    /// * `entries` -- Default bootstrap context entries to query on bootstrap.
+    /// * `contexts` -- Default bootstrap context entries to query on bootstrap.
     #[must_use]
-    pub fn with_defaults(entries: Vec<BootstrapContextEntry>) -> Self {
+    pub fn with_defaults(contexts: Vec<BootstrapContextEntry>) -> Self {
         Self {
-            default_contexts: entries,
+            default_contexts: contexts,
             ..Self::default()
         }
     }
@@ -130,34 +175,61 @@ impl BootstrapConfig {
         self.custom_contexts.push(entry);
     }
 
-    /// Returns all context IDs (defaults + custom) as a combined list.
+    /// Returns all context entries (defaults + custom) as a combined list.
     ///
-    /// The returned list contains context IDs from the default entries
-    /// followed by those from the custom entries.
+    /// The returned list contains references to the default context entries
+    /// followed by the custom context entries.
     #[must_use]
-    pub fn all_context_ids(&self) -> Vec<&ContextId> {
+    pub fn all_contexts(&self) -> Vec<&BootstrapContextEntry> {
         self.default_contexts
             .iter()
             .chain(self.custom_contexts.iter())
-            .map(|entry| &entry.context_id)
             .collect()
     }
 
-    /// Returns all context entries (defaults + custom) as a combined list.
+    /// Verifies that a context's actual creator DID matches the expected
+    /// creator DID in the bootstrap configuration.
     ///
-    /// Each entry carries an `expected_creator_did` that callers MUST verify
-    /// after joining the context. The bootstrap resolver itself does NOT
-    /// perform this verification — the creator DID is only available from
-    /// the context's creation event in the event log. Without post-join
-    /// verification, a hijacked context ID could impersonate a bootstrap
-    /// context. See [`BootstrapContextEntry`] for the full verification
-    /// protocol and spec §22.13.2.
-    #[must_use]
-    pub fn all_entries(&self) -> Vec<&BootstrapContextEntry> {
-        self.default_contexts
+    /// This implements the post-join verification step from §22.13.2. After
+    /// joining a bootstrap context, the SDK calls this method with the context
+    /// ID and the creator DID extracted from the context's event log.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the context was found in the configuration and the
+    ///   creator DID matches.
+    /// - `Ok(false)` if the context is not in the bootstrap configuration
+    ///   (not a bootstrap context, no verification needed).
+    /// - `Err(CreatorMismatch)` if the context was found but the actual
+    ///   creator DID does not match the expected one. The SDK MUST leave the
+    ///   context in this case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BootstrapVerificationError::CreatorMismatch`] when the context
+    /// is found in the configuration but the creator DID does not match.
+    pub fn verify_context_creator(
+        &self,
+        context_id: &ContextId,
+        actual_creator_did: &DID,
+    ) -> Result<bool, BootstrapVerificationError> {
+        let entry = self
+            .default_contexts
             .iter()
             .chain(self.custom_contexts.iter())
-            .collect()
+            .find(|e| e.context_id == *context_id);
+
+        entry.map_or(Ok(false), |e| {
+            if e.expected_creator_did == *actual_creator_did {
+                Ok(true)
+            } else {
+                Err(BootstrapVerificationError::CreatorMismatch {
+                    context_id: context_id.clone(),
+                    expected: e.expected_creator_did.clone(),
+                    actual: actual_creator_did.clone(),
+                })
+            }
+        })
     }
 
     /// Returns whether the SDK should auto-query contexts with discovery tools on first
@@ -206,12 +278,15 @@ impl BootstrapResolver {
 
     /// Returns all available context IDs (defaults + custom),
     /// deduplicated while preserving order.
+    ///
+    /// Extracts context IDs from [`BootstrapContextEntry`] entries.
     #[must_use]
     pub fn resolve_contexts(&self) -> Vec<ContextId> {
         let mut seen = std::collections::HashSet::new();
         self.config
-            .all_context_ids()
+            .all_contexts()
             .into_iter()
+            .map(|entry| &entry.context_id)
             .filter(|id| seen.insert((*id).clone()))
             .cloned()
             .collect()
@@ -321,11 +396,30 @@ impl From<BootstrapConfig> for BootstrapResolver {
 mod tests {
     use super::*;
 
-    fn entry(id: &str, did: &str) -> BootstrapContextEntry {
-        BootstrapContextEntry {
-            context_id: id.to_owned(),
-            expected_creator_did: DID(did.to_owned()),
-        }
+    // -- Helper: create a BootstrapContextEntry ----------------------------
+
+    fn entry(ctx_id: &str, creator: &str) -> BootstrapContextEntry {
+        BootstrapContextEntry::new(ctx_id.to_owned(), DID::from(creator))
+    }
+
+    // -- BootstrapContextEntry --------------------------------------------
+
+    #[test]
+    fn bootstrap_context_entry_construction() {
+        let e = BootstrapContextEntry::new(
+            "ctx-discovery-1".to_owned(),
+            DID::from("did:dht:zCreator1"),
+        );
+        assert_eq!(e.context_id, "ctx-discovery-1");
+        assert_eq!(e.expected_creator_did, "did:dht:zCreator1");
+    }
+
+    #[test]
+    fn bootstrap_context_entry_serde_roundtrip() {
+        let e = entry("ctx-discovery-1", "did:dht:zCreator1");
+        let json = serde_json::to_string(&e).unwrap();
+        let deserialized: BootstrapContextEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, deserialized);
     }
 
     // -- BootstrapConfig defaults -----------------------------------------
@@ -350,9 +444,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_all_context_ids_returns_empty() {
+    fn default_config_all_contexts_returns_empty() {
         let config = BootstrapConfig::default();
-        assert!(config.all_context_ids().is_empty());
+        assert!(config.all_contexts().is_empty());
     }
 
     // -- BootstrapConfig construction -------------------------------------
@@ -360,8 +454,8 @@ mod tests {
     #[test]
     fn with_defaults_sets_default_contexts() {
         let entries = vec![
-            entry("ctx-discovery-1", "did:dht:z6MkOp1"),
-            entry("ctx-discovery-2", "did:dht:z6MkOp2"),
+            entry("ctx-discovery-1", "did:dht:zCreator1"),
+            entry("ctx-discovery-2", "did:dht:zCreator2"),
         ];
         let config = BootstrapConfig::with_defaults(entries.clone());
 
@@ -376,54 +470,41 @@ mod tests {
     #[test]
     fn add_custom_context_appends_to_custom_list() {
         let mut config = BootstrapConfig::default();
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkC1"));
-        config.add_custom_context(entry("ctx-custom-2", "did:dht:z6MkC2"));
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"));
+        config.add_custom_context(entry("ctx-custom-2", "did:dht:zCustom2"));
 
         assert_eq!(config.custom_contexts.len(), 2);
         assert_eq!(config.custom_contexts[0].context_id, "ctx-custom-1");
         assert_eq!(config.custom_contexts[1].context_id, "ctx-custom-2");
     }
 
-    // -- all_context_ids combines defaults and custom ---------------------
+    // -- all_contexts combines defaults and custom ------------------------
 
     #[test]
-    fn all_context_ids_combines_defaults_and_custom() {
+    fn all_contexts_combines_defaults_and_custom() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:z6MkOp")]);
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkC"));
+            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]);
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:zC1"));
 
-        let all_ids = config.all_context_ids();
-        assert_eq!(all_ids.len(), 2);
-        assert_eq!(all_ids[0], "ctx-default-1");
-        assert_eq!(all_ids[1], "ctx-custom-1");
+        let all = config.all_contexts();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].context_id, "ctx-default-1");
+        assert_eq!(all[1].context_id, "ctx-custom-1");
     }
 
     #[test]
-    fn all_context_ids_defaults_come_before_custom() {
+    fn all_contexts_defaults_come_before_custom() {
         let mut config = BootstrapConfig::with_defaults(vec![
-            entry("ctx-d1", "did:dht:z6Mk1"),
-            entry("ctx-d2", "did:dht:z6Mk2"),
+            entry("ctx-d1", "did:dht:zD1"),
+            entry("ctx-d2", "did:dht:zD2"),
         ]);
-        config.add_custom_context(entry("ctx-c1", "did:dht:z6MkC"));
+        config.add_custom_context(entry("ctx-c1", "did:dht:zC1"));
 
-        let all_ids = config.all_context_ids();
-        assert_eq!(all_ids.len(), 3);
-        assert_eq!(*all_ids[0], "ctx-d1");
-        assert_eq!(*all_ids[1], "ctx-d2");
-        assert_eq!(*all_ids[2], "ctx-c1");
-    }
-
-    // -- all_entries ------------------------------------------------------
-
-    #[test]
-    fn all_entries_returns_entries_with_creator_dids() {
-        let mut config = BootstrapConfig::with_defaults(vec![entry("ctx-d1", "did:dht:z6MkOp1")]);
-        config.add_custom_context(entry("ctx-c1", "did:dht:z6MkOp2"));
-
-        let entries = config.all_entries();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].expected_creator_did, "did:dht:z6MkOp1");
-        assert_eq!(entries[1].expected_creator_did, "did:dht:z6MkOp2");
+        let all = config.all_contexts();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].context_id, "ctx-d1");
+        assert_eq!(all[1].context_id, "ctx-d2");
+        assert_eq!(all[2].context_id, "ctx-c1");
     }
 
     // -- Opt-out of auto-query --------------------------------------------
@@ -449,8 +530,8 @@ mod tests {
     #[test]
     fn bootstrap_config_serialization_roundtrip() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:z6MkOp1")]);
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkOp2"));
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"));
         config.auto_query_on_identity_creation = false;
 
         let json = serde_json::to_string(&config).unwrap();
@@ -459,14 +540,67 @@ mod tests {
         assert_eq!(config, deserialized);
     }
 
+    // -- verify_context_creator -------------------------------------------
+
     #[test]
-    fn bootstrap_config_backward_compat_deserialization() {
-        // Old format without default_contexts/custom_contexts should still
-        // deserialize (serde(default) on both fields).
-        let json = r#"{"auto_query_on_identity_creation":true,"fallback_to_did_resolution":true}"#;
-        let config: BootstrapConfig = serde_json::from_str(json).unwrap();
-        assert!(config.default_contexts.is_empty());
-        assert!(config.custom_contexts.is_empty());
+    fn verify_context_creator_success() {
+        let config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+
+        let result = config
+            .verify_context_creator(
+                &"ctx-discovery-1".to_owned(),
+                &DID::from("did:dht:zCreator1"),
+            )
+            .unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn verify_context_creator_not_found() {
+        let config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+
+        let result = config
+            .verify_context_creator(&"ctx-unknown".to_owned(), &DID::from("did:dht:zCreator1"))
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn verify_context_creator_mismatch() {
+        let config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+
+        let err = config
+            .verify_context_creator(
+                &"ctx-discovery-1".to_owned(),
+                &DID::from("did:dht:zAttacker"),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BootstrapVerificationError::CreatorMismatch { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("ctx-discovery-1"));
+        assert!(msg.contains("did:dht:zCreator1"));
+        assert!(msg.contains("did:dht:zAttacker"));
+    }
+
+    #[test]
+    fn verify_context_creator_checks_custom_contexts() {
+        let mut config = BootstrapConfig::default();
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:zCustomCreator"));
+
+        let result = config
+            .verify_context_creator(
+                &"ctx-custom-1".to_owned(),
+                &DID::from("did:dht:zCustomCreator"),
+            )
+            .unwrap();
+        assert!(result);
     }
 
     // -- BootstrapResolver ------------------------------------------------
@@ -474,8 +608,8 @@ mod tests {
     #[test]
     fn resolver_returns_all_context_ids() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:z6MkOp")]);
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkC"));
+            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]);
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:zC1"));
 
         let resolver = BootstrapResolver::new(config);
         let contexts = resolver.resolve_contexts();
@@ -488,9 +622,9 @@ mod tests {
     #[test]
     fn resolver_deduplicates_context_ids() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:z6MkOp")]);
-        config.add_custom_context(entry("ctx-shared", "did:dht:z6MkOp"));
-        config.add_custom_context(entry("ctx-unique", "did:dht:z6MkC"));
+            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zCreator")]);
+        config.add_custom_context(entry("ctx-shared", "did:dht:zCreator"));
+        config.add_custom_context(entry("ctx-unique", "did:dht:zOther"));
 
         let resolver = BootstrapResolver::new(config);
         let contexts = resolver.resolve_contexts();
@@ -509,14 +643,14 @@ mod tests {
 
     #[test]
     fn resolver_config_accessor_returns_config() {
-        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:z6MkOp")]);
+        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:zC1")]);
         let resolver = BootstrapResolver::new(config.clone());
         assert_eq!(resolver.config(), &config);
     }
 
     #[test]
     fn resolver_from_config() {
-        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:z6MkOp")]);
+        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:zC1")]);
         let resolver: BootstrapResolver = config.into();
         assert_eq!(resolver.resolve_contexts(), vec!["ctx-1"]);
     }
@@ -526,7 +660,7 @@ mod tests {
     #[test]
     fn resolve_with_fallback_returns_contexts_when_available() {
         let config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:z6MkOp")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
         let resolver = BootstrapResolver::new(config);
 
         let result = resolver.resolve_with_fallback("did:dht:zTestDid").unwrap();
