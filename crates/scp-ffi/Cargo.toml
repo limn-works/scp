@@ -29,7 +29,7 @@ allow_in_memory_custody = ["scp-platform/testing", "dep:scp-testing"]
 server = ["scp-ffi-common/server", "dep:scp-node"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["experimental-async"] }
+pyo3 = { version = "0.24.1", features = ["experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
@@ -57,7 +57,7 @@ tls_codec = "0.4"
 zeroize = { workspace = true }
 
 [dev-dependencies]
-pyo3 = { version = "0.23", features = ["auto-initialize"] }
+pyo3 = { version = "0.24.1", features = ["auto-initialize"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing"] }
 # Tests need InMemoryKeyCustody.
