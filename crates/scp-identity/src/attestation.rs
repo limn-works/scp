@@ -466,10 +466,9 @@ impl ScpIdentityLinkService {
             ))
         })?;
 
-        let id_prefix = if self.attestation_id.len() >= 8 {
-            &self.attestation_id[..8]
-        } else {
-            &self.attestation_id
+        let id_prefix = match self.attestation_id.char_indices().nth(8) {
+            Some((byte_pos, _)) => &self.attestation_id[..byte_pos],
+            None => &self.attestation_id,
         };
 
         Ok(Service {
@@ -1106,5 +1105,34 @@ mod tests {
     fn identity_link_service_status_constants() {
         assert_eq!(ScpIdentityLinkService::STATUS_ACTIVE, "active");
         assert_eq!(ScpIdentityLinkService::STATUS_REVOKED, "revoked");
+    }
+
+    #[test]
+    fn identity_link_service_non_ascii_attestation_id_no_panic() {
+        // Multi-byte UTF-8 characters: each emoji is 4 bytes, so 8 chars = 32 bytes.
+        // A naive byte slice `[..8]` would split inside a character and panic.
+        let original = ScpIdentityLinkService {
+            attestation_id: "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}\u{1F605}\u{1F606}\u{1F607}\u{1F608}\u{1F609}".to_owned(),
+            platform: IdentityLinkPlatform::Github,
+            platform_handle: "@alice".to_owned(),
+            platform_id: None,
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+        };
+
+        // Must not panic — the bug was a byte-indexed slice on a multi-byte string.
+        let service = original.to_service_entry(test_did()).unwrap();
+
+        // The prefix should be the first 8 characters (emoji), not 8 bytes.
+        let expected_prefix: String = original.attestation_id.chars().take(8).collect();
+        assert!(
+            service.id.contains(&expected_prefix),
+            "service ID should contain first 8 chars of attestation_id, got: {}",
+            service.id
+        );
+
+        let parsed = ScpIdentityLinkService::from_service_entry(&service).unwrap();
+        assert_eq!(original, parsed);
     }
 }
