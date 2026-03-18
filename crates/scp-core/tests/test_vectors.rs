@@ -938,7 +938,7 @@ fn vector_24_25_sender_and_access_info_differ() {
 fn vector_26_identity_link_attestation() {
     use scp_core::identity::attestation::{
         ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        AttestationProof, AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use std::borrow::Cow;
@@ -957,8 +957,11 @@ fn vector_26_identity_link_attestation() {
         claim: AttestationClaim::new("google.com".to_owned(), "alice@gmail.com".to_owned(), None),
         evidence: AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: r#"{"provider":"google.com","subject_id":"12345","verified_at":1700000000}"#
-                .to_owned(),
+            proof: AttestationProof::OauthVerified {
+                provider: "google.com".to_owned(),
+                subject_id: "12345".to_owned(),
+                verified_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000,
             verifier_did: None,
         },

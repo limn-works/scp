@@ -1261,8 +1261,9 @@ fn py_create_identity_link_attestation(
 
     use scp_core::identity::attestation::{
         ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        AttestationProof, AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
+    use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
@@ -1288,6 +1289,10 @@ fn py_create_identity_link_attestation(
                 )));
             }
         };
+
+        // Parse the proof JSON string into a typed AttestationProof.
+        let proof: AttestationProof = serde_json::from_str(&proof_owned)
+            .map_err(|e| ScpPyError::identity(format!("invalid proof JSON: {e}")))?;
 
         crate::runtime::with_identity_mut(&did_owned, |entry| {
             let issuer = DID::from(did_owned.as_str());
@@ -1319,11 +1324,12 @@ fn py_create_identity_link_attestation(
                 claim: AttestationClaim::new(platform_owned, handle_owned, platform_id_owned),
                 evidence: AttestationEvidence {
                     method,
-                    proof: proof_owned,
+                    proof,
                     verified_at: now_ms,
                     verifier_did: None,
                 },
                 revocation: AttestationRevocation::new("/revocations".to_owned()),
+                revocation_status: RevocationStatus::Active,
                 signature: Vec::new(),
             };
 

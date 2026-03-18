@@ -2454,8 +2454,9 @@ async fn identity_create_link_attestation_impl(
 
     use scp_core::identity::attestation::{
         ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        AttestationProof, AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
+    use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
@@ -2474,6 +2475,13 @@ async fn identity_create_link_attestation_impl(
             });
         }
     };
+
+    // Parse the proof JSON string into a typed AttestationProof.
+    let proof: AttestationProof = serde_json::from_str(&proof)
+        .map_err(|e| ScpError::Identity {
+            msg: format!("invalid proof JSON: {e}"),
+            code: "SCP-IDENT-1040".to_owned(),
+        })?;
 
     let core_id = identity
         .core_id
@@ -2518,6 +2526,7 @@ async fn identity_create_link_attestation_impl(
             verifier_did: None,
         },
         revocation: AttestationRevocation::new("/revocations".to_owned()),
+        revocation_status: RevocationStatus::Active,
         signature: Vec::new(),
     };
 
