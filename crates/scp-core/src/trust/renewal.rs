@@ -455,6 +455,7 @@ mod tests {
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 1500,
             reason: Some("revoked for test".to_owned()),
+            revoked_by: "did:key:issuer".into(),
         };
 
         let result = renew_attestation(&attestation, &resolver, &clock);
