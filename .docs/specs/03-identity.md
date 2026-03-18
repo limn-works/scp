@@ -122,7 +122,7 @@ Identity link attestations are sub-classified into two classes based on when and
 
 - The SDK performs the verification flow (OAuth code exchange, challenge-response round trip) locally at creation time.
 - On success, the SDK extracts the minimal identifying claim (`provider`, `subject_id`, `verified_at`) and signs it with the DID's signing key. This SDK-signed proof replaces the raw provider token — no JWT, no OIDC ID token, no PII is stored.
-- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_ms> }` signed by the issuer's `#active` or `#agent` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
+- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` or `#agent` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
 - Self-attestation model: issuer == subject. The DID owner asserts "I verified this at creation time." Consumers trust the assertion because: (a) the DID key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — shadow claiming (§3.5.5) and social graph import (§3.6) only work if the external account is genuinely controlled.
 - **No raw token storage.** The SDK MUST discard the OAuth access token, refresh token, and ID token after extracting the `subject_id`. Only the minimal signed claim persists. This eliminates PII leakage — Google OIDC tokens always include `email`, Apple tokens include `email` when requested. None of that data enters the attestation.
 
@@ -158,24 +158,32 @@ The following platforms are supported for identity link attestations. New provid
 
 **`ChallengeResponse` verification method:** `ChallengeResponse` is listed as a Class 1 (Cryptographic) verification method in §3.5.0 but does not appear in the provider registry table above. This is intentional — `ChallengeResponse` is platform-agnostic. It is not tied to a specific provider; instead, it is a generic mechanism where any verifier (e.g., a context governance engine, a bridge connector, or another participant) challenges an agent to prove a capability or identity claim via a cryptographic round trip. Any context that wants to verify an agent's capabilities can use `ChallengeResponse` regardless of the platform. The `platform` field in the attestation claim is set to the verifier's choice (e.g., the context ID or verifier's domain), and the `evidence.verifier_did` field identifies the verifier that issued the challenge.
 
+**`ChallengeResponse` creation flow:**
+1. A verifier sends a random 32-byte challenge to the subject.
+2. The subject signs the challenge with their SCP signing key (`#active` or `#agent`).
+3. The SDK constructs the proof: `{ "challenge": "<hex>", "response_signature": "<hex>", "verifier_did": "<did>", "verified_at": <unix_s> }`.
+4. The full `IdentityLinkAttestation` envelope is signed by the subject's DID key.
+
+**`ChallengeResponse` verification:** Verify `response_signature` is valid for `challenge` under the subject's DID signing key. Verify `verifier_did` is a known, trusted verifier.
+
 **Class 1 (Cryptographic) creation flow:**
 
 1. The SDK initiates an OAuth 2.0 authorization code flow with the OIDC provider. Minimal scope: `openid` only (no `email`, no `profile`). Apple Sign In uses the `sub` claim from the identity token.
 2. On success, the SDK receives the ID token (JWT). It extracts `sub` (subject identifier) and discards the token.
-3. The SDK constructs the proof content: `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_ms> }`.
+3. The SDK constructs the proof content: `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_s> }`.
 4. The SDK signs the full `IdentityLinkAttestation` envelope (which includes the proof content in `evidence.proof`) with the DID's signing key.
 5. The SDK discards the access token, refresh token, and ID token. Only the signed attestation persists.
 
 **Class 2 (Reference) creation flow:**
 
 1. The user places their DID string in the platform-specific location (profile bio, DNS TXT record).
-2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_ms> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
+2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_s> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
 3. The SDK signs the full `IdentityLinkAttestation` envelope with the DID's signing key.
 4. The attestation is published. It carries zero trust weight until a consumer fetches and verifies the proof.
 
 ### 3.5.2 Identity Attestation Wire Format
 
-Identity attestations use the attestation envelope defined in §7.4.1, with identity-link-specific fields. The canonical serialization is MessagePack (§17), consistent with all other SCP wire formats. The signature scope covers the canonical MessagePack serialization of all fields except the `signature` field itself.
+Identity attestations use the attestation envelope defined in §7.4.1, with identity-link-specific fields. The wire serialization is MessagePack (§17), consistent with all other SCP wire formats. The signature scope uses the §9.5.1 canonical hash construction — see "Signature scope" below.
 
 ```
  IdentityLinkAttestation {
@@ -183,8 +191,8 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   type:         "identity_link",
   issuer:       DID,             // The DID claiming the external identity
   subject:      DID,             // Same as issuer (self-attestation)
-  issued_at:    u64,             // Unix timestamp (ms)
-  expires_at:   Option<u64>,     // Optional expiry (ms). If absent, valid until revoked.
+  issued_at:    u64,             // Unix timestamp (s)
+  expires_at:   Option<u64>,     // Optional expiry (s). If absent, valid until revoked.
   claim: {
     platform:       String,      // Platform identifier per §3.5.1 provider registry
     platform_handle: String,     // Handle on the platform: "@alice", "alice123", etc.
@@ -194,15 +202,15 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
     proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
-    verified_at:    u64,         // Unix timestamp (ms) of last verification
+    verified_at:    u64,         // Unix timestamp (s) of last verification
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
   revocation_status: RevocationStatus, // Active or Revoked (§7.4.1). MUST be in signed scope.
-  signature:    Ed25519Signature,  // Signs MessagePack(all fields except signature), using issuer's #active or #agent key
+  signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active or #agent key
 }
 ```
 
-**Signature scope:** The signature covers `MessagePack_canonical(id, type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` where `MessagePack_canonical` uses sorted-key encoding (keys in lexicographic order within each map) per §17.1. The signature is computed using the issuer's Active Signing Key (`#active`) or Agent Signing Key (`#agent`). The inclusion of `revocation_status` in the signed scope prevents tampering — a revoked attestation cannot be replayed as active without invalidating the signature.
+**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
 
 **Attestation ID construction:** The `id` field is a deterministic, hex-encoded SHA-256 hash derived from the attestation's identifying fields using the canonical hash construction (§9.5.1). The domain separator `"SCP-ATTESTATION-ID-V1:"` prevents cross-protocol collision, and 4-byte big-endian length prefixes on variable-length fields prevent field boundary ambiguity (e.g., platform `"ab"` + handle `"cd"` vs platform `"a"` + handle `"bcd"`).
 

@@ -504,7 +504,7 @@ Input:
   subject:           "did:dht:z6MkIssuer"  (same as issuer for self-attestation)
   issued_at:         1700000000
   expires_at:        absent (no expiry — use absent sentinel)
-  claim:             AttestationClaim { platform: "x.com", platform_handle: "@alice",
+  claim:             AttestationClaim { platform: "google.com", platform_handle: "alice@gmail.com",
                        platform_id: None, link_type: "self_attestation" }
   evidence:          AttestationEvidence { method: "oauth", proof: "jwt-token",
                        verified_at: 1700000000, verifier_did: None }
@@ -595,23 +595,22 @@ Domain: `"SCP-ATTESTATION-ID-V1:"`
 ```
 Input:
   issuer:           "did:dht:z6MkIssuer"
-  platform:         "x"
-  platform_handle:  "@alice"
+  platform:         "google.com"
+  platform_handle:  "alice@gmail.com"
   issued_at:        1700000000
 
 Canonical hash input:
   "SCP-ATTESTATION-ID-V1:"                      (22 bytes, no length prefix)
   || BE32(18)  || "did:dht:z6MkIssuer"          (4 + 18 = 22 bytes)
-  || BE32(1)   || "x"                            (4 + 1 = 5 bytes)
-  || BE32(6)   || "@alice"                       (4 + 6 = 10 bytes)
+  || BE32(10)  || "google.com"                   (4 + 10 = 14 bytes)
+  || BE32(15)  || "alice@gmail.com"              (4 + 15 = 19 bytes)
   || BE64(1700000000)                            (8 bytes)
 
-Total: 22 + 22 + 5 + 10 + 8 = 67 bytes
+Total: 22 + 22 + 14 + 19 + 8 = 85 bytes
 
+// Hash must be recomputed from reference implementation
 Expected SHA-256:
-  0x3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c
-
-Result: "3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c" (hex-encoded)
+  (recompute from reference implementation — input changed from "x"/"@alice" to "google.com"/"alice@gmail.com")
 ```
 
 ## 25.17 Verification Procedure
