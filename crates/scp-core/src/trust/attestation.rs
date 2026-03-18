@@ -2517,12 +2517,14 @@ mod tests {
     #[test]
     fn verify_attestation_field_revocation_takes_precedence_over_checker() {
         // Even with a noop checker, a revoked field should fail.
+        // Must use make_signed_attestation_with_revocation so the signature
+        // covers the revocation_status (it's in the signed scope).
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
         let clock = TestClock::new(1000);
 
-        let mut attestation = make_signed_attestation(
+        let attestation = make_signed_attestation_with_revocation(
             &signing_key,
             AttestationType::Endorsement,
             "did:key:issuer",
@@ -2531,13 +2533,12 @@ mod tests {
             Some(2000),
             None,
             None,
+            RevocationStatus::Revoked {
+                revoked_at: 950,
+                reason: Some("compromised".to_owned()),
+                revoked_by: "did:key:issuer".into(),
+            },
         );
-
-        attestation.revocation_status = RevocationStatus::Revoked {
-            revoked_at: 950,
-            reason: Some("compromised".to_owned()),
-            revoked_by: "did:key:issuer".into(),
-        };
 
         let checker = NoOpRevocationChecker;
         let result =
