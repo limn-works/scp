@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), and ADR-038 (Content Access Key Layer) — are Decided.
+**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), ADR-038 (Content Access Key Layer), ADR-043 (Protocol Constants), and ADR-044 (Attestation Two-Class Model) — are Decided.
 
 **Dependencies between ADRs:**
 
@@ -19,7 +19,9 @@ Phase 1-5 ADRs
        ├── ADR-029 (Offline/Sync) <── Phase 1-2 implementation + empirical data
        ├── ADR-030 (Event Log Pruning) <── Phase 2 event log + empirical data
        ├── ADR-031 (Multi-Admin Governance) <── Phase 2 UCAN + single-admin governance
-       └── ADR-038 (Content Access Key Layer) <── ADR-007 (Sender Keys) + ADR-031 (Governance)
+       ├── ADR-038 (Content Access Key Layer) <── ADR-007 (Sender Keys) + ADR-031 (Governance)
+       ├── ADR-043 (Protocol Constants) <── Phase 1-5 implementation + empirical data
+       └── ADR-044 (Attestation Two-Class Model) <── §3.5 (Identity Attestations) + §7.4.1 (Attestation Format)
 ```
 
 ---
@@ -3450,3 +3452,74 @@ No protocol versioning mechanism is required for this change set.
 5. `DEFAULT_SESSION_CAP_PER_CALLER` changed from 5 to 1000; `ContextParams::session_cap` added.
 6. All spec sections referencing old values updated (§9.2.1, §5.13.8, §6.2.1, §24.1, §24.4, §23).
 7. Tests updated to reflect new defaults and absence of hard protocol ceilings.
+
+---
+
+## ADR-044: Attestation Two-Class Model and Provider Registry
+
+**Status:** Decided
+
+### Context
+
+Identity link attestations (§3.5) bind external platform identities to SCP DIDs. The original spec treated all attestation verification methods uniformly: OAuth, signed posts, DNS records, and challenge-response all shared the same trust model. In practice, these methods have fundamentally different trust properties:
+
+- **OAuth and challenge-response** produce cryptographic proof of identity ownership at creation time. The SDK performs the OAuth code exchange, receives a signed ID token, and can extract a verified subject identifier. The proof is ephemeral — it exists at creation time but is not externally re-verifiable later.
+- **Signed posts and DNS records** are live external resources. No cryptographic proof exists at creation time. The proof is the continued presence of the DID in the external resource, and consumers must fetch it to verify.
+
+The original §3.5.2 defined two alternative `proof` formats for OAuth attestations: (a) the raw JWT from the OIDC provider, or (b) an SDK-signed summary. The raw JWT path is problematic:
+
+1. **PII leakage.** Google OIDC tokens always include `email`. Apple tokens include `email` when the `email` scope is requested. Embedding raw JWTs in attestations stores PII in a protocol object that is replicated, cached, and potentially shared across untrusted consumers.
+2. **Token expiry mismatch.** JWTs expire (typically in 1 hour). An attestation containing an expired JWT requires verifiers to either (a) accept expired JWTs (defeating the purpose of JWT expiry), or (b) reject the attestation after 1 hour (defeating the purpose of attestations).
+3. **Verification requires JWKS.** Verifiers must fetch the OIDC provider's JWKS to validate the JWT. This creates a runtime dependency on external infrastructure for attestation verification.
+
+Additionally, the original spec did not define how attestations are published in DID documents, leaving discovery underspecified.
+
+### Decision
+
+**Two attestation classes** as sub-classifications of `AttestationType::IdentityLink`:
+
+**Class 1: Cryptographic.** Verification methods: `Oauth`, `ChallengeResponse`. The provider's confirmation was cryptographically verified at creation time. The SDK extracts the minimal claim (`provider`, `subject_id`, `verified_at`), signs the full attestation envelope with the DID key, and discards the raw token. The proof is an SDK-signed self-attestation: "I verified this at creation time." Consumers check the DID signature; no external fetch required.
+
+**Class 2: Reference.** Verification methods: `SignedPost`, `DnsRecord`. The proof is a live external resource. The attestation points to a URL or DNS record. Consumers MUST fetch and verify the proof before granting trust weight. Unverified Reference attestations carry zero trust.
+
+**SDK-signed proof format (Class 1).** The `evidence.proof` field contains `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_ms> }`. The envelope signature covers this field. No raw JWT is stored. The SDK requests `openid` scope only — no `email`, no `profile`.
+
+**Provider registry.** Seven initial providers: `github.com` (Class 2), `x.com` (Class 2), `google.com` (Class 1), `apple.com` (Class 1), `microsoft.com` (Class 1), `mastodon:<instance>` (Class 2), `dns` (Class 2). New providers by spec amendment only.
+
+**DID document service entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>-<index>`. Max 10 per DID document.
+
+**`revocation_status` in signed scope.** The `revocation_status` field replaces the separate `revocation` object in the wire format. It is included in the signature scope, preventing replay of revoked attestations as active.
+
+**Verification cache for Reference attestations.** Consumer-side, 1-hour TTL. Class 1 attestations need no cache (signature verification is deterministic).
+
+### Rationale
+
+The class distinction is not a new attestation type — it is a sub-classification within `IdentityLink`. This is deliberate. `AttestationType` has stable numeric tags (§7.4.1, `attestation_type_tag`). Adding a new variant would require a new tag and break the existing tag stability guarantee. Instead, the class is derived from the verification method, which is already a field in the wire format. Any consumer can determine the class by inspecting `evidence.method`.
+
+The self-attestation model is acceptable for identity links specifically because issuer == subject. The DID owner is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: shadow claiming (§3.5.5) verifies the external identity independently, and social graph import only surfaces contacts who genuinely control both identities.
+
+### Rejected Alternatives
+
+**1. Raw JWT embedding.** Rejected. PII exposure (Google always includes `email` in ID tokens). Token expiry creates verification timing issues. Runtime JWKS dependency for every verifier. The SDK-signed summary provides the same identity-linking function without any of these problems.
+
+**2. Operator-witnessed attestation.** A trusted third-party operator verifies the OAuth flow and co-signs the attestation. Rejected because: (a) it requires a third party, violating the "protocol requires no operator" tenet; (b) it creates a centralized verification bottleneck; (c) the self-attestation model is sufficient for the identity-link use case (issuer == subject).
+
+**3. Attestation class as separate `AttestationType` variant.** Adding `CryptographicIdentityLink` and `ReferenceIdentityLink` as new `AttestationType` variants. Rejected because: (a) `AttestationType` has stable numeric tags used in canonical hash computation — adding variants is a breaking protocol change; (b) the class is derivable from `evidence.method`, making a new variant redundant; (c) all existing code that handles `IdentityLink` attestations would need branching on two types instead of one.
+
+### Security Analysis
+
+**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid DID signature. Defense: (a) the claim is "I control external account X" — the only use cases (shadow claiming, social graph import) independently verify the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
+
+**Reference attestation spoofing.** An attacker publishes a Reference attestation pointing to a URL containing another user's DID. Defense: Reference attestations carry zero trust until the consumer verifies the proof. The consumer checks that the DID in the external resource matches the attestation's `issuer`. The attacker cannot place the victim's DID in the victim's profile.
+
+**Revocation replay.** An attacker intercepts a revoked attestation and strips `revocation_status: Revoked`. Defense: `revocation_status` is in the signature scope. Stripping it invalidates the signature. The original `Active` attestation still has a valid signature, but consumers check the revocation endpoint (§18.2.2) for the attestation ID.
+
+### Acceptance Criteria
+
+1. §3.5.0 defines Class 1 (Cryptographic) and Class 2 (Reference) with verification method mapping.
+2. §3.5.1 defines the provider registry with 7 initial providers, platform value conventions, and creation flows for each class.
+3. §3.5.2 wire format includes `revocation_status` in the signature scope (replaces separate `revocation` object).
+4. §3.5.3 defines `ScpIdentityLinkAttestation` DID document service entry format with fragment naming convention and max-10 limit.
+5. §3.5.4 defines class-specific verification procedures: Class 1 (signature-only), Class 2 (signature + proof fetch). Verification cache specified with 1-hour TTL.
+6. §3.5.6 documents security properties: no PII, self-attestation scope limits, zero-trust for unverified Reference attestations, revocation replay prevention.
+7. No new `AttestationType` variant introduced — class is derived from `evidence.method`.

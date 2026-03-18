@@ -486,7 +486,7 @@ Total: 18 + 21 + 22 + 8 = 69 bytes
 
 Note: Both the sender key and access key info strings use 4-byte BE length-prefixed context_id and DID fields. Domain separation between the two is provided by distinct prefix strings (`"scp-sender-key-v1"` vs `"scp-access-key-v1"`), which ensures the two info strings can never collide even with adversarial inputs.
 
-## 25.13 Attestation Signing Vectors (§3.5.1, §9.5.1)
+## 25.13 Attestation Signing Vectors (§3.5.2, §9.5.1)
 
 Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
 
@@ -585,7 +585,7 @@ Expected SHA-256:
   0xb9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53
 ```
 
-## 25.16 Attestation ID Vectors (§3.5.1)
+## 25.16 Attestation ID Vectors (§3.5.2)
 
 Domain: `"SCP-ATTESTATION-ID-V1:"`
 
