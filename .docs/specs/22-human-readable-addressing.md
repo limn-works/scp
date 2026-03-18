@@ -171,7 +171,7 @@ Contexts with discovery tools have a `name` field in their metadata (§5.7). The
 
 Example: A context with metadata name "Cooking Community" has canonical scope name `cooking-community`.
 
-The SDK ships with a mapping of default bootstrap context IDs to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific contexts with their own scope names.
+The SDK ships with a mapping of default `BootstrapContextEntry` values (§22.11.6) to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific contexts with their own scope names.
 
 **Scope name collisions.** Two contexts in different scope registries may register the same scope name. Intra-registry conflicts are prevented by `scope_register`'s conflict detection — a scope name maps to at most one context within a single registry (§22.3.5). Cross-registry conflicts are resolved by registry priority in the SDK's bootstrap configuration: the first matching registry in the priority order wins, with the resolution path metadata identifying which registry produced the result. Users can disambiguate by specifying a context explicitly in client UI (selecting from a list rather than typing a scope name).
 
@@ -1124,14 +1124,23 @@ These events are appended to the identity private state event log (§3.7). They 
 | `DiscoveryContext` | `"discovery_context"` | `context_id: String` | Found via search in a context with discovery tools. |
 | `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |
 
-**`BootstrapConfig`** — Client bootstrap discovery configuration.
+**`BootstrapConfig`** — Client bootstrap discovery configuration. See §22.13 for the two-context bootstrap governance model.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `default_context_ids` | `Vec<String>` | Yes | SDK default bootstrap context IDs. |
+| `default_contexts` | `Vec<BootstrapContextEntry>` | Yes | SDK default bootstrap contexts with creator DID verification. Replaces the former `default_context_ids: Vec<String>`. |
 | `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery tools on first identity creation. |
-| `custom_context_ids` | `Vec<String>` | Yes | User-added context IDs. May be empty. |
+| `custom_contexts` | `Vec<BootstrapContextEntry>` | Yes | User-added contexts with creator DID verification. May be empty. Replaces the former `custom_context_ids: Vec<String>`. |
 | `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to DID document capability resolution. |
+
+**`BootstrapContextEntry`** — A bootstrap context with expected creator DID for post-join verification. The `expected_creator_did` field enables the SDK to verify that the context it joined was actually created by the expected operator, defending against context ID substitution attacks (§22.13.2).
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `context_id` | `String` | Yes | The bootstrap context's ID (hex-encoded). |
+| `expected_creator_did` | `String` (DID) | Yes | The DID of the expected context creator. SDK MUST verify this matches the actual context creator after joining (§22.13.2). |
+
+**`DiscoveryBootstrap` — SUPERSEDED.** The `DiscoveryBootstrap` struct (a simple `{ default_context_ids: Vec<ContextId> }`) is superseded by `BootstrapConfig`. `DiscoveryBootstrap` predates the two-context bootstrap model and lacks creator DID verification, custom context support, auto-query configuration, and fallback policy. New code MUST use `BootstrapConfig` with `BootstrapContextEntry` entries. `DiscoveryBootstrap` remains in the codebase only for backward compatibility and SHOULD be removed when all consumers have migrated to `BootstrapConfig`.
 
 **`DiscoveryQuery`** — Parameters for multi-source discovery search.
 
@@ -1185,4 +1194,63 @@ The following tool names are normative — independent implementations MUST use 
 
 ## 22.12 Phase Integration
 
-Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on context and attestation infrastructure). Scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle tools from Phase 3).
+Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on context and attestation infrastructure). Scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle tools from Phase 3). `BootstrapContextEntry`, `BootstrapConfig` field migration, and the `evaluate_sybil_resistance` endorsement-independence wiring (§22.13) also land in Phase 4, as the bootstrap contexts serve as scope registries and depend on the scope tool infrastructure.
+
+## 22.13 Bootstrap Context Governance
+
+The SDK ships with two bootstrap contexts that serve as the initial scope registries and handle registries for the SCP network. Both are standard SCP contexts — no special type, no special template, no protocol-level privileges. They use the existing `scp:template/handle-registry` template (§22.3.4) with different admission policies. If both bootstrap contexts are removed from a client's configuration, scoped resolution (`alice@cooking-community`) stops working, but everything else — direct DID resolution, petnames, domain handles, attestation handles, context creation, MLS encryption — continues to function.
+
+### 22.13.1 Two Bootstrap Contexts
+
+**Verified Context.** Limn-operated. Uses the existing `scp:template/handle-registry` template. Admission is governed by `ContextSybilPolicy::high_trust()` (§9.3) with endorsement independence enabled (§22.13.3). Hosts scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), handle tools (`handle_register`, `handle_lookup`, `handle_deregister`), and agent tools (`agent_search`, `agent_register`, `agent_deregister`). Intended for verified identities with established trust signals — multiple attestation types, significant participation history, and independent endorsements. The higher admission bar makes this the authoritative scope registry for the network.
+
+**Community Context.** Operator-independent — any sufficiently trusted identity can operate it. Uses the existing `scp:template/handle-registry` template. Admission is governed by `ContextSybilPolicy::standard()` (§9.3). Hosts the same tool set as the Verified context: scope tools, handle tools, and agent tools. Lower barrier to entry — requires at least one trust signal category with some history but does not require the depth demanded by the Verified context. Provides a namespace for communities, experiments, and identities that have not yet accumulated sufficient trust signals for the Verified context.
+
+**Why two, not one.** A single bootstrap context creates a single point of governance: either the admission bar is high enough for trust (excluding newcomers from resolution) or low enough for inclusion (diluting trust signals). Two contexts resolve this tension. The Verified context provides high-trust resolution; the Community context provides inclusive resolution. Consumers see the trust level on every resolution result (`DiscoveryContextVerified` with provenance identifying which bootstrap context resolved it) and can make their own decisions. Applications that require high trust can filter for Verified-context results; applications optimizing for reach can accept either.
+
+**Distinguishing Verified from Community results.** Both bootstrap contexts produce `DiscoveryContextVerified` resolution results — the trust level variant is the same for both. Consumers distinguish them via the resolving context's ID in `ResolutionPath` provenance metadata — compare `resolution_path.source_id` (direct handle lookup) or `resolution_path.scope_registry_id` (two-hop scope resolution) against the `BootstrapContextEntry` values in the SDK's `BootstrapConfig`. A match against the Verified context's ID indicates a Verified-context result; a match against the Community context's ID indicates a Community-context result. A match against a `default_contexts` entry with the Verified context's ID indicates a Verified-context result; a match against the Community context's ID indicates a Community-context result. The distinction is in provenance, not in the `TrustLevel` variant.
+
+**Both are standard SCP contexts.** They are not special-cased in the protocol. They use the same `scp:template/handle-registry` template, the same scope tools, the same handle tools, the same governance engine, and the same event log as any other context with discovery tools. Their only distinction is their configuration: which `ContextSybilPolicy` governs admission and whether endorsement independence is enabled. A third-party could stand up an additional bootstrap context with its own policy and add it to clients' `BootstrapConfig` via `custom_contexts` — the protocol supports this by design.
+
+### 22.13.2 BootstrapContextEntry and Creator DID Verification
+
+The `BootstrapConfig` wire format (§22.11.6) uses `BootstrapContextEntry` instead of bare context ID strings. Each entry pairs a `context_id` with an `expected_creator_did`:
+
+```
+BootstrapContextEntry {
+  context_id:           ContextId,      // hex-encoded context ID
+  expected_creator_did: DID             // DID of the expected context creator
+}
+```
+
+`ContextId` and `DID` are wire-format `String` values, as shown in §22.11.6.
+
+**Post-join verification.** After the SDK joins a bootstrap context via MLS group join, it MUST verify that the context's creator DID matches the `expected_creator_did` from the `BootstrapContextEntry`. The creator DID is available from the context's event log (the first event in any context is the creation event, signed by the creator's DID). If the creator DID does not match, the SDK MUST leave the context and treat the entry as failed — the context may have been substituted by an attacker.
+
+**Threat model.** Without creator DID verification, an attacker who can influence bootstrap configuration (e.g., via a compromised SDK distribution or a man-in-the-middle on configuration delivery) could substitute a legitimate bootstrap context ID with an attacker-controlled context. The attacker's context would serve malicious scope and handle mappings — resolving `alice@cooking-community` to an attacker-controlled DID. The `expected_creator_did` field makes this attack detectable: the attacker would need to forge the context creator's DID signature on the creation event, which requires the creator's private key.
+
+**Threat model limitation.** Creator DID verification defends against context ID substitution by external attackers. It does not defend against a compromised or malicious operator. Protection against operator misbehavior relies on governance, event log auditability, and the ability to remove a bootstrap context from `BootstrapConfig`.
+
+**Migration from bare context IDs.** The former `default_context_ids: Vec<String>` and `custom_context_ids: Vec<String>` fields in `BootstrapConfig` are replaced by `default_contexts: Vec<BootstrapContextEntry>` and `custom_contexts: Vec<BootstrapContextEntry>` respectively. This is a breaking wire format change. The `DiscoveryBootstrap` struct (§22.11.6) is superseded entirely — it predates `BootstrapConfig` and lacks all post-§22.3.5 features.
+
+### 22.13.3 Sybil Endorsement Independence
+
+The Verified bootstrap context requires endorsement independence checking as part of its `ContextSybilPolicy::high_trust()` admission policy. This is a normative requirement. The existing `evaluate_sybil_resistance` does not currently call `check_threshold_attestation` for endorsement independence. Implementations MUST add this wiring. §9.3 already describes independent endorsements as a trust signal, and the `check_threshold_attestation` function (ADR-017 acceptance criterion 7) already implements pairwise independence scoring via `ThresholdRequirement` — the missing piece is the integration point.
+
+**What endorsement independence means.** When evaluating whether a DID meets the `high_trust()` admission threshold, the endorsements signal category requires that endorsing DIDs are independently trustworthy — not colluding. `check_threshold_attestation` computes a pairwise independence score for all endorsers by counting shared context memberships and mutual endorsements as independence penalties (`ThresholdRequirement.shared_context_penalty`, `ThresholdRequirement.mutual_endorsement_penalty`). The average pairwise independence must meet `ThresholdRequirement.independence_threshold`. This prevents a Sybil operator from creating a ring of mutually-endorsing identities to pass endorsement requirements.
+
+**Wiring into `evaluate_sybil_resistance`.** The `evaluate_sybil_resistance` function (§9.3) currently checks signal breadth, weighted strength, per-category requirements, and device attestation. For the Verified bootstrap context, the admission flow MUST additionally invoke `check_threshold_attestation` on the Endorsements signal category when the policy requires endorsements. Specifically:
+
+1. If the `ContextSybilPolicy` includes a `RequiredSignal` for `TrustSignalCategory::Endorsement`, the admission evaluator MUST:
+   a. Collect the endorsing DIDs from the candidate's endorsement attestations.
+   b. Gather the `AttestorInfo` for each endorser (shared contexts, mutual endorsements).
+   c. Call `check_threshold_attestation` with the policy's `ThresholdRequirement`.
+   d. Reject admission if the independence threshold is not met.
+
+2. The `RequiredSignal` struct MUST be extended with an optional `threshold_requirement: Option<ThresholdRequirement>` field. When present and the signal category is `Endorsement`, the admission evaluator uses this `ThresholdRequirement` for the `check_threshold_attestation` call. The `ContextSybilPolicy::high_trust()` preset SHOULD include an endorsement `RequiredSignal` with `threshold_requirement: Some(ThresholdRequirement { independence_threshold: 0.5, ..default() })`.
+
+> Note: `ThresholdRequirement` contains `f64` fields and cannot derive `Eq`. Adding this field requires removing `Eq` from `RequiredSignal` (and transitively from `ContextSybilPolicy`). Implementers SHOULD prefer removing the `Eq` derive, as `ContextSybilPolicy` comparison is not used in protocol-critical paths.
+
+**The Community context does not require endorsement independence.** `ContextSybilPolicy::standard()` has a lower bar — at least one signal category with some strength. It does not mandate endorsements and does not invoke independence checking. This is intentional: the Community context trades admission rigor for inclusion.
+
+**Relationship to §9.3.** This section does not introduce new trust signals, new evaluation functions, or new policy types. It documents the required wiring between existing components: `ContextSybilPolicy::high_trust()` requires endorsements, endorsement evaluation requires `check_threshold_attestation`, and `check_threshold_attestation` enforces independence via `ThresholdRequirement`. The Verified bootstrap context is the canonical use case where this full pipeline is exercised.
