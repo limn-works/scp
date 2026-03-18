@@ -486,13 +486,13 @@ Total: 18 + 21 + 22 + 8 = 69 bytes
 
 Note: Both the sender key and access key info strings use 4-byte BE length-prefixed context_id and DID fields. Domain separation between the two is provided by distinct prefix strings (`"scp-sender-key-v1"` vs `"scp-access-key-v1"`), which ensures the two info strings can never collide even with adversarial inputs.
 
-## 25.13 Attestation Signing Vectors (§3.5.1, §9.5.1)
+## 25.13 Attestation Signing Vectors (§3.5.2, §9.5.1)
 
-Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
+Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`
 
 ### Vector 26: Identity Link Attestation Signature
 
-The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
+The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation_status`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
 
 Note: this is the *signature* construction (used by `verify_signature`). The *attestation ID* uses a different domain separator (`"SCP-ATTESTATION-ID-V1:"`) and different fields — see `compute_id()` in `attestation.rs`.
 
@@ -504,15 +504,14 @@ Input:
   subject:           "did:dht:z6MkIssuer"  (same as issuer for self-attestation)
   issued_at:         1700000000
   expires_at:        absent (no expiry — use absent sentinel)
-  claim:             AttestationClaim { platform: "x", platform_handle: "@alice",
+  claim:             AttestationClaim { platform: "google.com", platform_handle: "alice@gmail.com",
                        platform_id: None, link_type: "self_attestation" }
-  evidence:          AttestationEvidence { method: "oauth", proof: "jwt-token",
+  evidence:          AttestationEvidence { method: "oauth", proof: "{\"provider\":\"google.com\",\"subject_id\":\"12345\",\"verified_at\":1700000000}",
                        verified_at: 1700000000, verifier_did: None }
-  revocation:        AttestationRevocation { method: "did_document",
-                       endpoint: "/revocations" }
+  revocation_status: RevocationStatus::Active
 
 Canonical hash input:
-  "SCP-IDENTITY-LINK-ATTESTATION-V1:"         (35 bytes, no length prefix)
+  "SCP-IDENTITY-LINK-ATTESTATION-V2:"         (33 bytes, no length prefix)
   || BE32(7)   || "att-001"                    (4 + 7 = 11 bytes — id)
   || BE32(13)  || "identity_link"              (4 + 13 = 17 bytes — attestation_type)
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)
@@ -521,7 +520,7 @@ Canonical hash input:
   || BE32(32)  || SHA-256(0x00)                (4 + 32 = 36 bytes — absent expires_at sentinel)
   || BE32(N_c) || msgpack(claim)               (4 + N_c bytes — claim as MessagePack)
   || BE32(N_e) || msgpack(evidence)            (4 + N_e bytes — evidence as MessagePack)
-  || BE32(N_r) || msgpack(revocation)          (4 + N_r bytes — revocation as MessagePack)
+  || BE32(N_r) || msgpack(revocation_status)    (4 + N_r bytes — revocation_status as MessagePack)
 
 The exact byte count depends on the MessagePack encoding of the sub-structures.
 Compute the expected SHA-256 hash using the Rust reference implementation.
@@ -585,7 +584,7 @@ Expected SHA-256:
   0xb9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53
 ```
 
-## 25.16 Attestation ID Vectors (§3.5.1)
+## 25.16 Attestation ID Vectors (§3.5.2)
 
 Domain: `"SCP-ATTESTATION-ID-V1:"`
 
@@ -596,23 +595,22 @@ Domain: `"SCP-ATTESTATION-ID-V1:"`
 ```
 Input:
   issuer:           "did:dht:z6MkIssuer"
-  platform:         "x"
-  platform_handle:  "@alice"
+  platform:         "google.com"
+  platform_handle:  "alice@gmail.com"
   issued_at:        1700000000
 
 Canonical hash input:
   "SCP-ATTESTATION-ID-V1:"                      (22 bytes, no length prefix)
   || BE32(18)  || "did:dht:z6MkIssuer"          (4 + 18 = 22 bytes)
-  || BE32(1)   || "x"                            (4 + 1 = 5 bytes)
-  || BE32(6)   || "@alice"                       (4 + 6 = 10 bytes)
+  || BE32(10)  || "google.com"                   (4 + 10 = 14 bytes)
+  || BE32(15)  || "alice@gmail.com"              (4 + 15 = 19 bytes)
   || BE64(1700000000)                            (8 bytes)
 
-Total: 22 + 22 + 5 + 10 + 8 = 67 bytes
+Total: 22 + 22 + 14 + 19 + 8 = 85 bytes
 
+// Hash must be recomputed from reference implementation
 Expected SHA-256:
-  0x3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c
-
-Result: "3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c" (hex-encoded)
+  (recompute from reference implementation — input changed from "x"/"@alice" to "google.com"/"alice@gmail.com")
 ```
 
 ## 25.17 Verification Procedure

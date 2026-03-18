@@ -93,6 +93,7 @@ For new users with a single device and no SCP contacts, platform-backed recovery
 
 Existing platform identities (Google, Apple, social accounts) can be linked to a protocol identity but are never the root. They serve as convenience and interop, not as source of truth.
 
+
 ## 3.5 Identity Attestations
 
 A user can publish cryptographic attestations binding their external platform identities to their DID. These attestations are the mechanism that makes bridging trustworthy and social graph import possible.
@@ -105,47 +106,112 @@ Properties of identity attestations:
 - **User-initiated.** Only the human creates attestations for their own identities. No third party can assert a link on someone's behalf.
 - **Independently verifiable.** Any participant can verify the attestation without relying on a central authority. Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.).
 - **Revocable.** Users can revoke attestations at any time, severing the link.
-- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery tools (§6.2.2B) and DID document capability entries (§7.4.1). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in contexts with discovery tools (§22.5).
+- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery tools (§6.2.2B) and DID document service entries (§3.5.3). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in contexts with discovery tools (§22.5).
 
 Identity attestations enable three critical flows:
 
 1. **Social graph import.** A user exports their follower list from X. Their local agent resolves each handle against known attestations. Contacts who have also joined SCP are automatically discoverable.
-2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID (see §3.5.3 for the claiming protocol).
+2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID (see §3.5.5 for the claiming protocol).
 3. **Cross-platform reputation continuity.** Trust judgments about a person can follow them across platforms — not because platforms share data, but because the human has cryptographically proven they're the same person.
 
-### 3.5.1 Identity Attestation Wire Format
+### 3.5.0 Attestation Classes
 
-Identity attestations use the attestation envelope defined in §7.4.1, with identity-link-specific fields. The canonical serialization is MessagePack (§17), consistent with all other SCP wire formats. The signature scope covers the canonical MessagePack serialization of all fields except the `signature` field itself.
+Identity link attestations are sub-classified into two classes based on when and how the external identity ownership was verified. The class is a property of the verification method, not of the attestation envelope — the wire format (§3.5.2) is the same for both classes. The class determines the trust model: who must verify, when, and what the attestation proves on its own. See ADR-044 for the design rationale and rejected alternatives.
+
+**Class 1: Cryptographic.** The provider's confirmation of identity ownership was cryptographically verified at attestation creation time. Verification methods: `Oauth`, `ChallengeResponse`.
+
+- The SDK performs the verification flow (OAuth code exchange, challenge-response round trip) locally at creation time.
+- On success, the SDK extracts the minimal identifying claim (`provider`, `subject_id`, `verified_at`) and signs it with the DID's signing key. This SDK-signed proof replaces the raw provider token — no JWT, no OIDC ID token, no PII is stored.
+- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` or `#agent` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
+- Self-attestation model: issuer == subject. The DID owner asserts "I verified this at creation time." Consumers trust the assertion because: (a) the DID key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — shadow claiming (§3.5.5) and social graph import (§3.6) only work if the external account is genuinely controlled.
+- **No raw token storage.** The SDK MUST discard the OAuth access token, refresh token, and ID token after extracting the `subject_id`. Only the minimal signed claim persists. This eliminates PII leakage — Google OIDC tokens always include `email`, Apple tokens include `email` when requested. None of that data enters the attestation.
+
+**Class 2: Reference.** The proof is a live external resource that consumers must verify themselves. Verification methods: `SignedPost`, `DnsRecord`.
+
+- The user places their DID string in an externally-visible location (profile bio, DNS TXT record, public post).
+- The attestation's `proof` field points to the resource URL or record location. No cryptographic proof of ownership exists at creation time — the proof is the continued presence of the DID in the external resource.
+- **Zero trust until verified.** A Reference attestation carries no trust weight on its own. Consumers MUST fetch the proof URL or query the DNS record and confirm the DID is present before granting any trust weight. An unverified Reference attestation is equivalent to no attestation.
+- Verification is consumer-side, cached with a 1-hour TTL (§3.5.4). Consumers that cannot verify (offline, rate-limited, proof URL inaccessible) MUST treat the attestation as unverified.
+
+The class distinction is critical for trust evaluation (§7.5). Class 1 attestations provide immediate trust signal upon DID signature verification. Class 2 attestations provide no trust signal until the consumer independently verifies the proof — they are pointers, not proofs.
+
+### 3.5.1 Provider Registry
+
+The following platforms are supported for identity link attestations. New providers are added by spec amendment only — the set is closed to prevent proliferation of unverifiable attestation targets.
+
+| Platform | `platform` value | Class | Verification method | Proof location | Renewal interval |
+|----------|-----------------|-------|--------------------|----|-----------------|
+| GitHub | `github.com` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
+| X / Twitter | `x.com` | 2 (Reference) | `SignedPost` | Profile description containing DID | 90 days |
+| Google | `google.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
+| Apple | `apple.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
+| Microsoft | `microsoft.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
+| Mastodon | `mastodon:<instance>` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
+| DNS | `dns` | 2 (Reference) | `DnsRecord` | TXT record at `_scp-verify.<domain>` | 180 days |
+
+**Platform value conventions:**
+
+- OIDC providers use their token issuer domain: `google.com`, `apple.com`, `microsoft.com`.
+- Social platforms use their primary domain: `github.com`, `x.com`.
+- Mastodon instances use the `mastodon:<instance>` format (e.g., `mastodon:mastodon.social`) because the Mastodon API endpoint varies by instance. The `platform_id` field SHOULD contain the Mastodon account URI (`@user@instance`).
+- DNS uses the bare string `dns`. The `platform_handle` field contains the domain name.
+
+**`ChallengeResponse` verification method:** `ChallengeResponse` is listed as a Class 1 (Cryptographic) verification method in §3.5.0 but does not appear in the provider registry table above. This is intentional — `ChallengeResponse` is platform-agnostic. It is not tied to a specific provider; instead, it is a generic mechanism where any verifier (e.g., a context governance engine, a bridge connector, or another participant) challenges an agent to prove a capability or identity claim via a cryptographic round trip. Any context that wants to verify an agent's capabilities can use `ChallengeResponse` regardless of the platform. The `platform` field in the attestation claim is set to the verifier's choice (e.g., the context ID or verifier's domain), and the `evidence.verifier_did` field identifies the verifier that issued the challenge.
+
+**`ChallengeResponse` creation flow:**
+1. A verifier sends a random 32-byte challenge to the subject.
+2. The subject signs the challenge with their SCP signing key (`#active` or `#agent`).
+3. The SDK constructs the proof: `{ "challenge": "<hex>", "response_signature": "<hex>" }`.
+4. The full `IdentityLinkAttestation` envelope is signed by the subject's DID key.
+
+**`ChallengeResponse` verification:** Verify `response_signature` is valid for `challenge` under the subject's DID signing key. Verify `verifier_did` is a known, trusted verifier.
+
+**Class 1 (Cryptographic) creation flow:**
+
+1. The SDK initiates an OAuth 2.0 authorization code flow with the OIDC provider. Minimal scope: `openid` only (no `email`, no `profile`). Apple Sign In uses the `sub` claim from the identity token.
+2. On success, the SDK receives the ID token (JWT). It extracts `sub` (subject identifier) and discards the token.
+3. The SDK constructs the proof content: `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_s> }`.
+4. The SDK signs the full `IdentityLinkAttestation` envelope (which includes the proof content in `evidence.proof`) with the DID's signing key.
+5. The SDK discards the access token, refresh token, and ID token. Only the signed attestation persists.
+
+**Class 2 (Reference) creation flow:**
+
+1. The user places their DID string in the platform-specific location (profile bio, DNS TXT record).
+2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_s> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
+3. The SDK signs the full `IdentityLinkAttestation` envelope with the DID's signing key.
+4. The attestation is published. It carries zero trust weight until a consumer fetches and verifies the proof.
+
+### 3.5.2 Identity Attestation Wire Format
+
+Identity attestations use the attestation envelope defined in §7.4.1, with identity-link-specific fields. The wire serialization is MessagePack (§17), consistent with all other SCP wire formats. The signature scope uses the §9.5.1 canonical hash construction — see "Signature scope" below.
 
 ```
-IdentityLinkAttestation {
+ IdentityLinkAttestation {
   id:           String,          // Deterministic ID (see below), hex-encoded
   type:         "identity_link",
   issuer:       DID,             // The DID claiming the external identity
   subject:      DID,             // Same as issuer (self-attestation)
-  issued_at:    u64,             // Unix timestamp (ms)
-  expires_at:   Option<u64>,     // Optional expiry (ms). If absent, valid until revoked.
+  issued_at:    u64,             // Unix timestamp (s)
+  expires_at:   Option<u64>,     // Optional expiry (s). If absent, valid until revoked.
   claim: {
-    platform:       String,      // Platform identifier: "x.com", "github.com", "discord.com", etc.
+    platform:       String,      // Platform identifier per §3.5.1 provider registry
     platform_handle: String,     // Handle on the platform: "@alice", "alice123", etc.
-    platform_id:    Option<String>, // Platform-specific immutable user ID (e.g., Twitter user ID)
+    platform_id:    Option<String>, // Platform-specific immutable user ID (e.g., OIDC sub claim, Twitter user ID)
     link_type:      "self_attestation",
   },
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
-    proof:          String,      // Method-specific proof data (see §3.5.2)
-    verified_at:    u64,         // Timestamp of last verification
-    verifier_did:   Option<DID>, // DID of the verifier, if third-party verified
+    proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
+                                     // Verifiers MUST use this string as-is in signature scope — do not parse and re-serialize
+    verified_at:    u64,         // Unix timestamp (s) of last verification
+    verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
-  revocation: {
-    method:         "did_document", // Revocation check method
-    endpoint:       String,        // DID document service endpoint path for revocation status
-  },
-  signature:    Ed25519Signature,  // Signs MessagePack(all fields except signature), using issuer's #active or #agent key
+  revocation_status: RevocationStatus, // Active or Revoked (§7.4.1). MUST be in signed scope.
+  signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active or #agent key
 }
 ```
 
-**Signature scope:** The signature covers `MessagePack_canonical(id, type, issuer, subject, issued_at, expires_at, claim, evidence, revocation)` where `MessagePack_canonical` uses sorted-key encoding (keys in lexicographic order within each map) per §17.1. The signature is computed using the issuer's Active Signing Key (`#active`) or Agent Signing Key (`#agent`).
+**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
 
 **Attestation ID construction:** The `id` field is a deterministic, hex-encoded SHA-256 hash derived from the attestation's identifying fields using the canonical hash construction (§9.5.1). The domain separator `"SCP-ATTESTATION-ID-V1:"` prevents cross-protocol collision, and 4-byte big-endian length prefixes on variable-length fields prevent field boundary ambiguity (e.g., platform `"ab"` + handle `"cd"` vs platform `"a"` + handle `"bcd"`).
 
@@ -161,56 +227,86 @@ id = hex(SHA-256(
 
 The `issued_at` timestamp is encoded as 8-byte big-endian for deterministic cross-platform computation. See §25.16 (Vector 29) for a test vector.
 
-**Revocation check:** Verifiers check revocation by resolving the issuer's DID document and looking for an `AttestationRevocations` service endpoint (§18.2.2). The endpoint returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked.
+**Revocation check:** Verifiers check revocation by resolving the issuer's DID document and looking for an `AttestationRevocations` service endpoint (§18.2.2). The endpoint returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked. Additionally, the `revocation_status` field in the attestation itself is checked — if `Revoked`, the attestation is invalid regardless of the revocation endpoint.
 
-### 3.5.2 Identity Attestation Verification Protocol
+### 3.5.3 DID Document Attestation Service Entry
 
-Each platform verification method has a defined verification protocol:
+Identity link attestations are published as service entries in the issuer's DID document. This enables discovery: any party resolving the DID document can enumerate the issuer's identity links without querying a separate registry.
 
-**OAuth verification (`method: "oauth"`):**
-1. The attesting SDK initiates an OAuth 2.0 authorization code flow with the target platform.
-2. On success, the SDK receives an access token and uses it to query the platform's user info endpoint.
-3. The `proof` field contains the OAuth provider's signed ID token (JWT) OR a JSON object `{ "provider": "<platform>", "subject": "<platform_user_id>", "issued_at": <unix_ts> }` signed by the attesting SDK.
-4. **Verification:** The verifier validates the JWT signature against the platform's published JWKS, confirms the `subject` matches `platform_id`, and confirms `issued_at` is within the attestation's validity period.
-5. **Platforms:** Google (`accounts.google.com`), Apple (`appleid.apple.com`), GitHub (`github.com`), Discord (`discord.com`).
+**Service entry format:**
 
-**Signed post verification (`method: "signed_post"`):**
-1. The attesting user posts a message on the target platform containing their DID string and a nonce.
-2. The `proof` field contains `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_ts> }`.
-3. **Verification:** The verifier fetches the post at `post_url`, confirms the post body contains the DID string and nonce, and confirms the post is authored by the claimed `platform_handle`. The verifier MUST use the platform's official API (not HTML scraping) where available.
-4. **Platforms:** X/Twitter, Mastodon, Bluesky, Reddit, any platform with public posts and API access.
+```
+Service {
+  id:              "<did>#attestation-<platform>--<index>",  // e.g., "did:dht:z...#attestation-github.com--0"
+  type:            "ScpIdentityLinkAttestation",
+  serviceEndpoint: "<attestation_id>"                       // Hex-encoded attestation ID (§3.5.2)
+}
+```
 
-**DNS record verification (`method: "dns_record"`):**
-1. The attesting user adds a TXT record at `_scp-verify.<domain>` containing their DID string.
-2. The `proof` field contains `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
-3. **Verification:** The verifier performs a DNS TXT lookup for `_scp-verify.<domain>` and confirms the record contains the DID string. DNSSEC validation is RECOMMENDED where the domain supports it.
-4. **Platforms:** Any domain the user controls.
+**Fragment naming convention:** `attestation-<platform>--<index>` where `<platform>` is the `platform` value from the provider registry (§3.5.1) and `<index>` is a zero-based integer for disambiguation when multiple attestations exist for the same platform (e.g., multiple Mastodon instances).
 
-**Challenge-response verification (`method: "challenge_response"`):**
-1. A third-party verifier (another SCP agent) sends a challenge to the claimed external identity through the platform.
-2. The user signs the challenge with their SCP identity key and returns the signature through the platform.
-3. The `proof` field contains `{ "challenge": "<hex>", "response_signature": "<hex>", "verifier_did": "<did>" }`.
-4. **Verification:** The verifier confirms the response signature is valid for the challenge under the claimed DID's signing key.
+**Fields:**
 
-**Renewal:** Identity link attestations SHOULD be re-verified at the following intervals:
+- `id`: Full DID URI with fragment. The fragment encodes the platform for human readability. The `<index>` disambiguates multiple attestations for the same platform.
+- `type`: `ScpIdentityLinkAttestation` (constant). Consumers filter DID document services by this type to discover identity link attestations.
+- `serviceEndpoint`: The attestation ID (hex string). Consumers use this to look up the full `IdentityLinkAttestation` from the identity's attestation store (via relay or DHT).
 
-| Method | Renewal interval | Rationale |
-|--------|-----------------|-----------|
-| OAuth | 30 days | Tokens expire; account may be revoked |
-| Signed post | 90 days | Posts may be deleted; account may be suspended |
-| DNS record | 180 days | DNS records are stable; domain ownership changes slowly |
-| Challenge-response | 60 days | No persistent proof; freshness matters |
+**Maximum attestations per DID document:** 10. This prevents DID document bloat — each service entry adds to the DID document size, which is replicated across resolvers. A user with more than 10 platform identities must choose which 10 to publish. The limit applies to service entries of type `ScpIdentityLinkAttestation` only; other service types have their own limits.
 
-### 3.5.3 Shadow Identity Claiming Protocol
+**Lifecycle:** When an attestation is revoked, the corresponding service entry MUST be removed from the DID document. When an attestation is renewed (re-verified), the service entry is unchanged — it still points to the same attestation ID. When an attestation is replaced (new attestation for the same platform+handle), the service entry's `serviceEndpoint` is updated to the new attestation ID.
+
+### 3.5.4 Verification
+
+Verification procedure depends on the attestation class (§3.5.0).
+
+**Class 1 (Cryptographic) verification:**
+
+1. Resolve the issuer's DID document. Extract the `#active` or `#agent` public key.
+2. Verify the Ed25519 signature on the attestation envelope against the issuer's public key.
+3. Check `revocation_status` is `Active`. If `Revoked`, reject.
+4. Check `expires_at` (if present). If expired, reject.
+5. Check freshness: if `evidence.verified_at` is older than the renewal interval for the verification method (§3.5.1), the attestation is stale. Stale attestations are degraded (reduced trust weight), not rejected outright.
+6. **Trust the self-attestation.** Because issuer == subject, the DID key signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (shadow claiming verifies independently, social graph import only surfaces genuine contacts).
+
+**Class 2 (Reference) verification:**
+
+1. Perform steps 1-5 from Class 1 verification (signature, revocation, expiry, freshness).
+2. **Fetch the proof resource.** For `SignedPost`: HTTP GET the `post_url`, confirm the response body contains the issuer's DID string and the nonce. For `DnsRecord`: perform a DNS TXT lookup for `_scp-verify.<domain>`, confirm a record contains the issuer's DID string. DNSSEC validation is RECOMMENDED where the domain supports it.
+3. **If fetch fails or DID is not present:** the attestation is unverified. Treat as if the attestation does not exist for trust evaluation. Do not cache a negative result — transient failures (rate limiting, DNS propagation delays) should not permanently invalidate an attestation.
+4. **If fetch succeeds and DID is present:** the attestation is verified. Cache the result.
+
+**Verification cache:**
+
+- Consumer-side. Each consumer maintains its own cache of Reference attestation verification results.
+- TTL: 1 hour. After TTL expires, the consumer MUST re-verify before granting trust weight.
+- Cache key: attestation ID.
+- Cache entries: `{ attestation_id, verified: bool, verified_at: u64, expires_at: u64 }`.
+- Class 1 attestations do not require caching — DID signature verification is deterministic and fast.
+
+**Renewal intervals** (SHOULD re-verify at these intervals; stale but not expired attestations are degraded, not rejected):
+
+| Platform | Class | Renewal interval | Rationale |
+|----------|-------|-----------------|-----------|
+| `google.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `apple.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `microsoft.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `github.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
+| `x.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
+| `mastodon:<instance>` | 2 | 90 days | Profile bio may be edited; instance may be deactivated |
+| `dns` | 2 | 180 days | DNS records are stable; domain ownership changes slowly |
+
+**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations are not tied to a specific platform (§3.5.1), so they do not appear in the per-platform tables above. The 60-day interval reflects that no persistent proof exists — freshness of the cryptographic round trip is the only signal.
+
+### 3.5.5 Shadow Identity Claiming Protocol
 
 When a bridge connector creates a shadow identity for an external platform participant (§12.3), the following protocol governs claiming:
 
 **Claiming sequence:**
 
-1. **Eligibility check.** The claimant presents an `IdentityLinkAttestation` (§3.5.1) for the same platform and handle as the shadow identity. The bridge verifies:
+1. **Eligibility check.** The claimant presents an `IdentityLinkAttestation` (§3.5.2) for the same platform and handle as the shadow identity. The bridge verifies:
    a. The attestation is valid (signature verifies, not expired, not revoked).
    b. The `platform` and `platform_handle` (or `platform_id` if available) match the shadow identity's external identity.
-   c. The attestation's `evidence` has been verified within the last renewal interval (§3.5.2).
+   c. The attestation's `evidence` has been verified within the last renewal interval (§3.5.4).
 
 2. **Claim request.** The claimant sends a `ShadowClaimRequest` to the bridge context:
    ```
@@ -238,6 +334,16 @@ When a bridge connector creates a shadow identity for an external platform parti
 5. **Conflict resolution.** If two claimants present valid attestations for the same shadow identity simultaneously, the first `ShadowClaimRequest` processed by the bridge wins. The second claimant receives a `SHADOW_ALREADY_CLAIMED` error (code 4040). The losing claimant MAY dispute via the bridge context's governance mechanism.
 
 **Participation record handling.** The shadow identity's participation history (message counts, duration, event log entries) is NOT merged into the claimant's participation profile. Shadow participation is recorded under the shadow DID — the `ShadowClaimed` event establishes the link for auditing, but participation records remain separate to prevent Sybil amplification (creating shadow identities to inflate participation).
+
+### 3.5.6 Security Considerations
+
+**SDK-signed proofs are self-attestation summaries.** Class 1 proofs assert "I performed OAuth and the provider confirmed my identity." This is a self-attestation — there is no way for a consumer to independently verify that the OAuth flow occurred. This is acceptable ONLY for identity links, where issuer == subject. SDK-signed proofs MUST NOT be used for cross-party attestation types (endorsements, capability delegations, etc.) where the issuer and subject differ.
+
+**No PII in attestations.** The attestation contains only: platform name, platform handle, platform user ID (opaque identifier, not email or name), and verification timestamp. No raw JWT, no OIDC claims beyond `sub`, no email addresses, no display names. The `openid`-only scope ensures the OIDC provider returns the minimum possible claim set. SDKs MUST NOT request `email` or `profile` scopes for attestation creation.
+
+**Reference attestations carry zero trust until verified.** A Class 2 attestation with an unverified proof URL provides no trust signal whatsoever. Trust evaluation (§7.5) MUST score unverified Reference attestations at zero. This prevents an attacker from publishing a Reference attestation pointing to a URL they do not control — the attestation exists, but no consumer will trust it until they verify the proof.
+
+**`revocation_status` in signed fields.** The `revocation_status` field is included in the signature scope (§3.5.2). This prevents re-activation: an attacker who obtains a `Revoked` attestation cannot strip the status and present it as `Active` because the signature covers `revocation_status`. However, this does NOT prevent replay of the original `Active`-signed version — the original attestation remains valid until consumers check the revocation endpoint. The revocation endpoint check (§18.2.2 `AttestationRevocations`) is ALWAYS required regardless of `revocation_status` value. The signed field is defense-in-depth, not a complete revocation mechanism.
 
 ## 3.6 Social Graph
 
