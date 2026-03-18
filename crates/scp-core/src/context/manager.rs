@@ -55,6 +55,7 @@ use crate::crypto::ucan::validate::{
 use crate::economy::budget::MemberBudgetTracker;
 use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Protocol-level collection size limits (§5.9)
@@ -1766,6 +1767,57 @@ impl ContextManager {
     /// This is a read-only query useful for diagnostics and testing.
     pub async fn is_local_did(&self, did: &DID) -> bool {
         self.local_dids.read().await.contains(did)
+    }
+
+    /// Returns the broadcast key and epoch for a locally controlled author
+    /// in a broadcast context.
+    ///
+    /// This enables FFI bridges to auto-resolve broadcast keys for
+    /// `enable_site_projection` without requiring the caller to manually
+    /// provide the key. The key is returned as `Zeroizing<[u8; 32]>` to
+    /// ensure sensitive material is wiped on drop.
+    ///
+    /// # Security
+    ///
+    /// Only returns keys for DIDs in [`local_dids`](Self::register_local_did).
+    /// This prevents leaking broadcast keys for remote authors.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    ///   or is not a broadcast context.
+    /// - [`ContextError::PermissionDenied`] if `author_did` is not locally
+    ///   controlled.
+    /// - [`ContextError::MemberNotFound`] if `author_did` is not a registered
+    ///   author in the broadcast context.
+    pub async fn get_broadcast_key_for_local_author(
+        &self,
+        context_id: &str,
+        author_did: &str,
+    ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
+        // Verify the DID is locally controlled.
+        if !self.local_dids.read().await.contains(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "author DID is not controlled by the local node: {author_did}"
+            )));
+        }
+
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        let bc = ctx
+            .broadcast_context
+            .as_ref()
+            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+        let author = bc.get_author(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let key_bytes = Zeroizing::new(*author.broadcast_key.as_bytes());
+        Ok((key_bytes, author.epoch))
     }
 
     /// Returns `true` if the given context needs to re-enter the
@@ -19628,6 +19680,134 @@ mod tests {
         assert_eq!(
             ctx.mls_epoch, 0,
             "epoch must not change for inactive context"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_broadcast_key_for_local_author
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_broadcast_key_for_local_author_returns_key_and_epoch() {
+        use zeroize::Zeroizing;
+
+        let manager = ContextManager::new(
+            Box::<MockCrypto>::default(),
+            Box::new(MockTransport::default()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let creator_did: DID = "did:key:creator1".into();
+        manager.register_local_did(creator_did.clone()).await;
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
+            ..Default::default()
+        };
+
+        let _handle = manager
+            .create_context("bc-key-test".into(), params, creator_did.clone())
+            .await
+            .unwrap();
+
+        let (key_bytes, epoch) = manager
+            .get_broadcast_key_for_local_author("bc-key-test", creator_did.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(epoch, 0, "initial epoch should be 0");
+        // Key should be 32 bytes, non-zero (randomly generated).
+        let zero = Zeroizing::new([0u8; 32]);
+        assert_ne!(key_bytes, zero, "broadcast key must not be all zeros");
+    }
+
+    #[tokio::test]
+    async fn get_broadcast_key_for_local_author_rejects_non_local_did() {
+        let manager = ContextManager::new(
+            Box::<MockCrypto>::default(),
+            Box::new(MockTransport::default()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let creator_did: DID = "did:key:creator2".into();
+        manager.register_local_did(creator_did.clone()).await;
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
+            ..Default::default()
+        };
+
+        let _handle = manager
+            .create_context("bc-key-test-2".into(), params, creator_did.clone())
+            .await
+            .unwrap();
+
+        let result = manager
+            .get_broadcast_key_for_local_author("bc-key-test-2", "did:key:not-local")
+            .await;
+
+        assert!(result.is_err(), "should reject non-local DID");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(_)),
+            "error should be PermissionDenied"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_broadcast_key_for_local_author_rejects_unknown_context() {
+        let manager = ContextManager::new(
+            Box::<MockCrypto>::default(),
+            Box::new(MockTransport::default()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let did: DID = "did:key:creator3".into();
+        manager.register_local_did(did.clone()).await;
+
+        let result = manager
+            .get_broadcast_key_for_local_author("nonexistent-ctx", did.as_ref())
+            .await;
+
+        assert!(result.is_err(), "should reject unknown context");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::MembershipFailed(_)),
+            "error should be MembershipFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_broadcast_key_for_local_author_rejects_encrypted_context() {
+        let manager = ContextManager::new(
+            Box::<MockCrypto>::default(),
+            Box::new(MockTransport::default()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let creator_did: DID = "did:key:creator4".into();
+        manager.register_local_did(creator_did.clone()).await;
+
+        // Default mode is Encrypted, not Broadcast.
+        let params = ContextParams::default();
+
+        let _handle = manager
+            .create_context("encrypted-ctx".into(), params, creator_did.clone())
+            .await
+            .unwrap();
+
+        let result = manager
+            .get_broadcast_key_for_local_author("encrypted-ctx", creator_did.as_ref())
+            .await;
+
+        assert!(result.is_err(), "should reject encrypted context");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::MembershipFailed(_)),
+            "error should be MembershipFailed (not a broadcast context)"
         );
     }
 }

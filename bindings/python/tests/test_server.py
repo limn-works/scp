@@ -35,10 +35,10 @@ class _MockNodeHandle:
     def enable_site_projection(
         self,
         context_id: str,
-        broadcast_key_hex: str,
-        author_did: str,
         admission: str,
         hostname: str,
+        broadcast_key_hex: str | None = None,
+        author_did: str | None = None,
         index_path: str | None = None,
         max_assets_per_deploy: int | None = None,
         max_deploy_size_bytes: int | None = None,
@@ -94,10 +94,10 @@ async def test_enable_site_projection_delegates_to_handle() -> None:
 
     await node.enable_site_projection(
         context_id="ctx-123",
-        broadcast_key_hex="ab" * 32,
-        author_did="did:dht:z6MkAuthor",
         admission="open",
         config=config,
+        broadcast_key_hex="ab" * 32,
+        author_did="did:dht:z6MkAuthor",
     )
 
     assert handle._last_enable_args["context_id"] == "ctx-123"
@@ -121,10 +121,10 @@ async def test_enable_site_projection_defaults_pass_none() -> None:
 
     await node.enable_site_projection(
         context_id="ctx-456",
-        broadcast_key_hex="cd" * 32,
-        author_did="did:dht:z6MkAuthor2",
         admission="gated",
         config=config,
+        broadcast_key_hex="cd" * 32,
+        author_did="did:dht:z6MkAuthor2",
     )
 
     assert handle._last_enable_args["index_path"] is None
@@ -142,8 +142,6 @@ async def test_enable_site_projection_requires_config() -> None:
     with pytest.raises(TypeError):
         await node.enable_site_projection(  # type: ignore[call-arg]
             context_id="ctx-789",
-            broadcast_key_hex="ef" * 32,
-            author_did="did:dht:z6MkAuthor3",
             admission="open",
         )
 

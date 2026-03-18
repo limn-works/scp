@@ -69,12 +69,15 @@ interface ServerBindings {
     /**
      * Activates HTTP broadcast projection for a context.
      *
+     * When [broadcastKeyHex] and [authorDid] are `null`, the key is
+     * auto-resolved from the `ContextManager` using the node's identity DID.
+     *
      * @param handleJson JSON-encoded node handle.
      * @param contextId The context ID to project.
-     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string.
-     * @param authorDid DID of the broadcast key owner.
      * @param admission "open" or "gated".
      * @param hostname Virtual host hostname (RFC 1123).
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string, or null for auto-lookup.
+     * @param authorDid DID of the broadcast key owner, or null for auto-lookup.
      * @param indexPath Default path for directory requests, or null for default "/index.html".
      * @param maxAssetsPerDeploy Max assets per deploy, or null for default 10000.
      * @param maxDeploySizeBytes Max total deploy size in bytes, or null for default 536870912.
@@ -85,10 +88,10 @@ interface ServerBindings {
     fun nodeEnableSiteProjection(
         handleJson: String,
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         hostname: String,
+        broadcastKeyHex: String?,
+        authorDid: String?,
         indexPath: String?,
         maxAssetsPerDeploy: Int?,
         maxDeploySizeBytes: Long?,
@@ -324,23 +327,29 @@ class Node internal constructor(
      *
      * Registers a broadcast context for HTTP content delivery.
      *
+     * When [broadcastKeyHex] and [authorDid] are `null`, the key is
+     * auto-resolved from the `ContextManager` using the node's identity
+     * DID. This is the recommended usage for locally managed contexts.
+     *
      * @param contextId The context ID to project.
-     * @param broadcastKeyHex 32-byte AES-256 broadcast key as a 64-char hex string.
-     * @param authorDid DID of the broadcast key owner.
      * @param admission "open" or "gated".
      * @param config [SiteConfig] with hostname, index path, and deploy limits.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as a 64-char hex string, or null for auto-lookup.
+     * @param authorDid DID of the broadcast key owner, or null for auto-lookup.
      * @throws BridgeException if parameters are invalid or operation fails.
      */
     @Suppress("LongParameterList")
     suspend fun enableSiteProjection(
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         config: SiteConfig,
+        broadcastKeyHex: String? = null,
+        authorDid: String? = null,
     ) {
         validateAdmission(admission)
-        validateBroadcastKeyHex(broadcastKeyHex)
+        if (broadcastKeyHex != null) {
+            validateBroadcastKeyHex(broadcastKeyHex)
+        }
         bridge.enableSiteProjection(
             this,
             contextId,
@@ -558,8 +567,8 @@ class ServerBridge internal constructor(
      *
      * @param node The running node.
      * @param contextId The context ID to project.
-     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string.
-     * @param authorDid DID of the broadcast key owner.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string, or null for auto-lookup.
+     * @param authorDid DID of the broadcast key owner, or null for auto-lookup.
      * @param admission "open" or "gated".
      * @param config [SiteConfig] with hostname, index path, and deploy limits.
      */
@@ -567,18 +576,18 @@ class ServerBridge internal constructor(
     internal suspend fun enableSiteProjection(
         node: Node,
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
+        broadcastKeyHex: String?,
+        authorDid: String?,
         admission: String,
         config: SiteConfig,
     ) = bridge.ffiCall {
         bindings.nodeEnableSiteProjection(
             node.handleJson,
             contextId,
-            broadcastKeyHex,
-            authorDid,
             admission,
             config.hostname,
+            broadcastKeyHex,
+            authorDid,
             if (config.indexPath == "/index.html") null else config.indexPath,
             if (config.maxAssetsPerDeploy == 10_000) null else config.maxAssetsPerDeploy,
             if (config.maxDeploySizeBytes == 536_870_912L) null else config.maxDeploySizeBytes,

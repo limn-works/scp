@@ -147,18 +147,21 @@ impl NapiNodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// `broadcastKeyHex` is the 32-byte AES-256 broadcast key as a 64-char
-    /// hex string. `authorDid` is the DID of the key owner. `admission` is
-    /// `"open"` or `"gated"`. `hostname` is the virtual host (RFC 1123).
+    /// When `broadcastKeyHex` and `authorDid` are `null`, the key is
+    /// auto-resolved from the `ContextManager` using the node's identity
+    /// DID. This is the recommended usage for locally managed contexts.
+    ///
+    /// `admission` is `"open"` or `"gated"`. `hostname` is the virtual
+    /// host (RFC 1123).
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn enable_site_projection(
         &self,
         context_id: String,
-        broadcast_key_hex: String,
-        author_did: String,
         admission: String,
         hostname: String,
+        broadcast_key_hex: Option<String>,
+        author_did: Option<String>,
         index_path: Option<String>,
         max_assets_per_deploy: Option<u32>,
         max_deploy_size_bytes: Option<i64>,
@@ -166,22 +169,49 @@ impl NapiNodeHandle {
         csp_override: Option<String>,
     ) -> napi::Result<()> {
         validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-        validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-        let key_vec = Zeroizing::new(
-            hex::decode(&broadcast_key_hex)
-                .map_err(|e| NapiError::from_reason(format!("invalid broadcast_key_hex: {e}")))?,
-        );
-        let key_bytes: Zeroizing<[u8; 32]> =
-            Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                NapiError::from_reason(
-                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                )
-            })?);
+        if let Some(ref did) = author_did {
+            validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        }
+
+        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
+        let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
+            match (broadcast_key_hex, author_did) {
+                (Some(key_hex), Some(did)) => {
+                    let key_hex = Zeroizing::new(key_hex);
+                    let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
+                        NapiError::from_reason(format!("invalid broadcast_key_hex: {e}"))
+                    })?);
+                    let key_bytes: Zeroizing<[u8; 32]> =
+                        Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
+                            NapiError::from_reason(
+                                "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                            )
+                        })?);
+                    (key_bytes, 0u64, did)
+                }
+                (None, None) => {
+                    // Auto-resolve from ContextManager using node's identity DID.
+                    let node_did = self.inner.did().to_owned();
+                    let mgr = crate::runtime::context_manager()?;
+                    let (key_bytes, epoch) = mgr
+                        .get_broadcast_key_for_local_author(&context_id, &node_did)
+                        .await
+                        .map_err(|e| {
+                            NapiError::from_reason(format!("broadcast key required — {e}"))
+                        })?;
+                    (key_bytes, epoch, node_did)
+                }
+                _ => {
+                    return Err(NapiError::from_reason(
+                        "broadcastKeyHex and authorDid must both be provided or both be null",
+                    ));
+                }
+            };
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
-            0,
-            author_did,
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
+            resolved_epoch,
+            resolved_author_did,
         );
 
         let adm = match admission.to_lowercase().as_str() {

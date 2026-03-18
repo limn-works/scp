@@ -225,37 +225,46 @@ class Node:
     async def enable_site_projection(
         self,
         context_id: str,
-        broadcast_key_hex: str,
-        author_did: str,
         admission: str,
         config: SiteConfig,
+        broadcast_key_hex: str | None = None,
+        author_did: str | None = None,
     ) -> None:
         """Activate HTTP broadcast projection for a context.
 
         Registers a broadcast context for HTTP content delivery.
 
+        When ``broadcast_key_hex`` and ``author_did`` are ``None``, the
+        key is auto-resolved from the ``ContextManager`` using the
+        node's identity DID. This is the recommended usage for locally
+        managed contexts.
+
         Args:
             context_id: The context ID to project.
-            broadcast_key_hex: 32-byte AES-256 broadcast key as a
-                64-character hex string.
-            author_did: DID of the broadcast key owner.
             admission: ``"open"`` or ``"gated"``.
             config: :class:`~scp_sdk.context.SiteConfig` with hostname,
                 index path, and deploy limits.
+            broadcast_key_hex: 32-byte AES-256 broadcast key as a
+                64-character hex string, or ``None`` for auto-lookup.
+            author_did: DID of the broadcast key owner, or ``None``
+                for auto-lookup.
 
         Raises:
-            ValueError: If parameters are invalid.
-            RuntimeError: If the underlying node operation fails.
+            ValueError: If parameters are invalid or only one of
+                ``broadcast_key_hex``/``author_did`` is provided.
+            RuntimeError: If the underlying node operation fails or
+                auto-lookup cannot find the key.
         """
         validate_admission(admission)
-        validate_broadcast_key_hex(broadcast_key_hex)
+        if broadcast_key_hex is not None:
+            validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(
             self._handle.enable_site_projection,
             context_id,
-            broadcast_key_hex,
-            author_did,
             admission,
             config.hostname,
+            broadcast_key_hex,
+            author_did,
             config.index_path if config.index_path != "/index.html" else None,
             config.max_assets_per_deploy if config.max_assets_per_deploy != 10_000 else None,
             config.max_deploy_size_bytes if config.max_deploy_size_bytes != 536_870_912 else None,

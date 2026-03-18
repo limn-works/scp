@@ -63,10 +63,10 @@ public enum ServerBridge {
     public typealias EnableSiteProjectionFn = @Sendable (
         _ handle: NodeHandle,
         _ contextId: String,
-        _ broadcastKeyHex: String,
-        _ authorDid: String,
         _ admission: String,
         _ hostname: String,
+        _ broadcastKeyHex: String?,
+        _ authorDid: String?,
         _ indexPath: String?,
         _ maxAssetsPerDeploy: UInt32?,
         _ maxDeploySizeBytes: UInt64?,
@@ -115,10 +115,10 @@ public enum ServerBridge {
     }
 
     /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.
-    public static let defaultEnableSiteProjection: EnableSiteProjectionFn = { hdl, ctx, key, auth, adm, host, idx, maxA, maxS, ret, csp in // swiftlint:disable:this line_length
+    public static let defaultEnableSiteProjection: EnableSiteProjectionFn = { hdl, ctx, adm, host, key, auth, idx, maxA, maxS, ret, csp in // swiftlint:disable:this line_length
         try await hdl.enableSiteProjection(
-            contextId: ctx, broadcastKeyHex: key, authorDid: auth,
-            admission: adm, hostname: host, indexPath: idx,
+            contextId: ctx, admission: adm, hostname: host,
+            broadcastKeyHex: key, authorDid: auth, indexPath: idx,
             maxAssetsPerDeploy: maxA, maxDeploySizeBytes: maxS,
             deployRetentionCount: ret, cspOverride: csp
         )
@@ -329,31 +329,37 @@ public struct Node: Sendable {
     ///
     /// Registers a broadcast context for HTTP content delivery.
     ///
+    /// When `broadcastKeyHex` and `authorDid` are `nil`, the key is
+    /// auto-resolved from the `ContextManager` using the node's identity
+    /// DID. This is the recommended usage for locally managed contexts.
+    ///
     /// - Parameters:
     ///   - contextId: The context ID to project.
-    ///   - broadcastKeyHex: 32-byte AES-256 broadcast key as a 64-char hex string.
-    ///   - authorDid: DID of the broadcast key owner.
     ///   - admission: `"open"` or `"gated"`.
     ///   - config: ``SiteConfig`` with hostname, index path, and deploy limits.
+    ///   - broadcastKeyHex: 32-byte AES-256 broadcast key as a 64-char hex string, or `nil` for auto-lookup.
+    ///   - authorDid: DID of the broadcast key owner, or `nil` for auto-lookup.
     ///   - enableFn: Bridge function override for testing.
     /// - Throws: ``ScpError`` if parameters are invalid or operation fails.
     public func enableSiteProjection(
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         config: SiteConfig,
+        broadcastKeyHex: String? = nil,
+        authorDid: String? = nil,
         enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
     ) async throws {
         try validateAdmission(admission)
-        try validateBroadcastKeyHex(broadcastKeyHex)
+        if let key = broadcastKeyHex {
+            try validateBroadcastKeyHex(key)
+        }
         try await enableFn(
             handle,
             contextId,
-            broadcastKeyHex,
-            authorDid,
             admission,
             config.hostname,
+            broadcastKeyHex,
+            authorDid,
             config.indexPath == "/index.html" ? nil : config.indexPath,
             config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
             config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
