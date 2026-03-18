@@ -234,6 +234,23 @@ impl NodeInner {
             Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
         }
     }
+
+    async fn serve_background(
+        &self,
+        bind_addr: Option<std::net::SocketAddr>,
+    ) -> Result<std::net::SocketAddr, scp_node::NodeError> {
+        match self {
+            Self::InMemory(n) => n.serve_background(bind_addr).await,
+            Self::Filesystem(n) => n.serve_background(bind_addr).await,
+        }
+    }
+
+    async fn http_url(&self) -> Option<String> {
+        match self {
+            Self::InMemory(n) => n.http_url().await,
+            Self::Filesystem(n) => n.http_url().await,
+        }
+    }
 }
 
 /// Opaque handle to a running SCP application node.
@@ -401,6 +418,35 @@ impl NodeHandle {
         validate_context_id(&context_id)?;
         self.inner.disable_broadcast_projection(&context_id).await;
         Ok(())
+    }
+
+    /// Starts the HTTP server in the background on the given bind address.
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bind_addr` is `None`.
+    /// Returns the actual bound address as a string (e.g., `"127.0.0.1:8443"`).
+    ///
+    /// Throws if the server is already running or binding fails.
+    pub async fn serve(&self, bind_addr: Option<String>) -> Result<String, ScpError> {
+        let addr = bind_addr
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>()
+                    .map_err(|_| ScpError::Validation {
+                        msg: format!("invalid bind_addr: {s}"),
+                        code: "SCP-TRANS-5070".to_owned(),
+                    })
+            })
+            .transpose()?;
+        self.inner
+            .serve_background(addr)
+            .await
+            .map(|a| a.to_string())
+            .map_err(ScpError::from)
+    }
+
+    /// Returns the HTTP URL of the background server, or `None` if not serving.
+    #[must_use]
+    pub async fn http_url(&self) -> Option<String> {
+        self.inner.http_url().await
     }
 }
 

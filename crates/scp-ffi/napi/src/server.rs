@@ -194,6 +194,23 @@ impl NodeInner {
             Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
         }
     }
+
+    async fn serve_background(
+        &self,
+        bind_addr: Option<std::net::SocketAddr>,
+    ) -> Result<std::net::SocketAddr, scp_node::NodeError> {
+        match self {
+            Self::InMemory(n) => n.serve_background(bind_addr).await,
+            Self::Filesystem(n) => n.serve_background(bind_addr).await,
+        }
+    }
+
+    async fn http_url(&self) -> Option<String> {
+        match self {
+            Self::InMemory(n) => n.http_url().await,
+            Self::Filesystem(n) => n.http_url().await,
+        }
+    }
 }
 
 /// Opaque handle to a running SCP application node.
@@ -360,6 +377,33 @@ impl NapiNodeHandle {
         validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         self.inner.disable_broadcast_projection(&context_id).await;
         Ok(())
+    }
+
+    /// Starts the HTTP server in the background on the given bind address.
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is not
+    /// provided. Returns the actual bound address as a string.
+    ///
+    /// Throws if the server is already running or binding fails.
+    #[napi]
+    pub async fn serve(&self, bind_addr: Option<String>) -> napi::Result<String> {
+        let addr = bind_addr
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>()
+                    .map_err(|e| NapiError::from_reason(format!("invalid bind_addr: {e}")))
+            })
+            .transpose()?;
+        self.inner
+            .serve_background(addr)
+            .await
+            .map(|a| a.to_string())
+            .map_err(node_err)
+    }
+
+    /// Returns the HTTP URL of the background server, or `null` if not serving.
+    #[napi(getter)]
+    pub async fn http_url(&self) -> Option<String> {
+        self.inner.http_url().await
     }
 }
 

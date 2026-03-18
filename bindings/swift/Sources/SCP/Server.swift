@@ -36,6 +36,27 @@ public enum ServerBridge {
     /// Start a full application node with file-backed storage.
     public typealias NodeStartLocalFn = @Sendable (_ dataDir: String) async throws -> NodeHandle
 
+    /// Start the HTTP server in the background.
+    public typealias ServeFn = @Sendable (
+        _ handle: NodeHandle,
+        _ bindAddr: String?
+    ) async throws -> String
+
+    /// Returns the HTTP URL of the background server, or nil.
+    public typealias HttpUrlFn = @Sendable (
+        _ handle: NodeHandle
+    ) async -> String?
+
+    /// Default serve -- delegates to UniFFI ``NodeHandle.serve()``.
+    public static let defaultServe: ServeFn = { handle, bindAddr in
+        try await handle.serve(bindAddr: bindAddr)
+    }
+
+    /// Default http_url -- delegates to UniFFI ``NodeHandle.httpUrl()``.
+    public static let defaultHttpUrl: HttpUrlFn = { handle in
+        await handle.httpUrl()
+    }
+
     // MARK: Node lifecycle (SCP-296, spec section 18.11.8)
 
     /// Enable HTTP broadcast projection for a context.
@@ -266,6 +287,36 @@ public struct Node: Sendable {
     /// In-flight connection handlers drain naturally. Idempotent.
     public func shutdown() {
         handle.shutdown()
+    }
+
+    // MARK: - HTTP server lifecycle
+
+    /// Starts the HTTP server in the background.
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is nil.
+    /// Pass `"0.0.0.0:PORT"` for network access.
+    ///
+    /// - Parameters:
+    ///   - bindAddr: Socket address to bind (e.g. `"127.0.0.1:8080"`).
+    ///   - serveFn: Bridge function override for testing.
+    /// - Returns: The actual bound address as a string.
+    /// - Throws: ``ScpError`` if the server is already running or binding fails.
+    @discardableResult
+    public func serve(
+        bindAddr: String? = nil,
+        serveFn: ServerBridge.ServeFn = ServerBridge.defaultServe
+    ) async throws -> String {
+        try await serveFn(handle, bindAddr)
+    }
+
+    /// The HTTP URL of the background server, or `nil` if not serving.
+    ///
+    /// - Parameter httpUrlFn: Bridge function override for testing.
+    /// - Returns: The HTTP URL or `nil`.
+    public func httpUrl(
+        httpUrlFn: ServerBridge.HttpUrlFn = ServerBridge.defaultHttpUrl
+    ) async -> String? {
+        await httpUrlFn(handle)
     }
 
     // MARK: - Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)

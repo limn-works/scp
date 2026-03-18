@@ -427,4 +427,109 @@ mod tests {
         let relay_err = ServerError::Relay(RelayError::BindFailed("addr in use".into()));
         assert!(relay_err.to_string().contains("addr in use"), "{relay_err}");
     }
+
+    /// Sends a minimal HTTP/1.1 GET request and returns the status line.
+    async fn http_get_status(addr: SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        response.lines().next().unwrap_or("").to_owned()
+    }
+
+    #[tokio::test]
+    async fn serve_background_binds_and_responds() {
+        let node = start_node_in_memory().await.unwrap();
+
+        // Serve on an OS-assigned port (port 0) so tests don't conflict.
+        let addr = node
+            .serve_background(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .await
+            .unwrap();
+
+        assert_ne!(addr.port(), 0, "should bind to a real port");
+        assert!(addr.ip().is_loopback(), "should be loopback");
+
+        // http_url should reflect the bound address.
+        let url = node.http_url().await;
+        assert!(url.is_some(), "http_url should be Some after serve");
+        let url = url.unwrap();
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "expected http:// URL, got: {url}"
+        );
+
+        // HTTP GET to .well-known/scp should return HTTP 200.
+        let status = http_get_status(addr, "/.well-known/scp").await;
+        assert!(
+            status.contains("200"),
+            "expected 200 in status line, got: {status}"
+        );
+
+        node.shutdown();
+
+        // After shutdown, yield briefly for the background task to clear state.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn serve_background_double_serve_returns_error() {
+        let node = start_node_in_memory().await.unwrap();
+
+        // First serve should succeed.
+        let _addr = node
+            .serve_background(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .await
+            .unwrap();
+
+        // Second serve should fail.
+        let result = node
+            .serve_background(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .await;
+        assert!(result.is_err(), "double serve should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already running"),
+            "error should mention 'already running', got: {err_msg}"
+        );
+
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn serve_background_shutdown_stops_server() {
+        let node = start_node_in_memory().await.unwrap();
+
+        let addr = node
+            .serve_background(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .await
+            .unwrap();
+
+        // Verify server is responsive.
+        let status = http_get_status(addr, "/.well-known/scp").await;
+        assert!(status.contains("200"), "expected 200, got: {status}");
+
+        // Shutdown.
+        node.shutdown();
+
+        // Yield for the background task to drain.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // After shutdown, connection should fail.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await;
+        assert!(
+            result.is_err() || result.unwrap().is_err(),
+            "connection should fail after shutdown"
+        );
+    }
 }

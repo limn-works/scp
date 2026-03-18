@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
@@ -60,6 +61,17 @@ pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, Site
 /// the server to the network.
 pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
+
+/// Default bind address for the background HTTP server (`127.0.0.1:8443`).
+///
+/// This binds to **loopback only** (`127.0.0.1`), which is the safe default
+/// for [`ApplicationNode::serve_background`] since SDK consumers typically
+/// run the node in-process and do not need external access.
+///
+/// For public-facing deployments, pass a non-loopback address explicitly —
+/// a warning is logged when a non-loopback address is used.
+pub const DEFAULT_BACKGROUND_HTTP_BIND_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8443);
 
 // ---------------------------------------------------------------------------
 // Resource limits
@@ -230,6 +242,14 @@ pub struct ApplicationNode<S: Storage> {
     /// `None` if HTTP/3 is not configured. Only available with the `http3` feature.
     #[cfg(feature = "http3")]
     http3_config: Option<scp_transport::http3::Http3Config>,
+    /// Whether the background HTTP server is currently running.
+    /// Used by [`serve_background`](Self::serve_background) to prevent double-serve.
+    /// Wrapped in `Arc` so the spawned background task can clear it on exit.
+    serving: Arc<AtomicBool>,
+    /// The bound address of the background HTTP server, if running.
+    /// Set by [`serve_background`](Self::serve_background) after successful bind.
+    /// Wrapped in `Arc` so the spawned background task can clear it on exit.
+    serving_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -243,6 +263,7 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
                 "tier_reeval",
                 &self.tier_reeval.as_ref().map(|_| "<active>"),
             )
+            .field("serving", &self.serving.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -380,6 +401,150 @@ impl<S: Storage> ApplicationNode<S> {
         if let Some(ref handle) = self.tier_reeval {
             handle.stop();
         }
+    }
+
+    /// Returns the HTTP URL of the background server, if running.
+    ///
+    /// Returns `Some("http://<addr>")` when [`serve_background`](Self::serve_background)
+    /// has been called and the server is actively listening. Returns `None`
+    /// if the background server has not been started.
+    pub async fn http_url(&self) -> Option<String> {
+        let guard = self.serving_addr.lock().await;
+        guard.map(|addr| format!("http://{addr}"))
+    }
+
+    /// Starts serving HTTP traffic in a background tokio task.
+    ///
+    /// Unlike [`serve`](Self::serve), this method does **not** consume the
+    /// node. It clones the shared `NodeState` and the cancellation token,
+    /// spawns the full merged router in a background task, and returns the
+    /// bound address.
+    ///
+    /// ## Bind address
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bind_addr` is
+    /// `None`. A `tracing::warn!` is emitted when a non-loopback address
+    /// is used, since exposing the HTTP server to the network may have
+    /// security implications.
+    ///
+    /// ## Double-serve prevention
+    ///
+    /// Calling this method more than once returns an error without starting
+    /// a second listener.
+    ///
+    /// ## Shutdown
+    ///
+    /// The spawned task observes the node's cancellation token. Calling
+    /// [`shutdown`](Self::shutdown) stops both the relay and the background
+    /// HTTP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if:
+    /// - The server is already running (double-serve).
+    /// - The TCP listener cannot bind.
+    /// - The bound address cannot be retrieved.
+    pub async fn serve_background(
+        &self,
+        bind_addr: Option<SocketAddr>,
+    ) -> Result<SocketAddr, NodeError> {
+        // Prevent double-serve.
+        if self
+            .serving
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(NodeError::Serve(
+                "background HTTP server is already running".into(),
+            ));
+        }
+
+        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+
+        // Security: warn when binding to a non-loopback address.
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                bind_addr = %addr,
+                "serve_background binding to non-loopback address — \
+                 HTTP server will be accessible from the network"
+            );
+        }
+
+        let state = Arc::clone(&self.state);
+        let shutdown_token = self.state.shutdown_token.clone();
+
+        // Build the full merged router (same as serve()).
+        let cors = http::build_cors_layer(&state.cors_origins);
+        let well_known = http::well_known_router(Arc::clone(&state)).layer(cors.clone());
+        let relay_rt = http::relay_router(Arc::clone(&state));
+        let projection =
+            crate::projection::broadcast_projection_router(Arc::clone(&state)).layer(cors);
+        let (bridge, bridge_webhook) =
+            http::build_bridge_routers(&state.bridge_state, state.bridge_lookup.as_ref());
+
+        let merged = http::build_merged_router(
+            axum::Router::new(),
+            well_known,
+            relay_rt,
+            projection,
+            bridge,
+            bridge_webhook,
+            state.acme_challenges.as_ref(),
+        );
+
+        // Spawn the projection rate limiter cleanup.
+        http::spawn_projection_rate_limit_cleanup(
+            state.projection_rate_limiter.clone(),
+            shutdown_token.clone(),
+        );
+
+        // Bind the TCP listener before spawning so we can report errors
+        // and the bound address synchronously.
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            // Reset serving flag on bind failure.
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!(
+                "failed to bind background HTTP server on {addr}: {e}"
+            ))
+        })?;
+        let local_addr = listener.local_addr().map_err(|e| {
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!("failed to get local address: {e}"))
+        })?;
+
+        // Store the bound address.
+        {
+            let mut guard = self.serving_addr.lock().await;
+            *guard = Some(local_addr);
+        }
+
+        let serving_flag = Arc::clone(&self.serving);
+        let serving_addr_ref = Arc::clone(&self.serving_addr);
+
+        // Spawn the background server task.
+        tokio::spawn(async move {
+            tracing::info!(
+                addr = %local_addr,
+                "background HTTP server started"
+            );
+
+            let result = axum::serve(listener, merged)
+                .with_graceful_shutdown(shutdown_token.cancelled_owned())
+                .await;
+
+            if let Err(ref e) = result {
+                tracing::error!(error = %e, "background HTTP server exited with error");
+            } else {
+                tracing::info!("background HTTP server shut down");
+            }
+
+            // Clear the serving flag and address on exit.
+            serving_flag.store(false, Ordering::SeqCst);
+            let mut guard = serving_addr_ref.lock().await;
+            *guard = None;
+        });
+
+        Ok(local_addr)
     }
 
     /// Returns a mutable reference to the tier change event receiver
@@ -2758,6 +2923,17 @@ fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
     Zeroizing::new(bytes)
 }
 
+/// Creates a field-by-field copy of an [`ScpIdentity`] (does not derive Clone).
+fn clone_identity(id: &ScpIdentity) -> ScpIdentity {
+    ScpIdentity {
+        identity_key: id.identity_key,
+        active_signing_key: id.active_signing_key,
+        agent_signing_key: id.agent_signing_key,
+        pre_rotation_commitment: id.pre_rotation_commitment,
+        did: id.did.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dev API token generation (spec §18.10.2)
 // ---------------------------------------------------------------------------
@@ -3054,6 +3230,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         tier_change_rx: None,
         #[cfg(feature = "http3")]
         http3_config,
+        serving: Arc::new(AtomicBool::new(false)),
+        serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
 
@@ -3083,10 +3261,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
 ) -> Result<ApplicationNode<S>, NodeError> {
-    // Resolve the HTTP bind address first — NAT strategy needs the public-facing
-    // HTTP port, not the internal relay port (which is bound to loopback and
-    // unreachable externally). UPnP maps this port on the router and the relay
-    // URL uses it. See #641.
+    // NAT strategy needs the public HTTP port, not the internal relay port (#641).
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
     let tier = nat_strategy.select_tier(http_bind_addr.port()).await?;
@@ -3121,20 +3296,11 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    // 5. Spawn periodic tier re-evaluation (§10.12.1, SCP-243).
     let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
         inner: Arc::clone(&did_method),
     });
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
-    // Construct a copy of the identity for the background task (ScpIdentity
-    // fields are all Copy/Clone but the struct itself doesn't derive Clone).
-    let bg_identity = ScpIdentity {
-        identity_key: identity.identity_key,
-        active_signing_key: identity.active_signing_key,
-        agent_signing_key: identity.agent_signing_key,
-        pre_rotation_commitment: identity.pre_rotation_commitment,
-        did: identity.did.clone(),
-    };
+    let bg_identity = clone_identity(&identity);
     let tier_reeval = spawn_tier_reevaluation(
         nat_strategy,
         network_detector,
@@ -3147,8 +3313,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         TIER_REEVALUATION_INTERVAL,
     );
 
-    // Build the production bridge auth lookup, hydrating from storage.
-    // In no-domain mode the audience is the relay URL itself (spec 12.10.2).
+    // Bridge auth lookup — audience is relay URL in no-domain mode (spec 12.10.2).
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
         relay_url.clone(),
@@ -3186,7 +3351,6 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         bridge_lookup: Some(bridge_lookup),
     });
 
-    // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
     Ok(ApplicationNode {
         domain: None,
         relay: RelayHandle {
@@ -3201,6 +3365,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         // HTTP/3 is not supported in no-domain mode (no TLS certificate).
         #[cfg(feature = "http3")]
         http3_config: None,
+        serving: Arc::new(AtomicBool::new(false)),
+        serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
 
