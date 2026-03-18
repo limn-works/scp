@@ -506,12 +506,12 @@ Input:
   expires_at:        absent (no expiry — use absent sentinel)
   claim:             AttestationClaim { platform: "google.com", platform_handle: "alice@gmail.com",
                        platform_id: None, link_type: "self_attestation" }
-  evidence:          AttestationEvidence { method: "oauth", proof: "jwt-token",
+  evidence:          AttestationEvidence { method: "oauth", proof: "{\"provider\":\"google.com\",\"subject_id\":\"12345\",\"verified_at\":1700000000}",
                        verified_at: 1700000000, verifier_did: None }
   revocation_status: RevocationStatus::Active
 
 Canonical hash input:
-  "SCP-IDENTITY-LINK-ATTESTATION-V2:"         (35 bytes, no length prefix)
+  "SCP-IDENTITY-LINK-ATTESTATION-V2:"         (33 bytes, no length prefix)
   || BE32(7)   || "att-001"                    (4 + 7 = 11 bytes — id)
   || BE32(13)  || "identity_link"              (4 + 13 = 17 bytes — attestation_type)
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)

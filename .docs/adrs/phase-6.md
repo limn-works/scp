@@ -3486,7 +3486,7 @@ Additionally, the original spec did not define how attestations are published in
 
 **Provider registry.** Seven initial providers: `github.com` (Class 2), `x.com` (Class 2), `google.com` (Class 1), `apple.com` (Class 1), `microsoft.com` (Class 1), `mastodon:<instance>` (Class 2), `dns` (Class 2). New providers by spec amendment only.
 
-**DID document service entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>-<index>`. Max 10 per DID document.
+**DID document service entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>--<index>`. Max 10 per DID document.
 
 **`revocation_status` in signed scope.** The `revocation_status` field replaces the separate `revocation` object in the wire format. It is included in the signature scope, preventing replay of revoked attestations as active.
 
