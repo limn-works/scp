@@ -17,10 +17,9 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, ServerError};
+use scp_ffi_common::server::{self, RunningNode, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
-use scp_platform::testing::InMemoryStorage;
 
 use crate::bridge::ScpError;
 use crate::{decrement_handle_count, increment_handle_count};
@@ -31,22 +30,24 @@ use crate::{decrement_handle_count, increment_handle_count};
 
 impl From<ServerError> for ScpError {
     fn from(e: ServerError) -> Self {
+        let user_msg = e.user_message();
+        tracing::error!(error = %e, "server operation failed");
         match e {
-            ServerError::Relay(inner) => Self::Transport {
-                msg: format!("relay error: {inner}"),
+            ServerError::Relay(_) => Self::Transport {
+                msg: user_msg,
                 code: "SCP-TRANS-5050".to_owned(),
             },
             ServerError::Node(inner) => Self::from(inner),
-            ServerError::Storage(inner) => Self::Context {
-                msg: format!("storage error: {inner}"),
+            ServerError::Storage(_) => Self::Context {
+                msg: user_msg,
                 code: "SCP-CTX-2051".to_owned(),
             },
-            ServerError::Platform(inner) => Self::Context {
-                msg: format!("platform error: {inner}"),
+            ServerError::Platform(_) => Self::Context {
+                msg: user_msg,
                 code: "SCP-CTX-2053".to_owned(),
             },
-            ServerError::Io(inner) => Self::Context {
-                msg: format!("io error: {inner}"),
+            ServerError::Io(_) => Self::Context {
+                msg: user_msg,
                 code: "SCP-CTX-2052".to_owned(),
             },
         }
@@ -55,25 +56,26 @@ impl From<ServerError> for ScpError {
 
 impl From<NodeError> for ScpError {
     fn from(e: NodeError) -> Self {
-        match &e {
+        tracing::error!(error = %e, "node operation failed");
+        match e {
             NodeError::MissingField(_) | NodeError::InvalidConfig(_) => Self::Validation {
-                msg: e.to_string(),
+                msg: "node configuration error".to_owned(),
                 code: "SCP-TRANS-5050".to_owned(),
             },
             NodeError::Identity(_) => Self::Identity {
-                msg: e.to_string(),
+                msg: "node identity operation failed".to_owned(),
                 code: "SCP-TRANS-5051".to_owned(),
             },
             NodeError::Relay(_) => Self::Transport {
-                msg: e.to_string(),
+                msg: "node relay error".to_owned(),
                 code: "SCP-TRANS-5052".to_owned(),
             },
             NodeError::Storage(_) => Self::Context {
-                msg: e.to_string(),
+                msg: "node storage error".to_owned(),
                 code: "SCP-TRANS-5053".to_owned(),
             },
             NodeError::Serve(_) | NodeError::Nat(_) | NodeError::Tls(_) => Self::Transport {
-                msg: e.to_string(),
+                msg: "node network error".to_owned(),
                 code: "SCP-TRANS-5054".to_owned(),
             },
         }
@@ -136,106 +138,6 @@ impl Drop for RelayHandle {
 // NodeHandle -- type-erased ApplicationNode wrapper
 // ---------------------------------------------------------------------------
 
-/// Internal enum that erases the `ApplicationNode<S>` generic parameter.
-///
-/// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
-/// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
-/// use a closed enum over the two concrete storage backends used by the shared
-/// server code: `InMemoryStorage` and `FilesystemStorage`.
-enum NodeInner {
-    InMemory(scp_node::ApplicationNode<InMemoryStorage>),
-    Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
-}
-
-impl NodeInner {
-    fn relay_url(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.relay_url(),
-            Self::Filesystem(n) => n.relay_url(),
-        }
-    }
-
-    fn did(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.identity().did(),
-            Self::Filesystem(n) => n.identity().did(),
-        }
-    }
-
-    const fn relay_port(&self) -> u16 {
-        match self {
-            Self::InMemory(n) => n.relay().bound_addr().port(),
-            Self::Filesystem(n) => n.relay().bound_addr().port(),
-        }
-    }
-
-    fn is_shutdown(&self) -> bool {
-        match self {
-            Self::InMemory(n) => n.relay().shutdown_handle().is_shutdown(),
-            Self::Filesystem(n) => n.relay().shutdown_handle().is_shutdown(),
-        }
-    }
-
-    fn shutdown(&self) {
-        match self {
-            Self::InMemory(n) => n.shutdown(),
-            Self::Filesystem(n) => n.shutdown(),
-        }
-    }
-
-    async fn enable_broadcast_projection_with_site(
-        &self,
-        context_id: &str,
-        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
-        admission: scp_core::context::broadcast::BroadcastAdmission,
-        site_config: Option<scp_node::projection::SiteConfig>,
-    ) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-            Self::Filesystem(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn commit_deploy(&self, context_id: &str, deploy_id: &str) -> Result<usize, NodeError> {
-        match self {
-            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
-        }
-    }
-
-    async fn rollback_deploy(&self, context_id: &str, deploy_id: &str) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
-        }
-    }
-
-    async fn disable_broadcast_projection(&self, context_id: &str) {
-        match self {
-            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
-            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
-        }
-    }
-}
-
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by [`node_start_in_memory`] or [`node_start_local`]. The node
@@ -244,7 +146,7 @@ impl NodeInner {
 /// only the relay is bound.
 #[derive(uniffi::Object)]
 pub struct NodeHandle {
-    inner: NodeInner,
+    inner: RunningNode,
 }
 
 #[uniffi::export]
@@ -466,7 +368,7 @@ pub async fn node_start_in_memory() -> Result<Arc<NodeHandle>, ScpError> {
     let node = server::start_node_in_memory().await?;
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
-        inner: NodeInner::InMemory(node),
+        inner: RunningNode::InMemory(node),
     }))
 }
 
@@ -479,7 +381,7 @@ pub async fn node_start_local(data_dir: String) -> Result<Arc<NodeHandle>, ScpEr
     let node = server::start_node_local(std::path::Path::new(&data_dir)).await?;
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
-        inner: NodeInner::Filesystem(node),
+        inner: RunningNode::Filesystem(node),
     }))
 }
 
@@ -571,7 +473,7 @@ mod tests {
     #[test]
     fn enable_site_projection_dispatches_through_node_inner() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
             0,
@@ -592,7 +494,7 @@ mod tests {
     #[test]
     fn commit_deploy_returns_error_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.commit_deploy("no-such-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -604,7 +506,7 @@ mod tests {
     #[test]
     fn rollback_deploy_returns_error_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.rollback_deploy("no-such-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -616,19 +518,23 @@ mod tests {
     #[test]
     fn disable_site_projection_is_noop_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.
         inner.shutdown();
     }
 
     #[test]
-    fn node_error_maps_to_scp_error() {
-        let err = NodeError::InvalidConfig("test config".into());
+    fn node_error_maps_to_scp_error_with_sanitized_message() {
+        let err = NodeError::InvalidConfig("/secret/path/data.db".into());
         let scp_err: ScpError = err.into();
         match scp_err {
             ScpError::Validation { msg, code } => {
-                assert!(msg.contains("test config"), "msg={msg}");
+                assert!(
+                    !msg.contains("/secret"),
+                    "internal path leaked in msg: {msg}"
+                );
+                assert_eq!(msg, "node configuration error");
                 assert_eq!(code, "SCP-TRANS-5050");
             }
             other => panic!("expected Validation, got: {other:?}"),

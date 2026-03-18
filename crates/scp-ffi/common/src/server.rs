@@ -9,7 +9,7 @@
 //! Gated behind the `server` feature. Not available for WASM (ADR-034).
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use scp_node::NodeError;
@@ -47,6 +47,73 @@ pub enum ServerError {
     /// The platform storage backend could not be initialized.
     #[error("platform error: {0}")]
     Platform(#[from] scp_platform::error::PlatformError),
+}
+
+impl ServerError {
+    /// Returns a sanitized message safe to expose to SDK consumers.
+    ///
+    /// Internal details (filesystem paths, OS error descriptions, permission
+    /// info) are stripped. Use `tracing::error!` with the full error for
+    /// server-side debugging before converting.
+    #[must_use]
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::Relay(_) => "relay startup failed".to_owned(),
+            Self::Node(_) => "node startup failed".to_owned(),
+            Self::Storage(_) => "storage initialization failed".to_owned(),
+            Self::Io(_) => "I/O error during server operation".to_owned(),
+            Self::Platform(_) => "platform error during server operation".to_owned(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data-directory validation
+// ---------------------------------------------------------------------------
+
+/// Validates a data directory path before use.
+///
+/// Rejects paths that:
+/// - Are empty
+/// - Contain `..` components (path traversal)
+/// - Exceed 4096 bytes
+/// - Contain null bytes
+///
+/// # Errors
+///
+/// Returns [`ServerError::Io`] with a descriptive message on validation failure.
+pub fn validate_data_dir(path: &Path) -> Result<(), ServerError> {
+    let os_str = path.as_os_str();
+    if os_str.is_empty() {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data directory path must not be empty",
+        )));
+    }
+    if os_str.len() > 4096 {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data directory path exceeds 4096 bytes",
+        )));
+    }
+    // Check for null bytes (encoded_bytes on Unix, to_string_lossy everywhere).
+    let lossy = path.to_string_lossy();
+    if lossy.contains('\0') {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "data directory path contains null bytes",
+        )));
+    }
+    // Reject parent-directory components.
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "data directory path must not contain '..' components",
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +212,7 @@ pub async fn start_relay_in_memory() -> Result<RunningRelay, ServerError> {
 /// [`ServerError::Storage`] if the database cannot be opened, or
 /// [`ServerError::Relay`] if the relay cannot bind.
 pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerError> {
+    validate_data_dir(data_dir)?;
     std::fs::create_dir_all(data_dir)?;
     let db_path = data_dir.join("blobs.redb");
     let storage = BlobStorageBackend::redb(&db_path)?;
@@ -236,7 +304,8 @@ pub async fn start_node_local(
 
     type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
-    // Ensure data directory exists.
+    // Validate and ensure data directory exists.
+    validate_data_dir(data_dir)?;
     std::fs::create_dir_all(data_dir)?;
 
     // File-backed protocol storage under <data_dir>/storage/.
@@ -277,6 +346,149 @@ pub async fn start_node_local(
         "application node started (local file-backed)"
     );
     Ok(node)
+}
+
+// ---------------------------------------------------------------------------
+// RunningNode — type-erased ApplicationNode wrapper (shared across bridges)
+// ---------------------------------------------------------------------------
+
+/// Type-erased wrapper over `ApplicationNode<S>` for the two concrete storage
+/// backends used by the shared server code.
+///
+/// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
+/// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
+/// use a closed enum over `InMemoryStorage` and `FilesystemStorage`.
+///
+/// This mirrors the pattern established by [`RunningRelay`] — shared in
+/// `scp-ffi-common` so each FFI bridge wraps this rather than duplicating the
+/// enum and its dispatch methods.
+pub enum RunningNode {
+    /// In-memory storage variant (ephemeral — suitable for tests/demos).
+    InMemory(scp_node::ApplicationNode<InMemoryStorage>),
+    /// Filesystem-backed storage variant (persistent — suitable for local dev).
+    Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
+}
+
+impl RunningNode {
+    /// Returns the WebSocket URL clients should connect to for this node's relay.
+    #[must_use]
+    pub fn relay_url(&self) -> &str {
+        match self {
+            Self::InMemory(n) => n.relay_url(),
+            Self::Filesystem(n) => n.relay_url(),
+        }
+    }
+
+    /// Returns the node's DID string.
+    #[must_use]
+    pub fn did(&self) -> &str {
+        match self {
+            Self::InMemory(n) => n.identity().did(),
+            Self::Filesystem(n) => n.identity().did(),
+        }
+    }
+
+    /// Returns the port the node's relay is listening on.
+    #[must_use]
+    pub const fn relay_port(&self) -> u16 {
+        match self {
+            Self::InMemory(n) => n.relay().bound_addr().port(),
+            Self::Filesystem(n) => n.relay().bound_addr().port(),
+        }
+    }
+
+    /// Returns `true` if shutdown has already been signaled.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        match self {
+            Self::InMemory(n) => n.relay().shutdown_handle().is_shutdown(),
+            Self::Filesystem(n) => n.relay().shutdown_handle().is_shutdown(),
+        }
+    }
+
+    /// Signals the node to stop (relay + background tasks).
+    pub fn shutdown(&self) {
+        match self {
+            Self::InMemory(n) => n.shutdown(),
+            Self::Filesystem(n) => n.shutdown(),
+        }
+    }
+
+    /// Activates HTTP broadcast projection with optional site configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] if projection activation fails.
+    pub async fn enable_broadcast_projection_with_site(
+        &self,
+        context_id: &str,
+        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+        admission: scp_core::context::broadcast::BroadcastAdmission,
+        site_config: Option<scp_node::projection::SiteConfig>,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::InMemory(n) => {
+                n.enable_broadcast_projection_with_site(
+                    context_id,
+                    broadcast_key,
+                    admission,
+                    None,
+                    site_config,
+                )
+                .await
+            }
+            Self::Filesystem(n) => {
+                n.enable_broadcast_projection_with_site(
+                    context_id,
+                    broadcast_key,
+                    admission,
+                    None,
+                    site_config,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Commits a deploy for a projected context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] if the context is not projected or commit fails.
+    pub async fn commit_deploy(
+        &self,
+        context_id: &str,
+        deploy_id: &str,
+    ) -> Result<usize, NodeError> {
+        match self {
+            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
+            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
+        }
+    }
+
+    /// Rolls back to a previous deploy for a projected context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] if the context is not projected or rollback fails.
+    pub async fn rollback_deploy(
+        &self,
+        context_id: &str,
+        deploy_id: &str,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
+            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
+        }
+    }
+
+    /// Deactivates HTTP broadcast projection for the given context.
+    pub async fn disable_broadcast_projection(&self, context_id: &str) {
+        match self {
+            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
+            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +638,70 @@ mod tests {
 
         let relay_err = ServerError::Relay(RelayError::BindFailed("addr in use".into()));
         assert!(relay_err.to_string().contains("addr in use"), "{relay_err}");
+    }
+
+    #[test]
+    fn user_message_does_not_leak_internal_details() {
+        let io_err = ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied: /home/user/.secret/data",
+        ));
+        let msg = io_err.user_message();
+        assert_eq!(msg, "I/O error during server operation");
+        assert!(
+            !msg.contains("/home"),
+            "user_message must not contain paths"
+        );
+
+        let relay_err = ServerError::Relay(RelayError::BindFailed("0.0.0.0:443".into()));
+        assert_eq!(relay_err.user_message(), "relay startup failed");
+
+        let storage_err = ServerError::Storage(StorageError::Internal("redb corruption".into()));
+        assert_eq!(storage_err.user_message(), "storage initialization failed");
+    }
+
+    #[test]
+    fn validate_data_dir_rejects_empty() {
+        let result = validate_data_dir(Path::new(""));
+        assert!(result.is_err(), "empty path should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("empty"), "error: {msg}");
+    }
+
+    #[test]
+    fn validate_data_dir_rejects_parent_traversal() {
+        let result = validate_data_dir(Path::new("/tmp/foo/../bar"));
+        assert!(result.is_err(), ".. component should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(".."), "error: {msg}");
+    }
+
+    #[test]
+    fn validate_data_dir_rejects_long_path() {
+        let long = "a".repeat(4097);
+        let result = validate_data_dir(Path::new(&long));
+        assert!(result.is_err(), "path >4096 bytes should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("4096"), "error: {msg}");
+    }
+
+    #[test]
+    fn validate_data_dir_accepts_valid_path() {
+        assert!(validate_data_dir(Path::new("/tmp/scp-test")).is_ok());
+        assert!(validate_data_dir(Path::new("relative/path")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn running_node_in_memory_dispatch() {
+        let node = start_node_in_memory().await.unwrap();
+        let running = RunningNode::InMemory(node);
+        assert!(
+            running.relay_url().starts_with("ws://") || running.relay_url().starts_with("wss://")
+        );
+        assert!(running.did().starts_with("did:"));
+        assert!(running.relay_port() > 0);
+        assert!(!running.is_shutdown());
+        running.shutdown();
+        assert!(running.is_shutdown());
     }
 }

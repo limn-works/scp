@@ -16,20 +16,21 @@
 use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, RunningRelay, ServerError};
+use scp_ffi_common::server::{self, RunningNode, RunningRelay, ServerError};
 use scp_node::NodeError;
-use scp_platform::testing::InMemoryStorage;
 
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
 
 fn server_err(e: ServerError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+    tracing::error!(error = %e, "server operation failed");
+    pyo3::exceptions::PyRuntimeError::new_err(e.user_message())
 }
 
 fn node_err(e: NodeError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+    tracing::error!(error = %e, "node operation failed");
+    pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
 }
 
 // ---------------------------------------------------------------------------
@@ -93,106 +94,6 @@ impl Drop for PyRelayHandle {
 // PyNodeHandle -- type-erased ApplicationNode wrapper
 // ---------------------------------------------------------------------------
 
-/// Internal enum that erases the `ApplicationNode<S>` generic parameter.
-///
-/// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
-/// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
-/// use a closed enum over the two concrete storage backends used by the shared
-/// server code: `InMemoryStorage` and `FilesystemStorage`.
-enum NodeInner {
-    InMemory(scp_node::ApplicationNode<InMemoryStorage>),
-    Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
-}
-
-impl NodeInner {
-    fn relay_url(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.relay_url(),
-            Self::Filesystem(n) => n.relay_url(),
-        }
-    }
-
-    fn did(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.identity().did(),
-            Self::Filesystem(n) => n.identity().did(),
-        }
-    }
-
-    const fn relay_port(&self) -> u16 {
-        match self {
-            Self::InMemory(n) => n.relay().bound_addr().port(),
-            Self::Filesystem(n) => n.relay().bound_addr().port(),
-        }
-    }
-
-    fn is_shutdown(&self) -> bool {
-        match self {
-            Self::InMemory(n) => n.relay().shutdown_handle().is_shutdown(),
-            Self::Filesystem(n) => n.relay().shutdown_handle().is_shutdown(),
-        }
-    }
-
-    fn shutdown(&self) {
-        match self {
-            Self::InMemory(n) => n.shutdown(),
-            Self::Filesystem(n) => n.shutdown(),
-        }
-    }
-
-    async fn enable_broadcast_projection_with_site(
-        &self,
-        context_id: &str,
-        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
-        admission: scp_core::context::broadcast::BroadcastAdmission,
-        site_config: Option<scp_node::projection::SiteConfig>,
-    ) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-            Self::Filesystem(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn commit_deploy(&self, context_id: &str, deploy_id: &str) -> Result<usize, NodeError> {
-        match self {
-            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
-        }
-    }
-
-    async fn rollback_deploy(&self, context_id: &str, deploy_id: &str) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
-        }
-    }
-
-    async fn disable_broadcast_projection(&self, context_id: &str) {
-        match self {
-            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
-            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
-        }
-    }
-}
-
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by `node_start_in_memory()` or `node_start_local()`. The node
@@ -201,7 +102,7 @@ impl NodeInner {
 /// only the relay is bound.
 #[pyclass(name = "NodeHandle")]
 pub struct PyNodeHandle {
-    inner: NodeInner,
+    inner: RunningNode,
 }
 
 // PyO3 `#[getter]` methods require `&self` and cannot be `const` or `#[must_use]`.
@@ -443,7 +344,7 @@ pub fn py_node_start_in_memory(py: Python<'_>) -> PyResult<PyNodeHandle> {
             .block_on(server::start_node_in_memory())
             .map_err(server_err)?;
         Ok(PyNodeHandle {
-            inner: NodeInner::InMemory(node),
+            inner: RunningNode::InMemory(node),
         })
     })
 }
@@ -460,7 +361,7 @@ pub fn py_node_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyNodeH
             .block_on(server::start_node_local(std::path::Path::new(&data_dir)))
             .map_err(server_err)?;
         Ok(PyNodeHandle {
-            inner: NodeInner::Filesystem(node),
+            inner: RunningNode::Filesystem(node),
         })
     })
 }
@@ -611,11 +512,11 @@ mod tests {
 
     #[test]
     fn node_inner_lifecycle_dispatch() {
-        // Test the NodeInner dispatch methods (which are the FFI layer).
+        // Test the RunningNode dispatch methods (which are the FFI layer).
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
 
-        // enable_site_projection via NodeInner
+        // enable_site_projection via RunningNode
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xCD; 32]),
             0,
@@ -631,7 +532,7 @@ mod tests {
         ));
         assert!(
             result.is_ok(),
-            "NodeInner enable should succeed: {result:?}"
+            "RunningNode enable should succeed: {result:?}"
         );
 
         // commit_deploy — will fail because no blobs exist but should return

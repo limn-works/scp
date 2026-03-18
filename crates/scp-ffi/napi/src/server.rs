@@ -17,10 +17,9 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, RunningRelay, ServerError};
+use scp_ffi_common::server::{self, RunningNode, RunningRelay, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
-use scp_platform::testing::InMemoryStorage;
 
 use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
@@ -30,11 +29,13 @@ use crate::{decrement_handle_count, increment_handle_count};
 // ---------------------------------------------------------------------------
 
 fn server_err(e: ServerError) -> NapiError {
-    NapiError::from_reason(e.to_string())
+    tracing::error!(error = %e, "server operation failed");
+    NapiError::from_reason(e.user_message())
 }
 
 fn node_err(e: NodeError) -> NapiError {
-    NapiError::from_reason(e.to_string())
+    tracing::error!(error = %e, "node operation failed");
+    NapiError::from_reason("node operation failed")
 }
 
 // ---------------------------------------------------------------------------
@@ -96,106 +97,6 @@ impl Drop for NapiRelayHandle {
 // NapiNodeHandle — type-erased ApplicationNode wrapper
 // ---------------------------------------------------------------------------
 
-/// Internal enum that erases the `ApplicationNode<S>` generic parameter.
-///
-/// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
-/// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
-/// use a closed enum over the two concrete storage backends used by the shared
-/// server code: `InMemoryStorage` and `FilesystemStorage`.
-enum NodeInner {
-    InMemory(scp_node::ApplicationNode<InMemoryStorage>),
-    Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
-}
-
-impl NodeInner {
-    fn relay_url(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.relay_url(),
-            Self::Filesystem(n) => n.relay_url(),
-        }
-    }
-
-    fn did(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.identity().did(),
-            Self::Filesystem(n) => n.identity().did(),
-        }
-    }
-
-    const fn relay_port(&self) -> u16 {
-        match self {
-            Self::InMemory(n) => n.relay().bound_addr().port(),
-            Self::Filesystem(n) => n.relay().bound_addr().port(),
-        }
-    }
-
-    fn is_shutdown(&self) -> bool {
-        match self {
-            Self::InMemory(n) => n.relay().shutdown_handle().is_shutdown(),
-            Self::Filesystem(n) => n.relay().shutdown_handle().is_shutdown(),
-        }
-    }
-
-    fn shutdown(&self) {
-        match self {
-            Self::InMemory(n) => n.shutdown(),
-            Self::Filesystem(n) => n.shutdown(),
-        }
-    }
-
-    async fn enable_broadcast_projection_with_site(
-        &self,
-        context_id: &str,
-        broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
-        admission: scp_core::context::broadcast::BroadcastAdmission,
-        site_config: Option<scp_node::projection::SiteConfig>,
-    ) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-            Self::Filesystem(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn commit_deploy(&self, context_id: &str, deploy_id: &str) -> Result<usize, NodeError> {
-        match self {
-            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
-        }
-    }
-
-    async fn rollback_deploy(&self, context_id: &str, deploy_id: &str) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
-        }
-    }
-
-    async fn disable_broadcast_projection(&self, context_id: &str) {
-        match self {
-            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
-            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
-        }
-    }
-}
-
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by [`node_start_in_memory`] or [`node_start_local`]. The node
@@ -204,7 +105,7 @@ impl NodeInner {
 /// only the relay is bound.
 #[napi]
 pub struct NapiNodeHandle {
-    inner: NodeInner,
+    inner: RunningNode,
 }
 
 #[napi]
@@ -430,7 +331,7 @@ pub async fn node_start_in_memory() -> napi::Result<NapiNodeHandle> {
     let node = server::start_node_in_memory().await.map_err(server_err)?;
     increment_handle_count();
     Ok(NapiNodeHandle {
-        inner: NodeInner::InMemory(node),
+        inner: RunningNode::InMemory(node),
     })
 }
 
@@ -454,7 +355,7 @@ pub async fn node_start_local(data_dir: String) -> napi::Result<NapiNodeHandle> 
         .map_err(server_err)?;
     increment_handle_count();
     Ok(NapiNodeHandle {
-        inner: NodeInner::Filesystem(node),
+        inner: RunningNode::Filesystem(node),
     })
 }
 
@@ -567,7 +468,7 @@ mod tests {
     #[test]
     fn enable_site_projection_dispatches_through_node_inner() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
             0,
@@ -588,7 +489,7 @@ mod tests {
     #[test]
     fn commit_deploy_returns_error_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.commit_deploy("no-such-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -600,7 +501,7 @@ mod tests {
     #[test]
     fn rollback_deploy_returns_error_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.rollback_deploy("no-such-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -612,7 +513,7 @@ mod tests {
     #[test]
     fn disable_site_projection_is_noop_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory()).unwrap();
-        let inner = NodeInner::InMemory(node);
+        let inner = RunningNode::InMemory(node);
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.
         inner.shutdown();
