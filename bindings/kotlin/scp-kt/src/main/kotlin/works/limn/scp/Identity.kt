@@ -173,9 +173,13 @@ interface IdentityAdvancedBindings {
      * Verifies the Ed25519 signature on an identity link attestation.
      *
      * @param attestationJson JSON string of the attestation.
+     * @param issuerPublicKeyHex Optional hex-encoded Ed25519 public key of the issuer.
      * @return true if valid.
      */
-    fun identityVerifyLinkAttestation(attestationJson: String): Boolean
+    fun identityVerifyLinkAttestation(
+        attestationJson: String,
+        issuerPublicKeyHex: String? = null,
+    ): Boolean
 }
 
 /**
@@ -371,10 +375,14 @@ class IdentityAdvancedBridge internal constructor(
      * Verifies the Ed25519 signature on an identity link attestation.
      *
      * @param attestationJson JSON string of the attestation.
+     * @param issuerPublicKeyHex Optional hex-encoded Ed25519 public key of the issuer.
      * @return true if valid.
      */
-    suspend fun verifyLinkAttestation(attestationJson: String): Boolean =
-        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson) }
+    suspend fun verifyLinkAttestation(
+        attestationJson: String,
+        issuerPublicKeyHex: String? = null,
+    ): Boolean =
+        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson, issuerPublicKeyHex) }
 }
 
 // ---------------------------------------------------------------------------

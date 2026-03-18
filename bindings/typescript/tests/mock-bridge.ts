@@ -1677,6 +1677,54 @@ export function createMockBridge(): Bridge & {
       return tokenBase64.includes("mock-token");
     },
 
+    // Identity link attestation (§3.5.1)
+    async identityCreateLinkAttestation(
+      did: string,
+      platform: string,
+      handle: string,
+      _proof: string,
+      verificationMethod: string,
+      platformId: string | null,
+    ): Promise<string> {
+      const now = Date.now();
+      const attestation = {
+        id: `mock-attestation-${now}`,
+        type: "identity_link",
+        issuer: did,
+        subject: did,
+        issued_at: now,
+        claim: {
+          platform,
+          platform_handle: handle,
+          link_type: "self_attestation",
+          ...(platformId != null ? { platform_id: platformId } : {}),
+        },
+        evidence: {
+          method: verificationMethod,
+          proof: "mock-proof",
+          verified_at: now,
+        },
+        revocation: { method: "did_document", endpoint: "/revocations" },
+        signature: Array.from({ length: 64 }, () => 0),
+      };
+      return JSON.stringify(attestation);
+    },
+
+    identityLinkAttestations(_did: string): string {
+      return "[]";
+    },
+
+    identityRemoveLinkAttestation(_did: string, _attestationId: string): boolean {
+      return true;
+    },
+
+    async identityVerifyLinkAttestation(
+      _attestationJson: string,
+      _issuerPublicKeyHex?: string | null,
+    ): Promise<boolean> {
+      return true;
+    },
+
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)
     async identityExecuteRecovery(
       did: string,

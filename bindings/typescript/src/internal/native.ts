@@ -1444,10 +1444,13 @@ export function createNativeBridge(): Bridge {
       );
     },
 
-    async identityVerifyLinkAttestation(attestationJson: string): Promise<boolean> {
-      return await (addon.identityVerifyLinkAttestation as (j: string) => Promise<boolean>)(
-        attestationJson,
-      );
+    async identityVerifyLinkAttestation(
+      attestationJson: string,
+      issuerPublicKeyHex?: string | null,
+    ): Promise<boolean> {
+      return await (
+        addon.identityVerifyLinkAttestation as (j: string, k?: string | null) => Promise<boolean>
+      )(attestationJson, issuerPublicKeyHex);
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)

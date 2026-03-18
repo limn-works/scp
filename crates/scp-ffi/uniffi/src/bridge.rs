@@ -2612,16 +2612,25 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
 
 /// Verifies the Ed25519 signature on an identity link attestation.
 ///
+/// If `issuer_public_key_hex` is provided, uses that key directly for
+/// verification. Otherwise falls back to looking up the issuer's key from
+/// the identity custody registry.
+///
 /// See spec §3.5.1.
 #[uniffi::export]
-pub async fn identity_verify_link_attestation(attestation_json: String) -> Result<bool, ScpError> {
-    identity_verify_link_attestation_impl(attestation_json).await
+pub async fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: Option<String>,
+) -> Result<bool, ScpError> {
+    identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
 }
 
 #[cfg(feature = "allow_in_memory_custody")]
-async fn identity_verify_link_attestation_impl(attestation_json: String) -> Result<bool, ScpError> {
+async fn identity_verify_link_attestation_impl(
+    attestation_json: String,
+    issuer_public_key_hex: Option<String>,
+) -> Result<bool, ScpError> {
     use scp_core::identity::attestation::IdentityLinkAttestation;
-    use scp_platform::traits::KeyCustody;
 
     let attestation: IdentityLinkAttestation =
         serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
@@ -2629,38 +2638,49 @@ async fn identity_verify_link_attestation_impl(attestation_json: String) -> Resu
             code: "SCP-IDENT-1044".to_owned(),
         })?;
 
-    let issuer_did = attestation.issuer.to_string();
-
-    // Look up the issuer's custody from the identity custody registry.
-    let entry = identity_custody_registry()
-        .get(&issuer_did)
-        .ok_or_else(|| ScpError::Identity {
-            msg: format!(
-                "issuer identity '{issuer_did}' not found — verify requires the issuer \
-                 to have created an attestation via identity_create_link_attestation"
-            ),
+    if let Some(hex_key) = issuer_public_key_hex {
+        // Caller provided the key directly — verify without registry lookup.
+        let pub_bytes = hex::decode(&hex_key).map_err(|e| ScpError::Identity {
+            msg: format!("invalid issuer_public_key_hex: {e}"),
             code: "SCP-IDENT-1044".to_owned(),
         })?;
-    let (custody, active_key) = entry.value().clone();
+        Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    } else {
+        // Fall back to the identity custody registry.
+        use scp_platform::traits::KeyCustody;
 
-    let pub_key = runtime()
-        .spawn(async move { custody.0.public_key(&active_key).await })
-        .await
-        .map_err(|e| ScpError::Identity {
-            msg: format!("tokio join error: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
-        })?
-        .map_err(|e| ScpError::Identity {
-            msg: format!("failed to get public key: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
-        })?;
-    Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
+        let issuer_did = attestation.issuer.to_string();
+        let entry = identity_custody_registry()
+            .get(&issuer_did)
+            .ok_or_else(|| ScpError::Identity {
+                msg: format!(
+                    "issuer identity '{issuer_did}' not found — verify requires the issuer \
+                     to have created an attestation via identity_create_link_attestation"
+                ),
+                code: "SCP-IDENT-1044".to_owned(),
+            })?;
+        let (custody, active_key) = entry.value().clone();
+
+        let pub_key = runtime()
+            .spawn(async move { custody.0.public_key(&active_key).await })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio join error: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            })?
+            .map_err(|e| ScpError::Identity {
+                msg: format!("failed to get public key: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            })?;
+        Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
+    }
 }
 
 #[cfg(not(feature = "allow_in_memory_custody"))]
 #[allow(clippy::unused_async)]
 async fn identity_verify_link_attestation_impl(
     _attestation_json: String,
+    _issuer_public_key_hex: Option<String>,
 ) -> Result<bool, ScpError> {
     Err(ScpError::Identity {
         msg: "identity link attestation verification requires in-memory custody — enable the \

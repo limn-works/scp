@@ -50,6 +50,56 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
+// Canonical hash helpers (matching scp-core::crypto::canonical)
+// ---------------------------------------------------------------------------
+
+/// Absent sentinel: `SHA-256(0x00)` — matches scp-core's `ABSENT_SENTINEL`.
+const ABSENT_SENTINEL: [u8; 32] = [
+    0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb, 0x78, 0x0a, 0x2c,
+    0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3, 0x06, 0x17, 0xaf, 0xa0, 0x1d,
+];
+
+/// Local structs mirroring scp-core's `AttestationClaim` field declaration order.
+///
+/// `rmp_serde::to_vec_named` serializes fields in struct declaration order for
+/// named structs, but in alphabetical (`BTreeMap`) order for `serde_json::Value`.
+/// To produce byte-identical msgpack output, we deserialize the JSON values into
+/// these local structs before serializing to msgpack.
+mod canonical_attestation {
+    use serde::{Deserialize, Serialize};
+
+    /// Mirrors `scp_core::identity::attestation::AttestationClaim` field order:
+    /// `platform`, `platform_handle`, `platform_id`, `link_type`.
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct Claim {
+        pub platform: String,
+        pub platform_handle: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub platform_id: Option<String>,
+        pub link_type: String,
+    }
+
+    /// Mirrors `scp_core::identity::attestation::AttestationEvidence` field order:
+    /// `method`, `proof`, `verified_at`, `verifier_did`.
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct Evidence {
+        pub method: String,
+        pub proof: String,
+        pub verified_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub verifier_did: Option<String>,
+    }
+
+    /// Mirrors `scp_core::identity::attestation::AttestationRevocation` field order:
+    /// `method`, `endpoint`.
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct Revocation {
+        pub method: String,
+        pub endpoint: String,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WASM-local identity registry
 // ---------------------------------------------------------------------------
 
@@ -1741,6 +1791,16 @@ pub fn identity_create_link_attestation(
     use sha2::{Digest, Sha256};
 
     future_to_promise(async move {
+        // Validate DID format.
+        if let Err(e) = scp_ffi_common::validate::validate_did(&did) {
+            return Err(ScpWasmError::Validation {
+                message: format!("invalid DID: {e}"),
+                code: "SCP-VALID-7033".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
         // Validate verification method.
         let method_str = match verification_method.as_str() {
             "oauth" | "signed_post" | "dns_record" | "challenge_response" => {
@@ -1803,28 +1863,61 @@ pub fn identity_create_link_attestation(
         }
 
         // Compute canonical signing bytes and sign.
-        // Domain separator + fields in fixed order, matching scp-core.
+        // Domain separator + fields in fixed order, matching scp-core's
+        // canonical_hash construction (§9.5.1).
         let canonical = {
-            let claim_msgpack =
-                rmp_serde::to_vec_named(&attestation["claim"]).map_err(|e| -> JsValue {
+            // Deserialize sub-structs into local types that mirror scp-core's
+            // field declaration order, ensuring byte-identical msgpack output.
+            let claim: canonical_attestation::Claim =
+                serde_json::from_value(attestation["claim"].clone()).map_err(|e| -> JsValue {
                     ScpWasmError::Identity {
-                        message: format!("claim serialization failed: {e}"),
+                        message: format!("claim deserialization failed: {e}"),
                         code: "SCP-IDENT-1041".to_owned(),
                     }
                     .into_js()
                     .into()
                 })?;
-            let evidence_msgpack =
-                rmp_serde::to_vec_named(&attestation["evidence"]).map_err(|e| -> JsValue {
-                    ScpWasmError::Identity {
-                        message: format!("evidence serialization failed: {e}"),
-                        code: "SCP-IDENT-1041".to_owned(),
-                    }
-                    .into_js()
-                    .into()
-                })?;
+            let evidence: canonical_attestation::Evidence = serde_json::from_value(
+                attestation["evidence"].clone(),
+            )
+            .map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("evidence deserialization failed: {e}"),
+                    code: "SCP-IDENT-1041".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+            let revocation: canonical_attestation::Revocation = serde_json::from_value(
+                attestation["revocation"].clone(),
+            )
+            .map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("revocation deserialization failed: {e}"),
+                    code: "SCP-IDENT-1041".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+
+            let claim_msgpack = rmp_serde::to_vec_named(&claim).map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("claim serialization failed: {e}"),
+                    code: "SCP-IDENT-1041".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+            let evidence_msgpack = rmp_serde::to_vec_named(&evidence).map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("evidence serialization failed: {e}"),
+                    code: "SCP-IDENT-1041".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
             let revocation_msgpack =
-                rmp_serde::to_vec_named(&attestation["revocation"]).map_err(|e| -> JsValue {
+                rmp_serde::to_vec_named(&revocation).map_err(|e| -> JsValue {
                     ScpWasmError::Identity {
                         message: format!("revocation serialization failed: {e}"),
                         code: "SCP-IDENT-1041".to_owned(),
@@ -1847,8 +1940,8 @@ pub fn identity_create_link_attestation(
             }
             // U64: issued_at
             h.update(now_ms.to_be_bytes());
-            // Absent sentinel for expires_at (0xFF byte).
-            h.update([0xFF]);
+            // Absent sentinel for expires_at: SHA-256(0x00), matching scp-core.
+            h.update(ABSENT_SENTINEL);
             // VarBytes for claim, evidence, revocation
             for field in &[claim_msgpack, evidence_msgpack, revocation_msgpack] {
                 h.update((field.len() as u32).to_be_bytes());
@@ -1936,16 +2029,133 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
     })
 }
 
+/// Computes the canonical signing bytes for an attestation JSON value.
+///
+/// Replicates scp-core's `canonical_hash` construction (§9.5.1): domain
+/// separator, length-prefixed `VarBytes`, `U64` timestamps, `Absent` sentinel
+/// for missing `expires_at`, and `rmp_serde` for sub-struct serialization
+/// using typed structs that match scp-core field declaration order.
+#[allow(clippy::cast_possible_truncation)]
+fn compute_attestation_canonical_bytes(
+    attestation: &serde_json::Value,
+) -> Result<Vec<u8>, JsValue> {
+    use sha2::{Digest, Sha256};
+
+    let id = attestation["id"].as_str().unwrap_or("");
+    let atype = attestation["type"].as_str().unwrap_or("");
+    let issuer = attestation["issuer"].as_str().unwrap_or("");
+    let subject = attestation["subject"].as_str().unwrap_or("");
+    let issued_at = attestation["issued_at"].as_u64().unwrap_or(0);
+
+    // Deserialize sub-structs into local types that mirror scp-core's
+    // field declaration order, ensuring byte-identical msgpack output.
+    let claim: canonical_attestation::Claim = serde_json::from_value(attestation["claim"].clone())
+        .map_err(|e| -> JsValue {
+            ScpWasmError::Identity {
+                message: format!("claim deserialization failed: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
+    let evidence: canonical_attestation::Evidence =
+        serde_json::from_value(attestation["evidence"].clone()).map_err(|e| -> JsValue {
+            ScpWasmError::Identity {
+                message: format!("evidence deserialization failed: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
+    let revocation: canonical_attestation::Revocation =
+        serde_json::from_value(attestation["revocation"].clone()).map_err(|e| -> JsValue {
+            ScpWasmError::Identity {
+                message: format!("revocation deserialization failed: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
+
+    let claim_msgpack = rmp_serde::to_vec_named(&claim).unwrap_or_default();
+    let evidence_msgpack = rmp_serde::to_vec_named(&evidence).unwrap_or_default();
+    let revocation_msgpack = rmp_serde::to_vec_named(&revocation).unwrap_or_default();
+
+    let mut h = Sha256::new();
+    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
+    for field in &[
+        id.as_bytes().to_vec(),
+        atype.as_bytes().to_vec(),
+        issuer.as_bytes().to_vec(),
+        subject.as_bytes().to_vec(),
+    ] {
+        h.update((field.len() as u32).to_be_bytes());
+        h.update(field);
+    }
+    h.update(issued_at.to_be_bytes());
+    // expires_at handling: Absent sentinel = SHA-256(0x00), matching scp-core.
+    match attestation
+        .get("expires_at")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(exp) => h.update(exp.to_be_bytes()),
+        None => h.update(ABSENT_SENTINEL),
+    }
+    for field in &[claim_msgpack, evidence_msgpack, revocation_msgpack] {
+        h.update((field.len() as u32).to_be_bytes());
+        h.update(field);
+    }
+    Ok(h.finalize().to_vec())
+}
+
+/// Resolves the Ed25519 public key for attestation verification.
+///
+/// If `issuer_public_key_hex` is provided, decodes and returns it. Otherwise
+/// falls back to the WASM-local identity registry.
+fn resolve_attestation_public_key(
+    issuer: &str,
+    issuer_public_key_hex: Option<&str>,
+) -> Result<Option<[u8; 32]>, JsValue> {
+    if let Some(hex_key) = issuer_public_key_hex {
+        let decoded = hex::decode(hex_key).map_err(|e| -> JsValue {
+            ScpWasmError::Validation {
+                message: format!("invalid issuer_public_key_hex: {e}"),
+                code: "SCP-VALID-7032".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
+        if decoded.len() != 32 {
+            return Ok(None);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&decoded);
+        Ok(Some(arr))
+    } else {
+        Ok(IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            map.get(issuer).map(|entry| entry.public_key_bytes)
+        }))
+    }
+}
+
 /// Verifies the Ed25519 signature on an identity link attestation JSON.
 ///
 /// Re-implements signature verification locally per ADR-034.
 ///
+/// # Arguments
+///
+/// * `attestation_json` — JSON string of the attestation.
+/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the issuer.
+///   If provided, uses this key directly. If `null`/`undefined`, falls back to
+///   looking up the issuer's key from the WASM-local identity registry.
+///
 /// See spec §3.5.1.
 #[wasm_bindgen]
-#[allow(clippy::cast_possible_truncation)]
-pub fn identity_verify_link_attestation(attestation_json: String) -> Promise {
-    use sha2::{Digest, Sha256};
-
+pub fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: Option<String>,
+) -> Promise {
     future_to_promise(async move {
         let attestation: serde_json::Value =
             serde_json::from_str(&attestation_json).map_err(|e| -> JsValue {
@@ -1969,6 +2179,16 @@ pub fn identity_verify_link_attestation(attestation_json: String) -> Promise {
             })?
             .to_owned();
 
+        // Validate DID format: must be did:{method}:{id}.
+        if let Err(e) = scp_ffi_common::validate::validate_did(&issuer) {
+            return Err(ScpWasmError::Validation {
+                message: format!("invalid issuer DID: {e}"),
+                code: "SCP-VALID-7033".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
         let sig_array: Vec<u8> = attestation["signature"]
             .as_array()
             .ok_or_else(|| -> JsValue {
@@ -1988,51 +2208,11 @@ pub fn identity_verify_link_attestation(attestation_json: String) -> Promise {
         }
         let sig_bytes: [u8; 64] = sig_array.try_into().unwrap_or([0u8; 64]);
 
-        let id = attestation["id"].as_str().unwrap_or("");
-        let atype = attestation["type"].as_str().unwrap_or("");
-        let subject = attestation["subject"].as_str().unwrap_or("");
-        let issued_at = attestation["issued_at"].as_u64().unwrap_or(0);
+        let canonical = compute_attestation_canonical_bytes(&attestation)?;
 
-        // Re-compute canonical signing bytes.
-        let claim_msgpack = rmp_serde::to_vec_named(&attestation["claim"]).unwrap_or_default();
-        let evidence_msgpack =
-            rmp_serde::to_vec_named(&attestation["evidence"]).unwrap_or_default();
-        let revocation_msgpack =
-            rmp_serde::to_vec_named(&attestation["revocation"]).unwrap_or_default();
-
-        let mut h = Sha256::new();
-        h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
-        for field in &[
-            id.as_bytes().to_vec(),
-            atype.as_bytes().to_vec(),
-            issuer.as_bytes().to_vec(),
-            subject.as_bytes().to_vec(),
-        ] {
-            h.update((field.len() as u32).to_be_bytes());
-            h.update(field);
-        }
-        h.update(issued_at.to_be_bytes());
-        // expires_at handling
-        match attestation
-            .get("expires_at")
-            .and_then(serde_json::Value::as_u64)
-        {
-            Some(exp) => h.update(exp.to_be_bytes()),
-            None => h.update([0xFF]),
-        }
-        for field in &[claim_msgpack, evidence_msgpack, revocation_msgpack] {
-            h.update((field.len() as u32).to_be_bytes());
-            h.update(field);
-        }
-        let canonical = h.finalize().to_vec();
-
-        // Look up the issuer's public key.
-        let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
-            let map = reg.borrow();
-            map.get(&issuer).map(|entry| entry.public_key_bytes)
-        });
-
-        let Some(pub_bytes) = pub_key_bytes else {
+        let Some(pub_bytes) =
+            resolve_attestation_public_key(&issuer, issuer_public_key_hex.as_deref())?
+        else {
             return Ok(JsValue::from_bool(false));
         };
 

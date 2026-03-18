@@ -452,7 +452,10 @@ export interface Bridge {
   ): Promise<string>;
   identityLinkAttestations(did: string): string;
   identityRemoveLinkAttestation(did: string, attestationId: string): boolean;
-  identityVerifyLinkAttestation(attestationJson: string): Promise<boolean>;
+  identityVerifyLinkAttestation(
+    attestationJson: string,
+    issuerPublicKeyHex?: string | null,
+  ): Promise<boolean>;
 
   // Recovery and custody migration (#632, spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;

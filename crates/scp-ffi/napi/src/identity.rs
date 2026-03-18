@@ -1483,13 +1483,19 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
 
 /// Verifies the Ed25519 signature on an identity link attestation.
 ///
+/// If `issuer_public_key_hex` is provided, uses that key directly for
+/// verification. Otherwise falls back to looking up the issuer's key from
+/// the identity registry.
+///
 /// See spec §3.5.1.
 #[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityVerifyLinkAttestation")]
 #[allow(clippy::unused_async)]
-pub async fn identity_verify_link_attestation(attestation_json: String) -> napi::Result<bool> {
+pub async fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: Option<String>,
+) -> napi::Result<bool> {
     use scp_core::identity::attestation::IdentityLinkAttestation;
-    use scp_platform::traits::KeyCustody;
 
     let attestation: IdentityLinkAttestation =
         serde_json::from_str(&attestation_json).map_err(|e| {
@@ -1499,29 +1505,42 @@ pub async fn identity_verify_link_attestation(attestation_json: String) -> napi:
             })
         })?;
 
-    let issuer_did: &str = &attestation.issuer;
-
-    crate::runtime::with_identity(issuer_did, |entry| {
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| ScpNapiError::Identity {
-            message: format!("no tokio runtime: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
+    if let Some(hex_key) = issuer_public_key_hex {
+        // Caller provided the key directly — verify without registry lookup.
+        let pub_bytes = hex::decode(&hex_key).map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("invalid issuer_public_key_hex: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            })
         })?;
+        Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    } else {
+        // Fall back to the identity registry.
+        use scp_platform::traits::KeyCustody;
 
-        let pub_key = tokio::task::block_in_place(|| {
-            rt.block_on(
-                entry
-                    .custody
-                    .0
-                    .public_key(&entry.identity.active_signing_key),
-            )
+        let issuer_did: &str = &attestation.issuer;
+        crate::runtime::with_identity(issuer_did, |entry| {
+            let rt = tokio::runtime::Handle::try_current().map_err(|e| ScpNapiError::Identity {
+                message: format!("no tokio runtime: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            })?;
+
+            let pub_key = tokio::task::block_in_place(|| {
+                rt.block_on(
+                    entry
+                        .custody
+                        .0
+                        .public_key(&entry.identity.active_signing_key),
+                )
+            })
+            .map_err(|e| ScpNapiError::Identity {
+                message: format!("failed to get public key: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            })?;
+            Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
         })
-        .map_err(|e| ScpNapiError::Identity {
-            message: format!("failed to get public key: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
-        })?;
-        Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
-    })
-    .map_err(NapiError::from)
+        .map_err(NapiError::from)
+    }
 }
 
 // ---------------------------------------------------------------------------
