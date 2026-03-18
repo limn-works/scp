@@ -487,7 +487,7 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
     //
     // An scp:// URI is shared out-of-band, so the trust level is
     // DirectExchange and the resolution layer is "Domain" (closest match
-    // for URI-based resolution — no discovery context is involved).
+    // for URI-based resolution — no context is involved).
     let result = serde_json::json!([{
         "context_id": context_id,
         "relay_urls": relay_urls,
@@ -1050,7 +1050,7 @@ struct WasmHandleEntry {
     entry_id: String,
 }
 
-/// In-memory handle registry for one discovery context.
+/// In-memory handle registry for one context.
 struct WasmHandleRegistry {
     entries: HashMap<String, WasmHandleEntry>,
     next_id: u64,
@@ -1071,7 +1071,7 @@ fn wasm_handle_registries() -> &'static Mutex<HashMap<String, WasmHandleRegistry
     REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Registers a handle in a discovery context. Returns JSON result.
+/// Registers a handle in a context with discovery tools. Returns JSON result.
 ///
 /// # Errors
 ///
@@ -1143,7 +1143,7 @@ pub fn handle_register(
     Ok(result.to_string())
 }
 
-/// Looks up a handle in a discovery context. Returns JSON result.
+/// Looks up a handle in a context with discovery tools. Returns JSON result.
 ///
 /// # Errors
 ///
@@ -1173,7 +1173,7 @@ pub fn handle_lookup(
     Ok(result.to_string())
 }
 
-/// Deregisters a handle from a discovery context. Returns JSON result.
+/// Deregisters a handle from a context with discovery tools. Returns JSON result.
 ///
 /// # Errors
 ///

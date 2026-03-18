@@ -6,7 +6,7 @@ SCP identifiers are cryptographic — DIDs (`did:dht:z6Mk...`) and context IDs (
 
 The addressing layer adds a **resolution protocol** that accepts human-readable strings and returns DIDs or context IDs. It does not replace cryptographic identifiers, create a global namespace, or require centralized infrastructure. Handles are resolution hints — they narrow search. They never define identity.
 
-**Primary mechanism: discovery context handles.** SCP-native, DNS-free, community-governed. This is where the spec's weight is. Discovery contexts (§6.2.2B) already provide searchable registries — this section extends them with handle registration and lookup.
+**Primary mechanism: context handles.** SCP-native, DNS-free, community-governed. This is where the spec's weight is. Contexts (§6.2.2B) already provide searchable registries — this section extends them with handle registration and lookup.
 
 **Local floor: petnames.** User-assigned names stored in identity private state (§3.7). Always work, zero infrastructure, zero governance. Petnames also close the disambiguation loop — when an unscoped query returns multiple candidates, the user's choice becomes a petname, resolving future ambiguity permanently.
 
@@ -14,7 +14,7 @@ The addressing layer adds a **resolution protocol** that accepts human-readable 
 
 **Web compatibility extension: domain handles.** For organizations and individuals who already have domains, `.well-known/scp` (§18.3) is extended with a handles map. This is the same role `.well-known/scp` already plays — an optional web on-ramp, not self-certifying, not required. Not a protocol pillar.
 
-**Graceful degradation.** Petnames always work (zero infrastructure). Discovery context handles work with SCP infrastructure only. Attestation handles work if external platforms exist. Domain handles work if DNS exists. Each is independently useful; none is required. Remove any layer and the rest continue functioning.
+**Graceful degradation.** Petnames always work (zero infrastructure). Context handles work with SCP infrastructure only. Attestation handles work if external platforms exist. Domain handles work if DNS exists. Each is independently useful; none is required. Remove any layer and the rest continue functioning.
 
 **Historical context.** Zooko's triangle (2001) identified tensions between human-readable, decentralized, and secure naming. Modern systems — AT Protocol's domain handles, blockchain naming (ENS, Handshake), Nostr's NIP-05 — demonstrate that the tradeoffs are more nuanced than a strict trilemma, depending on trust model and infrastructure assumptions. SCP's layered approach sidesteps the framing entirely: different resolution paths make different tradeoffs, the protocol carries explicit trust metadata on every resolution result, and the DID remains canonical regardless of which path was used to find it.
 
@@ -56,7 +56,7 @@ AddressResolution:
   | Context   { context_id, relay_urls, mode, trust_level, resolution_path }
 ```
 
-Agent capabilities are not part of the addressing layer. A handle resolves to a DID; the DID document is the authoritative source for capabilities (`SCPCapabilities` service endpoint, §6.2.2A). A handle registry caching capabilities would be stale by design — capabilities change when agents are updated, and the DID document reflects the current state. Discovery contexts already provide capability search via `agent_search` (§6.2.2B).
+Agent capabilities are not part of the addressing layer. A handle resolves to a DID; the DID document is the authoritative source for capabilities (`SCPCapabilities` service endpoint, §6.2.2A). A handle registry caching capabilities would be stale by design — capabilities change when agents are updated, and the DID document reflects the current state. Contexts already provide capability search via `agent_search` (§6.2.2B).
 
 ### 22.2.2 Normalization
 
@@ -69,11 +69,11 @@ Before resolution, addresses are normalized:
 
 Two addresses that normalize to the same string are considered identical.
 
-## 22.3 Discovery Context Handles (Primary Mechanism)
+## 22.3 Context Handles (Primary Mechanism)
 
-Discovery context handles are the primary human-readable addressing mechanism. They are SCP-native, DNS-free, and community-governed. Each discovery context is its own namespace with its own authority.
+Context handles are the primary human-readable addressing mechanism. They are SCP-native, DNS-free, and community-governed. Each context is its own namespace with its own authority.
 
-**Format:** `<name>@<discovery-context-name>`
+**Format:** `<name>@<scope-name>`
 
 **Examples:**
 ```
@@ -84,7 +84,7 @@ translator-ja@global-services
 
 ### 22.3.1 Handle Tools
 
-Discovery contexts that support handles expose three additional standard tool schemas alongside the existing `agent_search`/`agent_register`/`agent_deregister` tools (§6.2.2B). These are conventions, not mandates — a discovery context opts into handle support by implementing these tools.
+Contexts that support handles expose three additional standard tool schemas alongside the existing `agent_search`/`agent_register`/`agent_deregister` tools (§6.2.2B). These are conventions, not mandates — a context with discovery tools opts into handle support by implementing these tools.
 
 ```
 handle_register(handle, target, metadata?) → confirmation
@@ -143,11 +143,11 @@ handle_deregister(handle, did) → removal
 
 The `did` parameter in `handle_deregister` is explicit rather than inferred from the request signature — this ensures the tool schema is self-documenting and the DID-to-handle ownership check is visible in the interface. Writers verify the DID-signed request signature matches the provided DID and that the DID owns the handle.
 
-**Uniqueness.** A discovery context enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another DID already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given discovery context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
+**Uniqueness.** A context with discovery tools enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another DID already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
 
 **Ownership and verification.** The registrant's DID (authenticated via the DID-signed request) is the handle owner. Only the owner can update or deregister. All handle tool requests MUST carry a DID signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: DID-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner DID.
 
-**DID-signature verification scheme.** Handle tool requests use the same DID-authentication mechanism as discovery context reader requests (§6.2.2B). The signature is constructed as follows:
+**DID-signature verification scheme.** Handle tool requests use the same DID-authentication mechanism as context reader requests (§6.2.2B). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
 2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse. Scope tools sign with their own tool name (e.g., `"scope_register"`), not the corresponding handle tool name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
@@ -165,15 +165,15 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 
 **Two-tier model.** Handle tools follow the same two-tier architecture as existing discovery tools (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
-### 22.3.2 Discovery Context Naming
+### 22.3.2 Scope Naming
 
-Discovery contexts have a `name` field in their metadata (§5.7). The name used as the `scope` in addresses is this metadata name, normalized: lowercased, spaces replaced with hyphens, non-alphanumeric characters (except hyphens) removed. This normalized form is the **canonical scope name**.
+Contexts with discovery tools have a `name` field in their metadata (§5.7). The name used as the `scope` in addresses is this metadata name, normalized: lowercased, spaces replaced with hyphens, non-alphanumeric characters (except hyphens) removed. This normalized form is the **canonical scope name**.
 
-Example: A discovery context with metadata name "Cooking Community" has canonical scope name `cooking-community`.
+Example: A context with metadata name "Cooking Community" has canonical scope name `cooking-community`.
 
-The SDK ships with a mapping of default discovery context IDs to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific discovery contexts with their own scope names.
+The SDK ships with a mapping of default bootstrap context IDs to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific contexts with their own scope names.
 
-**Scope name collisions.** Two contexts in different scope registries may register the same scope name. Intra-registry conflicts are prevented by `scope_register`'s conflict detection — a scope name maps to at most one context within a single registry (§22.3.5). Cross-registry conflicts are resolved by registry priority in the SDK's bootstrap configuration: the first matching registry in the priority order wins, with the resolution path metadata identifying which registry produced the result. Users can disambiguate by specifying a discovery context explicitly in client UI (selecting from a list rather than typing a scope name).
+**Scope name collisions.** Two contexts in different scope registries may register the same scope name. Intra-registry conflicts are prevented by `scope_register`'s conflict detection — a scope name maps to at most one context within a single registry (§22.3.5). Cross-registry conflicts are resolved by registry priority in the SDK's bootstrap configuration: the first matching registry in the priority order wins, with the resolution path metadata identifying which registry produced the result. Users can disambiguate by specifying a context explicitly in client UI (selecting from a list rather than typing a scope name).
 
 ### 22.3.3 Resolution Flow
 
@@ -208,7 +208,7 @@ The SDK ships with a mapping of default discovery context IDs to their canonical
 
 ### 22.3.4 Handle Registry Template
 
-A new well-known context template for discovery contexts that serve as handle registries:
+A new well-known context template for contexts with discovery tools that serve as handle registries:
 
 ```
 Template: "scp:template/handle-registry"
@@ -226,7 +226,7 @@ Template: "scp:template/handle-registry"
                  agent_search, agent_register, agent_deregister
 ```
 
-This template is a starting point. Discovery contexts can customize governance, add tools (reputation scoring, category browsing), or restrict registration policies via context governance. The template follows the two-tier model: bounded registrars/admins (MLS members), unbounded readers.
+This template is a starting point. Contexts can customize governance, add tools (reputation scoring, category browsing), or restrict registration policies via context governance. The template follows the two-tier model: bounded registrars/admins (MLS members), unbounded readers.
 
 ### 22.3.5 Scope Tools (Namespace Registration)
 
@@ -378,7 +378,7 @@ SCP.AddressResolver.resolveContextPetname(name: "recipes") → ContextId?
 
 Identity attestations (§3.5) already bind external platform handles to DIDs — `@alice` on X → `did:dht:z6Mk...`. This binding is cryptographically signed, user-initiated, independently verifiable, and revocable. What's missing is a **reverse-lookup index**: given `@alice` on X, find the DID.
 
-The addressing layer adds reverse-lookup as a discovery context tool, not a new protocol primitive. When a user creates an identity attestation, the SDK SHOULD (opt-out configurable) register the mapping in one or more discovery contexts that support attestation indexing.
+The addressing layer adds reverse-lookup as a discovery tool, not a new protocol primitive. When a user creates an identity attestation, the SDK SHOULD (opt-out configurable) register the mapping in one or more contexts with discovery tools that support attestation indexing.
 
 **Format:** `@<handle>` (unqualified, searches all known platforms).
 
@@ -418,14 +418,14 @@ Multiple results are possible if multiple DIDs claim the same platform handle (o
 
 ### 22.5.2 Auto-Registration
 
-When a user creates an identity attestation (§3.5), the SDK SHOULD register the mapping in known discovery contexts that support `attestation_lookup`. This is opt-out via configuration. The registration flow:
+When a user creates an identity attestation (§3.5), the SDK SHOULD register the mapping in known contexts with discovery tools that support `attestation_lookup`. This is opt-out via configuration. The registration flow:
 
 1. User creates attestation: `SCP.Attestation.create(type: .identityLink, claim: { platform: "x", handle: "@alice_cooks" }, ...)`
-2. SDK discovers which known discovery contexts support `attestation_lookup`.
+2. SDK discovers which known contexts with discovery tools support `attestation_lookup`.
 3. SDK registers the mapping in each via a DID-authenticated request.
-4. Writers in the discovery context verify the attestation before recording it.
+4. Writers in the context verify the attestation before recording it.
 
-The discovery context's governance determines what verification is required before a mapping is accepted. A permissive registry might accept any signed attestation. A strict registry might require challenge-verified attestation with recent verification timestamp.
+The context's governance determines what verification is required before a mapping is accepted. A permissive registry might accept any signed attestation. A strict registry might require challenge-verified attestation with recent verification timestamp.
 
 ### 22.5.3 Resolution Flow
 
@@ -434,7 +434,7 @@ The discovery context's governance determines what verification is required befo
 2. Parse: attestation-backed handle (leading @)
    - If platform-qualified: extract platform from ":x" suffix
    - Otherwise: platform = "*" (search all)
-3. Query known discovery contexts that support attestation_lookup
+3. Query known contexts with discovery tools that support attestation_lookup
 4. For each: attestation_lookup(platform: platform, handle: "alice_cooks")
 5. Merge results, deduplicate by DID
 6. For each result, verify attestation is still valid (not revoked, not stale)
@@ -540,12 +540,12 @@ TrustLevel:
     }
   | DomainVerified              // HTTPS-dependent, domain operator controls binding
   | AttestationVerified         // cryptographically signed, platform-dependent verification
-  | DiscoveryContextVerified    // community-governed, discovery context controls binding
+  | DiscoveryContextVerified    // community-governed, context controls binding
 ```
 
 Trust levels are not strictly ordered — their relative strength is context-dependent. `DomainVerified` is stronger than `DiscoveryContextVerified` in some threat models (established domain with TLS history) and weaker in others (DNS seizure risk). The SDK exposes trust levels to consumers (agents, client UI); consumers decide what's sufficient for their operation.
 
-**`MultiLayerCorroborated`** indicates that multiple resolution paths agree on the same DID. The `sources` field records which paths corroborated, enabling consumers to evaluate the independence of the corroboration. **Caveat:** corroboration across layers is only as strong as the independence of those layers. An attacker who controls a domain, a discovery context, and an attestation can fake corroboration across all three cheaply. Consumers SHOULD evaluate the diversity of corroboration sources (e.g., a domain + an attestation from a major platform + an established discovery context is meaningfully harder to fake than a domain + a self-operated discovery context). The SDK SHOULD flag `MultiLayerCorroborated` results where all non-petname sources share a common operator or were registered within a short time window.
+**`MultiLayerCorroborated`** indicates that multiple resolution paths agree on the same DID. The `sources` field records which paths corroborated, enabling consumers to evaluate the independence of the corroboration. **Caveat:** corroboration across layers is only as strong as the independence of those layers. An attacker who controls a domain, a context with discovery tools, and an attestation can fake corroboration across all three cheaply. Consumers SHOULD evaluate the diversity of corroboration sources (e.g., a domain + an attestation from a major platform + an established context is meaningfully harder to fake than a domain + a self-operated context). The SDK SHOULD flag `MultiLayerCorroborated` results where all non-petname sources share a common operator or were registered within a short time window.
 
 **`Ambiguous` is a resolution outcome, not a trust level.** When multiple resolution paths find different DIDs for the same handle, the resolver returns multiple `AddressResolution` results — each with its own trust level — rather than a single result tagged `Ambiguous`. The resolver's return type (`Vec<AddressResolution>`) naturally represents this: a single result means unambiguous resolution; multiple results mean the consumer must disambiguate (§22.8.3).
 
@@ -554,8 +554,8 @@ Each `AddressResolution` also carries a `ResolutionPath` — structured metadata
 ```
 ResolutionPath {
   layer:                  "Petname" | "DiscoveryContext" | "Attestation" | "Domain",
-  source:                 string,     // discovery context name, domain, platform
-  source_id:              string?,    // discovery context ID (hex, for DiscoveryContext layer)
+  source:                 string,     // context name, domain, platform
+  source_id:              string?,    // context ID (hex, for DiscoveryContext layer)
   scope_registry_id:      string?,    // context ID of the scope registry (if two-hop resolution)
   scope_registry_source:  string?,    // human-readable name of the scope registry
   resolved_at:            timestamp,
@@ -583,7 +583,7 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
 
 2. In parallel:
    a. Check domain handles for configured domains
-   b. Query known discovery contexts via handle_lookup
+   b. Query known contexts with discovery tools via handle_lookup
    c. Query attestation indexes via attestation_lookup
 
 3. Collect results, deduplicate by DID
@@ -613,7 +613,7 @@ The protocol does not prevent name collisions — it surfaces them transparently
 
 ### 22.8.4 Resolution Caching
 
-The SDK caches resolution results locally to avoid redundant network calls. Cache entries are keyed by normalized address string, with per-layer TTLs: petnames are indefinite (user-managed); domain handles follow HTTP caching semantics (~1 hour); discovery context handles are short-lived (~15 minutes); scope entries use ~15 minutes (matching discovery context handles — scope entries are more stable than individual handles but should still be refreshed to detect re-registrations); attestation handles match attestation renewal intervals (§7.3.6). Cache misses trigger fresh resolution. Cache hits with expired TTL trigger background re-resolution (return cached result immediately, verify in background). Cache implementation details are specified in `.docs/scaffold/`.
+The SDK caches resolution results locally to avoid redundant network calls. Cache entries are keyed by normalized address string, with per-layer TTLs: petnames are indefinite (user-managed); domain handles follow HTTP caching semantics (~1 hour); context handles are short-lived (~15 minutes); scope entries use ~15 minutes (matching context handles — scope entries are more stable than individual handles but should still be refreshed to detect re-registrations); attestation handles match attestation renewal intervals (§7.3.6). Cache misses trigger fresh resolution. Cache hits with expired TTL trigger background re-resolution (return cached result immediately, verify in background). Cache implementation details are specified in `.docs/scaffold/`.
 
 ### 22.8.5 SDK Surface
 
@@ -623,7 +623,7 @@ SCP.Address.resolve(
   address: "alice@cooking-community"
 ) → [AddressResolution]
 
-// Register a handle in a discovery context
+// Register a handle in a context with discovery tools
 SCP.Address.register(
   handle: "alice",
   scope: discoveryContextID,
@@ -698,7 +698,7 @@ These events follow the existing identity private state model: append-only event
 
 ### 22.10.1 Handle Squatting
 
-**Discovery context handles.** Governance determines policy. First-come-first-served is the default. Discovery contexts can require attestation-backed registration (prove you are `@alice` on X before claiming `alice@premium-registry`), admin approval, or other policies. Squatting within a discovery context is a governance problem for that community.
+**Context handles.** Governance determines policy. First-come-first-served is the default. Contexts can require attestation-backed registration (prove you are `@alice` on X before claiming `alice@premium-registry`), admin approval, or other policies. Squatting within a context with discovery tools is a governance problem for that community.
 
 **Domain handles.** Domain operators control their namespace. Squatting within a domain is the domain operator's problem — identical to email.
 
@@ -728,21 +728,21 @@ Protocol defenses:
 
 **Petnames.** Fully private. Encrypted in identity private state (§3.7). No external visibility.
 
-**Discovery context handles.** Handle registrations are visible to the discovery context (writers see all registrations, readers can query). Handle lookups are DID-authenticated — the discovery context sees who queries what. This is an inherent property of any registry. Registration is opt-in per discovery context, withdrawable via `handle_deregister`.
+**Context handles.** Handle registrations are visible to the context (writers see all registrations, readers can query). Handle lookups are DID-authenticated — the context sees who queries what. This is an inherent property of any registry. Registration is opt-in per context, withdrawable via `handle_deregister`.
 
-**Attestation handles.** Attestation existence is public (published for discovery). The reverse-lookup query is a discovery context tool call with the same privacy properties as handle lookups.
+**Attestation handles.** Attestation existence is public (published for discovery). The reverse-lookup query is a discovery tool call with the same privacy properties as handle lookups.
 
 **Domain handles.** The domain operator sees all handles and query traffic. HTTPS protects against third-party observation. Same privacy model as any HTTP-based service.
 
 ### 22.10.5 Query Surveillance
 
-Discovery context handle lookups and attestation lookups are DID-authenticated tool calls. This means discovery context writers can observe every lookup — who searched for whom, when, how often. This is a structural property of any registry model and is not unique to SCP, but it bears explicit acknowledgment.
+Context handle lookups and attestation lookups are DID-authenticated tool calls. This means context writers can observe every lookup — who searched for whom, when, how often. This is a structural property of any registry model and is not unique to SCP, but it bears explicit acknowledgment.
 
 Mitigations:
-- **Multiple discovery contexts.** Users can distribute their lookups across multiple registries, preventing any single registry from seeing the full query pattern.
-- **SDK caching.** Resolution caching (§22.8.4) reduces repeat queries to the same discovery context.
-- **No query logging mandate.** The protocol does not require discovery contexts to log queries. Writers process lookups but are not mandated to record them beyond what the event log requires (registrations are logged; reads are not).
-- **Privacy-preserving lookup is a future direction.** Techniques like private information retrieval (PIR) or oblivious queries could be layered onto the discovery context tool interface without protocol changes — the tool schema is compatible. This is acknowledged as unspecified and not blocking for initial implementation.
+- **Multiple contexts with discovery tools.** Users can distribute their lookups across multiple registries, preventing any single registry from seeing the full query pattern.
+- **SDK caching.** Resolution caching (§22.8.4) reduces repeat queries to the same context.
+- **No query logging mandate.** The protocol does not require contexts with discovery tools to log queries. Writers process lookups but are not mandated to record them beyond what the event log requires (registrations are logged; reads are not).
+- **Privacy-preserving lookup is a future direction.** Techniques like private information retrieval (PIR) or oblivious queries could be layered onto the context tool interface without protocol changes — the tool schema is compatible. This is acknowledged as unspecified and not blocking for initial implementation.
 
 ## 22.11 Wire Format Tables
 
@@ -750,7 +750,7 @@ This section tabulates the wire format for all discovery and addressing types th
 
 ### 22.11.1 Agent Registration and Search
 
-These types are the tool call schemas for the standard discovery context tools defined in §6.2.2B.
+These types are the tool call schemas for the standard context tools defined in §6.2.2B.
 
 **`AgentSearchParams`** — Input for `agent_search` tool.
 
@@ -812,7 +812,7 @@ These types are the tool call schemas for the standard discovery context tools d
 | `Updated` | `"Updated"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | Updated existing registration. |
 | `Deregistered` | `"Deregistered"` | `did: String`, `entry_id: String`, `timestamp: u64` | Removed registration. |
 
-**`MembershipTier`** — Enum for discovery context membership levels.
+**`MembershipTier`** — Enum for context membership levels.
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
@@ -1014,15 +1014,15 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 | `MultiLayerCorroborated` | `"MultiLayerCorroborated"` | `sources: Vec<ResolutionPath>` | Multiple independent resolution paths agree. |
 | `DomainVerified` | `"DomainVerified"` | — | Resolved via `.well-known/scp`. HTTPS-dependent. |
 | `AttestationVerified` | `"AttestationVerified"` | — | Resolved via identity attestation. Platform-dependent. |
-| `DiscoveryContextVerified` | `"DiscoveryContextVerified"` | — | Resolved via discovery context handle. Community-governed. |
+| `DiscoveryContextVerified` | `"DiscoveryContextVerified"` | — | Resolved via context handle lookup. Community-governed. |
 
 **`ResolutionPath`** — Provenance for the resolution itself.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `layer` | `ResolutionLayer` | Yes | Which resolution layer found the result. |
-| `source` | `String` | Yes | Discovery context name, domain, or platform. |
-| `source_id` | `String` | No | Discovery context ID (hex) when `layer` = `DiscoveryContext`. |
+| `source` | `String` | Yes | Context name, domain, or platform. |
+| `source_id` | `String` | No | Context ID (hex) when `layer` = `DiscoveryContext`. |
 | `scope_registry_id` | `String` | No | Context ID of the scope registry used for two-hop resolution (§22.3.5). Present when scope lookup was involved. |
 | `scope_registry_source` | `String` | No | Human-readable name of the scope registry (e.g., "limn-bootstrap"). Present when `scope_registry_id` is present. |
 | `resolved_at` | `u64` | Yes | Unix timestamp (seconds) of resolution. |
@@ -1032,7 +1032,7 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `Petname` | `"Petname"` | Local petname store. |
-| `DiscoveryContext` | `"DiscoveryContext"` | Discovery context handle lookup. |
+| `DiscoveryContext` | `"DiscoveryContext"` | Context handle lookup. |
 | `Attestation` | `"Attestation"` | Attestation-backed reverse lookup. |
 | `Domain` | `"Domain"` | `.well-known/scp` domain handle. |
 | `MultiLayerCorroborated` | `"MultiLayerCorroborated"` | Multiple layers agreed. |
@@ -1121,16 +1121,16 @@ These events are appended to the identity private state event log (§3.7). They 
 |---------|-----|--------|-----------|
 | `DhtDidDocument` | `"dht_did_document"` | — | Found via `SCPBroadcastContext` service in publisher's DID doc. |
 | `WellKnown` | `"well_known"` | — | Found via `.well-known/scp` on a domain. |
-| `DiscoveryContext` | `"discovery_context"` | `context_id: String` | Found via search in a discovery context. |
+| `DiscoveryContext` | `"discovery_context"` | `context_id: String` | Found via search in a context with discovery tools. |
 | `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |
 
 **`BootstrapConfig`** — Client bootstrap discovery configuration.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `default_context_ids` | `Vec<String>` | Yes | SDK default discovery context IDs. |
-| `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query discovery contexts on first identity creation. |
-| `custom_context_ids` | `Vec<String>` | Yes | User-added discovery context IDs. May be empty. |
+| `default_context_ids` | `Vec<String>` | Yes | SDK default bootstrap context IDs. |
+| `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery tools on first identity creation. |
+| `custom_context_ids` | `Vec<String>` | Yes | User-added context IDs. May be empty. |
 | `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to DID document capability resolution. |
 
 **`DiscoveryQuery`** — Parameters for multi-source discovery search.
@@ -1146,7 +1146,7 @@ These events are appended to the identity private state event log (§3.7). They 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `entries` | `Vec<DiscoveryResultEntry>` | Yes | Matching entries across all queried sources. |
-| `sources` | `Vec<String>` | Yes | Discovery context IDs that were queried. |
+| `sources` | `Vec<String>` | Yes | Context IDs that were queried. |
 
 **`DiscoveryResultEntry`** — A single discovery result.
 
@@ -1185,4 +1185,4 @@ The following tool names are normative — independent implementations MUST use 
 
 ## 22.12 Phase Integration
 
-Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Discovery context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on discovery context and attestation infrastructure). Scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle tools from Phase 3).
+Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on context and attestation infrastructure). Scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle tools from Phase 3).

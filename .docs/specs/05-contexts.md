@@ -194,7 +194,7 @@ Properties of roles:
 - **Author** — holds `messages:write` UCAN. Can publish broadcast-key-encrypted content. Authors are bounded (added via `role:assigned` events with role `author`). Each author maintains their own broadcast key with an independent epoch counter.
 - **Subscriber** — holds `messages:read` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
 
-The author/subscriber distinction mirrors the writer/reader two-tier model from discovery contexts (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as discovery context reader-tier access.
+The author/subscriber distinction mirrors the writer/reader two-tier model from contexts with discovery tools (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as context reader-tier access.
 
 ### 5.5.1 Default Role Set
 
@@ -367,7 +367,7 @@ Ed25519_sign(active_signing_key, SHA-256(
 
 Contexts are cryptographic entities. You opt into a key, not a name. Spoofing a cryptographic identity is hard; spoofing a name is a UI problem for clients to solve.
 
-Human-readable addressing (§22) adds a protocol-level resolution layer — discovery context handles, petnames, attestation-backed handles, and domain handles — that maps human-readable strings to context IDs and DIDs. Handles are resolution hints; the cryptographic context ID remains canonical. Each resolution result carries a trust level (§22.7) indicating the strength of the name-to-identifier binding.
+Human-readable addressing (§22) adds a protocol-level resolution layer — context handles, petnames, attestation-backed handles, and domain handles — that maps human-readable strings to context IDs and DIDs. Handles are resolution hints; the cryptographic context ID remains canonical. Each resolution result carries a trust level (§22.7) indicating the strength of the name-to-identifier binding.
 
 ## 5.9 Governance
 
@@ -692,7 +692,7 @@ Template: "scp:template/paid-broadcast"
   projection_policy: { default_rule: Gated, overrides: [] }
 ```
 
-The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messages:read` is auto-granted (DID-authenticated, following the discovery context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
+The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messages:read` is auto-granted (DID-authenticated, following the context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
 
 Templates are not extensible by users — they are protocol constants. A template ID is a commitment: "this context has exactly these properties." If you need something a template doesn't cover, use explicit `ContextParams`. Templates and explicit params are equally valid; templates are just the fast path for common cases.
 
@@ -715,7 +715,7 @@ AutoAcceptPolicy {
 TrustRequirement:
   | shared_context    // DID shares at least one active context with me
   | known_did(list)   // DID is in an explicit allowlist
-  | discovery_context // DID is registered in a discovery context I trust
+  | discovery_context // DID is registered in a context with discovery tools I trust
 ```
 
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID I share at least one context with, if TTL ≤ 10 minutes, at most 5 per hour."
@@ -1391,12 +1391,12 @@ Where `context_id` and `author_did` are UTF-8 bytes and `epoch_bytes` is the 8-b
 
 ### 5.14.3 Subscriber Registration
 
-Broadcast contexts reuse the two-tier membership model from discovery contexts (§6.2.2B):
+Broadcast contexts reuse the two-tier membership model from contexts with discovery tools (§6.2.2B):
 
 - **Writer tier (authors):** Hold `messages:write` UCAN. Bounded. Manage content and key distribution.
 - **Reader tier (subscribers):** DID-authenticated (open) or UCAN-authenticated (gated). Unbounded. Receive author broadcast keys on request.
 
-Subscribers register via DID-signed requests — the same pattern discovery context readers use:
+Subscribers register via DID-signed requests — the same pattern context readers use:
 
 ```rust
 pub struct SubscriberRegistration {
@@ -1416,7 +1416,7 @@ pub struct SubscriberRegistration {
 
 The distinction between open and gated broadcast is expressed through the existing role/UCAN system at the template level, not through a new enum:
 
-**Open broadcast** (`public-broadcast` template): The subscriber role's `messages:read` capability is granted on DID-authenticated registration — no admin-issued UCAN required. This mirrors discovery context readers who query via DID-signed requests without UCAN.
+**Open broadcast** (`public-broadcast` template): The subscriber role's `messages:read` capability is granted on DID-authenticated registration — no admin-issued UCAN required. This mirrors context readers who query via DID-signed requests without UCAN.
 
 **Gated broadcast** (`gated-broadcast` template): The subscriber role requires an explicit `messages:read` UCAN from the context admin. Same as encrypted context membership — capabilities require admin-issued tokens.
 
@@ -1549,7 +1549,7 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 Broadcast contexts are discoverable through four mechanisms:
 
 1. **DID document service endpoint.** Authors MAY publish an `SCPBroadcastContext` service entry in their DID document with the context ID and relay URLs.
-2. **Discovery contexts.** Authors register broadcast contexts via `agent_register` in discovery contexts (§6.2.2B), with metadata indicating the context mode.
+2. **Contexts with discovery tools.** Authors register broadcast contexts via `agent_register` in contexts with discovery tools (§6.2.2B), with metadata indicating the context mode.
 3. **`.well-known/scp`.** Operators MAY list broadcast contexts in their `.well-known/scp` document (§18.3). Only broadcast context IDs may be listed — encrypted context IDs MUST NOT appear (§9.10 metadata privacy).
 4. **Out-of-band URI.** The universal context URI format (§18.4) is used for sharing context references: `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` is accepted as an alias and normalized to the universal format.
 

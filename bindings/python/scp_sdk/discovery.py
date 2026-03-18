@@ -254,10 +254,10 @@ def handle_register(
     description: str | None = None,
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Register a handle in a discovery context.
+    """Register a handle in a context with discovery tools.
 
     Args:
-        discovery_context_id: ID of the discovery context.
+        discovery_context_id: ID of the context.
         handle: The handle string to register.
         target_json: JSON string describing the target. Must have a
             ``"type"`` field (``"identity"`` or ``"context"``).
@@ -286,10 +286,10 @@ def handle_lookup(
     *,
     type_filter: str | None = None,
 ) -> dict[str, Any]:
-    """Look up a handle in a discovery context.
+    """Look up a handle in a context with discovery tools.
 
     Args:
-        discovery_context_id: ID of the discovery context.
+        discovery_context_id: ID of the context.
         handle: The handle string to look up.
         type_filter: Optional filter: ``"identity"`` or ``"context"``.
 
@@ -308,10 +308,10 @@ def handle_deregister(
     handle: str,
     did: str,
 ) -> dict[str, Any]:
-    """Deregister a handle from a discovery context.
+    """Deregister a handle from a context with discovery tools.
 
     Args:
-        discovery_context_id: ID of the discovery context.
+        discovery_context_id: ID of the context.
         handle: The handle string to deregister.
         did: DID of the registrant requesting deregistration.
 
@@ -346,7 +346,7 @@ def address_resolve(
         address: The address string to resolve
             (e.g., ``"alice@cooking-community"``).
         known_contexts_json: Optional JSON object mapping context IDs to
-            names. If ``None``, uses all registered discovery contexts.
+            names. If ``None``, uses all registered contexts with discovery tools.
 
     Returns:
         A list of ``AddressResolution`` dicts, each with ``type``

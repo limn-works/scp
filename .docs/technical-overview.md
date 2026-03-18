@@ -388,7 +388,7 @@ pub struct BroadcastEnvelope {
 }
 ```
 
-Subscriber registration uses the two-tier model from discovery contexts: a bounded writer tier (MLS members, authors) and an unbounded reader tier (DID-authenticated subscribers). Open broadcasts grant keys on DID authentication alone; gated broadcasts require a `messagesRead` UCAN from the context admin, enabling paid subscriptions, invite-only communities, and tiered access.
+Subscriber registration uses the two-tier model from contexts with discovery tools: a bounded writer tier (MLS members, authors) and an unbounded reader tier (DID-authenticated subscribers). Open broadcasts grant keys on DID authentication alone; gated broadcasts require a `messagesRead` UCAN from the context admin, enabling paid subscriptions, invite-only communities, and tiered access.
 
 #### Metadata privacy — what relays see
 
@@ -460,7 +460,7 @@ Creating a context from scratch means specifying a ceiling, roles, governance mo
 | `tool-interface` | Encrypted | Cross-context tool exposure point. |
 | `paid-service` | Encrypted | Tool context with per-invocation cost. Extends `tool-interface`. |
 | `paid-broadcast` | Broadcast | Subscription feed. Extends `gated-broadcast`. |
-| `handle-registry` | Encrypted | Discovery context that serves human-readable handles. |
+| `handle-registry` | Encrypted | Context that serves human-readable handles. |
 
 Templates are protocol constants, not extensible. A template ID in context metadata is a commitment: "this context has exactly these properties." The joining party evaluates a single check — "do I accept this template from this DID at this TTL?" — instead of inspecting six parameters individually.
 
@@ -536,9 +536,9 @@ Two complementary discovery channels:
 
 **DID document capabilities** — direct lookup, zero infrastructure. Every agent may publish structured capabilities in their DID document's `service` array. Anyone who knows a DID can resolve the document via Mainline DHT and inspect capabilities. Provides lookup, not search.
 
-**Discovery contexts** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (DID-authenticated, query via tool endpoints without joining the MLS group).
+**Contexts with discovery tools** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (DID-authenticated, query via tool endpoints without joining the MLS group).
 
-Bootstrap: SDK ships with default discovery context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct DID resolution and manual context ID sharing.
+Bootstrap: SDK ships with default bootstrap context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct DID resolution and manual context ID sharing.
 
 #### Human-readable addressing
 
@@ -547,7 +547,7 @@ Cryptographic identifiers (`did:dht:z6Mk...`) are the protocol's canonical ident
 | Path | Format | Authority | Trust level |
 |---|---|---|---|
 | **Petnames** | Any string (local) | The user | `LocalPetname` — highest personal trust, zero shareability |
-| **Discovery context handles** | `alice@cooking-community` | Community governance | `DiscoveryContextVerified` |
+| **Context handles** | `alice@cooking-community` | Community governance | `DiscoveryContextVerified` |
 | **Attestation-backed handles** | `@alice_cooks` or `@alice:github` | External platform + cryptographic attestation | `AttestationVerified` |
 | **Domain handles** | `alice@example.com` | Domain operator via `.well-known/scp` | `DomainVerified` |
 

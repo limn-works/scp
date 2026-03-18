@@ -9873,7 +9873,7 @@ pub fn petname_get_for_context(
 // Handle registry bridge functions (§22.3.1)
 // ---------------------------------------------------------------------------
 
-/// Registers a handle in a discovery context. Returns JSON result.
+/// Registers a handle in a context with discovery tools. Returns JSON result.
 #[uniffi::export]
 #[allow(clippy::too_many_arguments)]
 pub fn handle_register(
@@ -9911,7 +9911,7 @@ pub fn handle_register(
     })
 }
 
-/// Looks up a handle in a discovery context. Returns JSON result.
+/// Looks up a handle in a context with discovery tools. Returns JSON result.
 #[uniffi::export]
 pub fn handle_lookup(
     discovery_context_id: String,
@@ -9952,7 +9952,7 @@ pub fn handle_lookup(
     })
 }
 
-/// Deregisters a handle from a discovery context. Returns JSON result.
+/// Deregisters a handle from a context with discovery tools. Returns JSON result.
 #[uniffi::export]
 pub fn handle_deregister(
     discovery_context_id: String,

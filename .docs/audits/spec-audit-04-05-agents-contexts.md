@@ -231,8 +231,8 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.12.2] Auto-Accept TrustRequirement `discovery_context` Undefined
 - **Category**: Underspecified algorithms
 - **Location**: §5.12.2, lines 335-338
-- **What's missing**: `discovery_context // DID is registered in a discovery context I trust`. What makes a discovery context "trusted"? Is trust in a discovery context itself governed by auto-accept policies (circular)? How does the SDK evaluate this criterion at invitation-processing time — does it query the discovery context? Cache discovery context membership? What if the discovery context is offline?
-- **Why it matters**: This is a potentially expensive runtime check (querying an external context) in the fast path of invitation processing. If the discovery context is unreachable, does the auto-accept fail closed (reject) or fail open (prompt)?
+- **What's missing**: `discovery_context // DID is registered in a context with discovery tools I trust`. What makes a context with discovery tools "trusted"? Is trust in a context with discovery tools itself governed by auto-accept policies (circular)? How does the SDK evaluate this criterion at invitation-processing time — does it query the context? Cache context membership? What if the context is offline?
+- **Why it matters**: This is a potentially expensive runtime check (querying an external context) in the fast path of invitation processing. If the context is unreachable, does the auto-accept fail closed (reject) or fail open (prompt)?
 - **Severity**: LOW
 
 ### [5.12.3] Invitation Bundle Wire Format Not Specified

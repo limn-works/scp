@@ -542,7 +542,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
 Economic metadata participates in all discovery channels:
 
 - **Context metadata (§5.7):** Economic policy visible before opt-in. Prospective members see pricing alongside capability ceiling, governance model, and roles.
-- **Discovery context registration (§6.2.2B):** Contexts advertising in discovery contexts include economic metadata in their registration.
+- **Context registration (§6.2.2B):** Contexts advertising in contexts with discovery tools include economic metadata in their registration.
 - **DID document `SCPCapabilities` (§18.2.2):** Optional economic metadata — identities may advertise accepted payment adapters and currencies.
 - **Relay config in `.well-known/scp` (§18.3.3):** Relay economic parameters visible alongside operational parameters.
 

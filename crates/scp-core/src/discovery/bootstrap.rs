@@ -1,11 +1,11 @@
 //! Discovery bootstrap and fallback configuration.
 //!
-//! Provides configurable default discovery context IDs (analogous to DNS root
-//! servers) and a resolver that combines discovery context queries with
+//! Provides configurable default bootstrap context IDs (analogous to DNS root
+//! servers) and a resolver that combines context queries with
 //! fallback to direct DID resolution.
 //!
 //! The SDK ships with configurable defaults that are auto-queried on first
-//! identity creation (opt-out). Users can add custom discovery contexts and
+//! identity creation (opt-out). Users can add custom contexts with discovery tools and
 //! configure fallback behavior.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md`, acceptance criterion 8.
@@ -23,37 +23,37 @@ use super::{ContextId, DiscoveryError};
 
 /// Configuration for discovery bootstrap behavior.
 ///
-/// Controls which discovery contexts the SDK queries on startup, whether
+/// Controls which contexts with discovery tools the SDK queries on startup, whether
 /// auto-query fires on first identity creation, and whether to fall back to
-/// direct DID resolution when discovery contexts are unavailable.
+/// direct DID resolution when contexts with discovery tools are unavailable.
 ///
 /// Analogous to DNS root servers: the SDK ships with configurable default
-/// discovery context IDs. Users can add custom discovery contexts. If
+/// bootstrap context IDs. Users can add custom contexts with discovery tools. If
 /// defaults are unreachable, direct DID resolution still works.
 ///
 /// See ADR-020 acceptance criterion 8.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapConfig {
-    /// Default discovery context IDs shipped with the SDK.
+    /// Default bootstrap context IDs shipped with the SDK.
     ///
     /// These are queried automatically on first identity creation unless
     /// `auto_query_on_identity_creation` is set to `false`.
     pub default_context_ids: Vec<ContextId>,
 
-    /// Whether to automatically query discovery contexts on first identity
+    /// Whether to automatically query contexts with discovery tools on first identity
     /// creation.
     ///
     /// Defaults to `true`. Set to `false` to opt out of automatic discovery
     /// queries.
     pub auto_query_on_identity_creation: bool,
 
-    /// User-added custom discovery context IDs.
+    /// User-added custom context IDs.
     ///
     /// These are queried alongside the defaults. Users can add contexts via
     /// [`BootstrapConfig::add_custom_context`].
     pub custom_context_ids: Vec<ContextId>,
 
-    /// Whether to fall back to direct DID resolution when discovery contexts
+    /// Whether to fall back to direct DID resolution when contexts with discovery tools
     /// are unavailable or return no results.
     ///
     /// Defaults to `true`. When enabled, the resolver attempts DID document
@@ -81,7 +81,7 @@ impl BootstrapConfig {
     ///
     /// # Arguments
     ///
-    /// * `context_ids` -- Default discovery context IDs to query on bootstrap.
+    /// * `context_ids` -- Default bootstrap context IDs to query on bootstrap.
     #[must_use]
     pub fn with_defaults(context_ids: Vec<ContextId>) -> Self {
         Self {
@@ -90,7 +90,7 @@ impl BootstrapConfig {
         }
     }
 
-    /// Adds a custom discovery context ID.
+    /// Adds a custom context ID.
     ///
     /// Custom contexts are queried alongside the defaults. Duplicate context
     /// IDs are not filtered here -- deduplication happens at query time in
@@ -111,7 +111,7 @@ impl BootstrapConfig {
             .collect()
     }
 
-    /// Returns whether the SDK should auto-query discovery contexts on first
+    /// Returns whether the SDK should auto-query contexts with discovery tools on first
     /// identity creation.
     #[must_use]
     pub const fn should_auto_query(&self) -> bool {
@@ -119,7 +119,7 @@ impl BootstrapConfig {
     }
 
     /// Returns whether the resolver should fall back to direct DID resolution
-    /// when discovery contexts are unavailable.
+    /// when contexts with discovery tools are unavailable.
     #[must_use]
     pub const fn should_fallback(&self) -> bool {
         self.fallback_to_did_resolution
@@ -130,10 +130,10 @@ impl BootstrapConfig {
 // BootstrapResolver
 // ---------------------------------------------------------------------------
 
-/// Resolves discovery contexts and provides fallback to DID resolution.
+/// Resolves contexts with discovery tools and provides fallback to DID resolution.
 ///
 /// Holds a [`BootstrapConfig`] and provides methods to retrieve all available
-/// discovery context IDs and to attempt resolution with fallback behavior.
+/// bootstrap context IDs and to attempt resolution with fallback behavior.
 ///
 /// See ADR-020 acceptance criterion 8.
 #[derive(Debug, Clone)]
@@ -155,7 +155,7 @@ impl BootstrapResolver {
         &self.config
     }
 
-    /// Returns all available discovery context IDs (defaults + custom),
+    /// Returns all available context IDs (defaults + custom),
     /// deduplicated while preserving order.
     #[must_use]
     pub fn resolve_contexts(&self) -> Vec<ContextId> {
@@ -203,11 +203,11 @@ impl BootstrapResolver {
         Ok(())
     }
 
-    /// Attempts to resolve discovery context IDs, falling back to DID
+    /// Attempts to resolve bootstrap context IDs, falling back to DID
     /// resolution if configured and no contexts are available.
     ///
     /// Resolution strategy:
-    /// 1. Collect all configured discovery context IDs (defaults + custom).
+    /// 1. Collect all configured bootstrap context IDs (defaults + custom).
     /// 2. If contexts are found, return them.
     /// 3. If no contexts are found and fallback is enabled, attempt DID
     ///    document capability resolution by returning an empty list with a
@@ -217,11 +217,11 @@ impl BootstrapResolver {
     /// # Arguments
     ///
     /// * `did` -- The DID to fall back to for direct resolution. Used only
-    ///   when no discovery contexts are available and fallback is enabled.
+    ///   when no bootstrap contexts are available and fallback is enabled.
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryError::DidResolutionFailed`] if no discovery
+    /// Returns [`DiscoveryError::DidResolutionFailed`] if no bootstrap
     /// contexts are configured and fallback is disabled.
     pub fn resolve_with_fallback(&self, did: &str) -> Result<Vec<ContextId>, DiscoveryError> {
         let contexts = self.resolve_contexts();
@@ -230,7 +230,7 @@ impl BootstrapResolver {
             return Ok(contexts);
         }
 
-        // No discovery contexts available -- check fallback policy.
+        // No contexts with discovery tools available -- check fallback policy.
         if self.config.should_fallback() {
             // Return an empty list to signal the caller should try direct DID
             // resolution for the given DID. The actual DID resolution is
@@ -238,7 +238,7 @@ impl BootstrapResolver {
             Ok(Vec::new())
         } else {
             Err(DiscoveryError::DidResolutionFailed(format!(
-                "no discovery contexts configured and fallback disabled for DID: {did}"
+                "no bootstrap contexts configured and fallback disabled for DID: {did}"
             )))
         }
     }

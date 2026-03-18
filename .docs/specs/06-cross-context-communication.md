@@ -136,7 +136,7 @@ Sessions have an optional TTL set by the tool's context. When set, expired sessi
 
 ### 6.2.2 Protocol-Level Discovery
 
-Discovery is built from two complementary mechanisms: DID document capabilities (direct lookup) and discovery contexts (searchable registries). Together, these provide 0-setup discovery that makes SCP inherently social.
+Discovery is built from two complementary mechanisms: DID document capabilities (direct lookup) and contexts with discovery tools (searchable registries). Together, these provide 0-setup discovery that makes SCP inherently social.
 
 #### A. DID Document Capabilities
 
@@ -156,11 +156,11 @@ Every agent MAY publish structured capabilities in their DID document's `service
 }
 ```
 
-DID document capabilities provide direct lookup for any known DID. They do not provide search or browsing — for that, discovery contexts are needed.
+DID document capabilities provide direct lookup for any known DID. They do not provide search or browsing — for that, contexts with discovery tools are needed.
 
-#### B. Discovery Contexts
+#### B. Contexts with Discovery Tools
 
-Discovery contexts are standard SCP contexts with open join policies and standardized discovery tools. Anyone can create one. No central authority, no operator dependency. They inherit all context-governed properties: tool calls are rate-limited and auditable, results carry provenance.
+These are standard SCP contexts with open join policies and standardized discovery tools. Anyone can create one. No central authority, no operator dependency. They inherit all context-governed properties: tool calls are rate-limited and auditable, results carry provenance.
 
 **Standard discovery tool schemas** — minimum interoperable interface:
 
@@ -181,17 +181,17 @@ agent_deregister(did) → removal
   output: { removed: bool }
 ```
 
-These are conventions, not mandates — discovery contexts can add custom tools (e.g., reputation scoring, category browsing, geographic filtering) beyond the standard schema. Discovery contexts that support human-readable addressing (§22) additionally implement `handle_register`, `handle_lookup`, `handle_deregister`, and `attestation_lookup` tools. Contexts that serve as scope registries (§22.3.5) additionally implement `scope_register`, `scope_lookup`, `scope_deregister` — independent tools with separate storage, constrained to context-only targets and dot-free scope names (ADR-043).
+These are conventions, not mandates — contexts with discovery tools can add custom tools (e.g., reputation scoring, category browsing, geographic filtering) beyond the standard schema. Contexts that support human-readable addressing (§22) additionally implement `handle_register`, `handle_lookup`, `handle_deregister`, and `attestation_lookup` tools. Contexts that serve as scope registries (§22.3.5) additionally implement `scope_register`, `scope_lookup`, `scope_deregister` — independent tools with separate storage, constrained to context-only targets and dot-free scope names (ADR-043).
 
-**Two-tier membership model.** Discovery contexts use a two-tier architecture to support unbounded scale while maintaining MLS-based governance:
+**Two-tier membership model.** Contexts use a two-tier architecture to support unbounded scale while maintaining MLS-based governance:
 
 - **Writer tier (MLS members, bounded).** Writers are standard MLS group members. They can register/deregister entries, modify governance, and process registration requests. The MLS group is bounded at ~500 members to maintain practical epoch advance costs (O(N) cost per MLS Update). Writers are typically registry operators, curators, and high-volume registrants.
-- **Reader tier (DID-authenticated, unbounded).** Readers query the discovery context's tool endpoints via DID-signed requests without joining the MLS group. They can search (`agent_search`), inspect entries, and request inclusion proofs from the Merkle event log. No MLS membership required, no epoch advance cost. Reader capacity is unbounded.
+- **Reader tier (DID-authenticated, unbounded).** Readers query the context's tool endpoints via DID-signed requests without joining the MLS group. They can search (`agent_search`), inspect entries, and request inclusion proofs from the Merkle event log. No MLS membership required, no epoch advance cost. Reader capacity is unbounded.
 - **Registration flow.** A reader (non-MLS-member) registers by sending a DID-signed registration request to the context's `agent_register` tool endpoint. A writer processes the request and records it as an MLS application message in the event log. The registrant does NOT become an MLS member — their entry is stored in the context's registry data, and they can update or deregister via subsequent DID-authenticated requests to tool endpoints, processed by writers.
 - **Self-service updates.** Registered agents update their entries via DID-authenticated requests to tool endpoints. Updates are subject to ownership enforcement:
   1. **Entries are owned by their creator DID.** The DID that called `agent_register` is the entry owner, recorded at creation time.
   2. **Only the owner can update or delete their own entries.** Writers MUST verify that the DID signature on the update request matches the entry's owner DID before processing.
-  3. **Context admins can update or delete any entry.** DIDs holding the `Admin` role in the discovery context bypass ownership checks.
+  3. **Context admins can update or delete any entry.** DIDs holding the `Admin` role in the context bypass ownership checks.
   4. **Signature verification.** All update and delete requests MUST carry a valid signature from the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`). Writers verify the signature against the requester's current DID document before processing.
   5. **Rejection on mismatch.** If the requester's DID does not match the entry owner and the requester is not a context admin, the request is rejected with an `OwnershipViolation` error. The rejection is logged in the Merkle event log.
 - **Consistency.** All writes are recorded in the Merkle event log. Readers can request inclusion proofs to verify their registration was recorded and to audit the registry's integrity.
@@ -204,18 +204,18 @@ These are conventions, not mandates — discovery contexts can add custom tools 
 
 3. **Replay protection.** Writers MUST validate that the request timestamp is within 5 minutes of local time (consistent with §9.14 clock skew tolerance) and that the `nonce` has not been previously seen. Writers maintain a nonce deduplication cache with a 5-minute TTL, bounded at 10,000 entries with oldest-first eviction. Requests with expired timestamps or duplicate nonces are rejected.
 
-4. **Rate limiting.** Writers MUST enforce per-DID rate limits on registration requests. Default limits: 1 registration per DID per hour, 10 updates per DID per hour. Discovery context governance MAY configure stricter or more lenient limits. Rate-limited requests receive `ErrorCode::RATE_LIMITED` with a `Retry-After` hint.
+4. **Rate limiting.** Writers MUST enforce per-DID rate limits on registration requests. Default limits: 1 registration per DID per hour, 10 updates per DID per hour. Context governance MAY configure stricter or more lenient limits. Rate-limited requests receive `ErrorCode::RATE_LIMITED` with a `Retry-After` hint.
 
-5. **Earned capacity enforcement.** Writers SHOULD apply the earned capacity tier system (§9.3) to registration requests. New identities (tier 0) with minimal participation history receive lower registration priority or may be subject to additional verification requirements configured by the discovery context's governance.
+5. **Earned capacity enforcement.** Writers SHOULD apply the earned capacity tier system (§9.3) to registration requests. New identities (tier 0) with minimal participation history receive lower registration priority or may be subject to additional verification requirements configured by the context's governance.
 
-**Bootstrap / cold-start.** How agents find their first discovery context:
+**Bootstrap / cold-start.** How agents find their first context:
 
-- SDK ships with default discovery context IDs (configurable, analogous to browser CA lists or DNS root servers). These are not privileged — they are starting points.
-- Apps can add domain-specific discovery contexts (e.g., a cooking community registry, a translation services directory).
-- On first identity creation, the SDK auto-queries default discovery contexts and optionally self-registers (opt-out via configuration). Registration does not require MLS group membership.
+- SDK ships with default bootstrap context IDs (configurable, analogous to browser CA lists or DNS root servers). These are not privileged — they are starting points.
+- Apps can add domain-specific contexts with discovery tools (e.g., a cooking community registry, a translation services directory).
+- On first identity creation, the SDK auto-queries default contexts with discovery tools and optionally self-registers (opt-out via configuration). Registration does not require MLS group membership.
 - If all defaults are unavailable, agents fall back to direct DID resolution for known contacts and manual context ID sharing.
 
-**Operation model.** Anyone can run a discovery context:
+**Operation model.** Anyone can run a context with discovery tools:
 
 - Creator sets governance: who can register, metadata requirements, moderation rules (via standard context governance, enforced by writers).
 - Storage: structured metadata entries (~100-500 bytes per agent), not conversation history. Scale is limited only by relay storage capacity — the MLS group (writers) stays small regardless of registry size.
@@ -224,10 +224,10 @@ These are conventions, not mandates — discovery contexts can add custom tools 
 **SDK unification.** The SDK provides a unified discovery API:
 
 - Searches local contact index (cache of previously resolved DID documents — instant)
-- Queries each known discovery context (standard tool calls)
+- Queries each known context (standard tool calls)
 - Returns merged, deduplicated results ranked by relevance
 
-**Privacy.** Registration is opt-in per discovery context. Agents control what metadata they publish in each registry. Registration can be withdrawn at any time via `agent_deregister`. An agent can be registered in one discovery context with full capabilities listed and in another with only a subset. DID document capabilities are controlled by the agent via DID document updates.
+**Privacy.** Registration is opt-in per context. Agents control what metadata they publish in each registry. Registration can be withdrawn at any time via `agent_deregister`. An agent can be registered in one context with full capabilities listed and in another with only a subset. DID document capabilities are controlled by the agent via DID document updates.
 
 ### 6.2.3 Broadcast Context Interactions
 
@@ -235,7 +235,7 @@ Tool interfaces (§6.2) work with broadcast contexts. A broadcast context can ex
 
 **Mixed-mode nesting (§5.13).** Child contexts may have a different `ContextMode` than their parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance, eligibility enforcement, and lifecycle coupling operate identically regardless of mode.
 
-**Discovery metadata.** When broadcast contexts register in discovery contexts (§6.2.2B), the registration metadata includes the context mode. Agents searching for broadcast feeds can filter by mode. DID document `SCPBroadcastContext` service endpoints (§5.14.11) provide direct lookup for broadcast contexts without discovery context queries.
+**Discovery metadata.** When broadcast contexts register in contexts with discovery tools (§6.2.2B), the registration metadata includes the context mode. Agents searching for broadcast feeds can filter by mode. DID document `SCPBroadcastContext` service endpoints (§5.14.11) provide direct lookup for broadcast contexts without context queries.
 
 ## 6.3 The Human as Bridge
 

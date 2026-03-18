@@ -1805,10 +1805,10 @@ def handle_register(
     description: str | None = None,
     tags: list[str] | None = None,
 ) -> str:
-    """Register a handle in a discovery context.
+    """Register a handle in a context.
 
     Args:
-        discovery_context_id: ID of the discovery context.
+        discovery_context_id: ID of the context.
         handle: The handle string to register.
         target_json: JSON describing the target (identity or context).
         registrant_did: DID of the registrant.
@@ -1828,10 +1828,10 @@ def handle_lookup(
     handle: str,
     type_filter: str | None = None,
 ) -> str:
-    """Look up a handle in a discovery context.
+    """Look up a handle in a context.
 
     Args:
-        discovery_context_id: ID of the discovery context.
+        discovery_context_id: ID of the context.
         handle: The handle string to look up.
         type_filter: Optional filter: ``"identity"`` or ``"context"``.
 
@@ -1848,10 +1848,10 @@ def handle_deregister(
     handle: str,
     did: str,
 ) -> str:
-    """Deregister a handle from a discovery context.
+    """Deregister a handle from a context.
 
     Args:
-        discovery_context_id: ID of the discovery context.
+        discovery_context_id: ID of the context.
         handle: The handle string to deregister.
         did: DID of the registrant requesting deregistration.
 

@@ -365,7 +365,7 @@ Each test specifies:
 | **Layer** | Discovery |
 | **Tier** | Full |
 | **Spec Sections** | §22.3.1, §22.11 |
-| **Preconditions** | Discovery context exists with handle support. |
+| **Preconditions** | Context exists with handle support. |
 | **Steps** | 1. Register handle `alice` pointing to DID via `handle_register`. 2. Look up `alice` via `handle_lookup`. 3. Verify result contains the correct DID and metadata. 4. Attempt to register `alice` again from different DID — expect conflict. |
 | **Expected Outcome** | Registration succeeds. Lookup returns correct DID. Duplicate registration returns `conflict`. |
 
@@ -376,7 +376,7 @@ Each test specifies:
 | **Layer** | Discovery |
 | **Tier** | Full |
 | **Spec Sections** | §6.2.2B, §22.11 |
-| **Preconditions** | Discovery context exists. |
+| **Preconditions** | Context exists. |
 | **Steps** | 1. Register agent with capabilities `["scp:capability:translate/v1"]` via `agent_register`. 2. Search with `capability_filter: ["scp:capability:translate/v1"]` via `agent_search`. 3. Verify result includes the registered agent. 4. Deregister via `agent_deregister`. 5. Search again — agent absent. |
 | **Expected Outcome** | Registration and search work. Deregistration removes agent from search results. |
 

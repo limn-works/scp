@@ -43,7 +43,7 @@ describe("DiscoveryResult type (§22.2.1)", () => {
     expect(result.resolutionPath.resolvedAt).toBe(1700000000);
   });
 
-  it("accepts DiscoveryContextVerified trust level for discovery context source", () => {
+  it("accepts DiscoveryContextVerified trust level for context source", () => {
     const result: DiscoveryResult = {
       contextId: "ctx456",
       relayUrls: ["wss://relay.example.com"],

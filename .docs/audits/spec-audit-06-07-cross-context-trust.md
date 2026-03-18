@@ -84,14 +84,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Why it matters**: Without a normative schema, DID document capabilities are unparseable by conformant implementations. The conflict between freeform strings (example) and structured URIs (Section 7.3.4.1) creates ambiguity about what values are valid.
 - **Severity**: MEDIUM
 
-### [6.2.2B] Discovery Context Standard Tool Schemas -- No Error Responses
+### [6.2.2B] Standard Tool Schemas -- No Error Responses
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 6.2.2B (lines 88-101)
 - **What's missing**: The standard discovery tool schemas (`agent_search`, `agent_register`, `agent_deregister`) define input and output for success cases only. What does the response look like when: search finds no results? Registration is rejected by governance? The DID is already registered? The DID to deregister is not found? The caller lacks write permission? Rate limit exceeded? What error codes are returned?
 - **Why it matters**: Without specified error responses, SDK implementations will return different error structures, making cross-SDK discovery interoperability fragile.
 - **Severity**: MEDIUM
 
-### [6.2.2B] Discovery Context Writer Tier Bound -- "~500" is Not a Specification
+### [6.2.2B] Writer Tier Bound -- "~500" is Not a Specification
 - **Category**: Vague requirements
 - **Location**: Section 6.2.2B (line 106)
 - **What's missing**: "bounded at ~500 members" -- the tilde makes this aspirational. Is 500 a MUST, a SHOULD, or an observation? Is this per-implementation? Is there a formal maximum that prevents exceeding it? What error is returned if a 501st writer tries to join?
@@ -108,8 +108,8 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2.2B] Registry Entry Size and Count Limits
 - **Category**: Missing constants/defaults
 - **Location**: Section 6.2.2B (lines 119-123)
-- **What's missing**: "structured metadata entries (~100-500 bytes per agent)" -- no normative maximum. How many entries can a single discovery context hold? How many capabilities per entry? Maximum description length? Maximum tag count and tag length? Without limits, a single agent could register with megabytes of metadata, or a coordinated attack could fill a registry to exhaustion.
-- **Why it matters**: Storage exhaustion is a DoS vector for discovery contexts.
+- **What's missing**: "structured metadata entries (~100-500 bytes per agent)" -- no normative maximum. How many entries can a single context hold? How many capabilities per entry? Maximum description length? Maximum tag count and tag length? Without limits, a single agent could register with megabytes of metadata, or a coordinated attack could fill a registry to exhaustion.
+- **Why it matters**: Storage exhaustion is a DoS vector for contexts with discovery tools.
 - **Severity**: MEDIUM
 
 ### [6.2.2B] Inclusion Proof Format
@@ -122,8 +122,8 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2.2B] Bootstrap Context IDs Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 6.2.2B (line 114)
-- **What's missing**: "SDK ships with default discovery context IDs (configurable)." No actual context IDs are specified. No governance model for the default list. No update mechanism for the defaults. No signature over the default list to prevent tampering. The analogy to "browser CA lists or DNS root servers" is appropriate -- but those systems have extensive governance around their default lists. SCP has none specified.
-- **Why it matters**: The bootstrap discovery contexts are the protocol's cold-start mechanism. Without governance, an SDK could ship with malicious defaults that direct all new users to attacker-controlled registries.
+- **What's missing**: "SDK ships with default bootstrap context IDs (configurable)." No actual context IDs are specified. No governance model for the default list. No update mechanism for the defaults. No signature over the default list to prevent tampering. The analogy to "browser CA lists or DNS root servers" is appropriate -- but those systems have extensive governance around their default lists. SCP has none specified.
+- **Why it matters**: The bootstrap contexts with discovery tools are the protocol's cold-start mechanism. Without governance, an SDK could ship with malicious defaults that direct all new users to attacker-controlled registries.
 - **Severity**: MEDIUM
 
 ### [6.2.3] Mixed-Mode Nesting Security Properties Not Analyzed

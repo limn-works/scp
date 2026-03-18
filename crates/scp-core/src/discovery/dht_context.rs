@@ -66,9 +66,9 @@ pub enum ContextDiscoverySource {
     DhtDidDocument,
     /// Discovered via `.well-known/scp` document.
     WellKnown,
-    /// Discovered via a discovery context's `agent_search` tool.
+    /// Discovered via the `agent_search` tool in a context with discovery tools.
     DiscoveryContext {
-        /// The discovery context ID.
+        /// The context ID.
         context_id: String,
     },
     /// Discovered via an `scp://` URI shared out-of-band.

@@ -419,9 +419,9 @@ export interface HandleDeregisterResult {
 }
 
 /**
- * Registers a handle in a discovery context.
+ * Registers a handle in a context with discovery tools.
  *
- * @param discoveryContextId - ID of the discovery context.
+ * @param discoveryContextId - ID of the context.
  * @param handle - The handle string to register.
  * @param targetJson - JSON describing the target (`{ "type": "identity", "did": "..." }` or `{ "type": "context", "context_id": "...", "relay_urls": [...] }`).
  * @param registrantDid - DID of the registrant.
@@ -453,9 +453,9 @@ export async function handleRegister(
 }
 
 /**
- * Looks up a handle in a discovery context.
+ * Looks up a handle in a context with discovery tools.
  *
- * @param discoveryContextId - ID of the discovery context.
+ * @param discoveryContextId - ID of the context.
  * @param handle - The handle string to look up.
  * @param typeFilter - Optional filter: `"identity"` or `"context"`.
  * @returns Lookup result with a `results` array of matching entries.
@@ -475,9 +475,9 @@ export async function handleLookup(
 }
 
 /**
- * Deregisters a handle from a discovery context.
+ * Deregisters a handle from a context with discovery tools.
  *
- * @param discoveryContextId - ID of the discovery context.
+ * @param discoveryContextId - ID of the context.
  * @param handle - The handle string to deregister.
  * @param did - DID of the registrant requesting deregistration.
  * @returns Deregistration result with a `removed` boolean.
@@ -630,7 +630,7 @@ export async function scopeDeregister(
  * @param ownerDid - DID of the identity whose petname map to consult.
  * @param address - The address string to resolve (e.g., `"alice@cooking-community"`).
  * @param knownContextsJson - Optional JSON object mapping context IDs to names.
- *   If omitted, uses all registered discovery contexts.
+ *   If omitted, uses all registered contexts with discovery tools.
  * @returns Typed address resolution results.
  * @throws {ValidationError} If `ownerDid` is empty or address parsing fails.
  */

@@ -40,7 +40,7 @@ pub const fn map_discovery_source(
         ),
         // §22.7: An scp:// URI is shared out-of-band, so the trust level is
         // `DirectExchange` and the resolution layer is `"Domain"` (closest match
-        // for URI-based resolution — no discovery context is involved).
+        // for URI-based resolution — no context is involved).
         ContextDiscoverySource::ContextUri => (
             "context_uri",
             "DirectExchange",

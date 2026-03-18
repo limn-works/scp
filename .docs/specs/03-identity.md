@@ -105,7 +105,7 @@ Properties of identity attestations:
 - **User-initiated.** Only the human creates attestations for their own identities. No third party can assert a link on someone's behalf.
 - **Independently verifiable.** Any participant can verify the attestation without relying on a central authority. Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.).
 - **Revocable.** Users can revoke attestations at any time, severing the link.
-- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through discovery contexts (§6.2.2B) and DID document capability entries (§7.4.1). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in discovery contexts (§22.5).
+- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery tools (§6.2.2B) and DID document capability entries (§7.4.1). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in contexts with discovery tools (§22.5).
 
 Identity attestations enable three critical flows:
 
@@ -835,7 +835,7 @@ SCP identities can authenticate to services outside the protocol. A relying part
 
 This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The DID document is the identity provider, self-certified via BEP44 signatures on the DHT.
 
-**Relationship to existing DID-auth patterns.** SCP already uses DID-signed requests internally for discovery context reader authentication (§6.2.2B) and handle tool requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
+**Relationship to existing DID-auth patterns.** SCP already uses DID-signed requests internally for context reader authentication (§6.2.2B) and handle tool requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
 
 ### 3.11.1 Protocol Overview
 

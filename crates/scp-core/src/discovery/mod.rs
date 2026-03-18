@@ -5,13 +5,13 @@
 //!
 //! 1. **DID document capabilities** -- Direct lookup via `did:dht`. Any agent
 //!    can publish capabilities in their DID document's `SCPCapabilities` service
-//!    entry. Zero setup, zero registration, zero dependency on discovery contexts.
+//!    entry. Zero setup, zero registration, zero dependency on contexts with discovery tools.
 //!
-//! 2. **Discovery contexts** -- Searchable registries operated as standard SCP
+//! 2. **Contexts with discovery tools** -- Searchable registries operated as standard SCP
 //!    contexts with open join policies and standardized tool schemas.
 //!
 //! 3. **Human-readable addressing** (§22) -- Resolution layer mapping human-
-//!    readable strings to DIDs and context IDs via petnames, discovery context
+//!    readable strings to DIDs and context IDs via petnames, context
 //!    handles, attestation handles, and domain handles.
 //!
 //! # Modules
@@ -19,18 +19,18 @@
 //! - [`did_capabilities`] -- DID document capability resolution via `did:dht`.
 //! - [`dht_context`] -- DHT-based context discovery via DID document service endpoints (§5.14.11, §18.2.2).
 //! - [`addressing`] -- Address format types, trust levels, and unified resolution (§22).
-//! - [`handles`] -- Discovery context handle tools: register, lookup, deregister (§22.3).
+//! - [`handles`] -- Context handle tools: register, lookup, deregister (§22.3).
 //! - [`scope`] -- Scope tools: namespace-to-context registration (§22.3.5, ADR-043).
 //! - [`petnames`] -- Petname storage in identity private state (§22.4).
 //!
 //! # Types
 //!
 //! - [`CapabilityEntry`] -- Capabilities extracted from a DID document.
-//! - [`DiscoveryQuery`] -- Search query for discovery contexts.
+//! - [`DiscoveryQuery`] -- Search query for contexts with discovery tools.
 //! - [`DiscoveryResult`] -- Merged search results with provenance.
 //! - [`DiscoveryResultEntry`] -- A single result entry with relevance scoring.
-//! - [`RegistrationEntry`] -- A registered agent entry in a discovery context.
-//! - [`DiscoveryBootstrap`] -- Default discovery context configuration.
+//! - [`RegistrationEntry`] -- A registered agent entry in a context with discovery tools.
+//! - [`DiscoveryBootstrap`] -- Default context configuration.
 //! - [`DataProvenance`] -- Placeholder provenance metadata (replaced by SCP-070).
 //! - [`DiscoveryError`] -- Error type for discovery operations.
 //! - [`AddressResolver`] -- Multi-path address resolution (§22.8).
@@ -118,9 +118,9 @@ pub struct DataProvenance {
 // DiscoveryQuery
 // ---------------------------------------------------------------------------
 
-/// A search query for discovery contexts.
+/// A search query for contexts with discovery tools.
 ///
-/// Used to query discovery contexts for agents matching specific capabilities,
+/// Used to query contexts with discovery tools for agents matching specific capabilities,
 /// keywords, or history requirements. All fields are optional filters -- an
 /// empty query matches all entries.
 ///
@@ -133,7 +133,7 @@ pub struct DiscoveryQuery {
     /// Free-text keyword filter for metadata search.
     pub keywords: Option<Vec<String>>,
     /// Minimum participation history duration. Only agents with at least
-    /// this much history in discovery contexts are returned.
+    /// this much history in contexts with discovery tools are returned.
     pub min_history: Option<Duration>,
 }
 
@@ -144,14 +144,14 @@ pub struct DiscoveryQuery {
 /// Merged search results from one or more discovery sources.
 ///
 /// Contains deduplicated entries ranked by relevance, with provenance per
-/// entry and the list of discovery context sources that were queried.
+/// entry and the list of context sources that were queried.
 ///
 /// See ADR-020 acceptance criterion 1.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiscoveryResult {
     /// The discovery result entries, ranked by relevance score (descending).
     pub entries: Vec<DiscoveryResultEntry>,
-    /// The discovery context IDs that were queried to produce these results.
+    /// The context IDs that were queried to produce these results.
     pub sources: Vec<ContextId>,
 }
 
@@ -177,10 +177,10 @@ pub struct DiscoveryResultEntry {
 // RegistrationEntry
 // ---------------------------------------------------------------------------
 
-/// A registered agent entry in a discovery context.
+/// A registered agent entry in a context with discovery tools.
 ///
 /// Created when an agent registers via the `agent_register` tool schema.
-/// The entry is recorded in the discovery context's event log as an MLS
+/// The entry is recorded in the context's event log as an MLS
 /// application message.
 ///
 /// See ADR-020 acceptance criterion 1.
@@ -202,16 +202,16 @@ pub struct RegistrationEntry {
 // DiscoveryBootstrap
 // ---------------------------------------------------------------------------
 
-/// Default discovery context configuration for SDK bootstrap.
+/// Default context configuration for SDK bootstrap.
 ///
 /// Analogous to DNS root servers: the SDK ships with configurable default
-/// discovery context IDs that are queried on first identity creation (opt-out).
+/// bootstrap context IDs that are queried on first identity creation (opt-out).
 /// If defaults are unreachable, direct DID resolution still works.
 ///
 /// See ADR-020 acceptance criterion 8.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryBootstrap {
-    /// Default discovery context IDs to query on bootstrap.
+    /// Default bootstrap context IDs to query on bootstrap.
     pub default_context_ids: Vec<ContextId>,
 }
 

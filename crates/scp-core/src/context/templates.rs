@@ -495,7 +495,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
         },
-        // Discovery context: encrypted mode with messaging + tool invocation
+        // Context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
         // to bootstrap agent discovery via standardized tool schemas (ADR-020).
         TemplateId::DiscoveryContext => ContextParams {
