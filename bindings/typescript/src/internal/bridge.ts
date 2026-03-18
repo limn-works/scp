@@ -441,6 +441,19 @@ export interface Bridge {
   identityAttestDevice(did: string): Promise<string>;
   identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean>;
 
+  // Identity link attestation (§3.5.1)
+  identityCreateLinkAttestation(
+    did: string,
+    platform: string,
+    handle: string,
+    proof: string,
+    verificationMethod: string,
+    platformId: string | null,
+  ): Promise<string>;
+  identityLinkAttestations(did: string): string;
+  identityRemoveLinkAttestation(did: string, attestationId: string): boolean;
+  identityVerifyLinkAttestation(attestationJson: string): Promise<boolean>;
+
   // Recovery and custody migration (#632, spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
   identityExecuteCustodyMigration(

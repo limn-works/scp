@@ -935,6 +935,8 @@ pub struct IdentityEntry {
     pub custody: Arc<crate::custody::FfiKeyCustody>,
     /// The DID document for this identity.
     pub document: DidDocument,
+    /// Identity link attestations (§3.5.1). Stored locally per identity.
+    pub identity_link_attestations: Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
 /// Registers an identity in the global identity registry.
@@ -1460,6 +1462,7 @@ mod tests {
                 InMemoryKeyCustody::new(),
             )),
             document: test_did_document(did),
+            identity_link_attestations: Vec::new(),
         };
         register_identity(did, entry);
         let stats = registry_stats().unwrap();
@@ -1528,6 +1531,7 @@ mod tests {
                 InMemoryKeyCustody::new(),
             )),
             document: test_did_document(did),
+            identity_link_attestations: Vec::new(),
         };
         register_identity(did, entry);
         assert!(remove_identity_if_present(did));

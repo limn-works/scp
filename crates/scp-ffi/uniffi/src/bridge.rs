@@ -2387,6 +2387,290 @@ async fn identity_verify_device_attestation_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Free functions — identity link attestation (§3.5.1, §3.5.2)
+//
+// Uses a global DashMap to store attestations per DID. The Identity object
+// retains custody for signing; attestations are stored separately.
+// ---------------------------------------------------------------------------
+
+/// Global registry of identity link attestations, keyed by DID string.
+fn identity_link_attestation_registry()
+-> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
+{
+    static REGISTRY: std::sync::OnceLock<
+        dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Retained identity custody for attestation verification (keyed by DID).
+///
+/// Stores the custody and active signing key handle for identities that have
+/// created attestations, so that `identity_verify_link_attestation` can look
+/// up the issuer's public key without requiring the caller to pass the
+/// Identity object.
+#[cfg(feature = "allow_in_memory_custody")]
+fn identity_custody_registry()
+-> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
+    static REGISTRY: std::sync::OnceLock<
+        dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Creates an identity link attestation for an external platform identity.
+///
+/// See spec §3.5.1, §3.5.2.
+#[uniffi::export]
+pub async fn identity_create_link_attestation(
+    identity: Arc<Identity>,
+    platform: String,
+    handle: String,
+    proof: String,
+    verification_method: String,
+    platform_id: Option<String>,
+) -> Result<String, ScpError> {
+    identity_create_link_attestation_impl(
+        identity,
+        platform,
+        handle,
+        proof,
+        verification_method,
+        platform_id,
+    )
+    .await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn identity_create_link_attestation_impl(
+    identity: Arc<Identity>,
+    platform: String,
+    handle: String,
+    proof: String,
+    verification_method: String,
+    platform_id: Option<String>,
+) -> Result<String, ScpError> {
+    use std::borrow::Cow;
+
+    use scp_core::identity::attestation::{
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+    };
+    use scp_identity::DID;
+    use scp_platform::traits::KeyCustody;
+
+    let method = match verification_method.as_str() {
+        "oauth" => VerificationMethod::Oauth,
+        "signed_post" => VerificationMethod::SignedPost,
+        "dns_record" => VerificationMethod::DnsRecord,
+        "challenge_response" => VerificationMethod::ChallengeResponse,
+        other => {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "invalid verification method: {other}; expected 'oauth', \
+                     'signed_post', 'dns_record', or 'challenge_response'"
+                ),
+                code: "SCP-IDENT-1040".to_owned(),
+            });
+        }
+    };
+
+    let core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity link attestation requires retained identity state".to_owned(),
+            code: "SCP-IDENT-1040".to_owned(),
+        })?;
+    let custody = identity
+        .in_memory_custody
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity link attestation requires in-memory custody".to_owned(),
+            code: "SCP-IDENT-1040".to_owned(),
+        })?;
+
+    let did_str = identity.did.clone();
+    let issuer = DID::from(did_str.as_str());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = d.as_millis() as u64;
+            ms
+        })
+        .unwrap_or(0);
+
+    let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_ms);
+
+    let mut attestation = IdentityLinkAttestation {
+        id,
+        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+        issuer: issuer.clone(),
+        subject: issuer,
+        issued_at: now_ms,
+        expires_at: None,
+        claim: AttestationClaim::new(platform, handle, platform_id),
+        evidence: AttestationEvidence {
+            method,
+            proof,
+            verified_at: now_ms,
+            verifier_did: None,
+        },
+        revocation: AttestationRevocation::new("/revocations".to_owned()),
+        signature: Vec::new(),
+    };
+
+    let canonical = attestation
+        .canonical_signing_bytes()
+        .map_err(|e| ScpError::Identity {
+            msg: format!("attestation signing failed: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })?;
+
+    let active_key = core_id.active_signing_key;
+    let custody_clone = Arc::clone(custody);
+
+    let sig = runtime()
+        .spawn(async move { custody_clone.0.sign(&active_key, &canonical).await })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio join error: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })?
+        .map_err(|e| ScpError::Identity {
+            msg: format!("Ed25519 signing failed: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })?;
+    attestation.signature = sig.as_bytes().to_vec();
+
+    // Store custody for later verification lookups.
+    identity_custody_registry().insert(
+        identity.did.clone(),
+        (Arc::clone(custody), core_id.active_signing_key),
+    );
+
+    identity_link_attestation_registry()
+        .entry(did_str)
+        .or_default()
+        .push(attestation.clone());
+
+    serde_json::to_string(&attestation).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize attestation: {e}"),
+        code: "SCP-IDENT-1042".to_owned(),
+    })
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn identity_create_link_attestation_impl(
+    _identity: Arc<Identity>,
+    _platform: String,
+    _handle: String,
+    _proof: String,
+    _verification_method: String,
+    _platform_id: Option<String>,
+) -> Result<String, ScpError> {
+    Err(ScpError::Identity {
+        msg: "identity link attestation requires in-memory custody — enable the \
+              \"allow_in_memory_custody\" feature"
+            .to_owned(),
+        code: "SCP-IDENT-1040".to_owned(),
+    })
+}
+
+/// Lists all identity link attestations for an identity.
+///
+/// See spec §3.5.1.
+#[uniffi::export]
+pub fn identity_link_attestations(did: String) -> Result<String, ScpError> {
+    let attestations = identity_link_attestation_registry()
+        .get(&did)
+        .map(|v| v.value().clone())
+        .unwrap_or_default();
+    serde_json::to_string(&attestations).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize attestations: {e}"),
+        code: "SCP-IDENT-1043".to_owned(),
+    })
+}
+
+/// Removes an identity link attestation by its ID.
+///
+/// Returns `true` if the attestation was found and removed.
+///
+/// See spec §3.5.1.
+#[must_use]
+#[uniffi::export]
+pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> bool {
+    let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
+        return false;
+    };
+    let before = entry.len();
+    entry.retain(|a| a.id != attestation_id);
+    entry.len() < before
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// See spec §3.5.1.
+#[uniffi::export]
+pub async fn identity_verify_link_attestation(attestation_json: String) -> Result<bool, ScpError> {
+    identity_verify_link_attestation_impl(attestation_json).await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn identity_verify_link_attestation_impl(attestation_json: String) -> Result<bool, ScpError> {
+    use scp_core::identity::attestation::IdentityLinkAttestation;
+    use scp_platform::traits::KeyCustody;
+
+    let attestation: IdentityLinkAttestation =
+        serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
+            msg: format!("failed to parse attestation JSON: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        })?;
+
+    let issuer_did = attestation.issuer.to_string();
+
+    // Look up the issuer's custody from the identity custody registry.
+    let entry = identity_custody_registry()
+        .get(&issuer_did)
+        .ok_or_else(|| ScpError::Identity {
+            msg: format!(
+                "issuer identity '{issuer_did}' not found — verify requires the issuer \
+                 to have created an attestation via identity_create_link_attestation"
+            ),
+            code: "SCP-IDENT-1044".to_owned(),
+        })?;
+    let (custody, active_key) = entry.value().clone();
+
+    let pub_key = runtime()
+        .spawn(async move { custody.0.public_key(&active_key).await })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio join error: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        })?
+        .map_err(|e| ScpError::Identity {
+            msg: format!("failed to get public key: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        })?;
+    Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn identity_verify_link_attestation_impl(
+    _attestation_json: String,
+) -> Result<bool, ScpError> {
+    Err(ScpError::Identity {
+        msg: "identity link attestation verification requires in-memory custody — enable the \
+              \"allow_in_memory_custody\" feature"
+            .to_owned(),
+        code: "SCP-IDENT-1044".to_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Free functions — context lifecycle operations
 //
 // See ADR-021 acceptance criterion 3.
