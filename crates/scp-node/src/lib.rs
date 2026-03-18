@@ -426,7 +426,7 @@ impl<S: Storage> ApplicationNode<S> {
             projection,
             bridge,
             bridge_webhook,
-            self.state.acme_challenges.as_ref(),
+            &self.state,
         )
     }
 
@@ -690,6 +690,12 @@ impl<S: Storage> ApplicationNode<S> {
                 .map_err(NodeError::InvalidConfig)?;
         }
 
+        // Track the old hostname (if any) so we can remove it from the
+        // hostname index when updating to a new hostname.
+        let old_hostname = registry
+            .get(&routing_id)
+            .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
+
         if let Some(existing) = registry.get_mut(&routing_id) {
             existing.insert_key(broadcast_key);
             existing.admission = admission;
@@ -711,7 +717,28 @@ impl<S: Storage> ApplicationNode<S> {
             }
             registry.insert(routing_id, projected);
         }
+
+        // Extract the new hostname after mutation (if any).
+        let new_hostname = registry
+            .get(&routing_id)
+            .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
+
         drop(registry);
+
+        // Update the hostname index outside the projected_contexts lock to
+        // avoid holding two write locks simultaneously.
+        if old_hostname != new_hostname {
+            let mut index = self.state.hostname_index.write().await;
+            if let Some(ref old) = old_hostname {
+                index.remove(old);
+            }
+            if let Some(ref new) = new_hostname
+                && !new.is_empty()
+            {
+                index.insert(new.clone(), routing_id);
+            }
+        }
+
         Ok(())
     }
 
@@ -725,7 +752,17 @@ impl<S: Storage> ApplicationNode<S> {
     pub async fn disable_broadcast_projection(&self, context_id: &str) {
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
+        // Extract hostname before removal so we can clean up the index.
+        let hostname = registry
+            .get(&routing_id)
+            .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
         registry.remove(&routing_id);
+        drop(registry);
+
+        if let Some(hostname) = hostname {
+            let mut index = self.state.hostname_index.write().await;
+            index.remove(&hostname);
+        }
     }
 
     /// Updates the cached member public keys for a projected context.
@@ -3240,6 +3277,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         connection_tracker,
         subscription_registry,
         acme_challenges,
+        hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
     });
@@ -3374,6 +3412,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         connection_tracker,
         subscription_registry,
         acme_challenges: None,
+        hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
     });
