@@ -826,11 +826,11 @@ async fn sybil_resistance_evaluation() {
     let casual = ContextSybilPolicy::casual();
     let empty =
         IdentityDepthAssessment::new(did("did:dht:z6MkEmpty"), HashMap::new(), current_time);
-    assert!(evaluate_sybil_resistance(&empty, &casual, current_time).is_ok());
+    assert!(evaluate_sybil_resistance(&empty, &casual, current_time, None).is_ok());
 
     // Standard policy: fails with no signals (min_signal_breadth = 1).
     let standard = ContextSybilPolicy::standard();
-    let err = evaluate_sybil_resistance(&empty, &standard, current_time).unwrap_err();
+    let err = evaluate_sybil_resistance(&empty, &standard, current_time, None).unwrap_err();
     assert!(
         matches!(
             err,
@@ -850,11 +850,11 @@ async fn sybil_resistance_evaluation() {
         ),
     );
     let adequate = IdentityDepthAssessment::new(did("did:dht:z6MkAdequate"), signals, current_time);
-    assert!(evaluate_sybil_resistance(&adequate, &standard, current_time).is_ok());
+    assert!(evaluate_sybil_resistance(&adequate, &standard, current_time, None).is_ok());
 
     // High-trust policy: requires 3+ categories + specific signals.
     let high = ContextSybilPolicy::high_trust();
-    let err2 = evaluate_sybil_resistance(&adequate, &high, current_time).unwrap_err();
+    let err2 = evaluate_sybil_resistance(&adequate, &high, current_time, None).unwrap_err();
     assert!(
         matches!(
             err2,
@@ -868,7 +868,8 @@ async fn sybil_resistance_evaluation() {
         require_device_attestation: true,
         ..ContextSybilPolicy::casual()
     };
-    let err3 = evaluate_sybil_resistance(&adequate, &device_required, current_time).unwrap_err();
+    let err3 =
+        evaluate_sybil_resistance(&adequate, &device_required, current_time, None).unwrap_err();
     assert!(matches!(
         err3,
         scp_core::trust::sybil::SybilResistanceError::DeviceAttestationRequired
