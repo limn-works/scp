@@ -39,7 +39,7 @@ export { scpidChallenge, scpidSign, scpidVerify } from "./auth";
 // Identity
 // ---------------------------------------------------------------------------
 
-export type { CustodyType } from "./identity";
+export type { CustodyType, IdentityLinkAttestation } from "./identity";
 export { Identity } from "./identity";
 
 // ---------------------------------------------------------------------------

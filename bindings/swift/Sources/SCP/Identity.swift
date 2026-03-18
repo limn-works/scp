@@ -190,6 +190,54 @@ public enum IdentityBridge {
     public static let defaultExecuteCustodyMigration: ExecuteCustodyMigrationFn = { did, target, contextIds in
         try await identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
     }
+
+    // MARK: Identity Link Attestation (§3.5.1)
+
+    /// Create an identity link attestation.
+    public typealias CreateLinkAttestationFn = @Sendable (
+        _ identity: Identity,
+        _ platform: String,
+        _ handle: String,
+        _ proof: String,
+        _ verificationMethod: String,
+        _ platformId: String?
+    ) async throws -> String
+
+    /// List identity link attestations.
+    public typealias LinkAttestationsFn = @Sendable (
+        _ did: String
+    ) throws -> String
+
+    /// Remove an identity link attestation.
+    public typealias RemoveLinkAttestationFn = @Sendable (
+        _ did: String,
+        _ attestationId: String
+    ) -> Bool
+
+    /// Verify an identity link attestation.
+    public typealias VerifyLinkAttestationFn = @Sendable (
+        _ attestationJson: String
+    ) async throws -> Bool
+
+    /// Default create link attestation — delegates to UniFFI.
+    public static let defaultCreateLinkAttestation: CreateLinkAttestationFn = { identity, platform, handle, proof, method, platformId in
+        try await identityCreateLinkAttestation(identity: identity, platform: platform, handle: handle, proof: proof, verificationMethod: method, platformId: platformId)
+    }
+
+    /// Default link attestations — delegates to UniFFI.
+    public static let defaultLinkAttestations: LinkAttestationsFn = { did in
+        try identityLinkAttestations(did: did)
+    }
+
+    /// Default remove link attestation — delegates to UniFFI.
+    public static let defaultRemoveLinkAttestation: RemoveLinkAttestationFn = { did, attestationId in
+        identityRemoveLinkAttestation(did: did, attestationId: attestationId)
+    }
+
+    /// Default verify link attestation — delegates to UniFFI.
+    public static let defaultVerifyLinkAttestation: VerifyLinkAttestationFn = { json in
+        try await identityVerifyLinkAttestation(attestationJson: json)
+    }
 }
 
 // MARK: - Public API
@@ -523,4 +571,92 @@ public func executeCustodyMigration(
         IdentityBridge.defaultExecuteCustodyMigration
 ) async throws -> String {
     try await executeCustodyMigrationFn(did, target, contextIds)
+}
+
+// MARK: - Identity Link Attestation (§3.5.1)
+
+/// Creates an identity link attestation for an external platform identity.
+///
+/// - Parameters:
+///   - identity: The identity to attest.
+///   - platform: Platform identifier (e.g., `"github.com"`).
+///   - handle: Handle on the platform (e.g., `"@alice"`).
+///   - proof: Method-specific proof data.
+///   - verificationMethod: One of `"oauth"`, `"signed_post"`, `"dns_record"`,
+///     or `"challenge_response"`.
+///   - platformId: Optional immutable platform user ID.
+///   - createLinkAttestationFn: Bridge function override for testing.
+/// - Returns: JSON string of the created attestation.
+/// - Throws: ``ScpError/Identity(msg:code:)`` if signing fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5.1 (Identity Link Attestation)
+public func createIdentityLinkAttestation(
+    identity: Identity,
+    platform: String,
+    handle: String,
+    proof: String,
+    verificationMethod: String = "oauth",
+    platformId: String? = nil,
+    createLinkAttestationFn: IdentityBridge.CreateLinkAttestationFn =
+        IdentityBridge.defaultCreateLinkAttestation
+) async throws -> String {
+    try await createLinkAttestationFn(identity, platform, handle, proof, verificationMethod, platformId)
+}
+
+/// Lists all identity link attestations for a DID.
+///
+/// - Parameters:
+///   - did: The DID string.
+///   - linkAttestationsFn: Bridge function override for testing.
+/// - Returns: JSON array string of attestation objects.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5.1 (Identity Link Attestation)
+public func identityLinkAttestationsList(
+    did: String,
+    linkAttestationsFn: IdentityBridge.LinkAttestationsFn =
+        IdentityBridge.defaultLinkAttestations
+) throws -> String {
+    try linkAttestationsFn(did)
+}
+
+/// Removes an identity link attestation by its ID.
+///
+/// - Parameters:
+///   - did: The DID string.
+///   - attestationId: The deterministic attestation ID to remove.
+///   - removeLinkAttestationFn: Bridge function override for testing.
+/// - Returns: `true` if found and removed.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5.1 (Identity Link Attestation)
+public func removeIdentityLinkAttestation(
+    did: String,
+    attestationId: String,
+    removeLinkAttestationFn: IdentityBridge.RemoveLinkAttestationFn =
+        IdentityBridge.defaultRemoveLinkAttestation
+) -> Bool {
+    removeLinkAttestationFn(did, attestationId)
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// - Parameters:
+///   - attestationJson: JSON string of the attestation.
+///   - verifyLinkAttestationFn: Bridge function override for testing.
+/// - Returns: `true` if the signature is valid.
+///
+/// ## Provenance
+///
+/// - Spec section 3.5.1 (Identity Link Attestation)
+public func verifyIdentityLinkAttestation(
+    attestationJson: String,
+    verifyLinkAttestationFn: IdentityBridge.VerifyLinkAttestationFn =
+        IdentityBridge.defaultVerifyLinkAttestation
+) async throws -> Bool {
+    try await verifyLinkAttestationFn(attestationJson)
 }

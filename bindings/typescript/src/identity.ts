@@ -14,6 +14,45 @@ import { getBridge } from "./internal/bridge";
 import type { DIDDocument } from "./types";
 
 // ---------------------------------------------------------------------------
+// IdentityLinkAttestation
+// ---------------------------------------------------------------------------
+
+/** An identity link attestation proving ownership of an external platform identity (§3.5.1). */
+export interface IdentityLinkAttestation {
+  /** Deterministic attestation ID. */
+  id: string;
+  /** Always `"identity_link"`. */
+  type: string;
+  /** The DID that issued this attestation. */
+  issuer: string;
+  /** Same as issuer for self-attestations. */
+  subject: string;
+  /** Unix timestamp (ms) when created. */
+  issued_at: number;
+  /** Platform identity claim. */
+  claim: {
+    platform: string;
+    platform_handle: string;
+    platform_id?: string;
+    link_type: string;
+  };
+  /** Evidence supporting the claim. */
+  evidence: {
+    method: string;
+    proof: string;
+    verified_at: number;
+    verifier_did?: string;
+  };
+  /** Revocation metadata. */
+  revocation: {
+    method: string;
+    endpoint: string;
+  };
+  /** Ed25519 signature bytes. */
+  signature: number[];
+}
+
+// ---------------------------------------------------------------------------
 // CustodyType
 // ---------------------------------------------------------------------------
 
@@ -297,6 +336,90 @@ export class Identity {
       const bridge = await getBridge();
       const json = await bridge.identityExecuteCustodyMigration(this.did, target, contextIds);
       return JSON.parse(json);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // -- Identity link attestation (§3.5.1) ---------------------------------
+
+  /**
+   * Creates an identity link attestation for an external platform identity.
+   *
+   * @param options - Attestation creation options.
+   * @param options.platform - Platform identifier (e.g., `"github.com"`).
+   * @param options.handle - Handle on the platform (e.g., `"@alice"`).
+   * @param options.proof - Method-specific proof data.
+   * @param options.verificationMethod - One of `"oauth"`, `"signed_post"`, `"dns_record"`, `"challenge_response"`.
+   * @param options.platformId - Optional immutable platform user ID.
+   * @returns The created attestation.
+   * @throws {IdentityError} If signing fails.
+   */
+  async createAttestation(options: {
+    platform: string;
+    handle: string;
+    proof: string;
+    verificationMethod?: "oauth" | "signed_post" | "dns_record" | "challenge_response";
+    platformId?: string;
+  }): Promise<IdentityLinkAttestation> {
+    try {
+      const bridge = await getBridge();
+      const json = await bridge.identityCreateLinkAttestation(
+        this.did,
+        options.platform,
+        options.handle,
+        options.proof,
+        options.verificationMethod ?? "oauth",
+        options.platformId ?? null,
+      );
+      return JSON.parse(json);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Lists all identity link attestations for this identity.
+   *
+   * @returns Array of attestation objects.
+   */
+  async attestations(): Promise<IdentityLinkAttestation[]> {
+    try {
+      const bridge = await getBridge();
+      const json = bridge.identityLinkAttestations(this.did);
+      return JSON.parse(json);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Removes an identity link attestation by its ID.
+   *
+   * @param attestationId - The deterministic attestation ID to remove.
+   * @returns `true` if found and removed, `false` otherwise.
+   */
+  async removeAttestation(attestationId: string): Promise<boolean> {
+    try {
+      const bridge = await getBridge();
+      return bridge.identityRemoveLinkAttestation(this.did, attestationId);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Verifies the Ed25519 signature on an identity link attestation.
+   *
+   * @param attestation - The attestation to verify (or its JSON string).
+   * @returns `true` if the signature is valid.
+   * @throws {IdentityError} If the issuer's identity is not available.
+   */
+  static async verifyAttestation(attestation: IdentityLinkAttestation | string): Promise<boolean> {
+    try {
+      const bridge = await getBridge();
+      const json = typeof attestation === "string" ? attestation : JSON.stringify(attestation);
+      return await bridge.identityVerifyLinkAttestation(json);
     } catch (error) {
       throw mapBridgeError(error);
     }

@@ -425,7 +425,13 @@ impl IdentityLinkAttestation {
     ///
     /// This method is deterministic: identical attestation data always produces
     /// identical bytes, regardless of serde field ordering.
-    fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AttestationSignatureError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationSignatureError::SerializationFailed`] if any
+    /// sub-struct (`claim`, `evidence`, `revocation`) cannot be serialized
+    /// to `MessagePack`.
+    pub fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AttestationSignatureError> {
         use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
         let claim_bytes = rmp_serde::to_vec_named(&self.claim).map_err(|e| {

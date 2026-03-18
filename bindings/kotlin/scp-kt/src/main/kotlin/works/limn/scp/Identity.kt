@@ -118,6 +118,56 @@ interface IdentityAdvancedBindings {
         target: String,
         contextIds: List<String>,
     ): String
+
+    // Identity link attestation (§3.5.1)
+
+    /**
+     * Creates an identity link attestation for an external platform identity.
+     *
+     * @param identityHandle Handle from identity create.
+     * @param platform Platform identifier (e.g., "github.com").
+     * @param handle Handle on the platform.
+     * @param proof Method-specific proof data.
+     * @param verificationMethod One of "oauth", "signed_post", "dns_record", "challenge_response".
+     * @param platformId Optional immutable platform user ID.
+     * @return JSON string of the created attestation.
+     */
+    fun identityCreateLinkAttestation(
+        identityHandle: Long,
+        platform: String,
+        handle: String,
+        proof: String,
+        verificationMethod: String,
+        platformId: String?,
+    ): String
+
+    /**
+     * Lists all identity link attestations for a DID.
+     *
+     * @param did The DID string.
+     * @return JSON array string of attestation objects.
+     */
+    fun identityLinkAttestations(did: String): String
+
+    /**
+     * Removes an identity link attestation by its ID.
+     *
+     * @param did The DID string.
+     * @param attestationId The deterministic attestation ID.
+     * @return true if found and removed.
+     */
+    fun identityRemoveLinkAttestation(
+        did: String,
+        attestationId: String,
+    ): Boolean
+
+    /**
+     * Verifies the Ed25519 signature on an identity link attestation.
+     *
+     * @param attestationJson JSON string of the attestation.
+     * @return true if valid.
+     */
+    fun identityVerifyLinkAttestation(attestationJson: String): Boolean
 }
 
 /**
@@ -254,4 +304,67 @@ class IdentityAdvancedBridge internal constructor(
         bridge.ffiCall {
             bindings.identityExecuteCustodyMigration(did, target, contextIds)
         }
+
+    // Identity link attestation (§3.5.1)
+
+    /**
+     * Creates an identity link attestation for an external platform identity.
+     *
+     * @param identityHandle Handle from identity create.
+     * @param platform Platform identifier (e.g., "github.com").
+     * @param handle Handle on the platform (e.g., "@alice").
+     * @param proof Method-specific proof data.
+     * @param verificationMethod One of "oauth", "signed_post", "dns_record", "challenge_response".
+     * @param platformId Optional immutable platform user ID.
+     * @return JSON string of the created attestation.
+     */
+    suspend fun createLinkAttestation(
+        identityHandle: Long,
+        platform: String,
+        handle: String,
+        proof: String,
+        verificationMethod: String = "oauth",
+        platformId: String? = null,
+    ): String =
+        bridge.ffiCall {
+            bindings.identityCreateLinkAttestation(
+                identityHandle,
+                platform,
+                handle,
+                proof,
+                verificationMethod,
+                platformId,
+            )
+        }
+
+    /**
+     * Lists all identity link attestations for a DID.
+     *
+     * @param did The DID string.
+     * @return JSON array string of attestation objects.
+     */
+    suspend fun linkAttestations(did: String): String =
+        bridge.ffiCall { bindings.identityLinkAttestations(did) }
+
+    /**
+     * Removes an identity link attestation by its ID.
+     *
+     * @param did The DID string.
+     * @param attestationId The deterministic attestation ID.
+     * @return true if found and removed.
+     */
+    suspend fun removeLinkAttestation(
+        did: String,
+        attestationId: String,
+    ): Boolean =
+        bridge.ffiCall { bindings.identityRemoveLinkAttestation(did, attestationId) }
+
+    /**
+     * Verifies the Ed25519 signature on an identity link attestation.
+     *
+     * @param attestationJson JSON string of the attestation.
+     * @return true if valid.
+     */
+    suspend fun verifyLinkAttestation(attestationJson: String): Boolean =
+        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson) }
 }

@@ -1178,6 +1178,7 @@ mod tests {
                 identity: identity_a,
                 custody: Arc::clone(&custody_a),
                 document: doc_a,
+                identity_link_attestations: Vec::new(),
             },
         );
         runtime::register_identity(
@@ -1186,6 +1187,7 @@ mod tests {
                 identity: identity_b,
                 custody: Arc::clone(&custody_b),
                 document: doc_b,
+                identity_link_attestations: Vec::new(),
             },
         );
 
@@ -1256,6 +1258,7 @@ mod tests {
                 identity,
                 custody: Arc::clone(&custody),
                 document: doc,
+                identity_link_attestations: Vec::new(),
             },
         );
 
@@ -1303,6 +1306,7 @@ mod tests {
                 identity,
                 custody: Arc::clone(&custody),
                 document: doc,
+                identity_link_attestations: Vec::new(),
             },
         );
 

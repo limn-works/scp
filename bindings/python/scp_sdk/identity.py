@@ -470,6 +470,82 @@ class Identity:
         )
         return json.loads(result_json)
 
+    # -- Identity link attestation (§3.5.1) ----------------------------------
+
+    async def create_attestation(
+        self,
+        platform: str,
+        handle: str,
+        proof: str,
+        verification_method: str = "oauth",
+        platform_id: str | None = None,
+    ) -> IdentityLinkAttestation:
+        """Create an identity link attestation for an external platform.
+
+        Args:
+            platform: Platform identifier (e.g., ``"github.com"``).
+            handle: Handle on the platform (e.g., ``"@alice"``).
+            proof: Method-specific proof data.
+            verification_method: One of ``"oauth"``, ``"signed_post"``,
+                ``"dns_record"``, or ``"challenge_response"``.
+            platform_id: Optional immutable platform user ID.
+
+        Returns:
+            The created :class:`IdentityLinkAttestation`.
+
+        Raises:
+            scp_sdk.IdentityError: If signing fails.
+        """
+        import json
+
+        import _scp_core
+
+        result_json = await asyncio.to_thread(
+            _scp_core.py_create_identity_link_attestation,
+            self.did,
+            platform,
+            handle,
+            proof,
+            verification_method,
+            platform_id,
+        )
+        data = json.loads(result_json)
+        return IdentityLinkAttestation._from_dict(data)
+
+    async def attestations(self) -> list[IdentityLinkAttestation]:
+        """List all identity link attestations for this identity.
+
+        Returns:
+            A list of :class:`IdentityLinkAttestation` objects.
+        """
+        import json
+
+        import _scp_core
+
+        result_json = await asyncio.to_thread(
+            _scp_core.py_identity_link_attestations,
+            self.did,
+        )
+        items = json.loads(result_json)
+        return [IdentityLinkAttestation._from_dict(d) for d in items]
+
+    async def remove_attestation(self, attestation_id: str) -> bool:
+        """Remove an identity link attestation by its ID.
+
+        Args:
+            attestation_id: The deterministic attestation ID.
+
+        Returns:
+            ``True`` if the attestation was found and removed.
+        """
+        import _scp_core
+
+        return await asyncio.to_thread(
+            _scp_core.py_remove_identity_link_attestation,
+            self.did,
+            attestation_id,
+        )
+
     # -- Dunder methods ------------------------------------------------------
 
     def __repr__(self) -> str:
@@ -479,7 +555,89 @@ class Identity:
         return self.did
 
 
+# ---------------------------------------------------------------------------
+# IdentityLinkAttestation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IdentityLinkAttestation:
+    """An identity link attestation proving ownership of an external platform
+    identity (spec §3.5.1).
+
+    Created via :meth:`Identity.create_attestation`.
+    """
+
+    #: Deterministic attestation ID.
+    id: str
+
+    #: Always ``"identity_link"``.
+    attestation_type: str
+
+    #: The DID that issued this attestation.
+    issuer: str
+
+    #: Same as issuer for self-attestations.
+    subject: str
+
+    #: Unix timestamp (ms) when created.
+    issued_at: int
+
+    #: Platform identifier (e.g., ``"github.com"``).
+    platform: str
+
+    #: Handle on the platform.
+    platform_handle: str
+
+    #: Verification method used.
+    verification_method: str
+
+    #: Raw JSON string of the full attestation.
+    raw_json: str = ""
+
+    #: Optional platform-specific user ID.
+    platform_id: str | None = None
+
+    @classmethod
+    def _from_dict(cls, data: dict) -> IdentityLinkAttestation:
+        """Construct from a parsed JSON dict."""
+        import json
+
+        claim = data.get("claim", {})
+        evidence = data.get("evidence", {})
+        return cls(
+            id=data.get("id", ""),
+            attestation_type=data.get("type", "identity_link"),
+            issuer=data.get("issuer", ""),
+            subject=data.get("subject", ""),
+            issued_at=data.get("issued_at", 0),
+            platform=claim.get("platform", ""),
+            platform_handle=claim.get("platform_handle", ""),
+            verification_method=evidence.get("method", ""),
+            raw_json=json.dumps(data),
+            platform_id=claim.get("platform_id"),
+        )
+
+    async def verify(self) -> bool:
+        """Verify the Ed25519 signature on this attestation.
+
+        Returns:
+            ``True`` if the signature is valid.
+
+        Raises:
+            scp_sdk.IdentityError: If the issuer's identity is not
+                available for verification.
+        """
+        import _scp_core
+
+        return await asyncio.to_thread(
+            _scp_core.py_verify_identity_link_attestation,
+            self.raw_json,
+        )
+
+
 __all__ = [
     "DIDDocument",
     "Identity",
+    "IdentityLinkAttestation",
 ]

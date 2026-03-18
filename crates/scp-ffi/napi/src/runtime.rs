@@ -553,6 +553,9 @@ pub(crate) struct NapiIdentityEntry {
     pub(crate) custody: Arc<OpaqueInMemoryKeyCustody>,
     /// The DID document at the time of creation (or last key rotation).
     pub(crate) document: scp_identity::DidDocument,
+    /// Identity link attestations (§3.5.1). Stored locally per identity.
+    pub(crate) identity_link_attestations:
+        Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
 /// Global registry of identity state, keyed by DID string.
@@ -628,6 +631,31 @@ where
         })?;
 
     f(entry.value())
+}
+
+/// Executes a closure with mutable access to an identity's retained state.
+///
+/// Uses `DashMap::get_mut` for fine-grained per-key write locking.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Permission` if the DID is not found.
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpNapiError>
+where
+    F: FnOnce(&mut NapiIdentityEntry) -> Result<T, ScpNapiError>,
+{
+    let mut entry = identity_registry()
+        .get_mut(did)
+        .ok_or_else(|| ScpNapiError::Permission {
+            message: format!(
+                "identity '{did}' not found in registry — was it created with \
+                 identityCreate(\"in_memory\") in this process?"
+            ),
+            code: "SCP-PERM-3023".to_owned(),
+        })?;
+
+    f(entry.value_mut())
 }
 
 // ---------------------------------------------------------------------------

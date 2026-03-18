@@ -257,6 +257,18 @@ interface WasmModule {
   }) => Promise<{ did: string; custodyType: string }>;
   identity_attest_device: (did: string) => Promise<string>;
   identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
+  // Identity link attestation (§3.5.1)
+  identity_create_link_attestation: (
+    did: string,
+    platform: string,
+    handle: string,
+    proof: string,
+    verificationMethod: string,
+    platformId?: string,
+  ) => Promise<string>;
+  identity_link_attestations: (did: string) => string;
+  identity_remove_link_attestation: (did: string, attestationId: string) => boolean;
+  identity_verify_link_attestation: (attestationJson: string) => Promise<boolean>;
   // Recovery and custody migration (#632, spec §9.12, §3.2.1)
   identity_execute_recovery: (did: string, tier: string, contextIds: string[]) => string;
   identity_execute_custody_migration: (did: string, target: string, contextIds: string[]) => string;
@@ -1692,6 +1704,41 @@ export function createWasmBridge(): Bridge {
     async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
       const wasm = getWasm();
       return await wasm.identity_verify_device_attestation(did, tokenBase64);
+    },
+
+    // Identity link attestation (§3.5.1)
+    async identityCreateLinkAttestation(
+      did: string,
+      platform: string,
+      handle: string,
+      proof: string,
+      verificationMethod: string,
+      platformId: string | null,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.identity_create_link_attestation(
+        did,
+        platform,
+        handle,
+        proof,
+        verificationMethod,
+        platformId ?? undefined,
+      );
+    },
+
+    identityLinkAttestations(did: string): string {
+      const wasm = getWasm();
+      return wasm.identity_link_attestations(did);
+    },
+
+    identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
+      const wasm = getWasm();
+      return wasm.identity_remove_link_attestation(did, attestationId);
+    },
+
+    async identityVerifyLinkAttestation(attestationJson: string): Promise<boolean> {
+      const wasm = getWasm();
+      return await wasm.identity_verify_link_attestation(attestationJson);
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)
