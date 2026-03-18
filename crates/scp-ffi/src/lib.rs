@@ -78,6 +78,12 @@ pub mod validate;
 #[cfg(feature = "server")]
 pub mod server;
 
+// Full-stack E2E testing module — feature-gated behind allow_in_memory_custody.
+// Exposes FullStackNetwork/FullStackNode from scp-testing for real
+// encrypt→decrypt roundtrip tests from Python.
+#[cfg(feature = "allow_in_memory_custody")]
+pub mod testing;
+
 /// Global tokio runtime, created once at module import.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -247,6 +253,10 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Server startup (relay + application node) — feature-gated.
     #[cfg(feature = "server")]
     server::register_server(m)?;
+
+    // Full-stack E2E testing module — feature-gated.
+    #[cfg(feature = "allow_in_memory_custody")]
+    testing::register_testing(m)?;
 
     Ok(())
 }

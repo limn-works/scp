@@ -99,6 +99,12 @@ pub mod ucan;
 #[cfg(feature = "server")]
 pub mod server;
 
+// Full-stack E2E testing module — feature-gated behind allow_in_memory_custody.
+// Exposes FullStackNetwork/FullStackNode from scp-testing for real
+// encrypt→decrypt roundtrip tests from TypeScript.
+#[cfg(feature = "allow_in_memory_custody")]
+pub mod testing;
+
 // ---------------------------------------------------------------------------
 // Tokio runtime
 // ---------------------------------------------------------------------------
