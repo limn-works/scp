@@ -280,6 +280,38 @@ impl PyNodeHandle {
         })
     }
 
+    /// Starts the HTTP server in the background on the given bind address.
+    ///
+    /// If ``bind_addr`` is ``None``, defaults to ``127.0.0.1:8443``
+    /// (loopback only). Pass ``"0.0.0.0:PORT"`` for network access.
+    ///
+    /// Returns the actual bound address as a string (e.g., ``"127.0.0.1:8443"``).
+    ///
+    /// Raises ``RuntimeError`` if the server is already running or binding fails.
+    #[pyo3(signature = (bind_addr=None))]
+    fn serve(&self, py: Python<'_>, bind_addr: Option<String>) -> PyResult<String> {
+        let addr = bind_addr
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>().map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("invalid bind_addr: {e}"))
+                })
+            })
+            .transpose()?;
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            rt.block_on(self.inner.serve_background(addr))
+                .map(|a| a.to_string())
+                .map_err(node_err)
+        })
+    }
+
+    /// Returns the HTTP URL of the background server, or ``None`` if not serving.
+    #[getter]
+    fn http_url(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let rt = crate::runtime()?;
+        Ok(py.allow_threads(|| rt.block_on(self.inner.http_url())))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "NodeHandle(relay_url={}, did={})",
@@ -544,6 +576,32 @@ mod tests {
 
         // disable
         rt().block_on(inner.disable_broadcast_projection("dispatch-ctx"));
+
+        inner.shutdown();
+    }
+
+    #[test]
+    fn serve_background_dispatches_through_node_inner() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = RunningNode::InMemory(node);
+
+        // serve_background with port 0 (OS-assigned)
+        let addr = rt()
+            .block_on(inner.serve_background(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))))
+            .unwrap();
+
+        assert_ne!(addr.port(), 0, "should bind to a real port");
+        assert!(addr.ip().is_loopback());
+
+        // http_url should return Some
+        let url = rt().block_on(inner.http_url());
+        assert!(url.is_some(), "http_url should be Some after serve");
+
+        // Double serve should fail
+        let result = rt().block_on(
+            inner.serve_background(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))),
+        );
+        assert!(result.is_err(), "double serve should fail");
 
         inner.shutdown();
     }

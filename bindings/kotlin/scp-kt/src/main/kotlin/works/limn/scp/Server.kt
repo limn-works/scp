@@ -122,6 +122,23 @@ interface ServerBindings {
      * @param contextId The context ID to stop projecting.
      */
     fun nodeDisableSiteProjection(handleJson: String, contextId: String)
+
+    /**
+     * Starts the HTTP server in the background.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @param bindAddr Socket address to bind (e.g. "127.0.0.1:8080"), or null for default.
+     * @return The actual bound address as a string.
+     */
+    fun nodeServe(handleJson: String, bindAddr: String?): String
+
+    /**
+     * Returns the HTTP URL of the background server.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @return The HTTP URL, or null if not serving.
+     */
+    fun nodeHttpUrl(handleJson: String): String?
 }
 
 /**
@@ -274,6 +291,27 @@ class Node internal constructor(
     override fun close() {
         runBlocking { shutdown() }
     }
+
+    // HTTP server lifecycle
+
+    /**
+     * Starts the HTTP server in the background.
+     *
+     * Defaults to `127.0.0.1:8443` (loopback only) when [bindAddr] is null.
+     * Pass `"0.0.0.0:PORT"` for network access.
+     *
+     * @param bindAddr Socket address to bind (e.g. `"127.0.0.1:8080"`).
+     * @return The actual bound address as a string.
+     * @throws BridgeException if the server is already running or binding fails.
+     */
+    suspend fun serve(bindAddr: String? = null): String =
+        bridge.serve(this, bindAddr)
+
+    /**
+     * Returns the HTTP URL of the background server, or null if not serving.
+     */
+    suspend fun httpUrl(): String? =
+        bridge.httpUrl(this)
 
     // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 
@@ -481,6 +519,33 @@ class ServerBridge internal constructor(
         bridge.ffiCall {
             bindings.nodeShutdown(node.handleJson)
         }
+
+    // HTTP server lifecycle
+
+    /**
+     * Starts the HTTP server in the background.
+     *
+     * @param node The running node.
+     * @param bindAddr Socket address to bind, or null for default.
+     * @return The actual bound address as a string.
+     */
+    internal suspend fun serve(
+        node: Node,
+        bindAddr: String?,
+    ): String = bridge.ffiCall {
+        bindings.nodeServe(node.handleJson, bindAddr)
+    }
+
+    /**
+     * Returns the HTTP URL of the background server, or null if not serving.
+     *
+     * @param node The running node.
+     */
+    internal suspend fun httpUrl(
+        node: Node,
+    ): String? = bridge.ffiCall {
+        bindings.nodeHttpUrl(node.handleJson)
+    }
 
     // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 

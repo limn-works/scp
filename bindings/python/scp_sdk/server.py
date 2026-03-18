@@ -147,6 +147,11 @@ class Node:
         return self._handle.did  # type: ignore[no-any-return]
 
     @property
+    def http_url(self) -> str | None:
+        """The HTTP URL of the background server, or ``None`` if not serving."""
+        return self._handle.http_url  # type: ignore[no-any-return]
+
+    @property
     def is_shutdown(self) -> bool:
         """``True`` if :meth:`shutdown` has already been called."""
         return self._handle.is_shutdown  # type: ignore[no-any-return]
@@ -173,6 +178,24 @@ class Node:
         """
         handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir)
         return Node(handle)
+
+    async def serve(self, bind_addr: str | None = None) -> str:
+        """Start the HTTP server in the background.
+
+        If ``bind_addr`` is ``None``, defaults to ``127.0.0.1:8443``
+        (loopback only). Pass ``"0.0.0.0:PORT"`` for network access.
+
+        Args:
+            bind_addr: Socket address to bind (e.g. ``"127.0.0.1:8080"``).
+
+        Returns:
+            The actual bound address as a string (e.g. ``"127.0.0.1:8080"``).
+
+        Raises:
+            RuntimeError: If the server is already running or binding fails.
+            ValueError: If ``bind_addr`` is not a valid socket address.
+        """
+        return await asyncio.to_thread(self._handle.serve, bind_addr)  # type: ignore[no-any-return]
 
     async def shutdown(self) -> None:
         """Signal the node to stop (relay + background tasks).

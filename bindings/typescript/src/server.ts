@@ -46,6 +46,8 @@ interface NativeNodeHandle {
   readonly did: string;
   readonly isShutdown: boolean;
   shutdown(): void;
+  serve(bindAddr: string | null): Promise<string>;
+  readonly httpUrl: Promise<string | null>;
   enableSiteProjection(
     contextId: string,
     broadcastKeyHex: string,
@@ -265,6 +267,27 @@ export class Node implements AsyncDisposable {
     const addon = loadServerAddon();
     const handle = await addon.nodeStartLocal(dataDir);
     return new Node(handle);
+  }
+
+  /**
+   * Start the HTTP server in the background.
+   *
+   * Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is not
+   * provided. Pass `"0.0.0.0:PORT"` for network access.
+   *
+   * @param bindAddr - Socket address to bind (e.g. `"127.0.0.1:8080"`).
+   * @returns The actual bound address as a string.
+   * @throws {Error} If the server is already running or binding fails.
+   */
+  async serve(bindAddr?: string): Promise<string> {
+    return this.#handle.serve(bindAddr ?? null);
+  }
+
+  /**
+   * The HTTP URL of the background server, or `null` if not serving.
+   */
+  get httpUrl(): Promise<string | null> {
+    return this.#handle.httpUrl;
   }
 
   // -------------------------------------------------------------------------

@@ -713,7 +713,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 /// mode), both are mounted without authentication.
 ///
 /// See spec section 12.10.2.
-fn build_bridge_routers(
+pub(crate) fn build_bridge_routers(
     bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
     bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
 ) -> (Router, Router) {
@@ -745,7 +745,7 @@ fn build_bridge_routers(
 /// Builds the merged axum router for `serve()`, combining SCP protocol
 /// routes (well-known, relay, projection, ACME challenges) with the
 /// application router. Extracted from `serve()` for clippy line limits.
-fn build_merged_router(
+pub(crate) fn build_merged_router(
     app_router: Router,
     well_known: Router,
     relay_rt: Router,
@@ -841,7 +841,7 @@ fn build_main_server(
 ///
 /// Evicts stale per-IP token buckets every 60 seconds (buckets idle for more
 /// than 300 seconds). Runs until `shutdown_token` is cancelled.
-fn spawn_projection_rate_limit_cleanup(
+pub(crate) fn spawn_projection_rate_limit_cleanup(
     limiter: PublishRateLimiter,
     shutdown_token: CancellationToken,
 ) {
