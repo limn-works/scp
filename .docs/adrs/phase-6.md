@@ -3523,3 +3523,5 @@ The self-attestation model is acceptable for identity links specifically because
 5. §3.5.4 defines class-specific verification procedures: Class 1 (signature-only), Class 2 (signature + proof fetch). Verification cache specified with 1-hour TTL.
 6. §3.5.6 documents security properties: no PII, self-attestation scope limits, zero-trust for unverified Reference attestations, revocation replay prevention.
 7. No new `AttestationType` variant introduced — class is derived from `evidence.method`.
+
+**Migration note.** Changing the canonical signing bytes (replacing `revocation` with `revocation_status`) requires incrementing the domain separator from `SCP-IDENTITY-LINK-ATTESTATION-V1:` to `V2` per §9.5.1. No production attestations exist, so no backward compatibility is needed. The V2 separator should be adopted in the implementation PR.

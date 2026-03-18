@@ -106,7 +106,7 @@ Properties of identity attestations:
 - **User-initiated.** Only the human creates attestations for their own identities. No third party can assert a link on someone's behalf.
 - **Independently verifiable.** Any participant can verify the attestation without relying on a central authority. Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.).
 - **Revocable.** Users can revoke attestations at any time, severing the link.
-- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery tools (§6.2.2B) and DID document capability entries (§7.4.1). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in contexts with discovery tools (§22.5).
+- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery tools (§6.2.2B) and DID document service entries (§3.5.3). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in contexts with discovery tools (§22.5).
 
 Identity attestations enable three critical flows:
 
@@ -169,7 +169,7 @@ The following platforms are supported for identity link attestations. New provid
 **Class 2 (Reference) creation flow:**
 
 1. The user places their DID string in the platform-specific location (profile bio, DNS TXT record).
-2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_ts> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
+2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_ms> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
 3. The SDK signs the full `IdentityLinkAttestation` envelope with the DID's signing key.
 4. The attestation is published. It carries zero trust weight until a consumer fetches and verifies the proof.
 
@@ -332,7 +332,7 @@ When a bridge connector creates a shadow identity for an external platform parti
 
 **Reference attestations carry zero trust until verified.** A Class 2 attestation with an unverified proof URL provides no trust signal whatsoever. Trust evaluation (§7.5) MUST score unverified Reference attestations at zero. This prevents an attacker from publishing a Reference attestation pointing to a URL they do not control — the attestation exists, but no consumer will trust it until they verify the proof.
 
-**`revocation_status` in signed fields.** The `revocation_status` field is included in the signature scope (§3.5.2). This prevents a replay attack where an attacker intercepts a revoked attestation, strips the `Revoked` status, and presents it as `Active`. Because the signature covers `revocation_status`, any modification invalidates the signature. When revoking, the issuer creates a new signature over the attestation with `revocation_status: Revoked`. The revoked attestation and its signature are published to the revocation endpoint; the original `Active` attestation remains in the wild but is rejected by consumers who check the revocation endpoint (§3.5.2).
+**`revocation_status` in signed fields.** The `revocation_status` field is included in the signature scope (§3.5.2). This prevents re-activation: an attacker who obtains a `Revoked` attestation cannot strip the status and present it as `Active` because the signature covers `revocation_status`. However, this does NOT prevent replay of the original `Active`-signed version — the original attestation remains valid until consumers check the revocation endpoint. The revocation endpoint check (§18.2.2 `AttestationRevocations`) is ALWAYS required regardless of `revocation_status` value. The signed field is defense-in-depth, not a complete revocation mechanism.
 
 ## 3.6 Social Graph
 

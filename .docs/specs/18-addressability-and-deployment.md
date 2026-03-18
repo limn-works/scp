@@ -60,6 +60,7 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 | `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
 | `ParticipationStatements` | Relay URL(s) where the agent's participation statements can be fetched by verifiers | Participation Admission (§7.3.2.1) | §7.3.2.1 |
 | `AttestationRevocations` | Endpoint(s) for checking attestation revocation status | Attestation Verification (§7.4.4) | §7.4.4 |
+| `ScpIdentityLinkAttestation` | Identity link attestation entries for platform verification | Attestation Verification (§3.5.4) | §3.5.3 |
 
 **SCPRelay vs SCPCapabilities.** These are distinct service types with different consumers and different purposes:
 
