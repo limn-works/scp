@@ -768,8 +768,8 @@ mod sender_key_types {
 mod attestation_types {
     use super::*;
     use scp_core::identity::attestation::{
-        AttestationClaim, AttestationEvidence, AttestationRevocation, IdentityLinkAttestation,
-        VerificationMethod,
+        AttestationClaim, AttestationEvidence, AttestationProof, AttestationRevocation,
+        IdentityLinkAttestation, VerificationMethod,
     };
 
     /// §13.9 item 3: `AttestationClaim` MUST ignore unknown fields (JSON).
@@ -820,7 +820,11 @@ mod attestation_types {
     fn evidence_ignores_unknown_fields_json() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "token123".to_string(),
+            proof: AttestationProof::OauthVerified {
+                provider: "github.com".to_string(),
+                subject_id: "token123".to_string(),
+                verified_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -834,7 +838,7 @@ mod attestation_types {
             result.unwrap_err()
         );
         let decoded = result.unwrap();
-        assert_eq!(decoded.proof, "token123");
+        assert_eq!(decoded.method, VerificationMethod::Oauth);
     }
 
     /// §13.9 item 3: `AttestationEvidence` MUST ignore unknown fields (msgpack).
@@ -842,7 +846,11 @@ mod attestation_types {
     fn evidence_ignores_unknown_fields_msgpack() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "token123".to_string(),
+            proof: AttestationProof::OauthVerified {
+                provider: "github.com".to_string(),
+                subject_id: "token123".to_string(),
+                verified_at: 1_700_000_000,
+            },
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -856,7 +864,7 @@ mod attestation_types {
             result.unwrap_err()
         );
         let decoded = result.unwrap();
-        assert_eq!(decoded.proof, "token123");
+        assert_eq!(decoded.method, VerificationMethod::Oauth);
     }
 
     /// §13.9 item 3: `AttestationRevocation` MUST ignore unknown fields (JSON).
@@ -906,7 +914,11 @@ mod attestation_types {
             claim: AttestationClaim::new("github.com".to_string(), "alice".to_string(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: "token".to_string(),
+                proof: AttestationProof::OauthVerified {
+                    provider: "github.com".to_string(),
+                    subject_id: "token".to_string(),
+                    verified_at: 1_700_000_000,
+                },
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
@@ -940,7 +952,11 @@ mod attestation_types {
             claim: AttestationClaim::new("github.com".to_string(), "alice".to_string(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: "token".to_string(),
+                proof: AttestationProof::OauthVerified {
+                    provider: "github.com".to_string(),
+                    subject_id: "token".to_string(),
+                    verified_at: 1_700_000_000,
+                },
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
