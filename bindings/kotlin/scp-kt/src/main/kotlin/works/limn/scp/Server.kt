@@ -347,6 +347,9 @@ class Node internal constructor(
         authorDid: String? = null,
     ) {
         validateAdmission(admission)
+        require((broadcastKeyHex == null) == (authorDid == null)) {
+            "broadcastKeyHex and authorDid must both be provided or both be omitted"
+        }
         if (broadcastKeyHex != null) {
             validateBroadcastKeyHex(broadcastKeyHex)
         }

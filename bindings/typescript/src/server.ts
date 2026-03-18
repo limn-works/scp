@@ -329,6 +329,9 @@ export class Node implements AsyncDisposable {
     authorDid?: string,
   ): Promise<void> {
     validateAdmission(admission);
+    if ((broadcastKeyHex === undefined) !== (authorDid === undefined)) {
+      throw new Error("broadcastKeyHex and authorDid must both be provided or both be omitted");
+    }
     if (broadcastKeyHex !== undefined) {
       validateBroadcastKeyHex(broadcastKeyHex);
     }

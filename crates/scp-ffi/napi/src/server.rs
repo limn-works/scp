@@ -174,39 +174,45 @@ impl NapiNodeHandle {
         }
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
-            match (broadcast_key_hex, author_did) {
-                (Some(key_hex), Some(did)) => {
-                    let key_hex = Zeroizing::new(key_hex);
-                    let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
-                        NapiError::from_reason(format!("invalid broadcast_key_hex: {e}"))
+        let (resolved_key_bytes, resolved_epoch, resolved_author_did) = match (
+            broadcast_key_hex,
+            author_did,
+        ) {
+            (Some(key_hex), Some(did)) => {
+                let key_hex = Zeroizing::new(key_hex);
+                let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
+                    NapiError::from_reason(format!("invalid broadcast_key_hex: {e}"))
+                })?);
+                let key_bytes: Zeroizing<[u8; 32]> =
+                    Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
+                        NapiError::from_reason(
+                            "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                        )
                     })?);
-                    let key_bytes: Zeroizing<[u8; 32]> =
-                        Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                            NapiError::from_reason(
-                                "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                            )
-                        })?);
-                    (key_bytes, 0u64, did)
-                }
-                (None, None) => {
-                    // Auto-resolve from ContextManager using node's identity DID.
-                    let node_did = self.inner.did().to_owned();
-                    let mgr = crate::runtime::context_manager()?;
-                    let (key_bytes, epoch) = mgr
-                        .get_broadcast_key_for_local_author(&context_id, &node_did)
-                        .await
-                        .map_err(|e| {
-                            NapiError::from_reason(format!("broadcast key required — {e}"))
-                        })?;
-                    (key_bytes, epoch, node_did)
-                }
-                _ => {
-                    return Err(NapiError::from_reason(
-                        "broadcastKeyHex and authorDid must both be provided or both be null",
-                    ));
-                }
-            };
+                // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
+                (key_bytes, 0u64, did)
+            }
+            (None, None) => {
+                // Auto-resolve from ContextManager using node's identity DID.
+                let node_did = self.inner.did().to_owned();
+                let mgr = crate::runtime::context_manager()?;
+                let (key_bytes, epoch) = mgr
+                    .get_broadcast_key_for_local_author(&context_id, &node_did)
+                    .await
+                    .map_err(|e| {
+                        tracing::debug!(error = %e, "broadcast key auto-resolve failed");
+                        NapiError::from_reason(
+                            "broadcast key auto-resolve failed: not authorized for this context",
+                        )
+                    })?;
+                (key_bytes, epoch, node_did)
+            }
+            _ => {
+                return Err(NapiError::from_reason(
+                    "broadcastKeyHex and authorDid must both be provided or both be null",
+                ));
+            }
+        };
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
@@ -228,6 +234,7 @@ impl NapiNodeHandle {
         let content_path = scp_core::context::broadcast_content::ContentPath::new(idx_path_str)
             .map_err(|e| NapiError::from_reason(format!("invalid index_path: {e}")))?;
 
+        // JavaScript numbers are signed; validate non-negative before u64 conversion.
         let deploy_size = match max_deploy_size_bytes {
             Some(v) if v < 0 => {
                 return Err(NapiError::from_reason(

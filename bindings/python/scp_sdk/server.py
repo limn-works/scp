@@ -256,6 +256,10 @@ class Node:
                 auto-lookup cannot find the key.
         """
         validate_admission(admission)
+        if (broadcast_key_hex is None) != (author_did is None):
+            raise ValueError(
+                "broadcast_key_hex and author_did must both be provided or both be omitted"
+            )
         if broadcast_key_hex is not None:
             validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(

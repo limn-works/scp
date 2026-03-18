@@ -187,6 +187,13 @@ class ServerTest {
  */
 internal class StubServerBindings : ServerBindings {
 
+    // serve / httpUrl
+    var serveResult: String = "127.0.0.1:8443"
+    override fun nodeServe(handleJson: String, bindAddr: String?): String = serveResult
+
+    var httpUrlResult: String? = null
+    override fun nodeHttpUrl(handleJson: String): String? = httpUrlResult
+
     // Startup/shutdown
     var nodeStartInMemoryResult: String =
         """{"relayUrl":"ws://127.0.0.1:0/scp/v1","relayPort":0,"did":"did:dht:stub"}"""

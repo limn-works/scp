@@ -740,6 +740,13 @@ impl<S: Storage> ApplicationNode<S> {
             {
                 index.insert(new.clone(), routing_id);
             }
+            let index_len = index.len();
+            drop(index);
+            debug_assert!(
+                index_len <= Self::MAX_PROJECTED_CONTEXTS,
+                "hostname_index size {index_len} exceeds MAX_PROJECTED_CONTEXTS {}",
+                Self::MAX_PROJECTED_CONTEXTS,
+            );
         }
 
         drop(registry);

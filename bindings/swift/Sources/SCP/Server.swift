@@ -350,6 +350,12 @@ public struct Node: Sendable {
         enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
     ) async throws {
         try validateAdmission(admission)
+        guard (broadcastKeyHex == nil) == (authorDid == nil) else {
+            throw ScpError.Validation(
+                msg: "broadcastKeyHex and authorDid must both be provided or both be omitted",
+                code: "SCP-TRANS-5060"
+            )
+        }
         if let key = broadcastKeyHex {
             try validateBroadcastKeyHex(key)
         }

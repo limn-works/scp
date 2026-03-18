@@ -210,49 +210,55 @@ impl NodeHandle {
         }
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
-            match (broadcast_key_hex, author_did) {
-                (Some(key_hex), Some(did)) => {
-                    let key_hex = Zeroizing::new(key_hex);
-                    let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
+        let (resolved_key_bytes, resolved_epoch, resolved_author_did) = match (
+            broadcast_key_hex,
+            author_did,
+        ) {
+            (Some(key_hex), Some(did)) => {
+                let key_hex = Zeroizing::new(key_hex);
+                let key_vec =
+                    Zeroizing::new(hex::decode(&*key_hex).map_err(|e| ScpError::Validation {
+                        msg: format!("invalid broadcast_key_hex: {e}"),
+                        code: "SCP-TRANS-5060".to_owned(),
+                    })?);
+                let key_bytes: Zeroizing<[u8; 32]> =
+                    Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
                         ScpError::Validation {
-                            msg: format!("invalid broadcast_key_hex: {e}"),
+                            msg: "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
+                                .to_owned(),
                             code: "SCP-TRANS-5060".to_owned(),
                         }
                     })?);
-                    let key_bytes: Zeroizing<[u8; 32]> =
-                        Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                            ScpError::Validation {
-                                msg:
-                                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
-                                        .to_owned(),
-                                code: "SCP-TRANS-5060".to_owned(),
-                            }
-                        })?);
-                    (key_bytes, 0u64, did)
-                }
-                (None, None) => {
-                    // Auto-resolve from ContextManager using node's identity DID.
-                    let node_did = self.inner.did().to_owned();
-                    let mgr = crate::runtime::context_manager()?;
-                    let (key_bytes, epoch) = mgr
-                        .get_broadcast_key_for_local_author(&context_id, &node_did)
-                        .await
-                        .map_err(|e| ScpError::Context {
-                            msg: format!("broadcast key required — {e}"),
+                // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
+                (key_bytes, 0u64, did)
+            }
+            (None, None) => {
+                // Auto-resolve from ContextManager using node's identity DID.
+                let node_did = self.inner.did().to_owned();
+                let mgr = crate::runtime::context_manager()?;
+                let (key_bytes, epoch) = mgr
+                    .get_broadcast_key_for_local_author(&context_id, &node_did)
+                    .await
+                    .map_err(|e| {
+                        tracing::debug!(error = %e, "broadcast key auto-resolve failed");
+                        ScpError::Context {
+                            msg:
+                                "broadcast key auto-resolve failed: not authorized for this context"
+                                    .to_owned(),
                             code: "SCP-CTX-2060".to_owned(),
-                        })?;
-                    (key_bytes, epoch, node_did)
-                }
-                _ => {
-                    return Err(ScpError::Validation {
+                        }
+                    })?;
+                (key_bytes, epoch, node_did)
+            }
+            _ => {
+                return Err(ScpError::Validation {
                     msg:
                         "broadcast_key_hex and author_did must both be provided or both be omitted"
                             .to_owned(),
                     code: "SCP-TRANS-5060".to_owned(),
                 });
-                }
-            };
+            }
+        };
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),

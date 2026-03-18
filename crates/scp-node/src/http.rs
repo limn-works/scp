@@ -196,6 +196,9 @@ pub struct NodeState {
     /// the corresponding `/scp/broadcast/<routing_id_hex>/site/<path>` route.
     /// Populated by `enable_broadcast_projection_with_site()` and depopulated
     /// by `disable_broadcast_projection()`.
+    ///
+    /// LOCK ORDERING: Always acquire `projected_contexts` before `hostname_index`.
+    /// Read locks on `hostname_index` must be dropped before accessing `projected_contexts`.
     pub(crate) hostname_index: RwLock<HashMap<String, [u8; 32]>>,
 
     /// Shared state for bridge shadow operations.
