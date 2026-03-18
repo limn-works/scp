@@ -787,7 +787,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         ciphertext: &[u8],
         epoch: u64,
         sequence: u64,
-    ) -> Result<(Vec<u8>, String), ContextError> {
+    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
         self.with_context(context_id, |state| {
             let ctx_str = hex::encode(context_id);
 
@@ -824,22 +824,18 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     )
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-                    Ok((plaintext, sender_did))
+                    Ok(Some((plaintext, sender_did)))
                 }
-                DecryptedContent::Commit { sender_did } => {
+                DecryptedContent::Commit { sender_did: _ } => {
                     // Commit messages advance the MLS epoch. `decrypt_with_sender_did`
                     // has already called `merge_staged_commit` to apply the epoch
-                    // change. Signal to the caller that no application payload exists.
-                    Err(ContextError::CryptoFailed(format!(
-                        "received MLS Commit from {sender_did} — epoch advanced, no application payload"
-                    )))
+                    // change. No application payload exists.
+                    Ok(None)
                 }
-                DecryptedContent::Proposal { sender_did } => {
+                DecryptedContent::Proposal { sender_did: _ } => {
                     // Proposals are cached by OpenMLS during process_message.
                     // No application payload to return.
-                    Err(ContextError::CryptoFailed(format!(
-                        "received MLS Proposal from {sender_did} — cached, no application payload"
-                    )))
+                    Ok(None)
                 }
             }
         })

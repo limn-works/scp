@@ -3004,7 +3004,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         encrypted_blob: &[u8],
-    ) -> Result<(Vec<u8>, String), ContextError> {
+    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         // Phase 1: Acquire lock → state check → drop lock.
@@ -3024,9 +3024,16 @@ impl ContextManager {
         // OpenMLS group state — no need to hold `self.contexts` here.
         // MLS layer (ADR-001) -> sender key layer (ADR-007).
         // Uses epoch=0, sequence=0 matching the send path's AAD.
-        let (plaintext, sender_did) =
-            self.crypto
-                .decrypt_message(&context_id_bytes, encrypted_blob, 0, 0)?;
+        let decrypted = self
+            .crypto
+            .decrypt_message(&context_id_bytes, encrypted_blob, 0, 0)?;
+
+        // Commit/Proposal messages have no application payload — the MLS epoch
+        // was advanced (Commit) or the proposal was cached (Proposal). Skip
+        // membership checks and buffer push.
+        let Some((plaintext, sender_did)) = decrypted else {
+            return Ok(None);
+        };
 
         // Phase 3: Re-acquire lock → re-check active → verify membership →
         // capability check → push to receive buffer. Re-checking eliminates the
@@ -3076,7 +3083,7 @@ impl ContextManager {
             .event_log
             .append_context_event(&context_id_bytes, "MessageReceived");
 
-        Ok((plaintext, sender_did))
+        Ok(Some((plaintext, sender_did)))
     }
 
     /// Returns the current member count for a context.
@@ -8539,14 +8546,14 @@ mod tests {
             ciphertext: &[u8],
             _epoch: u64,
             _sequence: u64,
-        ) -> Result<(Vec<u8>, String), ContextError> {
+        ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
             self.decrypt_sender_did.as_ref().map_or_else(
                 || {
                     Err(ContextError::CryptoFailed(
                         "decrypt_message not configured in mock".to_owned(),
                     ))
                 },
-                |did| Ok((ciphertext.to_vec(), did.clone())),
+                |did| Ok(Some((ciphertext.to_vec(), did.clone()))),
             )
         }
 
@@ -9237,7 +9244,9 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let (plaintext, sender) = result.unwrap();
+        let (plaintext, sender) = result
+            .unwrap()
+            .expect("expected Some for application message");
         assert_eq!(plaintext, b"encrypted-payload");
         assert_eq!(sender, "did:key:creator");
 

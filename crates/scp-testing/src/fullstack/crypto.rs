@@ -197,6 +197,37 @@ impl E2eCryptoProvider {
         Ok(())
     }
 
+    /// Picks up any pending sender keys from the shared `KeyExchange`.
+    ///
+    /// This is the complement of `distribute_sender_key`: when another node
+    /// deposits its sender key for this node, calling `pickup_sender_keys`
+    /// retrieves and stores them locally so `decrypt_message` can find them.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if the lock is poisoned (shouldn't happen in
+    /// well-behaved tests).
+    pub fn pickup_sender_keys(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        let ctx_hex = Self::context_id_hex(context_id);
+        let sender_keys = {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange.take_sender_keys(&ctx_hex, &self.local_did)
+        };
+        if !sender_keys.is_empty() {
+            let mut store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (sender_did, key) in sender_keys {
+                store.set(&ctx_hex, &sender_did, key);
+            }
+        }
+        Ok(())
+    }
+
     /// Decrypts a message that was encrypted by `encrypt_message`.
     ///
     /// Performs the reverse: MLS decrypt → sender key decrypt.
@@ -417,9 +448,13 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 },
             );
 
-            // Deposit the commit for all existing members (not the new joiner).
+            // Deposit the commit for all existing members except the local
+            // node (the adder already merged the commit) and the new joiner
+            // (who receives the Welcome instead).
             for did in &existing_members {
-                exchange.deposit_commit(*context_id, did, commit_bytes.clone());
+                if did != &self.local_did {
+                    exchange.deposit_commit(*context_id, did, commit_bytes.clone());
+                }
             }
         }
 

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
@@ -164,12 +165,102 @@ pub fn py_fullstack_add_member(
 }
 
 /// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
+///
+/// After joining, the context is registered on the joiner's `ContextManager`
+/// with a `ContextHandle`, enabling subsequent `py_fullstack_send_message`
+/// and `py_fullstack_remove_member` calls on this node.
 #[pyfunction]
 pub fn py_fullstack_join_from_welcome(node: &PyFullStackNode, context_id: String) -> PyResult<()> {
     let ctx_bytes = context_id_bytes(&context_id);
+    let rt = crate::runtime()?;
+
+    // Step 1: Register the context on the joiner's ContextManager.
+    let params = ContextParams {
+        mode: ContextMode::Encrypted,
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::ContextClose,
+        ],
+        ..ContextParams::default()
+    };
+    let handle = rt
+        .block_on(node.inner.create_context(&context_id, params))
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to register context on joiner: {e}"
+            ))
+        })?;
+
+    // Step 2: Replace the throwaway MLS group with the Welcome-derived one
+    // and pick up the adder's sender keys from the exchange.
     node.inner.join_from_welcome(&ctx_bytes).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-    })
+    })?;
+
+    // Step 3: Store the handle.
+    {
+        let mut handles = node
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.insert(context_id, handle);
+    }
+
+    Ok(())
+}
+
+/// Synchronises sender keys between two nodes for a given context.
+///
+/// Each node distributes its own sender key to the other via the shared
+/// `KeyExchange`, then picks up the other's key. After this call, both
+/// nodes can encrypt and decrypt messages from each other.
+#[pyfunction]
+pub fn py_fullstack_sync_sender_keys(
+    node_a: &PyFullStackNode,
+    node_b: &PyFullStackNode,
+    context_id: String,
+) -> PyResult<()> {
+    let ctx_bytes = context_id_bytes(&context_id);
+    let did_a = node_a.inner.did.to_string();
+    let did_b = node_b.inner.did.to_string();
+
+    // A distributes to B, B distributes to A.
+    node_a
+        .inner
+        .crypto
+        .distribute_sender_key(&ctx_bytes, &did_b)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to distribute sender key from A to B: {e}"
+            ))
+        })?;
+    node_b
+        .inner
+        .crypto
+        .distribute_sender_key(&ctx_bytes, &did_a)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to distribute sender key from B to A: {e}"
+            ))
+        })?;
+
+    // Both pick up the other's key.
+    node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to pick up sender keys for A: {e}"
+        ))
+    })?;
+    node_b.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to pick up sender keys for B: {e}"
+        ))
+    })?;
+
+    Ok(())
 }
 
 /// Encrypts a message and returns the ciphertext as bytes.
@@ -269,6 +360,7 @@ pub fn register_testing(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_fullstack_create_context, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_add_member, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_join_from_welcome, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fullstack_sync_sender_keys, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_send_message, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_decrypt_message, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_remove_member, m)?)?;

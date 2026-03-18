@@ -95,6 +95,44 @@ if (addon === null) {
       expect(Buffer.from(decrypted)).toEqual(plaintext);
     });
 
+    test("Bob sends, Alice decrypts (bidirectional)", () => {
+      const alice = napi.fullstackCreateNode("did:dht:z6MkAliceBidir");
+      const bob = napi.fullstackCreateNode("did:dht:z6MkBobBidir");
+
+      const ctxId = napi.fullstackCreateContext(
+        alice,
+        "test-ctx-bidir",
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "member:invite",
+            "member:remove",
+            "context:close",
+          ],
+          governance: "single_admin",
+        }),
+      );
+
+      napi.fullstackAddMember(alice, ctxId, bob.did);
+      napi.fullstackJoinFromWelcome(bob, ctxId);
+
+      // Sync sender keys so both nodes can decrypt each other's messages.
+      napi.fullstackSyncSenderKeys(alice, bob, ctxId);
+
+      // Bob sends a message.
+      const plaintext = Buffer.from("Hello from Bob!");
+      const ciphertext = napi.fullstackSendMessage(bob, ctxId, plaintext);
+
+      // Ciphertext must differ from plaintext.
+      expect(Buffer.from(ciphertext)).not.toEqual(plaintext);
+
+      // Alice decrypts Bob's message.
+      const decrypted = napi.fullstackDecryptMessage(alice, ctxId, ciphertext, bob.did);
+      expect(Buffer.from(decrypted)).toEqual(plaintext);
+    });
+
     test("three-party: Alice sends, Bob and Carol both decrypt", () => {
       const alice = napi.fullstackCreateNode("did:dht:z6MkAlice3Party");
       const bob = napi.fullstackCreateNode("did:dht:z6MkBob3Party");

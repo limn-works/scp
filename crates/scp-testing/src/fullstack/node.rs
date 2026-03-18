@@ -237,6 +237,18 @@ impl FullStackNode {
             .decrypt_message(context_id, ciphertext, sender_did, epoch, sequence)
     }
 
+    /// Picks up any pending sender keys from the shared `KeyExchange`.
+    ///
+    /// Call this after another node has distributed its sender key so this
+    /// node can decrypt messages from that sender.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `ContextError` from the crypto provider.
+    pub fn pickup_sender_keys(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        self.crypto.pickup_sender_keys(context_id)
+    }
+
     /// Drains events from the `ContextManager`.
     pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
         self.manager.drain_events(context_id).await

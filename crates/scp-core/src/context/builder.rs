@@ -295,7 +295,9 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// extract sender DID from the MLS credential, then sender key decrypt
     /// (ADR-007).
     ///
-    /// Returns `(plaintext, sender_did)` on success.
+    /// Returns `Ok(Some((plaintext, sender_did)))` for application messages,
+    /// or `Ok(None)` when the MLS message was a Commit or Proposal (processed
+    /// successfully but containing no application payload).
     ///
     /// `epoch` and `sequence` are the sender-key AAD values. For standard
     /// sender keys these are `(0, 0)` matching the encrypt path.
@@ -313,7 +315,7 @@ pub trait ContextCryptoProvider: Send + Sync {
         _ciphertext: &[u8],
         _epoch: u64,
         _sequence: u64,
-    ) -> Result<(Vec<u8>, String), ContextError> {
+    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
         Err(ContextError::CryptoFailed(
             "decrypt_message not supported by this provider".to_string(),
         ))
