@@ -317,6 +317,10 @@ pub struct IdentityLinkAttestation {
     /// Revocation metadata.
     pub revocation: AttestationRevocation,
 
+    /// Revocation status: `Active` or `Revoked` (§7.4.1). Included in
+    /// the signed scope to prevent replay of revoked attestations.
+    pub revocation_status: crate::trust::attestation::RevocationStatus,
+
     /// Ed25519 signature over the canonical `MessagePack` of all other fields.
     ///
     /// The signature is computed using the issuer's Active Signing Key
@@ -396,10 +400,10 @@ impl IdentityLinkAttestation {
     /// using the domain-separated canonical hash construction per §9.5.1), then
     /// verifies the signature against the provided public key bytes.
     ///
-    /// The canonical form uses domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
+    /// The canonical form uses domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`
     /// with fields in a fixed order: `id`, `attestation_type`, `issuer`, `subject`,
     /// `issued_at`, `expires_at` (or absent sentinel), `claim` (`MessagePack`),
-    /// `evidence` (`MessagePack`), `revocation` (`MessagePack`).
+    /// `evidence` (`MessagePack`), `revocation_status` (`MessagePack`).
     ///
     /// # Arguments
     ///
@@ -420,8 +424,8 @@ impl IdentityLinkAttestation {
     ///
     /// The payload includes all fields except `signature`, serialized using the
     /// protocol's canonical hash construction (§9.5.1). Sub-structs (`claim`,
-    /// `evidence`, `revocation`) are serialized as `MessagePack` bytes and included
-    /// as variable-length fields.
+    /// `evidence`, `revocation_status`) are serialized as `MessagePack` bytes
+    /// and included as variable-length fields.
     ///
     /// This method is deterministic: identical attestation data always produces
     /// identical bytes, regardless of serde field ordering.
@@ -438,14 +442,15 @@ impl IdentityLinkAttestation {
                 "evidence serialization failed: {e}"
             ))
         })?;
-        let revocation_bytes = rmp_serde::to_vec_named(&self.revocation).map_err(|e| {
-            AttestationSignatureError::SerializationFailed(format!(
-                "revocation serialization failed: {e}"
-            ))
-        })?;
+        let revocation_status_bytes =
+            rmp_serde::to_vec_named(&self.revocation_status).map_err(|e| {
+                AttestationSignatureError::SerializationFailed(format!(
+                    "revocation_status serialization failed: {e}"
+                ))
+            })?;
 
         Ok(canonical_hash(
-            "SCP-IDENTITY-LINK-ATTESTATION-V1:",
+            "SCP-IDENTITY-LINK-ATTESTATION-V2:",
             &[
                 CanonicalField::VarBytes(self.id.as_bytes()),
                 CanonicalField::VarBytes(self.attestation_type.as_bytes()),
@@ -456,7 +461,7 @@ impl IdentityLinkAttestation {
                     .map_or(CanonicalField::Absent, CanonicalField::U64),
                 CanonicalField::VarBytes(&claim_bytes),
                 CanonicalField::VarBytes(&evidence_bytes),
-                CanonicalField::VarBytes(&revocation_bytes),
+                CanonicalField::VarBytes(&revocation_status_bytes),
             ],
         )
         .to_vec())
@@ -569,6 +574,7 @@ mod tests {
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("/revocations".to_owned()),
+            revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         }
     }
@@ -999,6 +1005,7 @@ mod tests {
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("/revocations".to_owned()),
+            revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(), // placeholder — will be replaced
         };
 
@@ -1081,13 +1088,37 @@ mod tests {
     }
 
     #[test]
-    fn verify_signature_tampered_revocation() {
+    fn verify_signature_revocation_metadata_not_in_signed_scope() {
+        // `revocation` (metadata about how to check revocation) is NOT in the
+        // signed scope per §3.5.2. Only `revocation_status` is signed.
+        // Tampering with `revocation.endpoint` should NOT invalidate the signature.
         let sk = test_signing_key(0xAA);
         let mut attestation = make_signed_attestation(&sk);
         attestation.revocation.endpoint = "/evil".to_owned();
         let vk = sk.verifying_key();
         let result = attestation.verify_signature(vk.as_bytes());
-        assert!(result.is_err(), "should fail with tampered revocation");
+        assert!(
+            result.is_ok(),
+            "revocation metadata is not in signed scope: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_tampered_revocation_status() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        // Tamper revocation_status from Active to Revoked — must invalidate
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            revoked_at: 1_700_000_000_000,
+            reason: Some("tampered".to_owned()),
+            revoked_by: attestation.issuer.clone(),
+        };
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(
+            result.is_err(),
+            "should fail with tampered revocation_status"
+        );
     }
 
     #[test]
@@ -1169,6 +1200,7 @@ mod tests {
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("/revocations".to_owned()),
+            revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(),
         };
 

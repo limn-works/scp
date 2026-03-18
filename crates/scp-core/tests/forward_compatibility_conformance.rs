@@ -911,6 +911,7 @@ mod attestation_types {
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("#scp-revocations".to_string()),
+            revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
         let json = serde_json::to_string(&attestation).unwrap();
@@ -945,6 +946,7 @@ mod attestation_types {
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("#scp-revocations".to_string()),
+            revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
         let bytes = rmp_serde::to_vec_named(&attestation).unwrap();

@@ -792,6 +792,7 @@ mod tests {
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 1_700_000_250,
             reason: Some("compromised".to_owned()),
+            revoked_by: did.clone(),
         };
 
         let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);

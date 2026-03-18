@@ -229,7 +229,9 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
             CanonicalField::U64(attestation.issued_at),
-            CanonicalField::U64(attestation.expires_at.unwrap_or(0)),
+            attestation
+                .expires_at
+                .map_or(CanonicalField::Absent, CanonicalField::U64),
         ],
     )
     .to_vec()

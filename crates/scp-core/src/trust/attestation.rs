@@ -154,7 +154,7 @@ impl IdentityLinkClaim {
 // RevocationStatus
 // ---------------------------------------------------------------------------
 
-/// Revocation status of an attestation.
+/// Revocation status of an attestation (§7.4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RevocationStatus {
     /// The attestation is active and not revoked.
@@ -165,6 +165,9 @@ pub enum RevocationStatus {
         revoked_at: u64,
         /// Optional reason for revocation.
         reason: Option<String>,
+        /// DID that performed the revocation. Must equal the attestation's
+        /// issuer — only the issuer can revoke their own attestation (§7.4.1).
+        revoked_by: DID,
     },
 }
 
@@ -597,7 +600,9 @@ pub(crate) fn canonical_attestation_bytes(
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
             CanonicalField::U64(attestation.issued_at),
-            CanonicalField::U64(attestation.expires_at.unwrap_or(0)),
+            attestation
+                .expires_at
+                .map_or(CanonicalField::Absent, CanonicalField::U64),
         ],
     )
     .to_vec())
@@ -936,6 +941,7 @@ mod tests {
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 950,
             reason: Some("compromised".to_owned()),
+            revoked_by: "did:key:issuer".into(),
         };
 
         let result = verify_attestation(&attestation, &resolver, &clock);

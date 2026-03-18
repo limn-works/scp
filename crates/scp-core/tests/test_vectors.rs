@@ -936,47 +936,77 @@ fn vector_24_25_sender_and_access_info_differ() {
 
 #[test]
 fn vector_26_identity_link_attestation() {
-    println!("=== Vector 26: Identity Link Attestation ===");
+    use scp_core::identity::attestation::{
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+    };
+    use scp_core::trust::attestation::RevocationStatus;
+    use std::borrow::Cow;
 
-    let id = b"att-001";
-    let attestation_type: u16 = 0x0001; // IdentityLink
-    let issuer = b"did:dht:z6MkIssuer";
-    let subject = b"did:dht:z6MkSubject";
-    let claim = br#"{"handle":"@alice","platform":"x"}"#;
-    let issued_at: u64 = 1_700_000_000;
-    let expires_at: u64 = 0; // no expiry
+    println!("=== Vector 26: Identity Link Attestation Signature (V2) ===");
 
-    let bytes = canonical_hash_bytes(
-        b"SCP-ATTESTATION-V1:",
+    // Construct the attestation per §25.13 spec inputs.
+    let issuer: DID = "did:dht:z6MkIssuer".into();
+    let attestation = IdentityLinkAttestation {
+        id: "att-001".to_owned(),
+        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+        issuer: issuer.clone(),
+        subject: issuer,
+        issued_at: 1_700_000_000,
+        expires_at: None,
+        claim: AttestationClaim::new("google.com".to_owned(), "alice@gmail.com".to_owned(), None),
+        evidence: AttestationEvidence {
+            method: VerificationMethod::Oauth,
+            proof: r#"{"provider":"google.com","subject_id":"12345","verified_at":1700000000}"#
+                .to_owned(),
+            verified_at: 1_700_000_000,
+            verifier_did: None,
+        },
+        revocation: AttestationRevocation::new(String::new()),
+        revocation_status: RevocationStatus::Active,
+        signature: Vec::new(),
+    };
+
+    // Sign with reference key and verify round-trip.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&REF_SEED);
+    let pubkey_bytes = signing_key.verifying_key().to_bytes();
+
+    // Sign by computing canonical bytes, signing, and embedding.
+    let mut signed = attestation;
+    // Use the verify_signature path to confirm construction.
+    // First, manually build canonical bytes via the same construction the
+    // struct uses internally, sign them, and embed the signature.
+    let claim_bytes = rmp_serde::to_vec_named(&signed.claim).unwrap();
+    let evidence_bytes = rmp_serde::to_vec_named(&signed.evidence).unwrap();
+    let revocation_status_bytes = rmp_serde::to_vec_named(&signed.revocation_status).unwrap();
+
+    let canonical = canonical_hash_bytes(
+        b"SCP-IDENTITY-LINK-ATTESTATION-V2:",
         &[
-            CanonicalField::VarBytes(id),
-            CanonicalField::U16(attestation_type),
-            CanonicalField::VarBytes(issuer),
-            CanonicalField::VarBytes(subject),
-            CanonicalField::VarBytes(claim),
-            CanonicalField::Absent, // evidence absent
-            CanonicalField::U64(issued_at),
-            CanonicalField::U64(expires_at),
+            CanonicalField::VarBytes(signed.id.as_bytes()),
+            CanonicalField::VarBytes(signed.attestation_type.as_bytes()),
+            CanonicalField::VarBytes((*signed.issuer).as_bytes()),
+            CanonicalField::VarBytes((*signed.subject).as_bytes()),
+            CanonicalField::U64(signed.issued_at),
+            CanonicalField::Absent, // expires_at is None
+            CanonicalField::VarBytes(&claim_bytes),
+            CanonicalField::VarBytes(&evidence_bytes),
+            CanonicalField::VarBytes(&revocation_status_bytes),
         ],
     );
 
-    println!("  Canonical hash input length: {} bytes", bytes.len());
-    // 19 (domain) + (4+7) + 2 + (4+18) + (4+19) + (4+34) + 32 (Absent) + 8 + 8
-    // = 19 + 11 + 2 + 22 + 23 + 38 + 32 + 8 + 8 = 163
-    assert_eq!(bytes.len(), 163);
+    let hash: [u8; 32] = Sha256::digest(&canonical).into();
+    print_vec("Identity link attestation canonical hash (V2)", &hash);
 
-    let hash: [u8; 32] = Sha256::digest(&bytes).into();
-    print_vec("Attestation canonical hash", &hash);
-
-    // Sign with reference key
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&REF_SEED);
     let signature = signing_key.sign(&hash);
-    print_vec("Attestation signature", signature.to_bytes().as_slice());
+    signed.signature = signature.to_bytes().to_vec();
+    print_vec("Identity link attestation signature", &signed.signature);
 
-    signing_key
-        .verifying_key()
-        .verify(&hash, &signature)
-        .expect("attestation signature must verify");
+    // Verify using the struct's verify_signature method — this confirms
+    // the internal canonical_signing_bytes matches our manual construction.
+    signed
+        .verify_signature(&pubkey_bytes)
+        .expect("identity link attestation V2 signature must verify");
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,7 +1195,7 @@ fn domain_separators_are_all_unique() {
         "SCP-PRIVATE-LOG-V1:",
         "SCP-BROADCAST-ENVELOPE-V1:",
         "SCP-PARTICIPATION-V1:",
-        "SCP-IDENTITY-LINK-ATTESTATION-V1:",
+        "SCP-IDENTITY-LINK-ATTESTATION-V2:",
         "SCP-ACCESS-KEY-REQUEST-V1:",
         "SCP-TOOL-REGISTRATION-V1:",
         "SCP-FORK-ID-V1:",
