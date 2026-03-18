@@ -492,7 +492,7 @@ Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
 
 ### Vector 26: Identity Link Attestation Signature
 
-The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
+The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation_status`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
 
 Note: this is the *signature* construction (used by `verify_signature`). The *attestation ID* uses a different domain separator (`"SCP-ATTESTATION-ID-V1:"`) and different fields — see `compute_id()` in `attestation.rs`.
 
@@ -508,8 +508,7 @@ Input:
                        platform_id: None, link_type: "self_attestation" }
   evidence:          AttestationEvidence { method: "oauth", proof: "jwt-token",
                        verified_at: 1700000000, verifier_did: None }
-  revocation:        AttestationRevocation { method: "did_document",
-                       endpoint: "/revocations" }
+  revocation_status: RevocationStatus::Active
 
 Canonical hash input:
   "SCP-IDENTITY-LINK-ATTESTATION-V1:"         (35 bytes, no length prefix)
@@ -521,7 +520,7 @@ Canonical hash input:
   || BE32(32)  || SHA-256(0x00)                (4 + 32 = 36 bytes — absent expires_at sentinel)
   || BE32(N_c) || msgpack(claim)               (4 + N_c bytes — claim as MessagePack)
   || BE32(N_e) || msgpack(evidence)            (4 + N_e bytes — evidence as MessagePack)
-  || BE32(N_r) || msgpack(revocation)          (4 + N_r bytes — revocation as MessagePack)
+  || BE32(N_r) || msgpack(revocation_status)    (4 + N_r bytes — revocation_status as MessagePack)
 
 The exact byte count depends on the MessagePack encoding of the sub-structures.
 Compute the expected SHA-256 hash using the Rust reference implementation.
