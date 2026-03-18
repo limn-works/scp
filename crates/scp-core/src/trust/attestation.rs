@@ -649,7 +649,9 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// Returns a specific [`TrustError`] variant for each failure mode:
 /// - [`TrustError::AttestationSignatureInvalid`] for signature failures
 /// - [`TrustError::AttestationExpired`] when past expiry
-/// - [`TrustError::AttestationRevoked`] when revoked
+/// - [`TrustError::AttestationRevocationInvalid`] when `revoked_by` does not
+///   match the issuer (§7.4.1)
+/// - [`TrustError::AttestationRevoked`] when revoked by the issuer
 /// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
 ///   missing or invalid
 ///
@@ -684,7 +686,20 @@ pub fn verify_attestation(
     }
 
     // 4. Check revocation status.
-    if let RevocationStatus::Revoked { revoked_at, .. } = &attestation.revocation_status {
+    if let RevocationStatus::Revoked {
+        revoked_at,
+        revoked_by,
+        ..
+    } = &attestation.revocation_status
+    {
+        // Per §7.4.1, only the issuer can revoke their own attestation.
+        if *revoked_by != attestation.issuer {
+            return Err(TrustError::AttestationRevocationInvalid {
+                attestation_id: attestation.id.clone(),
+                revoked_by: revoked_by.to_string(),
+                issuer: attestation.issuer.to_string(),
+            });
+        }
         return Err(TrustError::AttestationRevoked {
             attestation_id: attestation.id.clone(),
             revoked_at: *revoked_at,
@@ -811,9 +826,10 @@ pub fn check_threshold_attestation(
 /// Computes the canonical byte representation of an attestation for signing.
 ///
 /// ```text
-/// "SCP-ATTESTATION-V1:" || len(id) || id || attestation_type_tag_BE
+/// "SCP-ATTESTATION-V2:" || len(id) || id || attestation_type_tag_BE
 ///     || len(issuer) || issuer || len(subject) || subject
-///     || len(claim_json) || claim_json || issued_at_BE
+///     || len(claim_json) || claim_json || len(evidence_msgpack) || evidence_msgpack
+///     || issued_at_BE || expires_at_BE || len(revocation_status_msgpack) || revocation_status_msgpack
 /// ```
 ///
 /// Variable-length fields are prefixed with their length as a 4-byte
@@ -822,6 +838,10 @@ pub fn check_threshold_attestation(
 /// numeric tag (u16 big-endian) instead of Debug formatting for
 /// cross-version determinism. `issued_at` uses big-endian encoding,
 /// consistent with all other canonical hash functions.
+///
+/// `revocation_status` is included in the signed scope so that an
+/// intermediary cannot flip Active↔Revoked without invalidating the
+/// signature.
 pub(crate) fn canonical_attestation_bytes(
     attestation: &Attestation,
 ) -> Result<Vec<u8>, TrustError> {
@@ -839,11 +859,19 @@ pub(crate) fn canonical_attestation_bytes(
         })
         .transpose()?;
 
+    // Serialize revocation_status as MessagePack bytes.
+    let revocation_bytes = rmp_serde::to_vec(&attestation.revocation_status).map_err(|err| {
+        TrustError::InvalidEventData {
+            sequence: 0,
+            reason: format!("revocation_status serialization failed: {err}"),
+        }
+    })?;
+
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
-    // evidence, issued_at, expires_at.
+    // evidence, issued_at, expires_at, revocation_status.
     let claim_bytes = attestation.claim.to_string();
     Ok(canonical_hash(
-        "SCP-ATTESTATION-V1:",
+        "SCP-ATTESTATION-V2:",
         &[
             CanonicalField::VarBytes(attestation.id.as_bytes()),
             CanonicalField::U16(super::attestation_type_tag(&attestation.attestation_type)),
@@ -857,6 +885,7 @@ pub(crate) fn canonical_attestation_bytes(
             attestation
                 .expires_at
                 .map_or(CanonicalField::Absent, CanonicalField::U64),
+            CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
     .to_vec())
@@ -1030,7 +1059,7 @@ mod tests {
         (signing_key, verifying_key.to_bytes().to_vec())
     }
 
-    /// Creates and signs a test attestation.
+    /// Creates and signs a test attestation with `RevocationStatus::Active`.
     fn make_signed_attestation(
         signing_key: &SigningKey,
         attestation_type: AttestationType,
@@ -1040,6 +1069,34 @@ mod tests {
         expires_at: Option<u64>,
         renewal_interval: Option<Duration>,
         evidence: Option<AttestationEvidence>,
+    ) -> Attestation {
+        make_signed_attestation_with_revocation(
+            signing_key,
+            attestation_type,
+            issuer,
+            subject,
+            issued_at,
+            expires_at,
+            renewal_interval,
+            evidence,
+            RevocationStatus::Active,
+        )
+    }
+
+    /// Creates and signs a test attestation with the given `RevocationStatus`.
+    ///
+    /// The signature is computed over the full canonical bytes including
+    /// `revocation_status`, matching the V2 canonical construction.
+    fn make_signed_attestation_with_revocation(
+        signing_key: &SigningKey,
+        attestation_type: AttestationType,
+        issuer: &str,
+        subject: &str,
+        issued_at: u64,
+        expires_at: Option<u64>,
+        renewal_interval: Option<Duration>,
+        evidence: Option<AttestationEvidence>,
+        revocation_status: RevocationStatus,
     ) -> Attestation {
         let mut attestation = Attestation {
             id: format!("att-{issued_at}"),
@@ -1052,7 +1109,7 @@ mod tests {
             expires_at,
             renewal_interval,
             renewed_at: None,
-            revocation_status: RevocationStatus::Active,
+            revocation_status,
             signature: vec![],
         };
 
@@ -1181,6 +1238,45 @@ mod tests {
         resolver.add_key("did:key:issuer", pubkey_bytes);
         let clock = TestClock::new(1000);
 
+        // Sign the attestation with RevocationStatus::Revoked already set.
+        // This models an issuer who signs the revocation envelope.
+        let attestation = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+            RevocationStatus::Revoked {
+                revoked_at: 950,
+                reason: Some("compromised".to_owned()),
+                revoked_by: "did:key:issuer".into(),
+            },
+        );
+
+        let result = verify_attestation(&attestation, &resolver, &clock);
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevoked {
+                revoked_at: 950, ..
+            }) => {}
+            other => panic!("expected AttestationRevoked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_attestation_rejects_tampered_revocation_status() {
+        // An attestation signed as Active, then mutated to Revoked by an
+        // intermediary, must fail signature verification (not reach the
+        // revocation check). This proves revocation_status is in the
+        // signed scope.
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
         let mut attestation = make_signed_attestation(
             &signing_key,
             AttestationType::Endorsement,
@@ -1192,19 +1288,20 @@ mod tests {
             None,
         );
 
+        // Tamper: flip Active -> Revoked without re-signing.
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 950,
-            reason: Some("compromised".to_owned()),
+            reason: Some("tampered".to_owned()),
             revoked_by: "did:key:issuer".into(),
         };
 
         let result = verify_attestation(&attestation, &resolver, &clock);
         assert!(result.is_err());
         match result {
-            Err(TrustError::AttestationRevoked {
-                revoked_at: 950, ..
-            }) => {}
-            other => panic!("expected AttestationRevoked, got {other:?}"),
+            Err(TrustError::AttestationSignatureInvalid { .. }) => {}
+            other => panic!(
+                "expected AttestationSignatureInvalid (tampered revocation_status), got {other:?}"
+            ),
         }
     }
 
@@ -1857,6 +1954,45 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // revocation_status in signed scope tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_bytes_differ_for_active_vs_revoked() {
+        let active = Attestation {
+            id: "att-1".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
+            claim: serde_json::json!({"test": true}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(2000),
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let revoked = Attestation {
+            revocation_status: RevocationStatus::Revoked {
+                revoked_at: 1500,
+                reason: Some("compromised".to_owned()),
+                revoked_by: "did:key:issuer".into(),
+            },
+            ..active.clone()
+        };
+
+        let bytes_active = canonical_attestation_bytes(&active).unwrap();
+        let bytes_revoked = canonical_attestation_bytes(&revoked).unwrap();
+        assert_ne!(
+            bytes_active, bytes_revoked,
+            "revocation_status must be in the signed scope: Active and Revoked \
+             must produce different canonical bytes"
+        );
+    }
+
     // --- ThresholdRequirement NaN / Infinity guard tests ---
 
     #[test]
@@ -2045,5 +2181,44 @@ mod tests {
         assert!((t.shared_context_penalty() - 0.15).abs() < f64::EPSILON);
         assert!((t.shared_context_penalty_cap() - 0.6).abs() < f64::EPSILON);
         assert!((t.mutual_endorsement_penalty() - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn verify_attestation_rejects_revoked_by_non_issuer() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        // Sign the attestation with revoked_by pointing to a non-issuer DID.
+        // The issuer signs this envelope (so the signature is valid), but the
+        // revoked_by field doesn't match the issuer -- this must be rejected.
+        let attestation = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+            RevocationStatus::Revoked {
+                revoked_at: 950,
+                reason: Some("unauthorized".to_owned()),
+                revoked_by: "did:key:attacker".into(),
+            },
+        );
+
+        let result = verify_attestation(&attestation, &resolver, &clock);
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevocationInvalid {
+                revoked_by, issuer, ..
+            }) => {
+                assert_eq!(revoked_by, "did:key:attacker");
+                assert_eq!(issuer, "did:key:issuer");
+            }
+            other => panic!("expected AttestationRevocationInvalid, got {other:?}"),
+        }
     }
 }

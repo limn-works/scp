@@ -1182,7 +1182,7 @@ fn domain_separators_are_all_unique() {
         "SCP-KEY-CONTINUITY-V1:",
         "SCP-CLAIM-V1:",
         "SCP-PROPOSAL-V1:",
-        "SCP-ATTESTATION-V1:",
+        "SCP-ATTESTATION-V2:",
         "SCP-PSEUDONYM-V1:",
         "SCP-OFFER-ID-V1:",
         "SCP-ATTESTATION-ID-V1:",
