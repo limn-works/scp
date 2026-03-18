@@ -423,17 +423,25 @@ impl NodeHandle {
     /// Starts the HTTP server in the background on the given bind address.
     ///
     /// Defaults to `127.0.0.1:8443` (loopback only) when `bind_addr` is `None`.
-    /// Returns the actual bound address as a string (e.g., `"127.0.0.1:8443"`).
+    /// Returns the actual bound address as a raw string (e.g., `"127.0.0.1:8443"`).
+    /// Use [`http_url`](NodeHandle::http_url) for the full URL form
+    /// (`"http://127.0.0.1:8443"`).
+    ///
+    /// **Note:** The background server does not support TLS. For production
+    /// deployments requiring encryption, use the node binary's `serve()`
+    /// with TLS configuration.
     ///
     /// Throws if the server is already running or binding fails.
     pub async fn serve(&self, bind_addr: Option<String>) -> Result<String, ScpError> {
         let addr = bind_addr
             .map(|s| {
-                s.parse::<std::net::SocketAddr>()
-                    .map_err(|_| ScpError::Validation {
-                        msg: format!("invalid bind_addr: {s}"),
+                s.parse::<std::net::SocketAddr>().map_err(|_| {
+                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    ScpError::Validation {
+                        msg: format!("invalid bind_addr: {display}"),
                         code: "SCP-TRANS-5070".to_owned(),
-                    })
+                    }
+                })
             })
             .transpose()?;
         self.inner

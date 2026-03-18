@@ -401,7 +401,13 @@ impl PyNodeHandle {
     /// If ``bind_addr`` is ``None``, defaults to ``127.0.0.1:8443``
     /// (loopback only). Pass ``"0.0.0.0:PORT"`` for network access.
     ///
-    /// Returns the actual bound address as a string (e.g., ``"127.0.0.1:8443"``).
+    /// Returns the actual bound address as a raw string (e.g.,
+    /// ``"127.0.0.1:8443"``). Use :meth:`http_url` for the full URL form
+    /// (``"http://127.0.0.1:8443"``).
+    ///
+    /// **Note:** The background server does not support TLS. For production
+    /// deployments requiring encryption, use the node binary's ``serve()``
+    /// with TLS configuration.
     ///
     /// Raises ``RuntimeError`` if the server is already running or binding fails.
     #[pyo3(signature = (bind_addr=None))]
@@ -409,7 +415,10 @@ impl PyNodeHandle {
         let addr = bind_addr
             .map(|s| {
                 s.parse::<std::net::SocketAddr>().map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!("invalid bind_addr: {e}"))
+                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid bind_addr \"{display}\": {e}"
+                    ))
                 })
             })
             .transpose()?;
@@ -422,7 +431,10 @@ impl PyNodeHandle {
     }
 
     /// Returns the HTTP URL of the background server, or ``None`` if not serving.
-    #[getter]
+    ///
+    /// Returns the literal bind address, which may contain ``0.0.0.0`` if the
+    /// server was bound to the unspecified address.
+    #[pyo3(name = "http_url")]
     fn http_url(&self, py: Python<'_>) -> PyResult<Option<String>> {
         let rt = crate::runtime()?;
         Ok(py.allow_threads(|| rt.block_on(self.inner.http_url())))

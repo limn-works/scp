@@ -300,6 +300,10 @@ class Node internal constructor(
      * Defaults to `127.0.0.1:8443` (loopback only) when [bindAddr] is null.
      * Pass `"0.0.0.0:PORT"` for network access.
      *
+     * **Note:** The background server does not support TLS. All HTTP traffic is
+     * plaintext. For production deployments requiring encryption, use the node
+     * binary's `serve()` with TLS configuration.
+     *
      * @param bindAddr Socket address to bind (e.g. `"127.0.0.1:8080"`).
      * @return The actual bound address as a string.
      * @throws BridgeException if the server is already running or binding fails.
