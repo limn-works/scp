@@ -161,7 +161,7 @@ The following platforms are supported for identity link attestations. New provid
 **`ChallengeResponse` creation flow:**
 1. A verifier sends a random 32-byte challenge to the subject.
 2. The subject signs the challenge with their SCP signing key (`#active` or `#agent`).
-3. The SDK constructs the proof: `{ "challenge": "<hex>", "response_signature": "<hex>", "verifier_did": "<did>", "verified_at": <unix_s> }`.
+3. The SDK constructs the proof: `{ "challenge": "<hex>", "response_signature": "<hex>" }`.
 4. The full `IdentityLinkAttestation` envelope is signed by the subject's DID key.
 
 **`ChallengeResponse` verification:** Verify `response_signature` is valid for `challenge` under the subject's DID signing key. Verify `verifier_did` is a known, trusted verifier.
@@ -202,6 +202,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
     proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
+                                     // Verifiers MUST use this string as-is in signature scope — do not parse and re-serialize
     verified_at:    u64,         // Unix timestamp (s) of last verification
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
