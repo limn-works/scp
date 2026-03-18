@@ -146,6 +146,14 @@ class Node:
         """The node's DID string (e.g. ``did:dht:z6Mk...``)."""
         return self._handle.did  # type: ignore[no-any-return]
 
+    async def http_url(self) -> str | None:
+        """Return the HTTP URL of the background server, or ``None`` if not serving.
+
+        Returns the literal bind address, which may contain ``0.0.0.0`` if the
+        server was bound to the unspecified address.
+        """
+        return await asyncio.to_thread(self._handle.http_url)  # type: ignore[no-any-return]
+
     @property
     def is_shutdown(self) -> bool:
         """``True`` if :meth:`shutdown` has already been called."""
@@ -174,6 +182,32 @@ class Node:
         handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir)
         return Node(handle)
 
+    async def serve(self, bind_addr: str | None = None) -> str:
+        """Start the HTTP server in the background.
+
+        If ``bind_addr`` is ``None``, defaults to ``127.0.0.1:8443``
+        (loopback only). Pass ``"0.0.0.0:PORT"`` for network access.
+
+        Returns the actual bound address as a raw string (e.g.
+        ``"127.0.0.1:8080"``). Use :meth:`http_url` for the full URL
+        form (``"http://127.0.0.1:8080"``).
+
+        Note: The background server does not support TLS. For production
+        deployments requiring encryption, use the node binary's
+        ``serve()`` with TLS configuration.
+
+        Args:
+            bind_addr: Socket address to bind (e.g. ``"127.0.0.1:8080"``).
+
+        Returns:
+            The actual bound address as a string (e.g. ``"127.0.0.1:8080"``).
+
+        Raises:
+            RuntimeError: If the server is already running or binding fails.
+            ValueError: If ``bind_addr`` is not a valid socket address.
+        """
+        return await asyncio.to_thread(self._handle.serve, bind_addr)  # type: ignore[no-any-return]
+
     async def shutdown(self) -> None:
         """Signal the node to stop (relay + background tasks).
 
@@ -191,37 +225,50 @@ class Node:
     async def enable_site_projection(
         self,
         context_id: str,
-        broadcast_key_hex: str,
-        author_did: str,
         admission: str,
         config: SiteConfig,
+        broadcast_key_hex: str | None = None,
+        author_did: str | None = None,
     ) -> None:
         """Activate HTTP broadcast projection for a context.
 
         Registers a broadcast context for HTTP content delivery.
 
+        When ``broadcast_key_hex`` and ``author_did`` are ``None``, the
+        key is auto-resolved from the ``ContextManager`` using the
+        node's identity DID. This is the recommended usage for locally
+        managed contexts.
+
         Args:
             context_id: The context ID to project.
-            broadcast_key_hex: 32-byte AES-256 broadcast key as a
-                64-character hex string.
-            author_did: DID of the broadcast key owner.
             admission: ``"open"`` or ``"gated"``.
             config: :class:`~scp_sdk.context.SiteConfig` with hostname,
                 index path, and deploy limits.
+            broadcast_key_hex: 32-byte AES-256 broadcast key as a
+                64-character hex string, or ``None`` for auto-lookup.
+            author_did: DID of the broadcast key owner, or ``None``
+                for auto-lookup.
 
         Raises:
-            ValueError: If parameters are invalid.
-            RuntimeError: If the underlying node operation fails.
+            ValueError: If parameters are invalid or only one of
+                ``broadcast_key_hex``/``author_did`` is provided.
+            RuntimeError: If the underlying node operation fails or
+                auto-lookup cannot find the key.
         """
         validate_admission(admission)
-        validate_broadcast_key_hex(broadcast_key_hex)
+        if (broadcast_key_hex is None) != (author_did is None):
+            raise ValueError(
+                "broadcast_key_hex and author_did must both be provided or both be omitted"
+            )
+        if broadcast_key_hex is not None:
+            validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(
             self._handle.enable_site_projection,
             context_id,
-            broadcast_key_hex,
-            author_did,
             admission,
             config.hostname,
+            broadcast_key_hex,
+            author_did,
             config.index_path if config.index_path != "/index.html" else None,
             config.max_assets_per_deploy if config.max_assets_per_deploy != 10_000 else None,
             config.max_deploy_size_bytes if config.max_deploy_size_bytes != 536_870_912 else None,

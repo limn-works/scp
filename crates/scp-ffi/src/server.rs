@@ -142,9 +142,13 @@ impl PyNodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// Registers a broadcast context for HTTP content delivery. The
-    /// ``broadcast_key_hex`` is the 32-byte AES-256 broadcast key as a
-    /// 64-character hex string. ``author_did`` is the DID of the key owner.
+    /// Registers a broadcast context for HTTP content delivery.
+    ///
+    /// When ``broadcast_key_hex`` and ``author_did`` are ``None``, the key
+    /// is auto-resolved from the ``ContextManager`` using the node's
+    /// identity DID. This is the recommended usage for locally managed
+    /// contexts.
+    ///
     /// ``admission`` is ``"open"`` or ``"gated"``.
     ///
     /// Site configuration fields:
@@ -154,16 +158,16 @@ impl PyNodeHandle {
     /// - ``max_deploy_size_bytes``: max total deploy size in bytes (default 536870912).
     /// - ``deploy_retention_count``: deploys to retain (default 2, max 8).
     /// - ``csp_override``: optional Content-Security-Policy override.
-    #[pyo3(signature = (context_id, broadcast_key_hex, author_did, admission, hostname, index_path=None, max_assets_per_deploy=None, max_deploy_size_bytes=None, deploy_retention_count=None, csp_override=None))]
+    #[pyo3(signature = (context_id, admission, hostname, broadcast_key_hex=None, author_did=None, index_path=None, max_assets_per_deploy=None, max_deploy_size_bytes=None, deploy_retention_count=None, csp_override=None))]
     #[allow(clippy::too_many_arguments)]
     fn enable_site_projection(
         &self,
         py: Python<'_>,
         context_id: String,
-        broadcast_key_hex: String,
-        author_did: String,
         admission: String,
         hostname: String,
+        broadcast_key_hex: Option<String>,
+        author_did: Option<String>,
         index_path: Option<String>,
         max_assets_per_deploy: Option<usize>,
         max_deploy_size_bytes: Option<u64>,
@@ -171,23 +175,62 @@ impl PyNodeHandle {
         csp_override: Option<String>,
     ) -> PyResult<()> {
         crate::validate::validate_context_id(&context_id)?;
-        crate::validate::validate_did(&author_did)?;
+        if let Some(ref did) = author_did {
+            crate::validate::validate_did(did)?;
+        }
         let rt = crate::runtime()?;
 
-        let key_vec = Zeroizing::new(hex::decode(&broadcast_key_hex).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid broadcast_key_hex: {e}"))
-        })?);
-        let key_bytes: Zeroizing<[u8; 32]> =
-            Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                )
-            })?);
+        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
+        let (resolved_key_bytes, resolved_epoch, resolved_author_did) = match (
+            broadcast_key_hex,
+            author_did,
+        ) {
+            (Some(key_hex), Some(did)) => {
+                let key_hex = Zeroizing::new(key_hex);
+                let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid broadcast_key_hex: {e}"
+                    ))
+                })?);
+                let key_bytes: Zeroizing<[u8; 32]> =
+                    Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
+                        )
+                    })?);
+                // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
+                (key_bytes, 0u64, did)
+            }
+            (None, None) => {
+                // Auto-resolve from ContextManager using node's identity DID.
+                let node_did = self.inner.did().to_owned();
+                let mgr = crate::runtime::context_manager().map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "broadcast key auto-lookup failed: {e}"
+                    ))
+                })?;
+                let (key_bytes, epoch) = py.allow_threads(|| {
+                        rt.block_on(mgr.get_broadcast_key_for_local_author(&context_id, &node_did))
+                            .map_err(|e| {
+                                tracing::debug!(error = %e, "broadcast key auto-resolve failed");
+                                pyo3::exceptions::PyRuntimeError::new_err(
+                                    "broadcast key auto-resolve failed: not authorized for this context",
+                                )
+                            })
+                    })?;
+                (key_bytes, epoch, node_did)
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "broadcast_key_hex and author_did must both be provided or both be None",
+                ));
+            }
+        };
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
-            0,
-            author_did,
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
+            resolved_epoch,
+            resolved_author_did,
         );
 
         let adm = match admission.to_lowercase().as_str() {
@@ -278,6 +321,50 @@ impl PyNodeHandle {
             rt.block_on(self.inner.disable_broadcast_projection(&context_id));
             Ok(())
         })
+    }
+
+    /// Starts the HTTP server in the background on the given bind address.
+    ///
+    /// If ``bind_addr`` is ``None``, defaults to ``127.0.0.1:8443``
+    /// (loopback only). Pass ``"0.0.0.0:PORT"`` for network access.
+    ///
+    /// Returns the actual bound address as a raw string (e.g.,
+    /// ``"127.0.0.1:8443"``). Use :meth:`http_url` for the full URL form
+    /// (``"http://127.0.0.1:8443"``).
+    ///
+    /// **Note:** The background server does not support TLS. For production
+    /// deployments requiring encryption, use the node binary's ``serve()``
+    /// with TLS configuration.
+    ///
+    /// Raises ``RuntimeError`` if the server is already running or binding fails.
+    #[pyo3(signature = (bind_addr=None))]
+    fn serve(&self, py: Python<'_>, bind_addr: Option<String>) -> PyResult<String> {
+        let addr = bind_addr
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>().map_err(|e| {
+                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid bind_addr \"{display}\": {e}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            rt.block_on(self.inner.serve_background(addr))
+                .map(|a| a.to_string())
+                .map_err(node_err)
+        })
+    }
+
+    /// Returns the HTTP URL of the background server, or ``None`` if not serving.
+    ///
+    /// Returns the literal bind address, which may contain ``0.0.0.0`` if the
+    /// server was bound to the unspecified address.
+    #[pyo3(name = "http_url")]
+    fn http_url(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let rt = crate::runtime()?;
+        Ok(py.allow_threads(|| rt.block_on(self.inner.http_url())))
     }
 
     fn __repr__(&self) -> String {
@@ -544,6 +631,32 @@ mod tests {
 
         // disable
         rt().block_on(inner.disable_broadcast_projection("dispatch-ctx"));
+
+        inner.shutdown();
+    }
+
+    #[test]
+    fn serve_background_dispatches_through_node_inner() {
+        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let inner = RunningNode::InMemory(node);
+
+        // serve_background with port 0 (OS-assigned)
+        let addr = rt()
+            .block_on(inner.serve_background(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))))
+            .unwrap();
+
+        assert_ne!(addr.port(), 0, "should bind to a real port");
+        assert!(addr.ip().is_loopback());
+
+        // http_url should return Some
+        let url = rt().block_on(inner.http_url());
+        assert!(url.is_some(), "http_url should be Some after serve");
+
+        // Double serve should fail
+        let result = rt().block_on(
+            inner.serve_background(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))),
+        );
+        assert!(result.is_err(), "double serve should fail");
 
         inner.shutdown();
     }

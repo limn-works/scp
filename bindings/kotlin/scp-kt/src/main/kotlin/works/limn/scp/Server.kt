@@ -69,12 +69,15 @@ interface ServerBindings {
     /**
      * Activates HTTP broadcast projection for a context.
      *
+     * When [broadcastKeyHex] and [authorDid] are `null`, the key is
+     * auto-resolved from the `ContextManager` using the node's identity DID.
+     *
      * @param handleJson JSON-encoded node handle.
      * @param contextId The context ID to project.
-     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string.
-     * @param authorDid DID of the broadcast key owner.
      * @param admission "open" or "gated".
      * @param hostname Virtual host hostname (RFC 1123).
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string, or null for auto-lookup.
+     * @param authorDid DID of the broadcast key owner, or null for auto-lookup.
      * @param indexPath Default path for directory requests, or null for default "/index.html".
      * @param maxAssetsPerDeploy Max assets per deploy, or null for default 10000.
      * @param maxDeploySizeBytes Max total deploy size in bytes, or null for default 536870912.
@@ -85,10 +88,10 @@ interface ServerBindings {
     fun nodeEnableSiteProjection(
         handleJson: String,
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         hostname: String,
+        broadcastKeyHex: String?,
+        authorDid: String?,
         indexPath: String?,
         maxAssetsPerDeploy: Int?,
         maxDeploySizeBytes: Long?,
@@ -122,6 +125,23 @@ interface ServerBindings {
      * @param contextId The context ID to stop projecting.
      */
     fun nodeDisableSiteProjection(handleJson: String, contextId: String)
+
+    /**
+     * Starts the HTTP server in the background.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @param bindAddr Socket address to bind (e.g. "127.0.0.1:8080"), or null for default.
+     * @return The actual bound address as a string.
+     */
+    fun nodeServe(handleJson: String, bindAddr: String?): String
+
+    /**
+     * Returns the HTTP URL of the background server.
+     *
+     * @param handleJson JSON-encoded node handle.
+     * @return The HTTP URL, or null if not serving.
+     */
+    fun nodeHttpUrl(handleJson: String): String?
 }
 
 /**
@@ -275,6 +295,31 @@ class Node internal constructor(
         runBlocking { shutdown() }
     }
 
+    // HTTP server lifecycle
+
+    /**
+     * Starts the HTTP server in the background.
+     *
+     * Defaults to `127.0.0.1:8443` (loopback only) when [bindAddr] is null.
+     * Pass `"0.0.0.0:PORT"` for network access.
+     *
+     * **Note:** The background server does not support TLS. All HTTP traffic is
+     * plaintext. For production deployments requiring encryption, use the node
+     * binary's `serve()` with TLS configuration.
+     *
+     * @param bindAddr Socket address to bind (e.g. `"127.0.0.1:8080"`).
+     * @return The actual bound address as a string.
+     * @throws BridgeException if the server is already running or binding fails.
+     */
+    suspend fun serve(bindAddr: String? = null): String =
+        bridge.serve(this, bindAddr)
+
+    /**
+     * Returns the HTTP URL of the background server, or null if not serving.
+     */
+    suspend fun httpUrl(): String? =
+        bridge.httpUrl(this)
+
     // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 
     /**
@@ -282,23 +327,32 @@ class Node internal constructor(
      *
      * Registers a broadcast context for HTTP content delivery.
      *
+     * When [broadcastKeyHex] and [authorDid] are `null`, the key is
+     * auto-resolved from the `ContextManager` using the node's identity
+     * DID. This is the recommended usage for locally managed contexts.
+     *
      * @param contextId The context ID to project.
-     * @param broadcastKeyHex 32-byte AES-256 broadcast key as a 64-char hex string.
-     * @param authorDid DID of the broadcast key owner.
      * @param admission "open" or "gated".
      * @param config [SiteConfig] with hostname, index path, and deploy limits.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as a 64-char hex string, or null for auto-lookup.
+     * @param authorDid DID of the broadcast key owner, or null for auto-lookup.
      * @throws BridgeException if parameters are invalid or operation fails.
      */
     @Suppress("LongParameterList")
     suspend fun enableSiteProjection(
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         config: SiteConfig,
+        broadcastKeyHex: String? = null,
+        authorDid: String? = null,
     ) {
         validateAdmission(admission)
-        validateBroadcastKeyHex(broadcastKeyHex)
+        require((broadcastKeyHex == null) == (authorDid == null)) {
+            "broadcastKeyHex and authorDid must both be provided or both be omitted"
+        }
+        if (broadcastKeyHex != null) {
+            validateBroadcastKeyHex(broadcastKeyHex)
+        }
         bridge.enableSiteProjection(
             this,
             contextId,
@@ -482,6 +536,33 @@ class ServerBridge internal constructor(
             bindings.nodeShutdown(node.handleJson)
         }
 
+    // HTTP server lifecycle
+
+    /**
+     * Starts the HTTP server in the background.
+     *
+     * @param node The running node.
+     * @param bindAddr Socket address to bind, or null for default.
+     * @return The actual bound address as a string.
+     */
+    internal suspend fun serve(
+        node: Node,
+        bindAddr: String?,
+    ): String = bridge.ffiCall {
+        bindings.nodeServe(node.handleJson, bindAddr)
+    }
+
+    /**
+     * Returns the HTTP URL of the background server, or null if not serving.
+     *
+     * @param node The running node.
+     */
+    internal suspend fun httpUrl(
+        node: Node,
+    ): String? = bridge.ffiCall {
+        bindings.nodeHttpUrl(node.handleJson)
+    }
+
     // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 
     /**
@@ -489,8 +570,8 @@ class ServerBridge internal constructor(
      *
      * @param node The running node.
      * @param contextId The context ID to project.
-     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string.
-     * @param authorDid DID of the broadcast key owner.
+     * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string, or null for auto-lookup.
+     * @param authorDid DID of the broadcast key owner, or null for auto-lookup.
      * @param admission "open" or "gated".
      * @param config [SiteConfig] with hostname, index path, and deploy limits.
      */
@@ -498,18 +579,18 @@ class ServerBridge internal constructor(
     internal suspend fun enableSiteProjection(
         node: Node,
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
+        broadcastKeyHex: String?,
+        authorDid: String?,
         admission: String,
         config: SiteConfig,
     ) = bridge.ffiCall {
         bindings.nodeEnableSiteProjection(
             node.handleJson,
             contextId,
-            broadcastKeyHex,
-            authorDid,
             admission,
             config.hostname,
+            broadcastKeyHex,
+            authorDid,
             if (config.indexPath == "/index.html") null else config.indexPath,
             if (config.maxAssetsPerDeploy == 10_000) null else config.maxAssetsPerDeploy,
             if (config.maxDeploySizeBytes == 536_870_912L) null else config.maxDeploySizeBytes,

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -188,6 +188,18 @@ pub struct NodeState {
     /// When `None` (no-domain or self-signed mode), no challenge router is
     /// mounted.
     pub(crate) acme_challenges: Option<Arc<RwLock<HashMap<String, String>>>>,
+
+    /// Hostname-to-routing-id index for virtual host routing.
+    ///
+    /// Maps lowercase hostnames (no port) to routing IDs so that incoming
+    /// requests with a matching `Host` header are internally rewritten to
+    /// the corresponding `/scp/broadcast/<routing_id_hex>/site/<path>` route.
+    /// Populated by `enable_broadcast_projection_with_site()` and depopulated
+    /// by `disable_broadcast_projection()`.
+    ///
+    /// LOCK ORDERING: Always acquire `projected_contexts` before `hostname_index`.
+    /// Read locks on `hostname_index` must be dropped before accessing `projected_contexts`.
+    pub(crate) hostname_index: RwLock<HashMap<String, [u8; 32]>>,
 
     /// Shared state for bridge shadow operations.
     ///
@@ -591,14 +603,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             self.state.shutdown_token.clone(),
         );
 
-        let cors = build_cors_layer(&self.state.cors_origins);
-
-        // Apply CORS to public endpoints only. The WebSocket relay endpoint
-        // uses its own origin mechanism; the dev API is localhost-only.
-        let well_known = well_known_router(Arc::clone(&self.state)).layer(cors.clone());
-        let relay_rt = relay_router(Arc::clone(&self.state));
-        let projection =
-            crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
+        // Build the full merged router via the shared helper.
+        let merged = self.build_scp_router(app_router);
 
         let dev_router = self
             .state
@@ -610,23 +616,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         #[cfg(feature = "http3")]
         let http3_config = self.http3_config;
 
-        let (bridge, bridge_webhook) =
-            build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
         let relay = self.relay;
         let state = self.state;
-
-        // SCP routes take precedence: merge them last so they override
-        // any conflicting paths in app_router. ACME challenge router is
-        // included for renewal support (issue #305).
-        let merged = build_merged_router(
-            app_router,
-            well_known,
-            relay_rt,
-            projection,
-            bridge,
-            bridge_webhook,
-            state.acme_challenges.as_ref(),
-        );
 
         let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 
@@ -713,7 +704,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 /// mode), both are mounted without authentication.
 ///
 /// See spec section 12.10.2.
-fn build_bridge_routers(
+pub(crate) fn build_bridge_routers(
     bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
     bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
 ) -> (Router, Router) {
@@ -745,14 +736,23 @@ fn build_bridge_routers(
 /// Builds the merged axum router for `serve()`, combining SCP protocol
 /// routes (well-known, relay, projection, ACME challenges) with the
 /// application router. Extracted from `serve()` for clippy line limits.
-fn build_merged_router(
+///
+/// Virtual host routing is implemented via a fallback handler that checks
+/// incoming `Host` headers against registered site hostnames and internally
+/// dispatches to the projection site handler. This runs *before* the default
+/// 404, catching requests that did not match any explicit route.
+///
+/// **Note:** In axum 0.8, `Router::layer()` runs *after* routing and cannot
+/// rewrite request URIs. Virtual host routing therefore uses `Router::fallback`
+/// instead of middleware.
+pub(crate) fn build_merged_router(
     app_router: Router,
     well_known: Router,
     relay_rt: Router,
     projection: Router,
     bridge: Router,
     bridge_webhook: Router,
-    acme_challenges: Option<&Arc<RwLock<HashMap<String, String>>>>,
+    state: &Arc<NodeState>,
 ) -> Router {
     let merged = app_router
         .merge(well_known)
@@ -764,11 +764,111 @@ fn build_merged_router(
     // Mount ACME challenge router for renewal challenges (issue #305).
     // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can
     // validate domain ownership during certificate renewal.
-    if let Some(challenges) = acme_challenges {
+    let merged = if let Some(challenges) = &state.acme_challenges {
         merged.merge(tls::acme_challenge_router(Arc::clone(challenges)))
     } else {
         merged
+    };
+
+    // Virtual host fallback: when no explicit route matches, check if the
+    // Host header maps to a registered site hostname. If so, internally
+    // rewrite the URI and dispatch to the projection site handler.
+    let vhost_state = Arc::clone(state);
+    merged.fallback(move |req: axum::extract::Request| {
+        virtual_host_fallback(req, Arc::clone(&vhost_state))
+    })
+}
+
+/// Virtual host routing fallback.
+///
+/// Called for requests that did not match any explicit route. Reads the
+/// `Host` header, strips the port, lowercases it, and looks it up in
+/// [`NodeState::hostname_index`]. If a match is found, dispatches directly
+/// to [`site_handler`](crate::projection::site_handler) with the resolved
+/// routing ID and original request path.
+///
+/// If no match is found, returns 404.
+///
+/// **Security:** This is an internal dispatch only — no HTTP redirect is
+/// issued. The dispatched path passes through `ContentPath` validation in
+/// `site_handler`, which prevents path traversal.
+///
+/// CORS headers are intentionally not applied — virtual host sites are served
+/// same-origin. Cross-origin access should use the explicit `/scp/broadcast/`
+/// routes which include CORS.
+async fn virtual_host_fallback(
+    req: axum::extract::Request,
+    state: Arc<NodeState>,
+) -> axum::response::Response {
+    // site_handler only serves GET content; reject other methods early
+    // (before rate limiter check, to avoid wasting tokens).
+    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
+        return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Enforce the same per-IP rate limit that protects the explicit
+    // `/scp/broadcast/` projection routes. Without this, virtual-host
+    // requests would bypass `projection_rate_limit_middleware`.
+    let remote_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map_or(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            |ci| ci.0.ip(),
+        );
+    if !state.projection_rate_limiter.check(remote_ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+
+    // Extract the Host header value.
+    let host_value = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+
+    let Some(host_raw) = host_value else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // Strip port and lowercase.
+    // IPv6 bracket notation (e.g., "[::1]:8080") requires finding the closing
+    // bracket first; plain hostnames/IPv4 just split on ':'.
+    let hostname = if host_raw.starts_with('[') {
+        // IPv6 bracket notation: find closing bracket
+        host_raw.find(']').map_or(host_raw, |i| &host_raw[..=i])
+    } else {
+        // IPv4 or plain hostname: strip optional ":port"
+        host_raw.split(':').next().unwrap_or(host_raw)
+    }
+    .to_ascii_lowercase();
+
+    // Look up in the hostname index.
+    let routing_id = {
+        let index = state.hostname_index.read().await;
+        index.get(&hostname).copied()
+    };
+
+    let Some(routing_id) = routing_id else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let routing_id_hex = crate::projection::hex_encode(&routing_id);
+
+    // Extract the original path and strip leading '/'.
+    let original_path = req.uri().path();
+    let site_path = original_path
+        .strip_prefix('/')
+        .unwrap_or(original_path)
+        .to_owned();
+
+    // Dispatch directly to site_handler with the resolved routing ID and path.
+    crate::projection::site_handler(
+        State(state),
+        Path((routing_id_hex, site_path)),
+        req.headers().clone(),
+    )
+    .await
+    .into_response()
 }
 
 /// Spawns the dev API listener if configured.
@@ -841,7 +941,7 @@ fn build_main_server(
 ///
 /// Evicts stale per-IP token buckets every 60 seconds (buckets idle for more
 /// than 300 seconds). Runs until `shutdown_token` is cancelled.
-fn spawn_projection_rate_limit_cleanup(
+pub(crate) fn spawn_projection_rate_limit_cleanup(
     limiter: PublishRateLimiter,
     shutdown_token: CancellationToken,
 ) {
@@ -913,6 +1013,7 @@ mod tests {
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
+            hostname_index: RwLock::new(HashMap::new()),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
         })
@@ -1022,6 +1123,384 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(methods.contains("GET"), "should allow GET method");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual host routing tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod vhost_tests {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+    use zeroize::Zeroizing;
+
+    use scp_core::context::broadcast::BroadcastAdmission;
+    use scp_core::context::broadcast_content::{
+        BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, ContentPath, MimeType,
+    };
+    use scp_core::crypto::sender_keys::generate_broadcast_key;
+    use scp_transport::native::storage::{BlobStorageBackend, InMemoryBlobStorage};
+
+    use crate::http::NodeState;
+    use crate::projection::test_helpers::store_content_blob;
+    use crate::projection::{
+        ProjectedContext, SiteConfig, broadcast_projection_router, hex_encode,
+    };
+
+    /// Creates a test `NodeState` with the given projected contexts, blob
+    /// storage, and hostname index.
+    fn test_state_with_vhost(
+        projected: HashMap<[u8; 32], ProjectedContext>,
+        storage: InMemoryBlobStorage,
+        hostname_index: HashMap<String, [u8; 32]>,
+    ) -> Arc<NodeState> {
+        Arc::new(NodeState {
+            did: "did:dht:vhost_test".to_owned(),
+            relay_url: "wss://localhost/scp/v1".to_owned(),
+            broadcast_contexts: RwLock::new(HashMap::new()),
+            relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+            bridge_secret: Zeroizing::new([0u8; 32]),
+            dev_token: None,
+            dev_bind_addr: None,
+            projected_contexts: RwLock::new(projected),
+            blob_storage: Arc::new(BlobStorageBackend::from(storage)),
+            relay_config: scp_transport::native::server::RelayConfig::default(),
+            start_time: Instant::now(),
+            http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            cors_origins: None,
+            projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
+                1000,
+            ),
+            projection_ucan_cache: std::sync::RwLock::new(
+                crate::projection::ProjectionUcanCache::new(),
+            ),
+            tls_config: None,
+            cert_resolver: None,
+            did_document: scp_identity::document::DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:vhost_test".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
+            subscription_registry: scp_transport::relay::subscription::new_registry(),
+            acme_challenges: None,
+            hostname_index: RwLock::new(hostname_index),
+            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
+            bridge_lookup: None,
+        })
+    }
+
+    /// Sets up a projected context with site config and a deployed index.html,
+    /// returning (state, `routing_id`).
+    async fn setup_site_context(hostname: &str, ctx_id: &str) -> (Arc<NodeState>, [u8; 32]) {
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut projected =
+            ProjectedContext::new(ctx_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: hostname.to_owned(),
+            ..SiteConfig::default()
+        });
+        let routing_id = *projected.routing_id();
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("deploy-1".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>Hello from vhost</h1>".to_vec(),
+        };
+
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, blob_id);
+        projected.commit_deploy("deploy-1".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let mut hostname_index = HashMap::new();
+        hostname_index.insert(hostname.to_ascii_lowercase(), routing_id);
+
+        let state = test_state_with_vhost(projected_map, storage, hostname_index);
+        (state, routing_id)
+    }
+
+    /// Builds a router with virtual host fallback applied, matching the
+    /// production `build_merged_router` behavior.
+    fn build_vhost_router(state: &Arc<NodeState>) -> axum::Router {
+        let projection = broadcast_projection_router(Arc::clone(state));
+        let vhost_state = Arc::clone(state);
+        projection.fallback(move |req: axum::extract::Request| {
+            super::virtual_host_fallback(req, Arc::clone(&vhost_state))
+        })
+    }
+
+    #[tokio::test]
+    async fn vhost_routes_to_correct_context_content() {
+        let (state, _routing_id) = setup_site_context("mysite.example.com", "vhost_ctx_1").await;
+        let router = build_vhost_router(&state);
+
+        // Request with Host header matching the registered hostname.
+        let req = Request::builder()
+            .uri("/index.html")
+            .header("Host", "mysite.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"<h1>Hello from vhost</h1>");
+    }
+
+    #[tokio::test]
+    async fn vhost_strips_port() {
+        let (state, _routing_id) = setup_site_context("localhost", "vhost_port_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // Host: localhost:8080 should match "localhost".
+        let req = Request::builder()
+            .uri("/index.html")
+            .header("Host", "localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"<h1>Hello from vhost</h1>");
+    }
+
+    #[tokio::test]
+    async fn vhost_case_insensitive() {
+        let (state, _routing_id) = setup_site_context("localhost", "vhost_case_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // Host: LOCALHOST should match "localhost".
+        let req = Request::builder()
+            .uri("/index.html")
+            .header("Host", "LOCALHOST")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn vhost_unknown_host_falls_through() {
+        let (state, _routing_id) =
+            setup_site_context("mysite.example.com", "vhost_unknown_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // Unknown hostname should fall through to normal routing (404).
+        let req = Request::builder()
+            .uri("/index.html")
+            .header("Host", "unknown.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn vhost_no_cross_context_routing() {
+        // Set up two contexts with different hostnames and different content.
+        let key_a = generate_broadcast_key("did:dht:alice");
+        let key_b = generate_broadcast_key("did:dht:bob");
+
+        let ctx_id_a = "vhost_cross_a";
+        let ctx_id_b = "vhost_cross_b";
+
+        let mut projected_a =
+            ProjectedContext::new(ctx_id_a, key_a.clone(), BroadcastAdmission::Open, None);
+        projected_a.set_site_config(SiteConfig {
+            hostname: "site-a.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id_a = *projected_a.routing_id();
+
+        let mut projected_b =
+            ProjectedContext::new(ctx_id_b, key_b.clone(), BroadcastAdmission::Open, None);
+        projected_b.set_site_config(SiteConfig {
+            hostname: "site-b.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id_b = *projected_b.routing_id();
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Content for A: "Content A".
+        let bc_a = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("deploy-a".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"Content A".to_vec(),
+        };
+        let blob_id_a = store_content_blob(&storage, routing_id_a, &key_a, &bc_a).await;
+        let path_a = ContentPath::new("/index.html").unwrap();
+        let mut entries_a = HashMap::new();
+        entries_a.insert(path_a, blob_id_a);
+        projected_a.commit_deploy("deploy-a".into(), entries_a);
+
+        // Content for B: "Content B".
+        let bc_b = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("deploy-b".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"Content B".to_vec(),
+        };
+        let blob_id_b = store_content_blob(&storage, routing_id_b, &key_b, &bc_b).await;
+        let path_b = ContentPath::new("/index.html").unwrap();
+        let mut entries_b = HashMap::new();
+        entries_b.insert(path_b, blob_id_b);
+        projected_b.commit_deploy("deploy-b".into(), entries_b);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id_a, projected_a);
+        projected_map.insert(routing_id_b, projected_b);
+
+        let mut hostname_index = HashMap::new();
+        hostname_index.insert("site-a.example.com".to_owned(), routing_id_a);
+        hostname_index.insert("site-b.example.com".to_owned(), routing_id_b);
+
+        let state = test_state_with_vhost(projected_map, storage, hostname_index);
+        let router = build_vhost_router(&state);
+
+        // Request to site-a should return "Content A".
+        let req_a = Request::builder()
+            .uri("/index.html")
+            .header("Host", "site-a.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp_a = router.clone().oneshot(req_a).await.unwrap();
+        assert_eq!(resp_a.status(), axum::http::StatusCode::OK);
+        let body_a = resp_a.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body_a.as_ref(), b"Content A");
+
+        // Request to site-b should return "Content B".
+        let req_b = Request::builder()
+            .uri("/index.html")
+            .header("Host", "site-b.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp_b = router.oneshot(req_b).await.unwrap();
+        assert_eq!(resp_b.status(), axum::http::StatusCode::OK);
+        let body_b = resp_b.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body_b.as_ref(), b"Content B");
+    }
+
+    #[tokio::test]
+    async fn vhost_path_traversal_attempt() {
+        let (state, _routing_id) =
+            setup_site_context("evil.example.com", "vhost_traversal_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // Path traversal attempt: /../../../etc/passwd
+        // The rewritten URI goes through site_handler which validates via
+        // ContentPath, rejecting traversal.
+        let req = Request::builder()
+            .uri("/../../../etc/passwd")
+            .header("Host", "evil.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // ContentPath validation should reject this path and return 404.
+        assert_ne!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn vhost_does_not_rewrite_scp_paths() {
+        let (state, routing_id) =
+            setup_site_context("mysite.example.com", "vhost_scp_path_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // Explicit /scp/ paths should not be rewritten (would cause
+        // double-rewriting). The explicit route should handle it directly.
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header("Host", "mysite.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Should still succeed because the explicit route handles it.
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn vhost_no_host_header_falls_through() {
+        let (state, _routing_id) =
+            setup_site_context("mysite.example.com", "vhost_no_host_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // No Host header: should fall through (404 since no explicit route
+        // matches "/index.html").
+        let req = Request::builder()
+            .uri("/index.html")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn vhost_root_path_maps_to_index() {
+        let (state, _routing_id) = setup_site_context("mysite.example.com", "vhost_root_ctx").await;
+        let router = build_vhost_router(&state);
+
+        // Root path "/" should map to index.html via site_handler.
+        let req = Request::builder()
+            .uri("/")
+            .header("Host", "mysite.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"<h1>Hello from vhost</h1>");
     }
 }
 

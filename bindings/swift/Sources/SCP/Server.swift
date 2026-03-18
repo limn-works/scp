@@ -36,16 +36,37 @@ public enum ServerBridge {
     /// Start a full application node with file-backed storage.
     public typealias NodeStartLocalFn = @Sendable (_ dataDir: String) async throws -> NodeHandle
 
+    /// Start the HTTP server in the background.
+    public typealias ServeFn = @Sendable (
+        _ handle: NodeHandle,
+        _ bindAddr: String?
+    ) async throws -> String
+
+    /// Returns the HTTP URL of the background server, or nil.
+    public typealias HttpUrlFn = @Sendable (
+        _ handle: NodeHandle
+    ) async -> String?
+
+    /// Default serve -- delegates to UniFFI ``NodeHandle.serve()``.
+    public static let defaultServe: ServeFn = { handle, bindAddr in
+        try await handle.serve(bindAddr: bindAddr)
+    }
+
+    /// Default http_url -- delegates to UniFFI ``NodeHandle.httpUrl()``.
+    public static let defaultHttpUrl: HttpUrlFn = { handle in
+        await handle.httpUrl()
+    }
+
     // MARK: Node lifecycle (SCP-296, spec section 18.11.8)
 
     /// Enable HTTP broadcast projection for a context.
     public typealias EnableSiteProjectionFn = @Sendable (
         _ handle: NodeHandle,
         _ contextId: String,
-        _ broadcastKeyHex: String,
-        _ authorDid: String,
         _ admission: String,
         _ hostname: String,
+        _ broadcastKeyHex: String?,
+        _ authorDid: String?,
         _ indexPath: String?,
         _ maxAssetsPerDeploy: UInt32?,
         _ maxDeploySizeBytes: UInt64?,
@@ -94,10 +115,10 @@ public enum ServerBridge {
     }
 
     /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.
-    public static let defaultEnableSiteProjection: EnableSiteProjectionFn = { hdl, ctx, key, auth, adm, host, idx, maxA, maxS, ret, csp in // swiftlint:disable:this line_length
+    public static let defaultEnableSiteProjection: EnableSiteProjectionFn = { hdl, ctx, adm, host, key, auth, idx, maxA, maxS, ret, csp in // swiftlint:disable:this line_length
         try await hdl.enableSiteProjection(
-            contextId: ctx, broadcastKeyHex: key, authorDid: auth,
-            admission: adm, hostname: host, indexPath: idx,
+            contextId: ctx, admission: adm, hostname: host,
+            broadcastKeyHex: key, authorDid: auth, indexPath: idx,
             maxAssetsPerDeploy: maxA, maxDeploySizeBytes: maxS,
             deployRetentionCount: ret, cspOverride: csp
         )
@@ -268,37 +289,83 @@ public struct Node: Sendable {
         handle.shutdown()
     }
 
+    // MARK: - HTTP server lifecycle
+
+    /// Starts the HTTP server in the background.
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is nil.
+    /// Pass `"0.0.0.0:PORT"` for network access.
+    ///
+    /// **Note:** The background server does not support TLS. All HTTP traffic is
+    /// plaintext. For production deployments requiring encryption, use the node
+    /// binary's `serve()` with TLS configuration.
+    ///
+    /// - Parameters:
+    ///   - bindAddr: Socket address to bind (e.g. `"127.0.0.1:8080"`).
+    ///   - serveFn: Bridge function override for testing.
+    /// - Returns: The actual bound address as a string.
+    /// - Throws: ``ScpError`` if the server is already running or binding fails.
+    @discardableResult
+    public func serve(
+        bindAddr: String? = nil,
+        serveFn: ServerBridge.ServeFn = ServerBridge.defaultServe
+    ) async throws -> String {
+        try await serveFn(handle, bindAddr)
+    }
+
+    /// The HTTP URL of the background server, or `nil` if not serving.
+    ///
+    /// - Parameter httpUrlFn: Bridge function override for testing.
+    /// - Returns: The HTTP URL or `nil`.
+    public func httpUrl(
+        httpUrlFn: ServerBridge.HttpUrlFn = ServerBridge.defaultHttpUrl
+    ) async -> String? {
+        await httpUrlFn(handle)
+    }
+
     // MARK: - Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 
     /// Activates HTTP broadcast projection for a context.
     ///
     /// Registers a broadcast context for HTTP content delivery.
     ///
+    /// When `broadcastKeyHex` and `authorDid` are `nil`, the key is
+    /// auto-resolved from the `ContextManager` using the node's identity
+    /// DID. This is the recommended usage for locally managed contexts.
+    ///
     /// - Parameters:
     ///   - contextId: The context ID to project.
-    ///   - broadcastKeyHex: 32-byte AES-256 broadcast key as a 64-char hex string.
-    ///   - authorDid: DID of the broadcast key owner.
     ///   - admission: `"open"` or `"gated"`.
     ///   - config: ``SiteConfig`` with hostname, index path, and deploy limits.
+    ///   - broadcastKeyHex: 32-byte AES-256 broadcast key as a 64-char hex string, or `nil` for auto-lookup.
+    ///   - authorDid: DID of the broadcast key owner, or `nil` for auto-lookup.
     ///   - enableFn: Bridge function override for testing.
     /// - Throws: ``ScpError`` if parameters are invalid or operation fails.
     public func enableSiteProjection(
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         config: SiteConfig,
+        broadcastKeyHex: String? = nil,
+        authorDid: String? = nil,
         enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
     ) async throws {
         try validateAdmission(admission)
-        try validateBroadcastKeyHex(broadcastKeyHex)
+        guard (broadcastKeyHex == nil) == (authorDid == nil) else {
+            throw ScpError.Validation(
+                msg: "broadcastKeyHex and authorDid must both be provided or both be omitted",
+                code: "SCP-TRANS-5060"
+            )
+        }
+        if let key = broadcastKeyHex {
+            try validateBroadcastKeyHex(key)
+        }
         try await enableFn(
             handle,
             contextId,
-            broadcastKeyHex,
-            authorDid,
             admission,
             config.hostname,
+            broadcastKeyHex,
+            authorDid,
             config.indexPath == "/index.html" ? nil : config.indexPath,
             config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
             config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),

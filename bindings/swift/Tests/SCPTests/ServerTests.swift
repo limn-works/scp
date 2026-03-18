@@ -20,12 +20,12 @@ struct NodeLifecycleTests {
         var capturedAdmission: String?
         var capturedHostname: String?
 
-        let mockEnable: ServerBridge.EnableSiteProjectionFn = { _, cid, key, aut, adm, hst, _, _, _, _, _ in // swiftlint:disable:this line_length
+        let mockEnable: ServerBridge.EnableSiteProjectionFn = { _, cid, adm, hst, key, aut, _, _, _, _, _ in // swiftlint:disable:this line_length
             capturedContextId = cid
-            capturedBroadcastKeyHex = key
-            capturedAuthorDid = aut
             capturedAdmission = adm
             capturedHostname = hst
+            capturedBroadcastKeyHex = key
+            capturedAuthorDid = aut
         }
 
         let node = try await Node.startInMemory(startFn: mockNodeStart)
@@ -40,10 +40,10 @@ struct NodeLifecycleTests {
 
         try await node.enableSiteProjection(
             contextId: "ctx-123",
-            broadcastKeyHex: String(repeating: "ab", count: 32),
-            authorDid: "did:dht:z6MkAuthor",
             admission: "open",
             config: config,
+            broadcastKeyHex: String(repeating: "ab", count: 32),
+            authorDid: "did:dht:z6MkAuthor",
             enableFn: mockEnable
         )
 
@@ -82,10 +82,10 @@ struct NodeLifecycleTests {
 
         try await node.enableSiteProjection(
             contextId: "ctx-123",
-            broadcastKeyHex: String(repeating: "ab", count: 32),
-            authorDid: "did:dht:z6MkAuthor",
             admission: "open",
             config: config,
+            broadcastKeyHex: String(repeating: "ab", count: 32),
+            authorDid: "did:dht:z6MkAuthor",
             enableFn: mockEnable
         )
 
@@ -117,10 +117,10 @@ struct NodeLifecycleTests {
 
         try await node.enableSiteProjection(
             contextId: "ctx-456",
-            broadcastKeyHex: String(repeating: "cd", count: 32),
-            authorDid: "did:dht:z6MkAuthor2",
             admission: "gated",
             config: config,
+            broadcastKeyHex: String(repeating: "cd", count: 32),
+            authorDid: "did:dht:z6MkAuthor2",
             enableFn: mockEnable
         )
 

@@ -60,10 +60,10 @@ class ServerTest {
 
         node.enableSiteProjection(
             contextId = "ctx-123",
-            broadcastKeyHex = "ab".repeat(32),
-            authorDid = "did:dht:z6MkAuthor",
             admission = "open",
             config = config,
+            broadcastKeyHex = "ab".repeat(32),
+            authorDid = "did:dht:z6MkAuthor",
         )
 
         val args = stubBindings.lastEnableSiteProjectionArgs
@@ -86,10 +86,10 @@ class ServerTest {
 
         node.enableSiteProjection(
             contextId = "ctx-456",
-            broadcastKeyHex = "cd".repeat(32),
-            authorDid = "did:dht:z6MkAuthor2",
             admission = "gated",
             config = config,
+            broadcastKeyHex = "cd".repeat(32),
+            authorDid = "did:dht:z6MkAuthor2",
         )
 
         val args = stubBindings.lastEnableSiteProjectionArgs
@@ -187,6 +187,13 @@ class ServerTest {
  */
 internal class StubServerBindings : ServerBindings {
 
+    // serve / httpUrl
+    var serveResult: String = "127.0.0.1:8443"
+    override fun nodeServe(handleJson: String, bindAddr: String?): String = serveResult
+
+    var httpUrlResult: String? = null
+    override fun nodeHttpUrl(handleJson: String): String? = httpUrlResult
+
     // Startup/shutdown
     var nodeStartInMemoryResult: String =
         """{"relayUrl":"ws://127.0.0.1:0/scp/v1","relayPort":0,"did":"did:dht:stub"}"""
@@ -203,8 +210,8 @@ internal class StubServerBindings : ServerBindings {
     // enableSiteProjection
     data class EnableArgs(
         val contextId: String,
-        val broadcastKeyHex: String,
-        val authorDid: String,
+        val broadcastKeyHex: String?,
+        val authorDid: String?,
         val admission: String,
         val hostname: String,
         val indexPath: String?,
@@ -220,10 +227,10 @@ internal class StubServerBindings : ServerBindings {
     override fun nodeEnableSiteProjection(
         handleJson: String,
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         hostname: String,
+        broadcastKeyHex: String?,
+        authorDid: String?,
         indexPath: String?,
         maxAssetsPerDeploy: Int?,
         maxDeploySizeBytes: Long?,

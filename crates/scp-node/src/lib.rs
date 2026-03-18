@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
@@ -60,6 +61,17 @@ pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, Site
 /// the server to the network.
 pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
+
+/// Default bind address for the background HTTP server (`127.0.0.1:8443`).
+///
+/// This binds to **loopback only** (`127.0.0.1`), which is the safe default
+/// for [`ApplicationNode::serve_background`] since SDK consumers typically
+/// run the node in-process and do not need external access.
+///
+/// For public-facing deployments, pass a non-loopback address explicitly —
+/// a warning is logged when a non-loopback address is used.
+pub const DEFAULT_BACKGROUND_HTTP_BIND_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8443);
 
 // ---------------------------------------------------------------------------
 // Resource limits
@@ -230,6 +242,17 @@ pub struct ApplicationNode<S: Storage> {
     /// `None` if HTTP/3 is not configured. Only available with the `http3` feature.
     #[cfg(feature = "http3")]
     http3_config: Option<scp_transport::http3::Http3Config>,
+    /// Whether the background HTTP server is currently running.
+    /// Used by [`serve_background`](Self::serve_background) to prevent double-serve.
+    /// Wrapped in `Arc` so the spawned background task can clear it on exit.
+    serving: Arc<AtomicBool>,
+    /// Whether the projection rate-limit cleanup task has been spawned.
+    /// Guards against duplicate cleanup tasks on restart.
+    rate_limit_cleanup_spawned: Arc<AtomicBool>,
+    /// The bound address of the background HTTP server, if running.
+    /// Set by [`serve_background`](Self::serve_background) after successful bind.
+    /// Wrapped in `Arc` so the spawned background task can clear it on exit.
+    serving_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -243,6 +266,7 @@ impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
                 "tier_reeval",
                 &self.tier_reeval.as_ref().map(|_| "<active>"),
             )
+            .field("serving", &self.serving.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -382,6 +406,195 @@ impl<S: Storage> ApplicationNode<S> {
         }
     }
 
+    /// Builds the merged SCP protocol router (well-known, relay, projection,
+    /// bridge, ACME challenge routes) for use by both [`serve`](Self::serve)
+    /// and [`serve_background`](Self::serve_background).
+    ///
+    /// `app_router` is the caller-supplied application router that SCP routes
+    /// are merged onto. Pass `axum::Router::new()` when there is no
+    /// application router (e.g. `serve_background`).
+    fn build_scp_router(&self, app_router: axum::Router) -> axum::Router {
+        let cors = http::build_cors_layer(&self.state.cors_origins);
+        let well_known = http::well_known_router(Arc::clone(&self.state)).layer(cors.clone());
+        let relay_rt = http::relay_router(Arc::clone(&self.state));
+        let projection =
+            crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
+        let (bridge, bridge_webhook) =
+            http::build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
+
+        http::build_merged_router(
+            app_router,
+            well_known,
+            relay_rt,
+            projection,
+            bridge,
+            bridge_webhook,
+            &self.state,
+        )
+    }
+
+    /// Returns the HTTP URL of the background server, if running.
+    ///
+    /// Returns the literal bind address, which may contain `0.0.0.0` if the
+    /// server was bound to the unspecified address. Callers should replace
+    /// `0.0.0.0` with the appropriate interface address when constructing
+    /// user-facing URLs.
+    ///
+    /// Returns `Some("http://<addr>")` when [`serve_background`](Self::serve_background)
+    /// has been called and the server is actively listening. Returns `None`
+    /// if the background server has not been started.
+    pub async fn http_url(&self) -> Option<String> {
+        let guard = self.serving_addr.lock().await;
+        guard.map(|addr| format!("http://{addr}"))
+    }
+
+    /// Starts serving HTTP traffic in a background tokio task.
+    ///
+    /// Unlike [`serve`](Self::serve), this method does **not** consume the
+    /// node. It clones the shared `NodeState` and the cancellation token,
+    /// spawns the full merged router in a background task, and returns the
+    /// bound address.
+    ///
+    /// ## Bind address
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bind_addr` is
+    /// `None`. A `tracing::warn!` is emitted when a non-loopback address
+    /// is used, since exposing the HTTP server to the network may have
+    /// security implications.
+    ///
+    /// ## TLS
+    ///
+    /// The background server does **not** use TLS — all HTTP traffic is
+    /// plaintext. For production deployments requiring encryption, use the
+    /// node binary's [`serve`](Self::serve) method with TLS configuration.
+    ///
+    /// ## Dev API
+    ///
+    /// The dev API listener (spec §18.10) is intentionally **not** spawned
+    /// by this method. It is designed for the node binary's `serve()` flow,
+    /// not for SDK consumers using `serve_background()`.
+    ///
+    /// ## Double-serve prevention
+    ///
+    /// Calling this method more than once returns an error without starting
+    /// a second listener.
+    ///
+    /// ## Shutdown
+    ///
+    /// The spawned task observes the node's cancellation token. Calling
+    /// [`shutdown`](Self::shutdown) stops both the relay and the background
+    /// HTTP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if:
+    /// - The node has already been shut down.
+    /// - The server is already running (double-serve).
+    /// - The TCP listener cannot bind.
+    /// - The bound address cannot be retrieved.
+    pub async fn serve_background(
+        &self,
+        bind_addr: Option<SocketAddr>,
+    ) -> Result<SocketAddr, NodeError> {
+        // Reject if the node has already been shut down — the cancellation
+        // token is already cancelled so the server would exit immediately.
+        if self.state.shutdown_token.is_cancelled() {
+            return Err(NodeError::Serve(
+                "node has been shut down; cannot start background HTTP server".into(),
+            ));
+        }
+
+        // Prevent double-serve.
+        if self
+            .serving
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(NodeError::Serve(
+                "background HTTP server is already running".into(),
+            ));
+        }
+
+        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+
+        // Security: warn when binding to a non-loopback address.
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                bind_addr = %addr,
+                "serve_background binding to non-loopback address — \
+                 HTTP traffic is unencrypted (no TLS) and will be \
+                 accessible from the network"
+            );
+        }
+
+        let shutdown_token = self.state.shutdown_token.clone();
+
+        // Build the full merged router (same as serve()).
+        let merged = self.build_scp_router(axum::Router::new());
+
+        // Bind the TCP listener before spawning so we can report errors
+        // and the bound address synchronously.
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            // Reset serving flag on bind failure.
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!(
+                "failed to bind background HTTP server on {addr}: {e}"
+            ))
+        })?;
+        let local_addr = listener.local_addr().map_err(|e| {
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!("failed to get local address: {e}"))
+        })?;
+
+        // Store the bound address.
+        {
+            let mut guard = self.serving_addr.lock().await;
+            *guard = Some(local_addr);
+        }
+
+        // Spawn the projection rate limiter cleanup only after a successful
+        // bind — avoids leaking a background task on bind failure, and guards
+        // against duplicate tasks if serve_background is called more than once.
+        if self
+            .rate_limit_cleanup_spawned
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            http::spawn_projection_rate_limit_cleanup(
+                self.state.projection_rate_limiter.clone(),
+                shutdown_token.clone(),
+            );
+        }
+
+        let serving_flag = Arc::clone(&self.serving);
+        let serving_addr_ref = Arc::clone(&self.serving_addr);
+
+        // Spawn the background server task.
+        tokio::spawn(async move {
+            tracing::info!(
+                addr = %local_addr,
+                "background HTTP server started"
+            );
+
+            let result = axum::serve(listener, merged)
+                .with_graceful_shutdown(shutdown_token.cancelled_owned())
+                .await;
+
+            if let Err(ref e) = result {
+                tracing::error!(error = %e, "background HTTP server exited with error");
+            } else {
+                tracing::info!("background HTTP server shut down");
+            }
+
+            // Clear the serving flag and address on exit.
+            serving_flag.store(false, Ordering::SeqCst);
+            let mut guard = serving_addr_ref.lock().await;
+            *guard = None;
+        });
+
+        Ok(local_addr)
+    }
+
     /// Returns a mutable reference to the tier change event receiver
     /// (§10.12.1, SCP-243).
     ///
@@ -479,13 +692,20 @@ impl<S: Storage> ApplicationNode<S> {
 
         if let Some(ref config) = site_config {
             let existing_hostnames: std::collections::HashSet<String> = registry
-                .values()
-                .filter_map(|p| p.hostname().map(String::from))
+                .iter()
+                .filter(|(id, _)| **id != routing_id)
+                .filter_map(|(_, p)| p.hostname().map(str::to_ascii_lowercase))
                 .collect();
 
             projection::validate_site_config(config, self.domain.as_deref(), &existing_hostnames)
                 .map_err(NodeError::InvalidConfig)?;
         }
+
+        // Track the old hostname (if any) so we can remove it from the
+        // hostname index when updating to a new hostname.
+        let old_hostname = registry
+            .get(&routing_id)
+            .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
 
         if let Some(existing) = registry.get_mut(&routing_id) {
             existing.insert_key(broadcast_key);
@@ -508,7 +728,39 @@ impl<S: Storage> ApplicationNode<S> {
             }
             registry.insert(routing_id, projected);
         }
+
+        // Extract the new hostname after mutation (if any).
+        let new_hostname = registry
+            .get(&routing_id)
+            .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
+
+        // Update the hostname index while still holding the projected_contexts
+        // lock to eliminate the TOCTOU window between registry mutation and
+        // index update.
+        if old_hostname != new_hostname {
+            let mut index = self.state.hostname_index.write().await;
+            if let Some(ref old) = old_hostname {
+                // Only remove if this routing_id still owns the hostname entry.
+                if index.get(old) == Some(&routing_id) {
+                    index.remove(old);
+                }
+            }
+            if let Some(ref new) = new_hostname
+                && !new.is_empty()
+            {
+                index.insert(new.clone(), routing_id);
+            }
+            let index_len = index.len();
+            drop(index);
+            debug_assert!(
+                index_len <= Self::MAX_PROJECTED_CONTEXTS,
+                "hostname_index size {index_len} exceeds MAX_PROJECTED_CONTEXTS {}",
+                Self::MAX_PROJECTED_CONTEXTS,
+            );
+        }
+
         drop(registry);
+
         Ok(())
     }
 
@@ -522,7 +774,25 @@ impl<S: Storage> ApplicationNode<S> {
     pub async fn disable_broadcast_projection(&self, context_id: &str) {
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
+        // Extract hostname before removal so we can clean up the index.
+        let hostname = registry
+            .get(&routing_id)
+            .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
+
+        // Update the hostname index while still holding the projected_contexts
+        // lock to eliminate the TOCTOU window between registry removal and
+        // index update.
+        if let Some(ref hostname) = hostname {
+            let mut index = self.state.hostname_index.write().await;
+            // Only remove if this routing_id still owns the hostname entry,
+            // preventing removal of a hostname re-registered by another context.
+            if index.get(hostname) == Some(&routing_id) {
+                index.remove(hostname);
+            }
+        }
+
         registry.remove(&routing_id);
+        drop(registry);
     }
 
     /// Updates the cached member public keys for a projected context.
@@ -3037,6 +3307,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         connection_tracker,
         subscription_registry,
         acme_challenges,
+        hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
     });
@@ -3054,6 +3325,9 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         tier_change_rx: None,
         #[cfg(feature = "http3")]
         http3_config,
+        serving: Arc::new(AtomicBool::new(false)),
+        rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
+        serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
 
@@ -3083,10 +3357,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
 ) -> Result<ApplicationNode<S>, NodeError> {
-    // Resolve the HTTP bind address first — NAT strategy needs the public-facing
-    // HTTP port, not the internal relay port (which is bound to loopback and
-    // unreachable externally). UPnP maps this port on the router and the relay
-    // URL uses it. See #641.
+    // NAT strategy needs the public HTTP port, not the internal relay port (#641).
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
     let tier = nat_strategy.select_tier(http_bind_addr.port()).await?;
@@ -3121,20 +3392,11 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    // 5. Spawn periodic tier re-evaluation (§10.12.1, SCP-243).
     let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
         inner: Arc::clone(&did_method),
     });
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
-    // Construct a copy of the identity for the background task (ScpIdentity
-    // fields are all Copy/Clone but the struct itself doesn't derive Clone).
-    let bg_identity = ScpIdentity {
-        identity_key: identity.identity_key,
-        active_signing_key: identity.active_signing_key,
-        agent_signing_key: identity.agent_signing_key,
-        pre_rotation_commitment: identity.pre_rotation_commitment,
-        did: identity.did.clone(),
-    };
+    let bg_identity = identity.clone();
     let tier_reeval = spawn_tier_reevaluation(
         nat_strategy,
         network_detector,
@@ -3147,8 +3409,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         TIER_REEVALUATION_INTERVAL,
     );
 
-    // Build the production bridge auth lookup, hydrating from storage.
-    // In no-domain mode the audience is the relay URL itself (spec 12.10.2).
+    // Bridge auth lookup — audience is relay URL in no-domain mode (spec 12.10.2).
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
         relay_url.clone(),
@@ -3182,11 +3443,11 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         connection_tracker,
         subscription_registry,
         acme_challenges: None,
+        hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
     });
 
-    // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
     Ok(ApplicationNode {
         domain: None,
         relay: RelayHandle {
@@ -3201,6 +3462,9 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         // HTTP/3 is not supported in no-domain mode (no TLS certificate).
         #[cfg(feature = "http3")]
         http3_config: None,
+        serving: Arc::new(AtomicBool::new(false)),
+        rate_limit_cleanup_spawned: Arc::new(AtomicBool::new(false)),
+        serving_addr: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
 

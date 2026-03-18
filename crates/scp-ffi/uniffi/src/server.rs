@@ -184,17 +184,20 @@ impl NodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// `broadcast_key_hex` is the 32-byte AES-256 broadcast key as a 64-char
-    /// hex string. `author_did` is the DID of the key owner. `admission` is
-    /// `"open"` or `"gated"`. `hostname` is the virtual host (RFC 1123).
+    /// When `broadcast_key_hex` and `author_did` are `nil`/`null`, the key
+    /// is auto-resolved from the `ContextManager` using the node's identity
+    /// DID. This is the recommended usage for locally managed contexts.
+    ///
+    /// `admission` is `"open"` or `"gated"`. `hostname` is the virtual
+    /// host (RFC 1123).
     #[allow(clippy::too_many_arguments)]
     pub async fn enable_site_projection(
         &self,
         context_id: String,
-        broadcast_key_hex: String,
-        author_did: String,
         admission: String,
         hostname: String,
+        broadcast_key_hex: Option<String>,
+        author_did: Option<String>,
         index_path: Option<String>,
         max_assets_per_deploy: Option<u32>,
         max_deploy_size_bytes: Option<u64>,
@@ -202,27 +205,65 @@ impl NodeHandle {
         csp_override: Option<String>,
     ) -> Result<(), ScpError> {
         validate_context_id(&context_id)?;
-        validate_did(&author_did)?;
-        let key_vec =
-            Zeroizing::new(
-                hex::decode(&broadcast_key_hex).map_err(|e| ScpError::Validation {
-                    msg: format!("invalid broadcast_key_hex: {e}"),
-                    code: "SCP-TRANS-5060".to_owned(),
-                })?,
-            );
-        let key_bytes: Zeroizing<[u8; 32]> =
-            Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                ScpError::Validation {
-                    msg: "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
-                        .to_owned(),
-                    code: "SCP-TRANS-5060".to_owned(),
+        if let Some(ref did) = author_did {
+            validate_did(did)?;
+        }
+
+        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
+        let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
+            match (broadcast_key_hex, author_did) {
+                (Some(key_hex), Some(did)) => {
+                    let key_hex = Zeroizing::new(key_hex);
+                    let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
+                        ScpError::Validation {
+                            msg: format!("invalid broadcast_key_hex: {e}"),
+                            code: "SCP-TRANS-5060".to_owned(),
+                        }
+                    })?);
+                    let key_bytes: Zeroizing<[u8; 32]> =
+                        Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
+                            ScpError::Validation {
+                                msg:
+                                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
+                                        .to_owned(),
+                                code: "SCP-TRANS-5060".to_owned(),
+                            }
+                        })?);
+                    // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
+                    (key_bytes, 0u64, did)
                 }
-            })?);
+                (None, None) => {
+                    // Auto-resolve from ContextManager using node's identity DID.
+                    let node_did = self.inner.did().to_owned();
+                    let mgr = crate::runtime::context_manager()?;
+                    let (key_bytes, epoch) = mgr
+                        .get_broadcast_key_for_local_author(&context_id, &node_did)
+                        .await
+                        .map_err(|e| {
+                            tracing::debug!(error = %e, "broadcast key auto-resolve failed");
+                            ScpError::Context {
+                            msg:
+                                "broadcast key auto-resolve failed: not authorized for this context"
+                                    .to_owned(),
+                            code: "SCP-CTX-2060".to_owned(),
+                        }
+                        })?;
+                    (key_bytes, epoch, node_did)
+                }
+                _ => {
+                    return Err(ScpError::Validation {
+                    msg:
+                        "broadcast_key_hex and author_did must both be provided or both be omitted"
+                            .to_owned(),
+                    code: "SCP-TRANS-5060".to_owned(),
+                });
+                }
+            };
 
         let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
-            0,
-            author_did,
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
+            resolved_epoch,
+            resolved_author_did,
         );
 
         let adm = match admission.to_lowercase().as_str() {
@@ -303,6 +344,43 @@ impl NodeHandle {
         validate_context_id(&context_id)?;
         self.inner.disable_broadcast_projection(&context_id).await;
         Ok(())
+    }
+
+    /// Starts the HTTP server in the background on the given bind address.
+    ///
+    /// Defaults to `127.0.0.1:8443` (loopback only) when `bind_addr` is `None`.
+    /// Returns the actual bound address as a raw string (e.g., `"127.0.0.1:8443"`).
+    /// Use [`http_url`](NodeHandle::http_url) for the full URL form
+    /// (`"http://127.0.0.1:8443"`).
+    ///
+    /// **Note:** The background server does not support TLS. For production
+    /// deployments requiring encryption, use the node binary's `serve()`
+    /// with TLS configuration.
+    ///
+    /// Throws if the server is already running or binding fails.
+    pub async fn serve(&self, bind_addr: Option<String>) -> Result<String, ScpError> {
+        let addr = bind_addr
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>().map_err(|_| {
+                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    ScpError::Validation {
+                        msg: format!("invalid bind_addr: {display}"),
+                        code: "SCP-TRANS-5070".to_owned(),
+                    }
+                })
+            })
+            .transpose()?;
+        self.inner
+            .serve_background(addr)
+            .await
+            .map(|a| a.to_string())
+            .map_err(ScpError::from)
+    }
+
+    /// Returns the HTTP URL of the background server, or `None` if not serving.
+    #[must_use]
+    pub async fn http_url(&self) -> Option<String> {
+        self.inner.http_url().await
     }
 }
 

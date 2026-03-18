@@ -46,12 +46,14 @@ interface NativeNodeHandle {
   readonly did: string;
   readonly isShutdown: boolean;
   shutdown(): void;
+  serve(bindAddr: string | null): Promise<string>;
+  httpUrl(): Promise<string | null>;
   enableSiteProjection(
     contextId: string,
-    broadcastKeyHex: string,
-    authorDid: string,
     admission: string,
     hostname: string,
+    broadcastKeyHex: string | null,
+    authorDid: string | null,
     indexPath: string | null,
     maxAssetsPerDeploy: number | null,
     maxDeploySizeBytes: number | null,
@@ -267,6 +269,37 @@ export class Node implements AsyncDisposable {
     return new Node(handle);
   }
 
+  /**
+   * Start the HTTP server in the background.
+   *
+   * Defaults to `127.0.0.1:8443` (loopback only) when `bindAddr` is not
+   * provided. Pass `"0.0.0.0:PORT"` for network access.
+   *
+   * Returns the actual bound address as a raw string (e.g. `"127.0.0.1:8443"`).
+   * Use {@link httpUrl} for the full URL form (`"http://127.0.0.1:8443"`).
+   *
+   * **Note:** The background server does not support TLS. For production
+   * deployments requiring encryption, use the node binary's `serve()` with
+   * TLS configuration.
+   *
+   * @param bindAddr - Socket address to bind (e.g. `"127.0.0.1:8080"`).
+   * @returns The actual bound address as a string.
+   * @throws {Error} If the server is already running or binding fails.
+   */
+  async serve(bindAddr?: string): Promise<string> {
+    return this.#handle.serve(bindAddr ?? null);
+  }
+
+  /**
+   * The HTTP URL of the background server, or `null` if not serving.
+   *
+   * Returns the literal bind address, which may contain `0.0.0.0` if the
+   * server was bound to the unspecified address.
+   */
+  async httpUrl(): Promise<string | null> {
+    return this.#handle.httpUrl();
+  }
+
   // -------------------------------------------------------------------------
   // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
   // -------------------------------------------------------------------------
@@ -276,29 +309,39 @@ export class Node implements AsyncDisposable {
    *
    * Registers a broadcast context for HTTP content delivery.
    *
+   * When `broadcastKeyHex` and `authorDid` are omitted (or `undefined`),
+   * the key is auto-resolved from the `ContextManager` using the node's
+   * identity DID. This is the recommended usage for locally managed
+   * contexts.
+   *
    * @param contextId - The context ID to project.
-   * @param broadcastKeyHex - 32-byte AES-256 broadcast key as a 64-char hex string.
-   * @param authorDid - DID of the broadcast key owner.
    * @param admission - `"open"` or `"gated"`.
    * @param config - {@link SiteConfig} with hostname, index path, and deploy limits.
+   * @param broadcastKeyHex - 32-byte AES-256 broadcast key as a 64-char hex string, or omit for auto-lookup.
+   * @param authorDid - DID of the broadcast key owner, or omit for auto-lookup.
    * @throws {Error} If parameters are invalid.
    */
   async enableSiteProjection(
     contextId: string,
-    broadcastKeyHex: string,
-    authorDid: string,
     admission: string,
     config: SiteConfig,
+    broadcastKeyHex?: string,
+    authorDid?: string,
   ): Promise<void> {
     validateAdmission(admission);
-    validateBroadcastKeyHex(broadcastKeyHex);
+    if ((broadcastKeyHex === undefined) !== (authorDid === undefined)) {
+      throw new Error("broadcastKeyHex and authorDid must both be provided or both be omitted");
+    }
+    if (broadcastKeyHex !== undefined) {
+      validateBroadcastKeyHex(broadcastKeyHex);
+    }
     validateSiteConfig(config);
     await this.#handle.enableSiteProjection(
       contextId,
-      broadcastKeyHex,
-      authorDid,
       admission,
       config.hostname,
+      broadcastKeyHex ?? null,
+      authorDid ?? null,
       config.indexPath ?? null,
       config.maxAssetsPerDeploy ?? null,
       config.maxDeploySizeBytes ?? null,
