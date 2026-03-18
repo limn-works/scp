@@ -928,7 +928,7 @@ pub fn context_subscribe(
                         .deliver_incoming(&context_id, &envelope.encrypted_blob)
                         .await
                     {
-                        Ok((plaintext, sender_did)) => {
+                        Ok(Some((plaintext, sender_did))) => {
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
                             let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
@@ -942,6 +942,14 @@ pub fn context_subscribe(
                             on_message.call(
                                 Ok(Some(msg)),
                                 napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+                        }
+                        Ok(None) => {
+                            // MLS Commit or Proposal — epoch advanced or proposal
+                            // cached, no application payload to deliver.
+                            tracing::debug!(
+                                context_id = %context_id,
+                                "MLS control message processed (Commit/Proposal) — no payload"
                             );
                         }
                         Err(e) => {

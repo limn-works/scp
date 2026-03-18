@@ -80,6 +80,33 @@ class TestAliceToBobEncryptedRoundtrip:
         assert bytes(decrypted) == plaintext
 
 
+class TestBobSendsAliceDecrypts:
+    """Bob sends a message and Alice decrypts it (bidirectional)."""
+
+    def test_bidirectional_roundtrip(self) -> None:
+        alice = _scp_core.py_fullstack_create_node("did:dht:z6MkAliceBidirPy")
+        bob = _scp_core.py_fullstack_create_node("did:dht:z6MkBobBidirPy")
+
+        ctx_id = _scp_core.py_fullstack_create_context(alice, "py-ctx-bidir", CEILING_JSON)
+
+        _scp_core.py_fullstack_add_member(alice, ctx_id, bob.did)
+        _scp_core.py_fullstack_join_from_welcome(bob, ctx_id)
+
+        # Sync sender keys so both nodes can decrypt each other's messages.
+        _scp_core.py_fullstack_sync_sender_keys(alice, bob, ctx_id)
+
+        # Bob sends a message.
+        plaintext = b"Hello from Bob via Python!"
+        ciphertext = _scp_core.py_fullstack_send_message(bob, ctx_id, plaintext)
+
+        # Ciphertext must differ from plaintext.
+        assert ciphertext != plaintext
+
+        # Alice decrypts Bob's message.
+        decrypted = _scp_core.py_fullstack_decrypt_message(alice, ctx_id, ciphertext, bob.did)
+        assert bytes(decrypted) == plaintext
+
+
 class TestThreePartyGroup:
     """Alice sends, Bob and Carol both decrypt the same ciphertext."""
 

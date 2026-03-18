@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
+use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
@@ -193,18 +194,118 @@ pub fn fullstack_add_member(
 ///
 /// This is the joiner-side operation. The adder must have called
 /// `fullstack_add_member` first to deposit the Welcome and sender keys.
+///
+/// After joining, the context is registered on the joiner's `ContextManager`
+/// with a `ContextHandle`, enabling subsequent `fullstack_send_message` and
+/// `fullstack_remove_member` calls on this node.
 #[napi]
 pub fn fullstack_join_from_welcome(
     node: &NapiFullStackNode,
     context_id: String,
 ) -> napi::Result<()> {
     let ctx_bytes = context_id_bytes(&context_id);
+    let rt = crate::runtime();
+
+    // Step 1: Register the context on the joiner's ContextManager.
+    // This creates a throwaway MLS group + the joiner's own sender key +
+    // a PerContextState entry so send_message / leave_context work.
+    let params = ContextParams {
+        mode: ContextMode::Encrypted,
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::ContextClose,
+        ],
+        ..ContextParams::default()
+    };
+    let handle = rt
+        .block_on(node.inner.create_context(&context_id, params))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("failed to register context on joiner: {e}"),
+                code: "SCP-CTX-2055".to_owned(),
+            })
+        })?;
+
+    // Step 2: Replace the throwaway MLS group with the Welcome-derived one
+    // and pick up the adder's sender keys from the exchange.
     node.inner.join_from_welcome(&ctx_bytes).map_err(|e| {
         napi::Error::from(ScpNapiError::Crypto {
             message: format!("failed to join from Welcome: {e}"),
             code: "SCP-CRYPTO-4051".to_owned(),
         })
-    })
+    })?;
+
+    // Step 3: Store the handle so subsequent operations can retrieve it.
+    {
+        let mut handles = node
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.insert(context_id, handle);
+    }
+
+    Ok(())
+}
+
+/// Synchronises sender keys between two nodes for a given context.
+///
+/// Each node distributes its own sender key to the other via the shared
+/// `KeyExchange`, then picks up the other's key. After this call, both
+/// nodes can encrypt and decrypt messages from each other.
+///
+/// Call this after `fullstack_join_from_welcome` to enable bidirectional
+/// messaging in tests.
+#[napi]
+pub fn fullstack_sync_sender_keys(
+    node_a: &NapiFullStackNode,
+    node_b: &NapiFullStackNode,
+    context_id: String,
+) -> napi::Result<()> {
+    let ctx_bytes = context_id_bytes(&context_id);
+    let did_a = node_a.inner.did.to_string();
+    let did_b = node_b.inner.did.to_string();
+
+    // A distributes to B, B distributes to A.
+    node_a
+        .inner
+        .crypto
+        .distribute_sender_key(&ctx_bytes, &did_b)
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Crypto {
+                message: format!("failed to distribute sender key from A to B: {e}"),
+                code: "SCP-CRYPTO-4056".to_owned(),
+            })
+        })?;
+    node_b
+        .inner
+        .crypto
+        .distribute_sender_key(&ctx_bytes, &did_a)
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Crypto {
+                message: format!("failed to distribute sender key from B to A: {e}"),
+                code: "SCP-CRYPTO-4057".to_owned(),
+            })
+        })?;
+
+    // Both pick up the other's key from the exchange.
+    node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
+        napi::Error::from(ScpNapiError::Crypto {
+            message: format!("failed to pick up sender keys for A: {e}"),
+            code: "SCP-CRYPTO-4058".to_owned(),
+        })
+    })?;
+    node_b.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
+        napi::Error::from(ScpNapiError::Crypto {
+            message: format!("failed to pick up sender keys for B: {e}"),
+            code: "SCP-CRYPTO-4059".to_owned(),
+        })
+    })?;
+
+    Ok(())
 }
 
 /// Encrypts a message and returns the ciphertext.
