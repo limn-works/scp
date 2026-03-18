@@ -167,9 +167,10 @@ fn make_signed_attestation(
     let claim_str = att.claim.to_string();
     let evidence_bytes = att.evidence.as_ref().map(|e| rmp_serde::to_vec(e).unwrap());
     let att_type_tag = attestation_type_tag(&att.attestation_type);
+    let revocation_bytes = rmp_serde::to_vec(&att.revocation_status).unwrap();
 
     let canonical = canonical_hash(
-        "SCP-ATTESTATION-V1:",
+        "SCP-ATTESTATION-V2:",
         &[
             CanonicalField::VarBytes(att.id.as_bytes()),
             CanonicalField::U16(att_type_tag),
@@ -180,7 +181,9 @@ fn make_signed_attestation(
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
             CanonicalField::U64(att.issued_at),
-            CanonicalField::U64(att.expires_at.unwrap_or(0)),
+            att.expires_at
+                .map_or(CanonicalField::Absent, CanonicalField::U64),
+            CanonicalField::VarBytes(&revocation_bytes),
         ],
     );
     let sig = sk.sign(&canonical);

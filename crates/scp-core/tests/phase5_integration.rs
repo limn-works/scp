@@ -214,9 +214,11 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
         .as_ref()
         .map(|e| rmp_serde::to_vec(e).expect("AttestationEvidence serialization is infallible"));
     let claim_bytes = attestation.claim.to_string();
+    let revocation_bytes = rmp_serde::to_vec(&attestation.revocation_status)
+        .expect("RevocationStatus serialization is infallible");
 
     canonical_hash(
-        "SCP-ATTESTATION-V1:",
+        "SCP-ATTESTATION-V2:",
         &[
             CanonicalField::VarBytes(attestation.id.as_bytes()),
             CanonicalField::U16(scp_core::trust::attestation_type_tag(
@@ -232,6 +234,7 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
             attestation
                 .expires_at
                 .map_or(CanonicalField::Absent, CanonicalField::U64),
+            CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
     .to_vec()

@@ -198,6 +198,21 @@ pub enum TrustError {
         revoked_at: u64,
     },
 
+    /// The attestation's `revoked_by` DID does not match the issuer.
+    ///
+    /// Per §7.4.1, only the issuer can revoke their own attestation.
+    #[error(
+        "attestation {attestation_id}: revoked_by '{revoked_by}' does not match issuer '{issuer}'"
+    )]
+    AttestationRevocationInvalid {
+        /// The attestation ID.
+        attestation_id: String,
+        /// The DID that claims to have revoked the attestation.
+        revoked_by: String,
+        /// The attestation's issuer DID.
+        issuer: String,
+    },
+
     /// The attestation evidence is missing or invalid.
     #[error("attestation {attestation_id}: evidence invalid: {reason}")]
     AttestationEvidenceInvalid {

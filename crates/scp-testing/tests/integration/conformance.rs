@@ -218,8 +218,11 @@ fn conf_004_agent_binding_attestation() {
     let agent_key = make_signing_key(0x02);
 
     print_step(1, "Create identity attestation binding agent to human");
+    // RevocationStatus::Active serialized as MessagePack.
+    let revocation_active_bytes =
+        rmp_serde::to_vec(&scp_core::trust::RevocationStatus::Active).unwrap();
     let attestation_payload = canonical_hash_bytes(
-        b"SCP-ATTESTATION-V1:",
+        b"SCP-ATTESTATION-V2:",
         &[
             CanonicalField::VarBytes(b"agent-binding-001"),
             CanonicalField::U16(0x0001), // IdentityLink
@@ -229,6 +232,7 @@ fn conf_004_agent_binding_attestation() {
             CanonicalField::Absent, // no evidence
             CanonicalField::U64(1_700_000_000),
             CanonicalField::U64(0),
+            CanonicalField::VarBytes(&revocation_active_bytes),
         ],
     );
     let hash: [u8; 32] = Sha256::digest(&attestation_payload).into();
