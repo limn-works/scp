@@ -90,9 +90,11 @@ pub use admission::{
     AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
 };
 pub use attestation::{
-    Attestation, AttestationEvidence, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
-    IdentityDidPublicKeyResolver, RevocationStatus, ThresholdRequirement, ThresholdResult,
-    check_attestation_freshness, check_threshold_attestation, verify_attestation,
+    Attestation, AttestationEvidence, AttestationRevocationChecker, AttestationVerificationCache,
+    AttestorInfo, CRYPTOGRAPHIC_TTL_SECS, DidPublicKeyResolver, FreshnessStatus,
+    IdentityDidPublicKeyResolver, NoOpRevocationChecker, REFERENCE_TTL_SECS, RevocationStatus,
+    ThresholdRequirement, ThresholdResult, check_attestation_freshness,
+    check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
 };
 pub use capability_registry::{
     CapabilityRegistryError, RegistryEntry, is_known_protocol_capability,
@@ -149,7 +151,7 @@ pub type ToolId = String;
 // ---------------------------------------------------------------------------
 
 /// Errors produced by trust engine operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TrustError {
     /// No events found for the specified subject DID in the event log.
     #[error("no events found for subject DID: {did}")]

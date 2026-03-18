@@ -141,6 +141,47 @@ impl VerificationMethod {
             Self::ChallengeResponse => "challenge_response",
         }
     }
+
+    /// Returns the attestation class for this verification method (§7.4.1).
+    ///
+    /// - **Cryptographic** methods (challenge-response, DNS record) produce proofs
+    ///   that can be verified without contacting the original platform.
+    /// - **Reference** methods (OAuth, signed post) require fetching or validating
+    ///   external platform data that may become unavailable.
+    #[must_use]
+    pub const fn attestation_class(self) -> AttestationClass {
+        match self {
+            Self::Oauth | Self::SignedPost => AttestationClass::Reference,
+            Self::DnsRecord | Self::ChallengeResponse => AttestationClass::Cryptographic,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AttestationClass (§7.4.1)
+// ---------------------------------------------------------------------------
+
+/// Classification of attestation verification strength (§7.4.1).
+///
+/// Determines cache TTLs and verification strategies:
+/// - **Cryptographic** attestations are self-verifiable (signatures, DNS records)
+///   and can be cached longer.
+/// - **Reference** attestations depend on external platform data (OAuth tokens,
+///   signed posts) that may become stale or unavailable, requiring shorter TTLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationClass {
+    /// The proof is cryptographically self-verifiable without external calls.
+    ///
+    /// Examples: challenge-response (Ed25519 signature), DNS TXT record
+    /// (verifiable via standard DNS resolution).
+    Cryptographic,
+
+    /// The proof references external platform data that may change or disappear.
+    ///
+    /// Examples: OAuth tokens (expire, can be revoked), signed posts (can be
+    /// deleted, accounts suspended).
+    Reference,
 }
 
 // ---------------------------------------------------------------------------
