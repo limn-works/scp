@@ -618,21 +618,28 @@ class IdentityLinkAttestation:
             platform_id=claim.get("platform_id"),
         )
 
-    async def verify(self) -> bool:
+    async def verify(self, issuer_public_key_hex: str | None = None) -> bool:
         """Verify the Ed25519 signature on this attestation.
+
+        Args:
+            issuer_public_key_hex: Optional hex-encoded Ed25519 public key
+                of the issuer. If provided, uses this key directly for
+                verification. Otherwise falls back to looking up the
+                issuer's key from the identity registry.
 
         Returns:
             ``True`` if the signature is valid.
 
         Raises:
             scp_sdk.IdentityError: If the issuer's identity is not
-                available for verification.
+                available for verification (and no key is provided).
         """
         import _scp_core
 
         return await asyncio.to_thread(
             _scp_core.py_verify_identity_link_attestation,
             self.raw_json,
+            issuer_public_key_hex,
         )
 
 

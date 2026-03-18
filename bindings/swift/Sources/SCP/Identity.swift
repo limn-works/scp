@@ -216,7 +216,8 @@ public enum IdentityBridge {
 
     /// Verify an identity link attestation.
     public typealias VerifyLinkAttestationFn = @Sendable (
-        _ attestationJson: String
+        _ attestationJson: String,
+        _ issuerPublicKeyHex: String?
     ) async throws -> Bool
 
     /// Default create link attestation — delegates to UniFFI.
@@ -235,8 +236,8 @@ public enum IdentityBridge {
     }
 
     /// Default verify link attestation — delegates to UniFFI.
-    public static let defaultVerifyLinkAttestation: VerifyLinkAttestationFn = { json in
-        try await identityVerifyLinkAttestation(attestationJson: json)
+    public static let defaultVerifyLinkAttestation: VerifyLinkAttestationFn = { json, issuerPublicKeyHex in
+        try await identityVerifyLinkAttestation(attestationJson: json, issuerPublicKeyHex: issuerPublicKeyHex)
     }
 }
 
@@ -647,6 +648,9 @@ public func removeIdentityLinkAttestation(
 ///
 /// - Parameters:
 ///   - attestationJson: JSON string of the attestation.
+///   - issuerPublicKeyHex: Optional hex-encoded Ed25519 public key of the
+///     issuer. If provided, uses this key directly. Otherwise falls back to
+///     the identity registry.
 ///   - verifyLinkAttestationFn: Bridge function override for testing.
 /// - Returns: `true` if the signature is valid.
 ///
@@ -655,8 +659,9 @@ public func removeIdentityLinkAttestation(
 /// - Spec section 3.5.1 (Identity Link Attestation)
 public func verifyIdentityLinkAttestation(
     attestationJson: String,
+    issuerPublicKeyHex: String? = nil,
     verifyLinkAttestationFn: IdentityBridge.VerifyLinkAttestationFn =
         IdentityBridge.defaultVerifyLinkAttestation
 ) async throws -> Bool {
-    try await verifyLinkAttestationFn(attestationJson)
+    try await verifyLinkAttestationFn(attestationJson, issuerPublicKeyHex)
 }

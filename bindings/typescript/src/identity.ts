@@ -412,14 +412,21 @@ export class Identity {
    * Verifies the Ed25519 signature on an identity link attestation.
    *
    * @param attestation - The attestation to verify (or its JSON string).
+   * @param issuerPublicKeyHex - Optional hex-encoded Ed25519 public key of
+   *   the issuer. If provided, uses this key directly for verification.
+   *   Otherwise falls back to looking up the issuer's key from the identity
+   *   registry.
    * @returns `true` if the signature is valid.
-   * @throws {IdentityError} If the issuer's identity is not available.
+   * @throws {IdentityError} If the issuer's identity is not available (and no key provided).
    */
-  static async verifyAttestation(attestation: IdentityLinkAttestation | string): Promise<boolean> {
+  static async verifyAttestation(
+    attestation: IdentityLinkAttestation | string,
+    issuerPublicKeyHex?: string | null,
+  ): Promise<boolean> {
     try {
       const bridge = await getBridge();
       const json = typeof attestation === "string" ? attestation : JSON.stringify(attestation);
-      return await bridge.identityVerifyLinkAttestation(json);
+      return await bridge.identityVerifyLinkAttestation(json, issuerPublicKeyHex);
     } catch (error) {
       throw mapBridgeError(error);
     }

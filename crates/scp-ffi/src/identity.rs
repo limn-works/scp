@@ -1413,12 +1413,14 @@ fn py_remove_identity_link_attestation(
 
 /// Verifies the Ed25519 signature on an identity link attestation.
 ///
-/// Parses the attestation JSON string, resolves the issuer's public key
-/// from the identity registry, and verifies the signature.
+/// Parses the attestation JSON string and verifies the signature. If
+/// `issuer_public_key_hex` is provided, uses that key directly. Otherwise
+/// falls back to looking up the issuer's key from the identity registry.
 ///
 /// # Arguments
 ///
 /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+/// * `issuer_public_key_hex` — Optional hex-encoded Ed25519 public key.
 ///
 /// # Returns
 ///
@@ -1426,31 +1428,44 @@ fn py_remove_identity_link_attestation(
 ///
 /// # Errors
 ///
-/// Raises `IdentityError` if the JSON is malformed or the issuer's identity
-/// is not in the registry.
+/// Raises `IdentityError` if the JSON is malformed, the hex key is invalid,
+/// or the issuer's identity is not in the registry (when no key is provided).
 ///
 /// See spec §3.5.1.
 #[pyfunction]
-fn py_verify_identity_link_attestation(py: Python<'_>, attestation_json: &str) -> PyResult<bool> {
+#[pyo3(signature = (attestation_json, issuer_public_key_hex=None))]
+fn py_verify_identity_link_attestation(
+    py: Python<'_>,
+    attestation_json: &str,
+    issuer_public_key_hex: Option<&str>,
+) -> PyResult<bool> {
     use scp_core::identity::attestation::IdentityLinkAttestation;
-    use scp_platform::traits::KeyCustody;
 
     let json_owned = attestation_json.to_owned();
+    let hex_key_owned = issuer_public_key_hex.map(ToOwned::to_owned);
     let rt = crate::runtime()?;
 
     py.allow_threads(move || -> Result<bool, ScpPyError> {
         let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
             .map_err(|e| ScpPyError::identity(format!("failed to parse attestation JSON: {e}")))?;
 
-        let issuer_did: &str = &attestation.issuer;
+        if let Some(hex_key) = hex_key_owned {
+            // Caller provided the key directly — verify without registry lookup.
+            let pub_bytes = hex::decode(&hex_key)
+                .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
+            Ok(attestation.verify_signature(&pub_bytes).is_ok())
+        } else {
+            // Fall back to the identity registry.
+            use scp_platform::traits::KeyCustody;
 
-        // Look up the issuer's public key from the identity registry.
-        crate::runtime::with_identity(issuer_did, |entry| {
-            let pub_key = rt
-                .block_on(entry.custody.public_key(&entry.identity.active_signing_key))
-                .map_err(|e| ScpPyError::identity(format!("failed to get public key: {e}")))?;
-            Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
-        })
+            let issuer_did: &str = &attestation.issuer;
+            crate::runtime::with_identity(issuer_did, |entry| {
+                let pub_key = rt
+                    .block_on(entry.custody.public_key(&entry.identity.active_signing_key))
+                    .map_err(|e| ScpPyError::identity(format!("failed to get public key: {e}")))?;
+                Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
+            })
+        }
     })
     .map_err(PyErr::from)
 }

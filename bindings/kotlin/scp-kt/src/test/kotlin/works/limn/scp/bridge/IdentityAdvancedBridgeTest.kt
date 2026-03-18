@@ -137,6 +137,28 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         executeCustodyMigrationError?.let { throw it }
         return executeCustodyMigrationResult
     }
+
+    // Identity link attestation (§3.5.1) — stub implementations
+    override fun identityCreateLinkAttestation(
+        identityHandle: Long,
+        platform: String,
+        handle: String,
+        proof: String,
+        verificationMethod: String,
+        platformId: String?,
+    ): String = """{"id":"mock-id","type":"identity_link","issuer":"did:dht:z6mock"}"""
+
+    override fun identityLinkAttestations(did: String): String = "[]"
+
+    override fun identityRemoveLinkAttestation(
+        did: String,
+        attestationId: String,
+    ): Boolean = true
+
+    override fun identityVerifyLinkAttestation(
+        attestationJson: String,
+        issuerPublicKeyHex: String?,
+    ): Boolean = true
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
