@@ -9,6 +9,9 @@
 //! - `verify_participation_requirements` — Verify a DID meets participation requirements.
 //! - `aggregate_trust_input` — Aggregate trust inputs (throws — requires native bridge).
 //!
+//! Reference-class attestation verification (`SignedPost`, `DnsRecord`) is in
+//! [`crate::reference_verify`] — it uses the browser Fetch API.
+//!
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
