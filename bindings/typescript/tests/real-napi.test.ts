@@ -5,6 +5,10 @@
  * `crates/scp-ffi/napi/`. They verify that the TypeScript SDK classes
  * correctly delegate through the real FFI bridge to scp-core Rust code.
  *
+ * A-grade: All tests run through a real in-process relay (RelayTransportProvider),
+ * not LocalTransportProvider. The full encrypt -> sign -> relay publish pipeline
+ * executes for every contextSend / broadcastPublish call.
+ *
  * Prerequisites:
  * - The NAPI bridge must be compiled with `allow_in_memory_custody` feature.
  * - The platform-specific `@limn-works/scp-ts-napi-*` package must be loadable.
@@ -12,15 +16,27 @@
  * If the native addon is not available, all tests are skipped gracefully.
  */
 
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BridgeMode } from "../src/bridge";
-import { configureLocalTransport } from "../src/server";
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
 // ---------------------------------------------------------------------------
 
-let bridge: Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>> | null = null;
+type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
+type ServerAddon = {
+  relayStartInMemory(): Promise<{
+    readonly relayUrl: string;
+    readonly relayPort: number;
+    readonly isShutdown: boolean;
+    shutdown(): void;
+  }>;
+  transportConnect(relayUrl: string): Promise<unknown>;
+  configureRelayTransport(relayUrl: string, localDid: string): Promise<void>;
+};
+
+let bridge: NativeBridge | null = null;
+let serverAddon: ServerAddon | null = null;
 let skipReason = "";
 
 try {
@@ -28,27 +44,67 @@ try {
   const { createNativeBridge } = await import("../src/internal/native.js");
   bridge = createNativeBridge();
 
-  // Create a bootstrap identity and pre-configure the ContextManager with
-  // LocalTransportProvider. This must happen BEFORE any contextCreate call
-  // so that the OnceLock-based init picks up LocalTransportProvider instead
-  // of NotConfiguredTransportProvider. With LocalTransportProvider,
-  // contextSend and broadcastPublish succeed locally without a running
-  // relay — the full encrypt/sign pipeline still executes.
-  const bootstrapIdentity = await bridge.identityCreate("in_memory");
-  configureLocalTransport(bootstrapIdentity.did);
+  // Load the server addon for relay + transport operations
+  const { createRequire } = await import("node:module");
+  const req = createRequire(import.meta.url);
+  const platform = process.platform;
+  const arch = process.arch;
+  const platformMap: Record<string, string> = {
+    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
+    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
+    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
+    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
+    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
+  };
+  const pkg = platformMap[`${platform}-${arch}`];
+  if (pkg) {
+    serverAddon = req(pkg) as ServerAddon;
+  } else {
+    skipReason = `No native addon for ${platform}-${arch}`;
+  }
 } catch (e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
   skipReason = `Native NAPI bridge not available: ${msg}`;
 }
 
 // When the bridge is unavailable, define a single test that reports the skip.
-if (bridge === null) {
+if (bridge === null || serverAddon === null) {
   describe("Real NAPI bridge E2E (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
   // Capture the bridge in a const for type narrowing.
   const napi = bridge;
+  const addon = serverAddon;
+
+  // ---------------------------------------------------------------------------
+  // Relay lifecycle state
+  // ---------------------------------------------------------------------------
+
+  let relayHandle: Awaited<ReturnType<typeof addon.relayStartInMemory>> | null = null;
+
+  beforeAll(async () => {
+    // Start an in-memory relay on an ephemeral port
+    relayHandle = await addon.relayStartInMemory();
+
+    // Bootstrap identity first to get a DID for MLS credential identity.
+    // This must happen BEFORE configureRelayTransport because the
+    // ContextManager OnceLock is set by whichever call wins the race.
+    const bootstrap = await napi.identityCreate("in_memory");
+
+    // Configure the ContextManager with a relay-backed transport provider.
+    // configureRelayTransport creates a relay connection and wraps it in
+    // RelayTransportProvider, so contextSend publishes encrypted payloads
+    // through the relay. Must be called BEFORE any contextCreate (which
+    // triggers init_context_manager via OnceLock).
+    await addon.configureRelayTransport(relayHandle.relayUrl, bootstrap.did);
+
+    // Establish a SECOND WebSocket connection for contextSubscribe.
+    // contextSubscribe uses the global RELAY_ADAPTER (set by
+    // transportConnect) for its subscription stream, separate from the
+    // ContextManager's transport provider.
+    await addon.transportConnect(relayHandle.relayUrl);
+  });
 
   // ---------------------------------------------------------------------------
   // Lifecycle hooks
@@ -56,6 +112,9 @@ if (bridge === null) {
 
   afterAll(() => {
     napi.shutdown(1);
+    if (relayHandle && !relayHandle.isShutdown) {
+      relayHandle.shutdown();
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -187,14 +246,14 @@ if (bridge === null) {
       await napi.contextJoin(ctx, joiner.did);
     });
 
-    test("sends a message without error (local transport)", async () => {
+    test("sends a message without error (relay transport)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
       const payload = new TextEncoder().encode("hello from NAPI");
-      // Should not throw — LocalTransportProvider silently succeeds.
+      // Should not throw — RelayTransportProvider publishes through the relay.
       await napi.contextSend(ctx, identity.did, payload);
     });
 
@@ -477,7 +536,7 @@ if (bridge === null) {
       expect(typeof events[0]?.sequence).toBe("number");
     });
 
-    test("queries events with a MessageSent filter after send (local transport)", async () => {
+    test("queries events with a MessageSent filter after send (relay transport)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -863,7 +922,7 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E context lifecycle (real NAPI)", () => {
-    test("create -> join -> send -> membership check -> leave -> close (local transport)", async () => {
+    test("create -> join -> send -> membership check -> leave -> close (relay transport)", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -1126,7 +1185,7 @@ if (bridge === null) {
       expect(typeof admission).toBe("string");
     });
 
-    test("publish sends a broadcast message (local transport)", async () => {
+    test("publish sends a broadcast message (relay transport)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -1137,7 +1196,7 @@ if (bridge === null) {
         }),
       );
       const payload = new TextEncoder().encode("broadcast hello");
-      // Should not throw — LocalTransportProvider silently succeeds.
+      // Should not throw — RelayTransportProvider publishes through the relay.
       await napi.broadcastPublish(ctx, identity.did, payload);
     });
 
@@ -1494,7 +1553,7 @@ if (bridge === null) {
   // ---------------------------------------------------------------------------
 
   describe("E2E broadcast lifecycle (real NAPI)", () => {
-    test("create -> subscribe -> publish -> check subscriber -> unsubscribe (local transport)", async () => {
+    test("create -> subscribe -> publish -> check subscriber -> unsubscribe (relay transport)", async () => {
       const author = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
 
@@ -1539,27 +1598,19 @@ if (bridge === null) {
       );
 
       const body = Array.from(new TextEncoder().encode("<h1>Hello</h1>"));
-      try {
-        const result = await napi.broadcastPublishAsset(
-          ctx,
-          identity.did,
-          { path: "/index.html", contentType: "text/html", body },
-          "deploy-napi-1",
-        );
-        // If publish succeeds (transport configured), verify result shape.
-        expect(result).toHaveProperty("blobId");
-        expect(result).toHaveProperty("etag");
-        expect(result).toHaveProperty("deployId");
-        expect(typeof result.blobId).toBe("string");
-        expect(result.blobId.length).toBe(64);
-        expect(result.deployId).toBe("deploy-napi-1");
-      } catch (e: unknown) {
-        const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
-        const isTransportError = msg.includes("transport") || msg.includes("not configured");
-        if (!isTransportError) {
-          throw new Error(`expected transport error, got: ${msg}`);
-        }
-      }
+      const result = await napi.broadcastPublishAsset(
+        ctx,
+        identity.did,
+        { path: "/index.html", contentType: "text/html", body },
+        "deploy-napi-1",
+      );
+      // Relay transport is configured — publish succeeds.
+      expect(result).toHaveProperty("blobId");
+      expect(result).toHaveProperty("etag");
+      expect(result).toHaveProperty("deployId");
+      expect(typeof result.blobId).toBe("string");
+      expect(result.blobId.length).toBe(64);
+      expect(result.deployId).toBe("deploy-napi-1");
     });
 
     test("broadcastPublishAssets batch returns correct count", async () => {
@@ -1586,26 +1637,19 @@ if (bridge === null) {
         },
       ];
 
-      try {
-        const batch = await napi.broadcastPublishAssets(
-          ctx,
-          identity.did,
-          assets,
-          "deploy-napi-batch",
-        );
-        expect(batch.results.length).toBe(2);
-        expect(batch.deployId).toBe("deploy-napi-batch");
-        for (const r of batch.results) {
-          expect(r).toHaveProperty("blobId");
-          expect(r).toHaveProperty("etag");
-          expect(r).toHaveProperty("deployId");
-        }
-      } catch (e: unknown) {
-        const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
-        const isTransportError = msg.includes("transport") || msg.includes("not configured");
-        if (!isTransportError) {
-          throw new Error(`expected transport error, got: ${msg}`);
-        }
+      const batch = await napi.broadcastPublishAssets(
+        ctx,
+        identity.did,
+        assets,
+        "deploy-napi-batch",
+      );
+      // Relay transport is configured — batch publish succeeds.
+      expect(batch.results.length).toBe(2);
+      expect(batch.deployId).toBe("deploy-napi-batch");
+      for (const r of batch.results) {
+        expect(r).toHaveProperty("blobId");
+        expect(r).toHaveProperty("etag");
+        expect(r).toHaveProperty("deployId");
       }
     });
   });

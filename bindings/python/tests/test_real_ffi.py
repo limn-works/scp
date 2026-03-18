@@ -1,6 +1,10 @@
-"""Phase D4 — Python SDK Real FFI Integration Tests.
+"""Phase D4 — Python SDK Real FFI Integration Tests (A-grade).
 
 Tests the Python SDK through the actual _scp_core PyO3 bridge, NOT mocks.
+A-grade: All tests run through a real in-process relay (RelayTransportProvider),
+not NotConfiguredTransportProvider. The full encrypt -> sign -> relay publish
+pipeline executes for every py_context_send / py_broadcast_publish call.
+
 Requires: `maturin develop --release --features allow_in_memory_custody`
 
 Run:
@@ -29,6 +33,36 @@ except (ImportError, AttributeError):
 
 from scp_sdk.identity import Identity
 from scp_sdk.types import CustodyType
+
+# ---------------------------------------------------------------------------
+# Session-scoped relay fixture (started once, shut down after all tests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session", autouse=True)
+def relay():
+    """Start an in-memory relay for the entire test session.
+
+    Initializes the ContextManager with a RelayTransportProvider so
+    py_context_send publishes through the relay. A second connection
+    (transport_connect) is established for relay-based discovery.
+    """
+    handle = _scp_core.py_relay_start_in_memory()
+
+    # Create a bootstrap identity for the MLS credential DID.
+    bootstrap = _scp_core.py_identity_create("in_memory")
+
+    # Wire the ContextManager to use a real relay transport provider.
+    # Must be called BEFORE any py_context_create (OnceLock — first call wins).
+    _scp_core.configure_relay_transport(handle.relay_url, bootstrap.did)
+
+    # Second connection for relay-based context discovery.
+    _scp_core.transport_connect(handle.relay_url)
+
+    yield handle
+    if not handle.is_shutdown:
+        handle.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # PyContextParams
@@ -250,13 +284,9 @@ class TestContext:
                 "governance": "single_admin",
             },
         )
-        # With MlsCryptoProvider wired (#1324), crypto succeeds but transport
-        # is not configured (NotConfiguredTransportProvider). The error comes
-        # from the transport layer, not crypto — confirming MLS encryption works.
-        try:
-            _scp_core.py_context_send(handle, alice.did, b"Hello from Python!")
-        except RuntimeError as e:
-            assert "transport not configured" in str(e)
+        # RelayTransportProvider is configured — send publishes through the relay.
+        # Full pipeline: MLS encrypt -> sender key -> outer envelope -> relay publish.
+        _scp_core.py_context_send(handle, alice.did, b"Hello from Python!")
 
     async def test_drain_events(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
@@ -628,7 +658,7 @@ class TestBroadcastPublishAsset:
     """Broadcast content delivery asset publishing through real FFI."""
 
     async def test_broadcast_publish_asset_real_ffi(self):
-        """Single asset publish returns blob_id or raises transport error."""
+        """Single asset publish returns blob_id and etag through relay."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         handle = _scp_core.py_context_create(
             alice.did,
@@ -639,32 +669,22 @@ class TestBroadcastPublishAsset:
                 "mode": "broadcast",
             },
         )
-        try:
-            result = _scp_core.py_broadcast_publish_asset(
-                handle,
-                alice.did,
-                "/index.html",
-                "text/html",
-                b"<h1>Hello</h1>",
-                "deploy-test-1",
-            )
-            # If publish succeeds (transport configured), verify result shape.
-            assert "blob_id" in result
-            assert "etag" in result
-            # blob_id is a 64-char hex string (SHA-256).
-            assert len(result["blob_id"]) == 64
-            assert all(c in "0123456789abcdef" for c in result["blob_id"])
-            # etag is also a hex string.
-            assert len(result["etag"]) > 0
-        except Exception as e:
-            # Transport-not-configured is acceptable in CI (no relay).
-            # Content validation errors are NOT acceptable.
-            msg = str(e)
-            assert "transport" in msg.lower() or "not configured" in msg.lower(), (
-                f"expected transport error, got: {msg}"
-            )
-            assert "invalid path" not in msg
-            assert "invalid content_type" not in msg
+        # Relay transport is configured — publish succeeds.
+        result = _scp_core.py_broadcast_publish_asset(
+            handle,
+            alice.did,
+            "/index.html",
+            "text/html",
+            b"<h1>Hello</h1>",
+            "deploy-test-1",
+        )
+        assert "blob_id" in result
+        assert "etag" in result
+        # blob_id is a 64-char hex string (SHA-256).
+        assert len(result["blob_id"]) == 64
+        assert all(c in "0123456789abcdef" for c in result["blob_id"])
+        # etag is also a hex string.
+        assert len(result["etag"]) > 0
 
     async def test_broadcast_publish_asset_invalid_path_raises(self):
         """Invalid content path raises an error with 'invalid path' message."""
@@ -689,7 +709,7 @@ class TestBroadcastPublishAsset:
             )
 
     async def test_broadcast_publish_assets_real_ffi(self):
-        """Batch publish returns correct count or raises transport error."""
+        """Batch publish returns correct count through relay."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         handle = _scp_core.py_context_create(
             alice.did,
@@ -705,28 +725,22 @@ class TestBroadcastPublishAsset:
             ("/style.css", "text/css", b"body { margin: 0 }"),
             ("/app.js", "application/javascript", b"console.log('ok')"),
         ]
-        try:
-            result = _scp_core.py_broadcast_publish_assets(
-                handle,
-                alice.did,
-                assets,
-                "deploy-batch-1",
-            )
-            # Batch returns {"results": [...], "deploy_id": "..."}.
-            assert "results" in result
-            assert "deploy_id" in result
-            asset_results = result["results"]
-            assert len(asset_results) == 3
-            for r in asset_results:
-                assert "blob_id" in r
-                assert "etag" in r
-                assert len(r["blob_id"]) == 64
-        except RuntimeError as e:
-            # Transport-not-configured is acceptable in CI (no relay).
-            msg = str(e)
-            assert "transport" in msg.lower() or "not configured" in msg.lower(), (
-                f"expected transport error, got: {msg}"
-            )
+        # Relay transport is configured — batch publish succeeds.
+        result = _scp_core.py_broadcast_publish_assets(
+            handle,
+            alice.did,
+            assets,
+            "deploy-batch-1",
+        )
+        # Batch returns {"results": [...], "deploy_id": "..."}.
+        assert "results" in result
+        assert "deploy_id" in result
+        asset_results = result["results"]
+        assert len(asset_results) == 3
+        for r in asset_results:
+            assert "blob_id" in r
+            assert "etag" in r
+            assert len(r["blob_id"]) == 64
 
 
 # ---------------------------------------------------------------------------
