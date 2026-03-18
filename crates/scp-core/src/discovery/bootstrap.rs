@@ -47,7 +47,7 @@ pub struct BootstrapConfig {
     /// queries.
     pub auto_query_on_identity_creation: bool,
 
-    /// User-added custom bootstrap context IDs.
+    /// User-added custom context IDs.
     ///
     /// These are queried alongside the defaults. Users can add contexts via
     /// [`BootstrapConfig::add_custom_context`].
@@ -90,7 +90,7 @@ impl BootstrapConfig {
         }
     }
 
-    /// Adds a custom bootstrap context ID.
+    /// Adds a custom context ID.
     ///
     /// Custom contexts are queried alongside the defaults. Duplicate context
     /// IDs are not filtered here -- deduplication happens at query time in
@@ -155,7 +155,7 @@ impl BootstrapResolver {
         &self.config
     }
 
-    /// Returns all available bootstrap context IDs (defaults + custom),
+    /// Returns all available context IDs (defaults + custom),
     /// deduplicated while preserving order.
     #[must_use]
     pub fn resolve_contexts(&self) -> Vec<ContextId> {

@@ -1130,7 +1130,7 @@ These events are appended to the identity private state event log (§3.7). They 
 |-------|------|----------|-----------|
 | `default_context_ids` | `Vec<String>` | Yes | SDK default bootstrap context IDs. |
 | `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery tools on first identity creation. |
-| `custom_context_ids` | `Vec<String>` | Yes | User-added bootstrap context IDs. May be empty. |
+| `custom_context_ids` | `Vec<String>` | Yes | User-added context IDs. May be empty. |
 | `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to DID document capability resolution. |
 
 **`DiscoveryQuery`** — Parameters for multi-source discovery search.
