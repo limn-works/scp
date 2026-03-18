@@ -349,10 +349,13 @@ async fn attestation_threshold() {
     assert!(result.met, "2-of-3 threshold should be met");
     assert_eq!(result.valid_count, 3);
 
-    // 4-of-3 threshold should NOT be met.
-    let strict_requirement = ThresholdRequirement::new(4, 3, 0.5);
+    // 4-of-5 threshold should NOT be met (only 3 attestors provided).
+    let strict_requirement = ThresholdRequirement::new(4, 5, 0.5);
     let result_strict = check_threshold_attestation(&att_type, &attestors, &strict_requirement);
-    assert!(!result_strict.met, "4-of-3 threshold should not be met");
+    assert!(
+        !result_strict.met,
+        "4-of-5 threshold should not be met with only 3 attestors"
+    );
 }
 
 // ---------------------------------------------------------------------------
