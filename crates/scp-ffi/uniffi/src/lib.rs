@@ -112,6 +112,8 @@ pub use bridge::{
     broadcast_subscriber_count,
     broadcast_unblock_subscriber,
     broadcast_unsubscribe,
+    // Free functions — transport
+    configure_relay_transport,
     // Free functions — context lifecycle
     context_close,
     context_create,
@@ -188,7 +190,6 @@ pub use bridge::{
     tool_session_create,
     tool_session_invoke,
     tool_verify,
-    // Free functions — transport
     transport_connect,
     transport_disconnect,
     transport_status,

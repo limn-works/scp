@@ -170,6 +170,53 @@ pub fn init_context_manager() {
     let _ = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
 }
 
+/// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
+///
+/// Identical to [`init_context_manager`] except the transport provider is a
+/// `RelayTransportProvider` wrapping a real `NativeRelayAdapter` connected to
+/// the given relay URL. This allows `ContextManager::send_message` (and thus
+/// `context_send`) to publish encrypted payloads through the relay.
+///
+/// **Must be called before any `context_create` / `context_join` /
+/// `context_import`** — those functions call `init_context_manager` which
+/// will win the `OnceLock` race if called first.
+///
+/// Exposed to Swift/Kotlin via [`crate::bridge::configure_relay_transport`]
+/// so that E2E tests can exercise the full send → relay → subscribe → receive
+/// pipeline.
+///
+/// # Arguments
+///
+/// * `local_did` — The DID of the first identity (MLS credential identity).
+/// * `adapter` — A connected `NativeRelayAdapter` to wrap in
+///   `RelayTransportProvider`.
+///
+/// Subsequent calls are no-ops (`OnceLock`).
+pub fn init_context_manager_with_relay_transport(
+    local_did: &str,
+    adapter: scp_transport::native::adapter::NativeRelayAdapter,
+) {
+    if CONTEXT_MANAGER.get().is_some() {
+        tracing::warn!(
+            requested_did = %local_did,
+            "init_context_manager already initialized — ignoring relay-transport init"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+        let event_log = build_event_log_provider();
+        Arc::new(ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            not_configured_key_resolver(),
+        ))
+    });
+}
+
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///

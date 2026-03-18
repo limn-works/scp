@@ -4105,6 +4105,57 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
         })?
 }
 
+/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+///
+/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
+/// Once the `ContextManager` is initialized (by whichever call arrives first),
+/// the transport provider is locked in for the lifetime of the process.
+///
+/// Unlike the default transport (`NotConfiguredTransportProvider`), this creates a
+/// **real** relay connection and wraps it in `RelayTransportProvider`. This means
+/// `contextSend` will publish encrypted payloads through the relay, enabling
+/// full end-to-end send → relay → subscribe → receive tests.
+///
+/// The `relay_url` must point to a running relay. A separate
+/// `transportConnect` call is still needed for `contextSubscribe` (which
+/// uses the `TransportManager` for its subscription stream).
+///
+/// # Arguments
+///
+/// * `relay_url` — The URL of the relay to connect to.
+/// * `local_did` — The DID for MLS credential identity. Pass any valid
+///   `did:dht:` string (typically the DID of the first identity you plan
+///   to create).
+///
+/// # Errors
+///
+/// - Returns an error if `relay_url` fails URL validation.
+/// - Returns an error if `local_did` fails DID format validation.
+/// - Returns an error if the relay connection fails.
+#[uniffi::export]
+pub async fn configure_relay_transport(
+    relay_url: String,
+    local_did: String,
+) -> Result<(), ScpError> {
+    validate_relay_url(&relay_url)?;
+    validate_did(&local_did)?;
+
+    let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+        url: relay_url.clone(),
+        source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+    };
+
+    let adapter = scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced)
+        .await
+        .map_err(|e| ScpError::Transport {
+            msg: format!("failed to connect to relay '{relay_url}': {e}"),
+            code: "SCP-TRANS-5001".to_owned(),
+        })?;
+
+    crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Free functions — MCP operations
 //
