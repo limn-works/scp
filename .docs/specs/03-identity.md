@@ -194,7 +194,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
     proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
-    verified_at:    u64,         // Timestamp of last verification
+    verified_at:    u64,         // Unix timestamp (ms) of last verification
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
   revocation_status: RevocationStatus, // Active or Revoked (§7.4.1). MUST be in signed scope.
@@ -228,13 +228,13 @@ Identity link attestations are published as service entries in the issuer's DID 
 
 ```
 Service {
-  id:              "<did>#attestation-<platform>-<index>",  // e.g., "did:dht:z...#attestation-github.com-0"
+  id:              "<did>#attestation-<platform>--<index>",  // e.g., "did:dht:z...#attestation-github.com--0"
   type:            "ScpIdentityLinkAttestation",
   serviceEndpoint: "<attestation_id>"                       // Hex-encoded attestation ID (§3.5.2)
 }
 ```
 
-**Fragment naming convention:** `attestation-<platform>-<index>` where `<platform>` is the `platform` value from the provider registry (§3.5.1) and `<index>` is a zero-based integer for disambiguation when multiple attestations exist for the same platform (e.g., multiple Mastodon instances).
+**Fragment naming convention:** `attestation-<platform>--<index>` where `<platform>` is the `platform` value from the provider registry (§3.5.1) and `<index>` is a zero-based integer for disambiguation when multiple attestations exist for the same platform (e.g., multiple Mastodon instances).
 
 **Fields:**
 
@@ -285,6 +285,8 @@ Verification procedure depends on the attestation class (§3.5.0).
 | `x.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
 | `mastodon:<instance>` | 2 | 90 days | Profile bio may be edited; instance may be deactivated |
 | `dns` | 2 | 180 days | DNS records are stable; domain ownership changes slowly |
+
+**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations are not tied to a specific platform (§3.5.1), so they do not appear in the per-platform tables above. The 60-day interval reflects that no persistent proof exists — freshness of the cryptographic round trip is the only signal.
 
 ### 3.5.5 Shadow Identity Claiming Protocol
 
