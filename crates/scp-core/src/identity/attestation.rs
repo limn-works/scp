@@ -162,17 +162,17 @@ impl VerificationMethod {
         }
     }
 
-    /// Returns the attestation class for this verification method (§3.5.2).
+    /// Returns the attestation class for this verification method (§7.4.1).
     ///
-    /// - `Oauth` and `ChallengeResponse` are **Cryptographic** — self-verifying
-    ///   via cryptographic proof, verifiable offline.
-    /// - `SignedPost` and `DnsRecord` are **Reference** — require fetching an
-    ///   external resource to verify.
+    /// - **Cryptographic** methods (challenge-response, DNS record) produce proofs
+    ///   that can be verified without contacting the original platform.
+    /// - **Reference** methods (OAuth, signed post) require fetching or validating
+    ///   external platform data that may become unavailable.
     #[must_use]
     pub const fn attestation_class(self) -> AttestationClass {
         match self {
-            Self::Oauth | Self::ChallengeResponse => AttestationClass::Cryptographic,
-            Self::SignedPost | Self::DnsRecord => AttestationClass::Reference,
+            Self::Oauth | Self::SignedPost => AttestationClass::Reference,
+            Self::DnsRecord | Self::ChallengeResponse => AttestationClass::Cryptographic,
         }
     }
 }

@@ -24,12 +24,13 @@
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::ed25519::verify_ed25519_signature;
+use crate::identity::attestation::AttestationClass;
 use scp_event_log::Ed25519Signature;
 use scp_identity::DID;
 use scp_identity::cache::Clock;
@@ -630,6 +631,143 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 }
 
 // ---------------------------------------------------------------------------
+// AttestationRevocationChecker trait (§7.4.1)
+// ---------------------------------------------------------------------------
+
+/// Trait for checking attestation revocation status.
+///
+/// Implementations may check DID document service endpoints, local revocation
+/// lists, or external revocation services. The trait is object-safe and
+/// designed for injection into [`verify_attestation`].
+///
+/// See spec §7.4.1 (attestation verification).
+pub trait AttestationRevocationChecker {
+    /// Checks if the attestation with the given ID has been revoked by the issuer.
+    ///
+    /// Returns `Some(revoked_at)` with the revocation timestamp (seconds) if the
+    /// attestation has been revoked, or `None` if the attestation is still active.
+    fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
+}
+
+/// No-op revocation checker that always returns `None` (not revoked).
+///
+/// Suitable for testing, offline verification, or contexts where external
+/// revocation checking is not available.
+pub struct NoOpRevocationChecker;
+
+impl AttestationRevocationChecker for NoOpRevocationChecker {
+    fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AttestationVerificationCache (§7.4.1)
+// ---------------------------------------------------------------------------
+
+/// TTL for cached Reference attestation verification results: 1 hour.
+///
+/// Reference attestations (OAuth, signed post) depend on external platform data
+/// that can change or disappear. Shorter TTL ensures freshness.
+pub const REFERENCE_TTL_SECS: u64 = 3600;
+
+/// TTL for cached Cryptographic attestation verification results: 24 hours.
+///
+/// Cryptographic attestations (challenge-response, DNS) are self-verifiable
+/// and change infrequently. Longer TTL reduces redundant verification.
+pub const CRYPTOGRAPHIC_TTL_SECS: u64 = 86400;
+
+/// A cached attestation verification result.
+struct VerificationCacheEntry {
+    /// When the verification was performed (seconds since epoch).
+    verified_at: u64,
+    /// The class of the attestation, determining the TTL.
+    attestation_class: AttestationClass,
+    /// The cached verification result.
+    result: Result<(), TrustError>,
+}
+
+/// Cache for attestation verification results with class-based TTLs (§7.4.1).
+///
+/// Per-class TTLs: [`REFERENCE_TTL_SECS`] (1 hour) for Reference attestations,
+/// [`CRYPTOGRAPHIC_TTL_SECS`] (24 hours) for Cryptographic attestations.
+///
+/// This is a simple in-memory cache keyed by attestation ID. It does not
+/// persist across process restarts. For persistent caching, use
+/// [`super::aggregate::AttestationCache`] backed by a
+/// [`super::aggregate::TrustProtocolRepository`].
+pub struct AttestationVerificationCache {
+    entries: HashMap<String, VerificationCacheEntry>,
+}
+
+impl AttestationVerificationCache {
+    /// Creates an empty verification cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Returns the TTL in seconds for the given attestation class.
+    #[must_use]
+    const fn ttl_for_class(class: AttestationClass) -> u64 {
+        match class {
+            AttestationClass::Reference => REFERENCE_TTL_SECS,
+            AttestationClass::Cryptographic => CRYPTOGRAPHIC_TTL_SECS,
+        }
+    }
+
+    /// Retrieves a cached verification result if the entry exists and has not
+    /// expired.
+    ///
+    /// Returns `None` if the entry is missing or expired.
+    #[must_use]
+    pub fn get(&self, attestation_id: &str, now: u64) -> Option<&Result<(), TrustError>> {
+        let entry = self.entries.get(attestation_id)?;
+        let ttl = Self::ttl_for_class(entry.attestation_class);
+        if now > entry.verified_at.saturating_add(ttl) {
+            return None;
+        }
+        Some(&entry.result)
+    }
+
+    /// Inserts a verification result into the cache.
+    ///
+    /// Overwrites any existing entry for the same attestation ID.
+    pub fn insert(
+        &mut self,
+        attestation_id: String,
+        class: AttestationClass,
+        result: Result<(), TrustError>,
+        now: u64,
+    ) {
+        self.entries.insert(
+            attestation_id,
+            VerificationCacheEntry {
+                verified_at: now,
+                attestation_class: class,
+                result,
+            },
+        );
+    }
+
+    /// Removes all expired entries from the cache.
+    pub fn evict_expired(&mut self, now: u64) {
+        self.entries.retain(|_, entry| {
+            let ttl = Self::ttl_for_class(entry.attestation_class);
+            now <= entry.verified_at.saturating_add(ttl)
+        });
+    }
+}
+
+impl Default for AttestationVerificationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // verify_attestation
 // ---------------------------------------------------------------------------
 
@@ -642,7 +780,12 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// 2. **Evidence:** Validates that evidence is present when required by the
 ///    attestation type.
 /// 3. **Expiry:** Rejects if `expires_at < now`.
-/// 4. **Revocation:** Rejects if the attestation has been revoked.
+/// 4. **Revocation (field):** Rejects if the attestation's `revocation_status`
+///    field is `Revoked`.
+/// 5. **Revocation (external):** If a [`AttestationRevocationChecker`] is
+///    provided, queries it for external revocation signals. This is belt-and-
+///    suspenders with step 4: the field may be stale while the checker queries
+///    a live revocation service.
 ///
 /// # Errors
 ///
@@ -651,7 +794,7 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// - [`TrustError::AttestationExpired`] when past expiry
 /// - [`TrustError::AttestationRevocationInvalid`] when `revoked_by` does not
 ///   match the issuer (§7.4.1)
-/// - [`TrustError::AttestationRevoked`] when revoked by the issuer
+/// - [`TrustError::AttestationRevoked`] when revoked by the issuer (field or external)
 /// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
 ///   missing or invalid
 ///
@@ -660,6 +803,30 @@ pub fn verify_attestation(
     attestation: &Attestation,
     resolver: &impl DidPublicKeyResolver,
     clock: &impl Clock,
+) -> Result<(), TrustError> {
+    verify_attestation_with_revocation(attestation, resolver, clock, None)
+}
+
+/// Verifies an attestation with an optional external revocation checker.
+///
+/// This is the full-featured verification entry point. [`verify_attestation`]
+/// delegates here with `revocation_checker: None` for backward compatibility.
+///
+/// See [`verify_attestation`] for the verification steps and error semantics.
+///
+/// # Errors
+///
+/// Returns a specific [`TrustError`] variant for each failure mode:
+/// - [`TrustError::AttestationSignatureInvalid`] for signature failures
+/// - [`TrustError::AttestationExpired`] when past expiry
+/// - [`TrustError::AttestationRevoked`] when revoked (field or external checker)
+/// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
+///   missing or invalid
+pub fn verify_attestation_with_revocation(
+    attestation: &Attestation,
+    resolver: &impl DidPublicKeyResolver,
+    clock: &impl Clock,
+    revocation_checker: Option<&dyn AttestationRevocationChecker>,
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
     let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
@@ -685,7 +852,7 @@ pub fn verify_attestation(
         });
     }
 
-    // 4. Check revocation status.
+    // 4. Check revocation status (field on the attestation itself).
     if let RevocationStatus::Revoked {
         revoked_at,
         revoked_by,
@@ -703,6 +870,16 @@ pub fn verify_attestation(
         return Err(TrustError::AttestationRevoked {
             attestation_id: attestation.id.clone(),
             revoked_at: *revoked_at,
+        });
+    }
+
+    // 5. Check external revocation (belt-and-suspenders with step 4).
+    if let Some(checker) = revocation_checker
+        && let Some(revoked_at) = checker.check_revocation(&attestation.id, &attestation.issuer)
+    {
+        return Err(TrustError::AttestationRevoked {
+            attestation_id: attestation.id.clone(),
+            revoked_at,
         });
     }
 
@@ -2220,5 +2397,341 @@ mod tests {
             }
             other => panic!("expected AttestationRevocationInvalid, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationRevocationChecker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn noop_revocation_checker_returns_none() {
+        let checker = NoOpRevocationChecker;
+        let result = checker.check_revocation("att-1", &DID::from("did:key:issuer"));
+        assert!(result.is_none());
+    }
+
+    /// A test revocation checker that always reports a specific attestation as
+    /// revoked at a given timestamp.
+    struct AlwaysRevokedChecker {
+        revoked_at: u64,
+    }
+
+    impl AttestationRevocationChecker for AlwaysRevokedChecker {
+        fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
+            Some(self.revoked_at)
+        }
+    }
+
+    /// A test revocation checker that only revokes a specific attestation ID.
+    struct SelectiveRevokedChecker {
+        target_id: String,
+        revoked_at: u64,
+    }
+
+    impl AttestationRevocationChecker for SelectiveRevokedChecker {
+        fn check_revocation(&self, attestation_id: &str, _issuer: &DID) -> Option<u64> {
+            if attestation_id == self.target_id {
+                Some(self.revoked_at)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn verify_attestation_with_revocation_checker_rejects_revoked() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        let checker = AlwaysRevokedChecker { revoked_at: 999 };
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevoked {
+                revoked_at: 999, ..
+            }) => {}
+            other => panic!("expected AttestationRevoked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_attestation_with_noop_checker_succeeds() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        let checker = NoOpRevocationChecker;
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn verify_attestation_with_none_checker_succeeds() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        let result = verify_attestation_with_revocation(&attestation, &resolver, &clock, None);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn verify_attestation_field_revocation_takes_precedence_over_checker() {
+        // Even with a noop checker, a revoked field should fail.
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let mut attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        attestation.revocation_status = RevocationStatus::Revoked {
+            revoked_at: 950,
+            reason: Some("compromised".to_owned()),
+            revoked_by: "did:key:issuer".into(),
+        };
+
+        let checker = NoOpRevocationChecker;
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevoked {
+                revoked_at: 950, ..
+            }) => {}
+            other => panic!("expected AttestationRevoked at 950, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selective_revocation_checker_only_revokes_targeted_attestation() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        // Checker targets a different attestation ID.
+        let checker = SelectiveRevokedChecker {
+            target_id: "some-other-att-id".to_owned(),
+            revoked_at: 999,
+        };
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(
+            result.is_ok(),
+            "expected Ok for non-targeted attestation, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationVerificationCache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_new_is_empty() {
+        let cache = AttestationVerificationCache::new();
+        assert!(cache.get("att-1", 1000).is_none());
+    }
+
+    #[test]
+    fn cache_insert_and_get_success() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Cryptographic,
+            Ok(()),
+            1000,
+        );
+
+        let result = cache.get("att-1", 1000);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn cache_insert_and_get_error() {
+        let mut cache = AttestationVerificationCache::new();
+        let err = TrustError::AttestationExpired {
+            attestation_id: "att-1".to_owned(),
+            expired_at: 900,
+        };
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Reference,
+            Err(err),
+            1000,
+        );
+
+        let result = cache.get("att-1", 1000);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn cache_reference_ttl_1_hour() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-ref".to_owned(),
+            AttestationClass::Reference,
+            Ok(()),
+            1000,
+        );
+
+        // Just within TTL (1000 + 3600 = 4600)
+        assert!(cache.get("att-ref", 4600).is_some());
+
+        // Past TTL
+        assert!(cache.get("att-ref", 4601).is_none());
+    }
+
+    #[test]
+    fn cache_cryptographic_ttl_24_hours() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-crypto".to_owned(),
+            AttestationClass::Cryptographic,
+            Ok(()),
+            1000,
+        );
+
+        // Just within TTL (1000 + 86400 = 87400)
+        assert!(cache.get("att-crypto", 87400).is_some());
+
+        // Past TTL
+        assert!(cache.get("att-crypto", 87401).is_none());
+    }
+
+    #[test]
+    fn cache_evict_expired_removes_stale_entries() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-ref".to_owned(),
+            AttestationClass::Reference,
+            Ok(()),
+            1000,
+        );
+        cache.insert(
+            "att-crypto".to_owned(),
+            AttestationClass::Cryptographic,
+            Ok(()),
+            1000,
+        );
+
+        // At 4601: Reference (TTL 3600) is expired, Cryptographic (TTL 86400) is not.
+        cache.evict_expired(4601);
+
+        assert!(
+            cache.get("att-ref", 1000).is_none(),
+            "expired reference should be evicted"
+        );
+        assert!(
+            cache.get("att-crypto", 1000).is_some(),
+            "non-expired cryptographic should remain"
+        );
+    }
+
+    #[test]
+    fn cache_overwrite_existing_entry() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Reference,
+            Ok(()),
+            1000,
+        );
+
+        // Overwrite with an error result and different class.
+        let err = TrustError::AttestationRevoked {
+            attestation_id: "att-1".to_owned(),
+            revoked_at: 1500,
+        };
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Cryptographic,
+            Err(err),
+            2000,
+        );
+
+        let result = cache.get("att-1", 2000);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+
+        // New entry uses Cryptographic TTL (24h from 2000 = 88400)
+        assert!(cache.get("att-1", 88400).is_some());
+        assert!(cache.get("att-1", 88401).is_none());
+    }
+
+    #[test]
+    fn cache_default_trait() {
+        let cache = AttestationVerificationCache::default();
+        assert!(cache.get("anything", 0).is_none());
+    }
+
+    #[test]
+    fn cache_ttl_constants_match_spec() {
+        assert_eq!(REFERENCE_TTL_SECS, 3600, "Reference TTL should be 1 hour");
+        assert_eq!(
+            CRYPTOGRAPHIC_TTL_SECS, 86400,
+            "Cryptographic TTL should be 24 hours"
+        );
     }
 }
