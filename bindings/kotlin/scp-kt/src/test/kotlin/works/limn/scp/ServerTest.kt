@@ -60,10 +60,10 @@ class ServerTest {
 
         node.enableSiteProjection(
             contextId = "ctx-123",
-            broadcastKeyHex = "ab".repeat(32),
-            authorDid = "did:dht:z6MkAuthor",
             admission = "open",
             config = config,
+            broadcastKeyHex = "ab".repeat(32),
+            authorDid = "did:dht:z6MkAuthor",
         )
 
         val args = stubBindings.lastEnableSiteProjectionArgs
@@ -86,10 +86,10 @@ class ServerTest {
 
         node.enableSiteProjection(
             contextId = "ctx-456",
-            broadcastKeyHex = "cd".repeat(32),
-            authorDid = "did:dht:z6MkAuthor2",
             admission = "gated",
             config = config,
+            broadcastKeyHex = "cd".repeat(32),
+            authorDid = "did:dht:z6MkAuthor2",
         )
 
         val args = stubBindings.lastEnableSiteProjectionArgs
@@ -203,8 +203,8 @@ internal class StubServerBindings : ServerBindings {
     // enableSiteProjection
     data class EnableArgs(
         val contextId: String,
-        val broadcastKeyHex: String,
-        val authorDid: String,
+        val broadcastKeyHex: String?,
+        val authorDid: String?,
         val admission: String,
         val hostname: String,
         val indexPath: String?,
@@ -220,10 +220,10 @@ internal class StubServerBindings : ServerBindings {
     override fun nodeEnableSiteProjection(
         handleJson: String,
         contextId: String,
-        broadcastKeyHex: String,
-        authorDid: String,
         admission: String,
         hostname: String,
+        broadcastKeyHex: String?,
+        authorDid: String?,
         indexPath: String?,
         maxAssetsPerDeploy: Int?,
         maxDeploySizeBytes: Long?,

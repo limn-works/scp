@@ -48,10 +48,10 @@ interface NativeNodeHandle {
   shutdown(): void;
   enableSiteProjection(
     contextId: string,
-    broadcastKeyHex: string,
-    authorDid: string,
     admission: string,
     hostname: string,
+    broadcastKeyHex: string | null,
+    authorDid: string | null,
     indexPath: string | null,
     maxAssetsPerDeploy: number | null,
     maxDeploySizeBytes: number | null,
@@ -276,29 +276,36 @@ export class Node implements AsyncDisposable {
    *
    * Registers a broadcast context for HTTP content delivery.
    *
+   * When `broadcastKeyHex` and `authorDid` are omitted (or `undefined`),
+   * the key is auto-resolved from the `ContextManager` using the node's
+   * identity DID. This is the recommended usage for locally managed
+   * contexts.
+   *
    * @param contextId - The context ID to project.
-   * @param broadcastKeyHex - 32-byte AES-256 broadcast key as a 64-char hex string.
-   * @param authorDid - DID of the broadcast key owner.
    * @param admission - `"open"` or `"gated"`.
    * @param config - {@link SiteConfig} with hostname, index path, and deploy limits.
+   * @param broadcastKeyHex - 32-byte AES-256 broadcast key as a 64-char hex string, or omit for auto-lookup.
+   * @param authorDid - DID of the broadcast key owner, or omit for auto-lookup.
    * @throws {Error} If parameters are invalid.
    */
   async enableSiteProjection(
     contextId: string,
-    broadcastKeyHex: string,
-    authorDid: string,
     admission: string,
     config: SiteConfig,
+    broadcastKeyHex?: string,
+    authorDid?: string,
   ): Promise<void> {
     validateAdmission(admission);
-    validateBroadcastKeyHex(broadcastKeyHex);
+    if (broadcastKeyHex !== undefined) {
+      validateBroadcastKeyHex(broadcastKeyHex);
+    }
     validateSiteConfig(config);
     await this.#handle.enableSiteProjection(
       contextId,
-      broadcastKeyHex,
-      authorDid,
       admission,
       config.hostname,
+      broadcastKeyHex ?? null,
+      authorDid ?? null,
       config.indexPath ?? null,
       config.maxAssetsPerDeploy ?? null,
       config.maxDeploySizeBytes ?? null,

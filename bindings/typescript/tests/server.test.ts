@@ -21,10 +21,10 @@ interface MockNodeHandle {
   shutdown: () => void;
   enableSiteProjection: (
     contextId: string,
-    broadcastKeyHex: string,
-    authorDid: string,
     admission: string,
     hostname: string,
+    broadcastKeyHex: string | null,
+    authorDid: string | null,
     indexPath: string | null,
     maxAssetsPerDeploy: number | null,
     maxDeploySizeBytes: number | null,
@@ -141,10 +141,10 @@ describe("Node lifecycle methods (SCP-296)", () => {
 
     await handle.enableSiteProjection(
       "ctx-123",
-      "ab".repeat(32),
-      "did:dht:z6MkAuthor",
       "open",
       config.hostname,
+      "ab".repeat(32),
+      "did:dht:z6MkAuthor",
       config.indexPath ?? null,
       config.maxAssetsPerDeploy ?? null,
       config.maxDeploySizeBytes ?? null,
