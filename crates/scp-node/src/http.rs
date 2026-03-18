@@ -789,26 +789,50 @@ pub(crate) fn build_merged_router(
 /// **Security:** This is an internal dispatch only — no HTTP redirect is
 /// issued. The dispatched path passes through `ContentPath` validation in
 /// `site_handler`, which prevents path traversal.
+///
+/// CORS headers are intentionally not applied — virtual host sites are served
+/// same-origin. Cross-origin access should use the explicit `/scp/broadcast/`
+/// routes which include CORS.
 async fn virtual_host_fallback(
     req: axum::extract::Request,
     state: Arc<NodeState>,
 ) -> axum::response::Response {
+    // site_handler only serves GET content; reject other methods early
+    // (before rate limiter check, to avoid wasting tokens).
+    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Enforce the same per-IP rate limit that protects the explicit
+    // `/scp/broadcast/` projection routes. Without this, virtual-host
+    // requests would bypass `projection_rate_limit_middleware`.
+    let remote_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map_or(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            |ci| ci.0.ip(),
+        );
+    if !state.projection_rate_limiter.check(remote_ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+
     // Extract the Host header value.
     let host_value = req
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+        .and_then(|v| v.to_str().ok());
 
     let Some(host_raw) = host_value else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
     // Strip port (e.g., "localhost:8080" -> "localhost") and lowercase.
+    // Borrow through port-stripping, then allocate once with `to_ascii_lowercase()`.
     let hostname = host_raw
         .split(':')
         .next()
-        .unwrap_or(&host_raw)
+        .unwrap_or(host_raw)
         .to_ascii_lowercase();
 
     // Look up in the hostname index.
@@ -1109,9 +1133,7 @@ mod vhost_tests {
 
     use axum::body::Body;
     use axum::http::Request;
-    use ed25519_dalek::Signer;
     use http_body_util::BodyExt;
-    use sha2::{Digest, Sha256};
     use tokio::sync::RwLock;
     use tower::ServiceExt;
     use zeroize::Zeroizing;
@@ -1119,67 +1141,15 @@ mod vhost_tests {
     use scp_core::context::broadcast::BroadcastAdmission;
     use scp_core::context::broadcast_content::{
         BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, ContentPath, MimeType,
-        serialize_broadcast_content,
     };
-    use scp_core::crypto::sender_keys::{
-        BroadcastEnvelope, BroadcastKey, SealBroadcastParams, SigningPayloadFields,
-        build_broadcast_signing_payload, compute_provenance_hash, generate_broadcast_key,
-        generate_broadcast_nonce, seal_broadcast,
-    };
-    use scp_transport::native::storage::{BlobStorage, BlobStorageBackend, InMemoryBlobStorage};
+    use scp_core::crypto::sender_keys::generate_broadcast_key;
+    use scp_transport::native::storage::{BlobStorageBackend, InMemoryBlobStorage};
 
     use crate::http::NodeState;
+    use crate::projection::test_helpers::store_content_blob;
     use crate::projection::{
         ProjectedContext, SiteConfig, broadcast_projection_router, hex_encode,
     };
-
-    /// Seals content into a `BroadcastEnvelope` for testing.
-    fn test_seal(key: &BroadcastKey, plaintext: &[u8]) -> BroadcastEnvelope {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
-        let nonce = generate_broadcast_nonce();
-        let provenance_hash = compute_provenance_hash(None).unwrap();
-        let signature = sk.sign(&build_broadcast_signing_payload(&SigningPayloadFields {
-            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
-            context_id: "test-ctx",
-            author_did: key.author_did(),
-            sequence: 1,
-            key_epoch: key.epoch(),
-            timestamp: 1_700_000_000_000,
-            nonce: &nonce,
-            provenance_hash: &provenance_hash,
-        }));
-        let params = SealBroadcastParams {
-            context_id: "test-ctx",
-            sequence: 1,
-            timestamp: 1_700_000_000_000,
-            provenance: None,
-            signature,
-        };
-        seal_broadcast(key, plaintext, &nonce, &params).unwrap()
-    }
-
-    /// Stores a `BroadcastContent` blob and returns its `blob_id`.
-    async fn store_content_blob(
-        storage: &InMemoryBlobStorage,
-        routing_id: [u8; 32],
-        key: &BroadcastKey,
-        content: &BroadcastContent,
-    ) -> [u8; 32] {
-        let serialized = serialize_broadcast_content(content).unwrap();
-        let envelope = test_seal(key, &serialized);
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
-        let blob_id = {
-            let mut h = Sha256::new();
-            h.update(&blob_bytes);
-            let r: [u8; 32] = h.finalize().into();
-            r
-        };
-        storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
-            .await
-            .unwrap();
-        blob_id
-    }
 
     /// Creates a test `NodeState` with the given projected contexts, blob
     /// storage, and hostname index.

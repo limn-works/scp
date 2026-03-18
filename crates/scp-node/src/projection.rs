@@ -247,12 +247,13 @@ pub fn validate_site_config<S: std::hash::BuildHasher>(
     existing_hostnames: &HashSet<String, S>,
 ) -> Result<(), String> {
     validate_hostname(&config.hostname)?;
+    let normalized = config.hostname.to_ascii_lowercase();
     if let Some(domain) = node_domain
-        && config.hostname == domain
+        && normalized == domain.to_ascii_lowercase()
     {
         return Err("site hostname must not be the node's own hostname".into());
     }
-    if existing_hostnames.contains(&config.hostname) {
+    if existing_hostnames.contains(&normalized) {
         return Err(format!("duplicate site hostname: '{}'", config.hostname));
     }
     if config.deploy_retention_count > MAX_DEPLOY_RETENTION {
@@ -2282,22 +2283,24 @@ async fn projection_rate_limit_middleware(
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests
+// Shared test helpers (pub(crate) for cross-module test reuse)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod test_helpers {
     use super::*;
     use ed25519_dalek::Signer;
+    use scp_core::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
     use scp_core::crypto::sender_keys::{
         SealBroadcastParams, SigningPayloadFields, build_broadcast_signing_payload,
-        compute_provenance_hash, generate_broadcast_key, generate_broadcast_nonce,
-        rotate_broadcast_key, seal_broadcast,
+        compute_provenance_hash, generate_broadcast_nonce, seal_broadcast,
     };
+    use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
+    use sha2::{Digest, Sha256};
 
     /// Seals a broadcast envelope with test defaults for projection tests.
-    fn test_seal(key: &BroadcastKey, payload: &[u8]) -> BroadcastEnvelope {
+    pub fn test_seal(key: &BroadcastKey, payload: &[u8]) -> BroadcastEnvelope {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
         let nonce = generate_broadcast_nonce();
         let provenance_hash = compute_provenance_hash(None).unwrap();
@@ -2320,6 +2323,42 @@ mod tests {
         };
         seal_broadcast(key, payload, &nonce, &params).unwrap()
     }
+
+    /// Stores a `BroadcastContent` blob and returns its `blob_id`.
+    pub async fn store_content_blob(
+        storage: &InMemoryBlobStorage,
+        routing_id: [u8; 32],
+        key: &BroadcastKey,
+        content: &BroadcastContent,
+    ) -> [u8; 32] {
+        let serialized = serialize_broadcast_content(content).unwrap();
+        let envelope = test_seal(key, &serialized);
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+        blob_id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use scp_core::crypto::sender_keys::{generate_broadcast_key, rotate_broadcast_key};
+
+    use super::test_helpers::test_seal;
 
     // -----------------------------------------------------------------------
     // Hex helpers
@@ -5750,40 +5789,9 @@ mod tests {
 
     use scp_core::context::broadcast_content::{
         BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, MimeType,
-        serialize_broadcast_content,
     };
 
-    /// Seals a `BroadcastContent` payload as a `BroadcastEnvelope`.
-    fn test_seal_content(
-        key: &BroadcastKey,
-        content: &BroadcastContent,
-    ) -> (BroadcastEnvelope, Vec<u8>) {
-        let serialized = serialize_broadcast_content(content).unwrap();
-        let envelope = test_seal(key, &serialized);
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
-        (envelope, blob_bytes)
-    }
-
-    /// Stores a `BroadcastContent` blob and returns its `blob_id`.
-    async fn store_content_blob(
-        storage: &InMemoryBlobStorage,
-        routing_id: [u8; 32],
-        key: &BroadcastKey,
-        content: &BroadcastContent,
-    ) -> [u8; 32] {
-        let (_, blob_bytes) = test_seal_content(key, content);
-        let blob_id = {
-            let mut h = Sha256::new();
-            h.update(&blob_bytes);
-            let r: [u8; 32] = h.finalize().into();
-            r
-        };
-        storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
-            .await
-            .unwrap();
-        blob_id
-    }
+    use super::test_helpers::store_content_blob;
 
     #[tokio::test]
     async fn site_returns_correct_content_type_and_body() {

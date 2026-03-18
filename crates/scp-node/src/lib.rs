@@ -682,8 +682,9 @@ impl<S: Storage> ApplicationNode<S> {
 
         if let Some(ref config) = site_config {
             let existing_hostnames: std::collections::HashSet<String> = registry
-                .values()
-                .filter_map(|p| p.hostname().map(String::from))
+                .iter()
+                .filter(|(id, _)| **id != routing_id)
+                .filter_map(|(_, p)| p.hostname().map(str::to_ascii_lowercase))
                 .collect();
 
             projection::validate_site_config(config, self.domain.as_deref(), &existing_hostnames)
@@ -723,14 +724,16 @@ impl<S: Storage> ApplicationNode<S> {
             .get(&routing_id)
             .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
 
-        drop(registry);
-
-        // Update the hostname index outside the projected_contexts lock to
-        // avoid holding two write locks simultaneously.
+        // Update the hostname index while still holding the projected_contexts
+        // lock to eliminate the TOCTOU window between registry mutation and
+        // index update.
         if old_hostname != new_hostname {
             let mut index = self.state.hostname_index.write().await;
             if let Some(ref old) = old_hostname {
-                index.remove(old);
+                // Only remove if this routing_id still owns the hostname entry.
+                if index.get(old) == Some(&routing_id) {
+                    index.remove(old);
+                }
             }
             if let Some(ref new) = new_hostname
                 && !new.is_empty()
@@ -738,6 +741,8 @@ impl<S: Storage> ApplicationNode<S> {
                 index.insert(new.clone(), routing_id);
             }
         }
+
+        drop(registry);
 
         Ok(())
     }
@@ -756,13 +761,21 @@ impl<S: Storage> ApplicationNode<S> {
         let hostname = registry
             .get(&routing_id)
             .and_then(|p| p.hostname().map(str::to_ascii_lowercase));
+
+        // Update the hostname index while still holding the projected_contexts
+        // lock to eliminate the TOCTOU window between registry removal and
+        // index update.
+        if let Some(ref hostname) = hostname {
+            let mut index = self.state.hostname_index.write().await;
+            // Only remove if this routing_id still owns the hostname entry,
+            // preventing removal of a hostname re-registered by another context.
+            if index.get(hostname) == Some(&routing_id) {
+                index.remove(hostname);
+            }
+        }
+
         registry.remove(&routing_id);
         drop(registry);
-
-        if let Some(hostname) = hostname {
-            let mut index = self.state.hostname_index.write().await;
-            index.remove(&hostname);
-        }
     }
 
     /// Updates the cached member public keys for a projected context.
