@@ -203,29 +203,34 @@ pub enum FreshnessStatus {
 /// (`total_attestors`) must provide attestations of a given type, and the
 /// minimum independence score required among those attestors.
 ///
-/// All `f64` fields must be finite (not NaN or infinity). Deserialization
-/// rejects non-finite values via `TryFrom<ThresholdRequirementRaw>`.
+/// All `f64` fields must be finite (not NaN or infinity). Value ranges are
+/// enforced: `independence_threshold` must be in \[0.0, 1.0\], penalty fields
+/// must be non-negative, and `required_count` must be <= `total_attestors`.
+/// Deserialization rejects invalid values via `TryFrom<ThresholdRequirementRaw>`.
+///
+/// Fields are private to prevent bypass of validation. Use [`ThresholdRequirement::new`]
+/// or [`ThresholdRequirement::try_new`] for construction, and accessor methods for reading.
 ///
 /// See ADR-017 acceptance criterion 7.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(into = "ThresholdRequirementRaw")]
 pub struct ThresholdRequirement {
     /// The minimum number of valid attestations required (N).
-    pub required_count: u32,
+    required_count: u32,
     /// The total number of attestors in the set (M).
-    pub total_attestors: u32,
+    total_attestors: u32,
     /// Minimum independence score (0.0 to 1.0). Attestors with shared context
     /// memberships or mutual endorsements have reduced independence.
-    pub independence_threshold: f64,
+    independence_threshold: f64,
     /// Independence penalty per shared context membership between a pair of
     /// attestors. Default: 0.1. Capped at `shared_context_penalty_cap` total.
-    pub shared_context_penalty: f64,
+    shared_context_penalty: f64,
     /// Maximum total penalty from shared context memberships for a single
     /// pair. Default: 0.5.
-    pub shared_context_penalty_cap: f64,
+    shared_context_penalty_cap: f64,
     /// Independence penalty per mutual endorsement direction (A endorsed B
     /// = one direction, B endorsed A = another). Default: 0.2.
-    pub mutual_endorsement_penalty: f64,
+    mutual_endorsement_penalty: f64,
 }
 
 /// Raw deserialization helper for [`ThresholdRequirement`].
@@ -233,6 +238,7 @@ pub struct ThresholdRequirement {
 /// Carries `#[serde(default)]` annotations for backward-compatible
 /// deserialization, then validates f64 fields via `TryFrom`.
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ThresholdRequirementRaw {
     required_count: u32,
     total_attestors: u32,
@@ -300,8 +306,9 @@ impl ThresholdRequirement {
     /// Creates a new `ThresholdRequirement` with default penalty values.
     ///
     /// This constructor is `const` for use in static/const contexts. The caller
-    /// is responsible for passing finite f64 values. For runtime construction
-    /// with validation, use [`ThresholdRequirement::try_new`].
+    /// is responsible for passing valid values (finite f64, `required_count <=
+    /// total_attestors`, `independence_threshold` in \[0.0, 1.0\]). For runtime
+    /// construction with validation, use [`ThresholdRequirement::try_new`].
     #[must_use]
     pub const fn new(
         required_count: u32,
@@ -318,9 +325,62 @@ impl ThresholdRequirement {
         }
     }
 
+    /// Creates a new `ThresholdRequirement` with explicit penalty values.
+    ///
+    /// Like [`ThresholdRequirement::new`], this is `const` and does not
+    /// validate. For runtime construction with validation, construct via
+    /// this method and then call [`ThresholdRequirement::validate`], or use
+    /// [`ThresholdRequirement::try_new_with_penalties`].
+    #[must_use]
+    pub const fn new_with_penalties(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+        shared_context_penalty: f64,
+        shared_context_penalty_cap: f64,
+        mutual_endorsement_penalty: f64,
+    ) -> Self {
+        Self {
+            required_count,
+            total_attestors,
+            independence_threshold,
+            shared_context_penalty,
+            shared_context_penalty_cap,
+            mutual_endorsement_penalty,
+        }
+    }
+
+    /// Creates a new `ThresholdRequirement` with explicit penalty values and
+    /// validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the invalid field if validation fails.
+    pub fn try_new_with_penalties(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+        shared_context_penalty: f64,
+        shared_context_penalty_cap: f64,
+        mutual_endorsement_penalty: f64,
+    ) -> Result<Self, String> {
+        let t = Self::new_with_penalties(
+            required_count,
+            total_attestors,
+            independence_threshold,
+            shared_context_penalty,
+            shared_context_penalty_cap,
+            mutual_endorsement_penalty,
+        );
+        t.validate().map(|()| t)
+    }
+
     /// Creates a new `ThresholdRequirement` with validation.
     ///
-    /// Returns an error if any f64 field is NaN or infinite.
+    /// Returns an error if any field violates its constraints: f64 fields must
+    /// be finite, `independence_threshold` must be in \[0.0, 1.0\], penalty
+    /// fields must be non-negative, and `required_count` must be <=
+    /// `total_attestors`.
     ///
     /// # Errors
     ///
@@ -334,12 +394,19 @@ impl ThresholdRequirement {
         t.validate().map(|()| t)
     }
 
-    /// Validates that all f64 fields are finite (not NaN or infinity).
+    /// Validates all field constraints.
+    ///
+    /// - All f64 fields must be finite (not NaN or infinity).
+    /// - `independence_threshold` must be in \[0.0, 1.0\].
+    /// - `shared_context_penalty`, `shared_context_penalty_cap`, and
+    ///   `mutual_endorsement_penalty` must be non-negative.
+    /// - `required_count` must be <= `total_attestors`.
     ///
     /// # Errors
     ///
-    /// Returns a description of the first non-finite field found.
+    /// Returns a description of the first invalid field found.
     pub fn validate(&self) -> Result<(), String> {
+        // Check finiteness first (catches NaN and infinity).
         let fields: &[(&str, f64)] = &[
             ("independence_threshold", self.independence_threshold),
             ("shared_context_penalty", self.shared_context_penalty),
@@ -359,7 +426,82 @@ impl ThresholdRequirement {
                 ));
             }
         }
+
+        // independence_threshold must be in [0.0, 1.0].
+        if !(0.0..=1.0).contains(&self.independence_threshold) {
+            return Err(format!(
+                "ThresholdRequirement::independence_threshold must be in [0.0, 1.0], got {}",
+                self.independence_threshold
+            ));
+        }
+
+        // Penalty fields must be non-negative.
+        if self.shared_context_penalty < 0.0 {
+            return Err(format!(
+                "ThresholdRequirement::shared_context_penalty must be non-negative, got {}",
+                self.shared_context_penalty
+            ));
+        }
+        if self.shared_context_penalty_cap < 0.0 {
+            return Err(format!(
+                "ThresholdRequirement::shared_context_penalty_cap must be non-negative, got {}",
+                self.shared_context_penalty_cap
+            ));
+        }
+        if self.mutual_endorsement_penalty < 0.0 {
+            return Err(format!(
+                "ThresholdRequirement::mutual_endorsement_penalty must be non-negative, got {}",
+                self.mutual_endorsement_penalty
+            ));
+        }
+
+        // required_count must be <= total_attestors.
+        if self.required_count > self.total_attestors {
+            return Err(format!(
+                "ThresholdRequirement::required_count ({}) must be <= total_attestors ({})",
+                self.required_count, self.total_attestors
+            ));
+        }
+
         Ok(())
+    }
+
+    // --- Accessor methods ---
+
+    /// Returns the minimum number of valid attestations required (N).
+    #[must_use]
+    pub const fn required_count(&self) -> u32 {
+        self.required_count
+    }
+
+    /// Returns the total number of attestors in the set (M).
+    #[must_use]
+    pub const fn total_attestors(&self) -> u32 {
+        self.total_attestors
+    }
+
+    /// Returns the minimum independence score (0.0 to 1.0).
+    #[must_use]
+    pub const fn independence_threshold(&self) -> f64 {
+        self.independence_threshold
+    }
+
+    /// Returns the independence penalty per shared context membership.
+    #[must_use]
+    pub const fn shared_context_penalty(&self) -> f64 {
+        self.shared_context_penalty
+    }
+
+    /// Returns the maximum total penalty from shared context memberships.
+    #[must_use]
+    pub const fn shared_context_penalty_cap(&self) -> f64 {
+        self.shared_context_penalty_cap
+    }
+
+    /// Returns the independence penalty per mutual endorsement direction.
+    #[must_use]
+    pub const fn mutual_endorsement_penalty(&self) -> f64 {
+        self.mutual_endorsement_penalty
     }
 }
 
@@ -620,6 +762,13 @@ pub fn check_threshold_attestation(
     attestors: &[AttestorInfo],
     requirement: &ThresholdRequirement,
 ) -> ThresholdResult {
+    // Defense-in-depth: validate requirement even though constructors enforce it.
+    debug_assert!(
+        requirement.validate().is_ok(),
+        "ThresholdRequirement invariants violated: {:?}",
+        requirement.validate()
+    );
+
     // Count valid attestations of the required type.
     let valid_attestors: Vec<&AttestorInfo> = attestors
         .iter()
@@ -635,20 +784,20 @@ pub fn check_threshold_attestation(
     // Compute independence score among valid attestors.
     let independence_score = compute_independence_score(
         &valid_attestors,
-        requirement.shared_context_penalty,
-        requirement.shared_context_penalty_cap,
-        requirement.mutual_endorsement_penalty,
+        requirement.shared_context_penalty(),
+        requirement.shared_context_penalty_cap(),
+        requirement.mutual_endorsement_penalty(),
     );
 
-    let count_met = valid_count >= requirement.required_count;
-    let independence_met = independence_score >= requirement.independence_threshold;
+    let count_met = valid_count >= requirement.required_count();
+    let independence_met = independence_score >= requirement.independence_threshold();
 
     ThresholdResult {
         met: count_met && independence_met,
         valid_count,
-        required_count: requirement.required_count,
+        required_count: requirement.required_count(),
         independence_score,
-        independence_threshold: requirement.independence_threshold,
+        independence_threshold: requirement.independence_threshold(),
     }
 }
 
@@ -1716,14 +1865,7 @@ mod tests {
 
     #[test]
     fn threshold_requirement_validate_rejects_infinity() {
-        let t = ThresholdRequirement {
-            required_count: 2,
-            total_attestors: 3,
-            independence_threshold: 0.5,
-            shared_context_penalty: f64::INFINITY,
-            shared_context_penalty_cap: 0.5,
-            mutual_endorsement_penalty: 0.2,
-        };
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, f64::INFINITY, 0.5, 0.2);
         let err = t.validate().unwrap_err();
         assert!(
             err.contains("shared_context_penalty"),
@@ -1733,14 +1875,7 @@ mod tests {
 
     #[test]
     fn threshold_requirement_validate_rejects_neg_infinity() {
-        let t = ThresholdRequirement {
-            required_count: 2,
-            total_attestors: 3,
-            independence_threshold: 0.5,
-            shared_context_penalty: 0.1,
-            shared_context_penalty_cap: 0.5,
-            mutual_endorsement_penalty: f64::NEG_INFINITY,
-        };
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, 0.1, 0.5, f64::NEG_INFINITY);
         let err = t.validate().unwrap_err();
         assert!(
             err.contains("mutual_endorsement_penalty"),
@@ -1767,11 +1902,142 @@ mod tests {
         // Deserialize without optional penalty fields — should use defaults.
         let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5}"#;
         let t: ThresholdRequirement = serde_json::from_str(json).unwrap();
-        assert_eq!(t.required_count, 2);
-        assert_eq!(t.total_attestors, 3);
-        assert!((t.independence_threshold - 0.5).abs() < f64::EPSILON);
-        assert!((t.shared_context_penalty - 0.1).abs() < f64::EPSILON);
-        assert!((t.shared_context_penalty_cap - 0.5).abs() < f64::EPSILON);
-        assert!((t.mutual_endorsement_penalty - 0.2).abs() < f64::EPSILON);
+        assert_eq!(t.required_count(), 2);
+        assert_eq!(t.total_attestors(), 3);
+        assert!((t.independence_threshold() - 0.5).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty() - 0.1).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty_cap() - 0.5).abs() < f64::EPSILON);
+        assert!((t.mutual_endorsement_penalty() - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn threshold_requirement_serde_rejects_unknown_fields() {
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5,"evil_field":true}"#;
+        let result: Result<ThresholdRequirement, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown fields must be rejected: {result:?}"
+        );
+    }
+
+    // --- Value range validation tests ---
+
+    #[test]
+    fn threshold_requirement_rejects_independence_below_zero() {
+        let t = ThresholdRequirement::new(2, 3, -0.1);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("independence_threshold"),
+            "error should mention independence_threshold: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_independence_above_one() {
+        let t = ThresholdRequirement::new(2, 3, 1.01);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("independence_threshold"),
+            "error should mention independence_threshold: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_accepts_independence_boundary_values() {
+        // 0.0 and 1.0 are both valid boundary values.
+        assert!(ThresholdRequirement::new(2, 3, 0.0).validate().is_ok());
+        assert!(ThresholdRequirement::new(2, 3, 1.0).validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_negative_shared_context_penalty() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, -0.01, 0.5, 0.2);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("shared_context_penalty"),
+            "error should mention shared_context_penalty: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_negative_shared_context_penalty_cap() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, 0.1, -0.01, 0.2);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("shared_context_penalty_cap"),
+            "error should mention shared_context_penalty_cap: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_negative_mutual_endorsement_penalty() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, 0.1, 0.5, -0.01);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("mutual_endorsement_penalty"),
+            "error should mention mutual_endorsement_penalty: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_required_count_exceeding_total() {
+        let t = ThresholdRequirement::new(5, 3, 0.5);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("required_count"),
+            "error should mention required_count: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_accepts_required_count_equal_to_total() {
+        let t = ThresholdRequirement::new(3, 3, 0.5);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_try_new_enforces_ranges() {
+        assert!(ThresholdRequirement::try_new(5, 3, 0.5).is_err());
+        assert!(ThresholdRequirement::try_new(2, 3, -0.1).is_err());
+        assert!(ThresholdRequirement::try_new(2, 3, 1.5).is_err());
+        assert!(ThresholdRequirement::try_new(2, 3, 0.5).is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_try_new_with_penalties_enforces_ranges() {
+        // Negative penalty.
+        assert!(ThresholdRequirement::try_new_with_penalties(2, 3, 0.5, -0.1, 0.5, 0.2).is_err());
+        // required_count > total_attestors.
+        assert!(ThresholdRequirement::try_new_with_penalties(5, 3, 0.5, 0.1, 0.5, 0.2).is_err());
+        // Valid.
+        assert!(ThresholdRequirement::try_new_with_penalties(2, 3, 0.5, 0.1, 0.5, 0.2).is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_serde_rejects_invalid_ranges() {
+        // independence_threshold > 1.0.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":1.5}"#;
+        assert!(serde_json::from_str::<ThresholdRequirement>(json).is_err());
+
+        // required_count > total_attestors.
+        let json = r#"{"required_count":5,"total_attestors":3,"independence_threshold":0.5}"#;
+        assert!(serde_json::from_str::<ThresholdRequirement>(json).is_err());
+
+        // Negative penalty.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5,"shared_context_penalty":-0.1}"#;
+        assert!(serde_json::from_str::<ThresholdRequirement>(json).is_err());
+    }
+
+    // --- Accessor method tests ---
+
+    #[test]
+    fn threshold_requirement_accessor_methods() {
+        let t = ThresholdRequirement::new_with_penalties(2, 5, 0.7, 0.15, 0.6, 0.25);
+        assert_eq!(t.required_count(), 2);
+        assert_eq!(t.total_attestors(), 5);
+        assert!((t.independence_threshold() - 0.7).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty() - 0.15).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty_cap() - 0.6).abs() < f64::EPSILON);
+        assert!((t.mutual_endorsement_penalty() - 0.25).abs() < f64::EPSILON);
     }
 }

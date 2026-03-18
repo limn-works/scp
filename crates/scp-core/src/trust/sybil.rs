@@ -553,6 +553,7 @@ pub struct ContextSybilPolicy {
 /// provided [`ThresholdRequirement`] to enforce endorsement independence
 /// (§22.13.3). This prevents Sybil rings of mutually-endorsing identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequiredSignal {
     /// Which signal category is required.
     pub category: TrustSignalCategory,
@@ -707,10 +708,23 @@ pub enum SybilResistanceError {
     /// by `ThresholdRequirement`. This typically means the endorsers share too
     /// many context memberships or mutual endorsements, suggesting collusion
     /// or a Sybil ring.
+    ///
+    /// The `Display` impl deliberately omits exact scores and thresholds to
+    /// avoid leaking policy internals. Structured fields are available for
+    /// internal logging via `Debug`.
     #[error("endorsement independence insufficient: {reason}")]
     EndorsementIndependenceInsufficient {
-        /// Human-readable reason for the failure.
+        /// High-level reason without exact numbers (e.g. "insufficient
+        /// independent attestors" or "independence score too low").
         reason: String,
+        /// Computed independence score (for debug/logging only).
+        independence_score: f64,
+        /// Required independence threshold (for debug/logging only).
+        threshold: f64,
+        /// Number of valid attestations found (for debug/logging only).
+        valid_count: u32,
+        /// Required attestation count (for debug/logging only).
+        required_count: u32,
     },
 }
 
@@ -827,10 +841,21 @@ pub fn evaluate_sybil_resistance(
     }
 
     // 5. Endorsement independence check (§22.13.3).
-    //
-    // For each required signal with category Endorsement and a
-    // threshold_requirement, invoke check_threshold_attestation to verify
-    // that endorsers are independently trustworthy — not a Sybil ring.
+    check_endorsement_independence(assessment, policy, attestors)?;
+
+    Ok(())
+}
+
+/// Checks endorsement independence requirements (§22.13.3).
+///
+/// For each required signal with category Endorsement and a
+/// `threshold_requirement`, invokes [`check_threshold_attestation`] to verify
+/// that endorsers are independently trustworthy — not a Sybil ring.
+fn check_endorsement_independence(
+    assessment: &IdentityDepthAssessment,
+    policy: &ContextSybilPolicy,
+    attestors: Option<&[AttestorInfo]>,
+) -> Result<(), SybilResistanceError> {
     for req in &policy.required_signals {
         let (TrustSignalCategory::Endorsement, Some(threshold)) =
             (&req.category, &req.threshold_requirement)
@@ -843,18 +868,23 @@ pub fn evaluate_sybil_resistance(
                     reason: "attestors required for endorsement independence \
                          check but not provided"
                         .into(),
+                    independence_score: 0.0,
+                    threshold: threshold.independence_threshold(),
+                    valid_count: 0,
+                    required_count: threshold.required_count(),
                 },
             )?;
         // Filter attestors to only those whose attestation subject matches the
-        // DID being evaluated. Without this, an attacker could submit
-        // endorsement attestations for a completely different DID and have them
-        // count toward this subject's independence check.
+        // DID being evaluated AND whose attestation issuer matches their own
+        // DID. Without the subject check, an attacker could submit endorsement
+        // attestations for a different DID. Without the issuer check, an
+        // attacker could claim attestations issued by someone else.
         let subject_attestors: Vec<AttestorInfo> = att
             .iter()
             .filter(|a| {
                 a.attestation
                     .as_ref()
-                    .is_some_and(|att| att.subject == assessment.subject_did)
+                    .is_some_and(|att| att.subject == assessment.subject_did && att.issuer == a.did)
             })
             .cloned()
             .collect();
@@ -864,20 +894,21 @@ pub fn evaluate_sybil_resistance(
             threshold,
         );
         if !result.met {
+            let count_ok = result.valid_count >= result.required_count;
+            let reason = if count_ok {
+                "independence score too low".to_owned()
+            } else {
+                "insufficient independent attestors".to_owned()
+            };
             return Err(SybilResistanceError::EndorsementIndependenceInsufficient {
-                reason: format!(
-                    "threshold not met: {}/{} valid attestations \
-                         (need {}), independence {:.3} (need {:.3})",
-                    result.valid_count,
-                    threshold.total_attestors,
-                    result.required_count,
-                    result.independence_score,
-                    result.independence_threshold,
-                ),
+                reason,
+                independence_score: result.independence_score,
+                threshold: result.independence_threshold,
+                valid_count: result.valid_count,
+                required_count: result.required_count,
             });
         }
     }
-
     Ok(())
 }
 
@@ -1776,9 +1807,9 @@ mod tests {
             "Endorsement signal must have threshold_requirement"
         );
         let threshold = req.threshold_requirement.as_ref().unwrap();
-        assert_eq!(threshold.required_count, 2);
-        assert_eq!(threshold.total_attestors, 3);
-        assert!((threshold.independence_threshold - 0.5).abs() < f64::EPSILON);
+        assert_eq!(threshold.required_count(), 2);
+        assert_eq!(threshold.total_attestors(), 3);
+        assert!((threshold.independence_threshold() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1807,6 +1838,16 @@ mod tests {
         assert!(
             req.threshold_requirement.is_none(),
             "missing field should default to None"
+        );
+    }
+
+    #[test]
+    fn serde_required_signal_rejects_unknown_fields() {
+        let json = r#"{"category":"Endorsement","min_strength":2,"max_age_secs":15552000,"evil_field":true}"#;
+        let result: Result<RequiredSignal, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown fields must be rejected: {result:?}"
         );
     }
 
@@ -1933,6 +1974,111 @@ mod tests {
                 Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
             ),
             "only 1 of 3 attestations is for the correct subject, should fail: {result:?}"
+        );
+    }
+
+    // --- Issuer-DID consistency tests ---
+
+    #[test]
+    fn attestor_with_mismatched_issuer_did_is_filtered_out() {
+        // An attestor with did "alice" provides an attestation issued by "bob".
+        // This must be filtered out — the attestor can only claim attestations
+        // they themselves issued.
+        let assessment = make_deep_assessment(now());
+        let correct_subject = "did:dht:z6MkDeepIdentity";
+
+        let attestors = vec![
+            AttestorInfo {
+                did: did("did:dht:z6MkAlice"),
+                context_memberships: HashSet::from(["ctx-alpha".into()]),
+                endorsements: HashSet::new(),
+                // Attestation issued by Bob, not Alice — should be filtered out.
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkBob",
+                    correct_subject,
+                    now() - 3600,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserB"),
+                context_memberships: HashSet::from(["ctx-beta".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserB",
+                    correct_subject,
+                    now() - 7200,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEndorserC"),
+                context_memberships: HashSet::from(["ctx-gamma".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkEndorserC",
+                    correct_subject,
+                    now() - 10800,
+                )),
+            },
+        ];
+
+        let policy = ContextSybilPolicy::high_trust();
+        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        // high_trust requires 2 of 3, but Alice's attestation (issued by Bob) is
+        // filtered out, leaving only 2 valid attestors which should pass.
+        assert!(
+            result.is_ok(),
+            "2 valid attestors (Alice filtered) should still meet 2-of-3 threshold: {result:?}"
+        );
+    }
+
+    #[test]
+    fn all_attestors_with_mismatched_issuer_fails_independence() {
+        // All attestors provide attestations issued by someone else.
+        // All should be filtered out, causing the independence check to fail.
+        let assessment = make_deep_assessment(now());
+        let correct_subject = "did:dht:z6MkDeepIdentity";
+
+        let attestors = vec![
+            AttestorInfo {
+                did: did("did:dht:z6MkAlice"),
+                context_memberships: HashSet::from(["ctx-alpha".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkBob",
+                    correct_subject,
+                    now() - 3600,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkCarol"),
+                context_memberships: HashSet::from(["ctx-beta".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkDave",
+                    correct_subject,
+                    now() - 7200,
+                )),
+            },
+            AttestorInfo {
+                did: did("did:dht:z6MkEve"),
+                context_memberships: HashSet::from(["ctx-gamma".into()]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    "did:dht:z6MkFrank",
+                    correct_subject,
+                    now() - 10800,
+                )),
+            },
+        ];
+
+        let policy = ContextSybilPolicy::high_trust();
+        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "all attestors with mismatched issuer must fail: {result:?}"
         );
     }
 
