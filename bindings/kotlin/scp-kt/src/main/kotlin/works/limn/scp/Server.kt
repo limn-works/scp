@@ -606,6 +606,8 @@ class ServerBridge internal constructor(
      *    node identity).
      * 3. Neither provided -- auto-resolves using the node's identity DID.
      *
+     * Providing [broadcastKeyHex] without [authorDid] is an error.
+     *
      * @param node The running node.
      * @param contextId The context ID to project.
      * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string, or null for auto-lookup.
