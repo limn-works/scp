@@ -67,9 +67,12 @@
 - HIGH: publicKeyFromKeystore takeLast(32) fragile
 - See pseudonym HMAC key material inconsistency below
 
-### Pseudonym HMAC Key Material Inconsistency -- HIGH
-- InMemoryKeyCustody uses PRIVATE key; spec/ADR-027/Android/WASM say PUBLIC key
-- Fix: change InMemoryKeyCustody to verifying_key().to_bytes(); regenerate golden vectors
+### Pseudonym Oracle Fix (PR fix/audit-batch-1-p0-blockers, #1431)
+- FIXED: InMemoryKeyCustody + FileKeyCustody now use HKDF(private_key) -> pseudonym_secret -> HMAC
+- UNFIXED: SqliteKeyCustody still uses public key (verifying_key) -- same oracle vulnerability
+- UNFIXED: WASM custody JSDoc documents public key algorithm -- implementors will use insecure pattern
+- Pattern: HKDF-SHA-256(salt="scp-pseudonym-secret-v1", ikm=signing_key_bytes), expand with empty info
+- Defense-in-depth gap: HKDF info param is empty; should use "scp-pseudonym-v1" for forward separation
 
 ### Tiered Storage & Context Discovery
 - See `tiered-storage-scp213.md` for full details
@@ -160,3 +163,11 @@
 - REMAINING MEDIUM: site_handler non-immutable branch uses "public, max-age=0, must-revalidate" for gated contexts -- should be "private, max-age=0, must-revalidate" (projection.rs line 2154)
 - Error codes 2070-2075: clean, no collisions
 - Pattern: WASM reimplementations of scp-core validators consistently miss defensive checks that the core version has. Always diff WASM vs core line-by-line when reimplementing.
+
+### P0 Audit Batch 1 Review (2026-03-19) -- fix/audit-batch-1-p0-blockers
+- FIXES VERIFIED: #1418 (WASM event tags), #1419 (ceiling escalation), #1420 (phantom events), #1431 (pseudonym oracle), #1470 (atomic writes)
+- REMAINING HIGH: SqliteKeyCustody pseudonym oracle (same as #1431 but unfixed)
+- REMAINING MEDIUM: append_entry missing fsync before rename; stale .tmp blocks create_new; HKDF empty info
+- send_message 3-phase pattern: sound; TOCTOU gap handled by Phase 3 re-validation; seq burn is harmless
+- Ceiling fix: NAPI + UniFFI fixed; PyO3 was already correct (resolves at registration); WASM was already correct
+- Atomic write: create_new has fsync; append_entry does NOT have fsync -- inconsistency

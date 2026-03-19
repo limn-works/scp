@@ -389,12 +389,12 @@ impl KeyCustody for SqliteKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
-            // ADR-027 amendment: uses verifying (public) key bytes.
-            let verifying_key = signing_key.verifying_key();
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // NOT the public key, to prevent membership enumeration attacks.
+            let pseudonym_secret = crate::pseudonym::derive_pseudonym_secret(signing_key);
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
             let hmac_output = mac.finalize().into_bytes();
@@ -443,11 +443,13 @@ impl KeyCustody for SqliteKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(ed25519_public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
-            let verifying_key = signing_key.verifying_key();
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
+            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // NOT the public key, to prevent membership enumeration attacks.
+            // BLACK-001 mitigation: epoch_BE breaks long-term pseudonym correlation.
+            let pseudonym_secret = crate::pseudonym::derive_pseudonym_secret(signing_key);
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(&pseudonym_epoch.to_be_bytes());
             mac.update(b"scp-pseudonym-v2");

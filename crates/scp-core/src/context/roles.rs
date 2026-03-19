@@ -418,6 +418,19 @@ impl CapabilityCeiling {
     pub fn len(&self) -> usize {
         self.capabilities.len()
     }
+
+    /// Returns the capabilities as UCAN-formatted string names.
+    ///
+    /// Each capability is converted to its UCAN wire-format name via
+    /// [`Capability::ucan_capability_name`]. Useful for passing ceilings
+    /// to UCAN mint/delegate operations.
+    #[must_use]
+    pub fn to_ucan_string_set(&self) -> HashSet<String> {
+        self.capabilities
+            .iter()
+            .map(Capability::ucan_capability_name)
+            .collect()
+    }
 }
 
 /// Returns the default capability ceiling for new contexts.

@@ -153,6 +153,72 @@ impl HandleMap {
 }
 
 // ---------------------------------------------------------------------------
+// Atomic write helper
+// ---------------------------------------------------------------------------
+
+/// Writes `data` to `path` atomically via a `.tmp` sibling file.
+///
+/// 1. Writes to `{path}.tmp` with `mode(0o600)` on Unix.
+/// 2. Calls `sync_all` to flush to durable storage.
+/// 3. Renames to `path` (atomic on POSIX).
+/// 4. Cleans up the tmp file on any failure after creation.
+fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
+    let tmp_path = path.with_extension("tmp");
+
+    // Write to temp file with restrictive permissions on Unix.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| {
+                PlatformError::CustodyError(format!("failed to create temp key file: {e}"))
+            })?;
+        file.write_all(data).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            PlatformError::CustodyError(format!("failed to write temp key file: {e}"))
+        })?;
+        file.sync_all().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            PlatformError::CustodyError(format!("failed to sync temp key file: {e}"))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| {
+                PlatformError::CustodyError(format!("failed to create temp key file: {e}"))
+            })?;
+        file.write_all(data).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            PlatformError::CustodyError(format!("failed to write temp key file: {e}"))
+        })?;
+        file.sync_all().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            PlatformError::CustodyError(format!("failed to sync temp key file: {e}"))
+        })?;
+    }
+
+    // Atomic rename: if this fails, the original file is untouched.
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        PlatformError::CustodyError(format!("failed to rename temp key file: {e}"))
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // FileKeyCustody
 // ---------------------------------------------------------------------------
 
@@ -204,6 +270,8 @@ impl FileKeyCustody {
     }
 
     /// Creates a new key file at `path` with a fresh salt.
+    ///
+    /// Uses write-to-tmp + rename for crash-safe atomic writes (#1470).
     fn create_new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
         let mut salt = [0u8; SALT_LEN];
         rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -216,38 +284,8 @@ impl FileKeyCustody {
         data.extend_from_slice(&salt);
         data.extend_from_slice(&0u32.to_le_bytes());
 
-        // Create the file with restrictive permissions atomically on Unix
-        // to avoid a TOCTOU window where the file is world-readable.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|e| {
-                    PlatformError::CustodyError(format!("failed to create key file: {e}"))
-                })?;
-            file.write_all(&data).map_err(|e| {
-                PlatformError::CustodyError(format!("failed to write key file: {e}"))
-            })?;
-        }
-        #[cfg(not(unix))]
-        {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|e| {
-                    PlatformError::CustodyError(format!("failed to create key file: {e}"))
-                })?;
-            file.write_all(&data).map_err(|e| {
-                PlatformError::CustodyError(format!("failed to write key file: {e}"))
-            })?;
-        }
+        // Write to temp file, sync, then atomic rename (#1470).
+        atomic_write(path, &data)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -405,6 +443,8 @@ impl FileKeyCustody {
     }
 
     /// Appends an encrypted key entry to the file and updates the entry count.
+    ///
+    /// Uses write-to-tmp + rename for crash-safe atomic writes (#1470).
     fn append_entry(
         &self,
         key_type: StoredKeyType,
@@ -438,9 +478,8 @@ impl FileKeyCustody {
         let new_count = current_count + 1;
         data[count_offset..count_offset + 4].copy_from_slice(&new_count.to_le_bytes());
 
-        // Write back.
-        std::fs::write(&self.path, &data)
-            .map_err(|e| PlatformError::CustodyError(format!("failed to write key file: {e}")))?;
+        // Write to temp file with sync_all, then atomic rename (#1470).
+        atomic_write(&self.path, &data)?;
 
         Ok(new_index)
     }
@@ -500,6 +539,8 @@ impl FileKeyCustody {
         Ok(signing_key)
     }
 }
+
+use crate::pseudonym::derive_pseudonym_secret;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
@@ -656,13 +697,12 @@ impl KeyCustody for FileKeyCustody {
             let handle = KeyHandle::new(key_id);
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
 
-            // HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
-            // ADR-027 amendment: uses verifying (public) key bytes for
-            // cross-platform determinism with hardware TEE adapters.
-            let verifying_key = signing_key.verifying_key();
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // NOT the public key, to prevent membership enumeration attacks.
+            let pseudonym_secret = derive_pseudonym_secret(&signing_key);
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
             let hmac_output = mac.finalize().into_bytes();
@@ -697,11 +737,12 @@ impl KeyCustody for FileKeyCustody {
             let handle = KeyHandle::new(key_id);
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
 
-            // HMAC-SHA256(ed25519_public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
-            let verifying_key = signing_key.verifying_key();
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
+            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // NOT the public key, to prevent membership enumeration attacks.
+            let pseudonym_secret = derive_pseudonym_secret(&signing_key);
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(&pseudonym_epoch.to_be_bytes());
             mac.update(b"scp-pseudonym-v2");

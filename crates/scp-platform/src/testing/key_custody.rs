@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sha2::Sha256;
@@ -190,37 +189,7 @@ impl Default for InMemoryKeyCustody {
     }
 }
 
-/// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4A).
-#[allow(dead_code)] // Used by derive_pseudonym_secret, retained for future pseudonym wiring
-const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
-
-/// Derives a `pseudonym_secret` from Ed25519 private key bytes via HKDF-SHA-256.
-///
-/// ```text
-/// pseudonym_secret = HKDF-SHA256(
-///     ikm: ed25519_private_key_bytes,
-///     salt: "scp-pseudonym-secret-v1",
-///     info: "",
-///     len: 32
-/// )
-/// ```
-///
-/// CRITICAL PRIVACY REQUIREMENT (§9.10.4A): Using public key bytes as the
-/// HMAC key would be a membership enumeration oracle — anyone who knows a
-/// member's public key could compute their pseudonym for any `context_id`
-/// and check relay subscriptions. The `pseudonym_secret` is derived from
-/// private key bytes, making it unknowable without the private key.
-#[allow(dead_code)] // Retained for future pseudonym wiring
-fn derive_pseudonym_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), signing_key.as_bytes());
-    let mut secret = Zeroizing::new([0u8; 32]);
-    // HKDF-Expand with 32-byte output cannot fail (32 <= 255 * HashLen).
-    assert!(
-        hk.expand(b"", secret.as_mut()).is_ok(),
-        "HKDF-Expand with 32-byte output is infallible"
-    );
-    secret
-}
+use crate::pseudonym::derive_pseudonym_secret;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
@@ -392,14 +361,12 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
-            // ADR-027 amendment: uses verifying (public) key bytes, not signing
-            // (private) key bytes, for cross-platform determinism with hardware
-            // TEE adapters that cannot export private key material.
-            let verifying_key = signing_key.verifying_key();
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            // HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // NOT the public key, to prevent membership enumeration attacks.
+            let pseudonym_secret = derive_pseudonym_secret(signing_key);
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
             let hmac_output = mac.finalize().into_bytes();
@@ -449,15 +416,13 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(ed25519_public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
-            // ADR-027 amendment: uses verifying (public) key bytes, not signing
-            // (private) key bytes, for cross-platform determinism with hardware
-            // TEE adapters that cannot export private key material.
+            // HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
+            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // NOT the public key, to prevent membership enumeration attacks.
             // BLACK-001 mitigation: epoch_BE breaks long-term pseudonym correlation.
-            let verifying_key = signing_key.verifying_key();
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(verifying_key.to_bytes().as_slice())
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            let pseudonym_secret = derive_pseudonym_secret(signing_key);
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(&pseudonym_epoch.to_be_bytes());
             mac.update(b"scp-pseudonym-v2");
@@ -866,11 +831,10 @@ mod tests {
         let epoch: u64 = 7;
 
         // Compute expected pseudonym seed using the v2 reference algorithm:
-        // seed = HMAC-SHA256(public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
+        // seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
         let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
-        let identity_public_key = identity_signing_key.verifying_key();
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(identity_public_key.to_bytes().as_slice()).unwrap();
+        let pseudonym_secret = derive_pseudonym_secret(&identity_signing_key);
+        let mut mac = Hmac::<Sha256>::new_from_slice(pseudonym_secret.as_slice()).unwrap();
         mac.update(context_id);
         mac.update(&epoch.to_be_bytes());
         mac.update(b"scp-pseudonym-v2");
@@ -898,9 +862,9 @@ mod tests {
     ///
     /// Verifies that `derive_pseudonym` is deterministic and that different
     /// context IDs produce different pseudonyms. The `expected_seed` value is
-    /// computed from the reference HMAC-SHA256 algorithm using public key bytes
-    /// as the HMAC key (ADR-027 amendment). This golden vector is authoritative
-    /// for cross-language (Swift, Kotlin, TypeScript) verification.
+    /// computed from the reference HMAC-SHA256 algorithm using an HKDF-derived
+    /// pseudonym secret from the private key (§9.10.4A). This golden vector is
+    /// authoritative for cross-language (Swift, Kotlin, TypeScript) verification.
     #[tokio::test]
     async fn derive_pseudonym_cross_platform_golden_vector() {
         // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
@@ -913,13 +877,12 @@ mod tests {
         let context_id = b"test";
 
         // Compute expected pseudonym seed using the reference algorithm directly:
-        // seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")
-        // ADR-027 amendment: HMAC key is the Ed25519 PUBLIC key, not the private
-        // key, for cross-platform determinism with hardware TEE adapters.
+        // seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+        // §9.10.4A: HMAC key is a secret derived from the private key via HKDF,
+        // NOT the public key, to prevent membership enumeration attacks.
         let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
-        let identity_public_key = identity_signing_key.verifying_key();
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(identity_public_key.to_bytes().as_slice()).unwrap();
+        let pseudonym_secret = derive_pseudonym_secret(&identity_signing_key);
+        let mut mac = Hmac::<Sha256>::new_from_slice(pseudonym_secret.as_slice()).unwrap();
         mac.update(context_id);
         mac.update(b"scp-pseudonym");
         let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
@@ -949,9 +912,9 @@ mod tests {
         );
 
         // Assert that the implementation matches the reference algorithm.
-        // expected_seed is HMAC-SHA256(sk, context_id || "scp-pseudonym"), so
-        // the expected public key is the verifying key of the Ed25519 signing key
-        // derived from that seed. This is the authoritative golden value —
+        // expected_seed is HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym"),
+        // so the expected public key is the verifying key of the Ed25519 signing
+        // key derived from that seed. This is the authoritative golden value —
         // Swift, Kotlin, and TypeScript implementations MUST produce the same
         // public key bytes for these inputs.
         let expected_signing_key = SigningKey::from_bytes(&expected_seed);
