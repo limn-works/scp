@@ -164,7 +164,14 @@ fn resolve_storage_path(cli_path: Option<&PathBuf>) -> PathBuf {
     #[allow(clippy::option_if_let_else)]
     let data_home = env::var("XDG_DATA_HOME").map_or_else(
         |_| {
-            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
+            let home = env::var("HOME").unwrap_or_else(|_| {
+                eprintln!(
+                    "error: HOME environment variable is not set and no \
+                     --storage-path or XDG_DATA_HOME was provided.\n\
+                     Set HOME, XDG_DATA_HOME, or pass --storage-path explicitly."
+                );
+                std::process::exit(1);
+            });
             PathBuf::from(home).join(".local").join("share")
         },
         PathBuf::from,

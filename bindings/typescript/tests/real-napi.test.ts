@@ -288,16 +288,31 @@ if (bridge === null || serverAddon === null) {
       expect(ctx.contextId).toBeTruthy();
     });
 
-    test("creates a context with governance and TTL", async () => {
+    test("rejects unsupported governance model", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      await expect(
+        napi.contextCreate(
+          identity,
+          JSON.stringify({
+            ceiling: ["messages:read"],
+            governance: "threshold",
+            ttlSeconds: 3600,
+            memoryScope: "full",
+            ceilingPolicy: "governed",
+          }),
+        ),
+      ).rejects.toThrow(/unsupported governance model/);
+    });
+
+    test("creates a context with single_admin governance and TTL", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
           ceiling: ["messages:read"],
-          governance: "threshold",
+          governance: "single_admin",
           ttlSeconds: 3600,
           memoryScope: "full",
-          ceilingPolicy: "governed",
         }),
       );
       expect(ctx.contextId).toBeTruthy();

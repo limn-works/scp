@@ -448,11 +448,14 @@ async fn run_mcp_stdio_server(
                 };
 
                 if let Some(resp) = response
-                    && let Ok(json) = serde_json::to_string(&resp) {
-                        let _ = stdout.write_all(json.as_bytes()).await;
-                        let _ = stdout.write_all(b"\n").await;
-                        let _ = stdout.flush().await;
-                    }
+                    && let Ok(json) = serde_json::to_string(&resp)
+                    && (stdout.write_all(json.as_bytes()).await.is_err()
+                        || stdout.write_all(b"\n").await.is_err()
+                        || stdout.flush().await.is_err())
+                {
+                    tracing::warn!("MCP stdio server: stdout write failed, stopping");
+                    break;
+                }
             }
         } => {}
     }

@@ -24,7 +24,8 @@
 //! [`NativeRelayAdapter`]: super::adapter::NativeRelayAdapter
 //! [`TransportAdapter`]: crate::TransportAdapter
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +65,14 @@ const RECONNECT_OVERLAP: Duration = Duration::from_secs(5);
 /// forward-dating timestamps.
 #[allow(dead_code)]
 const RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS: u64 = 60;
+
+/// Maximum number of entries in the deduplication LRU cache.
+///
+/// Blob IDs older than this window are evicted, bounding memory usage to
+/// approximately 320 KiB (10,000 x 32 bytes). This is sufficient for typical
+/// reconnect overlap windows while preventing unbounded growth in long-lived
+/// connections (#1466).
+const DEDUP_CACHE_CAPACITY: usize = 10_000;
 
 /// A pending request waiting for a relay response keyed by `ref_id`.
 struct PendingRequest {
@@ -120,8 +129,12 @@ struct ClientInner {
     next_ref_id: u64,
     /// Active subscriptions keyed by routing ID.
     subscriptions: HashMap<[u8; 32], SubscriptionState>,
-    /// Set of blob IDs already seen (for deduplication on reconnect).
-    seen_blob_ids: HashSet<[u8; 32]>,
+    /// LRU cache of blob IDs already seen (for deduplication on reconnect).
+    ///
+    /// Bounded to [`DEDUP_CACHE_CAPACITY`] entries to prevent unbounded memory
+    /// growth in long-lived connections (#1466). Oldest entries are evicted
+    /// when the cache is full.
+    seen_blob_ids: lru::LruCache<[u8; 32], ()>,
     /// Whether the client is currently connected.
     connected: bool,
 }
@@ -191,7 +204,9 @@ impl NativeRelayClient {
             pending: HashMap::new(),
             next_ref_id: 1,
             subscriptions: HashMap::new(),
-            seen_blob_ids: HashSet::new(),
+            seen_blob_ids: lru::LruCache::new(
+                NonZeroUsize::new(DEDUP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
             connected: false,
         }));
 
@@ -353,9 +368,12 @@ impl NativeRelayClient {
                 let mut state = inner.write().await;
 
                 // Deduplication: skip if we've already seen this `blob_id`.
-                if !state.seen_blob_ids.insert(*blob_id) {
+                // `LruCache::contains` does NOT promote the entry (no LRU
+                // reorder), which is correct — we just want to check presence.
+                if state.seen_blob_ids.contains(blob_id) {
                     return;
                 }
+                state.seen_blob_ids.put(*blob_id, ());
 
                 if let Some(sub) = state.subscriptions.get_mut(routing_id) {
                     // Record local monotonic receive time for reconnection
@@ -830,7 +848,7 @@ impl NativeRelayClient {
             .collect()
     }
 
-    /// Clears the deduplication set. Useful after a successful reconnect
+    /// Clears the deduplication cache. Useful after a successful reconnect
     /// when the overlap window has passed.
     #[allow(dead_code)]
     pub async fn clear_dedup_set(&self) {
@@ -1022,7 +1040,9 @@ mod tests {
                     tx,
                 },
             )]),
-            seen_blob_ids: HashSet::new(),
+            seen_blob_ids: lru::LruCache::new(
+                NonZeroUsize::new(DEDUP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
             connected: true,
         }));
         (inner, rx)
