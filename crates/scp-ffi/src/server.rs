@@ -13,11 +13,18 @@
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, RunningNode, RunningRelay, ServerError};
+use scp_ffi_common::server::{
+    self, ConcreteDidMethod, NodeIdentity, RunningNode, RunningRelay, ServerError,
+};
+use scp_identity::{DidCache, InMemoryDhtClient};
 use scp_node::NodeError;
+use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 // ---------------------------------------------------------------------------
 // Error conversion
@@ -31,6 +38,58 @@ fn server_err(e: ServerError) -> PyErr {
 fn node_err(e: NodeError) -> PyErr {
     tracing::error!(error = %e, "node operation failed");
     pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
+}
+
+/// Auto-wires the global [`ContextManager`] with relay transport after
+/// node startup.
+///
+/// Connects to the node's local relay and initializes the `ContextManager`
+/// with `RelayTransportProvider` so that context operations (create, join,
+/// send) work immediately. If the `ContextManager` was already initialized
+/// (e.g., by a prior `configure_relay_transport` or `context_create` call),
+/// this is a no-op — the `OnceLock` ensures first-writer-wins semantics.
+///
+/// Best-effort: logs a warning if the relay connection fails rather than
+/// blocking node startup.
+fn auto_wire_context_manager(
+    py: Python<'_>,
+    rt: &tokio::runtime::Runtime,
+    did: &str,
+    relay_url: &str,
+) {
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    let did_owned = did.to_owned();
+    match py.allow_threads(|| rt.block_on(NativeRelayAdapter::connect_sourced(&sourced))) {
+        Ok(adapter) => {
+            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+                did_owned.clone(),
+            ));
+            let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+            let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
+                Box::new(crate::runtime::NoOpEventLogProvider);
+            crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                relay_url = %relay_url,
+                "auto_wire_context_manager: failed to connect to node relay — \
+                 context operations may fail until transport is configured manually"
+            );
+            // Fall back to initializing without transport so that at least
+            // the ContextManager exists (with NotConfiguredTransportProvider).
+            crate::runtime::init_context_manager(&did_owned);
+        }
+    }
+    // Always register the node's DID as a local DID for defense-in-depth.
+    py.allow_threads(|| {
+        if let Ok(mgr) = crate::runtime::context_manager() {
+            rt.block_on(mgr.register_local_did(did_owned.into()));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -142,12 +201,16 @@ impl PyNodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// Registers a broadcast context for HTTP content delivery.
+    /// Three resolution modes:
+    /// 1. Both ``broadcast_key_hex`` **and** ``author_did`` provided -- uses
+    ///    the explicit key with epoch 0.
+    /// 2. Only ``author_did`` provided -- auto-resolves the broadcast key
+    ///    using that DID (useful when the author identity differs from the
+    ///    node identity).
+    /// 3. Neither provided -- auto-resolves using the node's identity DID.
     ///
-    /// When ``broadcast_key_hex`` and ``author_did`` are ``None``, the key
-    /// is auto-resolved from the ``ContextManager`` using the node's
-    /// identity DID. This is the recommended usage for locally managed
-    /// contexts.
+    /// Providing ``broadcast_key_hex`` without ``author_did`` raises
+    /// ``ValueError``.
     ///
     /// ``admission`` is ``"open"`` or ``"gated"``.
     ///
@@ -201,16 +264,17 @@ impl PyNodeHandle {
                 // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
                 (key_bytes, 0u64, did)
             }
-            (None, None) => {
-                // Auto-resolve from ContextManager using node's identity DID.
-                let node_did = self.inner.did().to_owned();
+            (None, author_opt) => {
+                // Auto-resolve from ContextManager. Use provided author_did
+                // or fall back to node's identity DID.
+                let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
                 let mgr = crate::runtime::context_manager().map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "broadcast key auto-lookup failed: {e}"
                     ))
                 })?;
                 let (key_bytes, epoch) = py.allow_threads(|| {
-                        rt.block_on(mgr.get_broadcast_key_for_local_author(&context_id, &node_did))
+                        rt.block_on(mgr.get_broadcast_key_for_local_author(&context_id, &did))
                             .map_err(|e| {
                                 tracing::debug!(error = %e, "broadcast key auto-resolve failed");
                                 pyo3::exceptions::PyRuntimeError::new_err(
@@ -218,11 +282,12 @@ impl PyNodeHandle {
                                 )
                             })
                     })?;
-                (key_bytes, epoch, node_did)
+                (key_bytes, epoch, did)
             }
-            _ => {
+            (Some(_), None) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "broadcast_key_hex and author_did must both be provided or both be None",
+                    "broadcast_key_hex requires author_did — provide the DID of the \
+                     broadcast key owner, or omit both for auto-resolve",
                 ));
             }
         };
@@ -383,6 +448,38 @@ impl Drop for PyNodeHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Identity portability helper
+// ---------------------------------------------------------------------------
+
+/// Constructs a [`NodeIdentity`] from the global identity registry.
+///
+/// Looks up the given DID in the `PyO3` bridge identity registry (populated by
+/// `py_identity_create`) and builds a `NodeIdentity` with a configured DID
+/// method instance that can sign on behalf of the identity's custody provider.
+///
+/// # Errors
+///
+/// Returns `PyErr` if the DID is not found in the identity registry.
+fn build_node_identity(did: &str) -> PyResult<NodeIdentity> {
+    crate::runtime::with_identity(did, |entry| {
+        let custody = Arc::clone(&entry.custody);
+        let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ));
+
+        Ok(NodeIdentity {
+            identity: entry.identity.clone(),
+            document: entry.document.clone(),
+            did_method,
+        })
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Free functions -- relay startup
 // ---------------------------------------------------------------------------
 
@@ -421,18 +518,41 @@ pub fn py_relay_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyRela
 
 /// Starts a full application node with in-memory storage.
 ///
-/// Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
-/// self-signed TLS, and a relay on an OS-assigned port.
+/// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
+/// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
+/// relay on an OS-assigned port with a fresh DID.
+///
+/// When ``identity_did`` is provided, the node uses the pre-existing identity
+/// from the `PyO3` identity registry (populated by ``py_identity_create``).
+/// This enables identity portability — the same DID persists across node
+/// restarts.
 #[pyfunction]
-pub fn py_node_start_in_memory(py: Python<'_>) -> PyResult<PyNodeHandle> {
+#[pyo3(signature = (identity_did=None))]
+pub fn py_node_start_in_memory(
+    py: Python<'_>,
+    identity_did: Option<String>,
+) -> PyResult<PyNodeHandle> {
     let rt = crate::runtime()?;
-    py.allow_threads(|| {
-        let node = rt
-            .block_on(server::start_node_in_memory())
-            .map_err(server_err)?;
-        Ok(PyNodeHandle {
-            inner: RunningNode::InMemory(node),
-        })
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            crate::validate::validate_did(did)?;
+            Some(build_node_identity(did)?)
+        }
+        None => None,
+    };
+    let node = py.allow_threads(|| {
+        rt.block_on(server::start_node_in_memory(node_identity))
+            .map_err(server_err)
+    })?;
+
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(py, rt, &did, &relay_url);
+
+    Ok(PyNodeHandle {
+        inner: RunningNode::InMemory(node),
     })
 }
 
@@ -440,16 +560,52 @@ pub fn py_node_start_in_memory(py: Python<'_>) -> PyResult<PyNodeHandle> {
 ///
 /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
 /// blob database at ``<data_dir>/blobs.redb``.
+///
+/// When ``identity_did`` is ``None`` (the default), the node creates or
+/// reloads a persistent identity from ``<data_dir>/identity.key``. The
+/// passphrase is resolved as:
+///
+/// 1. The explicit ``passphrase`` parameter, if provided.
+/// 2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
+/// 3. Returns an error if neither is available.
+///
+/// When ``identity_did`` is provided, the node uses the pre-existing identity
+/// from the `PyO3` identity registry (populated by ``py_identity_create``).
+/// No passphrase is required in this mode.
 #[pyfunction]
-pub fn py_node_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyNodeHandle> {
+#[pyo3(signature = (data_dir, identity_did=None, passphrase=None))]
+pub fn py_node_start_local(
+    py: Python<'_>,
+    data_dir: String,
+    identity_did: Option<String>,
+    passphrase: Option<String>,
+) -> PyResult<PyNodeHandle> {
     let rt = crate::runtime()?;
-    py.allow_threads(|| {
-        let node = rt
-            .block_on(server::start_node_local(std::path::Path::new(&data_dir)))
-            .map_err(server_err)?;
-        Ok(PyNodeHandle {
-            inner: RunningNode::Filesystem(node),
-        })
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            crate::validate::validate_did(did)?;
+            Some(build_node_identity(did)?)
+        }
+        None => None,
+    };
+    let zeroized_passphrase = passphrase.map(Zeroizing::new);
+    let node = py.allow_threads(|| {
+        rt.block_on(server::start_node_local(
+            std::path::Path::new(&data_dir),
+            node_identity,
+            zeroized_passphrase,
+        ))
+        .map_err(server_err)
+    })?;
+
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(py, rt, &did, &relay_url);
+
+    Ok(PyNodeHandle {
+        inner: RunningNode::Filesystem(node),
     })
 }
 
@@ -503,7 +659,7 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -517,7 +673,10 @@ mod tests {
     #[test]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-pyo3-node-test-{}", std::process::id()));
-        let node = rt().block_on(server::start_node_local(&tmp)).unwrap();
+        let passphrase = Zeroizing::new("test-passphrase".to_owned());
+        let node = rt()
+            .block_on(server::start_node_local(&tmp, None, Some(passphrase)))
+            .unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -541,7 +700,7 @@ mod tests {
         // enable_broadcast_projection_with_site on a fresh node with a valid
         // key should succeed (the context need not exist in the manager for
         // projection — it is purely a node-local routing table entry).
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
             0,
@@ -564,7 +723,7 @@ mod tests {
 
     #[test]
     fn commit_deploy_on_unprojected_context_returns_error() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let result = rt().block_on(node.commit_deploy("nonexistent-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -580,7 +739,7 @@ mod tests {
 
     #[test]
     fn rollback_deploy_on_unprojected_context_returns_error() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let result = rt().block_on(node.rollback_deploy("nonexistent-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -591,7 +750,7 @@ mod tests {
 
     #[test]
     fn disable_site_projection_on_unprojected_context_is_noop() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         // Should not panic — disable on unknown context is a no-op.
         rt().block_on(node.disable_broadcast_projection("nonexistent-ctx"));
         node.shutdown();
@@ -600,7 +759,7 @@ mod tests {
     #[test]
     fn node_inner_lifecycle_dispatch() {
         // Test the RunningNode dispatch methods (which are the FFI layer).
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
 
         // enable_site_projection via RunningNode
@@ -637,7 +796,7 @@ mod tests {
 
     #[test]
     fn serve_background_dispatches_through_node_inner() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
 
         // serve_background with port 0 (OS-assigned)

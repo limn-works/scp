@@ -43,6 +43,7 @@ from scp_sdk.context import validate_admission, validate_broadcast_key_hex
 
 if TYPE_CHECKING:
     from scp_sdk.context import SiteConfig
+    from scp_sdk.identity import Identity
 
 
 class Relay:
@@ -160,26 +161,62 @@ class Node:
         return self._handle.is_shutdown  # type: ignore[no-any-return]
 
     @staticmethod
-    async def start_in_memory() -> Node:
+    async def start_in_memory(identity: Identity | None = None) -> Node:
         """Start a full application node with in-memory storage.
+
+        When ``identity`` is provided, the node uses that pre-existing identity
+        instead of generating a fresh one -- the same DID persists across node
+        restarts (identity portability).  When ``None``, a fresh ephemeral
+        identity is generated automatically.
 
         Auto-wires in-memory key custody, in-memory storage, in-memory DHT
         client, self-signed TLS, and a relay on an OS-assigned port.
+
+        Args:
+            identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
+                to use.  If provided, the node uses this identity instead of
+                generating a fresh DID.  The identity must have been created
+                via :meth:`~scp_sdk.identity.Identity.create` in the same
+                process (it must exist in the bridge identity registry).
         """
-        handle = await asyncio.to_thread(_scp_core.py_node_start_in_memory)
+        did = identity.did if identity is not None else None
+        handle = await asyncio.to_thread(_scp_core.py_node_start_in_memory, did)
         return Node(handle)
 
     @staticmethod
-    async def start_local(data_dir: str) -> Node:
+    async def start_local(
+        data_dir: str,
+        identity: Identity | None = None,
+        passphrase: str | None = None,
+    ) -> Node:
         """Start a full application node with file-backed storage.
+
+        When ``identity`` is provided, the node uses that pre-existing identity
+        instead of generating one -- the same DID persists across node restarts
+        (identity portability).  When ``None``, the node creates or reloads a
+        persistent identity via ``FileKeyCustody``.  The passphrase for key
+        derivation is resolved as:
+
+        1. The explicit ``passphrase`` parameter, if provided.
+        2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
+        3. Returns an error if neither is available.
+
+        No passphrase is required when ``identity`` is provided.
 
         Opens (or creates) persistent storage at ``<data_dir>/storage/``
         and a redb blob database at ``<data_dir>/blobs.redb``.
 
         Args:
             data_dir: Directory for persistent storage.
+            identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
+                to use.  If provided, the node uses this identity instead of
+                generating a fresh one.
+            passphrase: Passphrase for Argon2id key derivation (encrypts the
+                key file at rest).  Falls back to ``SCP_KEY_PASSPHRASE`` env
+                var when ``None``.
         """
-        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir)
+        did = identity.did if identity is not None else None
+        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did, passphrase)
         return Node(handle)
 
     async def serve(self, bind_addr: str | None = None) -> str:
@@ -232,12 +269,16 @@ class Node:
     ) -> None:
         """Activate HTTP broadcast projection for a context.
 
-        Registers a broadcast context for HTTP content delivery.
+        Three resolution modes:
 
-        When ``broadcast_key_hex`` and ``author_did`` are ``None``, the
-        key is auto-resolved from the ``ContextManager`` using the
-        node's identity DID. This is the recommended usage for locally
-        managed contexts.
+        1. Both ``broadcast_key_hex`` **and** ``author_did`` provided — uses
+           the explicit key with epoch 0.
+        2. Only ``author_did`` provided — auto-resolves the broadcast key
+           using that DID (useful when the author identity differs from
+           the node identity).
+        3. Neither provided — auto-resolves using the node's identity DID.
+
+        Providing ``broadcast_key_hex`` without ``author_did`` is an error.
 
         Args:
             context_id: The context ID to project.
@@ -247,18 +288,19 @@ class Node:
             broadcast_key_hex: 32-byte AES-256 broadcast key as a
                 64-character hex string, or ``None`` for auto-lookup.
             author_did: DID of the broadcast key owner, or ``None``
-                for auto-lookup.
+                for auto-lookup using the node's DID.
 
         Raises:
-            ValueError: If parameters are invalid or only one of
-                ``broadcast_key_hex``/``author_did`` is provided.
+            ValueError: If parameters are invalid or ``broadcast_key_hex``
+                is provided without ``author_did``.
             RuntimeError: If the underlying node operation fails or
                 auto-lookup cannot find the key.
         """
         validate_admission(admission)
-        if (broadcast_key_hex is None) != (author_did is None):
+        if broadcast_key_hex is not None and author_did is None:
             raise ValueError(
-                "broadcast_key_hex and author_did must both be provided or both be omitted"
+                "broadcast_key_hex requires author_did — provide the DID of the "
+                "broadcast key owner, or omit both for auto-resolve"
             )
         if broadcast_key_hex is not None:
             validate_broadcast_key_hex(broadcast_key_hex)

@@ -216,8 +216,38 @@ impl FileKeyCustody {
         data.extend_from_slice(&salt);
         data.extend_from_slice(&0u32.to_le_bytes());
 
-        std::fs::write(path, &data)
-            .map_err(|e| PlatformError::CustodyError(format!("failed to create key file: {e}")))?;
+        // Create the file with restrictive permissions atomically on Unix
+        // to avoid a TOCTOU window where the file is world-readable.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| {
+                    PlatformError::CustodyError(format!("failed to create key file: {e}"))
+                })?;
+            file.write_all(&data).map_err(|e| {
+                PlatformError::CustodyError(format!("failed to write key file: {e}"))
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| {
+                    PlatformError::CustodyError(format!("failed to create key file: {e}"))
+                })?;
+            file.write_all(&data).map_err(|e| {
+                PlatformError::CustodyError(format!("failed to write key file: {e}"))
+            })?;
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -352,9 +382,10 @@ impl FileKeyCustody {
         let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
-        let plaintext = cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
-            PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
-        })?;
+        let plaintext =
+            Zeroizing::new(cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
+                PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
+            })?);
 
         let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
         if plaintext.len() != KEY_LEN {
@@ -949,6 +980,21 @@ mod tests {
         let sig_bytes: [u8; 64] = sig.as_bytes().try_into().unwrap();
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         assert!(ed25519_dalek::Verifier::verify(&vk, b"msg", &signature).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn key_file_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let _custody = FileKeyCustody::new(&path, "test-perms").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "key file should be owner-only (0600), got: {mode:o}"
+        );
     }
 
     #[tokio::test]

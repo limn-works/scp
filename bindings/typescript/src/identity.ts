@@ -8,7 +8,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { mapBridgeError } from "./errors";
+import { IdentityError, mapBridgeError } from "./errors";
 import type { BridgeIdentityHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
 import type { DIDDocument } from "./types";
@@ -300,5 +300,254 @@ export class Identity {
     } catch (error) {
       throw mapBridgeError(error);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Identity Link Attestations (§3.5)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Creates an identity link attestation for an external platform (§3.5).
+   *
+   * Cryptographically binds this DID to an external platform identity.
+   * The proof is platform-specific evidence of ownership.
+   *
+   * @param options - Attestation creation options.
+   * @param options.platform - Platform identifier (e.g., `"github.com"`).
+   * @param options.handle - Platform-specific handle or username.
+   * @param options.proof - Platform-specific proof of ownership.
+   * @param options.platformId - Optional platform-assigned unique identifier.
+   * @returns The created `IdentityAttestation`.
+   * @throws {IdentityError} If the bridge function is not available.
+   */
+  async createAttestation(options: {
+    platform: string;
+    handle: string;
+    proof: string;
+    platformId?: string;
+  }): Promise<IdentityAttestation> {
+    try {
+      const bridge = await getBridge();
+      const fn = (bridge as unknown as Record<string, unknown>).identityCreateAttestation as
+        | ((
+            did: string,
+            platform: string,
+            handle: string,
+            proof: string,
+            platformId: string | undefined,
+          ) => Promise<string>)
+        | undefined;
+      if (!fn) {
+        throw new IdentityError(
+          "Identity link attestation creation is not yet available in the bridge",
+          "SCP-ATTEST-9001",
+        );
+      }
+      const json = await fn(
+        this.did,
+        options.platform,
+        options.handle,
+        options.proof,
+        options.platformId,
+      );
+      return IdentityAttestation._fromJson(json);
+    } catch (error) {
+      throw error instanceof IdentityError ? error : mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Lists all identity link attestations for this identity.
+   *
+   * @returns An array of `IdentityAttestation` objects.
+   * @throws {IdentityError} If the bridge function is not available.
+   */
+  async listAttestations(): Promise<readonly IdentityAttestation[]> {
+    try {
+      const bridge = await getBridge();
+      const fn = (bridge as unknown as Record<string, unknown>).identityListAttestations as
+        | ((did: string) => Promise<string>)
+        | undefined;
+      if (!fn) {
+        throw new IdentityError(
+          "Identity link attestation listing is not yet available in the bridge",
+          "SCP-ATTEST-9002",
+        );
+      }
+      const json = await fn(this.did);
+      const items = JSON.parse(json) as Record<string, unknown>[];
+      return items.map((item) => IdentityAttestation._fromRecord(item));
+    } catch (error) {
+      throw error instanceof IdentityError ? error : mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Removes an identity link attestation by ID.
+   *
+   * @param attestationId - The deterministic attestation ID to remove.
+   * @returns `true` if the attestation was found and removed.
+   * @throws {IdentityError} If the bridge function is not available.
+   */
+  async removeAttestation(attestationId: string): Promise<boolean> {
+    try {
+      const bridge = await getBridge();
+      const fn = (bridge as unknown as Record<string, unknown>).identityRemoveAttestation as
+        | ((did: string, attestationId: string) => Promise<boolean>)
+        | undefined;
+      if (!fn) {
+        throw new IdentityError(
+          "Identity link attestation removal is not yet available in the bridge",
+          "SCP-ATTEST-9003",
+        );
+      }
+      return await fn(this.did, attestationId);
+    } catch (error) {
+      throw error instanceof IdentityError ? error : mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Renews an identity link attestation with a fresh `verifiedAt`.
+   *
+   * @param attestation - The attestation to renew.
+   * @returns A new `IdentityAttestation` with updated `verifiedAt`.
+   * @throws {IdentityError} If the bridge function is not available.
+   */
+  async renewAttestation(attestation: IdentityAttestation): Promise<IdentityAttestation> {
+    try {
+      const bridge = await getBridge();
+      const fn = (bridge as unknown as Record<string, unknown>).identityRenewAttestation as
+        | ((did: string, attestationId: string) => Promise<string>)
+        | undefined;
+      if (!fn) {
+        throw new IdentityError(
+          "Identity link attestation renewal is not yet available in the bridge",
+          "SCP-ATTEST-9004",
+        );
+      }
+      const json = await fn(this.did, attestation.id);
+      return IdentityAttestation._fromJson(json);
+    } catch (error) {
+      throw error instanceof IdentityError ? error : mapBridgeError(error);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// IdentityAttestation
+// ---------------------------------------------------------------------------
+
+/** Data for an identity link attestation (§3.5). */
+export interface IdentityAttestationData {
+  /** Deterministic attestation ID. */
+  readonly id: string;
+  /** Platform identifier (e.g., `"github.com"`). */
+  readonly platform: string;
+  /** Platform handle or username. */
+  readonly platformHandle: string;
+  /** DID verification method that signed this attestation. */
+  readonly verificationMethod: string;
+  /** Unix timestamp (seconds) when the evidence was last verified. */
+  readonly verifiedAt: number;
+  /** Revocation status: `"active"`, `"revoked"`, or `"expired"`. */
+  readonly revocationStatus: string;
+  /** Optional platform-assigned unique identifier. */
+  readonly platformId?: string | undefined;
+}
+
+/**
+ * An identity link attestation binding a DID to an external platform (§3.5).
+ *
+ * Represents a cryptographically signed claim that the DID owner also
+ * controls an identity on an external platform (e.g., GitHub, X, LinkedIn).
+ */
+export class IdentityAttestation implements IdentityAttestationData {
+  /** Deterministic attestation ID. */
+  readonly id: string;
+  /** Platform identifier (e.g., `"github.com"`). */
+  readonly platform: string;
+  /** Platform handle or username. */
+  readonly platformHandle: string;
+  /** DID verification method that signed this attestation. */
+  readonly verificationMethod: string;
+  /** Unix timestamp (seconds) when the evidence was last verified. */
+  readonly verifiedAt: number;
+  /** Revocation status: `"active"`, `"revoked"`, or `"expired"`. */
+  readonly revocationStatus: string;
+  /** Optional platform-assigned unique identifier. */
+  readonly platformId?: string | undefined;
+
+  constructor(data: IdentityAttestationData) {
+    this.id = data.id;
+    this.platform = data.platform;
+    this.platformHandle = data.platformHandle;
+    this.verificationMethod = data.verificationMethod;
+    this.verifiedAt = data.verifiedAt;
+    this.revocationStatus = data.revocationStatus;
+    this.platformId = data.platformId;
+  }
+
+  /**
+   * Verifies this attestation's signature and validity.
+   *
+   * Delegates to the bridge's `trust_verify_attestation` function.
+   *
+   * @returns `true` if the attestation is valid.
+   * @throws {IdentityError} If the bridge function is not available.
+   */
+  async verify(): Promise<boolean> {
+    try {
+      const bridge = await getBridge();
+      const fn = (bridge as unknown as Record<string, unknown>).trustVerifyAttestation as
+        | ((json: string) => Promise<string>)
+        | undefined;
+      if (!fn) {
+        throw new IdentityError(
+          "Attestation verification is not yet available in the bridge",
+          "SCP-ATTEST-9005",
+        );
+      }
+      const resultJson = await fn(JSON.stringify(this._toBridgeRecord()));
+      const result = JSON.parse(resultJson) as { valid?: boolean };
+      return result.valid === true;
+    } catch (error) {
+      throw error instanceof IdentityError ? error : mapBridgeError(error);
+    }
+  }
+
+  /** @internal */
+  _toBridgeRecord(): Record<string, unknown> {
+    const rec: Record<string, unknown> = {
+      id: this.id,
+      platform: this.platform,
+      platform_handle: this.platformHandle,
+      verification_method: this.verificationMethod,
+      verified_at: this.verifiedAt,
+      revocation_status: this.revocationStatus,
+    };
+    if (this.platformId !== undefined) {
+      rec.platform_id = this.platformId;
+    }
+    return rec;
+  }
+
+  /** @internal */
+  static _fromJson(json: string): IdentityAttestation {
+    const data = JSON.parse(json) as Record<string, unknown>;
+    return IdentityAttestation._fromRecord(data);
+  }
+
+  /** @internal */
+  static _fromRecord(data: Record<string, unknown>): IdentityAttestation {
+    return new IdentityAttestation({
+      id: data.id as string,
+      platform: data.platform as string,
+      platformHandle: (data.platform_handle ?? data.platformHandle) as string,
+      verificationMethod: (data.verification_method ?? data.verificationMethod) as string,
+      verifiedAt: (data.verified_at ?? data.verifiedAt) as number,
+      revocationStatus: ((data.revocation_status ?? data.revocationStatus) as string) || "active",
+      platformId: (data.platform_id ?? data.platformId) as string | undefined,
+    });
   }
 }

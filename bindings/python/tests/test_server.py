@@ -247,3 +247,197 @@ async def test_node_context_manager_shutdown() -> None:
         assert handle.is_shutdown is False
 
     assert handle.is_shutdown is True
+
+
+# ---------------------------------------------------------------------------
+# Identity portability — Node.start_in_memory / start_local
+# ---------------------------------------------------------------------------
+
+
+class _MockIdentity:
+    """Minimal mock for scp_sdk.identity.Identity."""
+
+    def __init__(self, did: str = "did:dht:z6MkTestIdentity") -> None:
+        self.did = did
+
+
+@pytest.mark.asyncio
+async def test_start_in_memory_without_identity() -> None:
+    """start_in_memory() without identity calls bridge with None."""
+    import _scp_core
+
+    original = _scp_core.py_node_start_in_memory
+    calls: list[tuple[str | None]] = []
+
+    def mock_start(identity_did: str | None = None) -> _MockNodeHandle:
+        calls.append((identity_did,))
+        return _MockNodeHandle()
+
+    _scp_core.py_node_start_in_memory = mock_start
+    try:
+        node = await Node.start_in_memory()
+        assert isinstance(node, Node)
+        assert len(calls) == 1
+        assert calls[0] == (None,)
+    finally:
+        _scp_core.py_node_start_in_memory = original
+
+
+@pytest.mark.asyncio
+async def test_start_in_memory_with_identity() -> None:
+    """start_in_memory(identity) passes identity.did to bridge."""
+    import _scp_core
+
+    original = _scp_core.py_node_start_in_memory
+    calls: list[tuple[str | None]] = []
+
+    def mock_start(identity_did: str | None = None) -> _MockNodeHandle:
+        calls.append((identity_did,))
+        return _MockNodeHandle()
+
+    _scp_core.py_node_start_in_memory = mock_start
+    try:
+        identity = _MockIdentity("did:dht:z6MkPortable")
+        node = await Node.start_in_memory(identity=identity)
+        assert isinstance(node, Node)
+        assert len(calls) == 1
+        assert calls[0] == ("did:dht:z6MkPortable",)
+    finally:
+        _scp_core.py_node_start_in_memory = original
+
+
+@pytest.mark.asyncio
+async def test_start_local_without_identity() -> None:
+    """start_local(dir) without identity calls bridge with None."""
+    import _scp_core
+
+    original = _scp_core.py_node_start_local
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def mock_start(
+        data_dir: str,
+        identity_did: str | None = None,
+        passphrase: str | None = None,
+    ) -> _MockNodeHandle:
+        calls.append((data_dir, identity_did, passphrase))
+        return _MockNodeHandle()
+
+    _scp_core.py_node_start_local = mock_start
+    try:
+        node = await Node.start_local("/tmp/test-dir")
+        assert isinstance(node, Node)
+        assert len(calls) == 1
+        assert calls[0] == ("/tmp/test-dir", None, None)
+    finally:
+        _scp_core.py_node_start_local = original
+
+
+@pytest.mark.asyncio
+async def test_start_local_with_identity() -> None:
+    """start_local(dir, identity) passes identity.did to bridge."""
+    import _scp_core
+
+    original = _scp_core.py_node_start_local
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def mock_start(
+        data_dir: str,
+        identity_did: str | None = None,
+        passphrase: str | None = None,
+    ) -> _MockNodeHandle:
+        calls.append((data_dir, identity_did, passphrase))
+        return _MockNodeHandle()
+
+    _scp_core.py_node_start_local = mock_start
+    try:
+        identity = _MockIdentity("did:dht:z6MkPersist")
+        node = await Node.start_local("/tmp/test-dir", identity=identity)
+        assert isinstance(node, Node)
+        assert len(calls) == 1
+        assert calls[0] == ("/tmp/test-dir", "did:dht:z6MkPersist", None)
+    finally:
+        _scp_core.py_node_start_local = original
+
+
+@pytest.mark.asyncio
+async def test_start_local_with_passphrase() -> None:
+    """start_local(dir, passphrase=...) passes passphrase to bridge."""
+    import _scp_core
+
+    original = _scp_core.py_node_start_local
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def mock_start(
+        data_dir: str,
+        identity_did: str | None = None,
+        passphrase: str | None = None,
+    ) -> _MockNodeHandle:
+        calls.append((data_dir, identity_did, passphrase))
+        return _MockNodeHandle()
+
+    _scp_core.py_node_start_local = mock_start
+    try:
+        node = await Node.start_local("/tmp/test-dir", passphrase="my-secret")
+        assert isinstance(node, Node)
+        assert len(calls) == 1
+        assert calls[0] == ("/tmp/test-dir", None, "my-secret")
+    finally:
+        _scp_core.py_node_start_local = original
+
+
+# ---------------------------------------------------------------------------
+# enable_site_projection validation (#1405)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enable_site_projection_broadcast_key_without_author_did_raises() -> None:
+    """broadcast_key_hex without author_did raises ValueError."""
+    node = _make_node()
+    config = SiteConfig(hostname="example.com")
+
+    with pytest.raises(ValueError, match="broadcast_key_hex requires author_did"):
+        await node.enable_site_projection(
+            context_id="ctx-123",
+            admission="open",
+            config=config,
+            broadcast_key_hex="ab" * 32,
+            author_did=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_enable_site_projection_author_did_without_key_passes_through() -> None:
+    """author_did without broadcast_key_hex is allowed (auto-resolve with author_did)."""
+    handle = _MockNodeHandle()
+    node = _make_node(handle)
+    config = SiteConfig(hostname="example.com")
+
+    # This should pass SDK validation and reach the bridge handle.
+    await node.enable_site_projection(
+        context_id="ctx-123",
+        admission="open",
+        config=config,
+        broadcast_key_hex=None,
+        author_did="did:dht:z6MkAuthor",
+    )
+
+    assert handle._last_enable_args["broadcast_key_hex"] is None
+    assert handle._last_enable_args["author_did"] == "did:dht:z6MkAuthor"
+
+
+@pytest.mark.asyncio
+async def test_enable_site_projection_both_none_passes_through() -> None:
+    """Both None is allowed (auto-resolve with node DID)."""
+    handle = _MockNodeHandle()
+    node = _make_node(handle)
+    config = SiteConfig(hostname="example.com")
+
+    await node.enable_site_projection(
+        context_id="ctx-123",
+        admission="open",
+        config=config,
+    )
+
+    assert handle._last_enable_args["broadcast_key_hex"] is None
+    assert handle._last_enable_args["author_did"] is None

@@ -238,8 +238,8 @@ struct NodeLifecycleTests {
 
     // MARK: - Helpers
 
-    /// Mock node start function that creates a fake handle.
+    /// Mock node start function that creates a fake handle (ignores identity).
     private var mockNodeStart: ServerBridge.NodeStartInMemoryFn {
-        { NodeHandle(noPointer: .init()) }
+        { _ in NodeHandle(noPointer: .init()) }
     }
 }

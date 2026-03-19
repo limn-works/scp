@@ -69,8 +69,12 @@ interface NativeNodeHandle {
 interface ServerAddon {
   relayStartInMemory(): Promise<NativeRelayHandle>;
   relayStartLocal(dataDir: string): Promise<NativeRelayHandle>;
-  nodeStartInMemory(): Promise<NativeNodeHandle>;
-  nodeStartLocal(dataDir: string): Promise<NativeNodeHandle>;
+  nodeStartInMemory(identityDid: string | null): Promise<NativeNodeHandle>;
+  nodeStartLocal(
+    dataDir: string,
+    identityDid: string | null,
+    passphrase: string | null,
+  ): Promise<NativeNodeHandle>;
   transportConnect(relayUrl: string): Promise<unknown>;
   configureLocalTransport(localDid: string): void;
 }
@@ -248,10 +252,21 @@ export class Node implements AsyncDisposable {
    *
    * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
    * client, self-signed TLS, and a relay on an OS-assigned port.
+   *
+   * When `identity` is provided, the node uses the pre-existing identity
+   * (created via `identityCreate`) instead of generating a fresh one. This
+   * enables identity portability -- the same DID persists across node
+   * restarts. The `ContextManager` is also auto-initialized with the
+   * node's relay as transport.
+   *
+   * Accepts any object with a `did` property (including the `Identity`
+   * class from `identityCreate`), keeping the server module decoupled.
+   *
+   * @param identity - Optional identity object with a `.did` property.
    */
-  static async startInMemory(): Promise<Node> {
+  static async startInMemory(identity?: { did: string }): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartInMemory();
+    const handle = await addon.nodeStartInMemory(identity?.did ?? null);
     return new Node(handle);
   }
 
@@ -261,11 +276,28 @@ export class Node implements AsyncDisposable {
    * Opens (or creates) persistent storage at `<dataDir>/storage/` and a
    * redb blob database at `<dataDir>/blobs.redb`.
    *
+   * When `identity` is provided, the node uses the pre-existing identity
+   * instead of generating a fresh one. When omitted, the node creates or
+   * reloads a persistent identity via `FileKeyCustody`. The passphrase
+   * for key derivation is resolved as:
+   * 1. The explicit `passphrase` parameter, if provided.
+   * 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+   * 3. Returns an error if neither is available.
+   *
+   * No passphrase is required when `identity` is provided.
+   *
    * @param dataDir - Directory for persistent storage.
+   * @param identity - Optional identity object with a `.did` property.
+   * @param passphrase - Passphrase for Argon2id key derivation. Falls back
+   *   to `SCP_KEY_PASSPHRASE` env var when omitted.
    */
-  static async startLocal(dataDir: string): Promise<Node> {
+  static async startLocal(
+    dataDir: string,
+    identity?: { did: string },
+    passphrase?: string,
+  ): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartLocal(dataDir);
+    const handle = await addon.nodeStartLocal(dataDir, identity?.did ?? null, passphrase ?? null);
     return new Node(handle);
   }
 
@@ -307,12 +339,15 @@ export class Node implements AsyncDisposable {
   /**
    * Activate HTTP broadcast projection for a context.
    *
-   * Registers a broadcast context for HTTP content delivery.
+   * Three resolution modes:
+   * 1. Both `broadcastKeyHex` **and** `authorDid` provided -- uses the
+   *    explicit key with epoch 0.
+   * 2. Only `authorDid` provided -- auto-resolves the broadcast key
+   *    using that DID (useful when the author identity differs from the
+   *    node identity).
+   * 3. Neither provided -- auto-resolves using the node's identity DID.
    *
-   * When `broadcastKeyHex` and `authorDid` are omitted (or `undefined`),
-   * the key is auto-resolved from the `ContextManager` using the node's
-   * identity DID. This is the recommended usage for locally managed
-   * contexts.
+   * Providing `broadcastKeyHex` without `authorDid` is an error.
    *
    * @param contextId - The context ID to project.
    * @param admission - `"open"` or `"gated"`.
@@ -329,8 +364,10 @@ export class Node implements AsyncDisposable {
     authorDid?: string,
   ): Promise<void> {
     validateAdmission(admission);
-    if ((broadcastKeyHex === undefined) !== (authorDid === undefined)) {
-      throw new Error("broadcastKeyHex and authorDid must both be provided or both be omitted");
+    if (broadcastKeyHex !== undefined && authorDid === undefined) {
+      throw new Error(
+        "broadcastKeyHex requires authorDid — provide the DID of the broadcast key owner, or omit both for auto-resolve",
+      );
     }
     if (broadcastKeyHex !== undefined) {
       validateBroadcastKeyHex(broadcastKeyHex);

@@ -332,12 +332,13 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
         // "file" is the canonical name; "platform" is a backward-compat alias
         // (SCP-294a). Both resolve to FileKeyCustody.
         "file" | "platform" => {
-            let passphrase = std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
-                ScpPyError::validation(
-                    "file custody requires the SCP_KEY_PASSPHRASE environment \
-                     variable to be set — this passphrase protects the encrypted key file",
-                )
-            })?;
+            let passphrase =
+                zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
+                    ScpPyError::validation(
+                        "file custody requires the SCP_KEY_PASSPHRASE environment \
+                         variable to be set — this passphrase protects the encrypted key file",
+                    )
+                })?);
 
             let key_dir = dirs_home().join(".scp");
             std::fs::create_dir_all(&key_dir).map_err(|e| {

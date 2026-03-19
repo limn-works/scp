@@ -20,8 +20,10 @@ use zeroize::Zeroizing;
 use scp_ffi_common::server::{self, RunningNode, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
+use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
-use crate::bridge::ScpError;
+use crate::bridge::{Identity, ScpError};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -79,6 +81,49 @@ impl From<NodeError> for ScpError {
                 code: "SCP-TRANS-5054".to_owned(),
             },
         }
+    }
+}
+
+/// Auto-wires the global [`ContextManager`] with relay transport after
+/// node startup.
+///
+/// Connects to the node's local relay and initializes the `ContextManager`
+/// with `MlsCryptoProvider` and `RelayTransportProvider` so that context
+/// operations (create, join, send) work immediately. If the `ContextManager`
+/// was already initialized (e.g., by a prior `configure_relay_transport` or
+/// `context_create` call), this is a no-op — the `OnceLock` ensures
+/// first-writer-wins semantics.
+///
+/// Also registers the node's DID as a local DID on the `ContextManager`
+/// for defense-in-depth.
+///
+/// Best-effort: logs a warning if the relay connection fails rather than
+/// blocking node startup.
+async fn auto_wire_context_manager(did: &str, relay_url: &str) {
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    match NativeRelayAdapter::connect_sourced(&sourced).await {
+        Ok(adapter) => {
+            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                relay_url = %relay_url,
+                "auto_wire_context_manager: failed to connect to node relay — \
+                 context operations may fail until transport is configured manually"
+            );
+            // Fall back to initializing with MLS crypto (not FfiBridgeCrypto
+            // no-op) so that at least the ContextManager exists with real
+            // crypto for the identity's DID, matching PyO3/NAPI behavior.
+            crate::runtime::init_context_manager_with_did(did);
+        }
+    }
+    // Always register the node's DID as a local DID for defense-in-depth.
+    if let Ok(mgr) = crate::runtime::context_manager() {
+        mgr.register_local_did(did.to_owned().into()).await;
     }
 }
 
@@ -184,9 +229,15 @@ impl NodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// When `broadcast_key_hex` and `author_did` are `nil`/`null`, the key
-    /// is auto-resolved from the `ContextManager` using the node's identity
-    /// DID. This is the recommended usage for locally managed contexts.
+    /// Three resolution modes:
+    /// 1. Both `broadcast_key_hex` **and** `author_did` provided — uses the
+    ///    explicit key with epoch 0.
+    /// 2. Only `author_did` provided — auto-resolves the broadcast key
+    ///    using that DID (useful when the author identity differs from the
+    ///    node identity).
+    /// 3. Neither provided — auto-resolves using the node's identity DID.
+    ///
+    /// Providing `broadcast_key_hex` without `author_did` is an error.
     ///
     /// `admission` is `"open"` or `"gated"`. `hostname` is the virtual
     /// host (RFC 1123).
@@ -209,7 +260,7 @@ impl NodeHandle {
             validate_did(did)?;
         }
 
-        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
+        // Resolve broadcast key: explicit, auto-lookup, or auto with explicit author.
         let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
             match (broadcast_key_hex, author_did) {
                 (Some(key_hex), Some(did)) => {
@@ -232,12 +283,15 @@ impl NodeHandle {
                     // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
                     (key_bytes, 0u64, did)
                 }
-                (None, None) => {
-                    // Auto-resolve from ContextManager using node's identity DID.
-                    let node_did = self.inner.did().to_owned();
+                (None, author_opt) => {
+                    // Auto-resolve from ContextManager. Use the explicit author
+                    // DID if provided, otherwise fall back to the node's identity
+                    // DID. This supports the case where the node hosts content
+                    // authored by a different DID (#1405).
+                    let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
                     let mgr = crate::runtime::context_manager()?;
                     let (key_bytes, epoch) = mgr
-                        .get_broadcast_key_for_local_author(&context_id, &node_did)
+                        .get_broadcast_key_for_local_author(&context_id, &did)
                         .await
                         .map_err(|e| {
                             tracing::debug!(error = %e, "broadcast key auto-resolve failed");
@@ -248,15 +302,15 @@ impl NodeHandle {
                             code: "SCP-CTX-2060".to_owned(),
                         }
                         })?;
-                    (key_bytes, epoch, node_did)
+                    (key_bytes, epoch, did)
                 }
-                _ => {
+                (Some(_), None) => {
                     return Err(ScpError::Validation {
-                    msg:
-                        "broadcast_key_hex and author_did must both be provided or both be omitted"
+                        msg: "broadcast_key_hex requires author_did — provide the DID of the \
+                         broadcast key owner, or omit both for auto-resolve"
                             .to_owned(),
-                    code: "SCP-TRANS-5060".to_owned(),
-                });
+                        code: "SCP-TRANS-5060".to_owned(),
+                    });
                 }
             };
 
@@ -428,7 +482,110 @@ pub async fn relay_start_local(data_dir: String) -> Result<Arc<RelayHandle>, Scp
 // Free functions -- node startup
 // ---------------------------------------------------------------------------
 
+/// Builds a [`server::NodeIdentity`] from a `UniFFI` [`Identity`] handle.
+///
+/// Extracts the `ScpIdentity` and `DidDocument` retained in the identity
+/// handle, then constructs a `ConcreteDidMethod` (`DidDht`) with a signing
+/// function derived from the identity's custody provider. This enables
+/// node startup with a pre-existing identity instead of generating a fresh
+/// one, supporting identity portability across node restarts.
+///
+/// # Errors
+///
+/// Returns `ScpError::Identity` if:
+/// - The identity does not retain a `ScpIdentity` (external/load-only handles)
+/// - The identity does not retain a `DidDocument`
+/// - The identity has no custody provider (no signing capability)
+#[cfg(feature = "allow_in_memory_custody")]
+#[allow(clippy::type_complexity)]
+fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity, ScpError> {
+    use scp_ffi_common::server::ConcreteDidMethod;
+    use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
+    use scp_platform::traits::KeyCustody;
+
+    let core_id = id.core_id.clone().ok_or_else(|| ScpError::Identity {
+        msg: "identity does not contain key handles — only identities created \
+              via identity_create (not identity_load with external custody) can \
+              be used for node startup"
+            .to_owned(),
+        code: "SCP-IDENT-1010".to_owned(),
+    })?;
+
+    let document = id.core_document.clone().ok_or_else(|| ScpError::Identity {
+        msg: "identity does not contain a DID document — identity may have been \
+              loaded without document resolution"
+            .to_owned(),
+        code: "SCP-IDENT-1011".to_owned(),
+    })?;
+
+    let custody = id
+        .in_memory_custody
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity does not have in-memory custody — only in-memory custody \
+              identities can be used for node startup in this build"
+                .to_owned(),
+            code: "SCP-IDENT-1012".to_owned(),
+        })?;
+
+    // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
+    // implement `KeyCustody` (it wraps `InMemoryKeyCustody` in `.0`).
+    // `ConcreteDidMethod::make_sign_fn` requires `Arc<K: KeyCustody>`,
+    // so we delegate to the inner `.0` field directly. Same pattern as
+    // `make_dht_with_signer` in bridge.rs.
+    let custody_clone = Arc::clone(custody);
+    let sign_fn: Arc<
+        dyn Fn(
+                u64,
+                Vec<u8>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<u8>, IdentityError>> + Send>,
+            > + Send
+            + Sync,
+    > = Arc::new(move |key_id: u64, data: Vec<u8>| {
+        let kc = Arc::clone(&custody_clone);
+        Box::pin(async move {
+            let handle = scp_platform::traits::KeyHandle::new(key_id);
+            let sig =
+                kc.0.sign(&handle, &data)
+                    .await
+                    .map_err(IdentityError::Platform)?;
+            Ok(sig.into_bytes())
+        })
+    });
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let cache = Arc::new(DidCache::new());
+    let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
+        dht_client, cache, sign_fn,
+    ));
+
+    Ok(server::NodeIdentity {
+        identity: core_id,
+        document,
+        did_method,
+    })
+}
+
+/// Fallback for builds without `allow_in_memory_custody`: always returns an
+/// error because node identity portability requires custody access.
+#[cfg(not(feature = "allow_in_memory_custody"))]
+fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentity, ScpError> {
+    Err(ScpError::Identity {
+        msg: "node identity portability requires the \"allow_in_memory_custody\" \
+              feature — production mobile builds should use platform custody \
+              with identity_with_storage on ApplicationNodeBuilder directly"
+            .to_owned(),
+        code: "SCP-IDENT-1013".to_owned(),
+    })
+}
+
 /// Starts a full application node with in-memory storage.
+///
+/// When `identity` is provided, the node uses the pre-existing identity
+/// instead of generating a fresh one. This enables identity portability —
+/// the same DID persists across node restarts and can be shared between
+/// SDK and node instances.
 ///
 /// Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
 /// self-signed TLS, and a relay on an OS-assigned port.
@@ -436,14 +593,28 @@ pub async fn relay_start_local(data_dir: String) -> Result<Arc<RelayHandle>, Scp
 /// # Swift
 ///
 /// ```swift
-/// let node = try await nodeStartInMemory()
+/// let identity = try await identityCreate(custody: "in_memory")
+/// let node = try await nodeStartInMemory(identity: identity)
 /// print(node.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
-/// print(node.did())      // "did:dht:z6Mk..."
+/// print(node.did())      // same DID as identity.did()
 /// node.shutdown()
 /// ```
 #[uniffi::export]
-pub async fn node_start_in_memory() -> Result<Arc<NodeHandle>, ScpError> {
-    let node = server::start_node_in_memory().await?;
+pub async fn node_start_in_memory(
+    identity: Option<Arc<Identity>>,
+) -> Result<Arc<NodeHandle>, ScpError> {
+    let node_identity = match identity {
+        Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
+        None => None,
+    };
+    let node = server::start_node_in_memory(node_identity).await?;
+
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(&did, &relay_url).await;
+
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::InMemory(node),
@@ -452,11 +623,38 @@ pub async fn node_start_in_memory() -> Result<Arc<NodeHandle>, ScpError> {
 
 /// Starts a full application node with file-backed storage.
 ///
+/// When `identity` is provided, the node uses the pre-existing identity.
+/// When `None`, the node creates or reloads a persistent identity via
+/// `FileKeyCustody`. The passphrase is resolved as:
+/// 1. The explicit `passphrase` parameter, if provided.
+/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+/// 3. Returns an error if neither is available.
+///
 /// Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
 /// blob database at `<data_dir>/blobs.redb`.
 #[uniffi::export]
-pub async fn node_start_local(data_dir: String) -> Result<Arc<NodeHandle>, ScpError> {
-    let node = server::start_node_local(std::path::Path::new(&data_dir)).await?;
+pub async fn node_start_local(
+    data_dir: String,
+    identity: Option<Arc<Identity>>,
+    passphrase: Option<String>,
+) -> Result<Arc<NodeHandle>, ScpError> {
+    let node_identity = match identity {
+        Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
+        None => None,
+    };
+    let zeroized_passphrase = passphrase.map(Zeroizing::new);
+    let node = server::start_node_local(
+        std::path::Path::new(&data_dir),
+        node_identity,
+        zeroized_passphrase,
+    )
+    .await?;
+
+    // Auto-wire the ContextManager with relay transport.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(&did, &relay_url).await;
+
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::Filesystem(node),
@@ -502,7 +700,7 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let node = rt().block_on(node_start_in_memory()).unwrap();
+        let node = rt().block_on(node_start_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -520,7 +718,11 @@ mod tests {
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-uniffi-node-test-{}", std::process::id()));
         let node = rt()
-            .block_on(node_start_local(tmp.to_string_lossy().into_owned()))
+            .block_on(node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                None,
+                Some("test-passphrase".to_owned()),
+            ))
             .unwrap();
         let url = node.relay_url();
         assert!(
@@ -543,14 +745,14 @@ mod tests {
 
     #[test]
     fn node_shutdown_is_idempotent() {
-        let node = rt().block_on(node_start_in_memory()).unwrap();
+        let node = rt().block_on(node_start_in_memory(None)).unwrap();
         node.shutdown();
         node.shutdown();
     }
 
     #[test]
     fn enable_site_projection_dispatches_through_node_inner() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
@@ -571,7 +773,7 @@ mod tests {
 
     #[test]
     fn commit_deploy_returns_error_for_unprojected_context() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.commit_deploy("no-such-ctx", "deploy-1"));
         assert!(
@@ -583,7 +785,7 @@ mod tests {
 
     #[test]
     fn rollback_deploy_returns_error_for_unprojected_context() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.rollback_deploy("no-such-ctx", "deploy-1"));
         assert!(
@@ -595,11 +797,70 @@ mod tests {
 
     #[test]
     fn disable_site_projection_is_noop_for_unprojected_context() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.
         inner.shutdown();
+    }
+
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn node_in_memory_with_identity_uses_provided_did() {
+        use crate::bridge::identity_create;
+
+        let identity = rt()
+            .block_on(identity_create("in_memory".to_owned()))
+            .unwrap();
+        let expected_did = identity.did();
+
+        let node = rt().block_on(node_start_in_memory(Some(identity))).unwrap();
+
+        assert_eq!(
+            node.did(),
+            expected_did,
+            "node should use the pre-existing identity's DID"
+        );
+        assert!(node.relay_port() > 0);
+        let url = node.relay_url();
+        assert!(
+            url.starts_with("ws://") || url.starts_with("wss://"),
+            "expected ws(s):// URL, got: {url}"
+        );
+
+        node.shutdown();
+    }
+
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn node_local_with_identity_uses_provided_did() {
+        use crate::bridge::identity_create;
+
+        let identity = rt()
+            .block_on(identity_create("in_memory".to_owned()))
+            .unwrap();
+        let expected_did = identity.did();
+
+        let tmp =
+            std::env::temp_dir().join(format!("scp-uniffi-node-id-test-{}", std::process::id()));
+        // No passphrase needed when passing a pre-existing identity.
+        let node = rt()
+            .block_on(node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                Some(identity),
+                None,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            node.did(),
+            expected_did,
+            "node should use the pre-existing identity's DID"
+        );
+        assert!(node.relay_port() > 0);
+
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

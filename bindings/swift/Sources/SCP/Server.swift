@@ -13,8 +13,8 @@ import Foundation
 // Standalone UniFFI functions:
 //   - relayStartInMemory() async throws -> RelayHandle
 //   - relayStartLocal(dataDir: String) async throws -> RelayHandle
-//   - nodeStartInMemory() async throws -> NodeHandle
-//   - nodeStartLocal(dataDir: String) async throws -> NodeHandle
+//   - nodeStartInMemory(identity: Identity?) async throws -> NodeHandle
+//   - nodeStartLocal(dataDir: String, identity: Identity?) async throws -> NodeHandle
 
 // MARK: - ServerBridge
 
@@ -31,10 +31,10 @@ public enum ServerBridge {
     public typealias RelayStartLocalFn = @Sendable (_ dataDir: String) async throws -> RelayHandle
 
     /// Start a full application node with in-memory storage.
-    public typealias NodeStartInMemoryFn = @Sendable () async throws -> NodeHandle
+    public typealias NodeStartInMemoryFn = @Sendable (_ identity: Identity?) async throws -> NodeHandle
 
     /// Start a full application node with file-backed storage.
-    public typealias NodeStartLocalFn = @Sendable (_ dataDir: String) async throws -> NodeHandle
+    public typealias NodeStartLocalFn = @Sendable (_ dataDir: String, _ identity: Identity?, _ passphrase: String?) async throws -> NodeHandle
 
     /// Start the HTTP server in the background.
     public typealias ServeFn = @Sendable (
@@ -104,14 +104,14 @@ public enum ServerBridge {
         try await relayStartLocal(dataDir: dataDir)
     }
 
-    /// Default node in-memory startup -- delegates to UniFFI ``nodeStartInMemory()``.
-    public static let defaultNodeStartInMemory: NodeStartInMemoryFn = {
-        try await nodeStartInMemory()
+    /// Default node in-memory startup -- delegates to UniFFI ``nodeStartInMemory(identity:)``.
+    public static let defaultNodeStartInMemory: NodeStartInMemoryFn = { identity in
+        try await nodeStartInMemory(identity: identity)
     }
 
-    /// Default node local startup -- delegates to UniFFI ``nodeStartLocal(dataDir:)``.
-    public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir in
-        try await nodeStartLocal(dataDir: dataDir)
+    /// Default node local startup -- delegates to UniFFI ``nodeStartLocal(dataDir:identity:passphrase:)``.
+    public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir, identity, passphrase in
+        try await nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
     }
 
     /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.
@@ -251,34 +251,55 @@ public struct Node: Sendable {
 
     /// Starts a full application node with in-memory storage.
     ///
+    /// When `identity` is provided, the node uses the pre-existing identity
+    /// instead of generating a fresh one. This enables identity portability --
+    /// the same DID persists across node restarts.
+    ///
     /// Auto-wires in-memory key custody, in-memory storage, in-memory DHT
     /// client, self-signed TLS, and a relay on an OS-assigned port.
     ///
-    /// - Parameter startFn: Bridge function override for testing.
+    /// - Parameters:
+    ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
+    ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startInMemory(
+        identity: Identity? = nil,
         startFn: ServerBridge.NodeStartInMemoryFn = ServerBridge.defaultNodeStartInMemory
     ) async throws -> Node {
-        let handle = try await startFn()
+        let handle = try await startFn(identity)
         return Node(handle: handle)
     }
 
     /// Starts a full application node with file-backed storage.
+    ///
+    /// When `identity` is provided, the node uses the pre-existing identity.
+    /// When `nil`, the node creates or reloads a persistent identity via
+    /// `FileKeyCustody`. The passphrase for key derivation is resolved as:
+    /// 1. The explicit `passphrase` parameter, if provided.
+    /// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+    /// 3. Returns an error if neither is available.
+    ///
+    /// No passphrase is required when `identity` is provided.
     ///
     /// Opens (or creates) persistent storage at `<dataDir>/storage/` and a
     /// redb blob database at `<dataDir>/blobs.redb`.
     ///
     /// - Parameters:
     ///   - dataDir: Directory for persistent storage.
+    ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
+    ///   - passphrase: Passphrase for Argon2id key derivation. Falls back to
+    ///     `SCP_KEY_PASSPHRASE` env var when `nil`.
     ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startLocal(
         dataDir: String,
+        identity: Identity? = nil,
+        passphrase: String? = nil,
         startFn: ServerBridge.NodeStartLocalFn = ServerBridge.defaultNodeStartLocal
     ) async throws -> Node {
-        let handle = try await startFn(dataDir)
+        let handle = try await startFn(dataDir, identity, passphrase)
         return Node(handle: handle)
     }
 
@@ -327,11 +348,15 @@ public struct Node: Sendable {
 
     /// Activates HTTP broadcast projection for a context.
     ///
-    /// Registers a broadcast context for HTTP content delivery.
+    /// Three resolution modes:
+    /// 1. Both `broadcastKeyHex` **and** `authorDid` provided -- uses the
+    ///    explicit key with epoch 0.
+    /// 2. Only `authorDid` provided -- auto-resolves the broadcast key
+    ///    using that DID (useful when the author identity differs from the
+    ///    node identity).
+    /// 3. Neither provided -- auto-resolves using the node's identity DID.
     ///
-    /// When `broadcastKeyHex` and `authorDid` are `nil`, the key is
-    /// auto-resolved from the `ContextManager` using the node's identity
-    /// DID. This is the recommended usage for locally managed contexts.
+    /// Providing `broadcastKeyHex` without `authorDid` is an error.
     ///
     /// - Parameters:
     ///   - contextId: The context ID to project.
@@ -350,9 +375,9 @@ public struct Node: Sendable {
         enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
     ) async throws {
         try validateAdmission(admission)
-        guard (broadcastKeyHex == nil) == (authorDid == nil) else {
+        if broadcastKeyHex != nil, authorDid == nil {
             throw ScpError.Validation(
-                msg: "broadcastKeyHex and authorDid must both be provided or both be omitted",
+                msg: "broadcastKeyHex requires authorDid -- provide the DID of the broadcast key owner, or omit both for auto-resolve",
                 code: "SCP-TRANS-5060"
             )
         }

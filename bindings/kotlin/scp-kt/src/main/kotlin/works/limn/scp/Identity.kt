@@ -10,6 +10,7 @@
 
 package works.limn.scp
 
+import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
 /**
@@ -253,5 +254,181 @@ class IdentityAdvancedBridge internal constructor(
     ): String =
         bridge.ffiCall {
             bindings.identityExecuteCustodyMigration(did, target, contextIds)
+        }
+}
+
+// ---------------------------------------------------------------------------
+// Identity Link Attestation (§3.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * An identity link attestation binding a DID to an external platform (§3.5).
+ *
+ * Represents a cryptographically signed claim that the DID owner also
+ * controls an identity on an external platform (e.g., GitHub, X, LinkedIn).
+ *
+ * The [id] is deterministically derived as
+ * `hex(SHA-256(issuer || platform || handle || issued_at))`.
+ *
+ * Provenance: §3.5 (Identity Link Attestations)
+ *
+ * @property id Deterministic attestation ID.
+ * @property platform Platform identifier (e.g., `"github.com"`).
+ * @property platformHandle Platform handle or username.
+ * @property verificationMethod DID verification method that signed this attestation.
+ * @property verifiedAt Unix timestamp (seconds) when the evidence was last verified.
+ * @property revocationStatus Revocation status: `"active"`, `"revoked"`, or `"expired"`.
+ * @property platformId Optional platform-assigned unique identifier.
+ */
+data class IdentityAttestation(
+    val id: String,
+    val platform: String,
+    val platformHandle: String,
+    val verificationMethod: String,
+    val verifiedAt: Double,
+    val revocationStatus: String = "active",
+    val platformId: String? = null,
+)
+
+/**
+ * Native binding functions for identity link attestation operations.
+ *
+ * All methods are blocking JNA calls into Rust and must be dispatched
+ * on [kotlinx.coroutines.Dispatchers.IO].
+ *
+ * These bridge functions are not yet implemented in the FFI layer.
+ * All methods will throw [BridgeException] until the Rust bridge
+ * provides the underlying functions.
+ */
+interface IdentityAttestationBindings {
+    /**
+     * Creates an identity link attestation for an external platform.
+     *
+     * @param did The DID claiming the external identity.
+     * @param platform Platform identifier (e.g., "github.com").
+     * @param handle Platform-specific handle or username.
+     * @param proof Platform-specific proof of ownership.
+     * @param platformId Optional platform-assigned unique identifier.
+     * @return JSON string with the created attestation.
+     * @throws BridgeException if creation fails.
+     */
+    fun identityCreateAttestation(
+        did: String,
+        platform: String,
+        handle: String,
+        proof: String,
+        platformId: String?,
+    ): String
+
+    /**
+     * Lists all identity link attestations for a DID.
+     *
+     * @param did The DID to list attestations for.
+     * @return JSON array string of attestation objects.
+     * @throws BridgeException if listing fails.
+     */
+    fun identityListAttestations(did: String): String
+
+    /**
+     * Removes an identity link attestation by ID.
+     *
+     * @param did The DID that owns the attestation.
+     * @param attestationId The deterministic attestation ID to remove.
+     * @return true if the attestation was found and removed.
+     * @throws BridgeException if removal fails.
+     */
+    fun identityRemoveAttestation(
+        did: String,
+        attestationId: String,
+    ): Boolean
+
+    /**
+     * Renews an identity link attestation.
+     *
+     * @param did The DID that owns the attestation.
+     * @param attestationId The attestation ID to renew.
+     * @return JSON string with the renewed attestation.
+     * @throws BridgeException if renewal fails.
+     */
+    fun identityRenewAttestation(
+        did: String,
+        attestationId: String,
+    ): String
+}
+
+/**
+ * Identity link attestation operations bridge.
+ *
+ * Wraps attestation FFI calls for creating, listing, removing, and
+ * renewing identity link attestations (§3.5).
+ *
+ * Bridge functions are not yet available in the Rust FFI layer.
+ * All operations throw [BridgeException] with `SCP-ATTEST-*` codes
+ * until the underlying bridge functions are implemented.
+ *
+ * Provenance: §3.5 (Identity Link Attestations)
+ */
+class IdentityAttestationBridge internal constructor(
+    private val bindings: IdentityAttestationBindings,
+    private val bridge: CoroutineBridge,
+) {
+    /**
+     * Creates an identity link attestation for an external platform.
+     *
+     * @param did The DID claiming the external identity.
+     * @param platform Platform identifier.
+     * @param handle Platform-specific handle.
+     * @param proof Platform-specific proof of ownership.
+     * @param platformId Optional platform-assigned unique identifier.
+     * @return JSON string with the created attestation.
+     */
+    suspend fun createAttestation(
+        did: String,
+        platform: String,
+        handle: String,
+        proof: String,
+        platformId: String? = null,
+    ): String =
+        bridge.ffiCall {
+            bindings.identityCreateAttestation(did, platform, handle, proof, platformId)
+        }
+
+    /**
+     * Lists all identity link attestations for a DID.
+     *
+     * @param did The DID to list attestations for.
+     * @return JSON array string of attestation objects.
+     */
+    suspend fun listAttestations(did: String): String =
+        bridge.ffiCall { bindings.identityListAttestations(did) }
+
+    /**
+     * Removes an identity link attestation by ID.
+     *
+     * @param did The DID that owns the attestation.
+     * @param attestationId The deterministic attestation ID to remove.
+     * @return true if the attestation was found and removed.
+     */
+    suspend fun removeAttestation(
+        did: String,
+        attestationId: String,
+    ): Boolean =
+        bridge.ffiCall {
+            bindings.identityRemoveAttestation(did, attestationId)
+        }
+
+    /**
+     * Renews an identity link attestation.
+     *
+     * @param did The DID that owns the attestation.
+     * @param attestationId The attestation ID to renew.
+     * @return JSON string with the renewed attestation.
+     */
+    suspend fun renewAttestation(
+        did: String,
+        attestationId: String,
+    ): String =
+        bridge.ffiCall {
+            bindings.identityRenewAttestation(did, attestationId)
         }
 }

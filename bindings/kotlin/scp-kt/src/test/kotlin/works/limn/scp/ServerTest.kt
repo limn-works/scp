@@ -202,8 +202,12 @@ internal class StubServerBindings : ServerBindings {
 
     override fun relayStartInMemory(): String = relayStartInMemoryResult
     override fun relayStartLocal(dataDir: String): String = relayStartInMemoryResult
-    override fun nodeStartInMemory(): String = nodeStartInMemoryResult
-    override fun nodeStartLocal(dataDir: String): String = nodeStartInMemoryResult
+    override fun nodeStartInMemory(identityDid: String?): String = nodeStartInMemoryResult
+    override fun nodeStartLocal(
+        dataDir: String,
+        identityDid: String?,
+        passphrase: String?,
+    ): String = nodeStartInMemoryResult
     override fun relayShutdown(handleJson: String) { /* no-op stub */ }
     override fun nodeShutdown(handleJson: String) { /* no-op stub */ }
 
