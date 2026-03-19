@@ -13,10 +13,15 @@
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, RunningNode, RunningRelay, ServerError};
+use scp_ffi_common::server::{
+    self, ConcreteDidMethod, NodeIdentity, RunningNode, RunningRelay, ServerError,
+};
+use scp_identity::{DidCache, InMemoryDhtClient};
 use scp_node::NodeError;
 
 // ---------------------------------------------------------------------------
@@ -144,10 +149,12 @@ impl PyNodeHandle {
     ///
     /// Registers a broadcast context for HTTP content delivery.
     ///
-    /// When ``broadcast_key_hex`` and ``author_did`` are ``None``, the key
-    /// is auto-resolved from the ``ContextManager`` using the node's
-    /// identity DID. This is the recommended usage for locally managed
-    /// contexts.
+    /// When ``broadcast_key_hex`` is ``None``, the key is auto-resolved from
+    /// the ``ContextManager``. If ``author_did`` is also ``None``, the node's
+    /// own DID is used for the lookup. If ``author_did`` is provided without
+    /// ``broadcast_key_hex``, the provided DID is used for auto-resolve.
+    ///
+    /// ``broadcast_key_hex`` without ``author_did`` raises ``ValueError``.
     ///
     /// ``admission`` is ``"open"`` or ``"gated"``.
     ///
@@ -201,16 +208,17 @@ impl PyNodeHandle {
                 // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
                 (key_bytes, 0u64, did)
             }
-            (None, None) => {
-                // Auto-resolve from ContextManager using node's identity DID.
-                let node_did = self.inner.did().to_owned();
+            (None, author_opt) => {
+                // Auto-resolve from ContextManager. Use provided author_did
+                // or fall back to node's identity DID.
+                let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
                 let mgr = crate::runtime::context_manager().map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "broadcast key auto-lookup failed: {e}"
                     ))
                 })?;
                 let (key_bytes, epoch) = py.allow_threads(|| {
-                        rt.block_on(mgr.get_broadcast_key_for_local_author(&context_id, &node_did))
+                        rt.block_on(mgr.get_broadcast_key_for_local_author(&context_id, &did))
                             .map_err(|e| {
                                 tracing::debug!(error = %e, "broadcast key auto-resolve failed");
                                 pyo3::exceptions::PyRuntimeError::new_err(
@@ -218,11 +226,11 @@ impl PyNodeHandle {
                                 )
                             })
                     })?;
-                (key_bytes, epoch, node_did)
+                (key_bytes, epoch, did)
             }
-            _ => {
+            (Some(_), None) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "broadcast_key_hex and author_did must both be provided or both be None",
+                    "broadcast_key_hex requires author_did",
                 ));
             }
         };
@@ -383,6 +391,38 @@ impl Drop for PyNodeHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Identity portability helper
+// ---------------------------------------------------------------------------
+
+/// Constructs a [`NodeIdentity`] from the global identity registry.
+///
+/// Looks up the given DID in the `PyO3` bridge identity registry (populated by
+/// `py_identity_create`) and builds a `NodeIdentity` with a configured DID
+/// method instance that can sign on behalf of the identity's custody provider.
+///
+/// # Errors
+///
+/// Returns `PyErr` if the DID is not found in the identity registry.
+fn build_node_identity(did: &str) -> PyResult<NodeIdentity> {
+    crate::runtime::with_identity(did, |entry| {
+        let custody = Arc::clone(&entry.custody);
+        let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ));
+
+        Ok(NodeIdentity {
+            identity: entry.identity.clone(),
+            document: entry.document.clone(),
+            did_method,
+        })
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Free functions -- relay startup
 // ---------------------------------------------------------------------------
 
@@ -421,14 +461,31 @@ pub fn py_relay_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyRela
 
 /// Starts a full application node with in-memory storage.
 ///
-/// Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
-/// self-signed TLS, and a relay on an OS-assigned port.
+/// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
+/// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
+/// relay on an OS-assigned port with a fresh DID.
+///
+/// When ``identity_did`` is provided, the node uses the pre-existing identity
+/// from the `PyO3` identity registry (populated by ``py_identity_create``).
+/// This enables identity portability — the same DID persists across node
+/// restarts.
 #[pyfunction]
-pub fn py_node_start_in_memory(py: Python<'_>) -> PyResult<PyNodeHandle> {
+#[pyo3(signature = (identity_did=None))]
+pub fn py_node_start_in_memory(
+    py: Python<'_>,
+    identity_did: Option<String>,
+) -> PyResult<PyNodeHandle> {
     let rt = crate::runtime()?;
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            crate::validate::validate_did(did)?;
+            Some(build_node_identity(did)?)
+        }
+        None => None,
+    };
     py.allow_threads(|| {
         let node = rt
-            .block_on(server::start_node_in_memory(None))
+            .block_on(server::start_node_in_memory(node_identity))
             .map_err(server_err)?;
         Ok(PyNodeHandle {
             inner: RunningNode::InMemory(node),
@@ -440,14 +497,34 @@ pub fn py_node_start_in_memory(py: Python<'_>) -> PyResult<PyNodeHandle> {
 ///
 /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
 /// blob database at ``<data_dir>/blobs.redb``.
+///
+/// When ``identity_did`` is ``None`` (the default), the node creates or
+/// reloads a persistent identity from ``<data_dir>/identity.key`` using
+/// ``SCP_KEY_PASSPHRASE`` from the environment.
+///
+/// When ``identity_did`` is provided, the node uses the pre-existing identity
+/// from the `PyO3` identity registry (populated by ``py_identity_create``).
+/// No ``SCP_KEY_PASSPHRASE`` is required in this mode.
 #[pyfunction]
-pub fn py_node_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyNodeHandle> {
+#[pyo3(signature = (data_dir, identity_did=None))]
+pub fn py_node_start_local(
+    py: Python<'_>,
+    data_dir: String,
+    identity_did: Option<String>,
+) -> PyResult<PyNodeHandle> {
     let rt = crate::runtime()?;
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            crate::validate::validate_did(did)?;
+            Some(build_node_identity(did)?)
+        }
+        None => None,
+    };
     py.allow_threads(|| {
         let node = rt
             .block_on(server::start_node_local(
                 std::path::Path::new(&data_dir),
-                None,
+                node_identity,
             ))
             .map_err(server_err)?;
         Ok(PyNodeHandle {

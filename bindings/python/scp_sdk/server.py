@@ -43,6 +43,7 @@ from scp_sdk.context import validate_admission, validate_broadcast_key_hex
 
 if TYPE_CHECKING:
     from scp_sdk.context import SiteConfig
+    from scp_sdk.identity import Identity
 
 
 class Relay:
@@ -160,17 +161,25 @@ class Node:
         return self._handle.is_shutdown  # type: ignore[no-any-return]
 
     @staticmethod
-    async def start_in_memory() -> Node:
+    async def start_in_memory(identity: Identity | None = None) -> Node:
         """Start a full application node with in-memory storage.
 
         Auto-wires in-memory key custody, in-memory storage, in-memory DHT
         client, self-signed TLS, and a relay on an OS-assigned port.
+
+        Args:
+            identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
+                to use.  If provided, the node uses this identity instead of
+                generating a fresh DID.  The identity must have been created
+                via :meth:`~scp_sdk.identity.Identity.create` in the same
+                process (it must exist in the bridge identity registry).
         """
-        handle = await asyncio.to_thread(_scp_core.py_node_start_in_memory)
+        did = identity.did if identity is not None else None
+        handle = await asyncio.to_thread(_scp_core.py_node_start_in_memory, did)
         return Node(handle)
 
     @staticmethod
-    async def start_local(data_dir: str) -> Node:
+    async def start_local(data_dir: str, identity: Identity | None = None) -> Node:
         """Start a full application node with file-backed storage.
 
         Opens (or creates) persistent storage at ``<data_dir>/storage/``
@@ -178,8 +187,12 @@ class Node:
 
         Args:
             data_dir: Directory for persistent storage.
+            identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
+                to use.  If provided, the node uses this identity instead of
+                generating one from ``SCP_KEY_PASSPHRASE``.
         """
-        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir)
+        did = identity.did if identity is not None else None
+        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did)
         return Node(handle)
 
     async def serve(self, bind_addr: str | None = None) -> str:
@@ -250,16 +263,14 @@ class Node:
                 for auto-lookup.
 
         Raises:
-            ValueError: If parameters are invalid or only one of
-                ``broadcast_key_hex``/``author_did`` is provided.
+            ValueError: If parameters are invalid or ``broadcast_key_hex``
+                is provided without ``author_did``.
             RuntimeError: If the underlying node operation fails or
                 auto-lookup cannot find the key.
         """
         validate_admission(admission)
-        if (broadcast_key_hex is None) != (author_did is None):
-            raise ValueError(
-                "broadcast_key_hex and author_did must both be provided or both be omitted"
-            )
+        if broadcast_key_hex is not None and author_did is None:
+            raise ValueError("broadcast_key_hex requires author_did")
         if broadcast_key_hex is not None:
             validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(

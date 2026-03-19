@@ -1948,3 +1948,129 @@ def address_resolve(
             is malformed.
     """
     ...
+
+# ---------------------------------------------------------------------------
+# Server bridge functions and classes (crates/scp-ffi/src/server.rs)
+# ---------------------------------------------------------------------------
+
+class RelayHandle:
+    """Opaque handle to a running SCP relay server."""
+
+    @property
+    def relay_url(self) -> str:
+        """The WebSocket URL clients should connect to."""
+        ...
+
+    @property
+    def relay_port(self) -> int:
+        """The port the relay is listening on."""
+        ...
+
+    @property
+    def is_shutdown(self) -> bool:
+        """``True`` if shutdown has been signaled."""
+        ...
+
+    def shutdown(self) -> None:
+        """Signal the relay to stop accepting new connections."""
+        ...
+
+class NodeHandle:
+    """Opaque handle to a running SCP application node."""
+
+    @property
+    def relay_url(self) -> str:
+        """The WebSocket URL for this node's relay."""
+        ...
+
+    @property
+    def relay_port(self) -> int:
+        """The port the node's relay is listening on."""
+        ...
+
+    @property
+    def did(self) -> str:
+        """The node's DID string."""
+        ...
+
+    @property
+    def is_shutdown(self) -> bool:
+        """``True`` if shutdown has been signaled."""
+        ...
+
+    def shutdown(self) -> None:
+        """Signal the node to stop."""
+        ...
+
+    def enable_site_projection(
+        self,
+        context_id: str,
+        admission: str,
+        hostname: str,
+        broadcast_key_hex: str | None = None,
+        author_did: str | None = None,
+        index_path: str | None = None,
+        max_assets_per_deploy: int | None = None,
+        max_deploy_size_bytes: int | None = None,
+        deploy_retention_count: int | None = None,
+        csp_override: str | None = None,
+    ) -> None:
+        """Activate HTTP broadcast projection with site configuration."""
+        ...
+
+    def commit_deploy(self, context_id: str, deploy_id: str) -> int:
+        """Commit a deploy for a projected context."""
+        ...
+
+    def rollback_deploy(self, context_id: str, deploy_id: str) -> None:
+        """Roll back to a previous deploy."""
+        ...
+
+    def disable_site_projection(self, context_id: str) -> None:
+        """Deactivate HTTP broadcast projection."""
+        ...
+
+    def serve(self, bind_addr: str | None = None) -> str:
+        """Start the HTTP server in the background."""
+        ...
+
+    def http_url(self) -> str | None:
+        """Return the HTTP URL of the background server, or ``None``."""
+        ...
+
+def py_relay_start_in_memory() -> RelayHandle:
+    """Start a relay with in-memory blob storage."""
+    ...
+
+def py_relay_start_local(data_dir: str) -> RelayHandle:
+    """Start a relay with redb-backed blob storage."""
+    ...
+
+def py_node_start_in_memory(identity_did: str | None = None) -> NodeHandle:
+    """Start a full application node with in-memory storage.
+
+    Args:
+        identity_did: Optional DID of a pre-existing identity from the
+            bridge identity registry.  If ``None``, a fresh DID is generated.
+    """
+    ...
+
+def py_node_start_local(data_dir: str, identity_did: str | None = None) -> NodeHandle:
+    """Start a full application node with file-backed storage.
+
+    Args:
+        data_dir: Directory for persistent storage.
+        identity_did: Optional DID of a pre-existing identity.  If ``None``,
+            the node creates or reloads a persistent identity using
+            ``SCP_KEY_PASSPHRASE``.
+    """
+    ...
+
+def configure_relay_transport(relay_url: str, local_did: str) -> None:
+    """Pre-configure the ContextManager with RelayTransportProvider.
+
+    Args:
+        relay_url: The URL of the relay to connect to.
+        local_did: The DID for MLS credential identity.
+    """
+    ...
