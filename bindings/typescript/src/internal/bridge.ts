@@ -467,7 +467,7 @@ export interface Bridge {
     policyJson: string | null,
     spendingJson: string | null,
     trustedDidsJson: string | null,
-  ): { decision: string } | Promise<{ decision: string }>;
+  ): string | { decision: string } | Promise<string | { decision: string }>;
 
   // MetadataRecord inspection (§5.7.2, #615)
   metadataRecordToJson(

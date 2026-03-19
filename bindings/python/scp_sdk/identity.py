@@ -506,7 +506,7 @@ class Identity:
         if not hasattr(_scp_core, "py_identity_create_attestation"):
             raise IdentityError(
                 "Identity link attestation creation is not yet available in the bridge",
-                "SCP-ATTEST-9001",
+                "SCP-ATTEST-9010",
             )
         result_json = await asyncio.to_thread(
             _scp_core.py_identity_create_attestation,
@@ -564,7 +564,7 @@ class Identity:
         if not hasattr(_scp_core, "py_identity_list_attestations"):
             raise IdentityError(
                 "Identity link attestation listing is not yet available in the bridge",
-                "SCP-ATTEST-9002",
+                "SCP-ATTEST-9011",
             )
         import json
 
@@ -598,7 +598,7 @@ class Identity:
         if not hasattr(_scp_core, "py_identity_remove_attestation"):
             raise IdentityError(
                 "Identity link attestation removal is not yet available in the bridge",
-                "SCP-ATTEST-9003",
+                "SCP-ATTEST-9012",
             )
         return await asyncio.to_thread(
             _scp_core.py_identity_remove_attestation,
@@ -632,7 +632,7 @@ class Identity:
         if not hasattr(_scp_core, "py_identity_renew_attestation"):
             raise IdentityError(
                 "Identity link attestation renewal is not yet available in the bridge",
-                "SCP-ATTEST-9004",
+                "SCP-ATTEST-9013",
             )
         import json
 
@@ -651,6 +651,34 @@ class Identity:
 
     def __str__(self) -> str:
         return self.did
+
+
+# ---------------------------------------------------------------------------
+# RevocationStatus
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RevocationStatus:
+    """Revocation status for an identity attestation (§3.5).
+
+    Mirrors the Rust ``RevocationStatus`` enum:
+
+    - ``Active`` -> ``RevocationStatus(status="active")``
+    - ``Revoked { revoked_at, reason }`` ->
+      ``RevocationStatus(status="revoked", revoked_at=..., reason=...)``
+    """
+
+    #: Status string: ``"active"`` or ``"revoked"``.
+    status: str
+
+    #: Unix timestamp (seconds) when the attestation was revoked.
+    #: Only present when ``status == "revoked"``.
+    revoked_at: int | None = None
+
+    #: Optional human-readable revocation reason.
+    #: Only present when ``status == "revoked"``.
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -685,8 +713,10 @@ class IdentityAttestation:
     #: Unix timestamp (seconds) when the evidence was last verified.
     verified_at: float
 
-    #: Revocation status: ``"active"``, ``"revoked"``, or ``"expired"``.
-    revocation_status: str = "active"
+    #: Revocation status (``"active"`` or ``"revoked"`` with metadata).
+    revocation_status: RevocationStatus = field(
+        default_factory=lambda: RevocationStatus(status="active")
+    )
 
     #: Optional platform-assigned unique identifier.
     platform_id: str | None = None
@@ -714,7 +744,7 @@ class IdentityAttestation:
         if not hasattr(_scp_core, "trust_verify_attestation"):
             raise IdentityError(
                 "Identity attestation verification is not yet available in the bridge",
-                "SCP-ATTEST-9005",
+                "SCP-ATTEST-9014",
             )
         import json
 
@@ -727,13 +757,23 @@ class IdentityAttestation:
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict for bridge serialization."""
+        rs = self.revocation_status
+        if rs.status == "revoked":
+            rs_value: dict[str, Any] = {"Revoked": {}}
+            if rs.revoked_at is not None:
+                rs_value["Revoked"]["revoked_at"] = rs.revoked_at
+            if rs.reason is not None:
+                rs_value["Revoked"]["reason"] = rs.reason
+        else:
+            rs_value = "Active"  # type: ignore[assignment]
+
         d: dict[str, Any] = {
             "id": self.id,
             "platform": self.platform,
             "platform_handle": self.platform_handle,
             "verification_method": self.verification_method,
             "verified_at": self.verified_at,
-            "revocation_status": self.revocation_status,
+            "revocation_status": rs_value,
         }
         if self.platform_id is not None:
             d["platform_id"] = self.platform_id
@@ -742,20 +782,35 @@ class IdentityAttestation:
     @classmethod
     def _from_dict(cls, data: dict[str, Any]) -> IdentityAttestation:
         """Construct from a dict returned by the bridge."""
+        raw_rs = data.get("revocation_status", "active")
+        if isinstance(raw_rs, dict) and "Revoked" in raw_rs:
+            revoked_data = raw_rs["Revoked"]
+            rs = RevocationStatus(
+                status="revoked",
+                revoked_at=revoked_data.get("revoked_at"),
+                reason=revoked_data.get("reason"),
+            )
+        elif isinstance(raw_rs, str) and raw_rs.lower() == "active":
+            rs = RevocationStatus(status="active")
+        elif isinstance(raw_rs, str) and raw_rs.lower() == "revoked":
+            rs = RevocationStatus(status="revoked")
+        else:
+            rs = RevocationStatus(status=str(raw_rs))
+
         return cls(
             id=data["id"],
             platform=data["platform"],
             platform_handle=data["platform_handle"],
             verification_method=data["verification_method"],
             verified_at=data["verified_at"],
-            revocation_status=data.get("revocation_status", "active"),
+            revocation_status=rs,
             platform_id=data.get("platform_id"),
         )
 
     def __repr__(self) -> str:
         return (
             f"IdentityAttestation(id={self.id!r}, platform={self.platform!r}, "
-            f"handle={self.platform_handle!r}, status={self.revocation_status!r})"
+            f"handle={self.platform_handle!r}, status={self.revocation_status.status!r})"
         )
 
 
@@ -763,4 +818,5 @@ __all__ = [
     "DIDDocument",
     "Identity",
     "IdentityAttestation",
+    "RevocationStatus",
 ]

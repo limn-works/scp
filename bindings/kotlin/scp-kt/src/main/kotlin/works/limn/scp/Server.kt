@@ -211,8 +211,11 @@ class Relay internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        bridge.shutdownRelay(this)
-        isShutdown = true
+        try {
+            bridge.shutdownRelay(this)
+        } finally {
+            isShutdown = true
+        }
     }
 
     /**
@@ -289,8 +292,11 @@ class Node internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        bridge.shutdownNode(this)
-        isShutdown = true
+        try {
+            bridge.shutdownNode(this)
+        } finally {
+            isShutdown = true
+        }
     }
 
     /**
