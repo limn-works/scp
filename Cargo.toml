@@ -57,7 +57,7 @@ bs58 = "0.5"
 jsonschema = { version = "0.28", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 tracing = "0.1"
-lru = "0.12"
+lru = "0.16"
 dashmap = "6"
 hex = "0.4"
 axum = "0.8"
