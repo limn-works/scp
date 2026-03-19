@@ -257,11 +257,16 @@ class Node:
     ) -> None:
         """Activate HTTP broadcast projection for a context.
 
-        When both ``broadcast_key_hex`` and ``author_did`` are ``None``, the
-        key is auto-resolved using the node's identity DID. When only
-        ``author_did`` is provided, auto-resolves using that DID (useful
-        when the author identity differs from the node identity).
-        Providing ``broadcast_key_hex`` requires ``author_did``.
+        Three resolution modes:
+
+        1. Both ``broadcast_key_hex`` **and** ``author_did`` provided — uses
+           the explicit key with epoch 0.
+        2. Only ``author_did`` provided — auto-resolves the broadcast key
+           using that DID (useful when the author identity differs from
+           the node identity).
+        3. Neither provided — auto-resolves using the node's identity DID.
+
+        Providing ``broadcast_key_hex`` without ``author_did`` is an error.
 
         Args:
             context_id: The context ID to project.

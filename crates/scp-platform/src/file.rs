@@ -236,8 +236,16 @@ impl FileKeyCustody {
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(path, &data).map_err(|e| {
-                PlatformError::CustodyError(format!("failed to create key file: {e}"))
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| {
+                    PlatformError::CustodyError(format!("failed to create key file: {e}"))
+                })?;
+            file.write_all(&data).map_err(|e| {
+                PlatformError::CustodyError(format!("failed to write key file: {e}"))
             })?;
         }
 
@@ -374,9 +382,10 @@ impl FileKeyCustody {
         let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
-        let plaintext = cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
-            PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
-        })?;
+        let plaintext =
+            Zeroizing::new(cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
+                PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
+            })?);
 
         let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
         if plaintext.len() != KEY_LEN {

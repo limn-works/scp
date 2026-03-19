@@ -2015,7 +2015,16 @@ class NodeHandle:
         deploy_retention_count: int | None = None,
         csp_override: str | None = None,
     ) -> None:
-        """Activate HTTP broadcast projection with site configuration."""
+        """Activate HTTP broadcast projection with site configuration.
+
+        Three resolution modes:
+
+        1. Both ``broadcast_key_hex`` and ``author_did`` provided — uses
+           the explicit key with epoch 0.
+        2. Only ``author_did`` provided — auto-resolves the broadcast key
+           using that DID.
+        3. Neither provided — auto-resolves using the node's identity DID.
+        """
         ...
 
     def commit_deploy(self, context_id: str, deploy_id: str) -> int:

@@ -245,7 +245,18 @@ pub async fn start_relay_in_memory() -> Result<RunningRelay, ServerError> {
 /// [`ServerError::Relay`] if the relay cannot bind.
 pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerError> {
     validate_data_dir(data_dir)?;
-    std::fs::create_dir_all(data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(data_dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(data_dir)?;
+    }
     let db_path = data_dir.join("blobs.redb");
     let storage = BlobStorageBackend::redb(&db_path)?;
     start_relay_with(test_relay_config(), storage).await
@@ -352,11 +363,17 @@ pub async fn start_node_local(
 
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
-    std::fs::create_dir_all(data_dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(data_dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(data_dir)?;
     }
 
     // Common paths.

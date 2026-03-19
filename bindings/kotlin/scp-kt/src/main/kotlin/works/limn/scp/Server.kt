@@ -598,6 +598,14 @@ class ServerBridge internal constructor(
     /**
      * Activates HTTP broadcast projection for a context.
      *
+     * Three resolution modes:
+     * 1. Both [broadcastKeyHex] **and** [authorDid] provided -- uses the
+     *    explicit key with epoch 0.
+     * 2. Only [authorDid] provided -- auto-resolves the broadcast key
+     *    using that DID (useful when the author identity differs from the
+     *    node identity).
+     * 3. Neither provided -- auto-resolves using the node's identity DID.
+     *
      * @param node The running node.
      * @param contextId The context ID to project.
      * @param broadcastKeyHex 32-byte AES-256 broadcast key as 64-char hex string, or null for auto-lookup.
