@@ -2024,6 +2024,8 @@ class NodeHandle:
         2. Only ``author_did`` provided — auto-resolves the broadcast key
            using that DID.
         3. Neither provided — auto-resolves using the node's identity DID.
+
+        Providing ``broadcast_key_hex`` without ``author_did`` is an error.
         """
         ...
 
