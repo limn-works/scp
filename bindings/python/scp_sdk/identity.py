@@ -535,7 +535,18 @@ class Identity:
         Raises:
             scp_sdk.IdentityError: If the bridge function is not
                 available.
+            RuntimeError: If called from an async context (use
+                ``await identity.list_attestations()`` instead).
         """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # no running loop — safe
+        else:
+            raise RuntimeError(
+                "Identity.attestations cannot be used from an async context. "
+                "Use 'await identity.list_attestations()' instead."
+            )
         return run_sync(self.list_attestations())
 
     async def list_attestations(self) -> list[IdentityAttestation]:
@@ -700,7 +711,7 @@ class IdentityAttestation:
         """
         import _scp_core
 
-        if not hasattr(_scp_core, "py_identity_verify_attestation"):
+        if not hasattr(_scp_core, "trust_verify_attestation"):
             raise IdentityError(
                 "Identity attestation verification is not yet available in the bridge",
                 "SCP-ATTEST-9005",
@@ -709,7 +720,7 @@ class IdentityAttestation:
 
         attestation_json = json.dumps(self._to_bridge_dict())
         result = await asyncio.to_thread(
-            _scp_core.py_identity_verify_attestation,
+            _scp_core.trust_verify_attestation,
             attestation_json,
         )
         return bool(result.get("valid", False)) if isinstance(result, dict) else False

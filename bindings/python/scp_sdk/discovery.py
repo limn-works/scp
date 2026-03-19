@@ -47,7 +47,12 @@ def parse_address(address: str) -> dict[str, Any]:
         ValidationError: If the address is malformed.
     """
     bridge = _bridge()
-    return dict(bridge.discovery_parse_address(address))
+    result = bridge.discovery_parse_address(address)
+    if isinstance(result, str):
+        import json
+
+        return json.loads(result)
+    return dict(result)
 
 
 def create_query(
@@ -106,7 +111,12 @@ def discover(query: str) -> list[dict[str, Any]]:
             ``scp://`` URI.
     """
     bridge = _bridge()
-    return [dict(r) for r in bridge.context_discover(query)]
+    raw = bridge.context_discover(query)
+    if isinstance(raw, str):
+        import json
+
+        return json.loads(raw)
+    return [dict(r) for r in raw]
 
 
 # ---------------------------------------------------------------------------

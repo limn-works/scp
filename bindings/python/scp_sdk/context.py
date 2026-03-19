@@ -22,7 +22,6 @@ import json
 import logging
 import re
 import unicodedata
-from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -506,10 +505,10 @@ class _ReceiveIterator(AsyncIterator[Message]):
     configurable via :meth:`Context.create` or :meth:`Context.configure`.
     """
 
-    def __init__(self, bridge_receiver: Any, buffer_size: int) -> None:
+    def __init__(self, bridge_receiver: Any) -> None:
         self._receiver = bridge_receiver
-        self._buffer: deque[Message] = deque(maxlen=buffer_size)
-        self._buffer_size = buffer_size
+        # Buffering is handled at the Rust bridge level (bounded channel
+        # with oldest-drop overflow).  No Python-side buffer needed.
         self._closed = False
 
     def __aiter__(self) -> _ReceiveIterator:
@@ -518,10 +517,6 @@ class _ReceiveIterator(AsyncIterator[Message]):
     async def __anext__(self) -> Message:
         if self._closed:
             raise StopAsyncIteration
-
-        # Return buffered messages first.
-        if self._buffer:
-            return self._buffer.popleft()
 
         # Await the bridge receiver's __anext__, which returns an
         # asyncio.Future that resolves when a message arrives on the
@@ -538,6 +533,7 @@ class _ReceiveIterator(AsyncIterator[Message]):
             sender_did=raw.sender_did,
             content=raw.payload,
             timestamp=raw.timestamp,
+            # sequence not available from bridge; hardcoded to 0 until event log integration
             sequence=0,
             context_id=raw.context_id,
         )
@@ -804,7 +800,7 @@ class Context:
             ) from exc
 
         bridge_receiver = await asyncio.to_thread(_scp_core.py_context_receive, self._handle)
-        return _ReceiveIterator(bridge_receiver, self._buffer_size)
+        return _ReceiveIterator(bridge_receiver)
 
     # -- Tool invocation ----------------------------------------------------
 
@@ -1410,7 +1406,9 @@ class Context:
                 try:
                     import _scp_core
 
-                    _scp_core.py_context_leave(self._handle, self._creator_did)
+                    await asyncio.to_thread(
+                        _scp_core.py_context_leave, self._handle, self._creator_did
+                    )
                 except Exception:
                     logger.debug(
                         "cleanup: failed to leave context %s",
