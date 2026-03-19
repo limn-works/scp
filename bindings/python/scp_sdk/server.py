@@ -245,12 +245,11 @@ class Node:
     ) -> None:
         """Activate HTTP broadcast projection for a context.
 
-        Registers a broadcast context for HTTP content delivery.
-
-        When ``broadcast_key_hex`` and ``author_did`` are ``None``, the
-        key is auto-resolved from the ``ContextManager`` using the
-        node's identity DID. This is the recommended usage for locally
-        managed contexts.
+        When both ``broadcast_key_hex`` and ``author_did`` are ``None``, the
+        key is auto-resolved using the node's identity DID. When only
+        ``author_did`` is provided, auto-resolves using that DID (useful
+        when the author identity differs from the node identity).
+        Providing ``broadcast_key_hex`` requires ``author_did``.
 
         Args:
             context_id: The context ID to project.
@@ -260,7 +259,7 @@ class Node:
             broadcast_key_hex: 32-byte AES-256 broadcast key as a
                 64-character hex string, or ``None`` for auto-lookup.
             author_did: DID of the broadcast key owner, or ``None``
-                for auto-lookup.
+                for auto-lookup using the node's DID.
 
         Raises:
             ValueError: If parameters are invalid or ``broadcast_key_hex``

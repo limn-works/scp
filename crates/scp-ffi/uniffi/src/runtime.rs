@@ -170,6 +170,37 @@ pub fn init_context_manager() {
     let _ = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
 }
 
+/// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`]
+/// and `NotConfiguredTransportProvider`.
+///
+/// Unlike [`init_context_manager`] (which uses `FfiBridgeCrypto` no-op),
+/// this variant initializes real MLS crypto backed by the given DID. Used
+/// by `auto_wire_context_manager`'s fallback path when relay connection
+/// fails — the `ContextManager` exists with real crypto but no transport,
+/// matching the `PyO3` and NAPI bridge behavior.
+///
+/// Subsequent calls are no-ops (`OnceLock`).
+pub fn init_context_manager_with_did(local_did: &str) {
+    if CONTEXT_MANAGER.get().is_some() {
+        tracing::warn!(
+            requested_did = %local_did,
+            "init_context_manager already initialized — ignoring DID-parameterized init"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let event_log = build_event_log_provider();
+        Arc::new(ContextManager::new(
+            crypto,
+            Box::new(scp_core::context::NotConfiguredTransportProvider),
+            event_log,
+            not_configured_key_resolver(),
+        ))
+    });
+}
+
 /// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
 ///
 /// Identical to [`init_context_manager`] except the transport provider is a

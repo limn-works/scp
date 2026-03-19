@@ -327,11 +327,15 @@ class Node internal constructor(
     /**
      * Activates HTTP broadcast projection for a context.
      *
-     * Registers a broadcast context for HTTP content delivery.
+     * Three resolution modes:
+     * 1. Both [broadcastKeyHex] **and** [authorDid] provided -- uses the
+     *    explicit key with epoch 0.
+     * 2. Only [authorDid] provided -- auto-resolves the broadcast key
+     *    using that DID (useful when the author identity differs from the
+     *    node identity).
+     * 3. Neither provided -- auto-resolves using the node's identity DID.
      *
-     * When [broadcastKeyHex] and [authorDid] are `null`, the key is
-     * auto-resolved from the `ContextManager` using the node's identity
-     * DID. This is the recommended usage for locally managed contexts.
+     * Providing [broadcastKeyHex] without [authorDid] is an error.
      *
      * @param contextId The context ID to project.
      * @param admission "open" or "gated".

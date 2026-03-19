@@ -62,7 +62,6 @@ fn auto_wire_context_manager(
         source: RelayUrlSource::Explicit,
     };
     let did_owned = did.to_owned();
-    let relay_url_owned = relay_url.to_owned();
     match py.allow_threads(|| rt.block_on(NativeRelayAdapter::connect_sourced(&sourced))) {
         Ok(adapter) => {
             let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
@@ -76,7 +75,7 @@ fn auto_wire_context_manager(
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                relay_url = %relay_url_owned,
+                relay_url = %relay_url,
                 "auto_wire_context_manager: failed to connect to node relay — \
                  context operations may fail until transport is configured manually"
             );
@@ -202,14 +201,16 @@ impl PyNodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// Registers a broadcast context for HTTP content delivery.
+    /// Three resolution modes:
+    /// 1. Both ``broadcast_key_hex`` **and** ``author_did`` provided -- uses
+    ///    the explicit key with epoch 0.
+    /// 2. Only ``author_did`` provided -- auto-resolves the broadcast key
+    ///    using that DID (useful when the author identity differs from the
+    ///    node identity).
+    /// 3. Neither provided -- auto-resolves using the node's identity DID.
     ///
-    /// When ``broadcast_key_hex`` is ``None``, the key is auto-resolved from
-    /// the ``ContextManager``. If ``author_did`` is also ``None``, the node's
-    /// own DID is used for the lookup. If ``author_did`` is provided without
-    /// ``broadcast_key_hex``, the provided DID is used for auto-resolve.
-    ///
-    /// ``broadcast_key_hex`` without ``author_did`` raises ``ValueError``.
+    /// Providing ``broadcast_key_hex`` without ``author_did`` raises
+    /// ``ValueError``.
     ///
     /// ``admission`` is ``"open"`` or ``"gated"``.
     ///

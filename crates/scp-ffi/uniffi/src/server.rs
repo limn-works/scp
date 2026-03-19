@@ -115,9 +115,10 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str) {
                 "auto_wire_context_manager: failed to connect to node relay — \
                  context operations may fail until transport is configured manually"
             );
-            // Fall back to initializing without transport so that at least
-            // the ContextManager exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_context_manager();
+            // Fall back to initializing with MLS crypto (not FfiBridgeCrypto
+            // no-op) so that at least the ContextManager exists with real
+            // crypto for the identity's DID, matching PyO3/NAPI behavior.
+            crate::runtime::init_context_manager_with_did(did);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
@@ -228,9 +229,15 @@ impl NodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// When `broadcast_key_hex` and `author_did` are `nil`/`null`, the key
-    /// is auto-resolved from the `ContextManager` using the node's identity
-    /// DID. This is the recommended usage for locally managed contexts.
+    /// Three resolution modes:
+    /// 1. Both `broadcast_key_hex` **and** `author_did` provided — uses the
+    ///    explicit key with epoch 0.
+    /// 2. Only `author_did` provided — auto-resolves the broadcast key
+    ///    using that DID (useful when the author identity differs from the
+    ///    node identity).
+    /// 3. Neither provided — auto-resolves using the node's identity DID.
+    ///
+    /// Providing `broadcast_key_hex` without `author_did` is an error.
     ///
     /// `admission` is `"open"` or `"gated"`. `hostname` is the virtual
     /// host (RFC 1123).

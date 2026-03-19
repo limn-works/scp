@@ -249,17 +249,20 @@ export class Node implements AsyncDisposable {
    * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
    * client, self-signed TLS, and a relay on an OS-assigned port.
    *
-   * When `identityDid` is provided, the node uses the pre-existing identity
+   * When `identity` is provided, the node uses the pre-existing identity
    * (created via `identityCreate`) instead of generating a fresh one. This
-   * enables identity portability — the same DID persists across node
+   * enables identity portability -- the same DID persists across node
    * restarts. The `ContextManager` is also auto-initialized with the
    * node's relay as transport.
    *
-   * @param identityDid - Optional DID string from a previously created identity.
+   * Accepts any object with a `did` property (including the `Identity`
+   * class from `identityCreate`), keeping the server module decoupled.
+   *
+   * @param identity - Optional identity object with a `.did` property.
    */
-  static async startInMemory(identityDid?: string): Promise<Node> {
+  static async startInMemory(identity?: { did: string }): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartInMemory(identityDid ?? null);
+    const handle = await addon.nodeStartInMemory(identity?.did ?? null);
     return new Node(handle);
   }
 
@@ -269,17 +272,17 @@ export class Node implements AsyncDisposable {
    * Opens (or creates) persistent storage at `<dataDir>/storage/` and a
    * redb blob database at `<dataDir>/blobs.redb`.
    *
-   * When `identityDid` is provided, the node uses the pre-existing identity
+   * When `identity` is provided, the node uses the pre-existing identity
    * instead of generating a fresh one. When omitted, the node creates or
    * reloads a persistent identity via `FileKeyCustody` (requires
    * `SCP_KEY_PASSPHRASE` env var).
    *
    * @param dataDir - Directory for persistent storage.
-   * @param identityDid - Optional DID string from a previously created identity.
+   * @param identity - Optional identity object with a `.did` property.
    */
-  static async startLocal(dataDir: string, identityDid?: string): Promise<Node> {
+  static async startLocal(dataDir: string, identity?: { did: string }): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartLocal(dataDir, identityDid ?? null);
+    const handle = await addon.nodeStartLocal(dataDir, identity?.did ?? null);
     return new Node(handle);
   }
 
@@ -321,12 +324,15 @@ export class Node implements AsyncDisposable {
   /**
    * Activate HTTP broadcast projection for a context.
    *
-   * Registers a broadcast context for HTTP content delivery.
+   * Three resolution modes:
+   * 1. Both `broadcastKeyHex` **and** `authorDid` provided -- uses the
+   *    explicit key with epoch 0.
+   * 2. Only `authorDid` provided -- auto-resolves the broadcast key
+   *    using that DID (useful when the author identity differs from the
+   *    node identity).
+   * 3. Neither provided -- auto-resolves using the node's identity DID.
    *
-   * When `broadcastKeyHex` and `authorDid` are omitted (or `undefined`),
-   * the key is auto-resolved from the `ContextManager` using the node's
-   * identity DID. This is the recommended usage for locally managed
-   * contexts.
+   * Providing `broadcastKeyHex` without `authorDid` is an error.
    *
    * @param contextId - The context ID to project.
    * @param admission - `"open"` or `"gated"`.
