@@ -70,7 +70,11 @@ interface ServerAddon {
   relayStartInMemory(): Promise<NativeRelayHandle>;
   relayStartLocal(dataDir: string): Promise<NativeRelayHandle>;
   nodeStartInMemory(identityDid: string | null): Promise<NativeNodeHandle>;
-  nodeStartLocal(dataDir: string, identityDid: string | null): Promise<NativeNodeHandle>;
+  nodeStartLocal(
+    dataDir: string,
+    identityDid: string | null,
+    passphrase: string | null,
+  ): Promise<NativeNodeHandle>;
   transportConnect(relayUrl: string): Promise<unknown>;
   configureLocalTransport(localDid: string): void;
 }
@@ -274,15 +278,26 @@ export class Node implements AsyncDisposable {
    *
    * When `identity` is provided, the node uses the pre-existing identity
    * instead of generating a fresh one. When omitted, the node creates or
-   * reloads a persistent identity via `FileKeyCustody` (requires
-   * `SCP_KEY_PASSPHRASE` env var).
+   * reloads a persistent identity via `FileKeyCustody`. The passphrase
+   * for key derivation is resolved as:
+   * 1. The explicit `passphrase` parameter, if provided.
+   * 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+   * 3. Returns an error if neither is available.
+   *
+   * No passphrase is required when `identity` is provided.
    *
    * @param dataDir - Directory for persistent storage.
    * @param identity - Optional identity object with a `.did` property.
+   * @param passphrase - Passphrase for Argon2id key derivation. Falls back
+   *   to `SCP_KEY_PASSPHRASE` env var when omitted.
    */
-  static async startLocal(dataDir: string, identity?: { did: string }): Promise<Node> {
+  static async startLocal(
+    dataDir: string,
+    identity?: { did: string },
+    passphrase?: string,
+  ): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartLocal(dataDir, identity?.did ?? null);
+    const handle = await addon.nodeStartLocal(dataDir, identity?.did ?? null, passphrase ?? null);
     return new Node(handle);
   }
 

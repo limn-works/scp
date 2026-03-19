@@ -48,9 +48,11 @@ interface ServerBindings {
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
+     * @param passphrase Passphrase for Argon2id key derivation, or null to fall back to
+     *   `SCP_KEY_PASSPHRASE` env var.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
-    fun nodeStartLocal(dataDir: String, identityDid: String? = null): String
+    fun nodeStartLocal(dataDir: String, identityDid: String? = null, passphrase: String? = null): String
 
     /**
      * Shuts down a relay identified by its handle JSON.
@@ -443,18 +445,27 @@ class Node internal constructor(
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
-         * identity via `FileKeyCustody` (requires `SCP_KEY_PASSPHRASE` env var).
+         * identity via `FileKeyCustody`. The passphrase for key derivation
+         * is resolved as:
+         * 1. The explicit [passphrase] parameter, if provided.
+         * 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+         * 3. Returns an error if neither is available.
+         *
+         * No passphrase is required when [identityDid] is provided.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param dataDir Directory for persistent storage.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
+         * @param passphrase Passphrase for Argon2id key derivation, or null to fall back to
+         *   `SCP_KEY_PASSPHRASE` env var.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
         suspend fun startLocal(
             bridge: ServerBridge,
             dataDir: String,
             identityDid: String? = null,
-        ): Node = bridge.startNodeLocal(dataDir, identityDid)
+            passphrase: String? = null,
+        ): Node = bridge.startNodeLocal(dataDir, identityDid, passphrase)
     }
 }
 
@@ -531,11 +542,13 @@ class ServerBridge internal constructor(
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
+     * @param passphrase Passphrase for Argon2id key derivation, or null to fall back to
+     *   `SCP_KEY_PASSPHRASE` env var.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
-    suspend fun startNodeLocal(dataDir: String, identityDid: String? = null): Node =
+    suspend fun startNodeLocal(dataDir: String, identityDid: String? = null, passphrase: String? = null): Node =
         bridge.ffiCall {
-            val json = bindings.nodeStartLocal(dataDir, identityDid)
+            val json = bindings.nodeStartLocal(dataDir, identityDid, passphrase)
             val info = parseNodeInfo(json)
             Node(
                 relayUrl = info.relayUrl,

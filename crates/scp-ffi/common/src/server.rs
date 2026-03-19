@@ -338,10 +338,13 @@ pub async fn start_node_in_memory(
 ///
 /// When `identity` is `None`, the node creates or reloads a persistent
 /// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
-/// backed by `<data_dir>/identity.key`. The passphrase is read from the
-/// `SCP_KEY_PASSPHRASE` environment variable (required — returns an error
-/// if unset). On first run, a new DID is generated and persisted to
-/// storage. On subsequent runs, the same DID is reloaded from storage.
+/// backed by `<data_dir>/identity.key`. The passphrase is resolved as:
+/// 1. The explicit `passphrase` parameter, if `Some`.
+/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+/// 3. Returns an error if neither is available.
+///
+/// On first run, a new DID is generated and persisted to storage. On
+/// subsequent runs, the same DID is reloaded from storage.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
@@ -351,11 +354,12 @@ pub async fn start_node_in_memory(
 /// - The data directory cannot be created ([`ServerError::Io`])
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
-/// - `SCP_KEY_PASSPHRASE` is not set when `identity` is `None` ([`ServerError::Io`])
+/// - No passphrase provided and `SCP_KEY_PASSPHRASE` unset when `identity` is `None` ([`ServerError::Io`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,
     identity: Option<NodeIdentity>,
+    passphrase: Option<zeroize::Zeroizing<String>>,
 ) -> Result<scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>, ServerError> {
     use scp_identity::DidCache;
     use scp_node::{ApplicationNodeBuilder, SelfSignedTlsProvider};
@@ -400,13 +404,17 @@ pub async fn start_node_local(
             .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let passphrase =
-            zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
-                ServerError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "SCP_KEY_PASSPHRASE environment variable required for persistent node identity",
-                ))
-            })?);
+        let passphrase = match passphrase {
+            Some(p) => p,
+            None => zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(
+                |_| {
+                    ServerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "passphrase required for persistent node identity: pass explicitly or set SCP_KEY_PASSPHRASE",
+                    ))
+                },
+            )?),
+        };
         let key_path = data_dir.join("identity.key");
         let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
             &key_path,
@@ -615,18 +623,9 @@ impl RunningNode {
 mod tests {
     use super::*;
 
-    /// Set `SCP_KEY_PASSPHRASE` exactly once for the entire test binary.
-    ///
-    /// `std::sync::Once` guarantees the closure runs at most once, even
-    /// under concurrent test threads, so the `set_var` happens before any
-    /// parallel reader and is never repeated.
-    fn ensure_test_passphrase() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            // SAFETY: test-only, called exactly once before any concurrent reads.
-            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
-        });
+    /// Passphrase used by tests that exercise the `FileKeyCustody` path.
+    fn test_passphrase() -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new("test-passphrase".to_owned())
     }
 
     #[tokio::test]
@@ -698,9 +697,10 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_returns_relay_url_and_did() {
-        ensure_test_passphrase();
         let tmp = std::env::temp_dir().join(format!("scp-test-node-local-{}", std::process::id()));
-        let node = start_node_local(&tmp, None).await.unwrap();
+        let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .unwrap();
 
         // Relay URL should be a valid ws:// or wss:// URL.
         let url = node.relay_url();
@@ -735,14 +735,15 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_reuses_data_dir_across_restarts() {
-        ensure_test_passphrase();
         let tmp =
             std::env::temp_dir().join(format!("scp-test-node-persist-{}", std::process::id()));
 
         let first_did;
         // First run — creates storage directory, blob database, and identity key.
         {
-            let node = start_node_local(&tmp, None).await.unwrap();
+            let node = start_node_local(&tmp, None, Some(test_passphrase()))
+                .await
+                .unwrap();
             assert!(tmp.join("storage").is_dir());
             assert!(tmp.join("blobs.redb").exists());
             assert!(tmp.join("identity.key").exists());
@@ -758,7 +759,9 @@ mod tests {
         // With FileKeyCustody + identity_with_storage, the same DID is
         // reloaded from persistent storage across restarts.
         {
-            let node = start_node_local(&tmp, None).await.unwrap();
+            let node = start_node_local(&tmp, None, Some(test_passphrase()))
+                .await
+                .unwrap();
             assert_eq!(
                 node.identity().did(),
                 first_did,
@@ -1012,8 +1015,8 @@ mod tests {
 
         let tmp =
             std::env::temp_dir().join(format!("scp-test-node-local-id-{}", std::process::id()));
-        // No SCP_KEY_PASSPHRASE needed when passing a pre-existing identity.
-        let node = start_node_local(&tmp, Some(test_id)).await.unwrap();
+        // No passphrase needed when passing a pre-existing identity.
+        let node = start_node_local(&tmp, Some(test_id), None).await.unwrap();
 
         assert_eq!(
             node.identity().did(),
@@ -1041,37 +1044,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// This test removes the `SCP_KEY_PASSPHRASE` env var to verify the
-    /// error path. Because env vars are process-global, this races with
-    /// parallel tests that read the same variable. Run in isolation:
-    ///
-    /// ```sh
-    /// cargo test -p scp-ffi-common --features server -- --ignored node_local_without_identity
-    /// ```
+    /// Verifies that `start_node_local` without identity and without
+    /// passphrase returns an error. No env var mutation needed — the
+    /// explicit `None` passphrase parameter is sufficient.
     #[tokio::test]
-    #[ignore = "mutates process-global SCP_KEY_PASSPHRASE — must run in isolation (--ignored)"]
     async fn node_local_without_identity_requires_passphrase() {
-        // SAFETY: test-only, run in isolation via #[ignore].
-        let prev = std::env::var("SCP_KEY_PASSPHRASE").ok();
-        unsafe { std::env::remove_var("SCP_KEY_PASSPHRASE") };
-
         let tmp =
             std::env::temp_dir().join(format!("scp-test-node-no-pass-{}", std::process::id()));
-        let result = start_node_local(&tmp, None).await;
+        let result = start_node_local(&tmp, None, None).await;
 
-        // Restore env var if it was set before.
-        if let Some(val) = prev {
-            // SAFETY: test-only, restoring after isolated run.
-            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", val) };
-        }
-
-        let err = result
-            .err()
-            .expect("should fail without SCP_KEY_PASSPHRASE");
+        let err = result.err().expect("should fail without passphrase");
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("SCP_KEY_PASSPHRASE"),
-            "error should mention SCP_KEY_PASSPHRASE, got: {err_msg}"
+            err_msg.contains("passphrase required"),
+            "error should mention passphrase requirement, got: {err_msg}"
         );
 
         // Cleanup (data_dir may not have been fully created).

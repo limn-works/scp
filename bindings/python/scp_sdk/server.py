@@ -184,15 +184,24 @@ class Node:
         return Node(handle)
 
     @staticmethod
-    async def start_local(data_dir: str, identity: Identity | None = None) -> Node:
+    async def start_local(
+        data_dir: str,
+        identity: Identity | None = None,
+        passphrase: str | None = None,
+    ) -> Node:
         """Start a full application node with file-backed storage.
 
         When ``identity`` is provided, the node uses that pre-existing identity
         instead of generating one -- the same DID persists across node restarts
         (identity portability).  When ``None``, the node creates or reloads a
-        persistent identity via ``FileKeyCustody``, which requires the
-        ``SCP_KEY_PASSPHRASE`` environment variable to be set (used for
-        Argon2id key derivation to encrypt the key file at rest).
+        persistent identity via ``FileKeyCustody``.  The passphrase for key
+        derivation is resolved as:
+
+        1. The explicit ``passphrase`` parameter, if provided.
+        2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
+        3. Returns an error if neither is available.
+
+        No passphrase is required when ``identity`` is provided.
 
         Opens (or creates) persistent storage at ``<data_dir>/storage/``
         and a redb blob database at ``<data_dir>/blobs.redb``.
@@ -201,10 +210,13 @@ class Node:
             data_dir: Directory for persistent storage.
             identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
                 to use.  If provided, the node uses this identity instead of
-                generating one from ``SCP_KEY_PASSPHRASE``.
+                generating a fresh one.
+            passphrase: Passphrase for Argon2id key derivation (encrypts the
+                key file at rest).  Falls back to ``SCP_KEY_PASSPHRASE`` env
+                var when ``None``.
         """
         did = identity.did if identity is not None else None
-        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did)
+        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did, passphrase)
         return Node(handle)
 
     async def serve(self, bind_addr: str | None = None) -> str:

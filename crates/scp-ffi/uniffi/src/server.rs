@@ -625,7 +625,10 @@ pub async fn node_start_in_memory(
 ///
 /// When `identity` is provided, the node uses the pre-existing identity.
 /// When `None`, the node creates or reloads a persistent identity via
-/// `FileKeyCustody` (requires `SCP_KEY_PASSPHRASE` env var).
+/// `FileKeyCustody`. The passphrase is resolved as:
+/// 1. The explicit `passphrase` parameter, if provided.
+/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+/// 3. Returns an error if neither is available.
 ///
 /// Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
 /// blob database at `<data_dir>/blobs.redb`.
@@ -633,12 +636,19 @@ pub async fn node_start_in_memory(
 pub async fn node_start_local(
     data_dir: String,
     identity: Option<Arc<Identity>>,
+    passphrase: Option<String>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
     };
-    let node = server::start_node_local(std::path::Path::new(&data_dir), node_identity).await?;
+    let zeroized_passphrase = passphrase.map(Zeroizing::new);
+    let node = server::start_node_local(
+        std::path::Path::new(&data_dir),
+        node_identity,
+        zeroized_passphrase,
+    )
+    .await?;
 
     // Auto-wire the ContextManager with relay transport.
     let did = node.identity().did().to_owned();
@@ -662,16 +672,6 @@ mod tests {
 
     fn rt() -> &'static tokio::runtime::Runtime {
         crate::runtime()
-    }
-
-    /// Set `SCP_KEY_PASSPHRASE` exactly once for the entire test binary.
-    fn ensure_test_passphrase() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            // SAFETY: test-only, called exactly once before any concurrent reads.
-            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
-        });
     }
 
     #[test]
@@ -716,10 +716,13 @@ mod tests {
 
     #[test]
     fn node_local_starts_and_returns_did() {
-        ensure_test_passphrase();
         let tmp = std::env::temp_dir().join(format!("scp-uniffi-node-test-{}", std::process::id()));
         let node = rt()
-            .block_on(node_start_local(tmp.to_string_lossy().into_owned(), None))
+            .block_on(node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                None,
+                Some("test-passphrase".to_owned()),
+            ))
             .unwrap();
         let url = node.relay_url();
         assert!(
@@ -840,10 +843,12 @@ mod tests {
 
         let tmp =
             std::env::temp_dir().join(format!("scp-uniffi-node-id-test-{}", std::process::id()));
+        // No passphrase needed when passing a pre-existing identity.
         let node = rt()
             .block_on(node_start_local(
                 tmp.to_string_lossy().into_owned(),
                 Some(identity),
+                None,
             ))
             .unwrap();
 

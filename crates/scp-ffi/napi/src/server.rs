@@ -574,10 +574,13 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
 /// When `identityDid` is provided, the node uses the pre-existing identity
 /// from the identity registry instead of generating a fresh one. When
 /// `identityDid` is `null`, the node creates or reloads a persistent
-/// identity via `FileKeyCustody` (requires `SCP_KEY_PASSPHRASE` env var).
+/// identity via `FileKeyCustody`. The passphrase is resolved as:
+/// 1. The explicit `passphrase` parameter, if provided.
+/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+/// 3. Returns an error if neither is available.
 ///
 /// ```js
-/// const node = await nodeStartLocal("/tmp/my-node");
+/// const node = await nodeStartLocal("/tmp/my-node", null, "my-secret");
 /// console.log(node.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
 /// console.log(node.did);      // "did:dht:z6Mk..."
 /// node.shutdown();
@@ -591,6 +594,7 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
 pub async fn node_start_local(
     data_dir: String,
     identity_did: Option<String>,
+    passphrase: Option<String>,
 ) -> napi::Result<NapiNodeHandle> {
     let node_identity = match identity_did {
         Some(ref did) => {
@@ -599,9 +603,14 @@ pub async fn node_start_local(
         }
         None => None,
     };
-    let node = server::start_node_local(std::path::Path::new(&data_dir), node_identity)
-        .await
-        .map_err(server_err)?;
+    let zeroized_passphrase = passphrase.map(Zeroizing::new);
+    let node = server::start_node_local(
+        std::path::Path::new(&data_dir),
+        node_identity,
+        zeroized_passphrase,
+    )
+    .await
+    .map_err(server_err)?;
 
     // Auto-wire the ContextManager with relay transport.
     let did = node.identity().did().to_owned();
@@ -625,16 +634,6 @@ mod tests {
 
     fn rt() -> &'static tokio::runtime::Runtime {
         crate::runtime()
-    }
-
-    /// Set `SCP_KEY_PASSPHRASE` exactly once for the entire test binary.
-    fn ensure_test_passphrase() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            // SAFETY: test-only, called exactly once before any concurrent reads.
-            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
-        });
     }
 
     #[test]
@@ -694,10 +693,13 @@ mod tests {
 
     #[test]
     fn node_local_starts_and_returns_did() {
-        ensure_test_passphrase();
         let tmp = std::env::temp_dir().join(format!("scp-napi-node-test-{}", std::process::id()));
         let node = rt()
-            .block_on(node_start_local(tmp.to_string_lossy().into_owned(), None))
+            .block_on(node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                None,
+                Some("test-passphrase".to_owned()),
+            ))
             .unwrap();
         let url = node.relay_url();
         assert!(

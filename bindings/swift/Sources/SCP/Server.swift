@@ -34,7 +34,7 @@ public enum ServerBridge {
     public typealias NodeStartInMemoryFn = @Sendable (_ identity: Identity?) async throws -> NodeHandle
 
     /// Start a full application node with file-backed storage.
-    public typealias NodeStartLocalFn = @Sendable (_ dataDir: String, _ identity: Identity?) async throws -> NodeHandle
+    public typealias NodeStartLocalFn = @Sendable (_ dataDir: String, _ identity: Identity?, _ passphrase: String?) async throws -> NodeHandle
 
     /// Start the HTTP server in the background.
     public typealias ServeFn = @Sendable (
@@ -109,9 +109,9 @@ public enum ServerBridge {
         try await nodeStartInMemory(identity: identity)
     }
 
-    /// Default node local startup -- delegates to UniFFI ``nodeStartLocal(dataDir:identity:)``.
-    public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir, identity in
-        try await nodeStartLocal(dataDir: dataDir, identity: identity)
+    /// Default node local startup -- delegates to UniFFI ``nodeStartLocal(dataDir:identity:passphrase:)``.
+    public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir, identity, passphrase in
+        try await nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
     }
 
     /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.
@@ -275,7 +275,12 @@ public struct Node: Sendable {
     ///
     /// When `identity` is provided, the node uses the pre-existing identity.
     /// When `nil`, the node creates or reloads a persistent identity via
-    /// `FileKeyCustody` (requires `SCP_KEY_PASSPHRASE` env var).
+    /// `FileKeyCustody`. The passphrase for key derivation is resolved as:
+    /// 1. The explicit `passphrase` parameter, if provided.
+    /// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
+    /// 3. Returns an error if neither is available.
+    ///
+    /// No passphrase is required when `identity` is provided.
     ///
     /// Opens (or creates) persistent storage at `<dataDir>/storage/` and a
     /// redb blob database at `<dataDir>/blobs.redb`.
@@ -283,15 +288,18 @@ public struct Node: Sendable {
     /// - Parameters:
     ///   - dataDir: Directory for persistent storage.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
+    ///   - passphrase: Passphrase for Argon2id key derivation. Falls back to
+    ///     `SCP_KEY_PASSPHRASE` env var when `nil`.
     ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startLocal(
         dataDir: String,
         identity: Identity? = nil,
+        passphrase: String? = nil,
         startFn: ServerBridge.NodeStartLocalFn = ServerBridge.defaultNodeStartLocal
     ) async throws -> Node {
-        let handle = try await startFn(dataDir, identity)
+        let handle = try await startFn(dataDir, identity, passphrase)
         return Node(handle: handle)
     }
 

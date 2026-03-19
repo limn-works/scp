@@ -562,18 +562,23 @@ pub fn py_node_start_in_memory(
 /// blob database at ``<data_dir>/blobs.redb``.
 ///
 /// When ``identity_did`` is ``None`` (the default), the node creates or
-/// reloads a persistent identity from ``<data_dir>/identity.key`` using
-/// ``SCP_KEY_PASSPHRASE`` from the environment.
+/// reloads a persistent identity from ``<data_dir>/identity.key``. The
+/// passphrase is resolved as:
+///
+/// 1. The explicit ``passphrase`` parameter, if provided.
+/// 2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
+/// 3. Returns an error if neither is available.
 ///
 /// When ``identity_did`` is provided, the node uses the pre-existing identity
 /// from the `PyO3` identity registry (populated by ``py_identity_create``).
-/// No ``SCP_KEY_PASSPHRASE`` is required in this mode.
+/// No passphrase is required in this mode.
 #[pyfunction]
-#[pyo3(signature = (data_dir, identity_did=None))]
+#[pyo3(signature = (data_dir, identity_did=None, passphrase=None))]
 pub fn py_node_start_local(
     py: Python<'_>,
     data_dir: String,
     identity_did: Option<String>,
+    passphrase: Option<String>,
 ) -> PyResult<PyNodeHandle> {
     let rt = crate::runtime()?;
     let node_identity = match identity_did {
@@ -583,10 +588,12 @@ pub fn py_node_start_local(
         }
         None => None,
     };
+    let zeroized_passphrase = passphrase.map(Zeroizing::new);
     let node = py.allow_threads(|| {
         rt.block_on(server::start_node_local(
             std::path::Path::new(&data_dir),
             node_identity,
+            zeroized_passphrase,
         ))
         .map_err(server_err)
     })?;
@@ -631,16 +638,6 @@ mod tests {
         crate::runtime().unwrap()
     }
 
-    /// Set `SCP_KEY_PASSPHRASE` exactly once for the entire test binary.
-    fn ensure_test_passphrase() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            // SAFETY: test-only, called exactly once before any concurrent reads.
-            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
-        });
-    }
-
     #[test]
     fn relay_in_memory_starts_and_returns_url() {
         let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
@@ -675,9 +672,11 @@ mod tests {
 
     #[test]
     fn node_local_starts_and_returns_did() {
-        ensure_test_passphrase();
         let tmp = std::env::temp_dir().join(format!("scp-pyo3-node-test-{}", std::process::id()));
-        let node = rt().block_on(server::start_node_local(&tmp, None)).unwrap();
+        let passphrase = Zeroizing::new("test-passphrase".to_owned());
+        let node = rt()
+            .block_on(server::start_node_local(&tmp, None, Some(passphrase)))
+            .unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
