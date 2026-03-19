@@ -215,7 +215,7 @@ final class IdentityAttestationTests: XCTestCase {
                 platformHandle: "alice",
                 verificationMethod: "did:dht:z6Mk...#active",
                 verifiedAt: 1_700_000_000.0
-            ),
+            )
         ]
         let customList: IdentityAttestationBridge.ListFn = { _ in expected }
         let result = try await listIdentityAttestations(
