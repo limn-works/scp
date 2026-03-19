@@ -129,7 +129,7 @@ pub const MAX_CUSTOM_CONTEXTS: usize = 100;
 /// verification (§22.13.2).
 ///
 /// See ADR-020 acceptance criterion 8, §22.13.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BootstrapConfig {
     /// Default bootstrap context entries shipped with the SDK.
     ///
@@ -158,6 +158,52 @@ pub struct BootstrapConfig {
     /// Defaults to `true`. When enabled, the resolver attempts DID document
     /// capability resolution as a last resort.
     pub fallback_to_did_resolution: bool,
+}
+
+/// Raw deserialization target for [`BootstrapConfig`] that validates Vec lengths
+/// on deserialization. Rejects payloads where `default_contexts` exceeds
+/// [`MAX_DEFAULT_CONTEXTS`] or `custom_contexts` exceeds [`MAX_CUSTOM_CONTEXTS`].
+#[derive(Deserialize)]
+struct BootstrapConfigRaw {
+    #[serde(default)]
+    default_contexts: Vec<BootstrapContextEntry>,
+    #[serde(default = "default_true")]
+    auto_query_on_identity_creation: bool,
+    #[serde(default)]
+    custom_contexts: Vec<BootstrapContextEntry>,
+    #[serde(default = "default_true")]
+    fallback_to_did_resolution: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl<'de> Deserialize<'de> for BootstrapConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = BootstrapConfigRaw::deserialize(deserializer)?;
+        if raw.default_contexts.len() > MAX_DEFAULT_CONTEXTS {
+            return Err(serde::de::Error::custom(format!(
+                "default_contexts length {} exceeds maximum of {MAX_DEFAULT_CONTEXTS}",
+                raw.default_contexts.len()
+            )));
+        }
+        if raw.custom_contexts.len() > MAX_CUSTOM_CONTEXTS {
+            return Err(serde::de::Error::custom(format!(
+                "custom_contexts length {} exceeds maximum of {MAX_CUSTOM_CONTEXTS}",
+                raw.custom_contexts.len()
+            )));
+        }
+        Ok(Self {
+            default_contexts: raw.default_contexts,
+            auto_query_on_identity_creation: raw.auto_query_on_identity_creation,
+            custom_contexts: raw.custom_contexts,
+            fallback_to_did_resolution: raw.fallback_to_did_resolution,
+        })
+    }
 }
 
 impl Default for BootstrapConfig {

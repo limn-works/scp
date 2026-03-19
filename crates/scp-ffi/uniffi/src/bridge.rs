@@ -2659,12 +2659,21 @@ pub fn identity_link_attestations(did: String) -> Result<String, ScpError> {
 
 /// Removes an identity link attestation by its ID.
 ///
-/// Returns `true` if the attestation was found and removed.
+/// Returns `true` if the attestation was found and removed, `false` if the
+/// DID is not in the identity custody registry or the attestation was not found.
 ///
 /// See spec §3.5.1.
 #[must_use]
 #[uniffi::export]
 pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> bool {
+    // Verify the caller owns the DID by checking the identity custody registry.
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        if !identity_custody_registry().contains_key(&did) {
+            return false;
+        }
+    }
+
     let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
         return false;
     };

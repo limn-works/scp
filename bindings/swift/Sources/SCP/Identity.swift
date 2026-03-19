@@ -590,7 +590,7 @@ public enum RevocationStatus: Sendable, Equatable {
 ///
 /// The ``id`` is deterministically derived as
 /// `hex(SHA-256(issuer || platform || handle || issued_at))`.
-public struct IdentityAttestation: Sendable {
+public struct IdentityAttestation: Sendable, Equatable {
     /// Deterministic attestation ID.
     public let id: String
 

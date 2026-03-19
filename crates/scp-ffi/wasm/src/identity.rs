@@ -2162,12 +2162,19 @@ pub fn identity_link_attestations(did: String) -> Result<String, JsError> {
 
 /// Removes an identity link attestation by its ID.
 ///
-/// Returns `true` if found and removed, `false` otherwise.
+/// Returns `true` if found and removed, `false` if the DID is not in the
+/// identity registry or the attestation was not found.
 ///
 /// See spec §3.5.1.
 #[must_use]
 #[wasm_bindgen]
 pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> bool {
+    // Verify the caller owns the DID by checking the identity registry.
+    let owns_did = IDENTITY_REGISTRY.with(|reg| reg.borrow().contains_key(&did));
+    if !owns_did {
+        return false;
+    }
+
     LINK_ATTESTATIONS.with(|reg| {
         let mut map = reg.borrow_mut();
         map.get_mut(&did).is_some_and(|list| {

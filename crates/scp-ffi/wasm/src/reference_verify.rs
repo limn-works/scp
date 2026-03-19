@@ -208,6 +208,15 @@ async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (boo
         return (false, Some("nonce must not be empty".to_owned()));
     }
 
+    // Validate nonce contains only alphanumeric characters to prevent
+    // injection into the structured token `scp-verify:{did}:{nonce}`.
+    if !signed_post.nonce.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return (
+            false,
+            Some("nonce must contain only alphanumeric characters [a-zA-Z0-9]".to_owned()),
+        );
+    }
+
     // Validate URL scheme — only HTTPS allowed for security.
     if !signed_post.post_url.starts_with("https://") {
         return (false, Some("post_url must use HTTPS scheme".to_owned()));
@@ -323,12 +332,14 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
             // (case-insensitive, trailing dot optional) to prevent a malicious
             // DNS response from injecting records for a different domain.
             // Also strip enclosing quotes that Cloudflare DoH wraps around
-            // TXT record data before checking for the DID.
+            // TXT record data, then require an exact match (after trimming
+            // whitespace) to prevent a longer TXT record from matching a
+            // substring of a different DID.
             let found = doh_response
                 .answer
                 .iter()
                 .filter(|record| dns_name_matches(&record.name, &query_name))
-                .any(|record| strip_txt_quotes(&record.data).contains(issuer_did));
+                .any(|record| strip_txt_quotes(&record.data).trim() == issuer_did);
 
             if found {
                 (true, None)

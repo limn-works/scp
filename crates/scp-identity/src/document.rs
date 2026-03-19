@@ -2198,7 +2198,7 @@ mod tests {
     fn set_identity_link_replaces_same_id() {
         let mut doc = DidDocument::new("did:dht:zLinks2", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let att1 = crate::attestation::ScpIdentityLinkService {
-            attestation_id: "same_id_12345678".to_owned(),
+            attestation_id: "aa00bb0012345678".to_owned(),
             platform: crate::attestation::IdentityLinkPlatform::Github,
             platform_handle: "@alice".to_owned(),
             platform_id: None,
@@ -2209,7 +2209,7 @@ mod tests {
         doc.set_identity_link_attestation(&att1).unwrap();
 
         let att2 = crate::attestation::ScpIdentityLinkService {
-            attestation_id: "same_id_12345678".to_owned(),
+            attestation_id: "aa00bb0012345678".to_owned(),
             platform: crate::attestation::IdentityLinkPlatform::Github,
             platform_handle: "@alice_updated".to_owned(),
             platform_id: Some("9999".to_owned()),
@@ -2230,10 +2230,10 @@ mod tests {
         let mut doc = DidDocument::new("did:dht:zLinks3", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let att1 = test_link_attestation(
             crate::attestation::IdentityLinkPlatform::Mastodon,
-            "mastodon_id_1111",
+            "aabb111100001111",
         );
         let att2 = crate::attestation::ScpIdentityLinkService {
-            attestation_id: "mastodon_id_2222".to_owned(),
+            attestation_id: "aabb222200002222".to_owned(),
             platform: crate::attestation::IdentityLinkPlatform::Mastodon,
             platform_handle: "@bob@mastodon.social".to_owned(),
             platform_id: None,
@@ -2254,11 +2254,11 @@ mod tests {
         let mut doc = DidDocument::new("did:dht:zLinks4", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let att = test_link_attestation(
             crate::attestation::IdentityLinkPlatform::Discord,
-            "discord_id_01234",
+            "ddcc001100001234",
         );
         doc.set_identity_link_attestation(&att).unwrap();
 
-        assert!(doc.remove_identity_link_attestation("discord_id_01234"));
+        assert!(doc.remove_identity_link_attestation("ddcc001100001234"));
         assert!(doc.identity_link_attestations().is_empty());
     }
 
@@ -2275,8 +2275,10 @@ mod tests {
         doc.add_relay_service("wss://relay.example.com/scp/v1")
             .unwrap();
 
-        let att =
-            test_link_attestation(crate::attestation::IdentityLinkPlatform::X, "x_id_12345678");
+        let att = test_link_attestation(
+            crate::attestation::IdentityLinkPlatform::X,
+            "ee0012345678aabb",
+        );
         doc.set_identity_link_attestation(&att).unwrap();
 
         // Should have: PreRotationCommitment + SCPRelay + ScpIdentityLinkAttestation.
@@ -2294,7 +2296,7 @@ mod tests {
         // Add a valid one.
         let att = test_link_attestation(
             crate::attestation::IdentityLinkPlatform::Apple,
-            "apple_id_12345678",
+            "aa0012345678ccdd",
         );
         doc.set_identity_link_attestation(&att).unwrap();
 
@@ -2308,7 +2310,7 @@ mod tests {
         // Should return only the valid one, silently skipping the malformed.
         let links = doc.identity_link_attestations();
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].attestation_id, "apple_id_12345678");
+        assert_eq!(links[0].attestation_id, "aa0012345678ccdd");
     }
 
     #[test]
@@ -2317,7 +2319,7 @@ mod tests {
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         let att = crate::attestation::ScpIdentityLinkService {
-            attestation_id: "roundtrip_test_id".to_owned(),
+            attestation_id: "ff0011223344aabb".to_owned(),
             platform: crate::attestation::IdentityLinkPlatform::Google,
             platform_handle: "user@gmail.com".to_owned(),
             platform_id: Some("oidc-sub-abc".to_owned()),

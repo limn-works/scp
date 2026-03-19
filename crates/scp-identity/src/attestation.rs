@@ -504,8 +504,17 @@ impl ScpIdentityLinkService {
     /// # Errors
     ///
     /// Returns [`IdentityError::DocumentSerializationError`] if the attestation
-    /// data cannot be serialized to JSON.
+    /// data cannot be serialized to JSON or the `attestation_id` contains
+    /// non-hex characters.
     pub fn to_service_entry(&self, did: &str) -> Result<Service, IdentityError> {
+        // Validate attestation_id is hex-only before using it in the fragment.
+        if !self.attestation_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(IdentityError::DocumentSerializationError(format!(
+                "attestation_id must be hex-encoded, got '{}'",
+                self.attestation_id
+            )));
+        }
+
         let endpoint = serde_json::to_string(self).map_err(|e| {
             IdentityError::DocumentSerializationError(format!(
                 "failed to serialize identity link attestation: {e}"
@@ -1137,7 +1146,8 @@ mod tests {
     #[test]
     fn identity_link_service_revoked_status() {
         let original = ScpIdentityLinkService {
-            attestation_id: "revoked_id_0123456789".to_owned(),
+            attestation_id: "aabbccdd0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+                .to_owned(),
             platform: IdentityLinkPlatform::Apple,
             platform_handle: "alice@icloud.com".to_owned(),
             platform_id: Some("oidc-sub-12345".to_owned()),
@@ -1158,9 +1168,9 @@ mod tests {
     }
 
     #[test]
-    fn identity_link_service_non_ascii_attestation_id_no_panic() {
-        // Multi-byte UTF-8 characters: each emoji is 4 bytes, so 8 chars = 32 bytes.
-        // A naive byte slice `[..8]` would split inside a character and panic.
+    fn identity_link_service_non_hex_attestation_id_rejected() {
+        // Non-hex attestation IDs (including multi-byte UTF-8) must be rejected
+        // by the hex validation in `to_service_entry`.
         let original = ScpIdentityLinkService {
             attestation_id: "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}\u{1F605}\u{1F606}\u{1F607}\u{1F608}\u{1F609}".to_owned(),
             platform: IdentityLinkPlatform::Github,
@@ -1171,18 +1181,13 @@ mod tests {
             revocation_status: ServiceRevocationStatus::Active,
         };
 
-        // Must not panic — the bug was a byte-indexed slice on a multi-byte string.
-        let service = original.to_service_entry(test_did()).unwrap();
-
-        // The prefix should be the first 8 characters (emoji), not 8 bytes.
-        let expected_prefix: String = original.attestation_id.chars().take(8).collect();
+        let result = original.to_service_entry(test_did());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
         assert!(
-            service.id.contains(&expected_prefix),
-            "service ID should contain first 8 chars of attestation_id, got: {}",
-            service.id
+            err.to_string()
+                .contains("attestation_id must be hex-encoded"),
+            "error should mention hex requirement, got: {err}"
         );
-
-        let parsed = ScpIdentityLinkService::from_service_entry(&service).unwrap();
-        assert_eq!(original, parsed);
     }
 }
