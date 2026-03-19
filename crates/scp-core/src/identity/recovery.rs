@@ -1837,8 +1837,8 @@ mod tests {
                 _: &[u8; 32],
                 _: &str,
                 _: Option<&[u8]>,
-            ) -> Result<(), ContextError> {
-                Ok(())
+            ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
+                Ok(crate::context::builder::AddMemberOutput::default())
             }
             fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
                 Ok(())

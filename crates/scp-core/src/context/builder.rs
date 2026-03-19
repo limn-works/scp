@@ -69,6 +69,24 @@ pub enum ContextCreationError {
 }
 
 // ---------------------------------------------------------------------------
+// AddMemberOutput -- result from adding a member to an MLS group
+// ---------------------------------------------------------------------------
+
+/// Output from adding a member to an MLS group.
+///
+/// Contains the TLS-serialized Welcome message (for the new member) and
+/// the Commit message (for existing members to advance epoch).
+#[derive(Debug, Clone, Default)]
+pub struct AddMemberOutput {
+    /// TLS-serialized MLS Welcome message for the newly added member.
+    /// Empty for non-MLS providers.
+    pub welcome_bytes: Vec<u8>,
+    /// TLS-serialized MLS Commit message for existing group members.
+    /// Empty for non-MLS providers.
+    pub commit_bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
 // Provider traits -- dependency injection for external subsystems
 // ---------------------------------------------------------------------------
 
@@ -154,6 +172,10 @@ pub trait ContextCryptoProvider: Send + Sync {
 
     /// Adds a member to the MLS group (ADR-001 `add_member()`).
     ///
+    /// Returns an [`AddMemberOutput`] containing the TLS-serialized MLS
+    /// Welcome (for the joiner) and Commit (for existing members). Non-MLS
+    /// providers return `AddMemberOutput::default()` (empty bytes).
+    ///
     /// # Arguments
     ///
     /// * `context_id` - The 32-byte context identifier.
@@ -169,7 +191,7 @@ pub trait ContextCryptoProvider: Send + Sync {
         context_id: &[u8; 32],
         member_did: &str,
         key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError>;
+    ) -> Result<AddMemberOutput, ContextError>;
 
     /// Removes a member from the MLS group (ADR-001 `remove_member()`).
     ///
@@ -384,6 +406,41 @@ pub trait ContextCryptoProvider: Send + Sync {
     ) -> Result<(), ContextError> {
         Ok(())
     }
+
+    // -- Welcome delivery operations (§5.12.3, issue #1311) ------------------
+
+    /// Generates a key package for joining a group via Welcome.
+    /// Returns TLS-serialized key package bytes. The provider retains the
+    /// private state needed to process the incoming Welcome.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if key package generation fails.
+    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "prepare_key_package_for_join not supported".into(),
+        ))
+    }
+
+    /// Joins an MLS group from a TLS-serialized Welcome message.
+    /// Consumes the retained key package state from `prepare_key_package_for_join`.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if Welcome processing fails.
+    fn join_from_welcome(
+        &self,
+        _context_id: &[u8; 32],
+        _welcome_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        Err(ContextError::CryptoFailed(
+            "join_from_welcome not supported".into(),
+        ))
+    }
 }
 
 /// Provides transport operations needed during context creation.
@@ -426,6 +483,26 @@ pub trait ContextTransportProvider: Send + Sync {
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError>;
+
+    /// Sends a payload to a specific routing ID (e.g., personal invitation routing ID).
+    ///
+    /// Used for Welcome delivery (spec §5.12.3). The `ttl` is seconds.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if sending fails.
+    fn send_to_routing_id(
+        &self,
+        _routing_id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: u32,
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "send_to_routing_id not supported".into(),
+        ))
+    }
 }
 
 /// Provides event log operations needed during context creation.
@@ -1081,8 +1158,8 @@ mod tests {
             _context_id: &[u8; 32],
             _member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<AddMemberOutput, ContextError> {
+            Ok(AddMemberOutput::default())
         }
 
         fn remove_member(

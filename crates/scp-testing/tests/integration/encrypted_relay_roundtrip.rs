@@ -135,6 +135,14 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
+    fn ed25519_to_x25519_agree(
+        &self,
+        _key: &KeyHandle,
+        _peer_x25519_public: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
+
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }

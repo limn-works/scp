@@ -110,6 +110,13 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
     ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
+    fn ed25519_to_x25519_agree(
+        &self,
+        _: &KeyHandle,
+        _: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
     fn custody_type(&self, _: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
@@ -887,8 +894,8 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
         _: &[u8; 32],
         _: &str,
         _: Option<&[u8]>,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
+    ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
+        Ok(scp_core::context::AddMemberOutput::default())
     }
     fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<(), scp_core::context::ContextError> {
         Ok(())

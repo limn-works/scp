@@ -80,6 +80,33 @@ const MAX_THRESHOLD_SIGNERS: usize = 64;
 const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 
 // ---------------------------------------------------------------------------
+// Welcome event helper
+// ---------------------------------------------------------------------------
+
+/// Pushes a [`ContextEvent::WelcomeGenerated`] event to the receive buffer
+/// if the `AddMemberOutput` contains a non-empty Welcome message.
+///
+/// Used by both `join_context` and `execute_add_member` to avoid
+/// duplicating the emission logic.
+fn push_welcome_event(
+    buffer: &mut ReceiveBuffer,
+    context_id: &str,
+    creator_did: &DID,
+    member_did: &DID,
+    add_output: crate::context::builder::AddMemberOutput,
+) {
+    if !add_output.welcome_bytes.is_empty() {
+        buffer.push(ContextEvent::WelcomeGenerated {
+            context_id: context_id.to_owned(),
+            creator_did: creator_did.clone(),
+            member_did: member_did.clone(),
+            welcome_bytes: super::membership::RedactedBytes(add_output.welcome_bytes),
+            commit_bytes: super::membership::RedactedBytes(add_output.commit_bytes),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
 // ---------------------------------------------------------------------------
 
@@ -2669,7 +2696,8 @@ impl ContextManager {
         // provider calls since they are idempotent or externally consistent.
         let kp_bytes = key_package.mls_key_package_bytes.as_deref();
         self.crypto.validate_key_package(&member_did, kp_bytes)?;
-        self.crypto
+        let add_output = self
+            .crypto
             .add_member(&context_id_bytes, &member_did, kp_bytes)?;
         self.crypto
             .distribute_sender_key(&context_id_bytes, &member_did)?;
@@ -2739,6 +2767,15 @@ impl ContextManager {
                 member_did: member_did.clone(),
                 role_name: "member".into(),
             });
+
+            // Emit WelcomeGenerated event if the add produced a Welcome message.
+            push_welcome_event(
+                &mut ctx.receive_buffer,
+                &context_id,
+                &DID(creator_did),
+                &member_did,
+                add_output,
+            );
         }
         // Lock dropped before event log append.
 
@@ -5165,7 +5202,8 @@ impl ContextManager {
 
             // Crypto: add to MLS group under lock to prevent partial-failure
             // window (phantom MLS member if state mutation fails).
-            self.crypto
+            let add_output = self
+                .crypto
                 .add_member(&context_id_bytes, did, None)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -5183,6 +5221,15 @@ impl ContextManager {
                 member_did: did.clone(),
                 role_name: role.to_owned(),
             });
+
+            // Emit WelcomeGenerated event if the add produced a Welcome message.
+            push_welcome_event(
+                &mut ctx.receive_buffer,
+                context_id,
+                &DID(creator_did),
+                did,
+                add_output,
+            );
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -8532,12 +8579,12 @@ mod tests {
             _context_id: &[u8; 32],
             member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<(), ContextError> {
+        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
                 .push(member_did.to_owned());
-            Ok(())
+            Ok(crate::context::builder::AddMemberOutput::default())
         }
 
         fn remove_member(

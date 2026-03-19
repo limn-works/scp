@@ -393,7 +393,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         context_id: &[u8; 32],
         member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
+    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         // Generate a key package for the new member.
         let member_credential =
             ScpCredential::new(member_did.to_owned(), None, SigningKeyId::Active)
@@ -416,7 +416,9 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             add_member(group, kp_in).map_err(|e| ContextError::CryptoFailed(e.to_string()))?
         };
 
-        // Serialize the commit for distribution to existing members.
+        // Serialize the Welcome for cross-process delivery via AddMemberOutput.
+        let welcome_bytes = scp_core::crypto::mls::ratchet::serialize_commit(&result.welcome)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         let commit_bytes = serialize_commit(&result.commit)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
@@ -470,7 +472,10 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 .push(member_did.to_owned());
         }
 
-        Ok(())
+        Ok(scp_core::context::AddMemberOutput {
+            welcome_bytes,
+            commit_bytes,
+        })
     }
 
     fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {

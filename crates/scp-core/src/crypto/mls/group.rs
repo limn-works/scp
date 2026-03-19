@@ -640,13 +640,39 @@ pub fn join_group(
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
 ) -> Result<ScpMlsGroup, MlsError> {
-    // Serialize MlsMessageOut to bytes, then deserialize as MlsMessageIn.
-    // This is the production-path conversion (no test-utils feature required).
     let serialized = welcome
         .tls_serialize_detached()
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("serializing welcome: {e}")))?;
+    join_group_from_bytes(&serialized, provider, signer)
+}
 
-    let welcome_in = MlsMessageIn::tls_deserialize(&mut serialized.as_slice())
+/// Joins a group from TLS-serialized Welcome bytes.
+///
+/// This is the cross-process variant of [`join_group`]: the Welcome message
+/// arrives as raw bytes (e.g., from a relay or FFI boundary) rather than as
+/// an `MlsMessageOut` reference.
+///
+/// # Arguments
+///
+/// * `welcome_bytes` - TLS-serialized MLS Welcome message.
+/// * `provider` - The MLS provider holding the key package's private state
+///   (from [`generate_key_package`]).
+/// * `signer` - The new member's signing key pair (from [`generate_key_package`]).
+///
+/// # Returns
+///
+/// An [`ScpMlsGroup`] wrapping the joined group.
+///
+/// # Errors
+///
+/// Returns [`MlsError::WelcomeProcessingFailed`] if the Welcome message
+/// cannot be deserialized or processed.
+pub fn join_group_from_bytes(
+    welcome_bytes: &[u8],
+    provider: InMemoryMlsProvider,
+    signer: SignatureKeyPair,
+) -> Result<ScpMlsGroup, MlsError> {
+    let welcome_in = MlsMessageIn::tls_deserialize(&mut &*welcome_bytes)
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("deserializing welcome: {e}")))?;
 
     // Extract the Welcome from the MlsMessageIn body.

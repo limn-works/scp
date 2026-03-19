@@ -693,6 +693,22 @@ impl KeyCustody for FileKeyCustody {
         }
     }
 
+    fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+        let handle = *ed25519_handle;
+        let peer = *peer_x25519_public;
+        async move {
+            let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
+            Ok(crate::traits::x25519_agree_from_ed25519(
+                &signing_key,
+                &peer,
+            ))
+        }
+    }
+
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::Software
     }

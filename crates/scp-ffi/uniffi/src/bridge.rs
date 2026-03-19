@@ -339,6 +339,29 @@ impl KeyCustody for CallbackKeyCustody {
         })
     }
 
+    async fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> Result<SharedSecret, PlatformError> {
+        // The callback protocol does not expose ed25519→x25519 conversion.
+        // Delegates to dh_agree since the callback provider manages key types internally.
+        let shared = self
+            .provider
+            .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
+            .await
+            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+        if shared.len() != 32 {
+            return Err(PlatformError::CustodyError(format!(
+                "ed25519_to_x25519_agree returned {} bytes, expected 32",
+                shared.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&shared);
+        Ok(SharedSecret::new(arr))
+    }
+
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         let type_str = self.provider.custody_type(key.id().to_string());
         match type_str.as_str() {
@@ -12082,6 +12105,9 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 mod tests {
     use super::*;
 
+    /// Mutex to serialize MCP allowlist tests (shared global state in `scp_mcp::allowlist`).
+    static ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_handle() -> Arc<ContextHandle> {
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
@@ -13112,6 +13138,9 @@ mod tests {
     /// Stdio allowlist: `get_state` returns default entries.
     #[test]
     fn mcp_allowlist_get_state_returns_defaults() {
+        let _guard = ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Reset to clean state first.
         mcp_reset_stdio_allowlist().expect("reset should succeed");
 
@@ -13135,6 +13164,9 @@ mod tests {
     /// Stdio allowlist: configure adds entries.
     #[test]
     fn mcp_allowlist_configure_adds_entries() {
+        let _guard = ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         mcp_reset_stdio_allowlist().expect("reset should succeed");
 
         mcp_configure_stdio_allowlist(vec!["my-custom-server".to_owned()])
@@ -13153,6 +13185,9 @@ mod tests {
     /// Stdio allowlist: configure rejects entries containing paths.
     #[test]
     fn mcp_allowlist_configure_rejects_path_entries() {
+        let _guard = ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = mcp_configure_stdio_allowlist(vec!["/usr/bin/evil".to_owned()]);
         assert!(result.is_err(), "path entries must be rejected");
     }
@@ -13160,6 +13195,9 @@ mod tests {
     /// Stdio allowlist: disable enters unrestricted mode.
     #[test]
     fn mcp_allowlist_disable_enters_unrestricted() {
+        let _guard = ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         mcp_reset_stdio_allowlist().expect("reset should succeed");
 
         mcp_disable_stdio_allowlist().expect("disable should succeed");
@@ -13173,6 +13211,9 @@ mod tests {
     /// Stdio allowlist: reset restores defaults and re-enables enforcement.
     #[test]
     fn mcp_allowlist_reset_restores_defaults() {
+        let _guard = ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Start by disabling and adding a custom entry.
         mcp_disable_stdio_allowlist().expect("disable should succeed");
         mcp_configure_stdio_allowlist(vec!["custom-thing".to_owned()])

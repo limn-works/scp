@@ -392,8 +392,8 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
         _context_id: &[u8; 32],
         _member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
+    ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
+        Ok(scp_core::context::AddMemberOutput::default())
     }
     fn remove_member(
         &self,

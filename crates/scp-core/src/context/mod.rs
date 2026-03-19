@@ -106,9 +106,9 @@ pub use roles::{
 
 // Re-export builder and manager types for convenience.
 pub use builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-    CreationReceipt, EventLogHandle, LocalTransportProvider, MlsGroupHandle,
-    NotConfiguredTransportProvider, SenderKeyHandle, create_context,
+    AddMemberOutput, ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
+    ContextTransportProvider, CreationReceipt, EventLogHandle, LocalTransportProvider,
+    MlsGroupHandle, NotConfiguredTransportProvider, SenderKeyHandle, create_context,
 };
 pub use manager::{
     ContentKeysRotatedResult, ContextManager, ContextManagerBuildError, ContextManagerBuilder,
@@ -120,7 +120,7 @@ pub use manager::{
 // Re-export membership types.
 pub use membership::{
     ContextEvent, DEFAULT_BUFFER_CAPACITY, KeyPackage, MAX_BUFFER_CAPACITY, MIN_BUFFER_CAPACITY,
-    MemberInfo, MembershipState, ReceiveBuffer,
+    MemberInfo, MembershipState, ReceiveBuffer, RedactedBytes,
 };
 
 // Re-export memory scope and key destruction types (SCP-067).

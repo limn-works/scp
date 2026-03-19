@@ -293,7 +293,12 @@ impl ContextCryptoProvider for ArcCryptoProvider {
     fn validate_key_package(&self, did: &str, kp: Option<&[u8]>) -> Result<(), ContextError> {
         self.0.validate_key_package(did, kp)
     }
-    fn add_member(&self, id: &[u8; 32], did: &str, kp: Option<&[u8]>) -> Result<(), ContextError> {
+    fn add_member(
+        &self,
+        id: &[u8; 32],
+        did: &str,
+        kp: Option<&[u8]>,
+    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         self.0.add_member(id, did, kp)
     }
     fn remove_member(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {

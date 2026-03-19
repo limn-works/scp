@@ -3680,6 +3680,18 @@ impl KeyCustody for NoOpCustody {
         )))
     }
 
+    fn ed25519_to_x25519_agree(
+        &self,
+        _handle: &scp_platform::KeyHandle,
+        _peer_x25519_public: &[u8; 32],
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::SharedSecret, scp_platform::PlatformError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )))
+    }
+
     fn custody_type(&self, _handle: &scp_platform::KeyHandle) -> scp_platform::CustodyType {
         scp_platform::CustodyType::InMemory
     }

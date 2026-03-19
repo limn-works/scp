@@ -471,6 +471,34 @@ impl KeyCustody for SqliteKeyCustody {
         }
     }
 
+    fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+        let key_id = ed25519_handle.id();
+        let peer = *peer_x25519_public;
+        async move {
+            let store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
+
+            if kt != KEY_TYPE_ED25519 {
+                return Err(PlatformError::WrongKeyType {
+                    expected: KeyType::Ed25519,
+                    actual: KeyType::X25519,
+                });
+            }
+
+            let signing_key = store
+                .ed25519_keys
+                .get(&key_id)
+                .ok_or(PlatformError::KeyNotFound)?;
+            let result = crate::traits::x25519_agree_from_ed25519(signing_key, &peer);
+            drop(store);
+            Ok(result)
+        }
+    }
+
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::Software
     }

@@ -211,6 +211,24 @@ impl Default for MembershipState {
 }
 
 // ---------------------------------------------------------------------------
+// RedactedBytes — debug-safe wrapper for sensitive protocol bytes
+// ---------------------------------------------------------------------------
+
+/// Wrapper for MLS protocol bytes that redacts content in `Debug` output.
+///
+/// Used for `WelcomeGenerated` fields (`welcome_bytes`, `commit_bytes`) which
+/// contain MLS keying material (tree secrets, epoch keys). Printing these via
+/// `Debug` in log or panic output would leak cryptographic secrets.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for RedactedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{} bytes, REDACTED]", self.0.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextEvent
 // ---------------------------------------------------------------------------
 
@@ -491,6 +509,24 @@ pub enum ContextEvent {
         /// implementation does not support. At SCP/1.x there are no
         /// known feature flags, so callers should pass `vec![]`.
         unsupported_features: Vec<String>,
+    },
+    /// An MLS Welcome was generated for a newly added member.
+    ///
+    /// The application layer must ECIES-encrypt and deliver it to the
+    /// joiner's personal routing ID (spec §5.12.3, issue #1311).
+    WelcomeGenerated {
+        /// Context ID for ECIES domain binding.
+        context_id: String,
+        /// DID of the context creator (for ECIES domain binding).
+        creator_did: DID,
+        /// DID of the member being invited.
+        member_did: DID,
+        /// TLS-serialized MLS Welcome message (redacted in Debug output to
+        /// prevent MLS tree secrets and epoch keys from appearing in logs).
+        welcome_bytes: RedactedBytes,
+        /// TLS-serialized MLS Commit message for existing members (redacted
+        /// in Debug output for the same reason as `welcome_bytes`).
+        commit_bytes: RedactedBytes,
     },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
