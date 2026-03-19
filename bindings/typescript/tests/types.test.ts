@@ -505,13 +505,13 @@ describe("validateSiteConfig", () => {
 
   it("rejects maxAssetsPerDeploy of 0", () => {
     expect(() => validateSiteConfig({ hostname: "example.com", maxAssetsPerDeploy: 0 })).toThrow(
-      "maxAssetsPerDeploy must be >= 1",
+      "maxAssetsPerDeploy must be a positive integer",
     );
   });
 
   it("rejects maxDeploySizeBytes of -1", () => {
     expect(() => validateSiteConfig({ hostname: "example.com", maxDeploySizeBytes: -1 })).toThrow(
-      "maxDeploySizeBytes must be >= 1",
+      "maxDeploySizeBytes must be a positive integer",
     );
   });
 
