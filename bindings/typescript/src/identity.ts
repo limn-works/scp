@@ -599,7 +599,10 @@ export class IdentityAttestation implements IdentityAttestationData {
   /** Optional platform-assigned unique identifier. */
   readonly platformId?: string | undefined;
 
-  constructor(data: IdentityAttestationData) {
+  /** @internal Raw JSON from the bridge for roundtrip verification. */
+  private readonly _rawJson?: Record<string, unknown> | undefined;
+
+  constructor(data: IdentityAttestationData, rawJson?: Record<string, unknown>) {
     this.id = data.id;
     this.platform = data.platform;
     this.platformHandle = data.platformHandle;
@@ -607,6 +610,7 @@ export class IdentityAttestation implements IdentityAttestationData {
     this.verifiedAt = data.verifiedAt;
     this.revocationStatus = data.revocationStatus;
     this.platformId = data.platformId;
+    this._rawJson = rawJson;
   }
 
   /**
@@ -629,7 +633,11 @@ export class IdentityAttestation implements IdentityAttestationData {
           "SCP-ATTEST-9014",
         );
       }
-      return await fn(JSON.stringify(this._toBridgeRecord()));
+      // Use raw JSON if available (preserves full structure for
+      // signature verification), otherwise fall back to bridge record.
+      const payload = this._rawJson ?? this._toBridgeRecord();
+      const result = await fn(JSON.stringify(payload));
+      return Boolean(result);
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }
@@ -659,18 +667,37 @@ export class IdentityAttestation implements IdentityAttestationData {
 
   /** @internal */
   static _fromRecord(data: Record<string, unknown>): IdentityAttestation {
+    // Read from nested `claim` and `evidence` structures when present
+    // (full attestation JSON), with fallback to flat keys.
+    const claim = (data.claim ?? {}) as Record<string, unknown>;
+    const evidence = (data.evidence ?? {}) as Record<string, unknown>;
+
+    const platform = (claim.platform ?? data.platform) as string;
+    const platformHandle = (claim.platform_handle ??
+      data.platform_handle ??
+      data.platformHandle) as string;
+    const platformId = (claim.platform_id ?? data.platform_id ?? data.platformId) as
+      | string
+      | undefined;
+    const verificationMethod = (evidence.method ??
+      data.verification_method ??
+      data.verificationMethod) as string;
+    const verifiedAt = (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number;
     const rawRs = data.revocation_status ?? data.revocationStatus ?? "active";
     const revocationStatus =
       rawRs instanceof RevocationStatus ? rawRs : RevocationStatus._fromBridgeValue(rawRs);
 
-    return new IdentityAttestation({
-      id: data.id as string,
-      platform: data.platform as string,
-      platformHandle: (data.platform_handle ?? data.platformHandle) as string,
-      verificationMethod: (data.verification_method ?? data.verificationMethod) as string,
-      verifiedAt: (data.verified_at ?? data.verifiedAt) as number,
-      revocationStatus,
-      platformId: (data.platform_id ?? data.platformId) as string | undefined,
-    });
+    return new IdentityAttestation(
+      {
+        id: data.id as string,
+        platform,
+        platformHandle,
+        verificationMethod,
+        verifiedAt,
+        revocationStatus,
+        platformId,
+      },
+      data,
+    );
   }
 }

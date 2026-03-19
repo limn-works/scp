@@ -56,8 +56,11 @@ pub const RENEWAL_INTERVAL_DNS_RECORD_DAYS: u32 = 180;
 /// No persistent proof exists; freshness of the interaction matters more.
 pub const RENEWAL_INTERVAL_CHALLENGE_RESPONSE_DAYS: u32 = 60;
 
-/// Milliseconds per day, for converting renewal intervals to timestamps.
-pub const MS_PER_DAY: u64 = 86_400_000;
+/// Seconds per day, for converting renewal intervals to timestamps.
+///
+/// All attestation timestamps use seconds (spec §3.5.1). Wire format,
+/// `verified_at`, `issued_at`, and expiry are all Unix seconds.
+pub const SECS_PER_DAY: u64 = 86_400;
 
 // ---------------------------------------------------------------------------
 // AttestationClass (§3.5.2)
@@ -66,8 +69,9 @@ pub const MS_PER_DAY: u64 = 86_400_000;
 /// Classification of verification methods by their proof model (§3.5.2).
 ///
 /// Determines cache TTLs and verification strategy:
-/// - **Cryptographic** — self-verifying via cryptographic proof (OAuth tokens,
-///   challenge-response signatures). Can be verified offline. Cache TTL: 24h.
+/// - **Cryptographic** — backed by cryptographic verification (OAuth JWTs
+///   verified against JWKS, challenge-response signatures). Can be verified
+///   without re-fetching external resources. Cache TTL: 24h.
 /// - **Reference** — requires fetching an external resource to verify (signed
 ///   posts, DNS records). Verification requires network access. Cache TTL: 1h.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,10 +149,10 @@ impl VerificationMethod {
         }
     }
 
-    /// Returns the recommended renewal interval in milliseconds for this method.
+    /// Returns the recommended renewal interval in seconds for this method.
     #[must_use]
-    pub const fn renewal_interval_ms(self) -> u64 {
-        self.renewal_interval_days() as u64 * MS_PER_DAY
+    pub const fn renewal_interval_secs(self) -> u64 {
+        self.renewal_interval_days() as u64 * SECS_PER_DAY
     }
 
     /// Returns the wire-format string for this method (matches `evidence.method`).
@@ -164,15 +168,17 @@ impl VerificationMethod {
 
     /// Returns the attestation class for this verification method (§7.4.1).
     ///
-    /// - **Cryptographic** methods (challenge-response, DNS record) produce proofs
-    ///   that can be verified without contacting the original platform.
-    /// - **Reference** methods (OAuth, signed post) require fetching or validating
-    ///   external platform data that may become unavailable.
+    /// - **Cryptographic** methods (OAuth, challenge-response) produce proofs
+    ///   backed by cryptographic verification (OAuth JWTs verified against JWKS,
+    ///   challenge-response signatures). Can be verified without re-fetching the
+    ///   original external resource.
+    /// - **Reference** methods (signed post, DNS record) require fetching or
+    ///   validating external platform data that may become unavailable.
     #[must_use]
     pub const fn attestation_class(self) -> AttestationClass {
         match self {
-            Self::Oauth | Self::SignedPost => AttestationClass::Reference,
-            Self::DnsRecord | Self::ChallengeResponse => AttestationClass::Cryptographic,
+            Self::Oauth | Self::ChallengeResponse => AttestationClass::Cryptographic,
+            Self::SignedPost | Self::DnsRecord => AttestationClass::Reference,
         }
     }
 }
@@ -343,7 +349,7 @@ pub struct AttestationEvidence {
     /// - `ChallengeResponse` → [`AttestationProof::ChallengeResponseVerified`]
     pub proof: AttestationProof,
 
-    /// Unix timestamp (milliseconds) of last verification.
+    /// Unix timestamp (seconds) of last verification.
     pub verified_at: u64,
 
     /// DID of the third-party verifier, if the evidence was verified by
@@ -354,13 +360,13 @@ pub struct AttestationEvidence {
 
 impl AttestationEvidence {
     /// Returns whether this evidence has expired relative to the given
-    /// current timestamp, based on the verification method's renewal interval.
+    /// current timestamp (seconds), based on the verification method's renewal interval.
     ///
     /// An evidence record is considered expired when
-    /// `now_ms - verified_at > method.renewal_interval_ms()`.
+    /// `now_secs - verified_at > method.renewal_interval_secs()`.
     #[must_use]
-    pub const fn is_expired(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.verified_at) > self.method.renewal_interval_ms()
+    pub const fn is_expired(&self, now_secs: u64) -> bool {
+        now_secs.saturating_sub(self.verified_at) > self.method.renewal_interval_secs()
     }
 
     /// Validates that the proof variant matches the declared verification method.
@@ -453,10 +459,10 @@ pub struct IdentityLinkAttestation {
     /// Same as `issuer` for self-attestations.
     pub subject: DID,
 
-    /// Unix timestamp (milliseconds) when the attestation was created.
+    /// Unix timestamp (seconds) when the attestation was created.
     pub issued_at: u64,
 
-    /// Optional expiry timestamp (milliseconds). If absent, valid until revoked.
+    /// Optional expiry timestamp (seconds). If absent, valid until revoked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 
@@ -490,24 +496,24 @@ impl IdentityLinkAttestation {
     /// Returns `false` if `expires_at` is `None` (no expiry set — valid
     /// until revoked).
     #[must_use]
-    pub fn is_time_expired(&self, now_ms: u64) -> bool {
-        self.expires_at.is_some_and(|exp| now_ms > exp)
+    pub fn is_time_expired(&self, now_secs: u64) -> bool {
+        self.expires_at.is_some_and(|exp| now_secs > exp)
     }
 
     /// Returns whether the evidence needs renewal based on the verification
     /// method's recommended interval (§3.5.2).
     #[must_use]
-    pub const fn needs_renewal(&self, now_ms: u64) -> bool {
-        self.evidence.is_expired(now_ms)
+    pub const fn needs_renewal(&self, now_secs: u64) -> bool {
+        self.evidence.is_expired(now_secs)
     }
 
-    /// Returns the renewal deadline (milliseconds) — the timestamp after
+    /// Returns the renewal deadline (seconds) — the timestamp after
     /// which this attestation's evidence is considered stale.
     #[must_use]
-    pub const fn renewal_deadline_ms(&self) -> u64 {
+    pub const fn renewal_deadline_secs(&self) -> u64 {
         self.evidence
             .verified_at
-            .saturating_add(self.evidence.method.renewal_interval_ms())
+            .saturating_add(self.evidence.method.renewal_interval_secs())
     }
 
     /// Computes the deterministic attestation ID from its components.
@@ -730,7 +736,7 @@ mod tests {
         let issuer = did("did:dht:z6MkAlice");
         let platform = "github.com";
         let handle = "alice";
-        let issued_at = 1_700_000_000_000_u64;
+        let issued_at = 1_700_000_000_u64;
 
         IdentityLinkAttestation {
             id: IdentityLinkAttestation::compute_id(&issuer, platform, handle, issued_at),
@@ -751,7 +757,7 @@ mod tests {
                     subject_id: "12345".to_owned(),
                     verified_at: 1_700_000_000,
                 },
-                verified_at: 1_700_000_000_000,
+                verified_at: 1_700_000_000,
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("/revocations".to_owned()),
@@ -776,14 +782,14 @@ mod tests {
     }
 
     #[test]
-    fn verification_method_renewal_ms() {
+    fn verification_method_renewal_secs() {
         assert_eq!(
-            VerificationMethod::Oauth.renewal_interval_ms(),
-            30 * MS_PER_DAY
+            VerificationMethod::Oauth.renewal_interval_secs(),
+            30 * SECS_PER_DAY
         );
         assert_eq!(
-            VerificationMethod::DnsRecord.renewal_interval_ms(),
-            180 * MS_PER_DAY
+            VerificationMethod::DnsRecord.renewal_interval_secs(),
+            180 * SECS_PER_DAY
         );
     }
 
@@ -861,11 +867,11 @@ mod tests {
                 subject_id: "12345".to_owned(),
                 verified_at: 1_700_000_000,
             },
-            verified_at: 1_700_000_000_000,
+            verified_at: 1_700_000_000,
             verifier_did: None,
         };
         // 15 days later — within 30-day renewal
-        let now = 1_700_000_000_000 + 15 * MS_PER_DAY;
+        let now = 1_700_000_000 + 15 * SECS_PER_DAY;
         assert!(!evidence.is_expired(now));
     }
 
@@ -878,11 +884,11 @@ mod tests {
                 subject_id: "12345".to_owned(),
                 verified_at: 1_700_000_000,
             },
-            verified_at: 1_700_000_000_000,
+            verified_at: 1_700_000_000,
             verifier_did: None,
         };
         // 31 days later — past 30-day renewal
-        let now = 1_700_000_000_000 + 31 * MS_PER_DAY;
+        let now = 1_700_000_000 + 31 * SECS_PER_DAY;
         assert!(evidence.is_expired(now));
     }
 
@@ -895,11 +901,11 @@ mod tests {
                 nonce: "abc123".to_owned(),
                 posted_at: 1_700_000_000,
             },
-            verified_at: 1_700_000_000_000,
+            verified_at: 1_700_000_000,
             verifier_did: None,
         };
         // Exactly at 90 days — not expired (boundary is >)
-        let now = 1_700_000_000_000 + 90 * MS_PER_DAY;
+        let now = 1_700_000_000 + 90 * SECS_PER_DAY;
         assert!(!evidence.is_expired(now));
     }
 
@@ -911,7 +917,7 @@ mod tests {
                 challenge: "abc".to_owned(),
                 response_signature: "def".to_owned(),
             },
-            verified_at: 1_700_000_000_000,
+            verified_at: 1_700_000_000,
             verifier_did: Some(did("did:dht:z6MkVerifier")),
         };
         let json = serde_json::to_string(&evidence).unwrap();
@@ -1045,22 +1051,22 @@ mod tests {
     #[test]
     fn attestation_is_time_expired_before_expiry() {
         let mut attestation = make_attestation();
-        attestation.expires_at = Some(2_000_000_000_000);
-        assert!(!attestation.is_time_expired(1_999_999_999_999));
+        attestation.expires_at = Some(2_000_000_000);
+        assert!(!attestation.is_time_expired(1_999_999_999));
     }
 
     #[test]
     fn attestation_is_time_expired_after_expiry() {
         let mut attestation = make_attestation();
-        attestation.expires_at = Some(2_000_000_000_000);
-        assert!(attestation.is_time_expired(2_000_000_000_001));
+        attestation.expires_at = Some(2_000_000_000);
+        assert!(attestation.is_time_expired(2_000_000_001));
     }
 
     #[test]
     fn attestation_needs_renewal_fresh() {
         let attestation = make_attestation();
         // 5 days later — well within 30-day OAuth renewal
-        let now = attestation.evidence.verified_at + 5 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 5 * SECS_PER_DAY;
         assert!(!attestation.needs_renewal(now));
     }
 
@@ -1068,15 +1074,15 @@ mod tests {
     fn attestation_needs_renewal_stale() {
         let attestation = make_attestation();
         // 31 days later — past 30-day OAuth renewal
-        let now = attestation.evidence.verified_at + 31 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 31 * SECS_PER_DAY;
         assert!(attestation.needs_renewal(now));
     }
 
     #[test]
-    fn attestation_renewal_deadline_ms() {
+    fn attestation_renewal_deadline_secs() {
         let attestation = make_attestation();
-        let expected = attestation.evidence.verified_at + 30 * MS_PER_DAY;
-        assert_eq!(attestation.renewal_deadline_ms(), expected);
+        let expected = attestation.evidence.verified_at + 30 * SECS_PER_DAY;
+        assert_eq!(attestation.renewal_deadline_secs(), expected);
     }
 
     #[test]
@@ -1098,11 +1104,11 @@ mod tests {
     #[test]
     fn attestation_with_expiry_serialization() {
         let mut attestation = make_attestation();
-        attestation.expires_at = Some(1_800_000_000_000);
+        attestation.expires_at = Some(1_800_000_000);
         let json = serde_json::to_string(&attestation).unwrap();
-        assert!(json.contains("1800000000000"));
+        assert!(json.contains("1800000000"));
         let deserialized: IdentityLinkAttestation = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.expires_at, Some(1_800_000_000_000));
+        assert_eq!(deserialized.expires_at, Some(1_800_000_000));
     }
 
     #[test]
@@ -1110,10 +1116,10 @@ mod tests {
         let mut attestation = make_attestation();
         attestation.evidence.method = VerificationMethod::DnsRecord;
         // 100 days — within 180-day DNS renewal
-        let now = attestation.evidence.verified_at + 100 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 100 * SECS_PER_DAY;
         assert!(!attestation.needs_renewal(now));
         // 181 days — past renewal
-        let now = attestation.evidence.verified_at + 181 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 181 * SECS_PER_DAY;
         assert!(attestation.needs_renewal(now));
     }
 

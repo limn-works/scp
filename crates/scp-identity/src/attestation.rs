@@ -252,6 +252,11 @@ const IDENTITY_LINK_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
 ///
 /// Each variant corresponds to an entry in the closed provider registry.
 /// New providers are added by spec amendment only.
+///
+/// NOTE: The spec currently lists 7 platforms. This enum includes 16 as
+/// agreed in the attestation design discussion. A spec amendment adding
+/// the remaining 9 (linkedin.com, discord.com, reddit.com, bluesky.com,
+/// telegram.com, npm, pypi, steam, well-known) is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IdentityLinkPlatform {
     /// GitHub (`github.com`). Class 2. Verification: `SignedPost` (profile bio).

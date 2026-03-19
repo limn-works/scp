@@ -1299,21 +1299,16 @@ fn py_create_identity_link_attestation(
 
         crate::runtime::with_identity_mut(&did_owned, |entry| {
             let issuer = DID::from(did_owned.as_str());
-            let now_ms = std::time::SystemTime::now()
+            let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| {
-                    // Millisecond timestamp won't exceed u64 before ~year 584M.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let ms = d.as_millis() as u64;
-                    ms
-                })
+                .map(|d| d.as_secs())
                 .unwrap_or(0);
 
             let id = IdentityLinkAttestation::compute_id(
                 &issuer,
                 &platform_owned,
                 &handle_owned,
-                now_ms,
+                now_secs,
             );
 
             // Build the attestation with a placeholder signature.
@@ -1322,13 +1317,13 @@ fn py_create_identity_link_attestation(
                 attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
                 issuer: issuer.clone(),
                 subject: issuer,
-                issued_at: now_ms,
+                issued_at: now_secs,
                 expires_at: None,
                 claim: AttestationClaim::new(platform_owned, handle_owned, platform_id_owned),
                 evidence: AttestationEvidence {
                     method,
                     proof,
-                    verified_at: now_ms,
+                    verified_at: now_secs,
                     verifier_did: None,
                 },
                 revocation: AttestationRevocation::new("/revocations".to_owned()),

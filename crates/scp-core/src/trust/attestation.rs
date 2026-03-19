@@ -1054,25 +1054,26 @@ pub(crate) fn canonical_attestation_bytes(
 ) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Serialize evidence as MessagePack bytes if present.
+    // Serialize evidence as MessagePack bytes (named/sorted keys) if present.
     let evidence_bytes = attestation
         .evidence
         .as_ref()
         .map(|e| {
-            rmp_serde::to_vec(e).map_err(|err| TrustError::InvalidEventData {
+            rmp_serde::to_vec_named(e).map_err(|err| TrustError::InvalidEventData {
                 sequence: 0,
                 reason: format!("evidence serialization failed: {err}"),
             })
         })
         .transpose()?;
 
-    // Serialize revocation_status as MessagePack bytes.
-    let revocation_bytes = rmp_serde::to_vec(&attestation.revocation_status).map_err(|err| {
-        TrustError::InvalidEventData {
-            sequence: 0,
-            reason: format!("revocation_status serialization failed: {err}"),
-        }
-    })?;
+    // Serialize revocation_status as MessagePack bytes (named/sorted keys).
+    let revocation_bytes =
+        rmp_serde::to_vec_named(&attestation.revocation_status).map_err(|err| {
+            TrustError::InvalidEventData {
+                sequence: 0,
+                reason: format!("revocation_status serialization failed: {err}"),
+            }
+        })?;
 
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.

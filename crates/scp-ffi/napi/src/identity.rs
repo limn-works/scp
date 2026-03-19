@@ -1392,29 +1392,25 @@ pub async fn identity_create_link_attestation(
 
     crate::runtime::with_identity_mut(&did, |entry| {
         let issuer = DID::from(did.as_str());
-        let now_ms = std::time::SystemTime::now()
+        let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| {
-                #[allow(clippy::cast_possible_truncation)]
-                let ms = d.as_millis() as u64;
-                ms
-            })
+            .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_ms);
+        let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
 
         let mut attestation = IdentityLinkAttestation {
             id,
             attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
             issuer: issuer.clone(),
             subject: issuer,
-            issued_at: now_ms,
+            issued_at: now_secs,
             expires_at: None,
             claim: AttestationClaim::new(platform, handle, platform_id),
             evidence: AttestationEvidence {
                 method,
                 proof,
-                verified_at: now_ms,
+                verified_at: now_secs,
                 verifier_did: None,
             },
             revocation: AttestationRevocation::new("/revocations".to_owned()),

@@ -165,9 +165,12 @@ fn make_signed_attestation(
     use scp_core::trust::attestation_type_tag;
 
     let claim_str = att.claim.to_string();
-    let evidence_bytes = att.evidence.as_ref().map(|e| rmp_serde::to_vec(e).unwrap());
+    let evidence_bytes = att
+        .evidence
+        .as_ref()
+        .map(|e| rmp_serde::to_vec_named(e).unwrap());
     let att_type_tag = attestation_type_tag(&att.attestation_type);
-    let revocation_bytes = rmp_serde::to_vec(&att.revocation_status).unwrap();
+    let revocation_bytes = rmp_serde::to_vec_named(&att.revocation_status).unwrap();
 
     let canonical = canonical_hash(
         "SCP-ATTESTATION-V2:",

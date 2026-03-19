@@ -226,9 +226,9 @@ fn conf_004_agent_binding_attestation() {
     let claim_str = claim.to_string();
 
     print_step(1, "Create identity attestation binding agent to human");
-    // RevocationStatus::Active serialized as MessagePack.
+    // RevocationStatus::Active serialized as MessagePack (named keys).
     let revocation_active_bytes =
-        rmp_serde::to_vec(&scp_core::trust::RevocationStatus::Active).unwrap();
+        rmp_serde::to_vec_named(&scp_core::trust::RevocationStatus::Active).unwrap();
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.
     let attestation_payload = canonical_hash_bytes(

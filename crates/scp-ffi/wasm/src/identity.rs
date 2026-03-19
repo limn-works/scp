@@ -81,16 +81,45 @@ mod canonical_attestation {
 
     /// Mirrors `scp_core::identity::attestation::AttestationEvidence` field order:
     /// `method`, `proof`, `verified_at`, `verifier_did`.
-    ///
-    /// `proof` is `serde_json::Value` to support `AttestationProof`'s tagged enum
-    /// format (e.g., `{"type": "oauth_verified", "provider": "...", ...}`).
     #[derive(Serialize, Deserialize)]
     pub(super) struct Evidence {
         pub method: String,
-        pub proof: serde_json::Value,
+        pub proof: Proof,
         pub verified_at: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub verifier_did: Option<String>,
+    }
+
+    /// Mirrors `scp_core::identity::attestation::AttestationProof` (§3.5.2).
+    ///
+    /// Uses `#[serde(tag = "type")]` with `rename_all = "snake_case"` to match
+    /// scp-core's wire format. This ensures `rmp_serde::to_vec_named` produces
+    /// keys in the same order as scp-core, producing byte-identical msgpack.
+    ///
+    /// Variant names intentionally mirror scp-core's `AttestationProof` enum
+    /// (all end in `Verified`), so we suppress the clippy lint.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    #[allow(clippy::enum_variant_names)]
+    pub(super) enum Proof {
+        OauthVerified {
+            provider: String,
+            subject_id: String,
+            verified_at: u64,
+        },
+        SignedPostVerified {
+            post_url: String,
+            nonce: String,
+            posted_at: u64,
+        },
+        DnsRecordVerified {
+            domain: String,
+            record_name: String,
+        },
+        ChallengeResponseVerified {
+            challenge: String,
+            response_signature: String,
+        },
     }
 }
 
@@ -1821,7 +1850,7 @@ pub fn identity_create_link_attestation(
             }
         };
 
-        let now_ms = crate::time::now_secs() * 1000;
+        let now_secs = crate::time::now_secs();
 
         // Compute deterministic attestation ID.
         let issuer_bytes = did.as_bytes();
@@ -1833,7 +1862,7 @@ pub fn identity_create_link_attestation(
         hasher.update(platform.as_bytes());
         hasher.update((handle.len() as u32).to_be_bytes());
         hasher.update(handle.as_bytes());
-        hasher.update(now_ms.to_be_bytes());
+        hasher.update(now_secs.to_be_bytes());
         let id = hex::encode(hasher.finalize());
 
         // Build the tagged proof object matching scp-core's AttestationProof enum.
@@ -1842,7 +1871,7 @@ pub fn identity_create_link_attestation(
                 "type": "signed_post_verified",
                 "post_url": proof,
                 "nonce": "",
-                "posted_at": now_ms / 1000,
+                "posted_at": now_secs,
             }),
             "dns_record" => serde_json::json!({
                 "type": "dns_record_verified",
@@ -1859,7 +1888,7 @@ pub fn identity_create_link_attestation(
                 "type": "oauth_verified",
                 "provider": platform,
                 "subject_id": proof,
-                "verified_at": now_ms / 1000,
+                "verified_at": now_secs,
             }),
         };
 
@@ -1869,7 +1898,7 @@ pub fn identity_create_link_attestation(
             "type": "identity_link",
             "issuer": did,
             "subject": did,
-            "issued_at": now_ms,
+            "issued_at": now_secs,
             "claim": {
                 "platform": platform,
                 "platform_handle": handle,
@@ -1878,7 +1907,7 @@ pub fn identity_create_link_attestation(
             "evidence": {
                 "method": method_str,
                 "proof": proof_value,
-                "verified_at": now_ms,
+                "verified_at": now_secs,
             },
             "revocation": {
                 "method": "did_document",
@@ -1949,7 +1978,7 @@ pub fn identity_create_link_attestation(
                 h.update(field);
             }
             // U64: issued_at
-            h.update(now_ms.to_be_bytes());
+            h.update(now_secs.to_be_bytes());
             // Absent sentinel for expires_at: SHA-256(0x00), matching scp-core.
             h.update(ABSENT_SENTINEL);
             // VarBytes for claim, evidence, revocation_status
@@ -2117,14 +2146,22 @@ fn compute_attestation_canonical_bytes(
 
     let claim_msgpack = rmp_serde::to_vec_named(&claim).unwrap_or_default();
     let evidence_msgpack = rmp_serde::to_vec_named(&evidence).unwrap_or_default();
-    // revocation_status matches scp-core's RevocationStatus enum (Active variant),
-    // serialized as msgpack. NOT the revocation metadata struct.
-    let revocation_status_str = attestation
+    // revocation_status matches scp-core's RevocationStatus enum,
+    // serialized as msgpack. Handles both "Active" string and
+    // {"Revoked": { ... }} object variants.
+    let revocation_status_value = attestation
         .get("revocation_status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Active");
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("Active"));
     let revocation_status_msgpack =
-        rmp_serde::to_vec_named(&serde_json::json!(revocation_status_str)).unwrap_or_default();
+        rmp_serde::to_vec_named(&revocation_status_value).map_err(|e| -> JsValue {
+            ScpWasmError::Identity {
+                message: format!("revocation_status serialization failed: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
 
     let mut h = Sha256::new();
     h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V2:");
