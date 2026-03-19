@@ -17,7 +17,7 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, RunningNode, RunningRelay, ServerError};
+use scp_ffi_common::server::{self, NodeIdentity, RunningNode, RunningRelay, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
 
@@ -36,6 +36,40 @@ fn server_err(e: ServerError) -> NapiError {
 fn node_err(e: NodeError) -> NapiError {
     tracing::error!(error = %e, "node operation failed");
     NapiError::from_reason("node operation failed")
+}
+
+/// Auto-wires the global [`ContextManager`] with relay transport after
+/// node startup.
+///
+/// Connects to the node's local relay and initializes the `ContextManager`
+/// with `RelayTransportProvider` so that context operations (create, join,
+/// send) work immediately. If the `ContextManager` was already initialized
+/// (e.g., by a prior `configureLocalTransport` or `contextCreate` call),
+/// this is a no-op — the `OnceLock` ensures first-writer-wins semantics.
+///
+/// Best-effort: logs a warning if the relay connection fails rather than
+/// blocking node startup.
+async fn auto_wire_context_manager(did: &str, relay_url: &str) {
+    let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+    };
+    match scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced).await {
+        Ok(adapter) => {
+            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                relay_url = %relay_url,
+                "auto_wire_context_manager: failed to connect to node relay — \
+                 context operations may fail until transport is configured manually"
+            );
+            // Fall back to initializing without transport so that at least
+            // the ContextManager exists (with NotConfiguredTransportProvider).
+            crate::runtime::init_context_manager(did);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +224,12 @@ impl NapiNodeHandle {
                     // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
                     (key_bytes, 0u64, did)
                 }
-                (None, None) => {
-                    // Auto-resolve from ContextManager using node's identity DID.
-                    let node_did = self.inner.did().to_owned();
+                (None, author_opt) => {
+                    // Auto-resolve: use provided author_did or fall back to node DID.
+                    let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
                     let mgr = crate::runtime::context_manager()?;
                     let (key_bytes, epoch) = mgr
-                    .get_broadcast_key_for_local_author(&context_id, &node_did)
+                    .get_broadcast_key_for_local_author(&context_id, &did)
                     .await
                     .map_err(|e| {
                         tracing::debug!(error = %e, "broadcast key auto-resolve failed");
@@ -203,12 +237,10 @@ impl NapiNodeHandle {
                             "broadcast key auto-resolve failed: not authorized for this context",
                         )
                     })?;
-                    (key_bytes, epoch, node_did)
+                    (key_bytes, epoch, did)
                 }
-                _ => {
-                    return Err(NapiError::from_reason(
-                        "broadcastKeyHex and authorDid must both be provided or both be null",
-                    ));
+                (Some(_), None) => {
+                    return Err(NapiError::from_reason("broadcastKeyHex requires authorDid"));
                 }
             };
 
@@ -345,6 +377,83 @@ impl Drop for NapiNodeHandle {
 }
 
 // ---------------------------------------------------------------------------
+// build_node_identity — constructs NodeIdentity from identity registry
+// ---------------------------------------------------------------------------
+
+/// Builds a [`NodeIdentity`] from the NAPI identity registry for a given DID.
+///
+/// Looks up the DID in the global identity registry (populated by
+/// `identity_create`) and constructs a `NodeIdentity` with a properly
+/// configured `DidDht` instance that has signing capability.
+///
+/// # Errors
+///
+/// Returns `napi::Error` if:
+/// - The `allow_in_memory_custody` feature is not enabled.
+/// - The DID is not found in the identity registry.
+#[cfg(feature = "allow_in_memory_custody")]
+#[allow(clippy::type_complexity)]
+fn build_node_identity(did: &str) -> napi::Result<NodeIdentity> {
+    use std::sync::Arc;
+
+    use scp_identity::{DidCache, InMemoryDhtClient};
+    use scp_platform::traits::KeyCustody;
+
+    crate::runtime::with_identity(did, |entry| {
+        let custody_clone = Arc::clone(&entry.custody);
+
+        // Build a signing function from the retained custody — same pattern as
+        // `make_dht_with_signer` in identity.rs, but returning the closure
+        // type that `DidDht::with_client_and_signer` expects.
+        let sign_fn: Arc<
+            dyn Fn(
+                    u64,
+                    Vec<u8>,
+                ) -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<Vec<u8>, scp_identity::IdentityError>,
+                            > + Send,
+                    >,
+                > + Send
+                + Sync,
+        > = Arc::new(move |key_id: u64, data: Vec<u8>| {
+            let kc = Arc::clone(&custody_clone);
+            Box::pin(async move {
+                let handle = scp_platform::traits::KeyHandle::new(key_id);
+                let sig =
+                    kc.0.sign(&handle, &data)
+                        .await
+                        .map_err(scp_identity::IdentityError::Platform)?;
+                Ok(sig.into_bytes())
+            })
+        });
+
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let did_method = Arc::new(
+            scp_ffi_common::server::ConcreteDidMethod::with_client_and_signer(
+                dht_client, cache, sign_fn,
+            ),
+        );
+
+        Ok(NodeIdentity {
+            identity: entry.identity.clone(),
+            document: entry.document.clone(),
+            did_method,
+        })
+    })
+    .map_err(napi::Error::from)
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+fn build_node_identity(_did: &str) -> napi::Result<NodeIdentity> {
+    Err(NapiError::from_reason(
+        "identity portability requires in-memory custody — enable allow_in_memory_custody",
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Free functions — relay startup
 // ---------------------------------------------------------------------------
 
@@ -393,17 +502,42 @@ pub async fn relay_start_local(data_dir: String) -> napi::Result<NapiRelayHandle
 /// Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
 /// self-signed TLS, and a relay on an OS-assigned port.
 ///
+/// When `identityDid` is provided, the node uses the pre-existing identity
+/// from the identity registry (created via `identityCreate`) instead of
+/// generating a fresh one. This enables identity portability — the same
+/// DID persists across node restarts. The `ContextManager` is also
+/// auto-initialized with the node's relay as transport.
+///
 /// ```js
 /// const node = await nodeStartInMemory();
 /// console.log(node.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
 /// console.log(node.did);      // "did:dht:z6Mk..."
 /// node.shutdown();
+///
+/// // With identity portability:
+/// const id = await identityCreate("in_memory");
+/// const node2 = await nodeStartInMemory(id.did);
+/// console.log(node2.did === id.did); // true
 /// ```
 #[napi]
-pub async fn node_start_in_memory() -> napi::Result<NapiNodeHandle> {
-    let node = server::start_node_in_memory(None)
+pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<NapiNodeHandle> {
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+            Some(build_node_identity(did)?)
+        }
+        None => None,
+    };
+    let node = server::start_node_in_memory(node_identity)
         .await
         .map_err(server_err)?;
+
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(&did, &relay_url).await;
+
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::InMemory(node),
@@ -413,21 +547,45 @@ pub async fn node_start_in_memory() -> napi::Result<NapiNodeHandle> {
 /// Starts a full application node with file-backed storage.
 ///
 /// Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
-/// blob database at `<data_dir>/blobs.redb`. A new DID identity is generated
-/// on every invocation (key custody is in-memory — keys do not survive
-/// process restarts).
+/// blob database at `<data_dir>/blobs.redb`.
+///
+/// When `identityDid` is provided, the node uses the pre-existing identity
+/// from the identity registry instead of generating a fresh one. When
+/// `identityDid` is `null`, the node creates or reloads a persistent
+/// identity via `FileKeyCustody` (requires `SCP_KEY_PASSPHRASE` env var).
 ///
 /// ```js
 /// const node = await nodeStartLocal("/tmp/my-node");
 /// console.log(node.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
 /// console.log(node.did);      // "did:dht:z6Mk..."
 /// node.shutdown();
+///
+/// // With identity portability:
+/// const id = await identityCreate("in_memory");
+/// const node2 = await nodeStartLocal("/tmp/my-node", id.did);
+/// console.log(node2.did === id.did); // true
 /// ```
 #[napi]
-pub async fn node_start_local(data_dir: String) -> napi::Result<NapiNodeHandle> {
-    let node = server::start_node_local(std::path::Path::new(&data_dir), None)
+pub async fn node_start_local(
+    data_dir: String,
+    identity_did: Option<String>,
+) -> napi::Result<NapiNodeHandle> {
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+            Some(build_node_identity(did)?)
+        }
+        None => None,
+    };
+    let node = server::start_node_local(std::path::Path::new(&data_dir), node_identity)
         .await
         .map_err(server_err)?;
+
+    // Auto-wire the ContextManager with relay transport.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(&did, &relay_url).await;
+
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::Filesystem(node),
@@ -484,7 +642,7 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let node = rt().block_on(node_start_in_memory()).unwrap();
+        let node = rt().block_on(node_start_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -506,7 +664,7 @@ mod tests {
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-napi-node-test-{}", std::process::id()));
         let node = rt()
-            .block_on(node_start_local(tmp.to_string_lossy().into_owned()))
+            .block_on(node_start_local(tmp.to_string_lossy().into_owned(), None))
             .unwrap();
         let url = node.relay_url();
         assert!(
@@ -534,7 +692,7 @@ mod tests {
 
     #[test]
     fn node_shutdown_is_idempotent() {
-        let node = rt().block_on(node_start_in_memory()).unwrap();
+        let node = rt().block_on(node_start_in_memory(None)).unwrap();
         node.shutdown();
         // Second shutdown should not panic.
         node.shutdown();

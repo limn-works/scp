@@ -69,8 +69,8 @@ interface NativeNodeHandle {
 interface ServerAddon {
   relayStartInMemory(): Promise<NativeRelayHandle>;
   relayStartLocal(dataDir: string): Promise<NativeRelayHandle>;
-  nodeStartInMemory(): Promise<NativeNodeHandle>;
-  nodeStartLocal(dataDir: string): Promise<NativeNodeHandle>;
+  nodeStartInMemory(identityDid: string | null): Promise<NativeNodeHandle>;
+  nodeStartLocal(dataDir: string, identityDid: string | null): Promise<NativeNodeHandle>;
   transportConnect(relayUrl: string): Promise<unknown>;
   configureLocalTransport(localDid: string): void;
 }
@@ -248,10 +248,18 @@ export class Node implements AsyncDisposable {
    *
    * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
    * client, self-signed TLS, and a relay on an OS-assigned port.
+   *
+   * When `identityDid` is provided, the node uses the pre-existing identity
+   * (created via `identityCreate`) instead of generating a fresh one. This
+   * enables identity portability — the same DID persists across node
+   * restarts. The `ContextManager` is also auto-initialized with the
+   * node's relay as transport.
+   *
+   * @param identityDid - Optional DID string from a previously created identity.
    */
-  static async startInMemory(): Promise<Node> {
+  static async startInMemory(identityDid?: string): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartInMemory();
+    const handle = await addon.nodeStartInMemory(identityDid ?? null);
     return new Node(handle);
   }
 
@@ -261,11 +269,17 @@ export class Node implements AsyncDisposable {
    * Opens (or creates) persistent storage at `<dataDir>/storage/` and a
    * redb blob database at `<dataDir>/blobs.redb`.
    *
+   * When `identityDid` is provided, the node uses the pre-existing identity
+   * instead of generating a fresh one. When omitted, the node creates or
+   * reloads a persistent identity via `FileKeyCustody` (requires
+   * `SCP_KEY_PASSPHRASE` env var).
+   *
    * @param dataDir - Directory for persistent storage.
+   * @param identityDid - Optional DID string from a previously created identity.
    */
-  static async startLocal(dataDir: string): Promise<Node> {
+  static async startLocal(dataDir: string, identityDid?: string): Promise<Node> {
     const addon = loadServerAddon();
-    const handle = await addon.nodeStartLocal(dataDir);
+    const handle = await addon.nodeStartLocal(dataDir, identityDid ?? null);
     return new Node(handle);
   }
 
@@ -329,8 +343,8 @@ export class Node implements AsyncDisposable {
     authorDid?: string,
   ): Promise<void> {
     validateAdmission(admission);
-    if ((broadcastKeyHex === undefined) !== (authorDid === undefined)) {
-      throw new Error("broadcastKeyHex and authorDid must both be provided or both be omitted");
+    if (broadcastKeyHex !== undefined && authorDid === undefined) {
+      throw new Error("broadcastKeyHex requires authorDid");
     }
     if (broadcastKeyHex !== undefined) {
       validateBroadcastKeyHex(broadcastKeyHex);
