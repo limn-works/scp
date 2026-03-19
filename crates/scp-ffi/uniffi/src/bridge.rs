@@ -12105,6 +12105,9 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 mod tests {
     use super::*;
 
+    /// Mutex to serialize MCP allowlist tests (shared global state in `scp_mcp::allowlist`).
+    static ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_handle() -> Arc<ContextHandle> {
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
@@ -13135,6 +13138,7 @@ mod tests {
     /// Stdio allowlist: `get_state` returns default entries.
     #[test]
     fn mcp_allowlist_get_state_returns_defaults() {
+        let _guard = ALLOWLIST_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Reset to clean state first.
         mcp_reset_stdio_allowlist().expect("reset should succeed");
 
@@ -13158,6 +13162,7 @@ mod tests {
     /// Stdio allowlist: configure adds entries.
     #[test]
     fn mcp_allowlist_configure_adds_entries() {
+        let _guard = ALLOWLIST_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         mcp_reset_stdio_allowlist().expect("reset should succeed");
 
         mcp_configure_stdio_allowlist(vec!["my-custom-server".to_owned()])
@@ -13176,6 +13181,7 @@ mod tests {
     /// Stdio allowlist: configure rejects entries containing paths.
     #[test]
     fn mcp_allowlist_configure_rejects_path_entries() {
+        let _guard = ALLOWLIST_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = mcp_configure_stdio_allowlist(vec!["/usr/bin/evil".to_owned()]);
         assert!(result.is_err(), "path entries must be rejected");
     }
@@ -13183,6 +13189,7 @@ mod tests {
     /// Stdio allowlist: disable enters unrestricted mode.
     #[test]
     fn mcp_allowlist_disable_enters_unrestricted() {
+        let _guard = ALLOWLIST_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         mcp_reset_stdio_allowlist().expect("reset should succeed");
 
         mcp_disable_stdio_allowlist().expect("disable should succeed");
@@ -13196,6 +13203,7 @@ mod tests {
     /// Stdio allowlist: reset restores defaults and re-enables enforcement.
     #[test]
     fn mcp_allowlist_reset_restores_defaults() {
+        let _guard = ALLOWLIST_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Start by disabling and adding a custom entry.
         mcp_disable_stdio_allowlist().expect("disable should succeed");
         mcp_configure_stdio_allowlist(vec!["custom-thing".to_owned()])
