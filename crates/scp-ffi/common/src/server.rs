@@ -593,6 +593,20 @@ impl RunningNode {
 mod tests {
     use super::*;
 
+    /// Set `SCP_KEY_PASSPHRASE` exactly once for the entire test binary.
+    ///
+    /// `std::sync::Once` guarantees the closure runs at most once, even
+    /// under concurrent test threads, so the `set_var` happens before any
+    /// parallel reader and is never repeated.
+    fn ensure_test_passphrase() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            // SAFETY: test-only, called exactly once before any concurrent reads.
+            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
+        });
+    }
+
     #[tokio::test]
     async fn relay_in_memory_returns_valid_ws_url() {
         let relay = start_relay_in_memory().await.unwrap();
@@ -662,9 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_returns_relay_url_and_did() {
-        // FileKeyCustody requires a passphrase via env var.
-        // SAFETY: test-only, single-threaded tokio test.
-        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase-local") };
+        ensure_test_passphrase();
         let tmp = std::env::temp_dir().join(format!("scp-test-node-local-{}", std::process::id()));
         let node = start_node_local(&tmp, None).await.unwrap();
 
@@ -701,9 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_reuses_data_dir_across_restarts() {
-        // FileKeyCustody requires a passphrase via env var.
-        // SAFETY: test-only, single-threaded tokio test.
-        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase-persist") };
+        ensure_test_passphrase();
         let tmp =
             std::env::temp_dir().join(format!("scp-test-node-persist-{}", std::process::id()));
 
@@ -1009,10 +1019,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// This test removes the `SCP_KEY_PASSPHRASE` env var to verify the
+    /// error path. Because env vars are process-global, this races with
+    /// parallel tests that read the same variable. Run in isolation:
+    ///
+    /// ```sh
+    /// cargo test -p scp-ffi-common --features server -- --ignored node_local_without_identity
+    /// ```
     #[tokio::test]
+    #[ignore = "mutates process-global SCP_KEY_PASSPHRASE — must run in isolation (--ignored)"]
     async fn node_local_without_identity_requires_passphrase() {
-        // Temporarily remove the env var to verify the error.
-        // SAFETY: test-only, single-threaded tokio test.
+        // SAFETY: test-only, run in isolation via #[ignore].
         let prev = std::env::var("SCP_KEY_PASSPHRASE").ok();
         unsafe { std::env::remove_var("SCP_KEY_PASSPHRASE") };
 
@@ -1022,7 +1039,7 @@ mod tests {
 
         // Restore env var if it was set before.
         if let Some(val) = prev {
-            // SAFETY: test-only, single-threaded tokio test.
+            // SAFETY: test-only, restoring after isolated run.
             unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", val) };
         }
 
