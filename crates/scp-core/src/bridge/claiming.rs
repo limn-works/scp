@@ -802,7 +802,7 @@ mod tests {
         let mut attestation = make_identity_attestation(&did, HANDLE, &signing_key);
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 1_700_000_250,
-            reason: Some("compromised".to_owned()),
+            reason: "compromised".to_owned(),
             revoked_by: did.clone(),
         };
 
@@ -822,7 +822,7 @@ mod tests {
         let mut attestation = make_identity_attestation(&did, HANDLE, &signing_key);
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 1_700_000_250,
-            reason: Some("forged revocation".to_owned()),
+            reason: "forged revocation".to_owned(),
             revoked_by: "did:key:mallory".into(),
         };
 

@@ -461,7 +461,7 @@ mod tests {
             renewed_at: None,
             revocation_status: RevocationStatus::Revoked {
                 revoked_at: 1500,
-                reason: Some("revoked for test".to_owned()),
+                reason: "revoked for test".to_owned(),
                 revoked_by: "did:key:issuer".into(),
             },
             signature: vec![],

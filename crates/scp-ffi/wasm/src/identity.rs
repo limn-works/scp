@@ -132,7 +132,8 @@ mod canonical_attestation {
         Active,
         Revoked {
             revoked_at: u64,
-            reason: Option<String>,
+            #[serde(default)]
+            reason: String,
             #[serde(default = "default_revoked_by")]
             revoked_by: String,
         },

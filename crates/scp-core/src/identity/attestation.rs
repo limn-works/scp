@@ -1047,7 +1047,7 @@ mod tests {
         let mut attestation = make_attestation();
         attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
             revoked_at: 1_700_000_100_000,
-            reason: None,
+            reason: String::new(),
             revoked_by: did("did:dht:z6MkMallory"),
         };
         let errors = attestation.validate_structure();
@@ -1062,7 +1062,7 @@ mod tests {
         let mut attestation = make_attestation();
         attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
             revoked_at: 1_700_000_100_000,
-            reason: None,
+            reason: String::new(),
             revoked_by: attestation.issuer.clone(),
         };
         let errors = attestation.validate_structure();
@@ -1381,7 +1381,7 @@ mod tests {
         // Tamper revocation_status from Active to Revoked — must invalidate
         attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
             revoked_at: 1_700_000_000_000,
-            reason: Some("tampered".to_owned()),
+            reason: "tampered".to_owned(),
             revoked_by: attestation.issuer.clone(),
         };
         let vk = sk.verifying_key();

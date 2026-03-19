@@ -164,8 +164,9 @@ pub enum RevocationStatus {
     Revoked {
         /// Unix timestamp (seconds) when the revocation occurred.
         revoked_at: u64,
-        /// Optional reason for revocation.
-        reason: Option<String>,
+        /// Reason for revocation (empty string if no reason provided).
+        #[serde(default)]
+        reason: String,
         /// DID that performed the revocation. Must equal the attestation's
         /// issuer — only the issuer can revoke their own attestation (§7.4.1).
         #[serde(default = "default_revoked_by")]
@@ -1501,7 +1502,7 @@ mod tests {
             None,
             RevocationStatus::Revoked {
                 revoked_at: 950,
-                reason: Some("compromised".to_owned()),
+                reason: "compromised".to_owned(),
                 revoked_by: "did:key:issuer".into(),
             },
         );
@@ -1541,7 +1542,7 @@ mod tests {
         // Tamper: flip Active -> Revoked without re-signing.
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 950,
-            reason: Some("tampered".to_owned()),
+            reason: "tampered".to_owned(),
             revoked_by: "did:key:issuer".into(),
         };
 
@@ -2228,7 +2229,7 @@ mod tests {
         let revoked = Attestation {
             revocation_status: RevocationStatus::Revoked {
                 revoked_at: 1500,
-                reason: Some("compromised".to_owned()),
+                reason: "compromised".to_owned(),
                 revoked_by: "did:key:issuer".into(),
             },
             ..active.clone()
@@ -2454,7 +2455,7 @@ mod tests {
             None,
             RevocationStatus::Revoked {
                 revoked_at: 950,
-                reason: Some("unauthorized".to_owned()),
+                reason: "unauthorized".to_owned(),
                 revoked_by: "did:key:attacker".into(),
             },
         );
@@ -2608,7 +2609,7 @@ mod tests {
             None,
             RevocationStatus::Revoked {
                 revoked_at: 950,
-                reason: Some("compromised".to_owned()),
+                reason: "compromised".to_owned(),
                 revoked_by: "did:key:issuer".into(),
             },
         );
