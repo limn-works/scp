@@ -407,7 +407,7 @@ impl PyNodeHandle {
         let addr = bind_addr
             .map(|s| {
                 s.parse::<std::net::SocketAddr>().map_err(|e| {
-                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    let display = if s.len() > 128 { &s[..s.floor_char_boundary(128)] } else { &s };
                     pyo3::exceptions::PyValueError::new_err(format!(
                         "invalid bind_addr \"{display}\": {e}"
                     ))

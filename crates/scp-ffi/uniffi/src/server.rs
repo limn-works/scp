@@ -416,7 +416,7 @@ impl NodeHandle {
         let addr = bind_addr
             .map(|s| {
                 s.parse::<std::net::SocketAddr>().map_err(|_| {
-                    let display = if s.len() > 128 { &s[..128] } else { &s };
+                    let display = if s.len() > 128 { &s[..s.floor_char_boundary(128)] } else { &s };
                     ScpError::Validation {
                         msg: format!("invalid bind_addr: {display}"),
                         code: "SCP-TRANS-5070".to_owned(),
