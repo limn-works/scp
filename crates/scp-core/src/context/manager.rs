@@ -2949,8 +2949,11 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
 
-        // Determine if broadcast and, if so, produce the envelope under lock.
-        let broadcast_envelope: Option<BroadcastEnvelope> = {
+        // Phase 1 (under lock): State checks, capability check, membership
+        // verification, assign sequence number, produce broadcast envelope if
+        // applicable. Do NOT push to receive_buffer yet — transport may fail.
+        // See #1420 (phantom events) and #1422 (AAD zeros).
+        let (broadcast_envelope, seq) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -3005,14 +3008,7 @@ impl ContextManager {
                     .next_sequence_number(sender_did)
                     .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
 
-                // Emit MessageSent event to receive buffer.
-                ctx.receive_buffer.push(ContextEvent::MessageSent {
-                    sender_did: sender_did.clone(),
-                    sequence_number: seq,
-                    payload: payload.to_vec(),
-                });
-
-                Some(envelope)
+                (Some(envelope), seq)
             } else {
                 // Encrypted path: role-based capability check + seq under lock.
                 if !ctx
@@ -3029,32 +3025,49 @@ impl ContextManager {
                     .next_sequence_number(sender_did)
                     .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
 
-                ctx.receive_buffer.push(ContextEvent::MessageSent {
-                    sender_did: sender_did.clone(),
-                    sequence_number: seq,
-                    payload: payload.to_vec(),
-                });
-
-                None
+                (None, seq)
             }
         };
         // Lock dropped before crypto/transport/event-log calls.
 
-        let encrypted = if let Some(envelope) = broadcast_envelope {
+        // Phase 2 (no lock): Encrypt + send via transport.
+        // If either fails, return error — no phantom MessageSent in buffer.
+        // Sequence number is burned on failure (gaps are harmless).
+        let encrypted = if let Some(ref envelope) = broadcast_envelope {
             // Broadcast: serialize envelope for transport.
-            envelope.encrypted_content
+            envelope.encrypted_content.clone()
         } else {
             // Encrypted: sender key (ADR-007) -> inner envelope (ADR-002) ->
             // MLS (ADR-001) -> outer envelope.
             // Epoch 0 for standard sender keys (epoch tracking is per-sender-key,
-            // incremented on key rotation; the trait consumer passes the current
-            // epoch). Sequence is the per-sender monotonic counter.
+            // incremented on key rotation). Sequence 0 — changing this requires
+            // sending the sequence in the clear alongside the ciphertext so the
+            // receiver can reconstruct the AAD.
             self.crypto
                 .encrypt_message(&context_id_bytes, sender_did, payload, 0, 0)?
         };
 
         // Send via transport.
         self.transport.send_message(&context_id_bytes, &encrypted)?;
+
+        // Phase 3 (re-acquire lock): Re-check context active + membership,
+        // then push MessageSent event to receive buffer. Only reached on
+        // successful transport send — no phantom events (#1420).
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(&context_id) {
+                // Best-effort: if context was closed/left during transport send,
+                // skip the event push. The message was still sent on the wire,
+                // but the local context is no longer active.
+                if require_active(&ctx.handle).is_ok() {
+                    ctx.receive_buffer.push(ContextEvent::MessageSent {
+                        sender_did: sender_did.clone(),
+                        sequence_number: seq,
+                        payload: payload.to_vec(),
+                    });
+                }
+            }
+        }
 
         // Append MessageSent event to event log.
         self.event_log
@@ -8743,6 +8756,39 @@ mod tests {
         }
     }
 
+    /// A transport mock that always fails on `send_message`.
+    /// Used to test that phantom `MessageSent` events are not emitted
+    /// when transport fails (#1420).
+    struct FailingTransport;
+
+    impl ContextTransportProvider for FailingTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn publish_context(
+            &self,
+            _id: &[u8; 32],
+            _params: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            _context_id: &[u8; 32],
+            _encrypted_payload: &[u8],
+        ) -> Result<(), ContextError> {
+            Err(ContextError::TransportFailed(
+                "mock transport failure".into(),
+            ))
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Helper: create a manager with default mocks and a registered context
     // -----------------------------------------------------------------------
@@ -9295,6 +9341,88 @@ mod tests {
             .collect();
 
         assert_eq!(seq_nums, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// When transport fails, no phantom `MessageSent` event must appear in
+    /// the receive buffer. Fixes #1420.
+    #[tokio::test]
+    async fn send_message_transport_failure_no_phantom_event() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(FailingTransport),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("test-ctx-fail".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // send_message should fail because FailingTransport.send_message
+        // returns an error.
+        let result = manager
+            .send_message(&handle, &"did:key:creator".into(), b"hello", None)
+            .await;
+        assert!(
+            result.is_err(),
+            "send_message must fail when transport fails"
+        );
+
+        // The receive buffer must be empty — no phantom MessageSent event.
+        let events = manager.drain_events("test-ctx-fail").await;
+        let msg_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::MessageSent { .. }))
+            .collect();
+        assert!(
+            msg_events.is_empty(),
+            "no MessageSent event should be emitted when transport fails (#1420)"
+        );
+    }
+
+    /// When transport succeeds, `MessageSent` event must be present in the
+    /// receive buffer. Validates the positive path after the #1420 restructure.
+    #[tokio::test]
+    async fn send_message_transport_success_emits_event() {
+        let (manager, handle) = setup_active_context().await;
+
+        let result = manager
+            .send_message(&handle, &"did:key:creator".into(), b"positive-path", None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "send_message must succeed with mock transport"
+        );
+
+        let events = manager.drain_events("test-ctx").await;
+        let msg_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::MessageSent { .. }))
+            .collect();
+        assert_eq!(
+            msg_events.len(),
+            1,
+            "exactly one MessageSent event must be emitted on success"
+        );
+
+        if let ContextEvent::MessageSent {
+            sender_did,
+            payload,
+            ..
+        } = &msg_events[0]
+        {
+            assert_eq!(sender_did, "did:key:creator");
+            assert_eq!(payload, b"positive-path");
+        }
     }
 
     // -----------------------------------------------------------------------

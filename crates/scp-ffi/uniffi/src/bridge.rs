@@ -5681,11 +5681,13 @@ async fn ucan_mint_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
-                ceiling: if handle.ceiling_strings.is_empty() {
-                    None
+                // Empty ceiling means the user passed `[]` — apply the default
+                // ceiling instead of `None` (which would mean unlimited). #1419.
+                ceiling: Some(if handle.ceiling_strings.is_empty() {
+                    scp_core::context::roles::default_ceiling().to_ucan_string_set()
                 } else {
-                    Some(handle.ceiling_strings.iter().cloned().collect())
-                },
+                    handle.ceiling_strings.iter().cloned().collect()
+                }),
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)
@@ -5946,11 +5948,13 @@ async fn ucan_delegate_impl(
                 .collect();
 
             // Get ceiling from handle for delegation-time enforcement (#339).
-            let ceiling = if handle.ceiling_strings.is_empty() {
-                None
+            // Empty ceiling means the user passed `[]` — apply the default
+            // ceiling instead of `None` (which would mean unlimited). #1419.
+            let ceiling = Some(if handle.ceiling_strings.is_empty() {
+                scp_core::context::roles::default_ceiling().to_ucan_string_set()
             } else {
-                Some(handle.ceiling_strings.iter().cloned().collect())
-            };
+                handle.ceiling_strings.iter().cloned().collect()
+            });
 
             let params = DelegateParams {
                 parent_token: &parsed_parent,

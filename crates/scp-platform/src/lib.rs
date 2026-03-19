@@ -58,6 +58,10 @@ pub mod apple;
 pub mod file;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
+// Shared pseudonym secret derivation — used by all KeyCustody backends.
+// Gated behind `software_platform` because it depends on ed25519-dalek, hkdf, sha2.
+#[cfg(feature = "software_platform")]
+pub(crate) mod pseudonym;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 #[cfg(feature = "sync")]

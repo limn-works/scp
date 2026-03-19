@@ -3343,7 +3343,7 @@ impl WasmContextManager {
             proposal_id: pid.clone(),
         });
         ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceProposed"),
+            crate::runtime::wasm_event_type_tag("GovernanceProposalCreated"),
             proposer_did,
             proposal_id.as_bytes(),
         );
@@ -3443,7 +3443,7 @@ impl WasmContextManager {
         proposal.approvals.push((voter_did.to_owned(), vote_ts));
 
         ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceVoteApproval"),
+            crate::runtime::wasm_event_type_tag("GovernanceVoteCast"),
             voter_did,
             proposal_id.as_bytes(),
         );
@@ -3536,7 +3536,7 @@ impl WasmContextManager {
         proposal.rejections.push((voter_did.to_owned(), vote_ts));
 
         ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceVoteRejection"),
+            crate::runtime::wasm_event_type_tag("GovernanceVoteCast"),
             voter_did,
             proposal_id.as_bytes(),
         );
@@ -3601,7 +3601,7 @@ impl WasmContextManager {
         }
 
         ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceVoteWithdraw"),
+            crate::runtime::wasm_event_type_tag("GovernanceVoteWithdrawn"),
             voter_did,
             proposal_id.as_bytes(),
         );

@@ -355,14 +355,15 @@ pub async fn ucan_mint(
         let context_id = handle.context_id();
 
         // Get ceiling from the context handle for mint-time enforcement (#339).
-        // Empty ceiling means unrestricted — pass None, not Some(empty_set).
+        // Empty ceiling means the user passed `[]` — apply the default ceiling
+        // instead of `None` (which would mean unlimited). See #1419.
         let ceiling_strings: std::collections::HashSet<String> =
             handle.ceiling().into_iter().collect();
-        let ceiling = if ceiling_strings.is_empty() {
-            None
+        let ceiling = Some(if ceiling_strings.is_empty() {
+            scp_core::context::roles::default_ceiling().to_ucan_string_set()
         } else {
-            Some(ceiling_strings)
-        };
+            ceiling_strings
+        });
 
         let params = MintParams {
             issuer_did: &creator_did,
@@ -532,13 +533,15 @@ pub async fn ucan_delegate(
             .map_err(napi::Error::from)?;
 
         // Get ceiling from the context handle for delegation-time enforcement (#339).
+        // Empty ceiling means the user passed `[]` — apply the default ceiling
+        // instead of `None` (which would mean unlimited). See #1419.
         let ceiling_strings: std::collections::HashSet<String> =
             handle.ceiling().into_iter().collect();
-        let ceiling = if ceiling_strings.is_empty() {
-            None
+        let ceiling = Some(if ceiling_strings.is_empty() {
+            scp_core::context::roles::default_ceiling().to_ucan_string_set()
         } else {
-            Some(ceiling_strings)
-        };
+            ceiling_strings
+        });
 
         // Look up the DELEGATOR's identity from the global identity registry.
         // This is critical: the delegation must be signed with the delegator's
