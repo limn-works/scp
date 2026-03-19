@@ -211,8 +211,8 @@ pub struct MlsCryptoProvider {
     /// [`Zeroizing`] so key material is zeroed on drop.
     wrapping_secret_key: Mutex<Zeroizing<[u8; 32]>>,
     /// Pending key package state for Welcome-based joins (§5.12.3).
-    /// Each `prepare_key_package_for_join` call pushes one entry;
-    /// `join_from_welcome` pops the most recent.
+    /// `prepare_key_package_for_join` replaces any previous entry;
+    /// `join_from_welcome` pops it.
     pending_joins: Mutex<Vec<PendingJoinState>>,
 }
 
@@ -1128,8 +1128,6 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
-        const MAX_PENDING_JOINS: usize = 100;
-
         let credential = self
             .make_credential()
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -1153,12 +1151,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
 
-        if pending.len() >= MAX_PENDING_JOINS {
-            return Err(ContextError::CryptoFailed(
-                "too many pending key packages (max 100); call join_from_welcome to consume".into(),
-            ));
-        }
-
+        // Only one key package can be outstanding at a time.
+        // New prepare calls replace the old pending state to avoid
+        // LIFO matching errors when Welcomes arrive out of order.
+        pending.clear();
         pending.push(PendingJoinState { signer, provider });
 
         Ok(kp_bytes)

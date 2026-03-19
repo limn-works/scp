@@ -192,11 +192,11 @@ fn routing_id_determinism() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. multiple_key_packages — prepare multiple, use most recent
+// 5. prepare_replaces_previous_key_package — second prepare supersedes first
 // ---------------------------------------------------------------------------
 
 #[test]
-fn multiple_key_packages_uses_most_recent() {
+fn prepare_replaces_previous_key_package() {
     let bob_crypto =
         MlsCryptoProvider::new("did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string());
     let alice_crypto =
@@ -205,7 +205,8 @@ fn multiple_key_packages_uses_most_recent() {
 
     alice_crypto.create_mls_group(&context_id).unwrap();
 
-    // Bob prepares two key packages. Only the second should be used.
+    // Bob prepares two key packages. The second replaces the first
+    // (clear + push), so only kp2's private state is retained.
     let _kp1 = bob_crypto.prepare_key_package_for_join().unwrap();
     let kp2 = bob_crypto.prepare_key_package_for_join().unwrap();
 
@@ -217,7 +218,8 @@ fn multiple_key_packages_uses_most_recent() {
         )
         .unwrap();
 
-    // Should succeed because join_from_welcome pops the most recent (kp2).
+    // Should succeed because prepare_key_package_for_join replaced the
+    // first pending state with the second, so kp2's signer/provider match.
     bob_crypto
         .join_from_welcome(&context_id, &add_output.welcome_bytes)
         .unwrap();

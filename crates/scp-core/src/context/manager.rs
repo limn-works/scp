@@ -86,15 +86,19 @@ const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 /// Pushes a [`ContextEvent::WelcomeGenerated`] event to the receive buffer
 /// if the `AddMemberOutput` contains a non-empty Welcome message.
 ///
-/// Used by both `add_member_to_context` and `execute_add_member` to avoid
+/// Used by both `join_context` and `execute_add_member` to avoid
 /// duplicating the emission logic.
 fn push_welcome_event(
     buffer: &mut ReceiveBuffer,
+    context_id: &str,
+    creator_did: &DID,
     member_did: &DID,
     add_output: crate::context::builder::AddMemberOutput,
 ) {
     if !add_output.welcome_bytes.is_empty() {
         buffer.push(ContextEvent::WelcomeGenerated {
+            context_id: context_id.to_owned(),
+            creator_did: creator_did.clone(),
             member_did: member_did.clone(),
             welcome_bytes: add_output.welcome_bytes,
             commit_bytes: add_output.commit_bytes,
@@ -2765,7 +2769,13 @@ impl ContextManager {
             });
 
             // Emit WelcomeGenerated event if the add produced a Welcome message.
-            push_welcome_event(&mut ctx.receive_buffer, &member_did, add_output);
+            push_welcome_event(
+                &mut ctx.receive_buffer,
+                &context_id,
+                &DID(creator_did),
+                &member_did,
+                add_output,
+            );
         }
         // Lock dropped before event log append.
 
@@ -5213,7 +5223,13 @@ impl ContextManager {
             });
 
             // Emit WelcomeGenerated event if the add produced a Welcome message.
-            push_welcome_event(&mut ctx.receive_buffer, did, add_output);
+            push_welcome_event(
+                &mut ctx.receive_buffer,
+                context_id,
+                &DID(creator_did),
+                did,
+                add_output,
+            );
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))

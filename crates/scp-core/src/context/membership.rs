@@ -497,6 +497,10 @@ pub enum ContextEvent {
     /// The application layer must ECIES-encrypt and deliver it to the
     /// joiner's personal routing ID (spec §5.12.3, issue #1311).
     WelcomeGenerated {
+        /// Context ID for ECIES domain binding.
+        context_id: String,
+        /// DID of the context creator (for ECIES domain binding).
+        creator_did: DID,
         /// DID of the member being invited.
         member_did: DID,
         /// TLS-serialized MLS Welcome message.
