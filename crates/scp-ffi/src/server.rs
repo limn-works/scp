@@ -23,6 +23,8 @@ use scp_ffi_common::server::{
 };
 use scp_identity::{DidCache, InMemoryDhtClient};
 use scp_node::NodeError;
+use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 // ---------------------------------------------------------------------------
 // Error conversion
@@ -36,6 +38,53 @@ fn server_err(e: ServerError) -> PyErr {
 fn node_err(e: NodeError) -> PyErr {
     tracing::error!(error = %e, "node operation failed");
     pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
+}
+
+/// Auto-wires the global [`ContextManager`] with relay transport after
+/// node startup.
+///
+/// Connects to the node's local relay and initializes the `ContextManager`
+/// with `RelayTransportProvider` so that context operations (create, join,
+/// send) work immediately. If the `ContextManager` was already initialized
+/// (e.g., by a prior `configure_relay_transport` or `context_create` call),
+/// this is a no-op — the `OnceLock` ensures first-writer-wins semantics.
+///
+/// Best-effort: logs a warning if the relay connection fails rather than
+/// blocking node startup.
+fn auto_wire_context_manager(
+    py: Python<'_>,
+    rt: &tokio::runtime::Runtime,
+    did: &str,
+    relay_url: &str,
+) {
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    let did_owned = did.to_owned();
+    let relay_url_owned = relay_url.to_owned();
+    match py.allow_threads(|| rt.block_on(NativeRelayAdapter::connect_sourced(&sourced))) {
+        Ok(adapter) => {
+            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+                did_owned,
+            ));
+            let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+            let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
+                Box::new(crate::runtime::NoOpEventLogProvider);
+            crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                relay_url = %relay_url_owned,
+                "auto_wire_context_manager: failed to connect to node relay — \
+                 context operations may fail until transport is configured manually"
+            );
+            // Fall back to initializing without transport so that at least
+            // the ContextManager exists (with NotConfiguredTransportProvider).
+            crate::runtime::init_context_manager(&did_owned);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,13 +532,19 @@ pub fn py_node_start_in_memory(
         }
         None => None,
     };
-    py.allow_threads(|| {
-        let node = rt
-            .block_on(server::start_node_in_memory(node_identity))
-            .map_err(server_err)?;
-        Ok(PyNodeHandle {
-            inner: RunningNode::InMemory(node),
-        })
+    let node = py.allow_threads(|| {
+        rt.block_on(server::start_node_in_memory(node_identity))
+            .map_err(server_err)
+    })?;
+
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(py, rt, &did, &relay_url);
+
+    Ok(PyNodeHandle {
+        inner: RunningNode::InMemory(node),
     })
 }
 
@@ -520,16 +575,22 @@ pub fn py_node_start_local(
         }
         None => None,
     };
-    py.allow_threads(|| {
-        let node = rt
-            .block_on(server::start_node_local(
-                std::path::Path::new(&data_dir),
-                node_identity,
-            ))
-            .map_err(server_err)?;
-        Ok(PyNodeHandle {
-            inner: RunningNode::Filesystem(node),
-        })
+    let node = py.allow_threads(|| {
+        rt.block_on(server::start_node_local(
+            std::path::Path::new(&data_dir),
+            node_identity,
+        ))
+        .map_err(server_err)
+    })?;
+
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(py, rt, &did, &relay_url);
+
+    Ok(PyNodeHandle {
+        inner: RunningNode::Filesystem(node),
     })
 }
 
@@ -596,6 +657,8 @@ mod tests {
 
     #[test]
     fn node_local_starts_and_returns_did() {
+        // SAFETY: test-only, single-threaded test.
+        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
         let tmp = std::env::temp_dir().join(format!("scp-pyo3-node-test-{}", std::process::id()));
         let node = rt().block_on(server::start_node_local(&tmp, None)).unwrap();
         let url = node.relay_url();

@@ -558,7 +558,11 @@ pub async fn node_start_in_memory(
 
     // Initialize the ContextManager so context operations can be used
     // immediately after node startup (idempotent — OnceLock).
+    let did: String = node.identity().did().to_owned();
     crate::runtime::init_context_manager();
+    if let Ok(mgr) = crate::runtime::context_manager() {
+        mgr.register_local_did(did.into()).await;
+    }
 
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
@@ -587,7 +591,11 @@ pub async fn node_start_local(
 
     // Initialize the ContextManager so context operations can be used
     // immediately after node startup (idempotent — OnceLock).
+    let did: String = node.identity().did().to_owned();
     crate::runtime::init_context_manager();
+    if let Ok(mgr) = crate::runtime::context_manager() {
+        mgr.register_local_did(did.into()).await;
+    }
 
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
@@ -650,6 +658,8 @@ mod tests {
 
     #[test]
     fn node_local_starts_and_returns_did() {
+        // SAFETY: test-only, single-threaded test.
+        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
         let tmp = std::env::temp_dir().join(format!("scp-uniffi-node-test-{}", std::process::id()));
         let node = rt()
             .block_on(node_start_local(tmp.to_string_lossy().into_owned(), None))

@@ -378,12 +378,13 @@ pub async fn start_node_local(
             .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let passphrase = std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
-            ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SCP_KEY_PASSPHRASE environment variable required for persistent node identity",
-            ))
-        })?;
+        let passphrase =
+            zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
+                ServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SCP_KEY_PASSPHRASE environment variable required for persistent node identity",
+                ))
+            })?);
         let key_path = data_dir.join("identity.key");
         let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
             &key_path,
@@ -925,7 +926,7 @@ mod tests {
     // NodeIdentity (pre-existing identity) tests
     // -----------------------------------------------------------------------
 
-    /// Helper: creates a test identity using InMemoryKeyCustody and DidDht.
+    /// Helper: creates a test identity using `InMemoryKeyCustody` and `DidDht`.
     async fn create_test_identity() -> NodeIdentity {
         use scp_identity::cache::SystemClock;
         use scp_identity::dht::DidDht;

@@ -662,6 +662,8 @@ mod tests {
 
     #[test]
     fn node_local_starts_and_returns_did() {
+        // SAFETY: test-only, single-threaded test.
+        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase") };
         let tmp = std::env::temp_dir().join(format!("scp-napi-node-test-{}", std::process::id()));
         let node = rt()
             .block_on(node_start_local(tmp.to_string_lossy().into_owned(), None))

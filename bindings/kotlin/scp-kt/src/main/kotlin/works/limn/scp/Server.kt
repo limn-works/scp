@@ -38,19 +38,19 @@ interface ServerBindings {
     /**
      * Starts a full application node with in-memory storage.
      *
-     * @param identityJson JSON-encoded identity handle, or null to generate a fresh identity.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
-    fun nodeStartInMemory(identityJson: String? = null): String
+    fun nodeStartInMemory(identityDid: String? = null): String
 
     /**
      * Starts a full application node with file-backed storage.
      *
      * @param dataDir Directory for persistent storage.
-     * @param identityJson JSON-encoded identity handle, or null to generate a fresh identity.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
-    fun nodeStartLocal(dataDir: String, identityJson: String? = null): String
+    fun nodeStartLocal(dataDir: String, identityDid: String? = null): String
 
     /**
      * Shuts down a relay identified by its handle JSON.
@@ -411,7 +411,7 @@ class Node internal constructor(
         /**
          * Starts a full application node with in-memory storage.
          *
-         * When [identityJson] is provided, the node uses the pre-existing
+         * When [identityDid] is provided, the node uses the pre-existing
          * identity instead of generating a fresh one. This enables identity
          * portability -- the same DID persists across node restarts.
          *
@@ -419,31 +419,31 @@ class Node internal constructor(
          * client, self-signed TLS, and a relay on an OS-assigned port.
          *
          * @param bridge The [ServerBridge] providing FFI access.
-         * @param identityJson JSON-encoded identity handle, or null to generate a fresh one.
+         * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
         suspend fun startInMemory(
             bridge: ServerBridge,
-            identityJson: String? = null,
-        ): Node = bridge.startNodeInMemory(identityJson)
+            identityDid: String? = null,
+        ): Node = bridge.startNodeInMemory(identityDid)
 
         /**
          * Starts a full application node with file-backed storage.
          *
-         * When [identityJson] is provided, the node uses the pre-existing
+         * When [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
          * identity via `FileKeyCustody` (requires `SCP_KEY_PASSPHRASE` env var).
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param dataDir Directory for persistent storage.
-         * @param identityJson JSON-encoded identity handle, or null to generate a fresh one.
+         * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
         suspend fun startLocal(
             bridge: ServerBridge,
             dataDir: String,
-            identityJson: String? = null,
-        ): Node = bridge.startNodeLocal(dataDir, identityJson)
+            identityDid: String? = null,
+        ): Node = bridge.startNodeLocal(dataDir, identityDid)
     }
 }
 
@@ -496,15 +496,15 @@ class ServerBridge internal constructor(
     /**
      * Starts a full application node with in-memory storage.
      *
-     * When [identityJson] is provided, the node uses the pre-existing
+     * When [identityDid] is provided, the node uses the pre-existing
      * identity instead of generating a fresh one.
      *
-     * @param identityJson JSON-encoded identity handle, or null to generate a fresh one.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
-    suspend fun startNodeInMemory(identityJson: String? = null): Node =
+    suspend fun startNodeInMemory(identityDid: String? = null): Node =
         bridge.ffiCall {
-            val json = bindings.nodeStartInMemory(identityJson)
+            val json = bindings.nodeStartInMemory(identityDid)
             val info = parseNodeInfo(json)
             Node(
                 relayUrl = info.relayUrl,
@@ -519,12 +519,12 @@ class ServerBridge internal constructor(
      * Starts a full application node with file-backed storage.
      *
      * @param dataDir Directory for persistent storage.
-     * @param identityJson JSON-encoded identity handle, or null to generate a fresh one.
+     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
-    suspend fun startNodeLocal(dataDir: String, identityJson: String? = null): Node =
+    suspend fun startNodeLocal(dataDir: String, identityDid: String? = null): Node =
         bridge.ffiCall {
-            val json = bindings.nodeStartLocal(dataDir, identityJson)
+            val json = bindings.nodeStartLocal(dataDir, identityDid)
             val info = parseNodeInfo(json)
             Node(
                 relayUrl = info.relayUrl,
