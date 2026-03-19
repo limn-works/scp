@@ -1,6 +1,5 @@
-import XCTest
-
 @testable import SCP
+import XCTest
 
 /// Tests for identity link attestation wrappers (§3.5).
 ///

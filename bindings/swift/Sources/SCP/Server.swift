@@ -375,7 +375,7 @@ public struct Node: Sendable {
         enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
     ) async throws {
         try validateAdmission(admission)
-        if broadcastKeyHex != nil && authorDid == nil {
+        if broadcastKeyHex != nil, authorDid == nil {
             throw ScpError.Validation(
                 msg: "broadcastKeyHex requires authorDid -- provide the DID of the broadcast key owner, or omit both for auto-resolve",
                 code: "SCP-TRANS-5060"
