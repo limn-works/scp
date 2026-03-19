@@ -118,7 +118,8 @@ if (bridge === null || serverAddon === null) {
 
   /** Contexts with active subscriptions that need closing before relay shutdown. */
   const subscribedContexts: Array<{
-    handle: unknown;
+    // biome-ignore lint/suspicious/noExplicitAny: test cleanup needs opaque handle from contextCreate
+    handle: any;
     did: string;
   }> = [];
 
