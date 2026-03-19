@@ -599,10 +599,10 @@ export class IdentityAttestation implements IdentityAttestationData {
   /** Optional platform-assigned unique identifier. */
   readonly platformId?: string | undefined;
 
-  /** @internal Raw JSON from the bridge for roundtrip verification. */
-  private readonly _rawJson?: Record<string, unknown> | undefined;
+  /** @internal Raw JSON string from the bridge for roundtrip verification. */
+  private readonly _rawJson?: string | undefined;
 
-  constructor(data: IdentityAttestationData, rawJson?: Record<string, unknown>) {
+  constructor(data: IdentityAttestationData, rawJson?: string) {
     this.id = data.id;
     this.platform = data.platform;
     this.platformHandle = data.platformHandle;
@@ -633,10 +633,10 @@ export class IdentityAttestation implements IdentityAttestationData {
           "SCP-ATTEST-9014",
         );
       }
-      // Use raw JSON if available (preserves full structure for
+      // Use raw JSON string if available (preserves full structure for
       // signature verification), otherwise fall back to bridge record.
-      const payload = this._rawJson ?? this._toBridgeRecord();
-      const result = await fn(JSON.stringify(payload));
+      const json = this._rawJson ?? JSON.stringify(this._toBridgeRecord());
+      const result = await fn(json);
       return Boolean(result);
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
@@ -662,11 +662,11 @@ export class IdentityAttestation implements IdentityAttestationData {
   /** @internal */
   static _fromJson(json: string): IdentityAttestation {
     const data = JSON.parse(json) as Record<string, unknown>;
-    return IdentityAttestation._fromRecord(data);
+    return IdentityAttestation._fromRecord(data, json);
   }
 
   /** @internal */
-  static _fromRecord(data: Record<string, unknown>): IdentityAttestation {
+  static _fromRecord(data: Record<string, unknown>, rawJson?: string): IdentityAttestation {
     // Read from nested `claim` and `evidence` structures when present
     // (full attestation JSON), with fallback to flat keys.
     const claim = (data.claim ?? {}) as Record<string, unknown>;
@@ -697,7 +697,7 @@ export class IdentityAttestation implements IdentityAttestationData {
         revocationStatus,
         platformId,
       },
-      data,
+      rawJson,
     );
   }
 }

@@ -323,12 +323,10 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
 
     // URL-encode domain and record_name before inserting into DoH URL to
     // prevent injection even if the allowlists are loosened in the future.
-    let encoded_record_name: String =
-        js_sys::encode_uri_component(&dns_proof.record_name).into();
+    let encoded_record_name: String = js_sys::encode_uri_component(&dns_proof.record_name).into();
     let encoded_domain: String = js_sys::encode_uri_component(&dns_proof.domain).into();
     let query_name = format!("{}.{}", dns_proof.record_name, dns_proof.domain);
-    let url =
-        format!("{DOH_ENDPOINT}?name={encoded_record_name}.{encoded_domain}&type=TXT");
+    let url = format!("{DOH_ENDPOINT}?name={encoded_record_name}.{encoded_domain}&type=TXT");
 
     match fetch_url_with_headers(&url, &[("Accept", "application/dns-json")]).await {
         Ok(body) => {

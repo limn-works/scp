@@ -209,13 +209,9 @@ fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
 fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
 
-    let evidence_bytes = attestation
-        .evidence
-        .as_ref()
-        .map(|e| {
-            rmp_serde::to_vec_named(e)
-                .expect("AttestationEvidence serialization is infallible")
-        });
+    let evidence_bytes = attestation.evidence.as_ref().map(|e| {
+        rmp_serde::to_vec_named(e).expect("AttestationEvidence serialization is infallible")
+    });
     let claim_bytes = attestation.claim.to_string();
     let revocation_bytes = rmp_serde::to_vec_named(&attestation.revocation_status)
         .expect("RevocationStatus serialization is infallible");
