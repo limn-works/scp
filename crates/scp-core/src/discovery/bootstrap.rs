@@ -99,6 +99,12 @@ pub enum BootstrapVerificationError {
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Maximum number of default bootstrap context entries allowed in a [`BootstrapConfig`].
+///
+/// Prevents unbounded growth of the default contexts list. Callers passing
+/// more entries to [`BootstrapConfig::with_defaults`] will trigger a panic.
+pub const MAX_DEFAULT_CONTEXTS: usize = 100;
+
 /// Maximum number of custom context entries allowed in a [`BootstrapConfig`].
 ///
 /// Prevents unbounded growth of the custom contexts list. Contexts beyond
@@ -175,8 +181,17 @@ impl BootstrapConfig {
     /// # Arguments
     ///
     /// * `contexts` -- Default bootstrap context entries to query on bootstrap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `contexts.len()` exceeds [`MAX_DEFAULT_CONTEXTS`].
     #[must_use]
     pub fn with_defaults(contexts: Vec<BootstrapContextEntry>) -> Self {
+        assert!(
+            contexts.len() <= MAX_DEFAULT_CONTEXTS,
+            "too many default contexts: {} exceeds limit of {MAX_DEFAULT_CONTEXTS}",
+            contexts.len()
+        );
         Self {
             default_contexts: contexts,
             ..Self::default()
@@ -738,6 +753,26 @@ mod tests {
 
         assert!(matches!(err, DiscoveryError::DidResolutionFailed(_)));
         assert!(err.to_string().contains("did:dht:zTestDid"));
+    }
+
+    // -- with_defaults capacity limit -------------------------------------
+
+    #[test]
+    fn with_defaults_accepts_max_default_contexts() {
+        let entries: Vec<_> = (0..MAX_DEFAULT_CONTEXTS)
+            .map(|i| entry(&format!("ctx-{i}"), &format!("did:dht:zCreator{i}")))
+            .collect();
+        let config = BootstrapConfig::with_defaults(entries);
+        assert_eq!(config.default_contexts.len(), MAX_DEFAULT_CONTEXTS);
+    }
+
+    #[test]
+    #[should_panic(expected = "too many default contexts")]
+    fn with_defaults_panics_over_max_default_contexts() {
+        let entries: Vec<_> = (0..=MAX_DEFAULT_CONTEXTS)
+            .map(|i| entry(&format!("ctx-{i}"), &format!("did:dht:zCreator{i}")))
+            .collect();
+        let _ = BootstrapConfig::with_defaults(entries);
     }
 
     // -- add_custom_context capacity limit --------------------------------

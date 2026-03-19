@@ -5,7 +5,7 @@
 //! `web_sys::fetch` — it does NOT depend on `scp-core`.
 //!
 //! - **`SignedPost`**: fetches the post URL and checks that the response body
-//!   contains both the DID string and the nonce.
+//!   contains the structured token `scp-verify:{did}:{nonce}`.
 //! - **`DnsRecord`**: queries Cloudflare DNS-over-HTTPS for TXT records at
 //!   `_scp-verify.<domain>` and checks that one contains the DID string.
 //!
@@ -193,7 +193,7 @@ fn parse_proof<T: serde::de::DeserializeOwned>(
 // ---------------------------------------------------------------------------
 
 /// Verifies a `SignedPost` attestation by fetching the post URL and checking
-/// that the response body contains both the DID and the nonce.
+/// that the response body contains the structured token `scp-verify:{did}:{nonce}`.
 #[allow(clippy::future_not_send)] // WASM futures use Rc (JsFuture), inherently !Send
 async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (bool, Option<String>) {
     let signed_post: SignedPostProof = match parse_proof(proof, "signed_post") {
@@ -216,35 +216,17 @@ async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (boo
     match fetch_url(&signed_post.post_url).await {
         Ok(body) => {
             // Check for the structured verification format: `scp-verify:{did}:{nonce}`.
-            // This is the canonical format for signed post verification (§3.5.2).
-            // Falls back to checking DID and nonce as substrings for backward
-            // compatibility with posts that use a different format.
+            // This is the only accepted format for signed post verification (§3.5.2).
+            // No substring fallback — the structured token is required.
             let structured_token = format!("scp-verify:{issuer_did}:{}", signed_post.nonce);
             if body.contains(&structured_token) {
-                return (true, None);
-            }
-
-            // Fallback: check for DID and nonce as separate substrings.
-            let has_did = body.contains(issuer_did);
-            let has_nonce = body.contains(&signed_post.nonce);
-
-            if has_did && has_nonce {
                 (true, None)
             } else {
-                let mut missing = Vec::new();
-                if !has_did {
-                    missing.push("DID");
-                }
-                if !has_nonce {
-                    missing.push("nonce");
-                }
                 (
                     false,
-                    Some(format!(
-                        "post body missing structured token 'scp-verify:{{did}}:{{nonce}}' \
-                         and also missing: {}",
-                        missing.join(", ")
-                    )),
+                    Some(
+                        "post body missing structured token 'scp-verify:{did}:{nonce}'".to_owned(),
+                    ),
                 )
             }
         }
@@ -402,7 +384,7 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
 /// # Supported methods
 ///
 /// - `"signed_post"` — fetches the post URL over HTTPS, checks body contains
-///   both the DID and the nonce.
+///   the structured token `scp-verify:{did}:{nonce}`.
 /// - `"dns_record"` — queries Cloudflare DNS-over-HTTPS (`https://cloudflare-dns.com/dns-query`)
 ///   for TXT records at `{record_name}.{domain}`, checks one contains the DID.
 ///
