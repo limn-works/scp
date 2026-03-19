@@ -1280,18 +1280,7 @@ fn py_create_identity_link_attestation(
     let rt = crate::runtime()?;
 
     py.allow_threads(move || {
-        let method = match method_owned.as_str() {
-            "oauth" => VerificationMethod::Oauth,
-            "signed_post" => VerificationMethod::SignedPost,
-            "dns_record" => VerificationMethod::DnsRecord,
-            "challenge_response" => VerificationMethod::ChallengeResponse,
-            other => {
-                return Err(ScpPyError::identity(format!(
-                    "invalid verification method: {other}; expected 'oauth', \
-                     'signed_post', 'dns_record', or 'challenge_response'"
-                )));
-            }
-        };
+        let method: VerificationMethod = method_owned.parse().map_err(ScpPyError::identity)?;
 
         // Parse the proof JSON string into a typed AttestationProof.
         let proof: AttestationProof = serde_json::from_str(&proof_owned)
@@ -1330,6 +1319,19 @@ fn py_create_identity_link_attestation(
                 revocation_status: RevocationStatus::Active,
                 signature: Vec::new(),
             };
+
+            // Structural validation before signing.
+            let structure_errors = attestation.validate_structure();
+            if !structure_errors.is_empty() {
+                return Err(ScpPyError::identity(format!(
+                    "attestation structure validation failed: {}",
+                    structure_errors
+                        .iter()
+                        .map(AsRef::as_ref)
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )));
+            }
 
             // Compute canonical bytes and sign with active signing key.
             let canonical = attestation

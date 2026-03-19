@@ -27,7 +27,7 @@ export interface IdentityLinkAttestation {
   issuer: string;
   /** Same as issuer for self-attestations. */
   subject: string;
-  /** Unix timestamp (ms) when created. */
+  /** Unix timestamp (seconds) when created. */
   issued_at: number;
   /** Platform identity claim. */
   claim: {
@@ -633,9 +633,17 @@ export class IdentityAttestation implements IdentityAttestationData {
           "SCP-ATTEST-9014",
         );
       }
-      // Use raw JSON string if available (preserves full structure for
-      // signature verification), otherwise fall back to bridge record.
-      const json = this._rawJson ?? JSON.stringify(this._toBridgeRecord());
+      // Raw JSON is required for signature verification — _toBridgeRecord()
+      // does not preserve the full structure (claim/evidence nesting,
+      // signature bytes, etc.) needed for canonical hash computation.
+      if (!this._rawJson) {
+        throw new IdentityError(
+          "cannot verify attestation without raw JSON — attestation was not " +
+            "created via the bridge (missing _rawJson)",
+          "SCP-ATTEST-9006",
+        );
+      }
+      const json = this._rawJson;
       const result = await fn(json);
       return Boolean(result);
     } catch (error) {

@@ -121,6 +121,22 @@ mod canonical_attestation {
             response_signature: String,
         },
     }
+
+    /// Mirrors `scp_core::trust::attestation::RevocationStatus` field declaration order:
+    /// `Active` | `Revoked { revoked_at, reason, revoked_by }`.
+    ///
+    /// Used instead of `serde_json::Value` for `revocation_status` serialization to
+    /// produce byte-identical msgpack output matching scp-core.
+    #[derive(Serialize, Deserialize)]
+    pub(super) enum RevocationStatus {
+        Active,
+        Revoked {
+            revoked_at: u64,
+            reason: Option<String>,
+            #[serde(default)]
+            revoked_by: String,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1867,12 +1883,45 @@ pub fn identity_create_link_attestation(
 
         // Build the tagged proof object matching scp-core's AttestationProof enum.
         let proof_value = match method_str.as_str() {
-            "signed_post" => serde_json::json!({
-                "type": "signed_post_verified",
-                "post_url": proof,
-                "nonce": "",
-                "posted_at": now_secs,
-            }),
+            "signed_post" => {
+                // Parse the proof JSON to extract the nonce. The caller must
+                // provide a JSON object with at least { "post_url", "nonce" }.
+                let proof_obj: serde_json::Value =
+                    serde_json::from_str(&proof).map_err(|e| -> JsValue {
+                        ScpWasmError::Identity {
+                            message: format!(
+                                "signed_post proof must be a JSON object with 'post_url' \
+                                 and 'nonce' fields: {e}"
+                            ),
+                            code: "SCP-IDENT-1040".to_owned(),
+                        }
+                        .into_js()
+                        .into()
+                    })?;
+                let post_url = proof_obj
+                    .get("post_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&proof)
+                    .to_owned();
+                let nonce = proof_obj
+                    .get("nonce")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| -> JsValue {
+                        ScpWasmError::Identity {
+                            message: "signed_post proof must include a 'nonce' field".to_owned(),
+                            code: "SCP-IDENT-1040".to_owned(),
+                        }
+                        .into_js()
+                        .into()
+                    })?
+                    .to_owned();
+                serde_json::json!({
+                    "type": "signed_post_verified",
+                    "post_url": post_url,
+                    "nonce": nonce,
+                    "posted_at": now_secs,
+                })
+            }
             "dns_record" => serde_json::json!({
                 "type": "dns_record_verified",
                 "domain": proof,
@@ -1921,84 +1970,8 @@ pub fn identity_create_link_attestation(
             attestation["claim"]["platform_id"] = serde_json::json!(pid);
         }
 
-        // Compute canonical signing bytes and sign.
-        // Domain separator + fields in fixed order, matching scp-core's
-        // canonical_hash construction (§9.5.1).
-        let canonical = {
-            // Deserialize sub-structs into local types that mirror scp-core's
-            // field declaration order, ensuring byte-identical msgpack output.
-            let claim: canonical_attestation::Claim =
-                serde_json::from_value(attestation["claim"].clone()).map_err(|e| -> JsValue {
-                    ScpWasmError::Identity {
-                        message: format!("claim deserialization failed: {e}"),
-                        code: "SCP-IDENT-1041".to_owned(),
-                    }
-                    .into_js()
-                    .into()
-                })?;
-            let evidence: canonical_attestation::Evidence = serde_json::from_value(
-                attestation["evidence"].clone(),
-            )
-            .map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("evidence deserialization failed: {e}"),
-                    code: "SCP-IDENT-1041".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-
-            let claim_msgpack = rmp_serde::to_vec_named(&claim).map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("claim serialization failed: {e}"),
-                    code: "SCP-IDENT-1041".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-            let evidence_msgpack = rmp_serde::to_vec_named(&evidence).map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("evidence serialization failed: {e}"),
-                    code: "SCP-IDENT-1041".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-
-            let mut h = Sha256::new();
-            h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V2:");
-            // VarBytes fields: length-prefix + data
-            for field in &[
-                id.as_bytes().to_vec(),
-                b"identity_link".to_vec(),
-                did.as_bytes().to_vec(),
-                did.as_bytes().to_vec(),
-            ] {
-                h.update((field.len() as u32).to_be_bytes());
-                h.update(field);
-            }
-            // U64: issued_at
-            h.update(now_secs.to_be_bytes());
-            // Absent sentinel for expires_at: SHA-256(0x00), matching scp-core.
-            h.update(ABSENT_SENTINEL);
-            // VarBytes for claim, evidence, revocation_status
-            // revocation_status matches scp-core's RevocationStatus enum,
-            // serialized as msgpack (Active variant).
-            let revocation_status_msgpack = rmp_serde::to_vec_named(&serde_json::json!("Active"))
-                .map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("revocation_status serialization failed: {e}"),
-                    code: "SCP-IDENT-1041".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-            for field in &[claim_msgpack, evidence_msgpack, revocation_status_msgpack] {
-                h.update((field.len() as u32).to_be_bytes());
-                h.update(field);
-            }
-            h.finalize().to_vec()
-        };
+        // Compute canonical signing bytes via the shared function (§9.5.1).
+        let canonical = compute_attestation_canonical_bytes(&attestation)?;
 
         // Sign inside the registry closure.
         let signature_bytes = IDENTITY_REGISTRY.with(|reg| {
@@ -2144,17 +2117,39 @@ fn compute_attestation_canonical_bytes(
             .into()
         })?;
 
-    let claim_msgpack = rmp_serde::to_vec_named(&claim).unwrap_or_default();
-    let evidence_msgpack = rmp_serde::to_vec_named(&evidence).unwrap_or_default();
-    // revocation_status matches scp-core's RevocationStatus enum,
-    // serialized as msgpack. Handles both "Active" string and
-    // {"Revoked": { ... }} object variants.
+    let claim_msgpack = rmp_serde::to_vec_named(&claim).map_err(|e| -> JsValue {
+        ScpWasmError::Identity {
+            message: format!("claim serialization failed: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        }
+        .into_js()
+        .into()
+    })?;
+    let evidence_msgpack = rmp_serde::to_vec_named(&evidence).map_err(|e| -> JsValue {
+        ScpWasmError::Identity {
+            message: format!("evidence serialization failed: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        }
+        .into_js()
+        .into()
+    })?;
+    // Deserialize revocation_status into the typed mirror enum to produce
+    // byte-identical msgpack matching scp-core's RevocationStatus.
     let revocation_status_value = attestation
         .get("revocation_status")
         .cloned()
         .unwrap_or_else(|| serde_json::json!("Active"));
+    let revocation_status: canonical_attestation::RevocationStatus =
+        serde_json::from_value(revocation_status_value).map_err(|e| -> JsValue {
+            ScpWasmError::Identity {
+                message: format!("revocation_status deserialization failed: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
     let revocation_status_msgpack =
-        rmp_serde::to_vec_named(&revocation_status_value).map_err(|e| -> JsValue {
+        rmp_serde::to_vec_named(&revocation_status).map_err(|e| -> JsValue {
             ScpWasmError::Identity {
                 message: format!("revocation_status serialization failed: {e}"),
                 code: "SCP-IDENT-1044".to_owned(),

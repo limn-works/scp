@@ -674,13 +674,13 @@ impl AttestationRevocationChecker for NoOpRevocationChecker {
 
 /// TTL for cached Reference attestation verification results: 1 hour.
 ///
-/// Reference attestations (OAuth, signed post) depend on external platform data
+/// Reference attestations (signed post, DNS record) depend on external platform data
 /// that can change or disappear. Shorter TTL ensures freshness.
 pub const REFERENCE_TTL_SECS: u64 = 3600;
 
 /// TTL for cached Cryptographic attestation verification results: 24 hours.
 ///
-/// Cryptographic attestations (challenge-response, DNS) are self-verifiable
+/// Cryptographic attestations (OAuth, challenge-response) are self-verifiable
 /// and change infrequently. Longer TTL reduces redundant verification.
 pub const CRYPTOGRAPHIC_TTL_SECS: u64 = 86400;
 

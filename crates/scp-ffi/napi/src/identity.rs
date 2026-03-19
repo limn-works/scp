@@ -1366,21 +1366,12 @@ pub async fn identity_create_link_attestation(
     use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
-    let method = match verification_method.as_str() {
-        "oauth" => VerificationMethod::Oauth,
-        "signed_post" => VerificationMethod::SignedPost,
-        "dns_record" => VerificationMethod::DnsRecord,
-        "challenge_response" => VerificationMethod::ChallengeResponse,
-        other => {
-            return Err(NapiError::from(ScpNapiError::Identity {
-                message: format!(
-                    "invalid verification method: {other}; expected 'oauth', \
-                     'signed_post', 'dns_record', or 'challenge_response'"
-                ),
-                code: "SCP-IDENT-1040".to_owned(),
-            }));
-        }
-    };
+    let method: VerificationMethod = verification_method.parse().map_err(|e: String| {
+        NapiError::from(ScpNapiError::Identity {
+            message: e,
+            code: "SCP-IDENT-1040".to_owned(),
+        })
+    })?;
 
     // Parse the proof JSON string into a typed AttestationProof.
     let proof: AttestationProof = serde_json::from_str(&proof).map_err(|e| {
@@ -1420,6 +1411,22 @@ pub async fn identity_create_link_attestation(
             revocation_status: RevocationStatus::Active,
             signature: Vec::new(),
         };
+
+        // Structural validation before signing.
+        let structure_errors = attestation.validate_structure();
+        if !structure_errors.is_empty() {
+            return Err(ScpNapiError::Identity {
+                message: format!(
+                    "attestation structure validation failed: {}",
+                    structure_errors
+                        .iter()
+                        .map(AsRef::as_ref)
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+                code: "SCP-IDENT-1041".to_owned(),
+            });
+        }
 
         let canonical =
             attestation

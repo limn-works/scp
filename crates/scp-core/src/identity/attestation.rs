@@ -79,7 +79,7 @@ pub const SECS_PER_DAY: u64 = 86_400;
 pub enum AttestationClass {
     /// Self-verifying via cryptographic proof (OAuth, challenge-response).
     Cryptographic,
-    /// Requires fetching external resource to verify (signed post, DNS).
+    /// Requires fetching external resource to verify (signed post, DNS record).
     Reference,
 }
 
@@ -135,6 +135,27 @@ pub enum VerificationMethod {
     ///
     /// Renewal: 60 days.
     ChallengeResponse,
+}
+
+impl std::str::FromStr for VerificationMethod {
+    type Err = String;
+
+    /// Parses a wire-format string into a `VerificationMethod`.
+    ///
+    /// Accepted values: `"oauth"`, `"signed_post"`, `"dns_record"`,
+    /// `"challenge_response"`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "oauth" => Ok(Self::Oauth),
+            "signed_post" => Ok(Self::SignedPost),
+            "dns_record" => Ok(Self::DnsRecord),
+            "challenge_response" => Ok(Self::ChallengeResponse),
+            other => Err(format!(
+                "invalid verification method: {other}; expected 'oauth', \
+                 'signed_post', 'dns_record', or 'challenge_response'"
+            )),
+        }
+    }
 }
 
 impl VerificationMethod {
