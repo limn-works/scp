@@ -1011,17 +1011,16 @@ pub fn context_subscribe(
 /// Cancels an active subscription on a context handle.
 ///
 /// Triggers the cancellation token so the background relay listener task
-/// terminates, and resets the `subscription_active` flag so re-subscription
-/// is possible.  Called from the TypeScript `receive()` generator's `finally`
+/// terminates.  The background task itself clears `subscription_active` when
+/// it exits — clearing it here would race with a new subscription starting
+/// before the old task has terminated, allowing duplicate concurrent
+/// subscriptions.  Called from the TypeScript `receive()` generator's `finally`
 /// block to prevent orphaned tasks when the consumer abandons iteration.
 #[napi(js_name = "contextCancelSubscription")]
 pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
     if let Ok(token) = handle.subscription_cancel.lock() {
         token.cancel();
     }
-    handle
-        .subscription_active
-        .store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 

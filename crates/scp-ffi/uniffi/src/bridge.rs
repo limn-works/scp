@@ -13139,6 +13139,9 @@ mod tests {
         }
     }
 
+    /// Mutex to serialize MCP allowlist tests (shared global state in `scp_mcp::allowlist`).
+    static ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Stdio allowlist: `get_state` returns default entries.
     #[test]
     fn mcp_allowlist_get_state_returns_defaults() {
