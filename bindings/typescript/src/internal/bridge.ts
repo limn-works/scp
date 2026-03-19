@@ -78,6 +78,7 @@ export interface Bridge {
     identityDid: string,
     callback: MessageCallback,
   ): void;
+  contextCancelSubscription(handle: BridgeContextHandle): void;
 
   // Membership queries
   contextMemberCount(handle: BridgeContextHandle): Promise<number | null>;

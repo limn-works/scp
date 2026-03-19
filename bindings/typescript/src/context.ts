@@ -412,8 +412,8 @@ export class Context implements AsyncDisposable {
     let resolve: (() => void) | null = null;
     let done = false;
 
+    const bridge = await getBridge();
     try {
-      const bridge = await getBridge();
       bridge.contextSubscribe(this._handle, this._identityDid, {
         onMessage: (msg: Message) => {
           if (!done) {
@@ -443,6 +443,7 @@ export class Context implements AsyncDisposable {
     } finally {
       done = true;
       queue.length = 0;
+      bridge.contextCancelSubscription(this._handle);
     }
   }
 

@@ -1010,6 +1010,23 @@ pub fn context_subscribe(
     Ok(())
 }
 
+/// Cancels an active subscription on a context handle.
+///
+/// Triggers the cancellation token so the background relay listener task
+/// terminates, and resets the `subscription_active` flag so re-subscription
+/// is possible.  Called from the TypeScript `receive()` generator's `finally`
+/// block to prevent orphaned tasks when the consumer abandons iteration.
+#[napi(js_name = "contextCancelSubscription")]
+pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
+    if let Ok(token) = handle.subscription_cancel.lock() {
+        token.cancel();
+    }
+    handle
+        .subscription_active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Bridge functions — membership queries (delegated to ContextManager)
 // ---------------------------------------------------------------------------
