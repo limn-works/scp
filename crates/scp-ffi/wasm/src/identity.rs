@@ -1145,12 +1145,22 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
 
     // Store the agent signing key in the identity registry.
     let did = identity.did.clone();
-    IDENTITY_REGISTRY.with(|reg| {
+    let found = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         if let Some(entry) = map.get_mut(&did) {
             entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
+            true
+        } else {
+            false
         }
     });
+    if !found {
+        return Err(ScpWasmError::Identity {
+            message: format!("identity not found in registry: {did}"),
+            code: "SCP-IDENT-1009".to_owned(),
+        }
+        .into_js());
+    }
 
     Ok(WasmIdentity {
         did,
@@ -1184,12 +1194,22 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 
     // Store the new agent signing key in the identity registry.
     let did = identity.did.clone();
-    IDENTITY_REGISTRY.with(|reg| {
+    let found = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         if let Some(entry) = map.get_mut(&did) {
             entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
+            true
+        } else {
+            false
         }
     });
+    if !found {
+        return Err(ScpWasmError::Identity {
+            message: format!("identity not found in registry: {did}"),
+            code: "SCP-IDENT-1011".to_owned(),
+        }
+        .into_js());
+    }
 
     Ok(WasmIdentity {
         did,
@@ -1298,12 +1318,22 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     // Clear the agent signing key from the identity registry to prevent
     // the key material from lingering in WASM linear memory.
     let did = identity.did.clone();
-    IDENTITY_REGISTRY.with(|reg| {
+    let found = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         if let Some(entry) = map.get_mut(&did) {
             entry.agent_signing_key_bytes = None;
+            true
+        } else {
+            false
         }
     });
+    if !found {
+        return Err(ScpWasmError::Identity {
+            message: format!("identity not found in registry: {did}"),
+            code: "SCP-IDENT-1011".to_owned(),
+        }
+        .into_js());
+    }
 
     Ok(WasmIdentity {
         did,
@@ -1569,7 +1599,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
             return Ok(JsValue::from_bool(false));
         }
         // Reject future-dated attestations (clock skew tolerance: 60s).
-        if fields.timestamp > now_secs + 60 {
+        if fields.timestamp > now_secs.saturating_add(60) {
             return Ok(JsValue::from_bool(false));
         }
 
@@ -2190,14 +2220,20 @@ fn attestation_required_str<'a>(
     attestation: &'a serde_json::Value,
     field: &str,
 ) -> Result<&'a str, JsValue> {
-    attestation[field].as_str().ok_or_else(|| -> JsValue {
-        ScpWasmError::Identity {
-            message: format!("attestation missing required field '{field}'"),
-            code: "SCP-IDENT-1044".to_owned(),
-        }
-        .into_js()
-        .into()
-    })
+    attestation[field]
+        .as_str()
+        .ok_or_else(|| attestation_err(format!("attestation missing required field '{field}'")))
+}
+
+/// Shorthand for `SCP-IDENT-1044` attestation errors used across
+/// `compute_attestation_canonical_bytes` and its helpers.
+fn attestation_err(message: String) -> JsValue {
+    ScpWasmError::Identity {
+        message,
+        code: "SCP-IDENT-1044".to_owned(),
+    }
+    .into_js()
+    .into()
 }
 
 /// Computes the canonical signing bytes for an attestation JSON value.
@@ -2218,76 +2254,35 @@ fn compute_attestation_canonical_bytes(
     let subject = attestation_required_str(attestation, "subject")?;
     let issued_at = attestation["issued_at"]
         .as_u64()
-        .ok_or_else(|| -> JsValue {
-            ScpWasmError::Identity {
-                message: "attestation missing required field 'issued_at'".to_owned(),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
+        .ok_or_else(|| attestation_err("attestation missing required field 'issued_at'".into()))?;
 
     // Deserialize sub-structs into local types that mirror scp-core's
     // field declaration order, ensuring byte-identical msgpack output.
     let claim: canonical_attestation::Claim = serde_json::from_value(attestation["claim"].clone())
-        .map_err(|e| -> JsValue {
-            ScpWasmError::Identity {
-                message: format!("claim deserialization failed: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
+        .map_err(|e| attestation_err(format!("claim deserialization failed: {e}")))?;
     let evidence: canonical_attestation::Evidence =
-        serde_json::from_value(attestation["evidence"].clone()).map_err(|e| -> JsValue {
-            ScpWasmError::Identity {
-                message: format!("evidence deserialization failed: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
+        serde_json::from_value(attestation["evidence"].clone())
+            .map_err(|e| attestation_err(format!("evidence deserialization failed: {e}")))?;
 
-    let claim_msgpack = rmp_serde::to_vec_named(&claim).map_err(|e| -> JsValue {
-        ScpWasmError::Identity {
-            message: format!("claim serialization failed: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
-        }
-        .into_js()
-        .into()
-    })?;
-    let evidence_msgpack = rmp_serde::to_vec_named(&evidence).map_err(|e| -> JsValue {
-        ScpWasmError::Identity {
-            message: format!("evidence serialization failed: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
-        }
-        .into_js()
-        .into()
-    })?;
+    let claim_msgpack = rmp_serde::to_vec_named(&claim)
+        .map_err(|e| attestation_err(format!("claim serialization failed: {e}")))?;
+    let evidence_msgpack = rmp_serde::to_vec_named(&evidence)
+        .map_err(|e| attestation_err(format!("evidence serialization failed: {e}")))?;
     // Deserialize revocation_status into the typed mirror enum to produce
     // byte-identical msgpack matching scp-core's RevocationStatus.
-    let revocation_status_value = attestation
-        .get("revocation_status")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!("Active"));
+    let revocation_status_value =
+        attestation
+            .get("revocation_status")
+            .cloned()
+            .ok_or_else(|| {
+                attestation_err("attestation missing required field 'revocation_status'".into())
+            })?;
     let revocation_status: canonical_attestation::RevocationStatus =
-        serde_json::from_value(revocation_status_value).map_err(|e| -> JsValue {
-            ScpWasmError::Identity {
-                message: format!("revocation_status deserialization failed: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()
+        serde_json::from_value(revocation_status_value).map_err(|e| {
+            attestation_err(format!("revocation_status deserialization failed: {e}"))
         })?;
-    let revocation_status_msgpack =
-        rmp_serde::to_vec_named(&revocation_status).map_err(|e| -> JsValue {
-            ScpWasmError::Identity {
-                message: format!("revocation_status serialization failed: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
+    let revocation_status_msgpack = rmp_serde::to_vec_named(&revocation_status)
+        .map_err(|e| attestation_err(format!("revocation_status serialization failed: {e}")))?;
 
     let mut h = Sha256::new();
     h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V2:");

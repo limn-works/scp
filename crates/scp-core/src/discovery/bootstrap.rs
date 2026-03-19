@@ -303,10 +303,12 @@ impl BootstrapConfig {
         context_id: &ContextId,
         actual_creator_did: &DID,
     ) -> Result<bool, BootstrapVerificationError> {
+        // Check custom_contexts first so user overrides take precedence
+        // over stale default entries.
         let entry = self
-            .default_contexts
+            .custom_contexts
             .iter()
-            .chain(self.custom_contexts.iter())
+            .chain(self.default_contexts.iter())
             .find(|e| e.context_id == *context_id);
 
         entry.map_or(Ok(false), |e| {
@@ -703,6 +705,38 @@ mod tests {
             )
             .unwrap();
         assert!(result);
+    }
+
+    #[test]
+    fn verify_context_creator_custom_overrides_default() {
+        // When the same context_id exists in both default and custom lists,
+        // the custom entry's expected_creator_did should win.
+        let mut config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zDefaultCreator")]);
+        config
+            .add_custom_context(entry("ctx-shared", "did:dht:zCustomCreator"))
+            .unwrap();
+
+        // The custom creator DID should verify successfully.
+        let result = config
+            .verify_context_creator(
+                &"ctx-shared".to_owned(),
+                &DID::from("did:dht:zCustomCreator"),
+            )
+            .unwrap();
+        assert!(result);
+
+        // The default creator DID should now fail (custom overrides it).
+        let err = config
+            .verify_context_creator(
+                &"ctx-shared".to_owned(),
+                &DID::from("did:dht:zDefaultCreator"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BootstrapVerificationError::CreatorMismatch { .. }
+        ));
     }
 
     // -- BootstrapResolver ------------------------------------------------
