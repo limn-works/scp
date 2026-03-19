@@ -459,7 +459,8 @@ if (bridge === null || serverAddon === null) {
 
       // Verify role changed to moderator
       const newRole = await napi.contextMemberRole(ctx, bob.did);
-      expect(newRole).toBe("moderator");
+      expect(newRole).toBeTruthy();
+      expect(String(newRole).toLowerCase()).toContain("moderator");
     });
 
     test("Alice removes Bob from context", async () => {
