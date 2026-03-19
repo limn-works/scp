@@ -956,14 +956,13 @@ pub fn context_create_governance_checkpoint(
         let last_event_hash = parse_wasm_hex_32(&last_event_hash_hex, "last_event_hash")?;
         let state_snapshot_hash =
             parse_wasm_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
-        let creator_signature =
-            Zeroizing::new(hex::decode(&creator_signature_hex).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("invalid creator_signature hex: {e}"),
-                    code: "SCP-CTX-2062".to_owned(),
-                }
-                .into_js()
-            })?);
+        let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid creator_signature hex: {e}"),
+                code: "SCP-CTX-2062".to_owned(),
+            }
+            .into_js()
+        })?;
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let seq = checkpoint_seq as u64;
@@ -1023,13 +1022,13 @@ pub fn context_add_checkpoint_cosignature(
                 .into_js()
             })?;
 
-        let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
+        let signature = hex::decode(&signature_hex).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid signature hex: {e}"),
                 code: "SCP-CTX-2063".to_owned(),
             }
             .into_js()
-        })?);
+        })?;
 
         let status = with_manager(|mgr| {
             mgr.add_checkpoint_cosignature(&context_id, &mut checkpoint, &signer_did, &signature)
@@ -2474,9 +2473,9 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
             true,
             "NoPromotion",
         ),
-        // F1: DiscoveryContext is separate from PublicBroadcast — Encrypted mode,
+        // F1: HandleRegistry is separate from PublicBroadcast — Encrypted mode,
         // messaging_tool_invoke_ban ceiling, no projection (matches scp-core)
-        "scp:template/discovery-context" | "DiscoveryContext" => make(
+        "scp:template/handle-registry" | "HandleRegistry" => make(
             "Encrypted",
             &caps.msg_tools_invoke_ban,
             "SingleAdmin",
@@ -2533,7 +2532,7 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
                      BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
                      GatedBroadcast, scp:template/tool-interface, \
                      scp:template/paid-service, scp:template/paid-broadcast, \
-                     scp:template/discovery-context"
+                     scp:template/handle-registry"
                 ),
                 code: "SCP-VALID-7001".to_owned(),
             }
@@ -2556,8 +2555,8 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
         "scp:template/paid-broadcast" | "PaidBroadcast" => {
             serde_json::json!("scp:template/paid-broadcast")
         }
-        "scp:template/discovery-context" | "DiscoveryContext" => {
-            serde_json::json!("scp:template/discovery-context")
+        "scp:template/handle-registry" | "HandleRegistry" => {
+            serde_json::json!("scp:template/handle-registry")
         }
         other => serde_json::Value::String(other.to_owned()),
     };
@@ -3009,7 +3008,7 @@ fn canonical_template_name(template_id: &str) -> &str {
         "scp:template/tool-interface" | "ToolInterfaceTemplate" => "ToolInterfaceTemplate",
         "scp:template/paid-service" | "PaidService" => "PaidService",
         "scp:template/paid-broadcast" | "PaidBroadcast" => "PaidBroadcast",
-        "scp:template/discovery-context" | "DiscoveryContext" => "DiscoveryContext",
+        "scp:template/handle-registry" | "HandleRegistry" => "HandleRegistry",
         other => other,
     }
 }

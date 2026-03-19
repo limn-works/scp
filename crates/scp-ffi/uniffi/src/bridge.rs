@@ -12054,13 +12054,13 @@ fn parse_template_id_uniffi(
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
-        "DiscoveryContext" => Ok(TemplateId::DiscoveryContext),
+        "HandleRegistry" => Ok(TemplateId::HandleRegistry),
         _ => Err(ScpError::Validation {
             msg: format!(
                 "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
                  BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
                  GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
-                 DiscoveryContext"
+                 HandleRegistry"
             ),
             code: "SCP-VALID-7001".to_owned(),
         }),
@@ -12379,7 +12379,7 @@ mod tests {
             context_id: "ctx456".to_owned(),
             relay_urls: vec!["wss://relay.example.com".to_owned()],
             publisher_did: "did:dht:zTest".into(),
-            discovery_source: scp_core::discovery::ContextDiscoverySource::DiscoveryContext {
+            discovery_source: scp_core::discovery::ContextDiscoverySource::HandleRegistry {
                 context_id: "disc-ctx-1".to_owned(),
             },
             mode: None,
@@ -12387,8 +12387,8 @@ mod tests {
         };
 
         let json = discovery_result_to_json(&result);
-        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
+        assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");

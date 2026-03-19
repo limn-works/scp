@@ -18,6 +18,25 @@ use scp_identity::DidMethod;
 use super::{ContextId, DiscoveryError};
 
 // ---------------------------------------------------------------------------
+// BootstrapContextEntry
+// ---------------------------------------------------------------------------
+
+/// A bootstrap context entry pairing a context ID with the expected creator DID.
+///
+/// The `expected_creator_did` enables the SDK to verify that the context was
+/// indeed created by the expected operator (spec §22.13), preventing a
+/// hijacked context ID from impersonating a bootstrap context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapContextEntry {
+    /// The context ID to bootstrap from.
+    pub context_id: ContextId,
+
+    /// The expected DID of the context creator. The SDK MUST verify this
+    /// against the actual context creator before trusting bootstrap data.
+    pub expected_creator_did: String,
+}
+
+// ---------------------------------------------------------------------------
 // BootstrapConfig
 // ---------------------------------------------------------------------------
 
@@ -28,17 +47,18 @@ use super::{ContextId, DiscoveryError};
 /// direct DID resolution when contexts with discovery tools are unavailable.
 ///
 /// Analogous to DNS root servers: the SDK ships with configurable default
-/// bootstrap context IDs. Users can add custom contexts with discovery tools. If
+/// bootstrap context entries. Users can add custom contexts with discovery tools. If
 /// defaults are unreachable, direct DID resolution still works.
 ///
-/// See ADR-020 acceptance criterion 8.
+/// See ADR-020 acceptance criterion 8, spec §22.13.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapConfig {
-    /// Default bootstrap context IDs shipped with the SDK.
+    /// Default bootstrap context entries shipped with the SDK.
     ///
     /// These are queried automatically on first identity creation unless
     /// `auto_query_on_identity_creation` is set to `false`.
-    pub default_context_ids: Vec<ContextId>,
+    #[serde(default)]
+    pub default_contexts: Vec<BootstrapContextEntry>,
 
     /// Whether to automatically query contexts with discovery tools on first identity
     /// creation.
@@ -47,11 +67,12 @@ pub struct BootstrapConfig {
     /// queries.
     pub auto_query_on_identity_creation: bool,
 
-    /// User-added custom context IDs.
+    /// User-added custom context entries.
     ///
     /// These are queried alongside the defaults. Users can add contexts via
     /// [`BootstrapConfig::add_custom_context`].
-    pub custom_context_ids: Vec<ContextId>,
+    #[serde(default)]
+    pub custom_contexts: Vec<BootstrapContextEntry>,
 
     /// Whether to fall back to direct DID resolution when contexts with discovery tools
     /// are unavailable or return no results.
@@ -64,50 +85,60 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            default_context_ids: Vec::new(),
+            default_contexts: Vec::new(),
             auto_query_on_identity_creation: true,
-            custom_context_ids: Vec::new(),
+            custom_contexts: Vec::new(),
             fallback_to_did_resolution: true,
         }
     }
 }
 
 impl BootstrapConfig {
-    /// Creates a new `BootstrapConfig` with the given default discovery
-    /// context IDs.
+    /// Creates a new `BootstrapConfig` with the given default bootstrap
+    /// context entries.
     ///
     /// All other fields are set to their defaults: auto-query enabled,
     /// fallback enabled, no custom contexts.
     ///
     /// # Arguments
     ///
-    /// * `context_ids` -- Default bootstrap context IDs to query on bootstrap.
+    /// * `entries` -- Default bootstrap context entries to query on bootstrap.
     #[must_use]
-    pub fn with_defaults(context_ids: Vec<ContextId>) -> Self {
+    pub fn with_defaults(entries: Vec<BootstrapContextEntry>) -> Self {
         Self {
-            default_context_ids: context_ids,
+            default_contexts: entries,
             ..Self::default()
         }
     }
 
-    /// Adds a custom context ID.
+    /// Adds a custom context entry.
     ///
     /// Custom contexts are queried alongside the defaults. Duplicate context
     /// IDs are not filtered here -- deduplication happens at query time in
     /// [`BootstrapResolver::resolve_contexts`].
-    pub fn add_custom_context(&mut self, context_id: ContextId) {
-        self.custom_context_ids.push(context_id);
+    pub fn add_custom_context(&mut self, entry: BootstrapContextEntry) {
+        self.custom_contexts.push(entry);
     }
 
     /// Returns all context IDs (defaults + custom) as a combined list.
     ///
-    /// The returned list contains references to the default context IDs
-    /// followed by the custom context IDs.
+    /// The returned list contains context IDs from the default entries
+    /// followed by those from the custom entries.
     #[must_use]
     pub fn all_context_ids(&self) -> Vec<&ContextId> {
-        self.default_context_ids
+        self.default_contexts
             .iter()
-            .chain(self.custom_context_ids.iter())
+            .chain(self.custom_contexts.iter())
+            .map(|entry| &entry.context_id)
+            .collect()
+    }
+
+    /// Returns all context entries (defaults + custom) as a combined list.
+    #[must_use]
+    pub fn all_entries(&self) -> Vec<&BootstrapContextEntry> {
+        self.default_contexts
+            .iter()
+            .chain(self.custom_contexts.iter())
             .collect()
     }
 
@@ -272,6 +303,13 @@ impl From<BootstrapConfig> for BootstrapResolver {
 mod tests {
     use super::*;
 
+    fn entry(id: &str, did: &str) -> BootstrapContextEntry {
+        BootstrapContextEntry {
+            context_id: id.to_owned(),
+            expected_creator_did: did.to_owned(),
+        }
+    }
+
     // -- BootstrapConfig defaults -----------------------------------------
 
     #[test]
@@ -289,8 +327,8 @@ mod tests {
     #[test]
     fn default_config_has_empty_context_lists() {
         let config = BootstrapConfig::default();
-        assert!(config.default_context_ids.is_empty());
-        assert!(config.custom_context_ids.is_empty());
+        assert!(config.default_contexts.is_empty());
+        assert!(config.custom_contexts.is_empty());
     }
 
     #[test]
@@ -302,12 +340,15 @@ mod tests {
     // -- BootstrapConfig construction -------------------------------------
 
     #[test]
-    fn with_defaults_sets_default_context_ids() {
-        let ids = vec!["ctx-discovery-1".to_owned(), "ctx-discovery-2".to_owned()];
-        let config = BootstrapConfig::with_defaults(ids.clone());
+    fn with_defaults_sets_default_contexts() {
+        let entries = vec![
+            entry("ctx-discovery-1", "did:dht:z6MkOp1"),
+            entry("ctx-discovery-2", "did:dht:z6MkOp2"),
+        ];
+        let config = BootstrapConfig::with_defaults(entries.clone());
 
-        assert_eq!(config.default_context_ids, ids);
-        assert!(config.custom_context_ids.is_empty());
+        assert_eq!(config.default_contexts, entries);
+        assert!(config.custom_contexts.is_empty());
         assert!(config.should_auto_query());
         assert!(config.should_fallback());
     }
@@ -317,20 +358,21 @@ mod tests {
     #[test]
     fn add_custom_context_appends_to_custom_list() {
         let mut config = BootstrapConfig::default();
-        config.add_custom_context("ctx-custom-1".to_owned());
-        config.add_custom_context("ctx-custom-2".to_owned());
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkC1"));
+        config.add_custom_context(entry("ctx-custom-2", "did:dht:z6MkC2"));
 
-        assert_eq!(config.custom_context_ids.len(), 2);
-        assert_eq!(config.custom_context_ids[0], "ctx-custom-1");
-        assert_eq!(config.custom_context_ids[1], "ctx-custom-2");
+        assert_eq!(config.custom_contexts.len(), 2);
+        assert_eq!(config.custom_contexts[0].context_id, "ctx-custom-1");
+        assert_eq!(config.custom_contexts[1].context_id, "ctx-custom-2");
     }
 
     // -- all_context_ids combines defaults and custom ---------------------
 
     #[test]
     fn all_context_ids_combines_defaults_and_custom() {
-        let mut config = BootstrapConfig::with_defaults(vec!["ctx-default-1".to_owned()]);
-        config.add_custom_context("ctx-custom-1".to_owned());
+        let mut config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:z6MkOp")]);
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkC"));
 
         let all_ids = config.all_context_ids();
         assert_eq!(all_ids.len(), 2);
@@ -340,15 +382,30 @@ mod tests {
 
     #[test]
     fn all_context_ids_defaults_come_before_custom() {
-        let mut config =
-            BootstrapConfig::with_defaults(vec!["ctx-d1".to_owned(), "ctx-d2".to_owned()]);
-        config.add_custom_context("ctx-c1".to_owned());
+        let mut config = BootstrapConfig::with_defaults(vec![
+            entry("ctx-d1", "did:dht:z6Mk1"),
+            entry("ctx-d2", "did:dht:z6Mk2"),
+        ]);
+        config.add_custom_context(entry("ctx-c1", "did:dht:z6MkC"));
 
         let all_ids = config.all_context_ids();
         assert_eq!(all_ids.len(), 3);
         assert_eq!(*all_ids[0], "ctx-d1");
         assert_eq!(*all_ids[1], "ctx-d2");
         assert_eq!(*all_ids[2], "ctx-c1");
+    }
+
+    // -- all_entries ------------------------------------------------------
+
+    #[test]
+    fn all_entries_returns_entries_with_creator_dids() {
+        let mut config = BootstrapConfig::with_defaults(vec![entry("ctx-d1", "did:dht:z6MkOp1")]);
+        config.add_custom_context(entry("ctx-c1", "did:dht:z6MkOp2"));
+
+        let entries = config.all_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].expected_creator_did, "did:dht:z6MkOp1");
+        assert_eq!(entries[1].expected_creator_did, "did:dht:z6MkOp2");
     }
 
     // -- Opt-out of auto-query --------------------------------------------
@@ -373,8 +430,9 @@ mod tests {
 
     #[test]
     fn bootstrap_config_serialization_roundtrip() {
-        let mut config = BootstrapConfig::with_defaults(vec!["ctx-discovery-1".to_owned()]);
-        config.add_custom_context("ctx-custom-1".to_owned());
+        let mut config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:z6MkOp1")]);
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkOp2"));
         config.auto_query_on_identity_creation = false;
 
         let json = serde_json::to_string(&config).unwrap();
@@ -383,12 +441,23 @@ mod tests {
         assert_eq!(config, deserialized);
     }
 
+    #[test]
+    fn bootstrap_config_backward_compat_deserialization() {
+        // Old format without default_contexts/custom_contexts should still
+        // deserialize (serde(default) on both fields).
+        let json = r#"{"auto_query_on_identity_creation":true,"fallback_to_did_resolution":true}"#;
+        let config: BootstrapConfig = serde_json::from_str(json).unwrap();
+        assert!(config.default_contexts.is_empty());
+        assert!(config.custom_contexts.is_empty());
+    }
+
     // -- BootstrapResolver ------------------------------------------------
 
     #[test]
     fn resolver_returns_all_context_ids() {
-        let mut config = BootstrapConfig::with_defaults(vec!["ctx-default-1".to_owned()]);
-        config.add_custom_context("ctx-custom-1".to_owned());
+        let mut config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:z6MkOp")]);
+        config.add_custom_context(entry("ctx-custom-1", "did:dht:z6MkC"));
 
         let resolver = BootstrapResolver::new(config);
         let contexts = resolver.resolve_contexts();
@@ -400,9 +469,10 @@ mod tests {
 
     #[test]
     fn resolver_deduplicates_context_ids() {
-        let mut config = BootstrapConfig::with_defaults(vec!["ctx-shared".to_owned()]);
-        config.add_custom_context("ctx-shared".to_owned());
-        config.add_custom_context("ctx-unique".to_owned());
+        let mut config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:z6MkOp")]);
+        config.add_custom_context(entry("ctx-shared", "did:dht:z6MkOp"));
+        config.add_custom_context(entry("ctx-unique", "did:dht:z6MkC"));
 
         let resolver = BootstrapResolver::new(config);
         let contexts = resolver.resolve_contexts();
@@ -421,14 +491,14 @@ mod tests {
 
     #[test]
     fn resolver_config_accessor_returns_config() {
-        let config = BootstrapConfig::with_defaults(vec!["ctx-1".to_owned()]);
+        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:z6MkOp")]);
         let resolver = BootstrapResolver::new(config.clone());
         assert_eq!(resolver.config(), &config);
     }
 
     #[test]
     fn resolver_from_config() {
-        let config = BootstrapConfig::with_defaults(vec!["ctx-1".to_owned()]);
+        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:z6MkOp")]);
         let resolver: BootstrapResolver = config.into();
         assert_eq!(resolver.resolve_contexts(), vec!["ctx-1"]);
     }
@@ -437,7 +507,8 @@ mod tests {
 
     #[test]
     fn resolve_with_fallback_returns_contexts_when_available() {
-        let config = BootstrapConfig::with_defaults(vec!["ctx-discovery-1".to_owned()]);
+        let config =
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:z6MkOp")]);
         let resolver = BootstrapResolver::new(config);
 
         let result = resolver.resolve_with_fallback("did:dht:zTestDid").unwrap();

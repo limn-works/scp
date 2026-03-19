@@ -198,7 +198,7 @@ fn discovery_result_to_dict<'py>(
     let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
         map_discovery_source(&result.discovery_source);
 
-    if let scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } =
+    if let scp_core::discovery::ContextDiscoverySource::HandleRegistry { context_id } =
         &result.discovery_source
     {
         dict.set_item("discovery_context_id", context_id)?;
@@ -260,7 +260,7 @@ fn discovery_result_to_dict<'py>(
 /// - `metadata_summary` (str | None): Human-readable summary.
 /// - `trust_level` (dict): `{"kind": str}` per §22.7.
 /// - `resolution_path` (dict): `{"layer": str, "source": str, "source_id": str | None, "resolved_at": int}`
-///   per §22.11.3. Layer values use `PascalCase`: `"Domain"`, `"DiscoveryContext"`, etc.
+///   per §22.11.3. Layer values use `PascalCase`: `"Domain"`, `"HandleRegistry"`, etc.
 ///
 /// # Errors
 ///
@@ -1266,7 +1266,7 @@ mod tests {
             context_id: "ctx456".to_owned(),
             relay_urls: vec!["wss://relay.example.com".to_owned()],
             publisher_did: "did:dht:zTest".into(),
-            discovery_source: scp_core::discovery::ContextDiscoverySource::DiscoveryContext {
+            discovery_source: scp_core::discovery::ContextDiscoverySource::HandleRegistry {
                 context_id: "disc-ctx-1".to_owned(),
             },
             mode: None,
@@ -1274,8 +1274,8 @@ mod tests {
         };
 
         let json = discovery_result_to_json(&result);
-        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
+        assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");

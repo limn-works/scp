@@ -59,7 +59,9 @@ pub use addressing::{
     PetnameStore, ResolutionCache, ResolutionLayer, ResolutionPath, TrustLevel, normalize_address,
     parse_address,
 };
-pub use bootstrap::{BootstrapConfig, BootstrapResolver, WellKnownBootstrapError};
+pub use bootstrap::{
+    BootstrapConfig, BootstrapContextEntry, BootstrapResolver, WellKnownBootstrapError,
+};
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
     AgentSearchParams, AgentSearchResult, RegistrationEvent, TOOL_AGENT_DEREGISTER,

@@ -14,8 +14,8 @@
 //! configuration, trust level ordering, and handle target variants.
 
 use scp_core::discovery::{
-    BootstrapConfig, DataProvenance, DiscoveryQuery, HandleTarget, ParsedAddress, PetnameMap,
-    RegistrationEntry, TrustLevel, normalize_address, parse_address,
+    BootstrapConfig, BootstrapContextEntry, DataProvenance, DiscoveryQuery, HandleTarget,
+    ParsedAddress, PetnameMap, RegistrationEntry, TrustLevel, normalize_address, parse_address,
 };
 use scp_core::discovery::{
     HandleDeregisterParams, HandleLookupParams, HandleRegisterParams, HandleRegistry,
@@ -401,23 +401,32 @@ async fn did_routing_id_deterministic() {
 async fn bootstrap_config() {
     // Default config.
     let default_config = BootstrapConfig::default();
-    assert!(default_config.default_context_ids.is_empty());
-    assert!(default_config.custom_context_ids.is_empty());
+    assert!(default_config.default_contexts.is_empty());
+    assert!(default_config.custom_contexts.is_empty());
     assert!(default_config.should_auto_query());
     assert!(default_config.should_fallback());
 
     // with_defaults.
     let config = BootstrapConfig::with_defaults(vec![
-        "ctx-discovery-1".to_owned(),
-        "ctx-discovery-2".to_owned(),
+        BootstrapContextEntry {
+            context_id: "ctx-discovery-1".to_owned(),
+            expected_creator_did: "did:dht:z6MkOp1".to_owned(),
+        },
+        BootstrapContextEntry {
+            context_id: "ctx-discovery-2".to_owned(),
+            expected_creator_did: "did:dht:z6MkOp2".to_owned(),
+        },
     ]);
-    assert_eq!(config.default_context_ids.len(), 2);
-    assert!(config.custom_context_ids.is_empty());
+    assert_eq!(config.default_contexts.len(), 2);
+    assert!(config.custom_contexts.is_empty());
 
     // add_custom_context.
     let mut config = config;
-    config.add_custom_context("ctx-custom-1".to_owned());
-    assert_eq!(config.custom_context_ids.len(), 1);
+    config.add_custom_context(BootstrapContextEntry {
+        context_id: "ctx-custom-1".to_owned(),
+        expected_creator_did: "did:dht:z6MkC1".to_owned(),
+    });
+    assert_eq!(config.custom_contexts.len(), 1);
 
     // all_context_ids combines defaults and custom.
     let all = config.all_context_ids();
@@ -448,13 +457,13 @@ async fn trust_level_ordering() {
     );
     assert!(
         TrustLevel::AttestationVerified.default_rank()
-            > TrustLevel::DiscoveryContextVerified.default_rank()
+            > TrustLevel::HandleRegistryVerified.default_rank()
     );
 
     // Verify actual numeric values.
     assert_eq!(TrustLevel::DirectExchange.default_rank(), 6);
     assert_eq!(TrustLevel::LocalPetname.default_rank(), 5);
-    assert_eq!(TrustLevel::DiscoveryContextVerified.default_rank(), 1);
+    assert_eq!(TrustLevel::HandleRegistryVerified.default_rank(), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -49,6 +49,8 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
+use super::attestation::ThresholdRequirement;
+
 // ---------------------------------------------------------------------------
 // TrustSignalCategory — the 6 composable signal types from §9.3
 // ---------------------------------------------------------------------------
@@ -544,7 +546,7 @@ pub struct ContextSybilPolicy {
 }
 
 /// A required trust signal for context admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequiredSignal {
     /// Which signal category is required.
     pub category: TrustSignalCategory,
@@ -556,6 +558,15 @@ pub struct RequiredSignal {
     /// This is the binary cutoff — signals older than this are rejected
     /// regardless of freshness weight.
     pub max_age_secs: u64,
+
+    /// Optional N-of-M threshold requirement for this signal category.
+    ///
+    /// When present, the signal must additionally satisfy a threshold
+    /// attestation check (e.g., "at least 3 of 5 independent attestors
+    /// must have verified this signal"). When `None`, only the
+    /// `min_strength` and `max_age_secs` checks apply.
+    #[serde(default)]
+    pub threshold_requirement: Option<ThresholdRequirement>,
 }
 
 impl ContextSybilPolicy {
@@ -599,11 +610,13 @@ impl ContextSybilPolicy {
                     category: TrustSignalCategory::ParticipationHistory,
                     min_strength: 30 * 24 * 3600, // 30 days
                     max_age_secs: 90 * 24 * 3600, // 90 days
+                    threshold_requirement: None,
                 },
                 RequiredSignal {
                     category: TrustSignalCategory::ParticipationRecord,
                     min_strength: 2, // clean records in 2+ contexts
                     max_age_secs: 90 * 24 * 3600,
+                    threshold_requirement: None,
                 },
             ],
             freshness_config: FreshnessWeight::default_config(),

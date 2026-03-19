@@ -237,7 +237,7 @@ async fn all_template_ids() {
         TemplateId::ToolInterfaceTemplate,
         TemplateId::PaidService,
         TemplateId::PaidBroadcast,
-        TemplateId::DiscoveryContext,
+        TemplateId::HandleRegistry,
     ];
 
     for template in &templates {

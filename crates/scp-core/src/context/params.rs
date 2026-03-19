@@ -254,11 +254,11 @@ pub enum TemplateId {
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-broadcast")]
     PaidBroadcast,
-    /// Agent discovery template. Encrypted mode with messaging + tool invocation
-    /// ceiling, discoverable by default. Used to bootstrap agent discovery via
-    /// standardized tool schemas (ADR-020, §22).
-    #[serde(rename = "scp:template/discovery-context")]
-    DiscoveryContext,
+    /// Handle registry template. Encrypted mode with messaging + tool invocation
+    /// ceiling, discoverable by default. Used for human-readable addressing
+    /// and agent discovery via standardized tool schemas (ADR-020, §22).
+    #[serde(rename = "scp:template/handle-registry")]
+    HandleRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,7 +1078,7 @@ mod tests {
             TemplateId::GatedBroadcast,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
-            TemplateId::DiscoveryContext,
+            TemplateId::HandleRegistry,
         ];
         for (i, a) in variants.iter().enumerate() {
             for (j, b) in variants.iter().enumerate() {
