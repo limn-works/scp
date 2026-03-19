@@ -704,12 +704,16 @@ export function validateSiteConfig(config: SiteConfig): void {
   validateHostname(config.hostname);
   if (config.maxAssetsPerDeploy !== undefined) {
     if (!Number.isInteger(config.maxAssetsPerDeploy) || config.maxAssetsPerDeploy < 1) {
-      throw new Error(`maxAssetsPerDeploy must be a positive integer, got ${config.maxAssetsPerDeploy}`);
+      throw new Error(
+        `maxAssetsPerDeploy must be a positive integer, got ${config.maxAssetsPerDeploy}`,
+      );
     }
   }
   if (config.maxDeploySizeBytes !== undefined) {
     if (!Number.isInteger(config.maxDeploySizeBytes) || config.maxDeploySizeBytes < 1) {
-      throw new Error(`maxDeploySizeBytes must be a positive integer, got ${config.maxDeploySizeBytes}`);
+      throw new Error(
+        `maxDeploySizeBytes must be a positive integer, got ${config.maxDeploySizeBytes}`,
+      );
     }
   }
   if (config.deployRetentionCount !== undefined) {

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from scp_sdk.errors import IdentityError
-from scp_sdk.identity import Identity, IdentityAttestation
+from scp_sdk.identity import Identity, IdentityAttestation, RevocationStatus
 
 # ---------------------------------------------------------------------------
 # IdentityAttestation dataclass tests
@@ -37,14 +37,14 @@ class TestIdentityAttestationDataclass:
             platform="github.com",
             platform_handle="alice",
             verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000.0,
+            verified_at=1700000000,
         )
         assert att.id == "abc123"
         assert att.platform == "github.com"
         assert att.platform_handle == "alice"
         assert att.verification_method == "did:dht:z6Mk...#active"
-        assert att.verified_at == 1700000000.0
-        assert att.revocation_status == "active"
+        assert att.verified_at == 1700000000
+        assert att.revocation_status == RevocationStatus(status="active")
         assert att.platform_id is None
 
     def test_construction_all_fields(self) -> None:
@@ -53,11 +53,11 @@ class TestIdentityAttestationDataclass:
             platform="x.com",
             platform_handle="bob",
             verification_method="did:dht:z6Mk...#agent",
-            verified_at=1700000000.0,
-            revocation_status="revoked",
+            verified_at=1700000000,
+            revocation_status=RevocationStatus(status="revoked", revoked_at=1700000000),
             platform_id="12345",
         )
-        assert att.revocation_status == "revoked"
+        assert att.revocation_status == RevocationStatus(status="revoked", revoked_at=1700000000)
         assert att.platform_id == "12345"
 
     def test_from_dict(self) -> None:
@@ -66,8 +66,8 @@ class TestIdentityAttestationDataclass:
             "platform": "github.com",
             "platform_handle": "alice",
             "verification_method": "did:dht:z6Mk...#active",
-            "verified_at": 1700000000.0,
-            "revocation_status": "active",
+            "verified_at": 1700000000,
+            "revocation_status": "Active",
             "platform_id": "99",
         }
         att = IdentityAttestation._from_dict(data)
@@ -83,7 +83,7 @@ class TestIdentityAttestationDataclass:
             "verified_at": 1700000000.0,
         }
         att = IdentityAttestation._from_dict(data)
-        assert att.revocation_status == "active"
+        assert att.revocation_status == RevocationStatus(status="active")
         assert att.platform_id is None
 
     def test_to_bridge_dict_roundtrip(self) -> None:
@@ -92,7 +92,7 @@ class TestIdentityAttestationDataclass:
             platform="github.com",
             platform_handle="alice",
             verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000.0,
+            verified_at=1700000000,
             platform_id="42",
         )
         d = att._to_bridge_dict()
@@ -107,7 +107,7 @@ class TestIdentityAttestationDataclass:
             platform="github.com",
             platform_handle="alice",
             verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000.0,
+            verified_at=1700000000,
         )
         d = att._to_bridge_dict()
         assert "platform_id" not in d
@@ -118,7 +118,7 @@ class TestIdentityAttestationDataclass:
             platform="github.com",
             platform_handle="alice",
             verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000.0,
+            verified_at=1700000000,
         )
         r = repr(att)
         assert "abc123" in r
@@ -145,7 +145,7 @@ class TestIdentityCreateAttestation:
 
     def test_raises_when_bridge_missing(self) -> None:
         identity = _make_identity()
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9001"):
+        with pytest.raises(IdentityError, match="SCP-ATTEST-9010"):
             asyncio.get_event_loop().run_until_complete(
                 identity.create_attestation("github.com", "alice", "proof123")
             )
@@ -156,7 +156,7 @@ class TestIdentityListAttestations:
 
     def test_raises_when_bridge_missing(self) -> None:
         identity = _make_identity()
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9002"):
+        with pytest.raises(IdentityError, match="SCP-ATTEST-9011"):
             asyncio.get_event_loop().run_until_complete(identity.list_attestations())
 
 
@@ -165,7 +165,7 @@ class TestIdentityRemoveAttestation:
 
     def test_raises_when_bridge_missing(self) -> None:
         identity = _make_identity()
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9003"):
+        with pytest.raises(IdentityError, match="SCP-ATTEST-9012"):
             asyncio.get_event_loop().run_until_complete(identity.remove_attestation("att-id-123"))
 
 
@@ -178,23 +178,22 @@ class TestIdentityRenewAttestation:
             platform="github.com",
             platform_handle="alice",
             verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000.0,
+            verified_at=1700000000,
         )
         identity = _make_identity()
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9004"):
+        with pytest.raises(IdentityError, match="SCP-ATTEST-9013"):
             asyncio.get_event_loop().run_until_complete(identity.renew_attestation(att))
 
 
-class TestIdentityAttestationVerify:
-    """Tests for IdentityAttestation.verify when bridge is unavailable."""
+class TestIdentityAttestationVerifyRemoved:
+    """Verify that verify() was removed from IdentityAttestation (see #1458)."""
 
-    def test_raises_when_bridge_missing(self) -> None:
+    def test_verify_method_does_not_exist(self) -> None:
         att = IdentityAttestation(
             id="abc123",
             platform="github.com",
             platform_handle="alice",
             verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000.0,
+            verified_at=1700000000,
         )
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9005"):
-            asyncio.get_event_loop().run_until_complete(att.verify())
+        assert not hasattr(att, "verify")
