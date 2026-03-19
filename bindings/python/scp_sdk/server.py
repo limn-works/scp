@@ -270,7 +270,10 @@ class Node:
         """
         validate_admission(admission)
         if broadcast_key_hex is not None and author_did is None:
-            raise ValueError("broadcast_key_hex requires author_did")
+            raise ValueError(
+                "broadcast_key_hex requires author_did — provide the DID of the "
+                "broadcast key owner, or omit both for auto-resolve"
+            )
         if broadcast_key_hex is not None:
             validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(

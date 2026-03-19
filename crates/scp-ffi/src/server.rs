@@ -66,7 +66,7 @@ fn auto_wire_context_manager(
     match py.allow_threads(|| rt.block_on(NativeRelayAdapter::connect_sourced(&sourced))) {
         Ok(adapter) => {
             let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-                did_owned,
+                did_owned.clone(),
             ));
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
@@ -85,6 +85,12 @@ fn auto_wire_context_manager(
             crate::runtime::init_context_manager(&did_owned);
         }
     }
+    // Always register the node's DID as a local DID for defense-in-depth.
+    py.allow_threads(|| {
+        if let Ok(mgr) = crate::runtime::context_manager() {
+            rt.block_on(mgr.register_local_did(did_owned.into()));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +285,8 @@ impl PyNodeHandle {
             }
             (Some(_), None) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "broadcast_key_hex requires author_did",
+                    "broadcast_key_hex requires author_did — provide the DID of the \
+                     broadcast key owner, or omit both for auto-resolve",
                 ));
             }
         };

@@ -70,6 +70,10 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str) {
             crate::runtime::init_context_manager(did);
         }
     }
+    // Always register the node's DID as a local DID for defense-in-depth.
+    if let Ok(mgr) = crate::runtime::context_manager() {
+        mgr.register_local_did(did.to_owned().into()).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +244,10 @@ impl NapiNodeHandle {
                     (key_bytes, epoch, did)
                 }
                 (Some(_), None) => {
-                    return Err(NapiError::from_reason("broadcastKeyHex requires authorDid"));
+                    return Err(NapiError::from_reason(
+                        "broadcastKeyHex requires authorDid — provide the DID of the \
+                         broadcast key owner, or omit both for auto-resolve",
+                    ));
                 }
             };
 
@@ -402,9 +409,11 @@ fn build_node_identity(did: &str) -> napi::Result<NodeIdentity> {
     crate::runtime::with_identity(did, |entry| {
         let custody_clone = Arc::clone(&entry.custody);
 
-        // Build a signing function from the retained custody — same pattern as
-        // `make_dht_with_signer` in identity.rs, but returning the closure
-        // type that `DidDht::with_client_and_signer` expects.
+        // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
+        // implement `KeyCustody` (it wraps `InMemoryKeyCustody` in `.0`).
+        // `ConcreteDidMethod::make_sign_fn` requires `Arc<K: KeyCustody>`,
+        // so we delegate to the inner `.0` field directly. Same pattern as
+        // `make_dht_with_signer` in bridge.rs.
         let sign_fn: Arc<
             dyn Fn(
                     u64,

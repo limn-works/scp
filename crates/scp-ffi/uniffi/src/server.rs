@@ -20,6 +20,8 @@ use zeroize::Zeroizing;
 use scp_ffi_common::server::{self, RunningNode, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
+use scp_transport::native::NativeRelayAdapter;
+use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 use crate::bridge::{Identity, ScpError};
 use crate::{decrement_handle_count, increment_handle_count};
@@ -79,6 +81,48 @@ impl From<NodeError> for ScpError {
                 code: "SCP-TRANS-5054".to_owned(),
             },
         }
+    }
+}
+
+/// Auto-wires the global [`ContextManager`] with relay transport after
+/// node startup.
+///
+/// Connects to the node's local relay and initializes the `ContextManager`
+/// with `MlsCryptoProvider` and `RelayTransportProvider` so that context
+/// operations (create, join, send) work immediately. If the `ContextManager`
+/// was already initialized (e.g., by a prior `configure_relay_transport` or
+/// `context_create` call), this is a no-op — the `OnceLock` ensures
+/// first-writer-wins semantics.
+///
+/// Also registers the node's DID as a local DID on the `ContextManager`
+/// for defense-in-depth.
+///
+/// Best-effort: logs a warning if the relay connection fails rather than
+/// blocking node startup.
+async fn auto_wire_context_manager(did: &str, relay_url: &str) {
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    match NativeRelayAdapter::connect_sourced(&sourced).await {
+        Ok(adapter) => {
+            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                relay_url = %relay_url,
+                "auto_wire_context_manager: failed to connect to node relay — \
+                 context operations may fail until transport is configured manually"
+            );
+            // Fall back to initializing without transport so that at least
+            // the ContextManager exists (with NotConfiguredTransportProvider).
+            crate::runtime::init_context_manager();
+        }
+    }
+    // Always register the node's DID as a local DID for defense-in-depth.
+    if let Ok(mgr) = crate::runtime::context_manager() {
+        mgr.register_local_did(did.to_owned().into()).await;
     }
 }
 
@@ -477,9 +521,11 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
             code: "SCP-IDENT-1012".to_owned(),
         })?;
 
-    // Build a DidDht with signing capability from the custody provider.
-    // Constructs the sign function directly from the OpaqueInMemoryKeyCustody,
-    // matching the pattern used by make_dht_with_signer in bridge.rs.
+    // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
+    // implement `KeyCustody` (it wraps `InMemoryKeyCustody` in `.0`).
+    // `ConcreteDidMethod::make_sign_fn` requires `Arc<K: KeyCustody>`,
+    // so we delegate to the inner `.0` field directly. Same pattern as
+    // `make_dht_with_signer` in bridge.rs.
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -556,13 +602,11 @@ pub async fn node_start_in_memory(
     };
     let node = server::start_node_in_memory(node_identity).await?;
 
-    // Initialize the ContextManager so context operations can be used
-    // immediately after node startup (idempotent — OnceLock).
-    let did: String = node.identity().did().to_owned();
-    crate::runtime::init_context_manager();
-    if let Ok(mgr) = crate::runtime::context_manager() {
-        mgr.register_local_did(did.into()).await;
-    }
+    // Auto-wire the ContextManager with relay transport so that
+    // context operations work immediately after node startup.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(&did, &relay_url).await;
 
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
@@ -589,13 +633,10 @@ pub async fn node_start_local(
     };
     let node = server::start_node_local(std::path::Path::new(&data_dir), node_identity).await?;
 
-    // Initialize the ContextManager so context operations can be used
-    // immediately after node startup (idempotent — OnceLock).
-    let did: String = node.identity().did().to_owned();
-    crate::runtime::init_context_manager();
-    if let Ok(mgr) = crate::runtime::context_manager() {
-        mgr.register_local_did(did.into()).await;
-    }
+    // Auto-wire the ContextManager with relay transport.
+    let did = node.identity().did().to_owned();
+    let relay_url = node.relay_url().to_owned();
+    auto_wire_context_manager(&did, &relay_url).await;
 
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
