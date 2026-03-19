@@ -1585,7 +1585,7 @@ public struct SiteConfig: Sendable, Equatable {
     public let maxAssetsPerDeploy: Int
 
     /// Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB).
-    public let maxDeploySizeBytes: Int
+    public let maxDeploySizeBytes: Int64
 
     /// Number of deploys to retain (default: 2, max 8).
     public let deployRetentionCount: Int
@@ -1608,7 +1608,7 @@ public struct SiteConfig: Sendable, Equatable {
         hostname: String,
         indexPath: String = "/index.html",
         maxAssetsPerDeploy: Int = 10000,
-        maxDeploySizeBytes: Int = 536_870_912,
+        maxDeploySizeBytes: Int64 = 536_870_912,
         deployRetentionCount: Int = 2,
         cspOverride: String? = nil
     ) throws {
@@ -1634,7 +1634,7 @@ public struct SiteConfig: Sendable, Equatable {
         guard (1 ... 8).contains(deployRetentionCount) else {
             throw ScpError.Validation(
                 msg: "deployRetentionCount must be between 1 and 8, got \(deployRetentionCount)",
-                code: "SCP-VALID-7010"
+                code: "SCP-VALID-7140"
             )
         }
         if let csp = cspOverride {
@@ -1655,11 +1655,11 @@ public struct SiteConfig: Sendable, Equatable {
     /// - Throws: ``ScpError/Validation(msg:code:)`` if the hostname is invalid.
     static func validateHostname(_ hostname: String) throws {
         guard !hostname.isEmpty else {
-            throw ScpError.Validation(msg: "hostname must not be empty", code: "SCP-VALID-7011")
+            throw ScpError.Validation(msg: "hostname must not be empty", code: "SCP-VALID-7141")
         }
         guard hostname.count <= 253 else {
             throw ScpError.Validation(
-                msg: "hostname exceeds 253 characters", code: "SCP-VALID-7012"
+                msg: "hostname exceeds 253 characters", code: "SCP-VALID-7142"
             )
         }
         for label in hostname.split(separator: ".", omittingEmptySubsequences: false) {

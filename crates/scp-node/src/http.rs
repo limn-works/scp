@@ -925,10 +925,13 @@ fn build_main_server(
             "application node server started (plain HTTP, broadcast projection endpoints active)"
         );
         Box::pin(async move {
-            axum::serve(listener, merged)
-                .with_graceful_shutdown(shutdown_token.cancelled_owned())
-                .await
-                .map_err(|e| NodeError::Serve(e.to_string()))
+            axum::serve(
+                listener,
+                merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_token.cancelled_owned())
+            .await
+            .map_err(|e| NodeError::Serve(e.to_string()))
         })
     }
 }

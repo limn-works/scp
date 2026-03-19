@@ -241,6 +241,10 @@ export function createNativeBridge(): Bridge {
       });
     },
 
+    contextCancelSubscription(handle: BridgeContextHandle): void {
+      (addon.contextCancelSubscription as (h: BridgeContextHandle) => void)(handle);
+    },
+
     // Membership queries
     async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
       const result = await (

@@ -840,11 +840,9 @@ pub fn context_subscribe(
     };
 
     let context_id = handle.context_id.clone();
-    // NOTE: This uses SHA-256(context_id) as the routing ID. The send path
-    // (RelayTransportProvider::send_message) uses raw context_id bytes.
-    // These routing IDs DO NOT match — subscribe will not receive messages
-    // from the production send path. This requires pseudonym routing
-    // (ADR-002) to be wired for end-to-end correctness. See issue #NNNN.
+    // NOTE: Both subscribe and send paths use SHA-256(context_id) as the
+    // routing ID — they match. See context_id_bytes() which hashes when
+    // the raw ID is not exactly 32 bytes.
     let routing_id_bytes = scp_core::context::context_id_bytes(&context_id);
     let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
 
@@ -1007,6 +1005,22 @@ pub fn context_subscribe(
         active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 
+    Ok(())
+}
+
+/// Cancels an active subscription on a context handle.
+///
+/// Triggers the cancellation token so the background relay listener task
+/// terminates.  The background task itself clears `subscription_active` when
+/// it exits — clearing it here would race with a new subscription starting
+/// before the old task has terminated, allowing duplicate concurrent
+/// subscriptions.  Called from the TypeScript `receive()` generator's `finally`
+/// block to prevent orphaned tasks when the consumer abandons iteration.
+#[napi(js_name = "contextCancelSubscription")]
+pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
+    if let Ok(token) = handle.subscription_cancel.lock() {
+        token.cancel();
+    }
     Ok(())
 }
 

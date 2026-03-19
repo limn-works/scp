@@ -223,9 +223,12 @@ class Relay internal constructor(
      *
      * Blocks the calling thread until shutdown completes. Prefer [shutdown]
      * from a coroutine scope; this exists for `use {}` block support.
+     *
+     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
+     * when called from a thread that already holds the event loop.
      */
     override fun close() {
-        runBlocking { shutdown() }
+        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
     }
 
     override fun toString(): String = "Relay(url=$relayUrl, relayPort=$relayPort)"
@@ -301,9 +304,12 @@ class Node internal constructor(
      *
      * Blocks the calling thread until shutdown completes. Prefer [shutdown]
      * from a coroutine scope; this exists for `use {}` block support.
+     *
+     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
+     * when called from a thread that already holds the event loop.
      */
     override fun close() {
-        runBlocking { shutdown() }
+        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
     }
 
     // HTTP server lifecycle

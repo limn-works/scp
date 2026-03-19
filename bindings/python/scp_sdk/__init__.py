@@ -106,7 +106,7 @@ from scp_sdk.governance import (
     restore_context,
     withdraw_governance_vote,
 )
-from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation
+from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
 from scp_sdk.mcp import (
     McpClient,
     McpProvenance,
@@ -263,6 +263,7 @@ __all__ = [
     "Relay",
     "RelayPriceAdjustment",
     "RequireParticipation",
+    "RevocationStatus",
     "ScpError",
     "ScpIdAuthentication",
     "ScpIdChallenge",

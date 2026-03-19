@@ -22,7 +22,6 @@ import json
 import logging
 import re
 import unicodedata
-from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -499,17 +498,14 @@ class _ReceiveIterator(AsyncIterator[Message]):
     control back to the asyncio event loop so other coroutines can
     make progress while waiting for messages.
 
-    Oldest-drop overflow semantics are handled at the Rust bridge
-    level (see ``deliver_message`` in ``runtime.rs``).
-
-    Buffer size defaults to :data:`_DEFAULT_BUFFER_SIZE` (1,000) and is
-    configurable via :meth:`Context.create` or :meth:`Context.configure`.
+    Buffering is managed at the Rust bridge level (capacity 1000,
+    oldest-drop).  See ``deliver_message`` in ``runtime.rs``.
     """
 
-    def __init__(self, bridge_receiver: Any, buffer_size: int) -> None:
+    def __init__(self, bridge_receiver: Any) -> None:
         self._receiver = bridge_receiver
-        self._buffer: deque[Message] = deque(maxlen=buffer_size)
-        self._buffer_size = buffer_size
+        # Buffering is handled at the Rust bridge level (bounded channel
+        # with oldest-drop overflow).  No Python-side buffer needed.
         self._closed = False
 
     def __aiter__(self) -> _ReceiveIterator:
@@ -518,10 +514,6 @@ class _ReceiveIterator(AsyncIterator[Message]):
     async def __anext__(self) -> Message:
         if self._closed:
             raise StopAsyncIteration
-
-        # Return buffered messages first.
-        if self._buffer:
-            return self._buffer.popleft()
 
         # Await the bridge receiver's __anext__, which returns an
         # asyncio.Future that resolves when a message arrives on the
@@ -538,6 +530,7 @@ class _ReceiveIterator(AsyncIterator[Message]):
             sender_did=raw.sender_did,
             content=raw.payload,
             timestamp=raw.timestamp,
+            # sequence not available from bridge; hardcoded to 0 until event log integration
             sequence=0,
             context_id=raw.context_id,
         )
@@ -565,10 +558,9 @@ class Context:
             ``'closing'``, ``'closed'``, ``'expired'``).
     """
 
-    def __init__(self, handle: Any, creator_did: str, buffer_size: int) -> None:
+    def __init__(self, handle: Any, creator_did: str) -> None:
         self._handle = handle
         self._creator_did = creator_did
-        self._buffer_size = buffer_size
 
     # -- Properties ---------------------------------------------------------
 
@@ -599,7 +591,6 @@ class Context:
         promotion_policy: PromotionPolicy | str = PromotionPolicy.NO_PROMOTION,
         template_id: str | None = None,
         economic_policy: str | None = None,
-        buffer_size: int = _DEFAULT_BUFFER_SIZE,
     ) -> Context:
         """Create a new SCP context.
 
@@ -634,8 +625,6 @@ class Context:
                 must match the template definition.
             economic_policy: Optional economic policy as a JSON string
                 (spec section 19).  ``None`` means free context.
-            buffer_size: Receive buffer capacity.  Defaults to 1,000.
-                Must be between 100 and 10,000.
 
         Returns:
             A new :class:`Context` in the ``'active'`` state.
@@ -644,8 +633,6 @@ class Context:
             ContextError: If context creation fails.
             ValidationError: If parameters are invalid.
         """
-        _validate_buffer_size(buffer_size)
-
         try:
             import _scp_core
         except ImportError as exc:
@@ -681,7 +668,7 @@ class Context:
         }
 
         handle = await asyncio.to_thread(_scp_core.py_context_create, creator.did, params)
-        return cls(handle=handle, creator_did=creator.did, buffer_size=buffer_size)
+        return cls(handle=handle, creator_did=creator.did)
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -804,7 +791,7 @@ class Context:
             ) from exc
 
         bridge_receiver = await asyncio.to_thread(_scp_core.py_context_receive, self._handle)
-        return _ReceiveIterator(bridge_receiver, self._buffer_size)
+        return _ReceiveIterator(bridge_receiver)
 
     # -- Tool invocation ----------------------------------------------------
 
@@ -1361,21 +1348,6 @@ class Context:
 
         return await asyncio.to_thread(_scp_core.py_broadcast_admission, self._handle)
 
-    # -- Configuration ------------------------------------------------------
-
-    def configure(self, *, buffer_size: int | None = None) -> None:
-        """Update runtime configuration for this context.
-
-        Args:
-            buffer_size: New receive buffer capacity (100--10,000).
-
-        Raises:
-            ValueError: If *buffer_size* is out of bounds.
-        """
-        if buffer_size is not None:
-            _validate_buffer_size(buffer_size)
-            self._buffer_size = buffer_size
-
     # -- Async context manager ----------------------------------------------
 
     async def __aenter__(self) -> Context:
@@ -1410,7 +1382,9 @@ class Context:
                 try:
                     import _scp_core
 
-                    _scp_core.py_context_leave(self._handle, self._creator_did)
+                    await asyncio.to_thread(
+                        _scp_core.py_context_leave, self._handle, self._creator_did
+                    )
                 except Exception:
                     logger.debug(
                         "cleanup: failed to leave context %s",
@@ -1493,13 +1467,6 @@ class Context:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _validate_buffer_size(size: int) -> None:
-    """Raise :class:`ValueError` if *size* is outside the valid range."""
-    if not (_MIN_BUFFER_SIZE <= size <= _MAX_BUFFER_SIZE):
-        msg = f"buffer_size must be between {_MIN_BUFFER_SIZE} and {_MAX_BUFFER_SIZE}, got {size}"
-        raise ValueError(msg)
 
 
 @dataclass(frozen=True)

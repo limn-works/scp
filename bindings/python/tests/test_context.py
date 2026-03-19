@@ -9,7 +9,7 @@ Covers all acceptance criteria from SCP-043:
 - Context.create signature matches spec
 - join(), leave(), close(), send(), receive(), invoke() methods
 - __aenter__/__aexit__ implemented
-- Receive buffer: 1,000-event default, configurable buffer_size (100--10,000)
+- Receive buffer: managed at Rust bridge level (capacity 1,000, oldest-drop)
 - __anext__ returns awaitables that do not block the asyncio event loop (#138)
 
 Receive stream buffer test IDs from .docs/standards/sdk-common.md:
@@ -38,7 +38,6 @@ from scp_sdk.context import (
     Context,
     Membership,
     _ReceiveIterator,
-    _validate_buffer_size,
 )
 from scp_sdk.errors import ContextError
 from scp_sdk.types import Message
@@ -76,13 +75,11 @@ class _MockBridgeMessage:
 def _make_context(
     handle: _MockHandle | None = None,
     creator_did: str = "did:dht:z6MkAlice",
-    buffer_size: int = _DEFAULT_BUFFER_SIZE,
 ) -> Context:
     """Construct a Context with a mock handle for testing."""
     return Context(
         handle=handle or _MockHandle(),
         creator_did=creator_did,
-        buffer_size=buffer_size,
     )
 
 
@@ -207,19 +204,6 @@ class TestContextCreate:
         params = mock_bridge.py_context_create.call_args[0][1]
         assert params["tools"] == ["recipe_search"]
 
-    async def test_create_with_custom_buffer_size(self) -> None:
-        mock_bridge = MagicMock()
-        mock_bridge.py_context_create.return_value = _MockHandle()
-
-        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
-            ctx = await Context.create(
-                creator=_MockIdentity(),
-                ceiling=["messages:read"],
-                buffer_size=500,
-            )
-
-        assert ctx._buffer_size == 500
-
     async def test_create_raises_on_missing_bridge(self) -> None:
         with patch.dict("sys.modules", {"_scp_core": None}):
             with pytest.raises(ContextError, match="_scp_core"):
@@ -227,14 +211,6 @@ class TestContextCreate:
                     creator=_MockIdentity(),
                     ceiling=["messages:read"],
                 )
-
-    async def test_create_rejects_invalid_buffer_size(self) -> None:
-        with pytest.raises(ValueError, match="buffer_size"):
-            await Context.create(
-                creator=_MockIdentity(),
-                ceiling=["messages:read"],
-                buffer_size=50,
-            )
 
     async def test_create_passes_mode(self) -> None:
         mock_bridge = MagicMock()
@@ -719,64 +695,6 @@ class TestAsyncContextManager:
 # ---------------------------------------------------------------------------
 
 
-class TestContextConfigure:
-    """Tests for Context.configure() runtime configuration."""
-
-    def test_configure_updates_buffer_size(self) -> None:
-        ctx = _make_context(buffer_size=1000)
-        ctx.configure(buffer_size=500)
-        assert ctx._buffer_size == 500
-
-    def test_configure_rejects_below_min(self) -> None:
-        ctx = _make_context()
-        with pytest.raises(ValueError, match="buffer_size"):
-            ctx.configure(buffer_size=50)
-
-    def test_configure_rejects_above_max(self) -> None:
-        ctx = _make_context()
-        with pytest.raises(ValueError, match="buffer_size"):
-            ctx.configure(buffer_size=20_000)
-
-    def test_configure_no_args_is_noop(self) -> None:
-        ctx = _make_context(buffer_size=1000)
-        ctx.configure()
-        assert ctx._buffer_size == 1000
-
-
-# ---------------------------------------------------------------------------
-# Buffer size validation tests
-# ---------------------------------------------------------------------------
-
-
-class TestBufferSizeValidation:
-    """Tests for _validate_buffer_size helper."""
-
-    def test_accepts_minimum(self) -> None:
-        _validate_buffer_size(_MIN_BUFFER_SIZE)
-
-    def test_accepts_maximum(self) -> None:
-        _validate_buffer_size(_MAX_BUFFER_SIZE)
-
-    def test_accepts_default(self) -> None:
-        _validate_buffer_size(_DEFAULT_BUFFER_SIZE)
-
-    def test_rejects_below_minimum(self) -> None:
-        with pytest.raises(ValueError, match="buffer_size"):
-            _validate_buffer_size(_MIN_BUFFER_SIZE - 1)
-
-    def test_rejects_above_maximum(self) -> None:
-        with pytest.raises(ValueError, match="buffer_size"):
-            _validate_buffer_size(_MAX_BUFFER_SIZE + 1)
-
-    def test_rejects_zero(self) -> None:
-        with pytest.raises(ValueError):
-            _validate_buffer_size(0)
-
-    def test_rejects_negative(self) -> None:
-        with pytest.raises(ValueError):
-            _validate_buffer_size(-1)
-
-
 # ---------------------------------------------------------------------------
 # _ReceiveIterator tests
 # ---------------------------------------------------------------------------
@@ -816,7 +734,7 @@ class TestReceiveIterator:
             _MockBridgeMessage(payload="msg-3", timestamp=3.0),
         ]
         receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+        iterator = _ReceiveIterator(receiver)
 
         collected = []
         async for msg in iterator:
@@ -829,7 +747,7 @@ class TestReceiveIterator:
 
     async def test_empty_receiver_stops_iteration(self) -> None:
         receiver = _FakeReceiver([])
-        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+        iterator = _ReceiveIterator(receiver)
 
         collected = []
         async for msg in iterator:
@@ -839,7 +757,7 @@ class TestReceiveIterator:
 
     async def test_closed_iterator_raises_stop_async_iteration(self) -> None:
         receiver = _FakeReceiver([_MockBridgeMessage()])
-        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+        iterator = _ReceiveIterator(receiver)
         iterator.close()
 
         with pytest.raises(StopAsyncIteration):
@@ -847,7 +765,7 @@ class TestReceiveIterator:
 
     async def test_yields_message_type(self) -> None:
         receiver = _FakeReceiver([_MockBridgeMessage()])
-        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+        iterator = _ReceiveIterator(receiver)
 
         msg = await iterator.__anext__()
         assert isinstance(msg, Message)
@@ -870,7 +788,7 @@ class TestReceiveBufferCapacity001:
             for i in range(_DEFAULT_BUFFER_SIZE)
         ]
         receiver = _FakeReceiver(messages)
-        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+        iterator = _ReceiveIterator(receiver)
 
         collected = []
         async for msg in iterator:
@@ -917,7 +835,7 @@ class TestNonBlockingAnext:
                 return future
 
         receiver = _DelayedReceiver()
-        iterator = _ReceiveIterator(receiver, buffer_size=_DEFAULT_BUFFER_SIZE)
+        iterator = _ReceiveIterator(receiver)
 
         timer_completed = False
 
@@ -949,8 +867,8 @@ class TestNonBlockingAnext:
         messages_a = [_MockBridgeMessage(payload="a-1"), _MockBridgeMessage(payload="a-2")]
         messages_b = [_MockBridgeMessage(payload="b-1"), _MockBridgeMessage(payload="b-2")]
 
-        iter_a = _ReceiveIterator(_FakeReceiver(messages_a), buffer_size=_DEFAULT_BUFFER_SIZE)
-        iter_b = _ReceiveIterator(_FakeReceiver(messages_b), buffer_size=_DEFAULT_BUFFER_SIZE)
+        iter_a = _ReceiveIterator(_FakeReceiver(messages_a))
+        iter_b = _ReceiveIterator(_FakeReceiver(messages_b))
 
         async def collect(it: _ReceiveIterator) -> list[str]:
             out: list[str] = []
@@ -965,7 +883,7 @@ class TestNonBlockingAnext:
 
 
 class TestReceiveBufferConfigurable004:
-    """receive-buffer-configurable-004: buffer size configurable 100--10,000."""
+    """receive-buffer-configurable-004: buffer at Rust bridge level (1000, oldest-drop)."""
 
     def test_default_buffer_size_constant(self) -> None:
         assert _DEFAULT_BUFFER_SIZE == 1000
@@ -975,62 +893,6 @@ class TestReceiveBufferConfigurable004:
 
     def test_max_buffer_size_constant(self) -> None:
         assert _MAX_BUFFER_SIZE == 10_000
-
-    async def test_create_with_custom_buffer_size(self) -> None:
-        mock_bridge = MagicMock()
-        mock_bridge.py_context_create.return_value = _MockHandle()
-
-        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
-            ctx = await Context.create(
-                creator=_MockIdentity(),
-                ceiling=["messages:read"],
-                buffer_size=200,
-            )
-
-        assert ctx._buffer_size == 200
-
-    async def test_create_with_minimum_buffer_size(self) -> None:
-        mock_bridge = MagicMock()
-        mock_bridge.py_context_create.return_value = _MockHandle()
-
-        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
-            ctx = await Context.create(
-                creator=_MockIdentity(),
-                ceiling=["messages:read"],
-                buffer_size=_MIN_BUFFER_SIZE,
-            )
-
-        assert ctx._buffer_size == _MIN_BUFFER_SIZE
-
-    async def test_create_with_maximum_buffer_size(self) -> None:
-        mock_bridge = MagicMock()
-        mock_bridge.py_context_create.return_value = _MockHandle()
-
-        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
-            ctx = await Context.create(
-                creator=_MockIdentity(),
-                ceiling=["messages:read"],
-                buffer_size=_MAX_BUFFER_SIZE,
-            )
-
-        assert ctx._buffer_size == _MAX_BUFFER_SIZE
-
-    async def test_configure_changes_buffer_size(self) -> None:
-        ctx = _make_context(buffer_size=1000)
-        ctx.configure(buffer_size=500)
-        assert ctx._buffer_size == 500
-
-    async def test_configured_buffer_size_affects_new_iterators(self) -> None:
-        mock_bridge = MagicMock()
-        mock_receiver = _FakeReceiver([])
-        mock_bridge.py_context_receive.return_value = mock_receiver
-
-        ctx = _make_context(buffer_size=200)
-
-        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
-            iterator = await ctx.receive()
-
-        assert iterator._buffer_size == 200
 
 
 # ---------------------------------------------------------------------------

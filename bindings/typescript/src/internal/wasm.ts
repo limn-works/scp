@@ -755,6 +755,10 @@ export function createWasmBridge(): Bridge {
       });
     },
 
+    contextCancelSubscription(_handle: BridgeContextHandle): void {
+      // No-op in WASM — subscriptions are managed by the WASM runtime.
+    },
+
     // Membership queries — delegate to WASM runtime
     async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
       const wasm = getWasm();

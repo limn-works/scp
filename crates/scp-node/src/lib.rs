@@ -576,9 +576,12 @@ impl<S: Storage> ApplicationNode<S> {
                 "background HTTP server started"
             );
 
-            let result = axum::serve(listener, merged)
-                .with_graceful_shutdown(shutdown_token.cancelled_owned())
-                .await;
+            let result = axum::serve(
+                listener,
+                merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_token.cancelled_owned())
+            .await;
 
             if let Err(ref e) = result {
                 tracing::error!(error = %e, "background HTTP server exited with error");

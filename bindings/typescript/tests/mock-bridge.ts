@@ -363,6 +363,10 @@ export function createMockBridge(): Bridge & {
       ctx.subscriptions.push(callback);
     },
 
+    contextCancelSubscription(_handle: BridgeContextHandle): void {
+      // no-op in mock
+    },
+
     // Tools
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
       const ctx = getContext(handle);
