@@ -553,7 +553,6 @@ pub struct ContextSybilPolicy {
 /// provided [`ThresholdRequirement`] to enforce endorsement independence
 /// (§22.13.3). This prevents Sybil rings of mutually-endorsing identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RequiredSignal {
     /// Which signal category is required.
     pub category: TrustSignalCategory,
@@ -1848,12 +1847,15 @@ mod tests {
     }
 
     #[test]
-    fn serde_required_signal_rejects_unknown_fields() {
+    fn serde_required_signal_accepts_unknown_fields() {
+        // Wire-format types must tolerate unknown fields for forward
+        // compatibility — a newer sender may include fields this version
+        // doesn't know about yet.
         let json = r#"{"category":"Endorsement","min_strength":2,"max_age_secs":15552000,"evil_field":true}"#;
         let result: Result<RequiredSignal, _> = serde_json::from_str(json);
         assert!(
-            result.is_err(),
-            "unknown fields must be rejected: {result:?}"
+            result.is_ok(),
+            "unknown fields must be accepted for forward compatibility: {result:?}"
         );
     }
 

@@ -1220,19 +1220,18 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
     let pub_bytes = new_pub.to_bytes();
     let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
-    // Copy the agent key from the old identity if it exists.
-    let agent_key_bytes = IDENTITY_REGISTRY.with(|reg| {
-        reg.borrow()
-            .get(&old_did)
-            .and_then(|entry| entry.agent_signing_key_bytes.clone())
-    });
-
-    // Register the new identity in the registry.
+    // Remove old entry and re-insert new entry in a single closure so the
+    // agent key bytes are moved, not cloned.
     IDENTITY_REGISTRY
         .with(|reg| {
             let mut map = reg.borrow_mut();
 
-            // Remove the old identity first (key material is zeroized on drop).
+            // Take the agent key bytes from the old entry before removing it.
+            // `take()` moves the inner value out without cloning; the remaining
+            // entry is zeroized on drop via `remove()`.
+            let agent_key_bytes = map
+                .get_mut(&old_did)
+                .and_then(|entry| entry.agent_signing_key_bytes.take());
             map.remove(&old_did);
 
             check_registry_capacity(

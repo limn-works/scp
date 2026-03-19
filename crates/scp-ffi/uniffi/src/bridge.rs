@@ -2577,45 +2577,59 @@ async fn identity_create_link_attestation_impl(
     attestation.signature = sig.as_bytes().to_vec();
 
     // Store custody for later verification lookups.
+    // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
         let registry = identity_custody_registry();
-        if !registry.contains_key(&identity.did) && registry.len() >= UNIFFI_CUSTODY_REGISTRY_CAP {
-            return Err(ScpError::Identity {
-                msg: format!(
-                    "custody registry has reached capacity \
-                     ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
-                ),
-                code: "SCP-VALID-7403".to_owned(),
-            });
+        let len = registry.len();
+        match registry.entry(identity.did.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                occ.insert((Arc::clone(custody), core_id.active_signing_key));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
+                    return Err(ScpError::Identity {
+                        msg: format!(
+                            "custody registry has reached capacity \
+                             ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
+                        ),
+                        code: "SCP-VALID-7403".to_owned(),
+                    });
+                }
+                vac.insert((Arc::clone(custody), core_id.active_signing_key));
+            }
         }
-        registry.insert(
-            identity.did.clone(),
-            (Arc::clone(custody), core_id.active_signing_key),
-        );
     }
 
-    let registry = identity_link_attestation_registry();
-    if !registry.contains_key(&did_str) && registry.len() >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP {
-        return Err(ScpError::Identity {
-            msg: format!(
-                "link attestation registry has reached capacity \
-                 ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
-            ),
-            code: "SCP-VALID-7402".to_owned(),
-        });
-    }
+    // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
-        let mut entry = registry.entry(did_str).or_default();
-        if entry.len() >= UNIFFI_LINK_ATTESTATION_PER_DID_CAP {
-            return Err(ScpError::Identity {
-                msg: format!(
-                    "DID has reached the per-identity attestation limit \
-                     ({UNIFFI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
-                ),
-                code: "SCP-VALID-7403".to_owned(),
-            });
+        let registry = identity_link_attestation_registry();
+        let len = registry.len();
+        match registry.entry(did_str) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                if occ.get().len() >= UNIFFI_LINK_ATTESTATION_PER_DID_CAP {
+                    return Err(ScpError::Identity {
+                        msg: format!(
+                            "DID has reached the per-identity attestation limit \
+                             ({UNIFFI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                        ),
+                        code: "SCP-VALID-7403".to_owned(),
+                    });
+                }
+                occ.get_mut().push(attestation.clone());
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                if len >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP {
+                    return Err(ScpError::Identity {
+                        msg: format!(
+                            "link attestation registry has reached capacity \
+                             ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
+                        ),
+                        code: "SCP-VALID-7402".to_owned(),
+                    });
+                }
+                vac.insert(vec![attestation.clone()]);
+            }
         }
-        entry.push(attestation.clone());
     }
 
     serde_json::to_string(&attestation).map_err(|e| ScpError::Identity {

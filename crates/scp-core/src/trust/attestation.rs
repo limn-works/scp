@@ -250,7 +250,6 @@ pub struct ThresholdRequirement {
 /// Carries `#[serde(default)]` annotations for backward-compatible
 /// deserialization, then validates f64 fields via `TryFrom`.
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct ThresholdRequirementRaw {
     required_count: u32,
     total_attestors: u32,
@@ -2304,12 +2303,15 @@ mod tests {
     }
 
     #[test]
-    fn threshold_requirement_serde_rejects_unknown_fields() {
+    fn threshold_requirement_serde_accepts_unknown_fields() {
+        // Wire-format types must tolerate unknown fields for forward
+        // compatibility — a newer sender may include fields this version
+        // doesn't know about yet.
         let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5,"evil_field":true}"#;
         let result: Result<ThresholdRequirement, _> = serde_json::from_str(json);
         assert!(
-            result.is_err(),
-            "unknown fields must be rejected: {result:?}"
+            result.is_ok(),
+            "unknown fields must be accepted for forward compatibility: {result:?}"
         );
     }
 
