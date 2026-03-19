@@ -7046,7 +7046,7 @@ mod wasm_mirror_attestation {
         Active,
         Revoked {
             revoked_at: u64,
-            reason: Option<String>,
+            reason: String,
             #[serde(default = "default_revoked_by")]
             revoked_by: String,
         },
