@@ -353,6 +353,11 @@ pub async fn start_node_local(
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
     std::fs::create_dir_all(data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     // Common paths.
     let storage_dir = data_dir.join("storage");

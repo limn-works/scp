@@ -185,12 +185,25 @@ impl NapiNodeHandle {
 
     /// Activates HTTP broadcast projection with site configuration.
     ///
-    /// When `broadcastKeyHex` and `authorDid` are `null`, the key is
-    /// auto-resolved from the `ContextManager` using the node's identity
-    /// DID. This is the recommended usage for locally managed contexts.
+    /// Three resolution modes:
+    /// 1. Both `broadcastKeyHex` **and** `authorDid` provided -- uses
+    ///    the explicit key with epoch 0.
+    /// 2. Only `authorDid` provided -- auto-resolves the broadcast key
+    ///    using that DID (useful when the author identity differs from the
+    ///    node identity).
+    /// 3. Neither provided -- auto-resolves using the node's identity DID.
     ///
-    /// `admission` is `"open"` or `"gated"`. `hostname` is the virtual
-    /// host (RFC 1123).
+    /// Providing `broadcastKeyHex` without `authorDid` raises an error.
+    ///
+    /// `admission` is `"open"` or `"gated"`.
+    ///
+    /// Site configuration fields:
+    /// - `hostname` (required): virtual host hostname (RFC 1123).
+    /// - `indexPath`: default path for directory requests (default `"/index.html"`).
+    /// - `maxAssetsPerDeploy`: max assets per deploy (default 10000).
+    /// - `maxDeploySizeBytes`: max total deploy size in bytes (default 536870912).
+    /// - `deployRetentionCount`: deploys to retain (default 2, max 8).
+    /// - `cspOverride`: optional Content-Security-Policy override.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn enable_site_projection(
