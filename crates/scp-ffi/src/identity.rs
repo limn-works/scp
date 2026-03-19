@@ -1078,6 +1078,12 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             let new_did = new_identity.did.clone();
             let has_agent = new_document.has_agent_key();
 
+            // Preserve existing attestations from the old DID across migration.
+            let existing_attestations = crate::runtime::with_identity(&old_did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Remove old identity and register the new one.
             crate::runtime::remove_identity(&old_did);
             crate::runtime::register_identity(
@@ -1086,7 +1092,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                     identity: new_identity,
                     custody,
                     document: new_document,
-                    identity_link_attestations: Vec::new(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
             Ok(PyIdentity {

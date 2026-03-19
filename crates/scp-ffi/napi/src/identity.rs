@@ -362,6 +362,12 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Preserve existing attestations across key rotation.
+            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Update the identity registry with the rotated key handles.
             crate::runtime::register_identity(
                 &new_identity.did,
@@ -369,7 +375,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
-                    identity_link_attestations: Vec::new(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -423,6 +429,12 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Preserve existing attestations across agent key addition.
+            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Update the identity registry with the new key state so that
             // bridge functions (ucan_delegate, etc.) see the updated identity.
             crate::runtime::register_identity(
@@ -431,7 +443,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
-                    identity_link_attestations: Vec::new(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -486,6 +498,12 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Preserve existing attestations across agent key rotation.
+            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Update the identity registry with the rotated key state.
             crate::runtime::register_identity(
                 &new_identity.did,
@@ -493,7 +511,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
-                    identity_link_attestations: Vec::new(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -548,6 +566,12 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // Preserve existing attestations across agent key removal.
+            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Update the identity registry with the post-removal key state.
             crate::runtime::register_identity(
                 &new_identity.did,
@@ -555,7 +579,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
-                    identity_link_attestations: Vec::new(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -654,6 +678,12 @@ impl NapiIdentity {
 
             let new_did = new_identity.did.clone();
 
+            // Preserve existing attestations from the old DID across migration.
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Remove the old identity and register the new one.
             crate::runtime::remove_identity(&self.inner.did);
             crate::runtime::register_identity(
@@ -662,7 +692,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
-                    identity_link_attestations: Vec::new(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
