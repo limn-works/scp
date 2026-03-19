@@ -116,6 +116,12 @@ if (bridge === null || serverAddon === null) {
 
   let relayHandle: Awaited<ReturnType<typeof addon.relayStartInMemory>> | null = null;
 
+  /** Contexts with active subscriptions that need closing before relay shutdown. */
+  const subscribedContexts: Array<{
+    handle: unknown;
+    did: string;
+  }> = [];
+
   beforeAll(async () => {
     // Start an in-memory relay on an ephemeral port
     relayHandle = await addon.relayStartInMemory();
@@ -140,6 +146,17 @@ if (bridge === null || serverAddon === null) {
   });
 
   afterAll(async () => {
+    // Close contexts that have active subscriptions so their background
+    // tasks terminate before the relay shuts down.
+    for (const { handle, did } of subscribedContexts) {
+      try {
+        await napi.contextClose(handle, did);
+      } catch {
+        // Best-effort — context may already be closed.
+      }
+    }
+    subscribedContexts.length = 0;
+
     napi.shutdown(1);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
@@ -323,13 +340,13 @@ if (bridge === null || serverAddon === null) {
   // -------------------------------------------------------------------------
 
   describe("contextSubscribe relay wiring", () => {
-    test("contextSubscribe establishes relay subscription without error", async () => {
+    test("contextSubscribe establishes relay subscription without throwing", async () => {
       const alice = await napi.identityCreate("in_memory");
 
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
-          ceiling: ["messages:read", "messages:write"],
+          ceiling: ["messages:read", "messages:write", "context:close"],
           governance: "single_admin",
           memoryScope: "ephemeral",
         }),
@@ -341,9 +358,8 @@ if (bridge === null || serverAddon === null) {
         // Callback may or may not fire depending on relay delivery.
       });
 
-      // The subscription was accepted (no error thrown).
-      // A brief wait to let the background task reach the relay.
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Track for cleanup in afterAll.
+      subscribedContexts.push({ handle: ctx, did: alice.did });
     });
 
     test("duplicate subscription is rejected (SCP-CTX-2022)", async () => {
@@ -352,7 +368,7 @@ if (bridge === null || serverAddon === null) {
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
-          ceiling: ["messages:read", "messages:write"],
+          ceiling: ["messages:read", "messages:write", "context:close"],
           governance: "single_admin",
           memoryScope: "ephemeral",
         }),
@@ -360,6 +376,7 @@ if (bridge === null || serverAddon === null) {
 
       // First subscription succeeds.
       addon.contextSubscribe(ctx, alice.did, () => {});
+      subscribedContexts.push({ handle: ctx, did: alice.did });
 
       // Second subscription to the same context must fail.
       expect(() => {
@@ -440,9 +457,9 @@ if (bridge === null || serverAddon === null) {
       );
       expect(result).toBeDefined();
 
-      // Verify role changed
+      // Verify role changed to moderator
       const newRole = await napi.contextMemberRole(ctx, bob.did);
-      expect(newRole).toBeTruthy();
+      expect(newRole).toBe("moderator");
     });
 
     test("Alice removes Bob from context", async () => {
