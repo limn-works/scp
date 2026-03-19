@@ -52,6 +52,9 @@ use crate::error::ScpPyError;
 use crate::runtime::IdentityEntry;
 use crate::validate;
 
+/// Maximum number of identity link attestations per DID in the `PyO3` bridge.
+const PYO3_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+
 /// Ensures the global production DID resolver is initialized.
 ///
 /// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
@@ -1260,8 +1263,8 @@ fn py_create_identity_link_attestation(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationProof, AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationProof,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
@@ -1346,7 +1349,13 @@ fn py_create_identity_link_attestation(
                 .map_err(|e| ScpPyError::identity(format!("Ed25519 signing failed: {e}")))?;
             attestation.signature = sig.as_bytes().to_vec();
 
-            // Store the attestation.
+            // Store the attestation (with per-DID cap check).
+            if entry.identity_link_attestations.len() >= PYO3_LINK_ATTESTATION_PER_DID_CAP {
+                return Err(ScpPyError::validation(format!(
+                    "DID has reached the per-identity attestation limit \
+                     ({PYO3_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                )));
+            }
             entry.identity_link_attestations.push(attestation.clone());
 
             // Return as JSON.

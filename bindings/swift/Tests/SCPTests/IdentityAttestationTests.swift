@@ -168,26 +168,6 @@ final class IdentityAttestationTests: XCTestCase {
         }
     }
 
-    func testRenewThrowsNotImplemented() async {
-        do {
-            _ = try await renewIdentityAttestation(
-                did: "did:dht:z6MkTest",
-                attestationId: "att-123"
-            )
-            XCTFail("Expected error")
-        } catch let error as ScpError {
-            switch error {
-            case let .Identity(msg, code):
-                XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9013")
-            default:
-                XCTFail("Expected Identity error, got \(error)")
-            }
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
-    }
-
     func testVerifyThrowsNotImplemented() async {
         let att = IdentityAttestation(
             id: "abc123",
@@ -222,7 +202,7 @@ final class IdentityAttestationTests: XCTestCase {
             verificationMethod: "did:dht:z6Mk...#active",
             verifiedAt: 1_700_000_000
         )
-        let customCreate: IdentityAttestationBridge.CreateFn = { _, _, _, _, _ in
+        let customCreate: IdentityAttestationBridge.CreateFn = { _, _, _, _, _, _ in
             expected
         }
         let result = try await createIdentityAttestation(

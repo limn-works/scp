@@ -668,6 +668,7 @@ public enum IdentityAttestationBridge {
         _ platform: String,
         _ handle: String,
         _ proof: String,
+        _ verificationMethod: String,
         _ platformId: String?
     ) async throws -> IdentityAttestation
 
@@ -682,14 +683,8 @@ public enum IdentityAttestationBridge {
         _ attestationId: String
     ) async throws -> Bool
 
-    /// Renew an attestation.
-    public typealias RenewFn = @Sendable (
-        _ did: String,
-        _ attestationId: String
-    ) async throws -> IdentityAttestation
-
     /// Default create function — not yet available.
-    public static let defaultCreate: CreateFn = { _, _, _, _, _ in
+    public static let defaultCreate: CreateFn = { _, _, _, _, _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation creation is not yet available in the bridge",
             code: "SCP-ATTEST-9010"
@@ -712,13 +707,6 @@ public enum IdentityAttestationBridge {
         )
     }
 
-    /// Default renew function — not yet available.
-    public static let defaultRenew: RenewFn = { _, _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation renewal is not yet available in the bridge",
-            code: "SCP-ATTEST-9013"
-        )
-    }
 }
 
 // MARK: - Identity Attestation Public API
@@ -730,6 +718,8 @@ public enum IdentityAttestationBridge {
 ///   - platform: Platform identifier (e.g., `"github.com"`).
 ///   - handle: Platform-specific handle or username.
 ///   - proof: Platform-specific proof of ownership.
+///   - verificationMethod: One of `"oauth"`, `"signed_post"`, `"dns_record"`,
+///     `"challenge_response"`. Defaults to `"oauth"`.
 ///   - platformId: Optional platform-assigned unique identifier.
 ///   - createFn: Bridge function override for testing.
 /// - Returns: The created ``IdentityAttestation``.
@@ -743,10 +733,11 @@ public func createIdentityAttestation(
     platform: String,
     handle: String,
     proof: String,
+    verificationMethod: String = "oauth",
     platformId: String? = nil,
     createFn: IdentityAttestationBridge.CreateFn = IdentityAttestationBridge.defaultCreate
 ) async throws -> IdentityAttestation {
-    try await createFn(did, platform, handle, proof, platformId)
+    try await createFn(did, platform, handle, proof, verificationMethod, platformId)
 }
 
 /// Lists all identity link attestations for an identity.
@@ -787,22 +778,3 @@ public func removeIdentityAttestation(
     try await removeFn(did, attestationId)
 }
 
-/// Renews an identity link attestation with a fresh `verifiedAt`.
-///
-/// - Parameters:
-///   - did: The DID that owns the attestation.
-///   - attestationId: The attestation ID to renew.
-///   - renewFn: Bridge function override for testing.
-/// - Returns: A new ``IdentityAttestation`` with updated `verifiedAt`.
-/// - Throws: ``ScpError/Identity(msg:code:)`` if renewal fails.
-///
-/// ## Provenance
-///
-/// - Spec section 3.5 (Identity Link Attestations)
-public func renewIdentityAttestation(
-    did: String,
-    attestationId: String,
-    renewFn: IdentityAttestationBridge.RenewFn = IdentityAttestationBridge.defaultRenew
-) async throws -> IdentityAttestation {
-    try await renewFn(did, attestationId)
-}

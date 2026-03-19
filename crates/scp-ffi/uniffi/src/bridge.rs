@@ -2393,6 +2393,12 @@ async fn identity_verify_device_attestation_impl(
 // retains custody for signing; attestations are stored separately.
 // ---------------------------------------------------------------------------
 
+/// Maximum number of DID entries in the identity link attestation registry.
+const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
+
+/// Maximum number of attestations per DID in the identity link attestation registry.
+const UNIFFI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+
 /// Global registry of identity link attestations, keyed by DID string.
 fn identity_link_attestation_registry()
 -> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
@@ -2453,8 +2459,8 @@ async fn identity_create_link_attestation_impl(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationProof, AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationProof,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
@@ -2477,11 +2483,10 @@ async fn identity_create_link_attestation_impl(
     };
 
     // Parse the proof JSON string into a typed AttestationProof.
-    let proof: AttestationProof = serde_json::from_str(&proof)
-        .map_err(|e| ScpError::Identity {
-            msg: format!("invalid proof JSON: {e}"),
-            code: "SCP-IDENT-1040".to_owned(),
-        })?;
+    let proof: AttestationProof = serde_json::from_str(&proof).map_err(|e| ScpError::Identity {
+        msg: format!("invalid proof JSON: {e}"),
+        code: "SCP-IDENT-1040".to_owned(),
+    })?;
 
     let core_id = identity
         .core_id
@@ -2559,10 +2564,29 @@ async fn identity_create_link_attestation_impl(
         (Arc::clone(custody), core_id.active_signing_key),
     );
 
-    identity_link_attestation_registry()
-        .entry(did_str)
-        .or_default()
-        .push(attestation.clone());
+    let registry = identity_link_attestation_registry();
+    if !registry.contains_key(&did_str) && registry.len() >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP {
+        return Err(ScpError::Identity {
+            msg: format!(
+                "link attestation registry has reached capacity \
+                 ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
+            ),
+            code: "SCP-VALID-7402".to_owned(),
+        });
+    }
+    {
+        let mut entry = registry.entry(did_str).or_default();
+        if entry.len() >= UNIFFI_LINK_ATTESTATION_PER_DID_CAP {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "DID has reached the per-identity attestation limit \
+                     ({UNIFFI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                ),
+                code: "SCP-VALID-7403".to_owned(),
+            });
+        }
+        entry.push(attestation.clone());
+    }
 
     serde_json::to_string(&attestation).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize attestation: {e}"),

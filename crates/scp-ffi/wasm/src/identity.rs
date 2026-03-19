@@ -81,21 +81,16 @@ mod canonical_attestation {
 
     /// Mirrors `scp_core::identity::attestation::AttestationEvidence` field order:
     /// `method`, `proof`, `verified_at`, `verifier_did`.
+    ///
+    /// `proof` is `serde_json::Value` to support `AttestationProof`'s tagged enum
+    /// format (e.g., `{"type": "oauth_verified", "provider": "...", ...}`).
     #[derive(Serialize, Deserialize)]
     pub(super) struct Evidence {
         pub method: String,
-        pub proof: String,
+        pub proof: serde_json::Value,
         pub verified_at: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub verifier_did: Option<String>,
-    }
-
-    /// Mirrors `scp_core::identity::attestation::AttestationRevocation` field order:
-    /// `method`, `endpoint`.
-    #[derive(Serialize, Deserialize)]
-    pub(super) struct Revocation {
-        pub method: String,
-        pub endpoint: String,
     }
 }
 
@@ -154,6 +149,13 @@ const WASM_IDENTITY_REGISTRY_CAP: usize = 10_000;
 
 /// Maximum number of migration links stored in the WASM-local registry.
 const WASM_MIGRATION_LINKS_CAP: usize = 10_000;
+
+/// Maximum number of identity link attestation entries (DID keys) in the
+/// WASM-local attestation registry.
+const WASM_LINK_ATTESTATIONS_CAP: usize = 1_000;
+
+/// Maximum number of attestations per DID in the WASM-local attestation registry.
+const WASM_LINK_ATTESTATIONS_PER_DID_CAP: usize = 1_000;
 
 thread_local! {
     /// Maps DID strings to identity state. WASM is single-threaded, so
@@ -1834,6 +1836,33 @@ pub fn identity_create_link_attestation(
         hasher.update(now_ms.to_be_bytes());
         let id = hex::encode(hasher.finalize());
 
+        // Build the tagged proof object matching scp-core's AttestationProof enum.
+        let proof_value = match method_str.as_str() {
+            "signed_post" => serde_json::json!({
+                "type": "signed_post_verified",
+                "post_url": proof,
+                "nonce": "",
+                "posted_at": now_ms / 1000,
+            }),
+            "dns_record" => serde_json::json!({
+                "type": "dns_record_verified",
+                "domain": proof,
+                "record_name": "_scp-verify",
+            }),
+            "challenge_response" => serde_json::json!({
+                "type": "challenge_response_verified",
+                "challenge": proof,
+                "response_signature": "",
+            }),
+            // "oauth" and any other validated method default to oauth_verified.
+            _ => serde_json::json!({
+                "type": "oauth_verified",
+                "provider": platform,
+                "subject_id": proof,
+                "verified_at": now_ms / 1000,
+            }),
+        };
+
         // Build the attestation JSON.
         let mut attestation = serde_json::json!({
             "id": id,
@@ -1848,13 +1877,14 @@ pub fn identity_create_link_attestation(
             },
             "evidence": {
                 "method": method_str,
-                "proof": proof,
+                "proof": proof_value,
                 "verified_at": now_ms,
             },
             "revocation": {
                 "method": "did_document",
                 "endpoint": "/revocations",
             },
+            "revocation_status": "Active",
             "signature": [],
         });
 
@@ -1888,17 +1918,6 @@ pub fn identity_create_link_attestation(
                 .into_js()
                 .into()
             })?;
-            let revocation: canonical_attestation::Revocation = serde_json::from_value(
-                attestation["revocation"].clone(),
-            )
-            .map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!("revocation deserialization failed: {e}"),
-                    code: "SCP-IDENT-1041".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
 
             let claim_msgpack = rmp_serde::to_vec_named(&claim).map_err(|e| -> JsValue {
                 ScpWasmError::Identity {
@@ -1916,18 +1935,9 @@ pub fn identity_create_link_attestation(
                 .into_js()
                 .into()
             })?;
-            let revocation_msgpack =
-                rmp_serde::to_vec_named(&revocation).map_err(|e| -> JsValue {
-                    ScpWasmError::Identity {
-                        message: format!("revocation serialization failed: {e}"),
-                        code: "SCP-IDENT-1041".to_owned(),
-                    }
-                    .into_js()
-                    .into()
-                })?;
 
             let mut h = Sha256::new();
-            h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
+            h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V2:");
             // VarBytes fields: length-prefix + data
             for field in &[
                 id.as_bytes().to_vec(),
@@ -1942,8 +1952,19 @@ pub fn identity_create_link_attestation(
             h.update(now_ms.to_be_bytes());
             // Absent sentinel for expires_at: SHA-256(0x00), matching scp-core.
             h.update(ABSENT_SENTINEL);
-            // VarBytes for claim, evidence, revocation
-            for field in &[claim_msgpack, evidence_msgpack, revocation_msgpack] {
+            // VarBytes for claim, evidence, revocation_status
+            // revocation_status matches scp-core's RevocationStatus enum,
+            // serialized as msgpack (Active variant).
+            let revocation_status_msgpack = rmp_serde::to_vec_named(&serde_json::json!("Active"))
+                .map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("revocation_status serialization failed: {e}"),
+                    code: "SCP-IDENT-1041".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+            for field in &[claim_msgpack, evidence_msgpack, revocation_status_msgpack] {
                 h.update((field.len() as u32).to_be_bytes());
                 h.update(field);
             }
@@ -1974,11 +1995,37 @@ pub fn identity_create_link_attestation(
                 .collect::<Vec<_>>()
         );
 
-        // Store the attestation.
+        // Store the attestation (with capacity checks).
         LINK_ATTESTATIONS.with(|reg| {
             let mut map = reg.borrow_mut();
-            map.entry(did).or_default().push(attestation.clone());
-        });
+            if !map.contains_key(&did) && map.len() >= WASM_LINK_ATTESTATIONS_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "link attestation registry has reached capacity \
+                             ({WASM_LINK_ATTESTATIONS_CAP}) — cannot store additional attestations"
+                        ),
+                        code: "SCP-VALID-7402".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
+            let entry = map.entry(did).or_default();
+            if entry.len() >= WASM_LINK_ATTESTATIONS_PER_DID_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "DID has reached the per-identity attestation limit \
+                             ({WASM_LINK_ATTESTATIONS_PER_DID_CAP}) — cannot store additional attestations"
+                        ),
+                        code: "SCP-VALID-7403".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
+            entry.push(attestation.clone());
+            Ok(())
+        })?;
 
         let json = serde_json::to_string(&attestation).map_err(|e| -> JsValue {
             ScpWasmError::Identity {
@@ -2067,22 +2114,20 @@ fn compute_attestation_canonical_bytes(
             .into_js()
             .into()
         })?;
-    let revocation: canonical_attestation::Revocation =
-        serde_json::from_value(attestation["revocation"].clone()).map_err(|e| -> JsValue {
-            ScpWasmError::Identity {
-                message: format!("revocation deserialization failed: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
 
     let claim_msgpack = rmp_serde::to_vec_named(&claim).unwrap_or_default();
     let evidence_msgpack = rmp_serde::to_vec_named(&evidence).unwrap_or_default();
-    let revocation_msgpack = rmp_serde::to_vec_named(&revocation).unwrap_or_default();
+    // revocation_status matches scp-core's RevocationStatus enum (Active variant),
+    // serialized as msgpack. NOT the revocation metadata struct.
+    let revocation_status_str = attestation
+        .get("revocation_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Active");
+    let revocation_status_msgpack =
+        rmp_serde::to_vec_named(&serde_json::json!(revocation_status_str)).unwrap_or_default();
 
     let mut h = Sha256::new();
-    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
+    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V2:");
     for field in &[
         id.as_bytes().to_vec(),
         atype.as_bytes().to_vec(),
@@ -2101,7 +2146,7 @@ fn compute_attestation_canonical_bytes(
         Some(exp) => h.update(exp.to_be_bytes()),
         None => h.update(ABSENT_SENTINEL),
     }
-    for field in &[claim_msgpack, evidence_msgpack, revocation_msgpack] {
+    for field in &[claim_msgpack, evidence_msgpack, revocation_status_msgpack] {
         h.update((field.len() as u32).to_be_bytes());
         h.update(field);
     }

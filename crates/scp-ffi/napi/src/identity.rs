@@ -52,6 +52,9 @@ use scp_platform::traits::KeyCustody;
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
 
+/// Maximum number of identity link attestations per DID in the NAPI bridge.
+const NAPI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+
 /// Ensures the global production DID resolver is initialized (idempotent). #311
 ///
 /// The `InMemoryDhtClient` created here is stored in a shared global so that
@@ -1356,8 +1359,8 @@ pub async fn identity_create_link_attestation(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationProof, AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationProof,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
@@ -1380,11 +1383,12 @@ pub async fn identity_create_link_attestation(
     };
 
     // Parse the proof JSON string into a typed AttestationProof.
-    let proof: AttestationProof = serde_json::from_str(&proof)
-        .map_err(|e| NapiError::from(ScpNapiError::Identity {
+    let proof: AttestationProof = serde_json::from_str(&proof).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
             message: format!("invalid proof JSON: {e}"),
             code: "SCP-IDENT-1040".to_owned(),
-        }))?;
+        })
+    })?;
 
     crate::runtime::with_identity_mut(&did, |entry| {
         let issuer = DID::from(did.as_str());
@@ -1445,6 +1449,15 @@ pub async fn identity_create_link_attestation(
         })?;
         attestation.signature = sig.as_bytes().to_vec();
 
+        if entry.identity_link_attestations.len() >= NAPI_LINK_ATTESTATION_PER_DID_CAP {
+            return Err(ScpNapiError::Identity {
+                message: format!(
+                    "DID has reached the per-identity attestation limit \
+                     ({NAPI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                ),
+                code: "SCP-VALID-7403".to_owned(),
+            });
+        }
         entry.identity_link_attestations.push(attestation.clone());
 
         serde_json::to_string(&attestation).map_err(|e| ScpNapiError::Identity {

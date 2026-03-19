@@ -14,6 +14,48 @@ import { getBridge } from "./internal/bridge";
 import type { DIDDocument } from "./types";
 
 // ---------------------------------------------------------------------------
+// IdentityLinkAttestation
+// ---------------------------------------------------------------------------
+
+/** An identity link attestation proving ownership of an external platform identity (§3.5.1). */
+export interface IdentityLinkAttestation {
+  /** Deterministic attestation ID. */
+  id: string;
+  /** Always `"identity_link"`. */
+  type: string;
+  /** The DID that issued this attestation. */
+  issuer: string;
+  /** Same as issuer for self-attestations. */
+  subject: string;
+  /** Unix timestamp (ms) when created. */
+  issued_at: number;
+  /** Platform identity claim. */
+  claim: {
+    platform: string;
+    platform_handle: string;
+    platform_id?: string;
+    link_type: string;
+  };
+  /** Evidence supporting the claim. */
+  evidence: {
+    method: string;
+    /** Tagged enum matching scp-core's `AttestationProof` (e.g., `{ type: "oauth_verified", ... }`). */
+    proof: Record<string, unknown>;
+    verified_at: number;
+    verifier_did?: string;
+  };
+  /** Revocation metadata. */
+  revocation: {
+    method: string;
+    endpoint: string;
+  };
+  /** Revocation status: `"Active"` or `{ "Revoked": { ... } }`. */
+  revocation_status: string;
+  /** Ed25519 signature bytes. */
+  signature: number[];
+}
+
+// ---------------------------------------------------------------------------
 // CustodyType
 // ---------------------------------------------------------------------------
 
@@ -324,16 +366,18 @@ export class Identity {
     platform: string;
     handle: string;
     proof: string;
+    verificationMethod?: string;
     platformId?: string;
   }): Promise<IdentityAttestation> {
     try {
       const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityCreateAttestation as
+      const fn = (bridge as unknown as Record<string, unknown>).identityCreateLinkAttestation as
         | ((
             did: string,
             platform: string,
             handle: string,
             proof: string,
+            verificationMethod: string,
             platformId: string | undefined,
           ) => Promise<string>)
         | undefined;
@@ -348,6 +392,7 @@ export class Identity {
         options.platform,
         options.handle,
         options.proof,
+        options.verificationMethod ?? "oauth",
         options.platformId,
       );
       return IdentityAttestation._fromJson(json);
@@ -365,7 +410,7 @@ export class Identity {
   async listAttestations(): Promise<readonly IdentityAttestation[]> {
     try {
       const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityListAttestations as
+      const fn = (bridge as unknown as Record<string, unknown>).identityLinkAttestations as
         | ((did: string) => Promise<string>)
         | undefined;
       if (!fn) {
@@ -392,7 +437,7 @@ export class Identity {
   async removeAttestation(attestationId: string): Promise<boolean> {
     try {
       const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityRemoveAttestation as
+      const fn = (bridge as unknown as Record<string, unknown>).identityRemoveLinkAttestation as
         | ((did: string, attestationId: string) => Promise<boolean>)
         | undefined;
       if (!fn) {
@@ -402,32 +447,6 @@ export class Identity {
         );
       }
       return await fn(this.did, attestationId);
-    } catch (error) {
-      throw error instanceof IdentityError ? error : mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Renews an identity link attestation with a fresh `verifiedAt`.
-   *
-   * @param attestation - The attestation to renew.
-   * @returns A new `IdentityAttestation` with updated `verifiedAt`.
-   * @throws {IdentityError} If the bridge function is not available.
-   */
-  async renewAttestation(attestation: IdentityAttestation): Promise<IdentityAttestation> {
-    try {
-      const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityRenewAttestation as
-        | ((did: string, attestationId: string) => Promise<string>)
-        | undefined;
-      if (!fn) {
-        throw new IdentityError(
-          "Identity link attestation renewal is not yet available in the bridge",
-          "SCP-ATTEST-9013",
-        );
-      }
-      const json = await fn(this.did, attestation.id);
-      return IdentityAttestation._fromJson(json);
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }
@@ -601,8 +620,8 @@ export class IdentityAttestation implements IdentityAttestationData {
   async verify(): Promise<boolean> {
     try {
       const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).trustVerifyAttestation as
-        | ((json: string) => Promise<string>)
+      const fn = (bridge as unknown as Record<string, unknown>).identityVerifyLinkAttestation as
+        | ((json: string, issuerPublicKeyHex?: string) => Promise<boolean>)
         | undefined;
       if (!fn) {
         throw new IdentityError(
@@ -610,9 +629,7 @@ export class IdentityAttestation implements IdentityAttestationData {
           "SCP-ATTEST-9014",
         );
       }
-      const resultJson = await fn(JSON.stringify(this._toBridgeRecord()));
-      const result = JSON.parse(resultJson) as { valid?: boolean };
-      return result.valid === true;
+      return await fn(JSON.stringify(this._toBridgeRecord()));
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }

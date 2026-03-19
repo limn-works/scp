@@ -698,14 +698,30 @@ struct VerificationCacheEntry {
 /// [`super::aggregate::TrustProtocolRepository`].
 pub struct AttestationVerificationCache {
     entries: HashMap<String, VerificationCacheEntry>,
+    /// Maximum number of entries the cache can hold. When full, the oldest
+    /// entry (by `verified_at`) is evicted before inserting a new one.
+    max_capacity: usize,
 }
 
+/// Default maximum capacity for the attestation verification cache.
+const DEFAULT_CACHE_CAPACITY: usize = 10_000;
+
 impl AttestationVerificationCache {
-    /// Creates an empty verification cache.
+    /// Creates an empty verification cache with the default capacity (10000).
     #[must_use]
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            max_capacity: DEFAULT_CACHE_CAPACITY,
+        }
+    }
+
+    /// Creates an empty verification cache with the specified maximum capacity.
+    #[must_use]
+    pub fn with_capacity(max_capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_capacity,
         }
     }
 
@@ -734,7 +750,9 @@ impl AttestationVerificationCache {
 
     /// Inserts a verification result into the cache.
     ///
-    /// Overwrites any existing entry for the same attestation ID.
+    /// Overwrites any existing entry for the same attestation ID. If the
+    /// cache is at capacity and the key is new, evicts the oldest entry
+    /// (by `verified_at` timestamp) before inserting.
     pub fn insert(
         &mut self,
         attestation_id: String,
@@ -742,6 +760,18 @@ impl AttestationVerificationCache {
         result: Result<(), TrustError>,
         now: u64,
     ) {
+        // If this key already exists, overwriting won't increase count.
+        if !self.entries.contains_key(&attestation_id) && self.entries.len() >= self.max_capacity {
+            // Evict the oldest entry by verified_at.
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.verified_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest_key);
+            }
+        }
         self.entries.insert(
             attestation_id,
             VerificationCacheEntry {
