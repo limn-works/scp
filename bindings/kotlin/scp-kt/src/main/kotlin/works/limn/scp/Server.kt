@@ -211,11 +211,8 @@ class Relay internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        try {
-            bridge.shutdownRelay(this)
-        } finally {
-            isShutdown = true
-        }
+        bridge.shutdownRelay(this)
+        isShutdown = true
     }
 
     /**
@@ -223,9 +220,12 @@ class Relay internal constructor(
      *
      * Blocks the calling thread until shutdown completes. Prefer [shutdown]
      * from a coroutine scope; this exists for `use {}` block support.
+     *
+     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
+     * when called from a thread that already holds the event loop.
      */
     override fun close() {
-        runBlocking { shutdown() }
+        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
     }
 
     override fun toString(): String = "Relay(url=$relayUrl, relayPort=$relayPort)"
@@ -289,11 +289,8 @@ class Node internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        try {
-            bridge.shutdownNode(this)
-        } finally {
-            isShutdown = true
-        }
+        bridge.shutdownNode(this)
+        isShutdown = true
     }
 
     /**
@@ -301,9 +298,12 @@ class Node internal constructor(
      *
      * Blocks the calling thread until shutdown completes. Prefer [shutdown]
      * from a coroutine scope; this exists for `use {}` block support.
+     *
+     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
+     * when called from a thread that already holds the event loop.
      */
     override fun close() {
-        runBlocking { shutdown() }
+        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
     }
 
     // HTTP server lifecycle
