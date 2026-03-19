@@ -31,12 +31,12 @@ use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 // ---------------------------------------------------------------------------
 
 fn server_err(e: ServerError) -> PyErr {
-    tracing::error!(error = %e, "server operation failed");
+    tracing::debug!(error = %e, "server operation failed");
     pyo3::exceptions::PyRuntimeError::new_err(e.user_message())
 }
 
 fn node_err(e: NodeError) -> PyErr {
-    tracing::error!(error = %e, "node operation failed");
+    tracing::debug!(error = %e, "node operation failed");
     pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
 }
 
@@ -407,7 +407,11 @@ impl PyNodeHandle {
         let addr = bind_addr
             .map(|s| {
                 s.parse::<std::net::SocketAddr>().map_err(|e| {
-                    let display = if s.len() > 128 { &s[..s.floor_char_boundary(128)] } else { &s };
+                    let display = if s.len() > 128 {
+                        &s[..s.floor_char_boundary(128)]
+                    } else {
+                        &s
+                    };
                     pyo3::exceptions::PyValueError::new_err(format!(
                         "invalid bind_addr \"{display}\": {e}"
                     ))

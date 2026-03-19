@@ -29,12 +29,12 @@ use crate::{decrement_handle_count, increment_handle_count};
 // ---------------------------------------------------------------------------
 
 fn server_err(e: ServerError) -> NapiError {
-    tracing::error!(error = %e, "server operation failed");
+    tracing::debug!(error = %e, "server operation failed");
     NapiError::from_reason(e.user_message())
 }
 
 fn node_err(e: NodeError) -> NapiError {
-    tracing::error!(error = %e, "node operation failed");
+    tracing::debug!(error = %e, "node operation failed");
     NapiError::from_reason("node operation failed")
 }
 
@@ -367,7 +367,11 @@ impl NapiNodeHandle {
         let addr = bind_addr
             .map(|s| {
                 s.parse::<std::net::SocketAddr>().map_err(|e| {
-                    let display = if s.len() > 128 { &s[..s.floor_char_boundary(128)] } else { &s };
+                    let display = if s.len() > 128 {
+                        &s[..s.floor_char_boundary(128)]
+                    } else {
+                        &s
+                    };
                     NapiError::from_reason(format!("invalid bind_addr \"{display}\": {e}"))
                 })
             })

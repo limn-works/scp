@@ -33,7 +33,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 impl From<ServerError> for ScpError {
     fn from(e: ServerError) -> Self {
         let user_msg = e.user_message();
-        tracing::error!(error = %e, "server operation failed");
+        tracing::debug!(error = %e, "server operation failed");
         match e {
             ServerError::Relay(_) => Self::Transport {
                 msg: user_msg,
@@ -58,7 +58,7 @@ impl From<ServerError> for ScpError {
 
 impl From<NodeError> for ScpError {
     fn from(e: NodeError) -> Self {
-        tracing::error!(error = %e, "node operation failed");
+        tracing::debug!(error = %e, "node operation failed");
         match e {
             NodeError::MissingField(_) | NodeError::InvalidConfig(_) => Self::Validation {
                 msg: "node configuration error".to_owned(),
@@ -416,7 +416,11 @@ impl NodeHandle {
         let addr = bind_addr
             .map(|s| {
                 s.parse::<std::net::SocketAddr>().map_err(|_| {
-                    let display = if s.len() > 128 { &s[..s.floor_char_boundary(128)] } else { &s };
+                    let display = if s.len() > 128 {
+                        &s[..s.floor_char_boundary(128)]
+                    } else {
+                        &s
+                    };
                     ScpError::Validation {
                         msg: format!("invalid bind_addr: {display}"),
                         code: "SCP-TRANS-5070".to_owned(),

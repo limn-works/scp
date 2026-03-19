@@ -3482,7 +3482,7 @@ Additionally, the original spec did not define how attestations are published in
 
 **Class 2: Reference.** Verification methods: `SignedPost`, `DnsRecord`. The proof is a live external resource. The attestation points to a URL or DNS record. Consumers MUST fetch and verify the proof before granting trust weight. Unverified Reference attestations carry zero trust.
 
-**SDK-signed proof format (Class 1).** The `evidence.proof` field contains `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_ms> }`. The envelope signature covers this field. No raw JWT is stored. The SDK requests `openid` scope only — no `email`, no `profile`.
+**SDK-signed proof format (Class 1).** The `evidence.proof` field contains `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_s> }`. The envelope signature covers this field. No raw JWT is stored. The SDK requests `openid` scope only — no `email`, no `profile`.
 
 **Provider registry.** Seven initial providers: `github.com` (Class 2), `x.com` (Class 2), `google.com` (Class 1), `apple.com` (Class 1), `microsoft.com` (Class 1), `mastodon:<instance>` (Class 2), `dns` (Class 2). New providers by spec amendment only.
 

@@ -1585,7 +1585,7 @@ public struct SiteConfig: Sendable, Equatable {
     public let maxAssetsPerDeploy: Int
 
     /// Maximum total deploy size in bytes (default: 536,870,912 = 512 MiB).
-    public let maxDeploySizeBytes: Int
+    public let maxDeploySizeBytes: Int64
 
     /// Number of deploys to retain (default: 2, max 8).
     public let deployRetentionCount: Int
@@ -1608,7 +1608,7 @@ public struct SiteConfig: Sendable, Equatable {
         hostname: String,
         indexPath: String = "/index.html",
         maxAssetsPerDeploy: Int = 10000,
-        maxDeploySizeBytes: Int = 536_870_912,
+        maxDeploySizeBytes: Int64 = 536_870_912,
         deployRetentionCount: Int = 2,
         cspOverride: String? = nil
     ) throws {

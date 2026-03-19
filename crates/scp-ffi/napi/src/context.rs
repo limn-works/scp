@@ -840,11 +840,9 @@ pub fn context_subscribe(
     };
 
     let context_id = handle.context_id.clone();
-    // NOTE: This uses SHA-256(context_id) as the routing ID. The send path
-    // (RelayTransportProvider::send_message) uses raw context_id bytes.
-    // These routing IDs DO NOT match — subscribe will not receive messages
-    // from the production send path. This requires pseudonym routing
-    // (ADR-002) to be wired for end-to-end correctness. See issue #NNNN.
+    // NOTE: Both subscribe and send paths use SHA-256(context_id) as the
+    // routing ID — they match. See context_id_bytes() which hashes when
+    // the raw ID is not exactly 32 bytes.
     let routing_id_bytes = scp_core::context::context_id_bytes(&context_id);
     let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
 

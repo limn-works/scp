@@ -1616,7 +1616,7 @@ export async function evaluateInvitation(
   try {
     const bridge = await getBridge();
     const trustedDidsJson = trustedDids ? JSON.stringify(trustedDids) : undefined;
-    const result = bridge.evaluateInvitation(
+    const raw = bridge.evaluateInvitation(
       paramsJson,
       inviterDid,
       identityDid,
@@ -1624,20 +1624,12 @@ export async function evaluateInvitation(
       spendingJson ?? null,
       trustedDidsJson ?? null,
     );
-    // NAPI returns an object directly; WASM returns a JSON string promise.
-    if (typeof result === "string") {
-      return JSON.parse(result) as InvitationEvaluationResult;
+    // Normalize: bridge may return a string, an object, or a Promise of either.
+    const resolved = await Promise.resolve(raw);
+    if (typeof resolved === "string") {
+      return JSON.parse(resolved) as InvitationEvaluationResult;
     }
-    // Handle promise (WASM)
-    if (result && typeof (result as Promise<string>).then === "function") {
-      const resolved = await (result as Promise<string>);
-      if (typeof resolved === "string") {
-        return JSON.parse(resolved) as InvitationEvaluationResult;
-      }
-      return resolved as unknown as InvitationEvaluationResult;
-    }
-    // NAPI returns object with decision field
-    return result as unknown as InvitationEvaluationResult;
+    return resolved as unknown as InvitationEvaluationResult;
   } catch (error) {
     throw mapBridgeError(error);
   }
