@@ -133,9 +133,15 @@ mod canonical_attestation {
         Revoked {
             revoked_at: u64,
             reason: Option<String>,
-            #[serde(default)]
+            #[serde(default = "default_revoked_by")]
             revoked_by: String,
         },
+    }
+
+    /// Default `revoked_by` DID for pre-migration attestations that were serialized
+    /// without the `revoked_by` field.
+    fn default_revoked_by() -> String {
+        "did:unknown:pre-migration".to_owned()
     }
 }
 
