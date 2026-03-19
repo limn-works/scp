@@ -874,19 +874,13 @@ pub fn identity_create(custody: String) -> Promise {
         // and identity_attest_device can produce real Ed25519 signatures.
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
-            // Cap check: reject if at capacity and this is a new entry.
-            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-                return Err(JsValue::from(
-                    ScpWasmError::Validation {
-                        message: format!(
-                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                         — cannot create additional identities"
-                        ),
-                        code: "SCP-VALID-7400".to_owned(),
-                    }
-                    .into_js(),
-                ));
-            }
+            check_registry_capacity(
+                &*map,
+                &did,
+                WASM_IDENTITY_REGISTRY_CAP,
+                "identity registry",
+                "SCP-VALID-7400",
+            )?;
             map.insert(
                 did.clone(),
                 IdentityEntry {
@@ -896,7 +890,7 @@ pub fn identity_create(custody: String) -> Promise {
                     agent_signing_key_bytes: None,
                 },
             );
-            Ok(())
+            Ok::<(), JsValue>(())
         })?;
 
         Ok(JsValue::from(WasmIdentity {
@@ -1099,18 +1093,13 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
 
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
-            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-                return Err(JsValue::from(
-                    ScpWasmError::Validation {
-                        message: format!(
-                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                         — cannot create additional identities"
-                        ),
-                        code: "SCP-VALID-7400".to_owned(),
-                    }
-                    .into_js(),
-                ));
-            }
+            check_registry_capacity(
+                &*map,
+                &did,
+                WASM_IDENTITY_REGISTRY_CAP,
+                "identity registry",
+                "SCP-VALID-7400",
+            )?;
             map.insert(
                 did.clone(),
                 IdentityEntry {
@@ -1120,7 +1109,7 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
                 },
             );
-            Ok(())
+            Ok::<(), JsValue>(())
         })?;
 
         Ok(JsValue::from(WasmIdentity {
@@ -1238,53 +1227,50 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
     });
 
     // Register the new identity in the registry.
-    IDENTITY_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
+    IDENTITY_REGISTRY
+        .with(|reg| {
+            let mut map = reg.borrow_mut();
 
-        // Remove the old identity first (key material is zeroized on drop).
-        map.remove(&old_did);
+            // Remove the old identity first (key material is zeroized on drop).
+            map.remove(&old_did);
 
-        // Capacity check (matching identity_migrate pattern).
-        if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-            return Err(ScpWasmError::Validation {
-                message: format!(
-                    "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                     — cannot create additional identities"
-                ),
-                code: "SCP-VALID-7400".to_owned(),
-            }
-            .into_js());
-        }
+            check_registry_capacity(
+                &*map,
+                &new_did,
+                WASM_IDENTITY_REGISTRY_CAP,
+                "identity registry",
+                "SCP-VALID-7400",
+            )?;
 
-        map.insert(
-            new_did.clone(),
-            IdentityEntry {
-                signing_key_bytes: zeroize::Zeroizing::new(new_key.to_bytes()),
-                public_key_bytes: pub_bytes,
-                custody_type: custody.clone(),
-                agent_signing_key_bytes: agent_key_bytes,
-            },
-        );
+            map.insert(
+                new_did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(new_key.to_bytes()),
+                    public_key_bytes: pub_bytes,
+                    custody_type: custody.clone(),
+                    agent_signing_key_bytes: agent_key_bytes,
+                },
+            );
 
-        Ok(())
-    })?;
+            Ok::<(), JsValue>(())
+        })
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
 
     // Record the migration link (with capacity check).
-    MIGRATION_LINKS.with(|links| {
-        let mut map = links.borrow_mut();
-        if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
-            return Err(ScpWasmError::Validation {
-                message: format!(
-                    "migration links registry has reached capacity \
-                     ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional migration links"
-                ),
-                code: "SCP-VALID-7401".to_owned(),
-            }
-            .into_js());
-        }
-        map.insert(new_did.clone(), old_did);
-        Ok(())
-    })?;
+    MIGRATION_LINKS
+        .with(|links| {
+            let mut map = links.borrow_mut();
+            check_registry_capacity(
+                &*map,
+                &new_did,
+                WASM_MIGRATION_LINKS_CAP,
+                "migration links registry",
+                "SCP-VALID-7401",
+            )?;
+            map.insert(new_did.clone(), old_did);
+            Ok::<(), JsValue>(())
+        })
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
 
     Ok(WasmIdentity {
         did: new_did,
@@ -1367,18 +1353,13 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             map.remove(&old_did);
             // After removing old_did, the net count stays the same or decreases,
             // so we only need to check if the new_did is truly a new entry.
-            if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-                return Err(JsValue::from(
-                    ScpWasmError::Validation {
-                        message: format!(
-                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                         — cannot create additional identities"
-                        ),
-                        code: "SCP-VALID-7400".to_owned(),
-                    }
-                    .into_js(),
-                ));
-            }
+            check_registry_capacity(
+                &*map,
+                &new_did,
+                WASM_IDENTITY_REGISTRY_CAP,
+                "identity registry",
+                "SCP-VALID-7400",
+            )?;
             map.insert(
                 new_did.clone(),
                 IdentityEntry {
@@ -1388,26 +1369,21 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
                     agent_signing_key_bytes,
                 },
             );
-            Ok(())
+            Ok::<(), JsValue>(())
         })?;
 
         // Store the migration link so identity_resolve can populate alsoKnownAs.
         MIGRATION_LINKS.with(|links| {
             let mut map = links.borrow_mut();
-            if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
-                return Err(JsValue::from(
-                    ScpWasmError::Validation {
-                        message: format!(
-                            "migration links registry has reached capacity \
-                         ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional migration links"
-                        ),
-                        code: "SCP-VALID-7401".to_owned(),
-                    }
-                    .into_js(),
-                ));
-            }
+            check_registry_capacity(
+                &*map,
+                &new_did,
+                WASM_MIGRATION_LINKS_CAP,
+                "migration links registry",
+                "SCP-VALID-7401",
+            )?;
             map.insert(new_did.clone(), old_did);
-            Ok(())
+            Ok::<(), JsValue>(())
         })?;
 
         Ok(JsValue::from(WasmIdentity {
@@ -2037,15 +2013,53 @@ pub fn identity_create_link_attestation(
         // validate_structure). WASM cannot call scp-core directly per ADR-034,
         // so we implement equivalent checks locally.
         {
-            let mut errors = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
             if attestation["type"].as_str() != Some("identity_link") {
-                errors.push("type must be \"identity_link\"");
+                errors.push("type must be \"identity_link\"".to_owned());
             }
             if attestation["issuer"].as_str() != attestation["subject"].as_str() {
-                errors.push("issuer must equal subject for self-attestations");
+                errors.push("issuer must equal subject for self-attestations".to_owned());
             }
             if attestation["claim"]["link_type"].as_str() != Some("self_attestation") {
-                errors.push("claim.link_type must be \"self_attestation\"");
+                errors.push("claim.link_type must be \"self_attestation\"".to_owned());
+            }
+            // ID recomputation check (SHA-256 of issuer+platform+handle+issued_at).
+            if attestation["id"].as_str() != Some(id.as_str()) {
+                errors.push(format!(
+                    "id mismatch: expected {id}, got {:?}",
+                    attestation["id"].as_str().unwrap_or("<missing>"),
+                ));
+            }
+            // revoked_by == issuer check (when Revoked).
+            if let Some(revoked_obj) = attestation
+                .get("revocation_status")
+                .and_then(|s| s.as_object())
+                .and_then(|obj| obj.get("Revoked"))
+            {
+                let revoked_by = revoked_obj
+                    .get("revoked_by")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let issuer_str = attestation["issuer"].as_str().unwrap_or("");
+                if !revoked_by.is_empty() && revoked_by != issuer_str {
+                    errors.push(format!(
+                        "revoked_by {revoked_by} does not match issuer {issuer_str}",
+                    ));
+                }
+            }
+            // proof variant matches verification method.
+            let expected_method = match &typed_proof {
+                canonical_attestation::Proof::OauthVerified { .. } => "oauth",
+                canonical_attestation::Proof::SignedPostVerified { .. } => "signed_post",
+                canonical_attestation::Proof::DnsRecordVerified { .. } => "dns_record",
+                canonical_attestation::Proof::ChallengeResponseVerified { .. } => {
+                    "challenge_response"
+                }
+            };
+            if method_str != expected_method {
+                errors.push(format!(
+                    "proof variant ({expected_method}) does not match evidence.method ({method_str})",
+                ));
             }
             if !errors.is_empty() {
                 return Err(ScpWasmError::Validation {
@@ -2163,6 +2177,22 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
     })
 }
 
+/// Extracts a required string field from an attestation JSON value, returning
+/// an identity error if the field is missing or not a string.
+fn attestation_required_str<'a>(
+    attestation: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, JsValue> {
+    attestation[field].as_str().ok_or_else(|| -> JsValue {
+        ScpWasmError::Identity {
+            message: format!("attestation missing required field '{field}'"),
+            code: "SCP-IDENT-1044".to_owned(),
+        }
+        .into_js()
+        .into()
+    })
+}
+
 /// Computes the canonical signing bytes for an attestation JSON value.
 ///
 /// Replicates scp-core's `canonical_hash` construction (§9.5.1): domain
@@ -2175,11 +2205,20 @@ fn compute_attestation_canonical_bytes(
 ) -> Result<Vec<u8>, JsValue> {
     use sha2::{Digest, Sha256};
 
-    let id = attestation["id"].as_str().unwrap_or("");
-    let atype = attestation["type"].as_str().unwrap_or("");
-    let issuer = attestation["issuer"].as_str().unwrap_or("");
-    let subject = attestation["subject"].as_str().unwrap_or("");
-    let issued_at = attestation["issued_at"].as_u64().unwrap_or(0);
+    let id = attestation_required_str(attestation, "id")?;
+    let atype = attestation_required_str(attestation, "type")?;
+    let issuer = attestation_required_str(attestation, "issuer")?;
+    let subject = attestation_required_str(attestation, "subject")?;
+    let issued_at = attestation["issued_at"]
+        .as_u64()
+        .ok_or_else(|| -> JsValue {
+            ScpWasmError::Identity {
+                message: "attestation missing required field 'issued_at'".to_owned(),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
 
     // Deserialize sub-structs into local types that mirror scp-core's
     // field declaration order, ensuring byte-identical msgpack output.

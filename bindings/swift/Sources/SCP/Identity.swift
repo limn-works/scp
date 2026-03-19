@@ -604,7 +604,7 @@ public struct IdentityAttestation: Sendable {
     public let verificationMethod: String
 
     /// Unix timestamp (seconds) when the evidence was last verified.
-    public let verifiedAt: Int
+    public let verifiedAt: UInt64
 
     /// Revocation status.
     public let revocationStatus: RevocationStatus
@@ -625,7 +625,7 @@ public struct IdentityAttestation: Sendable {
         platform: String,
         platformHandle: String,
         verificationMethod: String,
-        verifiedAt: Int,
+        verifiedAt: UInt64,
         revocationStatus: RevocationStatus = .active,
         platformId: String? = nil,
         rawJson: String? = nil

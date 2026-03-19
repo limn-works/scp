@@ -715,6 +715,16 @@ impl IdentityLinkAttestation {
             )));
         }
 
+        // expires_at, when present, must be after issued_at.
+        if let Some(expires_at) = self.expires_at
+            && expires_at <= self.issued_at
+        {
+            errors.push(Cow::Owned(format!(
+                "expires_at ({expires_at}) must be greater than issued_at ({})",
+                self.issued_at,
+            )));
+        }
+
         if let Err(e) = self.evidence.validate_proof_method() {
             errors.push(e);
         }

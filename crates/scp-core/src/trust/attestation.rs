@@ -776,7 +776,7 @@ impl AttestationVerificationCache {
     /// # Performance
     ///
     /// Eviction scans all entries to find the oldest (`O(n)` where `n` is
-    /// the cache size). This is acceptable for the default capacity (1024)
+    /// the cache size). This is acceptable for the default capacity (10000)
     /// and typical usage patterns where eviction is infrequent. For larger
     /// caches, consider a `BTreeMap<(u64, String), _>` indexed by
     /// `(verified_at, id)` for `O(log n)` eviction.

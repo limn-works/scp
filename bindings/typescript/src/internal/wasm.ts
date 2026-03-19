@@ -1749,7 +1749,10 @@ export function createWasmBridge(): Bridge {
       issuerPublicKeyHex?: string | null,
     ): Promise<boolean> {
       const wasm = getWasm();
-      return await wasm.identity_verify_link_attestation_signature(attestationJson, issuerPublicKeyHex);
+      return await wasm.identity_verify_link_attestation_signature(
+        attestationJson,
+        issuerPublicKeyHex,
+      );
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)
