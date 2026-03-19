@@ -216,17 +216,29 @@ impl FileKeyCustody {
         data.extend_from_slice(&salt);
         data.extend_from_slice(&0u32.to_le_bytes());
 
-        std::fs::write(path, &data)
-            .map_err(|e| PlatformError::CustodyError(format!("failed to create key file: {e}")))?;
-
-        // Restrict permissions to owner-only on Unix (0o600). Key files
-        // must not be world-readable or group-readable.
+        // Create the file with restrictive permissions atomically on Unix
+        // to avoid a TOCTOU window where the file is world-readable.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| PlatformError::CustodyError(format!("failed to set key file permissions: {e}")),
-            )?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| {
+                    PlatformError::CustodyError(format!("failed to create key file: {e}"))
+                })?;
+            file.write_all(&data).map_err(|e| {
+                PlatformError::CustodyError(format!("failed to write key file: {e}"))
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, &data).map_err(|e| {
+                PlatformError::CustodyError(format!("failed to create key file: {e}"))
+            })?;
         }
 
         Ok(Self {

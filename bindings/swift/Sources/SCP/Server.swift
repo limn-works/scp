@@ -13,8 +13,8 @@ import Foundation
 // Standalone UniFFI functions:
 //   - relayStartInMemory() async throws -> RelayHandle
 //   - relayStartLocal(dataDir: String) async throws -> RelayHandle
-//   - nodeStartInMemory() async throws -> NodeHandle
-//   - nodeStartLocal(dataDir: String) async throws -> NodeHandle
+//   - nodeStartInMemory(identity: Identity?) async throws -> NodeHandle
+//   - nodeStartLocal(dataDir: String, identity: Identity?) async throws -> NodeHandle
 
 // MARK: - ServerBridge
 

@@ -164,6 +164,11 @@ class Node:
     async def start_in_memory(identity: Identity | None = None) -> Node:
         """Start a full application node with in-memory storage.
 
+        When ``identity`` is provided, the node uses that pre-existing identity
+        instead of generating a fresh one -- the same DID persists across node
+        restarts (identity portability).  When ``None``, a fresh ephemeral
+        identity is generated automatically.
+
         Auto-wires in-memory key custody, in-memory storage, in-memory DHT
         client, self-signed TLS, and a relay on an OS-assigned port.
 
@@ -181,6 +186,13 @@ class Node:
     @staticmethod
     async def start_local(data_dir: str, identity: Identity | None = None) -> Node:
         """Start a full application node with file-backed storage.
+
+        When ``identity`` is provided, the node uses that pre-existing identity
+        instead of generating one -- the same DID persists across node restarts
+        (identity portability).  When ``None``, the node creates or reloads a
+        persistent identity via ``FileKeyCustody``, which requires the
+        ``SCP_KEY_PASSPHRASE`` environment variable to be set (used for
+        Argon2id key derivation to encrypt the key file at rest).
 
         Opens (or creates) persistent storage at ``<data_dir>/storage/``
         and a redb blob database at ``<data_dir>/blobs.redb``.
