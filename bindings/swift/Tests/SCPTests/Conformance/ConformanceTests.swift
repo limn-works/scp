@@ -94,7 +94,7 @@ struct ConformanceTests {
             let issuer = input["issuer_did"] ?? ""
             let audience = input["audience_did"] ?? ""
             let handle = ContextHandle(noPointer: .init())
-            let mockMint: UcanBridge.MintFn = { _, _, _ in
+            let mockMint: UcanBridge.MintFn = { _, _, _, _ in
                 throw ScpError.Validation(
                     msg: "Conformance stub: no real Rust runtime",
                     code: "SCP-VALID-7999"

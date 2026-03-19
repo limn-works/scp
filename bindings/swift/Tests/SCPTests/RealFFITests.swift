@@ -82,14 +82,18 @@ private struct FFISkipError: Error {}
 /// Creates a ``ContextParams`` with sensible test defaults.
 private func makeTestParams(
     ceiling: [String] = ["messages:read", "messages:write"],
+    mode: ContextMode = .encrypted,
     governance: GovernanceModel = .singleAdmin,
+    ceilingPolicy: CeilingPolicy = .immutable,
     memoryScope: MemoryScope = .full,
     ttlSeconds: UInt64 = 3600,
     promotable: Bool = false,
     minProtocolVersion: UInt16 = 0
 ) -> ContextParams {
     ContextParams(
+        mode: mode,
         ceiling: ceiling,
+        ceilingPolicy: ceilingPolicy,
         governance: governance,
         memoryScope: memoryScope,
         ttlSeconds: ttlSeconds,
@@ -97,7 +101,8 @@ private func makeTestParams(
         minProtocolVersion: minProtocolVersion,
         maxChainDepth: nil,
         maxNestingDepth: nil,
-        sessionCap: nil
+        sessionCap: nil,
+        economicPolicy: nil
     )
 }
 
@@ -1121,7 +1126,8 @@ struct RealFFIUcanAndGovernanceTests {
             _ = try await ucanMint(
                 handle: handle,
                 memberDid: identity.did(),
-                capabilities: ["messages:read", "messages:write"]
+                capabilities: ["messages:read", "messages:write"],
+                proofs: nil
             )
             Issue.record("Expected ADR-039 self-delegation error from ucanMint")
         } catch let error as ScpError {

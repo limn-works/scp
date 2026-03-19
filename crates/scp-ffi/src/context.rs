@@ -866,7 +866,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     // Delegate context creation to the shared ContextManager for lifecycle tracking.
     // Build scp-core ContextParams from the parsed PyContextParams.
     {
-        let core_params = build_core_context_params(&parsed);
+        let core_params = build_core_context_params(&parsed)?;
         let creator_did_owned = scp_identity::DID(identity_did.to_owned());
         let rt = crate::runtime()?;
         let mgr = crate::runtime::context_manager()
@@ -1013,7 +1013,7 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
         // We need the handle to delegate. Since the handle is stored in
         // ContextManager's internal state, we create a temporary handle
         // matching the context's params for the join call.
-        let core_params = build_core_context_params(&handle.params);
+        let core_params = build_core_context_params(&handle.params)?;
         let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
         // Transition the temp handle to Active to match the real state.
         rt.block_on(async {
@@ -1074,7 +1074,7 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        let core_params = build_core_context_params(&handle.params);
+        let core_params = build_core_context_params(&handle.params)?;
         let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
         rt.block_on(async {
             let _ = temp_handle
@@ -1154,7 +1154,7 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        let core_params = build_core_context_params(&handle.params);
+        let core_params = build_core_context_params(&handle.params)?;
         let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
         let close_result = rt.block_on(async {
             let _ = temp_handle
@@ -1246,7 +1246,7 @@ fn py_context_send(
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        let core_params = build_core_context_params(&handle.params);
+        let core_params = build_core_context_params(&handle.params)?;
         let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
         rt.block_on(async {
             let _ = temp_handle
@@ -1414,9 +1414,11 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
 ///
 /// Converts the flat FFI-facing parameter representation into the typed
 /// scp-core parameter struct used by [`ContextManager::create_context`].
-fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::ContextParams {
+fn build_core_context_params(
+    py_params: &PyContextParams,
+) -> PyResult<scp_core::context::ContextParams> {
     use scp_core::context::params::{
-        CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, PromotionPolicy, TemplateId,
+        CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, PromotionPolicy,
     };
 
     let mode = match py_params.mode.as_str() {
@@ -1444,22 +1446,10 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
     let _ = py_params.governance.as_str();
     let governance_model = GovernanceModel::SingleAdmin;
 
-    let template_id = py_params.template_id.as_deref().and_then(|tid| match tid {
-        "BilateralEphemeral" => Some(TemplateId::BilateralEphemeral),
-        "BilateralPersistent" => Some(TemplateId::BilateralPersistent),
-        "Coordination" => Some(TemplateId::Coordination),
-        "GroupDiscussion" => Some(TemplateId::GroupDiscussion),
-        "PublicBroadcast" => Some(TemplateId::PublicBroadcast),
-        "GatedBroadcast" => Some(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" => Some(TemplateId::ToolInterfaceTemplate),
-        "scp:template/paid-service" => Some(TemplateId::PaidService),
-        "scp:template/paid-broadcast" => Some(TemplateId::PaidBroadcast),
-        "scp:template/handle-registry"
-        | "HandleRegistry"
-        | "scp:template/discovery-context"
-        | "DiscoveryContext" => Some(TemplateId::HandleRegistry),
-        _ => None,
-    });
+    let template_id = py_params
+        .template_id
+        .as_deref()
+        .and_then(|tid| parse_template_id(tid).ok());
 
     let ceiling: Vec<scp_core::context::roles::Capability> = py_params
         .ceiling
@@ -1498,7 +1488,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
 
     let ttl = py_params.ttl.map(std::time::Duration::from_secs_f64);
 
-    scp_core::context::ContextParams {
+    Ok(scp_core::context::ContextParams {
         mode,
         ceiling,
         ceiling_policy,
@@ -1509,7 +1499,15 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         memory_scope,
         governance: governance_model,
         template_id,
-        economic_policy: None,
+        economic_policy: py_params
+            .economic_policy
+            .as_deref()
+            .map(|ep_json| {
+                serde_json::from_str(ep_json).map_err(|e| {
+                    PyRuntimeError::new_err(format!("invalid economic_policy JSON: {e}"))
+                })
+            })
+            .transpose()?,
         metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
         projection_policy: None,
         discoverable: false,
@@ -1522,7 +1520,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: py_params.min_protocol_version,
         migration_source: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2338,7 +2336,7 @@ fn py_finalize_close(handle: &PyContextHandle) -> PyResult<()> {
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
-    let core_params = build_core_context_params(&handle.params);
+    let core_params = build_core_context_params(&handle.params)?;
     let context_id = handle.context_id.clone();
 
     rt.block_on(async move {
@@ -3223,7 +3221,7 @@ fn py_context_handle_ttl_expiry(handle: &PyContextHandle) -> PyResult<()> {
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
     let context_id = handle.context_id.clone();
-    let core_params = build_core_context_params(&handle.params);
+    let core_params = build_core_context_params(&handle.params)?;
 
     rt.block_on(async move {
         let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
@@ -3288,7 +3286,7 @@ fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyR
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
     let context_id = handle.context_id.clone();
-    let core_params = build_core_context_params(&handle.params);
+    let core_params = build_core_context_params(&handle.params)?;
 
     rt.block_on(async move {
         let core_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);

@@ -75,7 +75,8 @@ public enum UcanBridge {
     public typealias MintFn = @Sendable (
         _ handle: ContextHandle,
         _ memberDid: String,
-        _ capabilities: [String]
+        _ capabilities: [String],
+        _ proofs: [String]?
     ) async throws -> UcanToken
 
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
@@ -91,8 +92,8 @@ public enum UcanBridge {
     }
 
     /// Default mint function that delegates to the UniFFI-generated binding.
-    public static let defaultMint: MintFn = { handle, memberDid, capabilities in
-        try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities)
+    public static let defaultMint: MintFn = { handle, memberDid, capabilities, proofs in
+        try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities, proofs: proofs)
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
@@ -156,6 +157,7 @@ public func validateUcanToken(
 ///   - handle: The ``ContextHandle`` for the context.
 ///   - memberDid: The DID of the member to mint the token for.
 ///   - capabilities: An array of capability strings.
+///   - proofs: Optional proof chain CIDs for delegated tokens.
 ///   - mintFn: Bridge function override for testing.
 /// - Returns: The minted ``UcanToken``.
 /// - Throws: ``ScpError/Permission(msg:code:)`` if minting fails.
@@ -169,9 +171,10 @@ public func mintUcanToken(
     handle: ContextHandle,
     memberDid: String,
     capabilities: [String],
+    proofs: [String]? = nil,
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
-    try await mintFn(handle, memberDid, capabilities)
+    try await mintFn(handle, memberDid, capabilities, proofs)
 }
 
 /// Revokes a UCAN token using the full revocation pipeline.
@@ -293,11 +296,11 @@ public func mint(
     audienceDid: String,
     capabilities: [UcanCapability],
     expirySecs _: UInt64 = 3600,
-    proofs _: [String] = [],
+    proofs: [String] = [],
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
     let capStrings = capabilities.map { "\($0.resource):\($0.action)" }
-    return try await mintFn(handle, audienceDid, capStrings)
+    return try await mintFn(handle, audienceDid, capStrings, proofs.isEmpty ? nil : proofs)
 }
 
 /// Revokes a UCAN token.

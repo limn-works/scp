@@ -216,6 +216,7 @@ export declare function mintUcan(
   ctx: Context,
   memberDid: string,
   capabilities: readonly string[],
+  proofs?: readonly string[],
 ): Promise<UcanToken>;
 
 export declare function validateUcan(

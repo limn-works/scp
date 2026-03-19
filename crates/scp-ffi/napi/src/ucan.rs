@@ -313,18 +313,24 @@ pub async fn ucan_validate(
 ///
 /// See RED-102 for the `KeyCustody` wiring story.
 #[napi]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
 pub async fn ucan_mint(
     handle: &NapiContextHandle,
     member_did: String,
     capabilities: Vec<String>,
+    proofs: Option<Vec<String>>,
 ) -> napi::Result<NapiUcanToken> {
     validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    if let Some(ref tokens) = proofs {
+        for t in tokens {
+            validate_ucan_token(t).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        }
+    }
 
     // In-memory custody is only available when `allow_in_memory_custody` is enabled.
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &member_did, &capabilities);
+        let _ = (&handle, &member_did, &capabilities, &proofs);
         return Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
             code: "SCP-PERM-3023".to_owned(),
@@ -373,7 +379,7 @@ pub async fn ucan_mint(
             capabilities: &capabilities,
             lifetime_secs: 3600, // 1 hour default
             not_before: None,
-            proofs: vec![],
+            proofs: proofs.unwrap_or_default(),
             facts: None,
             key_scope: None,
             signing_key_id: None,
