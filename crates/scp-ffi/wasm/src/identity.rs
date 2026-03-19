@@ -1887,65 +1887,36 @@ pub fn identity_create_link_attestation(
         hasher.update(now_secs.to_be_bytes());
         let id = hex::encode(hasher.finalize());
 
-        // Build the tagged proof object matching scp-core's AttestationProof enum.
-        let proof_value = match method_str.as_str() {
-            "signed_post" => {
-                // Parse the proof JSON to extract the nonce. The caller must
-                // provide a JSON object with at least { "post_url", "nonce" }.
-                let proof_obj: serde_json::Value =
-                    serde_json::from_str(&proof).map_err(|e| -> JsValue {
-                        ScpWasmError::Identity {
-                            message: format!(
-                                "signed_post proof must be a JSON object with 'post_url' \
-                                 and 'nonce' fields: {e}"
-                            ),
-                            code: "SCP-IDENT-1040".to_owned(),
-                        }
-                        .into_js()
-                        .into()
-                    })?;
-                let post_url = proof_obj
-                    .get("post_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&proof)
-                    .to_owned();
-                let nonce = proof_obj
-                    .get("nonce")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| -> JsValue {
-                        ScpWasmError::Identity {
-                            message: "signed_post proof must include a 'nonce' field".to_owned(),
-                            code: "SCP-IDENT-1040".to_owned(),
-                        }
-                        .into_js()
-                        .into()
-                    })?
-                    .to_owned();
-                serde_json::json!({
-                    "type": "signed_post_verified",
-                    "post_url": post_url,
-                    "nonce": nonce,
-                    "posted_at": now_secs,
-                })
-            }
-            "dns_record" => serde_json::json!({
-                "type": "dns_record_verified",
-                "domain": proof,
-                "record_name": "_scp-verify",
-            }),
-            "challenge_response" => serde_json::json!({
-                "type": "challenge_response_verified",
-                "challenge": proof,
-                "response_signature": "",
-            }),
-            // "oauth" and any other validated method default to oauth_verified.
-            _ => serde_json::json!({
-                "type": "oauth_verified",
-                "provider": platform,
-                "subject_id": proof,
-                "verified_at": now_secs,
-            }),
-        };
+        // Parse the proof JSON string into a typed proof structure, matching
+        // the PyO3/NAPI/UniFFI bridges. The caller provides a JSON-serialized
+        // `AttestationProof` variant (e.g., `{"type":"oauth_verified","provider":"github.com",...}`).
+        let proof_value: serde_json::Value =
+            serde_json::from_str(&proof).map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!(
+                        "proof must be a JSON-serialized AttestationProof variant: {e}"
+                    ),
+                    code: "SCP-IDENT-1040".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+
+        // Validate that the parsed proof is a valid AttestationProof variant
+        // by deserializing into our local canonical type.
+        let _typed_proof: canonical_attestation::Proof =
+            serde_json::from_value(proof_value.clone()).map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!(
+                        "proof JSON does not match any AttestationProof variant \
+                         (oauth_verified, signed_post_verified, dns_record_verified, \
+                         challenge_response_verified): {e}"
+                    ),
+                    code: "SCP-IDENT-1040".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
 
         // Build the attestation JSON.
         let mut attestation = serde_json::json!({
@@ -1974,6 +1945,33 @@ pub fn identity_create_link_attestation(
 
         if let Some(pid) = &platform_id {
             attestation["claim"]["platform_id"] = serde_json::json!(pid);
+        }
+
+        // Structural validation before signing (mirrors scp-core's
+        // validate_structure). WASM cannot call scp-core directly per ADR-034,
+        // so we implement equivalent checks locally.
+        {
+            let mut errors = Vec::new();
+            if attestation["type"].as_str() != Some("identity_link") {
+                errors.push("type must be \"identity_link\"");
+            }
+            if attestation["issuer"].as_str() != attestation["subject"].as_str() {
+                errors.push("issuer must equal subject for self-attestations");
+            }
+            if attestation["claim"]["link_type"].as_str() != Some("self_attestation") {
+                errors.push("claim.link_type must be \"self_attestation\"");
+            }
+            if !errors.is_empty() {
+                return Err(ScpWasmError::Validation {
+                    message: format!(
+                        "attestation structure validation failed: {}",
+                        errors.join("; ")
+                    ),
+                    code: "SCP-VALID-7034".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
         }
 
         // Compute canonical signing bytes via the shared function (§9.5.1).

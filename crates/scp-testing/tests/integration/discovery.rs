@@ -416,10 +416,12 @@ async fn bootstrap_config() {
 
     // add_custom_context.
     let mut config = config;
-    config.add_custom_context(BootstrapContextEntry::new(
-        "ctx-custom-1".to_owned(),
-        DID::from("did:dht:zCustom1"),
-    ));
+    config
+        .add_custom_context(BootstrapContextEntry::new(
+            "ctx-custom-1".to_owned(),
+            DID::from("did:dht:zCustom1"),
+        ))
+        .unwrap();
     assert_eq!(config.custom_contexts.len(), 1);
 
     // all_contexts combines defaults and custom.

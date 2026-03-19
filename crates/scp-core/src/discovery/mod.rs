@@ -61,7 +61,7 @@ pub use addressing::{
 };
 pub use bootstrap::{
     BootstrapConfig, BootstrapContextEntry, BootstrapResolver, BootstrapVerificationError,
-    WellKnownBootstrapError,
+    MAX_CUSTOM_CONTEXTS, WellKnownBootstrapError,
 };
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,

@@ -879,6 +879,11 @@ fn check_endorsement_independence(
         // DID. Without the subject check, an attacker could submit endorsement
         // attestations for a different DID. Without the issuer check, an
         // attacker could claim attestations issued by someone else.
+        //
+        // Deduplicate by DID to prevent the same attestor from being counted
+        // multiple times (e.g., submitting the same endorsement 5 times should
+        // not satisfy a 3-of-5 threshold).
+        let mut seen_dids = std::collections::HashSet::new();
         let subject_attestors: Vec<AttestorInfo> = att
             .iter()
             .filter(|a| {
@@ -886,6 +891,7 @@ fn check_endorsement_independence(
                     .as_ref()
                     .is_some_and(|att| att.subject == assessment.subject_did && att.issuer == a.did)
             })
+            .filter(|a| seen_dids.insert(a.did.clone()))
             .cloned()
             .collect();
         let result = check_threshold_attestation(
@@ -2140,6 +2146,45 @@ mod tests {
                 Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
             ),
             "min_strength=0 must not bypass independence check: {result:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_attestor_dids_not_counted_multiple_times() {
+        // Submit the same DID 5 times — should NOT meet a 3-of-5 threshold
+        // because deduplication collapses them to 1 unique attestor.
+        let assessment = make_deep_assessment(now());
+        let subject = "did:dht:z6MkDeepIdentity";
+        let same_did = "did:dht:z6MkEndorserDuplicate";
+
+        let attestors: Vec<AttestorInfo> = (0u64..5)
+            .map(|i| AttestorInfo {
+                did: did(same_did),
+                context_memberships: HashSet::from([format!("ctx-{i}")]),
+                endorsements: HashSet::new(),
+                attestation: Some(make_endorsement_attestation(
+                    same_did,
+                    subject,
+                    now() - 3600 * (i + 1),
+                )),
+            })
+            .collect();
+
+        let mut policy = ContextSybilPolicy::casual();
+        policy.required_signals = vec![RequiredSignal {
+            category: TrustSignalCategory::Endorsement,
+            min_strength: 1,
+            max_age_secs: 365 * 24 * 3600,
+            threshold_requirement: Some(ThresholdRequirement::new(3, 5, 0.3)),
+        }];
+
+        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "5 copies of the same DID must not satisfy a 3-of-5 threshold: {result:?}"
         );
     }
 

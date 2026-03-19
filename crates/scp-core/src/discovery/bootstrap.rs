@@ -86,7 +86,24 @@ pub enum BootstrapVerificationError {
         /// The actual creator DID from the context's event log.
         actual: DID,
     },
+
+    /// The custom contexts list has reached its maximum capacity.
+    ///
+    /// Prevents unbounded growth of the custom contexts list. The limit is
+    /// [`MAX_CUSTOM_CONTEXTS`].
+    #[error("custom contexts list has reached maximum capacity ({MAX_CUSTOM_CONTEXTS})")]
+    TooManyCustomContexts,
 }
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of custom context entries allowed in a [`BootstrapConfig`].
+///
+/// Prevents unbounded growth of the custom contexts list. Contexts beyond
+/// this limit are rejected with [`BootstrapVerificationError::TooManyCustomContexts`].
+pub const MAX_CUSTOM_CONTEXTS: usize = 100;
 
 // ---------------------------------------------------------------------------
 // BootstrapConfig
@@ -171,8 +188,20 @@ impl BootstrapConfig {
     /// Custom contexts are queried alongside the defaults. Duplicate context
     /// IDs are not filtered here -- deduplication happens at query time in
     /// [`BootstrapResolver::resolve_contexts`].
-    pub fn add_custom_context(&mut self, entry: BootstrapContextEntry) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BootstrapVerificationError::TooManyCustomContexts`] if the
+    /// custom contexts list has reached [`MAX_CUSTOM_CONTEXTS`].
+    pub fn add_custom_context(
+        &mut self,
+        entry: BootstrapContextEntry,
+    ) -> Result<(), BootstrapVerificationError> {
+        if self.custom_contexts.len() >= MAX_CUSTOM_CONTEXTS {
+            return Err(BootstrapVerificationError::TooManyCustomContexts);
+        }
         self.custom_contexts.push(entry);
+        Ok(())
     }
 
     /// Returns all context entries (defaults + custom) as a combined list.
@@ -470,8 +499,12 @@ mod tests {
     #[test]
     fn add_custom_context_appends_to_custom_list() {
         let mut config = BootstrapConfig::default();
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"));
-        config.add_custom_context(entry("ctx-custom-2", "did:dht:zCustom2"));
+        config
+            .add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"))
+            .unwrap();
+        config
+            .add_custom_context(entry("ctx-custom-2", "did:dht:zCustom2"))
+            .unwrap();
 
         assert_eq!(config.custom_contexts.len(), 2);
         assert_eq!(config.custom_contexts[0].context_id, "ctx-custom-1");
@@ -484,7 +517,9 @@ mod tests {
     fn all_contexts_combines_defaults_and_custom() {
         let mut config =
             BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]);
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:zC1"));
+        config
+            .add_custom_context(entry("ctx-custom-1", "did:dht:zC1"))
+            .unwrap();
 
         let all = config.all_contexts();
         assert_eq!(all.len(), 2);
@@ -498,7 +533,9 @@ mod tests {
             entry("ctx-d1", "did:dht:zD1"),
             entry("ctx-d2", "did:dht:zD2"),
         ]);
-        config.add_custom_context(entry("ctx-c1", "did:dht:zC1"));
+        config
+            .add_custom_context(entry("ctx-c1", "did:dht:zC1"))
+            .unwrap();
 
         let all = config.all_contexts();
         assert_eq!(all.len(), 3);
@@ -531,7 +568,9 @@ mod tests {
     fn bootstrap_config_serialization_roundtrip() {
         let mut config =
             BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"));
+        config
+            .add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"))
+            .unwrap();
         config.auto_query_on_identity_creation = false;
 
         let json = serde_json::to_string(&config).unwrap();
@@ -592,7 +631,9 @@ mod tests {
     #[test]
     fn verify_context_creator_checks_custom_contexts() {
         let mut config = BootstrapConfig::default();
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:zCustomCreator"));
+        config
+            .add_custom_context(entry("ctx-custom-1", "did:dht:zCustomCreator"))
+            .unwrap();
 
         let result = config
             .verify_context_creator(
@@ -609,7 +650,9 @@ mod tests {
     fn resolver_returns_all_context_ids() {
         let mut config =
             BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]);
-        config.add_custom_context(entry("ctx-custom-1", "did:dht:zC1"));
+        config
+            .add_custom_context(entry("ctx-custom-1", "did:dht:zC1"))
+            .unwrap();
 
         let resolver = BootstrapResolver::new(config);
         let contexts = resolver.resolve_contexts();
@@ -623,8 +666,12 @@ mod tests {
     fn resolver_deduplicates_context_ids() {
         let mut config =
             BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zCreator")]);
-        config.add_custom_context(entry("ctx-shared", "did:dht:zCreator"));
-        config.add_custom_context(entry("ctx-unique", "did:dht:zOther"));
+        config
+            .add_custom_context(entry("ctx-shared", "did:dht:zCreator"))
+            .unwrap();
+        config
+            .add_custom_context(entry("ctx-unique", "did:dht:zOther"))
+            .unwrap();
 
         let resolver = BootstrapResolver::new(config);
         let contexts = resolver.resolve_contexts();
@@ -691,5 +738,29 @@ mod tests {
 
         assert!(matches!(err, DiscoveryError::DidResolutionFailed(_)));
         assert!(err.to_string().contains("did:dht:zTestDid"));
+    }
+
+    // -- add_custom_context capacity limit --------------------------------
+
+    #[test]
+    fn add_custom_context_rejects_at_capacity() {
+        let mut config = BootstrapConfig::default();
+        for i in 0..MAX_CUSTOM_CONTEXTS {
+            config
+                .add_custom_context(entry(&format!("ctx-{i}"), &format!("did:dht:zCreator{i}")))
+                .unwrap();
+        }
+        assert_eq!(config.custom_contexts.len(), MAX_CUSTOM_CONTEXTS);
+
+        // The next add must fail.
+        let err = config
+            .add_custom_context(entry("ctx-overflow", "did:dht:zOverflow"))
+            .unwrap_err();
+        assert!(
+            matches!(err, BootstrapVerificationError::TooManyCustomContexts),
+            "expected TooManyCustomContexts, got: {err:?}"
+        );
+        // Ensure the list did not grow.
+        assert_eq!(config.custom_contexts.len(), MAX_CUSTOM_CONTEXTS);
     }
 }
