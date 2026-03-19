@@ -680,6 +680,14 @@ class RevocationStatus:
     #: Only present when ``status == "revoked"``.
     reason: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.status == "revoked" and self.revoked_at is None:
+            raise ValueError("RevocationStatus with status='revoked' requires revoked_at")
+        if self.status not in ("active", "revoked"):
+            raise ValueError(
+                f"Invalid revocation status: {self.status!r} (expected 'active' or 'revoked')"
+            )
+
 
 # ---------------------------------------------------------------------------
 # IdentityAttestation
@@ -711,7 +719,7 @@ class IdentityAttestation:
     verification_method: str
 
     #: Unix timestamp (seconds) when the evidence was last verified.
-    verified_at: float
+    verified_at: int
 
     #: Revocation status (``"active"`` or ``"revoked"`` with metadata).
     revocation_status: RevocationStatus = field(
@@ -720,40 +728,6 @@ class IdentityAttestation:
 
     #: Optional platform-assigned unique identifier.
     platform_id: str | None = None
-
-    async def verify(self) -> bool:
-        """Verify this attestation's signature and validity.
-
-        Delegates to the bridge's ``trust_verify_attestation`` function
-        which checks:
-
-        1. Ed25519 signature against the issuer's signing key.
-        2. Deterministic ID correctness.
-        3. Expiry and revocation status.
-        4. Evidence freshness (§3.5.2).
-
-        Returns:
-            ``True`` if the attestation is valid, ``False`` otherwise.
-
-        Raises:
-            scp_sdk.IdentityError: If the bridge function is not
-                available or the attestation cannot be verified.
-        """
-        import _scp_core
-
-        if not hasattr(_scp_core, "trust_verify_attestation"):
-            raise IdentityError(
-                "Identity attestation verification is not yet available in the bridge",
-                "SCP-ATTEST-9014",
-            )
-        import json
-
-        attestation_json = json.dumps(self._to_bridge_dict())
-        result = await asyncio.to_thread(
-            _scp_core.trust_verify_attestation,
-            attestation_json,
-        )
-        return bool(result.get("valid", False)) if isinstance(result, dict) else False
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict for bridge serialization."""
@@ -785,17 +759,20 @@ class IdentityAttestation:
         raw_rs = data.get("revocation_status", "active")
         if isinstance(raw_rs, dict) and "Revoked" in raw_rs:
             revoked_data = raw_rs["Revoked"]
+            revoked_at = revoked_data.get("revoked_at")
+            if revoked_at is None:
+                raise ValueError("Bridge returned Revoked status without revoked_at timestamp")
             rs = RevocationStatus(
                 status="revoked",
-                revoked_at=revoked_data.get("revoked_at"),
+                revoked_at=revoked_at,
                 reason=revoked_data.get("reason"),
             )
         elif isinstance(raw_rs, str) and raw_rs.lower() == "active":
             rs = RevocationStatus(status="active")
         elif isinstance(raw_rs, str) and raw_rs.lower() == "revoked":
-            rs = RevocationStatus(status="revoked")
+            raise ValueError("Bridge returned bare 'revoked' string without revocation metadata")
         else:
-            rs = RevocationStatus(status=str(raw_rs))
+            raise ValueError(f"Unknown revocation status from bridge: {raw_rs!r}")
 
         return cls(
             id=data["id"],
