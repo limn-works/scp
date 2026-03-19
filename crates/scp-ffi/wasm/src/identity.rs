@@ -1276,6 +1276,15 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
         })
         .map_err(|e| JsError::new(&format!("{e:?}")))?;
 
+    // Migrate any link attestations from the old DID to the new DID so they
+    // remain discoverable after rotation.
+    LINK_ATTESTATIONS.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(attestations) = map.remove(&old_did) {
+            map.insert(new_did.clone(), attestations);
+        }
+    });
+
     // Record the migration link (with capacity check).
     MIGRATION_LINKS
         .with(|links| {
@@ -1401,6 +1410,15 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             );
             Ok::<(), JsValue>(())
         })?;
+
+        // Migrate any link attestations from the old DID to the new DID so
+        // they remain discoverable after migration.
+        LINK_ATTESTATIONS.with(|reg| {
+            let mut map = reg.borrow_mut();
+            if let Some(attestations) = map.remove(&old_did) {
+                map.insert(new_did.clone(), attestations);
+            }
+        });
 
         // Store the migration link so identity_resolve can populate alsoKnownAs.
         MIGRATION_LINKS.with(|links| {
@@ -2530,6 +2548,7 @@ mod tests {
     fn cleanup_registries() {
         IDENTITY_REGISTRY.with(|reg| reg.borrow_mut().clear());
         MIGRATION_LINKS.with(|links| links.borrow_mut().clear());
+        LINK_ATTESTATIONS.with(|reg| reg.borrow_mut().clear());
     }
 
     #[test]
