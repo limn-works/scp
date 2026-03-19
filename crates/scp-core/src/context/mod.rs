@@ -120,7 +120,7 @@ pub use manager::{
 // Re-export membership types.
 pub use membership::{
     ContextEvent, DEFAULT_BUFFER_CAPACITY, KeyPackage, MAX_BUFFER_CAPACITY, MIN_BUFFER_CAPACITY,
-    MemberInfo, MembershipState, ReceiveBuffer,
+    MemberInfo, MembershipState, ReceiveBuffer, RedactedBytes,
 };
 
 // Re-export memory scope and key destruction types (SCP-067).

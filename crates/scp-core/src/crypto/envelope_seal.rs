@@ -58,7 +58,7 @@ pub fn derive_invitation_routing_id(did: &str) -> [u8; 32] {
 }
 
 /// Derives a key package routing ID for a DID.
-/// `SHA-256(len(did) || did || b"scp-key-packages")` per spec §9.7.4.
+/// `SHA-256(len(did) || did || b"scp-key-packages")`.
 #[must_use]
 pub fn derive_key_package_routing_id(did: &str) -> [u8; 32] {
     derive_routing_id(did, b"scp-key-packages")
@@ -152,7 +152,10 @@ pub fn ecies_open(
     creator_did: &str,
 ) -> Result<Vec<u8>, EnvelopeSealError> {
     let ephemeral_key = X25519Pub::from(*ephemeral_pub);
-    let local_secret = x25519_dalek::StaticSecret::from(*local_x25519_secret);
+    // Wrap the dereferenced secret in Zeroizing so the stack copy is zeroed
+    // on drop (StaticSecret::from consumes by value, creating a second copy).
+    let secret_copy = Zeroizing::new(*local_x25519_secret);
+    let local_secret = x25519_dalek::StaticSecret::from(*secret_copy);
     let shared_secret = local_secret.diffie_hellman(&ephemeral_key);
 
     let info = build_invitation_info(context_id, creator_did);

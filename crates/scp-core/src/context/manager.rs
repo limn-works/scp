@@ -100,8 +100,8 @@ fn push_welcome_event(
             context_id: context_id.to_owned(),
             creator_did: creator_did.clone(),
             member_did: member_did.clone(),
-            welcome_bytes: add_output.welcome_bytes,
-            commit_bytes: add_output.commit_bytes,
+            welcome_bytes: super::membership::RedactedBytes(add_output.welcome_bytes),
+            commit_bytes: super::membership::RedactedBytes(add_output.commit_bytes),
         });
     }
 }

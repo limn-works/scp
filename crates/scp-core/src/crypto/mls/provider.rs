@@ -172,8 +172,10 @@ struct ContextCryptoState {
 /// package, the signer and provider are retained here so that a subsequent
 /// [`MlsCryptoProvider::join_from_welcome`] call can reconstruct the group.
 struct PendingJoinState {
-    /// The signing key pair for the generated key package.
-    signer: SignatureKeyPair,
+    /// The signing key pair for the generated key package, wrapped in
+    /// [`EagerDropSigner`] for best-effort zeroization (consistent with
+    /// [`ScpMlsGroup::signer`]).
+    signer: super::group::EagerDropSigner,
     /// The MLS provider holding the key package's private state.
     provider: super::storage::InMemoryMlsProvider,
 }
@@ -212,8 +214,9 @@ pub struct MlsCryptoProvider {
     wrapping_secret_key: Mutex<Zeroizing<[u8; 32]>>,
     /// Pending key package state for Welcome-based joins (§5.12.3).
     /// `prepare_key_package_for_join` replaces any previous entry;
-    /// `join_from_welcome` pops it.
-    pending_joins: Mutex<Vec<PendingJoinState>>,
+    /// `join_from_welcome` takes it. `Option` enforces the single-entry
+    /// invariant at the type level.
+    pending_joins: Mutex<Option<PendingJoinState>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -232,7 +235,7 @@ impl MlsCryptoProvider {
             broadcast_keys: Mutex::new(HashMap::new()),
             wrapping_public_key: Mutex::new(wrapping_public_key),
             wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
-            pending_joins: Mutex::new(Vec::new()),
+            pending_joins: Mutex::new(None),
         }
     }
 
@@ -1154,8 +1157,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // Only one key package can be outstanding at a time.
         // New prepare calls replace the old pending state to avoid
         // LIFO matching errors when Welcomes arrive out of order.
-        pending.clear();
-        pending.push(PendingJoinState { signer, provider });
+        *pending = Some(PendingJoinState {
+            signer: super::group::EagerDropSigner::new(signer),
+            provider,
+        });
 
         Ok(kp_bytes)
     }
@@ -1165,19 +1170,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         welcome_bytes: &[u8],
     ) -> Result<(), ContextError> {
-        let entry = {
+        let mut entry = {
             let mut pending = self
                 .pending_joins
                 .lock()
                 .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-            pending.pop().ok_or_else(|| {
+            pending.take().ok_or_else(|| {
                 ContextError::CryptoFailed("no pending key package for Welcome".into())
             })?
         };
 
-        let group =
-            super::group::join_group_from_bytes(welcome_bytes, entry.provider, entry.signer)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let signer = entry.signer.take().ok_or_else(|| {
+            ContextError::CryptoFailed("pending join signer already consumed".into())
+        })?;
+
+        let group = super::group::join_group_from_bytes(welcome_bytes, entry.provider, signer)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
 
