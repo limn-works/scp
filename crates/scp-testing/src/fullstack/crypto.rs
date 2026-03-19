@@ -197,6 +197,53 @@ impl E2eCryptoProvider {
         Ok(())
     }
 
+    /// Regenerates and distributes the local sender key to all known members.
+    ///
+    /// After `join_from_welcome`, the joiner's sender key (generated during
+    /// the throwaway `create_context`) is stale — it was created for a
+    /// different MLS group. This method regenerates it and deposits it in
+    /// the `KeyExchange` for all existing members to pick up.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if the sender key cannot be generated or
+    /// distributed.
+    pub fn regenerate_and_distribute_sender_key(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<(), ContextError> {
+        // Regenerate sender key.
+        let key = generate_sender_key();
+        let ctx_hex = Self::context_id_hex(context_id);
+
+        {
+            let mut store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.set(&ctx_hex, &self.local_did, key);
+        }
+
+        // Distribute to all known members in the exchange.
+        // Read existing members from the exchange's deposited sender keys
+        // by reading the members list.
+        let members: Vec<String> = {
+            let members_guard = self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            members_guard.get(context_id).cloned().unwrap_or_default()
+        };
+
+        for member_did in &members {
+            if member_did != &self.local_did {
+                self.distribute_sender_key(context_id, member_did)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Picks up any pending sender keys from the shared `KeyExchange`.
     ///
     /// This is the complement of `distribute_sender_key`: when another node
