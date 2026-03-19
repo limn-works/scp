@@ -443,7 +443,7 @@ pub async fn relay_start_local(data_dir: String) -> Result<Arc<RelayHandle>, Scp
 /// ```
 #[uniffi::export]
 pub async fn node_start_in_memory() -> Result<Arc<NodeHandle>, ScpError> {
-    let node = server::start_node_in_memory().await?;
+    let node = server::start_node_in_memory(None).await?;
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::InMemory(node),
@@ -456,7 +456,7 @@ pub async fn node_start_in_memory() -> Result<Arc<NodeHandle>, ScpError> {
 /// blob database at `<data_dir>/blobs.redb`.
 #[uniffi::export]
 pub async fn node_start_local(data_dir: String) -> Result<Arc<NodeHandle>, ScpError> {
-    let node = server::start_node_local(std::path::Path::new(&data_dir)).await?;
+    let node = server::start_node_local(std::path::Path::new(&data_dir), None).await?;
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::Filesystem(node),
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn enable_site_projection_dispatches_through_node_inner() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn commit_deploy_returns_error_for_unprojected_context() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.commit_deploy("no-such-ctx", "deploy-1"));
         assert!(
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn rollback_deploy_returns_error_for_unprojected_context() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         let result = rt().block_on(inner.rollback_deploy("no-such-ctx", "deploy-1"));
         assert!(
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn disable_site_projection_is_noop_for_unprojected_context() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.

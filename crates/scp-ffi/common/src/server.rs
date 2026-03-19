@@ -12,10 +12,42 @@ use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
+use scp_identity::cache::SystemClock;
+use scp_identity::dht::DidDht;
+use scp_identity::{DidDocument, InMemoryDhtClient, ScpIdentity};
 use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
+
+// ---------------------------------------------------------------------------
+// NodeIdentity — pre-existing identity for node startup
+// ---------------------------------------------------------------------------
+
+/// Concrete DID method type used by all FFI bridges for node identity.
+///
+/// Parameterized over `InMemoryDhtClient` (no real DHT network — suitable
+/// for local development and testing) and `SystemClock` (wall-clock time).
+pub type ConcreteDidMethod = DidDht<InMemoryDhtClient, SystemClock>;
+
+/// Pre-existing identity to use when starting an application node.
+///
+/// Constructed by FFI bridges from their identity registries. Contains
+/// the identity, its DID document, and a configured DID method instance
+/// with signing capability.
+///
+/// When `Some(NodeIdentity)` is passed to [`start_node_in_memory`] or
+/// [`start_node_local`], the node uses this identity instead of generating
+/// a fresh one. This enables identity portability — the same DID persists
+/// across node restarts and can be shared across FFI bridge instances.
+pub struct NodeIdentity {
+    /// The SCP identity containing key handles and DID string.
+    pub identity: ScpIdentity,
+    /// The published DID document.
+    pub document: DidDocument,
+    /// A configured DID method instance with signing capability.
+    pub did_method: Arc<ConcreteDidMethod>,
+}
 
 // ---------------------------------------------------------------------------
 // ServerError
@@ -225,12 +257,16 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 
 /// Starts a full application node with in-memory storage.
 ///
-/// Auto-wires:
+/// When `identity` is `None` (auto-generate):
 /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
 /// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
 /// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT network)
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
+///
+/// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
+/// identity instead of generating a fresh one. This enables identity
+/// portability — the same DID persists across node restarts.
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
 /// call [`ApplicationNode::serve`] if HTTP endpoints are needed.
@@ -239,9 +275,26 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 ///
 /// Returns [`ServerError::Node`] if relay binding, identity generation, or TLS
 /// provisioning fails.
-pub async fn start_node_in_memory()
--> Result<scp_node::ApplicationNode<InMemoryStorage>, ServerError> {
-    let node = scp_node::ApplicationNode::dev(0).await?;
+pub async fn start_node_in_memory(
+    identity: Option<NodeIdentity>,
+) -> Result<scp_node::ApplicationNode<InMemoryStorage>, ServerError> {
+    let node = match identity {
+        None => scp_node::ApplicationNode::dev(0).await?,
+        Some(id) => {
+            use scp_node::{ApplicationNodeBuilder, SelfSignedTlsProvider};
+
+            ApplicationNodeBuilder::new()
+                .storage(InMemoryStorage::new())
+                .blob_storage(BlobStorageBackend::in_memory())
+                .domain("localhost")
+                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
+                .identity(id.identity, id.document, id.did_method)
+                .build_for_testing()
+                .await?
+        }
+    };
+
     tracing::info!(
         relay_url = %node.relay_url(),
         relay_addr = %node.relay().bound_addr(),
@@ -254,7 +307,6 @@ pub async fn start_node_in_memory()
 /// Starts a full application node with file-backed storage for local development.
 ///
 /// Auto-wires:
-/// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
 /// - [`FilesystemStorage`](scp_platform::filesystem::FilesystemStorage) at
 ///   `<data_dir>/storage/` — persistent key-value storage for protocol state
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
@@ -267,21 +319,18 @@ pub async fn start_node_in_memory()
 /// The relay is started during construction. The HTTP server is **not** started;
 /// call [`ApplicationNode::serve`] if HTTP endpoints are needed.
 ///
-/// This is the zero-friction path for local development with durable relay
-/// blob storage. The relay's redb database survives restarts, and the
-/// protocol repository's filesystem storage is retained on disk — but
-/// because a new DID is generated on every invocation (see below), prior
-/// protocol state is orphaned under the old DID. Only relay blob storage
-/// is DID-independent and genuinely persists across restarts.
+/// # Identity modes
 ///
-/// # Identity persistence
+/// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
+/// identity. This enables identity portability — the same DID persists
+/// across node restarts and can be shared across FFI bridge instances.
 ///
-/// A new DID identity is generated on every invocation because the key
-/// custody backend is in-memory — private key material does not survive
-/// process restarts. When a file-backed `KeyCustody` implementation is
-/// available, this function should be updated to use
-/// [`identity_with_storage`](scp_node::ApplicationNodeBuilder::identity_with_storage)
-/// for stable DIDs across restarts.
+/// When `identity` is `None`, the node creates or reloads a persistent
+/// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
+/// backed by `<data_dir>/identity.key`. The passphrase is read from the
+/// `SCP_KEY_PASSPHRASE` environment variable (required — returns an error
+/// if unset). On first run, a new DID is generated and persisted to
+/// storage. On subsequent runs, the same DID is reloaded from storage.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
@@ -291,52 +340,73 @@ pub async fn start_node_in_memory()
 /// - The data directory cannot be created ([`ServerError::Io`])
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
+/// - `SCP_KEY_PASSPHRASE` is not set when `identity` is `None` ([`ServerError::Io`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,
+    identity: Option<NodeIdentity>,
 ) -> Result<scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>, ServerError> {
-    use scp_identity::cache::SystemClock;
-    use scp_identity::dht::DidDht;
-    use scp_identity::{DidCache, InMemoryDhtClient};
+    use scp_identity::DidCache;
     use scp_node::{ApplicationNodeBuilder, SelfSignedTlsProvider};
     use scp_platform::filesystem::FilesystemStorage;
-    use scp_platform::testing::InMemoryKeyCustody;
-
-    type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
     std::fs::create_dir_all(data_dir)?;
 
-    // File-backed protocol storage under <data_dir>/storage/.
+    // Common paths.
     let storage_dir = data_dir.join("storage");
-    let storage = FilesystemStorage::new(&storage_dir)?;
-
-    // Redb-backed blob storage for the relay.
     let blob_path = data_dir.join("blobs.redb");
+
+    // File-backed protocol storage and blob storage (shared across identity modes).
+    let storage = FilesystemStorage::new(&storage_dir)?;
     let blob_storage = BlobStorageBackend::redb(&blob_path)?;
 
-    // In-memory key custody — keys are NOT persisted across restarts.
-    // A new DID is generated on every invocation via `generate_identity_with`.
-    // See `identity_with_storage` for the persistent alternative (requires
-    // file-backed KeyCustody).
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let dht_client = Arc::new(InMemoryDhtClient::new());
-    let cache = Arc::new(DidCache::new());
-    let sign_fn = DevDidDht::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DevDidDht::with_client_and_signer(
-        dht_client, cache, sign_fn,
-    ));
+    // Build the node. The `.identity()` and `.identity_with_storage()` methods
+    // return different builder generic types, so we construct separate builder
+    // chains in each arm. The common builder prefix is duplicated because the
+    // storage values are moved into the builder.
+    let node = if let Some(id) = identity {
+        ApplicationNodeBuilder::new()
+            .storage(storage)
+            .blob_storage(blob_storage)
+            .domain("localhost")
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
+            .identity(id.identity, id.document, id.did_method)
+            .build_for_testing()
+            .await?
+    } else {
+        // Persistent key custody — keys survive process restarts.
+        let passphrase = std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
+            ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SCP_KEY_PASSPHRASE environment variable required for persistent node identity",
+            ))
+        })?;
+        let key_path = data_dir.join("identity.key");
+        let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
+            &key_path,
+            &passphrase,
+        )?);
 
-    let node = ApplicationNodeBuilder::new()
-        .storage(storage)
-        .blob_storage(blob_storage)
-        .domain("localhost")
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
-        .generate_identity_with(custody, did_method)
-        .build_for_testing()
-        .await?;
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let sign_fn = ConcreteDidMethod::make_sign_fn(Arc::clone(&key_custody));
+        let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ));
+
+        ApplicationNodeBuilder::new()
+            .storage(storage)
+            .blob_storage(blob_storage)
+            .domain("localhost")
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
+            .identity_with_storage(key_custody, did_method)
+            .build_for_testing()
+            .await?
+    };
 
     tracing::info!(
         relay_url = %node.relay_url(),
@@ -572,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_in_memory_returns_relay_url_and_did() {
-        let node = start_node_in_memory().await.unwrap();
+        let node = start_node_in_memory(None).await.unwrap();
         // Relay URL should be a valid ws:// or wss:// URL.
         let url = node.relay_url();
         assert!(
@@ -591,8 +661,11 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_returns_relay_url_and_did() {
+        // FileKeyCustody requires a passphrase via env var.
+        // SAFETY: test-only, single-threaded tokio test.
+        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase-local") };
         let tmp = std::env::temp_dir().join(format!("scp-test-node-local-{}", std::process::id()));
-        let node = start_node_local(&tmp).await.unwrap();
+        let node = start_node_local(&tmp, None).await.unwrap();
 
         // Relay URL should be a valid ws:// or wss:// URL.
         let url = node.relay_url();
@@ -614,6 +687,11 @@ mod tests {
         assert!(tmp.join("storage").is_dir(), "storage dir should exist");
         // Blob database should have been created.
         assert!(tmp.join("blobs.redb").exists(), "blobs.redb should exist");
+        // Key file should have been created.
+        assert!(
+            tmp.join("identity.key").exists(),
+            "identity.key should exist"
+        );
 
         node.shutdown();
         // Cleanup
@@ -622,14 +700,20 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_reuses_data_dir_across_restarts() {
+        // FileKeyCustody requires a passphrase via env var.
+        // SAFETY: test-only, single-threaded tokio test.
+        unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", "test-passphrase-persist") };
         let tmp =
             std::env::temp_dir().join(format!("scp-test-node-persist-{}", std::process::id()));
 
-        // First run — creates storage directory and blob database.
+        let first_did;
+        // First run — creates storage directory, blob database, and identity key.
         {
-            let node = start_node_local(&tmp).await.unwrap();
+            let node = start_node_local(&tmp, None).await.unwrap();
             assert!(tmp.join("storage").is_dir());
             assert!(tmp.join("blobs.redb").exists());
+            assert!(tmp.join("identity.key").exists());
+            first_did = node.identity().did().to_owned();
             node.shutdown();
             // Drop the node so background tasks release the redb file lock.
             drop(node);
@@ -638,13 +722,14 @@ mod tests {
         }
 
         // Second run — should open the same data directory without error.
-        // Identity will be different (InMemoryKeyCustody generates fresh
-        // keys each time), but the storage backends are reused.
+        // With FileKeyCustody + identity_with_storage, the same DID is
+        // reloaded from persistent storage across restarts.
         {
-            let node = start_node_local(&tmp).await.unwrap();
-            assert!(
-                node.identity().did().starts_with("did:"),
-                "should produce a valid DID"
+            let node = start_node_local(&tmp, None).await.unwrap();
+            assert_eq!(
+                node.identity().did(),
+                first_did,
+                "second run should produce the same DID (persistent identity)"
             );
             node.shutdown();
         }
@@ -719,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn running_node_in_memory_dispatch() {
-        let node = start_node_in_memory().await.unwrap();
+        let node = start_node_in_memory(None).await.unwrap();
         let running = RunningNode::InMemory(node);
         assert!(
             running.relay_url().starts_with("ws://") || running.relay_url().starts_with("wss://")
@@ -748,7 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_background_binds_and_responds() {
-        let node = start_node_in_memory().await.unwrap();
+        let node = start_node_in_memory(None).await.unwrap();
 
         // Serve on an OS-assigned port (port 0) so tests don't conflict.
         let addr = node
@@ -783,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_background_double_serve_returns_error() {
-        let node = start_node_in_memory().await.unwrap();
+        let node = start_node_in_memory(None).await.unwrap();
 
         // First serve should succeed.
         let _addr = node
@@ -807,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_background_shutdown_stops_server() {
-        let node = start_node_in_memory().await.unwrap();
+        let node = start_node_in_memory(None).await.unwrap();
 
         let addr = node
             .serve_background(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
@@ -834,5 +919,122 @@ mod tests {
             result.is_err() || result.unwrap().is_err(),
             "connection should fail after shutdown"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeIdentity (pre-existing identity) tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a test identity using InMemoryKeyCustody and DidDht.
+    async fn create_test_identity() -> NodeIdentity {
+        use scp_identity::cache::SystemClock;
+        use scp_identity::dht::DidDht;
+        use scp_identity::{DidCache, DidMethod, InMemoryDhtClient};
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+        let sign_fn = DevDidDht::make_sign_fn(Arc::clone(&custody));
+        let did_method = Arc::new(DevDidDht::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ));
+        let (identity, document) = did_method.create(custody.as_ref()).await.unwrap();
+
+        NodeIdentity {
+            identity,
+            document,
+            did_method,
+        }
+    }
+
+    #[tokio::test]
+    async fn node_in_memory_with_identity() {
+        let test_id = create_test_identity().await;
+        let expected_did = test_id.identity.did.clone();
+
+        let node = start_node_in_memory(Some(test_id)).await.unwrap();
+
+        assert_eq!(
+            node.identity().did(),
+            expected_did,
+            "node should use the pre-existing identity's DID"
+        );
+        assert!(
+            node.relay_url().starts_with("ws://") || node.relay_url().starts_with("wss://"),
+            "expected ws(s):// URL, got: {}",
+            node.relay_url()
+        );
+        assert_ne!(node.relay().bound_addr().port(), 0);
+
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn node_local_with_identity() {
+        let test_id = create_test_identity().await;
+        let expected_did = test_id.identity.did.clone();
+
+        let tmp =
+            std::env::temp_dir().join(format!("scp-test-node-local-id-{}", std::process::id()));
+        // No SCP_KEY_PASSPHRASE needed when passing a pre-existing identity.
+        let node = start_node_local(&tmp, Some(test_id)).await.unwrap();
+
+        assert_eq!(
+            node.identity().did(),
+            expected_did,
+            "node should use the pre-existing identity's DID"
+        );
+        assert!(
+            node.relay_url().starts_with("ws://") || node.relay_url().starts_with("wss://"),
+            "expected ws(s):// URL, got: {}",
+            node.relay_url()
+        );
+        assert_ne!(node.relay().bound_addr().port(), 0);
+
+        // Storage and blob dirs should still be created.
+        assert!(tmp.join("storage").is_dir(), "storage dir should exist");
+        assert!(tmp.join("blobs.redb").exists(), "blobs.redb should exist");
+        // No identity.key file when using pre-existing identity.
+        assert!(
+            !tmp.join("identity.key").exists(),
+            "identity.key should NOT be created for pre-existing identity"
+        );
+
+        node.shutdown();
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn node_local_without_identity_requires_passphrase() {
+        // Temporarily remove the env var to verify the error.
+        // SAFETY: test-only, single-threaded tokio test.
+        let prev = std::env::var("SCP_KEY_PASSPHRASE").ok();
+        unsafe { std::env::remove_var("SCP_KEY_PASSPHRASE") };
+
+        let tmp =
+            std::env::temp_dir().join(format!("scp-test-node-no-pass-{}", std::process::id()));
+        let result = start_node_local(&tmp, None).await;
+
+        // Restore env var if it was set before.
+        if let Some(val) = prev {
+            // SAFETY: test-only, single-threaded tokio test.
+            unsafe { std::env::set_var("SCP_KEY_PASSPHRASE", val) };
+        }
+
+        let err = result
+            .err()
+            .expect("should fail without SCP_KEY_PASSPHRASE");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("SCP_KEY_PASSPHRASE"),
+            "error should mention SCP_KEY_PASSPHRASE, got: {err_msg}"
+        );
+
+        // Cleanup (data_dir may not have been fully created).
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

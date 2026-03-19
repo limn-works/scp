@@ -26,7 +26,7 @@ scp-event-log = { path = "../../scp-event-log", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
-scp-platform = { path = "../../scp-platform", features = ["testing", "filesystem"], optional = true }
+scp-platform = { path = "../../scp-platform", features = ["testing", "filesystem", "file"], optional = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

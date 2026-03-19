@@ -428,7 +428,7 @@ pub fn py_node_start_in_memory(py: Python<'_>) -> PyResult<PyNodeHandle> {
     let rt = crate::runtime()?;
     py.allow_threads(|| {
         let node = rt
-            .block_on(server::start_node_in_memory())
+            .block_on(server::start_node_in_memory(None))
             .map_err(server_err)?;
         Ok(PyNodeHandle {
             inner: RunningNode::InMemory(node),
@@ -445,7 +445,10 @@ pub fn py_node_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyNodeH
     let rt = crate::runtime()?;
     py.allow_threads(|| {
         let node = rt
-            .block_on(server::start_node_local(std::path::Path::new(&data_dir)))
+            .block_on(server::start_node_local(
+                std::path::Path::new(&data_dir),
+                None,
+            ))
             .map_err(server_err)?;
         Ok(PyNodeHandle {
             inner: RunningNode::Filesystem(node),
@@ -503,7 +506,7 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -517,7 +520,7 @@ mod tests {
     #[test]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-pyo3-node-test-{}", std::process::id()));
-        let node = rt().block_on(server::start_node_local(&tmp)).unwrap();
+        let node = rt().block_on(server::start_node_local(&tmp, None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -541,7 +544,7 @@ mod tests {
         // enable_broadcast_projection_with_site on a fresh node with a valid
         // key should succeed (the context need not exist in the manager for
         // projection — it is purely a node-local routing table entry).
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
             0,
@@ -564,7 +567,7 @@ mod tests {
 
     #[test]
     fn commit_deploy_on_unprojected_context_returns_error() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let result = rt().block_on(node.commit_deploy("nonexistent-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -580,7 +583,7 @@ mod tests {
 
     #[test]
     fn rollback_deploy_on_unprojected_context_returns_error() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let result = rt().block_on(node.rollback_deploy("nonexistent-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -591,7 +594,7 @@ mod tests {
 
     #[test]
     fn disable_site_projection_on_unprojected_context_is_noop() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         // Should not panic — disable on unknown context is a no-op.
         rt().block_on(node.disable_broadcast_projection("nonexistent-ctx"));
         node.shutdown();
@@ -600,7 +603,7 @@ mod tests {
     #[test]
     fn node_inner_lifecycle_dispatch() {
         // Test the RunningNode dispatch methods (which are the FFI layer).
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
 
         // enable_site_projection via RunningNode
@@ -637,7 +640,7 @@ mod tests {
 
     #[test]
     fn serve_background_dispatches_through_node_inner() {
-        let node = rt().block_on(server::start_node_in_memory()).unwrap();
+        let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
         let inner = RunningNode::InMemory(node);
 
         // serve_background with port 0 (OS-assigned)
