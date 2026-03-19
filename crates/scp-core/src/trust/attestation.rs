@@ -168,8 +168,15 @@ pub enum RevocationStatus {
         reason: Option<String>,
         /// DID that performed the revocation. Must equal the attestation's
         /// issuer — only the issuer can revoke their own attestation (§7.4.1).
+        #[serde(default = "default_revoked_by")]
         revoked_by: DID,
     },
+}
+
+/// Default `revoked_by` DID for pre-migration attestations that were serialized
+/// without the `revoked_by` field.
+fn default_revoked_by() -> DID {
+    DID::from("did:unknown:pre-migration")
 }
 
 // ---------------------------------------------------------------------------

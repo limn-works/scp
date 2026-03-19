@@ -1394,8 +1394,11 @@ pub async fn identity_create_link_attestation(
         let issuer = DID::from(did.as_str());
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_err(|_| ScpNapiError::Identity {
+                message: "system clock is before UNIX epoch".to_owned(),
+                code: "SCP-IDENT-1042".to_owned(),
+            })?
+            .as_secs();
 
         let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
 

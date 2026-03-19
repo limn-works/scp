@@ -201,6 +201,9 @@ const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 /// pruned to bound document size. Per ADR-039, this is set to 2.
 const MAX_RETIRED_AGENT_KEYS: usize = 2;
 
+/// Maximum identity link attestations per DID document (§3.5.3).
+const MAX_IDENTITY_LINK_ATTESTATIONS: usize = 10;
+
 impl DidDocument {
     /// Constructs a new DID Document for an SCP identity.
     ///
@@ -630,6 +633,11 @@ impl DidDocument {
     ) -> Result<(), IdentityError> {
         // Remove any existing entry with the same attestation_id.
         let target_id = &attestation.attestation_id;
+        let had_existing = self.service.iter().any(|s| {
+            s.service_type == "ScpIdentityLinkAttestation"
+                && ScpIdentityLinkService::from_service_entry(s)
+                    .is_ok_and(|parsed| parsed.attestation_id == *target_id)
+        });
         self.service.retain(|s| {
             if s.service_type != "ScpIdentityLinkAttestation" {
                 return true;
@@ -637,6 +645,21 @@ impl DidDocument {
             ScpIdentityLinkService::from_service_entry(s)
                 .map_or(true, |parsed| parsed.attestation_id != *target_id)
         });
+
+        // Enforce 10-attestation-per-DID-document cap (§3.5.3).
+        if !had_existing {
+            let count = self
+                .service
+                .iter()
+                .filter(|s| s.service_type == "ScpIdentityLinkAttestation")
+                .count();
+            if count >= MAX_IDENTITY_LINK_ATTESTATIONS {
+                return Err(IdentityError::TooManyIdentityLinkAttestations {
+                    count: count + 1,
+                    max: MAX_IDENTITY_LINK_ATTESTATIONS,
+                });
+            }
+        }
 
         let service = attestation.to_service_entry(&self.id)?;
         self.service.push(service);

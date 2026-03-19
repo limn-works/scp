@@ -476,6 +476,10 @@ impl ScpIdentityLinkService {
             None => &self.attestation_id,
         };
 
+        // NOTE: Spec §3.5.3 says `attestation-<platform>--<index>` (double-dash,
+        // numeric index). Code uses `attestation-<platform>-<id_prefix>` (single-
+        // dash, 8-char hash prefix) for uniqueness without global counters. A spec
+        // amendment is pending to align the spec with this implementation.
         Ok(Service {
             id: format!("{did}#attestation-{}-{id_prefix}", self.platform.as_str()),
             service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),

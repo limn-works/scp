@@ -383,6 +383,15 @@ pub enum IdentityError {
         /// The maximum allowed.
         max: usize,
     },
+
+    /// Too many identity link attestations in the DID document (§3.5.3).
+    #[error("too many identity link attestations: {count} exceeds maximum of {max}")]
+    TooManyIdentityLinkAttestations {
+        /// The number of attestations that would exist after the add.
+        count: usize,
+        /// The maximum allowed.
+        max: usize,
+    },
 }
 
 /// Abstract trait for DID method implementations.

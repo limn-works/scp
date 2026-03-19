@@ -2393,6 +2393,9 @@ async fn identity_verify_device_attestation_impl(
 // retains custody for signing; attestations are stored separately.
 // ---------------------------------------------------------------------------
 
+/// Maximum number of entries in the identity custody registry.
+const UNIFFI_CUSTODY_REGISTRY_CAP: usize = 10_000;
+
 /// Maximum number of DID entries in the identity link attestation registry.
 const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 
@@ -2507,8 +2510,11 @@ async fn identity_create_link_attestation_impl(
     let issuer = DID::from(did_str.as_str());
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| ScpError::Identity {
+            msg: "system clock is before UNIX epoch".to_owned(),
+            code: "SCP-IDENT-1042".to_owned(),
+        })?
+        .as_secs();
 
     let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
 
@@ -2555,10 +2561,22 @@ async fn identity_create_link_attestation_impl(
     attestation.signature = sig.as_bytes().to_vec();
 
     // Store custody for later verification lookups.
-    identity_custody_registry().insert(
-        identity.did.clone(),
-        (Arc::clone(custody), core_id.active_signing_key),
-    );
+    {
+        let registry = identity_custody_registry();
+        if !registry.contains_key(&identity.did) && registry.len() >= UNIFFI_CUSTODY_REGISTRY_CAP {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "custody registry has reached capacity \
+                     ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
+                ),
+                code: "SCP-VALID-7403".to_owned(),
+            });
+        }
+        registry.insert(
+            identity.did.clone(),
+            (Arc::clone(custody), core_id.active_signing_key),
+        );
+    }
 
     let registry = identity_link_attestation_registry();
     if !registry.contains_key(&did_str) && registry.len() >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP {

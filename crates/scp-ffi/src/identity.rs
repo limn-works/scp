@@ -1301,8 +1301,8 @@ fn py_create_identity_link_attestation(
             let issuer = DID::from(did_owned.as_str());
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_err(|_| ScpPyError::identity("system clock is before UNIX epoch"))?
+                .as_secs();
 
             let id = IdentityLinkAttestation::compute_id(
                 &issuer,
