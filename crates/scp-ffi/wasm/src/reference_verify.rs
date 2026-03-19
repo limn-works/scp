@@ -78,6 +78,8 @@ struct DohResponse {
 /// A single DNS answer record from the DNS-over-HTTPS JSON response.
 #[derive(serde::Deserialize)]
 struct DohAnswer {
+    /// The DNS name this answer is for (e.g., `"_scp-verify.example.com."`).
+    name: String,
     /// Record data (e.g., the TXT record content).
     data: String,
 }
@@ -257,6 +259,28 @@ async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (boo
 /// Cloudflare DNS-over-HTTPS endpoint.
 const DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 
+/// Returns `true` if `answer_name` matches `expected` in a DNS-aware comparison:
+/// case-insensitive, trailing-dot-insensitive.
+fn dns_name_matches(answer_name: &str, expected: &str) -> bool {
+    let a = answer_name
+        .strip_suffix('.')
+        .unwrap_or(answer_name)
+        .to_ascii_lowercase();
+    let e = expected
+        .strip_suffix('.')
+        .unwrap_or(expected)
+        .to_ascii_lowercase();
+    a == e
+}
+
+/// Strips the enclosing double quotes that Cloudflare `DoH` wraps around TXT
+/// record data (e.g., `"\"did:dht:z6Mk...\""` → `"did:dht:z6Mk..."`).
+fn strip_txt_quotes(data: &str) -> &str {
+    data.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(data)
+}
+
 /// Verifies a `DnsRecord` attestation by querying Cloudflare DNS-over-HTTPS
 /// for TXT records at `_scp-verify.<domain>` and checking that one contains
 /// the DID.
@@ -313,11 +337,16 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
                 }
             };
 
-            // Check if any TXT record contains the DID.
+            // Only consider answers whose name matches the queried domain
+            // (case-insensitive, trailing dot optional) to prevent a malicious
+            // DNS response from injecting records for a different domain.
+            // Also strip enclosing quotes that Cloudflare DoH wraps around
+            // TXT record data before checking for the DID.
             let found = doh_response
                 .answer
                 .iter()
-                .any(|record| record.data.contains(issuer_did));
+                .filter(|record| dns_name_matches(&record.name, &query_name))
+                .any(|record| strip_txt_quotes(&record.data).contains(issuer_did));
 
             if found {
                 (true, None)
