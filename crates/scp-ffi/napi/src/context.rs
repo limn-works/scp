@@ -450,9 +450,21 @@ pub async fn context_create(
         _ => scp_core::context::params::MemoryScope::Ephemeral,
     };
 
-    // Currently only SingleAdmin is supported; governance string was already parsed.
-    let _ = governance.as_str();
-    let core_governance = scp_core::context::params::GovernanceModel::SingleAdmin;
+    // Validate governance model — reject unknown values instead of silently
+    // defaulting to SingleAdmin (#1421).
+    let core_governance = match governance.as_str() {
+        "single_admin" => scp_core::context::params::GovernanceModel::SingleAdmin,
+        other => {
+            return Err(ScpNapiError::Validation {
+                message: format!(
+                    "unsupported governance model: {other:?} — \
+                     only \"single_admin\" is currently supported"
+                ),
+                code: "SCP-VALID-7030".to_owned(),
+            }
+            .into());
+        }
+    };
 
     let core_ceiling: Vec<scp_core::context::roles::Capability> = ceiling
         .iter()

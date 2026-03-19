@@ -3125,7 +3125,18 @@ impl ContextManager {
         // `decrypt_message` is sync and takes its own internal mutex for
         // OpenMLS group state — no need to hold `self.contexts` here.
         // MLS layer (ADR-001) -> sender key layer (ADR-007).
-        // Uses epoch=0, sequence=0 matching the send path's AAD.
+        //
+        // AAD epoch=0, sequence=0: The sender key AAD includes epoch and
+        // sequence for replay/reorder protection (spec §9.7). However, the
+        // current wire format does not transmit these values in the clear —
+        // they are encrypted inside the MLS ciphertext. The receiver therefore
+        // cannot reconstruct the sender's epoch/sequence without first
+        // decrypting, creating a chicken-and-egg problem. Both send and
+        // receive paths use hardcoded zeros until the wire format carries
+        // epoch/sequence in an authenticated-but-unencrypted header (see
+        // #1422). This is safe because MLS already provides its own replay
+        // protection via the ratchet tree; the sender key AAD is a
+        // defense-in-depth layer that is currently inert.
         let decrypted = self
             .crypto
             .decrypt_message(&context_id_bytes, encrypted_blob, 0, 0)?;

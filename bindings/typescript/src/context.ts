@@ -1410,10 +1410,10 @@ export class Context implements AsyncDisposable {
     if (this._disposed) {
       return;
     }
-    this._disposed = true;
     try {
       const bridge = await getBridge();
       await bridge.contextLeave(this._handle, this._identityDid);
+      this._disposed = true;
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -1431,10 +1431,10 @@ export class Context implements AsyncDisposable {
     if (this._disposed) {
       return;
     }
-    this._disposed = true;
     try {
       const bridge = await getBridge();
       await bridge.contextClose(this._handle, this._identityDid);
+      this._disposed = true;
     } catch (error) {
       throw mapBridgeError(error);
     }

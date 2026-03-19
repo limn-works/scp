@@ -663,6 +663,9 @@ pub fn remove_ffi_state(context_id: &str) {
     // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
     // to prevent unbounded memory growth in long-running processes.
     crate::bridge_connector::remove_bridge_state(context_id);
+    // Clean up per-context economy state (budget + antispam trackers) to prevent
+    // unbounded memory growth in long-running processes (#1433).
+    remove_economy_state(context_id);
 }
 
 /// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
@@ -1377,7 +1380,6 @@ where
 /// Removes economy state (budget tracker and antispam tracker) for a context.
 ///
 /// Should be called during context cleanup for long-running processes.
-#[allow(dead_code)]
 pub fn remove_economy_state(context_id: &str) {
     economy_budget_registry().remove(context_id);
     economy_antispam_registry().remove(context_id);
