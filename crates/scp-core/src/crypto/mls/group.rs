@@ -640,41 +640,10 @@ pub fn join_group(
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
 ) -> Result<ScpMlsGroup, MlsError> {
-    // Serialize MlsMessageOut to bytes, then deserialize as MlsMessageIn.
-    // This is the production-path conversion (no test-utils feature required).
     let serialized = welcome
         .tls_serialize_detached()
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("serializing welcome: {e}")))?;
-
-    let welcome_in = MlsMessageIn::tls_deserialize(&mut serialized.as_slice())
-        .map_err(|e| MlsError::WelcomeProcessingFailed(format!("deserializing welcome: {e}")))?;
-
-    // Extract the Welcome from the MlsMessageIn body.
-    let welcome_body = welcome_in.extract();
-    let MlsMessageBodyIn::Welcome(welcome) = welcome_body else {
-        return Err(MlsError::WelcomeProcessingFailed(
-            "message is not a Welcome".to_string(),
-        ));
-    };
-
-    // max_past_epochs(2) must match create_group's MlsGroupCreateConfig to
-    // ensure joining members also retain past epoch message secrets during
-    // the 30-second grace window. See create_group() and issue #324.
-    let join_config = MlsGroupJoinConfig::builder().max_past_epochs(2).build();
-
-    let staged_welcome = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
-        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
-
-    let group = staged_welcome
-        .into_group(&provider)
-        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
-
-    Ok(ScpMlsGroup {
-        group: Some(group),
-        provider,
-        signer: EagerDropSigner::new(signer),
-        destroyed: false,
-    })
+    join_group_from_bytes(&serialized, provider, signer)
 }
 
 /// Joins a group from TLS-serialized Welcome bytes.

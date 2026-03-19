@@ -6,6 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
+use zeroize::Zeroizing;
 
 use super::sender_keys::key_protocol::{aes128gcm_decrypt, aes128gcm_encrypt, hkdf_derive_key};
 
@@ -18,6 +19,17 @@ pub enum EnvelopeSealError {
     /// ECIES decryption failed.
     #[error("ECIES decryption failed: {0}")]
     OpenFailed(String),
+}
+
+/// Appends `data` to `buf` with a 4-byte big-endian length prefix.
+///
+/// Used by `build_invitation_info`, `build_invitation_aad`, and
+/// `derive_routing_id` to enforce unambiguous field boundaries and prevent
+/// boundary-shift attacks.
+#[allow(clippy::cast_possible_truncation)]
+fn append_length_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
 }
 
 /// Derives a routing ID by hashing a DID with a domain separator.
@@ -70,16 +82,8 @@ pub fn ed25519_pubkey_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], Enve
 fn build_invitation_info(context_id: &str, creator_did: &str) -> Vec<u8> {
     let mut info = Vec::new();
     info.extend_from_slice(b"scp-invitation-v1");
-    let ctx_bytes = context_id.as_bytes();
-    #[allow(clippy::cast_possible_truncation)]
-    let ctx_len = ctx_bytes.len() as u32;
-    info.extend_from_slice(&ctx_len.to_be_bytes());
-    info.extend_from_slice(ctx_bytes);
-    let did_bytes = creator_did.as_bytes();
-    #[allow(clippy::cast_possible_truncation)]
-    let did_len = did_bytes.len() as u32;
-    info.extend_from_slice(&did_len.to_be_bytes());
-    info.extend_from_slice(did_bytes);
+    append_length_prefixed(&mut info, context_id.as_bytes());
+    append_length_prefixed(&mut info, creator_did.as_bytes());
     info
 }
 
@@ -91,16 +95,8 @@ fn build_invitation_info(context_id: &str, creator_did: &str) -> Vec<u8> {
 fn build_invitation_aad(context_id: &str, creator_did: &str, ephemeral_pub: &[u8; 32]) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(b"scp-invitation-aad-v1");
-    let ctx_bytes = context_id.as_bytes();
-    #[allow(clippy::cast_possible_truncation)]
-    let ctx_len = ctx_bytes.len() as u32;
-    aad.extend_from_slice(&ctx_len.to_be_bytes());
-    aad.extend_from_slice(ctx_bytes);
-    let did_bytes = creator_did.as_bytes();
-    #[allow(clippy::cast_possible_truncation)]
-    let did_len = did_bytes.len() as u32;
-    aad.extend_from_slice(&did_len.to_be_bytes());
-    aad.extend_from_slice(did_bytes);
+    append_length_prefixed(&mut aad, context_id.as_bytes());
+    append_length_prefixed(&mut aad, creator_did.as_bytes());
     aad.extend_from_slice(ephemeral_pub);
     aad
 }
@@ -129,7 +125,9 @@ pub fn ecies_seal(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did, &ephemeral_pub_bytes);
 
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)
+    // x25519-dalek v2 SharedSecret does NOT implement ZeroizeOnDrop.
+    let shared_bytes = Zeroizing::new(*shared_secret.as_bytes());
+    let aes_key = hkdf_derive_key(shared_bytes.as_ref(), &info)
         .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
 
     let sealed = aes128gcm_encrypt(&aes_key, plaintext, &aad)
@@ -160,7 +158,9 @@ pub fn ecies_open(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did, ephemeral_pub);
 
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)
+    // x25519-dalek v2 SharedSecret does NOT implement ZeroizeOnDrop.
+    let shared_bytes = Zeroizing::new(*shared_secret.as_bytes());
+    let aes_key = hkdf_derive_key(shared_bytes.as_ref(), &info)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))?;
 
     aes128gcm_decrypt(&aes_key, sealed, &aad)

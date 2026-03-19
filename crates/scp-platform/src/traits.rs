@@ -609,9 +609,12 @@ pub fn x25519_agree_from_ed25519(
     signing_key: &ed25519_dalek::SigningKey,
     peer_x25519_public: &[u8; 32],
 ) -> SharedSecret {
-    let scalar_bytes = signing_key.to_scalar_bytes();
-    let x25519_secret = x25519_dalek::StaticSecret::from(scalar_bytes);
+    let scalar_bytes = zeroize::Zeroizing::new(signing_key.to_scalar_bytes());
+    let x25519_secret = x25519_dalek::StaticSecret::from(*scalar_bytes);
     let peer_key = x25519_dalek::PublicKey::from(*peer_x25519_public);
     let shared = x25519_secret.diffie_hellman(&peer_key);
-    SharedSecret::new(shared.to_bytes())
+    // x25519-dalek v2 SharedSecret does NOT implement ZeroizeOnDrop.
+    // Manually copy to Zeroizing then extract.
+    let shared_bytes = zeroize::Zeroizing::new(shared.to_bytes());
+    SharedSecret::new(*shared_bytes)
 }
