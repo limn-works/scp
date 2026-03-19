@@ -1271,6 +1271,7 @@ fn py_create_identity_link_attestation(
     use scp_platform::traits::KeyCustody;
 
     validate::validate_did(did)?;
+    validate::validate_attestation_fields(platform, handle, proof)?;
     let did_owned = did.to_owned();
     let platform_owned = platform.to_owned();
     let handle_owned = handle.to_owned();

@@ -275,7 +275,17 @@ pub enum IdentityLinkPlatform {
     #[serde(rename = "microsoft.com")]
     Microsoft,
     /// Mastodon (`mastodon`). Class 2. Verification: `SignedPost` (profile bio).
-    /// Instance is specified in the platform handle (e.g., `@user@mastodon.social`).
+    ///
+    /// Mastodon is a federated platform with many instances. The spec says the
+    /// platform value should be `mastodon:<instance>` (e.g., `mastodon:mastodon.social`).
+    /// However, the enum variant serializes to just `"mastodon"` because enum
+    /// variants cannot carry instance-specific data.
+    ///
+    /// **Convention:** The `platform_handle` field should include the full Mastodon
+    /// address with instance (e.g., `@user@mastodon.social`). Verifiers should
+    /// extract the instance from the handle when needed. For attestations that
+    /// need instance-specific platform values, use the raw string `"mastodon:<instance>"`
+    /// directly instead of this enum variant.
     #[serde(rename = "mastodon")]
     Mastodon,
     /// DNS (`dns`). Class 2. Verification: `DnsRecord` (`_scp-verify.<domain>`).
@@ -439,7 +449,38 @@ pub struct ScpIdentityLinkService {
     pub verified_at: u64,
 
     /// Revocation status: `"active"` or `"revoked"`.
-    pub revocation_status: String,
+    pub revocation_status: ServiceRevocationStatus,
+}
+
+/// Revocation status for identity link service entries.
+///
+/// A typed enum replacing the raw `String` field. Serializes to
+/// lowercase `"active"` / `"revoked"` for wire compatibility with
+/// existing DID document service entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceRevocationStatus {
+    /// The attestation is active (not revoked).
+    Active,
+    /// The attestation has been revoked.
+    Revoked,
+}
+
+impl ServiceRevocationStatus {
+    /// Returns the wire-format string for this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceRevocationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ScpIdentityLinkService {
@@ -962,7 +1003,7 @@ mod tests {
             platform_id: Some("12345678".to_owned()),
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+            revocation_status: ServiceRevocationStatus::Active,
         }
     }
 
@@ -990,7 +1031,7 @@ mod tests {
             platform_id: None,
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+            revocation_status: ServiceRevocationStatus::Active,
         };
 
         let service = original.to_service_entry(test_did()).unwrap();
@@ -1014,7 +1055,7 @@ mod tests {
             platform_id: None,
             verification_method: "#agent".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+            revocation_status: ServiceRevocationStatus::Active,
         };
 
         let service = original.to_service_entry(test_did()).unwrap();
@@ -1035,7 +1076,7 @@ mod tests {
                 platform_id: None,
                 verification_method: "#active".to_owned(),
                 verified_at: 1_700_000_000,
-                revocation_status: ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+                revocation_status: ServiceRevocationStatus::Active,
             };
 
             let service = service_entry.to_service_entry(test_did()).unwrap();
@@ -1102,12 +1143,12 @@ mod tests {
             platform_id: Some("oidc-sub-12345".to_owned()),
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: ScpIdentityLinkService::STATUS_REVOKED.to_owned(),
+            revocation_status: ServiceRevocationStatus::Revoked,
         };
 
         let service = original.to_service_entry(test_did()).unwrap();
         let parsed = ScpIdentityLinkService::from_service_entry(&service).unwrap();
-        assert_eq!(parsed.revocation_status, "revoked");
+        assert_eq!(parsed.revocation_status, ServiceRevocationStatus::Revoked);
     }
 
     #[test]
@@ -1127,7 +1168,7 @@ mod tests {
             platform_id: None,
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+            revocation_status: ServiceRevocationStatus::Active,
         };
 
         // Must not panic — the bug was a byte-indexed slice on a multi-byte string.

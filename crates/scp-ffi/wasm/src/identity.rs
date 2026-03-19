@@ -198,6 +198,29 @@ impl std::fmt::Debug for IdentityEntry {
 /// Maximum number of identities in the WASM-local identity registry.
 const WASM_IDENTITY_REGISTRY_CAP: usize = 10_000;
 
+/// Checks that a `HashMap` has capacity for a new key. Returns `Err(JsValue)` if
+/// the map is at `cap` and the key is not already present.
+fn check_registry_capacity<K: std::hash::Hash + Eq, V>(
+    map: &HashMap<K, V>,
+    key: &K,
+    cap: usize,
+    registry_name: &str,
+    error_code: &str,
+) -> Result<(), JsValue> {
+    if !map.contains_key(key) && map.len() >= cap {
+        return Err(ScpWasmError::Validation {
+            message: format!(
+                "{registry_name} has reached capacity ({cap}) \
+                 — cannot store additional entries"
+            ),
+            code: error_code.to_owned(),
+        }
+        .into_js()
+        .into());
+    }
+    Ok(())
+}
+
 /// Maximum number of migration links stored in the WASM-local registry.
 const WASM_MIGRATION_LINKS_CAP: usize = 10_000;
 
@@ -423,7 +446,9 @@ fn hkdf_expand_sha256(
 /// Minimal z-base-32 encoder for did:dht DID derivation.
 ///
 /// z-base-32 uses the alphabet `ybndrfg8ejkmcpqxot1uwisza345h769`.
-fn zbase32_encode(input: &[u8]) -> String {
+///
+/// `pub(crate)` so other WASM bridge modules can reuse if needed.
+pub(crate) fn zbase32_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
 
     let mut bits: u64 = 0;
@@ -1394,6 +1419,26 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
     })
 }
 
+/// Domain separator for device attestation payloads.
+const DEVICE_ATTESTATION_DOMAIN: &[u8] = b"SCP-DEVICE-ATTESTATION-V1:";
+
+/// Constructs the canonical device attestation payload bytes.
+///
+/// Format: `domain_separator || len(did) as u32 BE || did_bytes || timestamp as u64 BE`
+///
+/// Uses length-prefixed fields to match the canonical hash construction pattern
+/// used by all other SCP signed payloads (§9.5.1).
+fn device_attestation_payload(did: &str, timestamp_secs: u64) -> Vec<u8> {
+    let did_bytes = did.as_bytes();
+    let mut payload = Vec::with_capacity(DEVICE_ATTESTATION_DOMAIN.len() + 4 + did_bytes.len() + 8);
+    payload.extend_from_slice(DEVICE_ATTESTATION_DOMAIN);
+    #[allow(clippy::cast_possible_truncation)]
+    payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    payload.extend_from_slice(did_bytes);
+    payload.extend_from_slice(&timestamp_secs.to_be_bytes());
+    payload
+}
+
 /// Generates a device attestation token for an identity.
 ///
 /// Signs a timestamped challenge with the identity's Ed25519 signing key.
@@ -1406,9 +1451,11 @@ pub fn identity_attest_device(did: String) -> Promise {
     use ed25519_dalek::Signer;
 
     future_to_promise(async move {
-        // Create attestation payload: DID + timestamp.
+        // Create attestation payload using domain-separated canonical construction
+        // matching other SCP signed payloads. Format: domain separator + length-prefixed
+        // DID + u64 timestamp.
         let timestamp_secs = crate::time::now_secs();
-        let payload = format!("device-attestation:{did}:{timestamp_secs}");
+        let payload = device_attestation_payload(&did, timestamp_secs);
 
         // Produce a real Ed25519 signature over the attestation payload.
         // Signing is performed inside the registry closure so that private
@@ -1426,7 +1473,7 @@ pub fn identity_attest_device(did: String) -> Promise {
             })?;
 
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
-            let signature = signing_key.sign(payload.as_bytes());
+            let signature = signing_key.sign(&payload);
             Ok::<[u8; 64], JsValue>(signature.to_bytes())
         })?;
 
@@ -1571,14 +1618,12 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
         };
 
         // Verify the Ed25519 signature against the public key.
-        let payload = format!("device-attestation:{did}:{}", fields.timestamp);
+        let payload = device_attestation_payload(&did, fields.timestamp);
         let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes) else {
             return Ok(JsValue::from_bool(false));
         };
         let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
-        let verified = verifying_key
-            .verify_strict(payload.as_bytes(), &signature)
-            .is_ok();
+        let verified = verifying_key.verify_strict(&payload, &signature).is_ok();
 
         Ok(JsValue::from_bool(verified))
     })
@@ -1854,6 +1899,18 @@ pub fn identity_create_link_attestation(
             .into());
         }
 
+        // Validate attestation input field sizes.
+        if let Err(e) =
+            scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof)
+        {
+            return Err(ScpWasmError::Validation {
+                message: format!("attestation field validation failed: {e}"),
+                code: "SCP-VALID-7037".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
         // Validate verification method.
         let method_str = match verification_method.as_str() {
             "oauth" | "signed_post" | "dns_record" | "challenge_response" => {
@@ -1904,8 +1961,8 @@ pub fn identity_create_link_attestation(
 
         // Validate that the parsed proof is a valid AttestationProof variant
         // by deserializing into our local canonical type.
-        let _typed_proof: canonical_attestation::Proof =
-            serde_json::from_value(proof_value.clone()).map_err(|e| -> JsValue {
+        let typed_proof: canonical_attestation::Proof = serde_json::from_value(proof_value.clone())
+            .map_err(|e| -> JsValue {
                 ScpWasmError::Identity {
                     message: format!(
                         "proof JSON does not match any AttestationProof variant \
@@ -1917,6 +1974,35 @@ pub fn identity_create_link_attestation(
                 .into_js()
                 .into()
             })?;
+
+        // Validate variant-specific fields: ChallengeResponseVerified must have
+        // a non-empty response_signature, SignedPostVerified must have a non-empty
+        // post_url.
+        match &typed_proof {
+            canonical_attestation::Proof::ChallengeResponseVerified {
+                response_signature, ..
+            } if response_signature.is_empty() => {
+                return Err(ScpWasmError::Validation {
+                    message: "challenge_response_verified proof requires a non-empty \
+                              response_signature"
+                        .to_owned(),
+                    code: "SCP-VALID-7035".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
+            canonical_attestation::Proof::SignedPostVerified { post_url, .. }
+                if post_url.is_empty() =>
+            {
+                return Err(ScpWasmError::Validation {
+                    message: "signed_post_verified proof requires a non-empty post_url".to_owned(),
+                    code: "SCP-VALID-7036".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
+            _ => {}
+        }
 
         // Build the attestation JSON.
         let mut attestation = serde_json::json!({
@@ -2004,18 +2090,13 @@ pub fn identity_create_link_attestation(
         // Store the attestation (with capacity checks).
         LINK_ATTESTATIONS.with(|reg| {
             let mut map = reg.borrow_mut();
-            if !map.contains_key(&did) && map.len() >= WASM_LINK_ATTESTATIONS_CAP {
-                return Err(JsValue::from(
-                    ScpWasmError::Validation {
-                        message: format!(
-                            "link attestation registry has reached capacity \
-                             ({WASM_LINK_ATTESTATIONS_CAP}) — cannot store additional attestations"
-                        ),
-                        code: "SCP-VALID-7402".to_owned(),
-                    }
-                    .into_js(),
-                ));
-            }
+            check_registry_capacity(
+                &*map,
+                &did,
+                WASM_LINK_ATTESTATIONS_CAP,
+                "link attestation registry",
+                "SCP-VALID-7402",
+            )?;
             let entry = map.entry(did).or_default();
             if entry.len() >= WASM_LINK_ATTESTATIONS_PER_DID_CAP {
                 return Err(JsValue::from(
@@ -2233,7 +2314,7 @@ fn resolve_attestation_public_key(
 ///
 /// See spec §3.5.1.
 #[wasm_bindgen]
-pub fn identity_verify_link_attestation(
+pub fn identity_verify_link_attestation_signature(
     attestation_json: String,
     issuer_public_key_hex: Option<String>,
 ) -> Promise {

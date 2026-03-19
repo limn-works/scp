@@ -223,7 +223,8 @@ fn conf_004_agent_binding_attestation() {
     let agent_did = format!("did:key:{}", hex(&agent_key.verifying_key().to_bytes()));
 
     let claim = serde_json::json!({"platform": "agent-binding"});
-    let claim_str = claim.to_string();
+    let claim_bytes =
+        rmp_serde::to_vec_named(&claim).expect("claim msgpack serialization");
 
     print_step(1, "Create identity attestation binding agent to human");
     // RevocationStatus::Active serialized as MessagePack (named keys).
@@ -238,7 +239,7 @@ fn conf_004_agent_binding_attestation() {
             CanonicalField::U16(0x0000), // IdentityLink = tag 0
             CanonicalField::VarBytes(human_did.as_bytes()),
             CanonicalField::VarBytes(agent_did.as_bytes()),
-            CanonicalField::VarBytes(claim_str.as_bytes()),
+            CanonicalField::VarBytes(&claim_bytes),
             CanonicalField::Absent, // no evidence
             CanonicalField::U64(1_700_000_000),
             CanonicalField::Absent, // expires_at: None → Absent per V2 spec

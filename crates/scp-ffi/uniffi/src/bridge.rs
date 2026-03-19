@@ -2469,6 +2469,14 @@ async fn identity_create_link_attestation_impl(
     use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
+    // Validate attestation input field sizes.
+    scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof).map_err(
+        |e| ScpError::Validation {
+            msg: format!("attestation field validation failed: {e}"),
+            code: "SCP-VALID-7037".to_owned(),
+        },
+    )?;
+
     let method: VerificationMethod =
         verification_method
             .parse()

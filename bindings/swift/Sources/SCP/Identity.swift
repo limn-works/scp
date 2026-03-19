@@ -590,7 +590,7 @@ public enum RevocationStatus: Sendable, Equatable {
 ///
 /// The ``id`` is deterministically derived as
 /// `hex(SHA-256(issuer || platform || handle || issued_at))`.
-public struct IdentityAttestation: Sendable, Equatable {
+public struct IdentityAttestation: Sendable {
     /// Deterministic attestation ID.
     public let id: String
 
@@ -612,6 +612,13 @@ public struct IdentityAttestation: Sendable, Equatable {
     /// Optional platform-assigned unique identifier.
     public let platformId: String?
 
+    /// Raw JSON string from the bridge for roundtrip signature verification.
+    ///
+    /// `nil` for attestations constructed manually (not from the bridge).
+    /// Stored as a JSON string (not `[String: Any]`) to maintain `Sendable`
+    /// conformance.
+    public let rawJson: String?
+
     /// Creates an attestation from its component fields.
     public init(
         id: String,
@@ -620,7 +627,8 @@ public struct IdentityAttestation: Sendable, Equatable {
         verificationMethod: String,
         verifiedAt: Int,
         revocationStatus: RevocationStatus = .active,
-        platformId: String? = nil
+        platformId: String? = nil,
+        rawJson: String? = nil
     ) {
         self.id = id
         self.platform = platform
@@ -629,24 +637,26 @@ public struct IdentityAttestation: Sendable, Equatable {
         self.verifiedAt = verifiedAt
         self.revocationStatus = revocationStatus
         self.platformId = platformId
+        self.rawJson = rawJson
     }
 
     /// Verifies this attestation's signature and validity.
     ///
     /// Delegates to the bridge's trust verification function.
     ///
+    /// - Parameters:
+    ///   - verifyFn: Bridge function override for testing.
     /// - Returns: `true` if the attestation is valid.
     /// - Throws: ``ScpError`` if verification is not available.
     ///
     /// ## Provenance
     ///
     /// - Spec section 3.5 (Identity Link Attestations)
-    public func verify() async throws -> Bool {
-        // Bridge function not yet available — throw not-implemented
-        throw ScpError.Identity(
-            msg: "Attestation verification is not yet available in the bridge",
-            code: "SCP-ATTEST-9014"
-        )
+    // Stub — see #1453
+    public func verify(
+        verifyFn: IdentityAttestationBridge.VerifyFn = IdentityAttestationBridge.defaultVerify
+    ) async throws -> Bool {
+        try await verifyFn(self)
     }
 }
 
@@ -683,6 +693,7 @@ public enum IdentityAttestationBridge {
         _ attestationId: String
     ) async throws -> Bool
 
+    // Stub — see #1453
     /// Default create function — not yet available.
     public static let defaultCreate: CreateFn = { _, _, _, _, _, _ in
         throw ScpError.Identity(
@@ -691,6 +702,7 @@ public enum IdentityAttestationBridge {
         )
     }
 
+    // Stub — see #1453
     /// Default list function — not yet available.
     public static let defaultList: ListFn = { _ in
         throw ScpError.Identity(
@@ -699,11 +711,26 @@ public enum IdentityAttestationBridge {
         )
     }
 
+    // Stub — see #1453
     /// Default remove function — not yet available.
     public static let defaultRemove: RemoveFn = { _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation removal is not yet available in the bridge",
             code: "SCP-ATTEST-9012"
+        )
+    }
+
+    /// Verify an attestation's signature and validity.
+    public typealias VerifyFn = @Sendable (
+        _ attestation: IdentityAttestation
+    ) async throws -> Bool
+
+    // Stub — see #1453
+    /// Default verify function — not yet available.
+    public static let defaultVerify: VerifyFn = { _ in
+        throw ScpError.Identity(
+            msg: "Identity link attestation verification is not yet available in the bridge",
+            code: "SCP-ATTEST-9005"
         )
     }
 

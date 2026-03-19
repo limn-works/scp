@@ -89,12 +89,7 @@ struct DohAnswer {
 /// Builds a JSON result string: `{ "verified": bool, "error"?: string }`.
 fn result_json(verified: bool, error: Option<&str>) -> String {
     error.map_or_else(
-        || {
-            serde_json::json!({
-                "verified": verified,
-            })
-            .to_string()
-        },
+        || serde_json::json!({ "verified": verified }).to_string(),
         |e| {
             serde_json::json!({
                 "verified": verified,
@@ -111,47 +106,17 @@ fn result_json(verified: bool, error: Option<&str>) -> String {
 
 /// Fetches a URL using the browser Fetch API and returns the response text.
 ///
-/// Uses `RequestMode::Cors` by default. Returns the response body as a string,
-/// or an error message if the fetch fails (network error, CORS block, non-2xx
-/// status).
+/// Convenience wrapper for [`fetch_url_with_headers`] with no custom headers.
 #[allow(clippy::future_not_send)] // WASM futures use Rc (JsFuture), inherently !Send
 async fn fetch_url(url: &str) -> Result<String, String> {
-    let opts = web_sys::RequestInit::new();
-    opts.set_method("GET");
-    opts.set_mode(web_sys::RequestMode::Cors);
-
-    let request = web_sys::Request::new_with_str_and_init(url, &opts)
-        .map_err(|e| format!("failed to create request for {url}: {e:?}"))?;
-
-    let window = web_sys::window().ok_or_else(|| "no global window object".to_owned())?;
-    let resp_value = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| format!("fetch failed for {url}: {e:?}"))?;
-
-    let resp: web_sys::Response = resp_value
-        .dyn_into()
-        .map_err(|_| "fetch response is not a Response object".to_owned())?;
-
-    if !resp.ok() {
-        return Err(format!("fetch returned HTTP {} for {url}", resp.status()));
-    }
-
-    let text_promise = resp
-        .text()
-        .map_err(|e| format!("failed to read response text: {e:?}"))?;
-    let text_value = JsFuture::from(text_promise)
-        .await
-        .map_err(|e| format!("failed to await response text: {e:?}"))?;
-
-    text_value
-        .as_string()
-        .ok_or_else(|| "response text is not a string".to_owned())
+    fetch_url_with_headers(url, &[]).await
 }
 
 /// Fetches a URL with custom headers using the browser Fetch API.
 ///
-/// Same as [`fetch_url`] but allows setting request headers (needed for
-/// DNS-over-HTTPS `Accept: application/dns-json`).
+/// Uses `RequestMode::Cors`. Returns the response body as a string, or an
+/// error message if the fetch fails (network error, CORS block, non-2xx
+/// status). Pass an empty slice for no custom headers.
 #[allow(clippy::future_not_send)] // WASM futures use Rc (JsFuture), inherently !Send
 async fn fetch_url_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
     let opts = web_sys::RequestInit::new();
@@ -194,6 +159,34 @@ async fn fetch_url_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<S
 }
 
 // ---------------------------------------------------------------------------
+// Proof parsing helper
+// ---------------------------------------------------------------------------
+
+/// Parses a proof field that may be either a JSON string or a direct object.
+///
+/// Handles both `"proof": "{\"key\":\"val\"}"` (string-encoded) and
+/// `"proof": {"key":"val"}` (direct object) formats.
+fn parse_proof<T: serde::de::DeserializeOwned>(
+    proof: &serde_json::Value,
+    method_name: &str,
+) -> Result<T, (bool, Option<String>)> {
+    match proof {
+        serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
+            (
+                false,
+                Some(format!("failed to parse {method_name} proof string: {e}")),
+            )
+        }),
+        other => serde_json::from_value(other.clone()).map_err(|e| {
+            (
+                false,
+                Some(format!("failed to parse {method_name} proof object: {e}")),
+            )
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SignedPost verification
 // ---------------------------------------------------------------------------
 
@@ -201,26 +194,9 @@ async fn fetch_url_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<S
 /// that the response body contains both the DID and the nonce.
 #[allow(clippy::future_not_send)] // WASM futures use Rc (JsFuture), inherently !Send
 async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (bool, Option<String>) {
-    // Parse proof — handle both string-encoded JSON and direct object.
-    let signed_post: SignedPostProof = match proof {
-        serde_json::Value::String(s) => match serde_json::from_str(s) {
-            Ok(p) => p,
-            Err(e) => {
-                return (
-                    false,
-                    Some(format!("failed to parse signed_post proof string: {e}")),
-                );
-            }
-        },
-        other => match serde_json::from_value(other.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                return (
-                    false,
-                    Some(format!("failed to parse signed_post proof object: {e}")),
-                );
-            }
-        },
+    let signed_post: SignedPostProof = match parse_proof(proof, "signed_post") {
+        Ok(p) => p,
+        Err(result) => return result,
     };
 
     if signed_post.post_url.is_empty() {
@@ -237,6 +213,16 @@ async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (boo
 
     match fetch_url(&signed_post.post_url).await {
         Ok(body) => {
+            // Check for the structured verification format: `scp-verify:{did}:{nonce}`.
+            // This is the canonical format for signed post verification (§3.5.2).
+            // Falls back to checking DID and nonce as substrings for backward
+            // compatibility with posts that use a different format.
+            let structured_token = format!("scp-verify:{issuer_did}:{}", signed_post.nonce);
+            if body.contains(&structured_token) {
+                return (true, None);
+            }
+
+            // Fallback: check for DID and nonce as separate substrings.
             let has_did = body.contains(issuer_did);
             let has_nonce = body.contains(&signed_post.nonce);
 
@@ -252,7 +238,11 @@ async fn verify_signed_post(issuer_did: &str, proof: &serde_json::Value) -> (boo
                 }
                 (
                     false,
-                    Some(format!("post body missing: {}", missing.join(", "))),
+                    Some(format!(
+                        "post body missing structured token 'scp-verify:{{did}}:{{nonce}}' \
+                         and also missing: {}",
+                        missing.join(", ")
+                    )),
                 )
             }
         }
@@ -272,26 +262,9 @@ const DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 /// the DID.
 #[allow(clippy::future_not_send)] // WASM futures use Rc (JsFuture), inherently !Send
 async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool, Option<String>) {
-    // Parse proof — handle both string-encoded JSON and direct object.
-    let dns_proof: DnsRecordProof = match proof {
-        serde_json::Value::String(s) => match serde_json::from_str(s) {
-            Ok(p) => p,
-            Err(e) => {
-                return (
-                    false,
-                    Some(format!("failed to parse dns_record proof string: {e}")),
-                );
-            }
-        },
-        other => match serde_json::from_value(other.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                return (
-                    false,
-                    Some(format!("failed to parse dns_record proof object: {e}")),
-                );
-            }
-        },
+    let dns_proof: DnsRecordProof = match parse_proof(proof, "dns_record") {
+        Ok(p) => p,
+        Err(result) => return result,
     };
 
     if dns_proof.domain.is_empty() {

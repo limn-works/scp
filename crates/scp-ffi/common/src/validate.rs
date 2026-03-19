@@ -91,6 +91,15 @@ pub const MAX_TRANSPORT_MODE_LEN: usize = 64;
 /// Maximum length for a deploy ID (matches `scp-core::context::broadcast_content::MAX_DEPLOY_ID_BYTES`).
 pub const MAX_DEPLOY_ID_LEN: usize = 128;
 
+/// Maximum length for an attestation platform string (e.g., "github.com").
+pub const MAX_ATTESTATION_PLATFORM_LEN: usize = 256;
+
+/// Maximum length for an attestation platform handle (e.g., "@alice").
+pub const MAX_ATTESTATION_HANDLE_LEN: usize = 256;
+
+/// Maximum length for an attestation proof JSON string.
+pub const MAX_ATTESTATION_PROOF_LEN: usize = 65_536;
+
 // ---------------------------------------------------------------------------
 // String emptiness and length
 // ---------------------------------------------------------------------------
@@ -463,6 +472,33 @@ pub const fn json_value_type_name(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Attestation field validation
+// ---------------------------------------------------------------------------
+
+/// Validates the input fields for an identity link attestation creation.
+///
+/// Enforces size limits on `platform`, `handle`, and `proof` to prevent
+/// unbounded input sizes in all FFI bridges. Limits are defined by
+/// [`MAX_ATTESTATION_PLATFORM_LEN`], [`MAX_ATTESTATION_HANDLE_LEN`], and
+/// [`MAX_ATTESTATION_PROOF_LEN`].
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if any field is empty or exceeds its limit.
+pub fn validate_attestation_fields(
+    platform: &str,
+    handle: &str,
+    proof: &str,
+) -> Result<(), ValidationError> {
+    validate_non_empty(platform, "platform", MAX_ATTESTATION_PLATFORM_LEN)?;
+    reject_control_chars(platform, "platform")?;
+    validate_non_empty(handle, "handle", MAX_ATTESTATION_HANDLE_LEN)?;
+    reject_control_chars(handle, "handle")?;
+    validate_non_empty(proof, "proof", MAX_ATTESTATION_PROOF_LEN)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

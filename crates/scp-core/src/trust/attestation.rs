@@ -316,10 +316,19 @@ const fn default_mutual_endorsement_penalty() -> f64 {
 impl ThresholdRequirement {
     /// Creates a new `ThresholdRequirement` with default penalty values.
     ///
-    /// This constructor is `const` for use in static/const contexts. The caller
-    /// is responsible for passing valid values (finite f64, `required_count <=
-    /// total_attestors`, `independence_threshold` in \[0.0, 1.0\]). For runtime
-    /// construction with validation, use [`ThresholdRequirement::try_new`].
+    /// # Safety (logical)
+    ///
+    /// **This constructor performs NO validation.** It is `const` for use in
+    /// static/const contexts (e.g., compile-time policy definitions). The caller
+    /// MUST ensure:
+    ///
+    /// - `required_count <= total_attestors`
+    /// - `independence_threshold` is in \[0.0, 1.0\] and finite
+    /// - All f64 penalty fields (using defaults here) are finite and non-negative
+    ///
+    /// Violating these invariants will cause incorrect threshold evaluation at
+    /// runtime. For runtime construction with validation, use
+    /// [`ThresholdRequirement::try_new`] instead.
     #[must_use]
     pub const fn new(
         required_count: u32,
@@ -339,9 +348,12 @@ impl ThresholdRequirement {
     /// Creates a new `ThresholdRequirement` with explicit penalty values.
     ///
     /// Like [`ThresholdRequirement::new`], this is `const` and does not
-    /// validate. For runtime construction with validation, construct via
-    /// this method and then call [`ThresholdRequirement::validate`], or use
+    /// validate. For runtime construction with validation, use
     /// [`ThresholdRequirement::try_new_with_penalties`].
+    ///
+    /// Prefer [`ThresholdRequirement::new`] + [`ThresholdRequirement::try_new`]
+    /// when default penalties suffice. This constructor is for advanced use
+    /// cases that need custom penalty tuning.
     #[must_use]
     pub const fn new_with_penalties(
         required_count: u32,
@@ -760,6 +772,14 @@ impl AttestationVerificationCache {
     /// Overwrites any existing entry for the same attestation ID. If the
     /// cache is at capacity and the key is new, evicts the oldest entry
     /// (by `verified_at` timestamp) before inserting.
+    ///
+    /// # Performance
+    ///
+    /// Eviction scans all entries to find the oldest (`O(n)` where `n` is
+    /// the cache size). This is acceptable for the default capacity (1024)
+    /// and typical usage patterns where eviction is infrequent. For larger
+    /// caches, consider a `BTreeMap<(u64, String), _>` indexed by
+    /// `(verified_at, id)` for `O(log n)` eviction.
     pub fn insert(
         &mut self,
         attestation_id: String,
@@ -767,6 +787,10 @@ impl AttestationVerificationCache {
         result: Result<(), TrustError>,
         now: u64,
     ) {
+        // A cache with max_capacity == 0 is effectively disabled.
+        if self.max_capacity == 0 {
+            return;
+        }
         // If this key already exists, overwriting won't increase count.
         if !self.entries.contains_key(&attestation_id) && self.entries.len() >= self.max_capacity {
             // Evict the oldest entry by verified_at.
@@ -1084,7 +1108,18 @@ pub(crate) fn canonical_attestation_bytes(
 
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.
-    let claim_bytes = attestation.claim.to_string();
+    //
+    // Serialize claim as MessagePack (named/sorted keys) for deterministic
+    // ordering. Using `serde_json::Value::to_string()` would produce JSON
+    // with non-deterministic key ordering. This matches
+    // `IdentityLinkAttestation::canonical_signing_bytes` which also uses
+    // `rmp_serde::to_vec_named`.
+    let claim_bytes = rmp_serde::to_vec_named(&attestation.claim).map_err(|err| {
+        TrustError::InvalidEventData {
+            sequence: 0,
+            reason: format!("claim serialization failed: {err}"),
+        }
+    })?;
     Ok(canonical_hash(
         "SCP-ATTESTATION-V2:",
         &[
@@ -1092,7 +1127,7 @@ pub(crate) fn canonical_attestation_bytes(
             CanonicalField::U16(super::attestation_type_tag(&attestation.attestation_type)),
             CanonicalField::VarBytes(attestation.issuer.as_bytes()),
             CanonicalField::VarBytes(attestation.subject.as_bytes()),
-            CanonicalField::VarBytes(claim_bytes.as_bytes()),
+            CanonicalField::VarBytes(&claim_bytes),
             evidence_bytes
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),

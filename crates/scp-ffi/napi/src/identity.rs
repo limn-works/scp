@@ -1366,6 +1366,10 @@ pub async fn identity_create_link_attestation(
     use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
+    // Validate attestation input field sizes.
+    scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof)
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     let method: VerificationMethod = verification_method.parse().map_err(|e: String| {
         NapiError::from(ScpNapiError::Identity {
             message: e,

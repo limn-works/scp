@@ -2172,7 +2172,7 @@ mod tests {
             platform_id: None,
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: crate::attestation::ScpIdentityLinkService::STATUS_ACTIVE.to_owned(),
+            revocation_status: crate::attestation::ServiceRevocationStatus::Active,
         }
     }
 
@@ -2204,7 +2204,7 @@ mod tests {
             platform_id: None,
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: "active".to_owned(),
+            revocation_status: crate::attestation::ServiceRevocationStatus::Active,
         };
         doc.set_identity_link_attestation(&att1).unwrap();
 
@@ -2215,7 +2215,7 @@ mod tests {
             platform_id: Some("9999".to_owned()),
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_001,
-            revocation_status: "active".to_owned(),
+            revocation_status: crate::attestation::ServiceRevocationStatus::Active,
         };
         doc.set_identity_link_attestation(&att2).unwrap();
 
@@ -2239,7 +2239,7 @@ mod tests {
             platform_id: None,
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: "active".to_owned(),
+            revocation_status: crate::attestation::ServiceRevocationStatus::Active,
         };
 
         doc.set_identity_link_attestation(&att1).unwrap();
@@ -2323,7 +2323,7 @@ mod tests {
             platform_id: Some("oidc-sub-abc".to_owned()),
             verification_method: "#active".to_owned(),
             verified_at: 1_700_000_000,
-            revocation_status: "active".to_owned(),
+            revocation_status: crate::attestation::ServiceRevocationStatus::Active,
         };
         doc.set_identity_link_attestation(&att).unwrap();
 

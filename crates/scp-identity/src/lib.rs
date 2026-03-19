@@ -44,7 +44,8 @@ pub mod resolver;
 
 pub use attestation::{
     AttestationPlatform, IdentityLinkPlatform, KeyCustodyModel, Platform, PlatformAttestation,
-    ScpIdentityLinkService, ScpKeyCustodyAttestation, UnknownPlatformError,
+    ScpIdentityLinkService, ScpKeyCustodyAttestation, ServiceRevocationStatus,
+    UnknownPlatformError,
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{

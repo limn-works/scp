@@ -25,6 +25,11 @@ import works.limn.scp.bridge.CoroutineBridge
  *
  * All methods are blocking JNA calls into Rust and must be dispatched
  * on [kotlinx.coroutines.Dispatchers.IO].
+ *
+ * **Handle type convention:** All `identityHandle` parameters use [Long]
+ * (not [Int]). This is the correct UniFFI/JNA handle type — UniFFI
+ * generates Rust `Arc<T>` handles as 64-bit pointers passed through JNA
+ * as `long`/[Long]. Using [Int] would truncate on 64-bit platforms.
  */
 interface IdentityAdvancedBindings {
     /**

@@ -164,7 +164,7 @@ fn make_signed_attestation(
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
     use scp_core::trust::attestation_type_tag;
 
-    let claim_str = att.claim.to_string();
+    let claim_bytes = rmp_serde::to_vec_named(&att.claim).unwrap();
     let evidence_bytes = att
         .evidence
         .as_ref()
@@ -179,7 +179,7 @@ fn make_signed_attestation(
             CanonicalField::U16(att_type_tag),
             CanonicalField::VarBytes(att.issuer.as_bytes()),
             CanonicalField::VarBytes(att.subject.as_bytes()),
-            CanonicalField::VarBytes(claim_str.as_bytes()),
+            CanonicalField::VarBytes(&claim_bytes),
             evidence_bytes
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
