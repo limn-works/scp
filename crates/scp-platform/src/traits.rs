@@ -385,6 +385,25 @@ pub trait KeyCustody: Send + Sync {
         pseudonym_epoch: u64,
     ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
 
+    /// Performs X25519 key agreement using an Ed25519 key via birational conversion.
+    ///
+    /// Converts the Ed25519 key to X25519 internally (`SHA-512(seed)[0..32]` → clamp → scalar),
+    /// then performs X25519 DH with the peer's X25519 public key. The private key never
+    /// leaves the custody boundary.
+    ///
+    /// Used for ECIES decryption of invitation bundles (spec §5.12.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an X25519 key
+    /// (use [`dh_agree`](Self::dh_agree) for X25519 keys directly).
+    fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
+
     /// Returns the custody type for a given key handle.
     ///
     /// This is a synchronous query against local state — no I/O is required.

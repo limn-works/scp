@@ -54,6 +54,7 @@ serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = "3"
 tls_codec = "0.4"
+x25519-dalek = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 axum = { workspace = true, features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
@@ -167,6 +168,10 @@ path = "tests/integration/sdk_wrapper.rs"
 [[test]]
 name = "sdk_usability"
 path = "tests/integration/sdk_usability.rs"
+
+[[test]]
+name = "welcome_delivery"
+path = "tests/integration/welcome_delivery.rs"
 
 [lints]
 workspace = true

@@ -166,6 +166,18 @@ struct ContextCryptoState {
     member_wrapping_keys: HashMap<String, [u8; 32]>,
 }
 
+/// State retained for a pending Welcome-based join operation.
+///
+/// When [`MlsCryptoProvider::prepare_key_package_for_join`] generates a key
+/// package, the signer and provider are retained here so that a subsequent
+/// [`MlsCryptoProvider::join_from_welcome`] call can reconstruct the group.
+struct PendingJoinState {
+    /// The signing key pair for the generated key package.
+    signer: SignatureKeyPair,
+    /// The MLS provider holding the key package's private state.
+    provider: super::storage::InMemoryMlsProvider,
+}
+
 /// Production [`ContextCryptoProvider`] backed by `OpenMLS`.
 ///
 /// Manages per-context MLS groups and sender keys. Thread-safe via internal
@@ -198,6 +210,10 @@ pub struct MlsCryptoProvider {
     /// Used to open HPKE-sealed sender key responses. Wrapped in
     /// [`Zeroizing`] so key material is zeroed on drop.
     wrapping_secret_key: Mutex<Zeroizing<[u8; 32]>>,
+    /// Pending key package state for Welcome-based joins (§5.12.3).
+    /// Each `prepare_key_package_for_join` call pushes one entry;
+    /// `join_from_welcome` pops the most recent.
+    pending_joins: Mutex<Vec<PendingJoinState>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -216,6 +232,7 @@ impl MlsCryptoProvider {
             broadcast_keys: Mutex::new(HashMap::new()),
             wrapping_public_key: Mutex::new(wrapping_public_key),
             wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
+            pending_joins: Mutex::new(Vec::new()),
         }
     }
 
@@ -415,7 +432,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         member_did: &str,
         key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
+    ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
+        use tls_codec::Serialize as TlsSerializeTrait;
+
         let bytes = key_package_bytes.ok_or_else(|| {
             ContextError::CryptoFailed(
                 "production MlsCryptoProvider requires MLS key package bytes for add_member"
@@ -450,13 +469,28 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
         let member_did_owned = member_did.to_owned();
         self.with_context(context_id, |state| {
-            let _result = group::add_member(&mut state.mls_group, kp_in)
+            let result = group::add_member(&mut state.mls_group, kp_in)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+            // TLS-serialize Welcome and Commit for cross-process delivery.
+            let welcome_bytes = result
+                .welcome
+                .tls_serialize_detached()
+                .map_err(|e| ContextError::CryptoFailed(format!("serializing welcome: {e}")))?;
+            let commit_bytes = result
+                .commit
+                .tls_serialize_detached()
+                .map_err(|e| ContextError::CryptoFailed(format!("serializing commit: {e}")))?;
+
             // Store the member's wrapping key if present.
             if let Some(wk) = wrapping_key {
                 state.member_wrapping_keys.insert(member_did_owned, wk);
             }
-            Ok(())
+
+            Ok(crate::context::builder::AddMemberOutput {
+                welcome_bytes,
+                commit_bytes,
+            })
         })
     }
 
@@ -1087,6 +1121,81 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
         contexts.insert(*context_id, crypto_state);
+
+        Ok(())
+    }
+
+    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+        use tls_codec::Serialize as TlsSerializeTrait;
+
+        let credential = self
+            .make_credential()
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let wrapping_pk = self
+            .wrapping_public_key
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+
+        let (kp_bundle, signer, provider) =
+            super::group::generate_key_package_with_wrapping_key(&credential, Some(&*wrapping_pk))
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let kp_bytes = kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|e| ContextError::CryptoFailed(format!("serializing key package: {e}")))?;
+
+        let mut pending = self
+            .pending_joins
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        pending.push(PendingJoinState { signer, provider });
+
+        Ok(kp_bytes)
+    }
+
+    fn join_from_welcome(
+        &self,
+        context_id: &[u8; 32],
+        welcome_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        let entry = {
+            let mut pending = self
+                .pending_joins
+                .lock()
+                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+            if pending.is_empty() {
+                return Err(ContextError::CryptoFailed(
+                    "no pending key package for Welcome".into(),
+                ));
+            }
+            let idx = pending.len() - 1;
+            pending.remove(idx) // Use most recent
+        };
+
+        let group =
+            super::group::join_group_from_bytes(welcome_bytes, entry.provider, entry.signer)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let sender_key = generate_sender_key();
+
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        contexts.insert(
+            *context_id,
+            ContextCryptoState {
+                mls_group: group,
+                sender_key,
+                sender_key_store: SenderKeyStore::new(),
+                sender_key_epoch: 0,
+                pending_distributions: Vec::new(),
+                nonce_dedup: NonceDedup::new(),
+                member_wrapping_keys: HashMap::new(),
+            },
+        );
 
         Ok(())
     }

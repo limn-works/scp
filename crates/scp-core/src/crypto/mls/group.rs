@@ -677,6 +677,63 @@ pub fn join_group(
     })
 }
 
+/// Joins a group from TLS-serialized Welcome bytes.
+///
+/// This is the cross-process variant of [`join_group`]: the Welcome message
+/// arrives as raw bytes (e.g., from a relay or FFI boundary) rather than as
+/// an `MlsMessageOut` reference.
+///
+/// # Arguments
+///
+/// * `welcome_bytes` - TLS-serialized MLS Welcome message.
+/// * `provider` - The MLS provider holding the key package's private state
+///   (from [`generate_key_package`]).
+/// * `signer` - The new member's signing key pair (from [`generate_key_package`]).
+///
+/// # Returns
+///
+/// An [`ScpMlsGroup`] wrapping the joined group.
+///
+/// # Errors
+///
+/// Returns [`MlsError::WelcomeProcessingFailed`] if the Welcome message
+/// cannot be deserialized or processed.
+pub fn join_group_from_bytes(
+    welcome_bytes: &[u8],
+    provider: InMemoryMlsProvider,
+    signer: SignatureKeyPair,
+) -> Result<ScpMlsGroup, MlsError> {
+    let welcome_in = MlsMessageIn::tls_deserialize(&mut &*welcome_bytes)
+        .map_err(|e| MlsError::WelcomeProcessingFailed(format!("deserializing welcome: {e}")))?;
+
+    // Extract the Welcome from the MlsMessageIn body.
+    let welcome_body = welcome_in.extract();
+    let MlsMessageBodyIn::Welcome(welcome) = welcome_body else {
+        return Err(MlsError::WelcomeProcessingFailed(
+            "message is not a Welcome".to_string(),
+        ));
+    };
+
+    // max_past_epochs(2) must match create_group's MlsGroupCreateConfig to
+    // ensure joining members also retain past epoch message secrets during
+    // the 30-second grace window. See create_group() and issue #324.
+    let join_config = MlsGroupJoinConfig::builder().max_past_epochs(2).build();
+
+    let staged_welcome = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
+        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
+
+    let group = staged_welcome
+        .into_group(&provider)
+        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
+
+    Ok(ScpMlsGroup {
+        group: Some(group),
+        provider,
+        signer: EagerDropSigner::new(signer),
+        destroyed: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

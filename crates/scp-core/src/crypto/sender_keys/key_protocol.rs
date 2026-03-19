@@ -67,7 +67,7 @@ pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
 // ---------------------------------------------------------------------------
 
 /// AES-128-GCM nonce size in bytes.
-const HPKE_NONCE_SIZE: usize = 12;
+pub(crate) const HPKE_NONCE_SIZE: usize = 12;
 
 /// HKDF info domain separator for sender key HPKE encryption (§9.16.2).
 /// The full info string is `"scp-sender-key-v1" || context_id || sender_did || epoch_BE`.
@@ -1209,7 +1209,7 @@ pub fn hpke_seal_sender_key(
 ///
 /// The returned key is wrapped in [`Zeroizing`] so the derived key material
 /// is zeroed on drop (defense-in-depth, see issue #82).
-fn hkdf_derive_key(
+pub(crate) fn hkdf_derive_key(
     shared_secret: &[u8],
     info: &[u8],
 ) -> Result<Zeroizing<[u8; 16]>, SenderKeyError> {
@@ -1221,7 +1221,7 @@ fn hkdf_derive_key(
 }
 
 /// Encrypts `plaintext` with AES-128-GCM. Returns `nonce || ciphertext || tag`.
-fn aes128gcm_encrypt(
+pub(crate) fn aes128gcm_encrypt(
     key: &[u8; 16],
     plaintext: &[u8],
     aad: &[u8],
@@ -1250,7 +1250,11 @@ fn aes128gcm_encrypt(
 }
 
 /// Decrypts AES-128-GCM ciphertext of the form `nonce || ciphertext || tag`.
-fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SenderKeyError> {
+pub(crate) fn aes128gcm_decrypt(
+    key: &[u8; 16],
+    sealed: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SenderKeyError> {
     if sealed.len() < HPKE_NONCE_SIZE {
         return Err(SenderKeyError::HpkeDecryptionFailed(format!(
             "sealed data too short: {} bytes, minimum {}",

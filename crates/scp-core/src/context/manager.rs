@@ -2669,7 +2669,8 @@ impl ContextManager {
         // provider calls since they are idempotent or externally consistent.
         let kp_bytes = key_package.mls_key_package_bytes.as_deref();
         self.crypto.validate_key_package(&member_did, kp_bytes)?;
-        self.crypto
+        let add_output = self
+            .crypto
             .add_member(&context_id_bytes, &member_did, kp_bytes)?;
         self.crypto
             .distribute_sender_key(&context_id_bytes, &member_did)?;
@@ -2739,6 +2740,17 @@ impl ContextManager {
                 member_did: member_did.clone(),
                 role_name: "member".into(),
             });
+
+            // Emit WelcomeGenerated event so the application layer can
+            // ECIES-encrypt and deliver the Welcome to the joiner's
+            // personal routing ID (spec §5.12.3, issue #1311).
+            if !add_output.welcome_bytes.is_empty() {
+                ctx.receive_buffer.push(ContextEvent::WelcomeGenerated {
+                    member_did: member_did.clone(),
+                    welcome_bytes: add_output.welcome_bytes,
+                    commit_bytes: add_output.commit_bytes,
+                });
+            }
         }
         // Lock dropped before event log append.
 
@@ -5165,7 +5177,8 @@ impl ContextManager {
 
             // Crypto: add to MLS group under lock to prevent partial-failure
             // window (phantom MLS member if state mutation fails).
-            self.crypto
+            let add_output = self
+                .crypto
                 .add_member(&context_id_bytes, did, None)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -5183,6 +5196,17 @@ impl ContextManager {
                 member_did: did.clone(),
                 role_name: role.to_owned(),
             });
+
+            // Emit WelcomeGenerated event so the application layer can
+            // ECIES-encrypt and deliver the Welcome to the joiner's
+            // personal routing ID (spec §5.12.3, issue #1311).
+            if !add_output.welcome_bytes.is_empty() {
+                ctx.receive_buffer.push(ContextEvent::WelcomeGenerated {
+                    member_did: did.clone(),
+                    welcome_bytes: add_output.welcome_bytes,
+                    commit_bytes: add_output.commit_bytes,
+                });
+            }
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -8532,12 +8556,12 @@ mod tests {
             _context_id: &[u8; 32],
             member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<(), ContextError> {
+        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
                 .push(member_did.to_owned());
-            Ok(())
+            Ok(crate::context::builder::AddMemberOutput::default())
         }
 
         fn remove_member(

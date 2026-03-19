@@ -492,6 +492,18 @@ pub enum ContextEvent {
         /// known feature flags, so callers should pass `vec![]`.
         unsupported_features: Vec<String>,
     },
+    /// An MLS Welcome was generated for a newly added member.
+    ///
+    /// The application layer must ECIES-encrypt and deliver it to the
+    /// joiner's personal routing ID (spec §5.12.3, issue #1311).
+    WelcomeGenerated {
+        /// DID of the member being invited.
+        member_did: DID,
+        /// TLS-serialized MLS Welcome message.
+        welcome_bytes: Vec<u8>,
+        /// TLS-serialized MLS Commit message for existing members.
+        commit_bytes: Vec<u8>,
+    },
     /// Warning: the receive buffer overflowed and events were dropped.
     ///
     /// Emitted when the buffer is full and the oldest event is dropped.

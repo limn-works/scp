@@ -558,8 +558,8 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         _context_id: &[u8; 32],
         _member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
+    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
+        Ok(scp_core::context::AddMemberOutput::default())
     }
 
     fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {

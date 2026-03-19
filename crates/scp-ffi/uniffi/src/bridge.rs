@@ -339,6 +339,29 @@ impl KeyCustody for CallbackKeyCustody {
         })
     }
 
+    async fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> Result<SharedSecret, PlatformError> {
+        // The callback protocol does not expose ed25519→x25519 conversion.
+        // Delegates to dh_agree since the callback provider manages key types internally.
+        let shared = self
+            .provider
+            .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
+            .await
+            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+        if shared.len() != 32 {
+            return Err(PlatformError::CustodyError(format!(
+                "ed25519_to_x25519_agree returned {} bytes, expected 32",
+                shared.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&shared);
+        Ok(SharedSecret::new(arr))
+    }
+
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         let type_str = self.provider.custody_type(key.id().to_string());
         match type_str.as_str() {

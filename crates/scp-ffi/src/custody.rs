@@ -116,6 +116,24 @@ impl KeyCustody for FfiKeyCustody {
         }
     }
 
+    async fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> Result<SharedSecret, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => {
+                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
+            Self::File(kc) => {
+                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
+        }
+    }
+
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         match self {
             #[cfg(feature = "allow_in_memory_custody")]
