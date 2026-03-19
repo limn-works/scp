@@ -20,30 +20,36 @@ pub enum EnvelopeSealError {
     OpenFailed(String),
 }
 
-/// Derives a personal invitation routing ID for a DID.
-/// `SHA-256(did_bytes || b"scp-invitations")` per spec §5.12.3.
-#[must_use]
-pub fn derive_invitation_routing_id(did: &str) -> [u8; 32] {
+/// Derives a routing ID by hashing a DID with a domain separator.
+/// Format: `SHA-256(len(did) || did || domain)` where `len` is a 4-byte
+/// big-endian length prefix, preventing boundary-shift attacks where a DID
+/// suffix could be confused with the domain prefix.
+fn derive_routing_id(did: &str, domain: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(did.as_bytes());
-    hasher.update(b"scp-invitations");
+    let did_bytes = did.as_bytes();
+    #[allow(clippy::cast_possible_truncation)]
+    let did_len = did_bytes.len() as u32;
+    hasher.update(did_len.to_be_bytes());
+    hasher.update(did_bytes);
+    hasher.update(domain);
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&result);
     bytes
 }
 
+/// Derives a personal invitation routing ID for a DID.
+/// `SHA-256(len(did) || did || b"scp-invitations")` per spec §5.12.3.
+#[must_use]
+pub fn derive_invitation_routing_id(did: &str) -> [u8; 32] {
+    derive_routing_id(did, b"scp-invitations")
+}
+
 /// Derives a key package routing ID for a DID.
-/// `SHA-256(did_bytes || b"scp-key-packages")` per spec §9.7.4.
+/// `SHA-256(len(did) || did || b"scp-key-packages")` per spec §9.7.4.
 #[must_use]
 pub fn derive_key_package_routing_id(did: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(did.as_bytes());
-    hasher.update(b"scp-key-packages");
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    bytes
+    derive_routing_id(did, b"scp-key-packages")
 }
 
 /// Converts an Ed25519 public key to X25519 via birational mapping (RFC 7748).
@@ -77,6 +83,28 @@ fn build_invitation_info(context_id: &str, creator_did: &str) -> Vec<u8> {
     info
 }
 
+/// Builds the AES-GCM AAD for invitation ECIES (distinct from HKDF info).
+/// Format: `"scp-invitation-aad-v1" || len(context_id) || context_id || len(creator_did) || creator_did || ephemeral_pubkey[32]`
+///
+/// Including the ephemeral public key in the AAD binds the ciphertext to
+/// the specific DH exchange, preventing ephemeral key substitution attacks.
+fn build_invitation_aad(context_id: &str, creator_did: &str, ephemeral_pub: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(b"scp-invitation-aad-v1");
+    let ctx_bytes = context_id.as_bytes();
+    #[allow(clippy::cast_possible_truncation)]
+    let ctx_len = ctx_bytes.len() as u32;
+    aad.extend_from_slice(&ctx_len.to_be_bytes());
+    aad.extend_from_slice(ctx_bytes);
+    let did_bytes = creator_did.as_bytes();
+    #[allow(clippy::cast_possible_truncation)]
+    let did_len = did_bytes.len() as u32;
+    aad.extend_from_slice(&did_len.to_be_bytes());
+    aad.extend_from_slice(did_bytes);
+    aad.extend_from_slice(ephemeral_pub);
+    aad
+}
+
 /// ECIES-seals an arbitrary-length payload to a recipient's X25519 public key.
 ///
 /// Returns `(sealed_bytes, ephemeral_pubkey)` where `sealed_bytes` = `nonce || ciphertext || tag`.
@@ -93,13 +121,13 @@ pub fn ecies_seal(
 ) -> Result<(Vec<u8>, [u8; 32]), EnvelopeSealError> {
     let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = X25519Pub::from(&ephemeral_secret);
+    let ephemeral_pub_bytes = ephemeral_public.to_bytes();
 
     let recipient_key = X25519Pub::from(*recipient_x25519_pub);
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_key);
 
     let info = build_invitation_info(context_id, creator_did);
-    // AAD uses the same structure as info for domain binding.
-    let aad = build_invitation_info(context_id, creator_did);
+    let aad = build_invitation_aad(context_id, creator_did, &ephemeral_pub_bytes);
 
     let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)
         .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
@@ -107,7 +135,7 @@ pub fn ecies_seal(
     let sealed = aes128gcm_encrypt(&aes_key, plaintext, &aad)
         .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
 
-    Ok((sealed, ephemeral_public.to_bytes()))
+    Ok((sealed, ephemeral_pub_bytes))
 }
 
 /// ECIES-opens a sealed payload using a local X25519 secret key.
@@ -130,7 +158,7 @@ pub fn ecies_open(
     let shared_secret = local_secret.diffie_hellman(&ephemeral_key);
 
     let info = build_invitation_info(context_id, creator_did);
-    let aad = build_invitation_info(context_id, creator_did);
+    let aad = build_invitation_aad(context_id, creator_did, ephemeral_pub);
 
     let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))?;

@@ -1128,6 +1128,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
+        const MAX_PENDING_JOINS: usize = 100;
+
         let credential = self
             .make_credential()
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -1150,6 +1152,13 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .pending_joins
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+
+        if pending.len() >= MAX_PENDING_JOINS {
+            return Err(ContextError::CryptoFailed(
+                "too many pending key packages (max 100); call join_from_welcome to consume".into(),
+            ));
+        }
+
         pending.push(PendingJoinState { signer, provider });
 
         Ok(kp_bytes)
@@ -1165,13 +1174,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 .pending_joins
                 .lock()
                 .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-            if pending.is_empty() {
-                return Err(ContextError::CryptoFailed(
-                    "no pending key package for Welcome".into(),
-                ));
-            }
-            let idx = pending.len() - 1;
-            pending.remove(idx) // Use most recent
+            pending.pop().ok_or_else(|| {
+                ContextError::CryptoFailed("no pending key package for Welcome".into())
+            })?
         };
 
         let group =
@@ -1184,6 +1189,13 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .contexts
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+
+        // Destroy any existing MLS group state for this context to ensure
+        // proper key material cleanup (defense-in-depth).
+        if let Some(mut old_state) = contexts.remove(context_id) {
+            let _ = group::destroy_group(&mut old_state.mls_group);
+        }
+
         contexts.insert(
             *context_id,
             ContextCryptoState {

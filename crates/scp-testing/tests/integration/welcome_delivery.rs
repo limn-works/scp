@@ -15,8 +15,7 @@
 
 use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::crypto::envelope_seal::{
-    derive_invitation_routing_id, derive_key_package_routing_id, ecies_open, ecies_seal,
-    ed25519_pubkey_to_x25519,
+    derive_invitation_routing_id, derive_key_package_routing_id,
 };
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 
@@ -160,45 +159,7 @@ fn join_from_welcome_without_prepare_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. ecies_seal_for_welcome_delivery
-// ---------------------------------------------------------------------------
-
-/// Verifies the ECIES envelope that wraps Welcome messages for relay delivery.
-/// In production, Alice seals the Welcome to Bob's Ed25519 public key (via
-/// birational X25519 conversion), sends it to Bob's personal routing ID,
-/// and Bob opens it.
-#[test]
-fn ecies_seal_for_welcome_delivery() {
-    let bob_signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let bob_verifying = bob_signing.verifying_key();
-    let context_id = "ctx-welcome-test";
-    let creator_did = "did:dht:z6MkAlice";
-
-    // Alice converts Bob's Ed25519 pub to X25519 and seals.
-    let bob_x25519_pub = ed25519_pubkey_to_x25519(&bob_verifying.to_bytes()).unwrap();
-
-    let welcome_payload = b"TLS-serialized Welcome message bytes here";
-    let (sealed, eph_pub) =
-        ecies_seal(welcome_payload, &bob_x25519_pub, context_id, creator_did).unwrap();
-
-    // Bob converts his Ed25519 secret to X25519 and opens.
-    let bob_scalar_bytes = bob_signing.to_scalar_bytes();
-    let bob_x25519_secret = x25519_dalek::StaticSecret::from(bob_scalar_bytes);
-
-    let recovered = ecies_open(
-        &sealed,
-        &eph_pub,
-        &bob_x25519_secret.to_bytes(),
-        context_id,
-        creator_did,
-    )
-    .unwrap();
-
-    assert_eq!(recovered, welcome_payload);
-}
-
-// ---------------------------------------------------------------------------
-// 5. routing_id_determinism
+// 4. routing_id_determinism
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -231,7 +192,7 @@ fn routing_id_determinism() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. multiple_key_packages — prepare multiple, use most recent
+// 5. multiple_key_packages — prepare multiple, use most recent
 // ---------------------------------------------------------------------------
 
 #[test]

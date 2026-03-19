@@ -702,12 +702,10 @@ impl KeyCustody for FileKeyCustody {
         let peer = *peer_x25519_public;
         async move {
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
-            let scalar_bytes = signing_key.to_scalar_bytes();
-            let x25519_secret = StaticSecret::from(scalar_bytes);
-            let peer_key = X25519PublicKey::from(peer);
-            let shared = x25519_secret.diffie_hellman(&peer_key);
-            let shared_bytes = Zeroizing::new(shared.to_bytes());
-            Ok(SharedSecret::new(*shared_bytes))
+            Ok(crate::traits::x25519_agree_from_ed25519(
+                &signing_key,
+                &peer,
+            ))
         }
     }
 

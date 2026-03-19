@@ -31,7 +31,7 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"

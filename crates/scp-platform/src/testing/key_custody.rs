@@ -507,14 +507,10 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // Convert Ed25519 seed → X25519 scalar via to_scalar_bytes().
-            let scalar_bytes = signing_key.to_scalar_bytes();
-            let x25519_secret = StaticSecret::from(scalar_bytes);
-            let peer_key = X25519PublicKey::from(peer);
-            let shared = x25519_secret.diffie_hellman(&peer_key);
+            // Convert Ed25519 → X25519 via birational conversion and perform DH.
+            let result = crate::traits::x25519_agree_from_ed25519(signing_key, &peer);
             drop(store);
-            let shared_bytes = Zeroizing::new(shared.to_bytes());
-            Ok(SharedSecret::new(*shared_bytes))
+            Ok(result)
         }
     }
 

@@ -80,6 +80,29 @@ const MAX_THRESHOLD_SIGNERS: usize = 64;
 const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 
 // ---------------------------------------------------------------------------
+// Welcome event helper
+// ---------------------------------------------------------------------------
+
+/// Pushes a [`ContextEvent::WelcomeGenerated`] event to the receive buffer
+/// if the `AddMemberOutput` contains a non-empty Welcome message.
+///
+/// Used by both `add_member_to_context` and `execute_add_member` to avoid
+/// duplicating the emission logic.
+fn push_welcome_event(
+    buffer: &mut ReceiveBuffer,
+    member_did: &DID,
+    add_output: crate::context::builder::AddMemberOutput,
+) {
+    if !add_output.welcome_bytes.is_empty() {
+        buffer.push(ContextEvent::WelcomeGenerated {
+            member_did: member_did.clone(),
+            welcome_bytes: add_output.welcome_bytes,
+            commit_bytes: add_output.commit_bytes,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
 // ---------------------------------------------------------------------------
 
@@ -2741,16 +2764,8 @@ impl ContextManager {
                 role_name: "member".into(),
             });
 
-            // Emit WelcomeGenerated event so the application layer can
-            // ECIES-encrypt and deliver the Welcome to the joiner's
-            // personal routing ID (spec §5.12.3, issue #1311).
-            if !add_output.welcome_bytes.is_empty() {
-                ctx.receive_buffer.push(ContextEvent::WelcomeGenerated {
-                    member_did: member_did.clone(),
-                    welcome_bytes: add_output.welcome_bytes,
-                    commit_bytes: add_output.commit_bytes,
-                });
-            }
+            // Emit WelcomeGenerated event if the add produced a Welcome message.
+            push_welcome_event(&mut ctx.receive_buffer, &member_did, add_output);
         }
         // Lock dropped before event log append.
 
@@ -5197,16 +5212,8 @@ impl ContextManager {
                 role_name: role.to_owned(),
             });
 
-            // Emit WelcomeGenerated event so the application layer can
-            // ECIES-encrypt and deliver the Welcome to the joiner's
-            // personal routing ID (spec §5.12.3, issue #1311).
-            if !add_output.welcome_bytes.is_empty() {
-                ctx.receive_buffer.push(ContextEvent::WelcomeGenerated {
-                    member_did: did.clone(),
-                    welcome_bytes: add_output.welcome_bytes,
-                    commit_bytes: add_output.commit_bytes,
-                });
-            }
+            // Emit WelcomeGenerated event if the add produced a Welcome message.
+            push_welcome_event(&mut ctx.receive_buffer, did, add_output);
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
