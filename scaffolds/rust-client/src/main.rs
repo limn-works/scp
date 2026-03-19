@@ -14,16 +14,16 @@
 use std::sync::Arc;
 
 use scp_core::context::builder::{
-    ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    AddMemberOutput, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::ContextManager;
 use scp_core::context::{
     Capability, ContextCreationError, ContextError, ContextMode, ContextParams,
 };
+use scp_identity::cache::DidCache;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
-use scp_identity::cache::DidCache;
 use scp_identity::{DidMethod, DID};
 use scp_platform::testing::InMemoryKeyCustody;
 
@@ -90,31 +90,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct MockCrypto;
 impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> { Ok(()) }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn validate_key_package(&self, _owner_did: &str, _key_package_bytes: Option<&[u8]>) -> Result<(), ContextError> { Ok(()) }
-    fn encrypt_message(&self, _id: &[u8; 32], _sender_did: &str, payload: &[u8], _epoch: u64, _sequence: u64) -> Result<Vec<u8>, ContextError> { Ok(payload.to_vec()) }
-    fn add_member(&self, _id: &[u8; 32], _member_did: &str, _key_package_bytes: Option<&[u8]>) -> Result<(), ContextError> { Ok(()) }
-    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
-    fn remove_member_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> { Ok(()) }
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn validate_key_package(
+        &self,
+        _owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn encrypt_message(
+        &self,
+        _id: &[u8; 32],
+        _sender_did: &str,
+        payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        Ok(payload.to_vec())
+    }
+    fn add_member(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<AddMemberOutput, ContextError> {
+        Ok(AddMemberOutput::default())
+    }
+    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn remove_member_sender_key(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
 }
 
 struct MockTransport;
 impl ContextTransportProvider for MockTransport {
-    fn is_connected(&self) -> bool { true }
-    fn publish_context(&self, _id: &[u8; 32], _params: &ContextParams) -> Result<(), ContextCreationError> { Ok(()) }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> { Ok(()) }
+    fn is_connected(&self) -> bool {
+        true
+    }
+    fn publish_context(
+        &self,
+        _id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+        Ok(())
+    }
 }
 
 struct MockEventLog;
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> { Ok(()) }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> { Ok(()) }
+    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
 }
