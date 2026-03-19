@@ -86,16 +86,21 @@ pub trait Clock: Send + Sync + 'static {
 pub struct SystemClock;
 
 impl Clock for SystemClock {
+    #[allow(clippy::expect_used)]
     fn now_secs(&self) -> u64 {
-        // In production the system clock should always be available. If it
-        // somehow is not (clock before epoch), fall back to 0 rather than
-        // panicking -- callers that care about correctness already validate
-        // timestamps downstream.
-        scp_primitives::time::now_secs().unwrap_or(0)
+        // The Clock trait returns u64 (not Result), so we cannot propagate the
+        // error. A system clock before the Unix epoch is an unrecoverable
+        // environment failure — panicking is the correct behaviour here, as
+        // silently returning 0 would bypass UCAN expiry and nonce freshness
+        // checks.
+        scp_primitives::time::now_secs().expect("system clock is unavailable or before Unix epoch")
     }
 
+    #[allow(clippy::expect_used)]
     fn now_millis(&self) -> u64 {
-        scp_primitives::time::now_millis().unwrap_or(0)
+        // Same rationale as now_secs — returning 0 would bypass security checks.
+        scp_primitives::time::now_millis()
+            .expect("system clock is unavailable or before Unix epoch")
     }
 
     fn register_timer(&self, _at_millis: u64, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {

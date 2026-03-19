@@ -3063,7 +3063,10 @@ pub async fn context_close(
             // context's memory scope and initiate the appropriate destruction
             // path via CloseOrchestrator (#365).
             let memory_scope = core_handle.params().memory_scope;
-            let now = scp_core::time::now_secs().unwrap_or(0);
+            let now = scp_core::time::now_secs().map_err(|_| ScpError::Context {
+                msg: "system clock is unavailable or before Unix epoch".to_owned(),
+                code: "SCP-CTX-2017".to_owned(),
+            })?;
 
             let crypto_provider = crate::runtime::context_manager_crypto();
             let orchestrator = scp_core::context::close::CloseOrchestrator::new(crypto_provider);
@@ -6485,6 +6488,13 @@ pub async fn event_log_query(
                 .and_then(serde_json::Value::as_u64)
                 .map(|v| v as usize);
 
+            // Pre-compute timestamp for the fallback summary event outside the
+            // closure so we can propagate clock errors properly.
+            let fallback_now = scp_core::time::now_secs().map_err(|_| ScpError::Context {
+                msg: "system clock is unavailable or before Unix epoch".to_owned(),
+                code: "SCP-CTX-2024".to_owned(),
+            })?;
+
             // Query the event log from per-context UCAN state.
             let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
                 let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
@@ -6562,11 +6572,10 @@ pub async fn event_log_query(
                 }
 
                 // Fallback: return a summary event with Merkle root metadata.
-                let now = scp_core::time::now_secs().unwrap_or(0);
                 let summary = Event {
                     event_type: "LogSummary".to_owned(),
                     actor_did: String::new(),
-                    timestamp: now,
+                    timestamp: fallback_now,
                     payload_json: serde_json::json!({
                         "event_count": event_count,
                         "merkle_root": merkle_root_hex,
@@ -11166,7 +11175,12 @@ pub fn bridge_register(
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
     let (bridge_id, now_secs) =
-        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform).map_err(|e| {
+            ScpError::Context {
+                msg: e.to_string(),
+                code: "SCP-CTX-2017".to_owned(),
+            }
+        })?;
     let request = scp_core::bridge::registration::BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
@@ -11338,7 +11352,12 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                 code: "SCP-CTX-2020".to_owned(),
             })?;
 
-        let results = vec![discovery_result_to_json(&result)];
+        let results = vec![
+            discovery_result_to_json(&result).map_err(|e| ScpError::Context {
+                msg: e,
+                code: "SCP-CTX-2020".to_owned(),
+            })?,
+        ];
         serde_json::to_string(&results).map_err(|e| ScpError::Context {
             msg: format!("failed to serialize discovery results: {e}"),
             code: "SCP-CTX-2021".to_owned(),
@@ -11356,8 +11375,15 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                         code: "SCP-CTX-2022".to_owned(),
                     })?;
 
-                let json_results: Vec<serde_json::Value> =
-                    results.iter().map(discovery_result_to_json).collect();
+                let json_results: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        discovery_result_to_json(r).map_err(|e| ScpError::Context {
+                            msg: e,
+                            code: "SCP-CTX-2022".to_owned(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 serde_json::to_string(&json_results).map_err(|e| ScpError::Context {
                     msg: format!("failed to serialize discovery results: {e}"),
                     code: "SCP-CTX-2023".to_owned(),
@@ -12789,7 +12815,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
@@ -12814,10 +12840,10 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
-        assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
-        assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
-        assert_eq!(json["resolution_path"]["source"], "handle_registry");
+        let json = discovery_result_to_json(&result).unwrap();
+        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
+        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");
     }
@@ -12833,7 +12859,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DirectExchange");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "context_uri");
@@ -12852,7 +12878,7 @@ mod tests {
             metadata_summary: Some("Example context".to_owned()),
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DomainVerified");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "well-known");
