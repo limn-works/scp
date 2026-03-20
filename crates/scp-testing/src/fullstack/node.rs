@@ -375,4 +375,13 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.restore_event_log(id)
     }
+    fn prune_before_checkpoint(
+        &self,
+        context_id: &[u8; 32],
+        checkpoint_event_count: u64,
+        policy: &scp_core::context::governance::PruningPolicy,
+    ) -> Option<usize> {
+        self.0
+            .prune_before_checkpoint(context_id, checkpoint_event_count, policy)
+    }
 }

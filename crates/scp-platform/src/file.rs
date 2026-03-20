@@ -490,24 +490,21 @@ impl FileKeyCustody {
         KeyHandle::new(id)
     }
 
-    /// Looks up handle metadata; returns key type and entry index.
-    async fn lookup_handle(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<(StoredKeyType, usize), PlatformError> {
-        let map = self.handle_map.lock().await;
-        map.entries
-            .get(&handle.id())
-            .copied()
-            .ok_or(PlatformError::KeyNotFound)
-    }
-
     /// Decrypts an Ed25519 signing key from the file for the given handle.
+    ///
+    /// Holds the `handle_map` lock across both the lookup and the file read to
+    /// prevent a concurrent `destroy_key` from rewriting the file between the
+    /// two operations (TOCTOU).
     async fn decrypt_ed25519_key(
         &self,
         handle: &KeyHandle,
     ) -> Result<(Zeroizing<[u8; KEY_LEN]>, SigningKey), PlatformError> {
-        let (key_type, entry_index) = self.lookup_handle(handle).await?;
+        let map = self.handle_map.lock().await;
+        let (key_type, entry_index) = map
+            .entries
+            .get(&handle.id())
+            .copied()
+            .ok_or(PlatformError::KeyNotFound)?;
         if key_type != StoredKeyType::Ed25519 {
             return Err(PlatformError::WrongKeyType {
                 expected: KeyType::Ed25519,
@@ -515,6 +512,7 @@ impl FileKeyCustody {
             });
         }
         let data = self.read_file()?;
+        drop(map);
         let key_bytes = self.decrypt_entry(&data, entry_index)?;
         let signing_key = SigningKey::from_bytes(&key_bytes);
         Ok((key_bytes, signing_key))
@@ -610,8 +608,16 @@ impl KeyCustody for FileKeyCustody {
                 }
             }
 
-            let (key_type, entry_index) = self.lookup_handle(&handle).await?;
+            // Hold handle_map lock across lookup and file read to prevent
+            // a concurrent destroy_key from rewriting the file (TOCTOU).
+            let map = self.handle_map.lock().await;
+            let (key_type, entry_index) = map
+                .entries
+                .get(&handle.id())
+                .copied()
+                .ok_or(PlatformError::KeyNotFound)?;
             let data = self.read_file()?;
+            drop(map);
             let key_bytes = self.decrypt_entry(&data, entry_index)?;
 
             match key_type {
@@ -636,6 +642,7 @@ impl KeyCustody for FileKeyCustody {
         let key_id = key.id();
         async move {
             // Remove from pseudonym keys if present.
+            // Pseudonym keys are in-memory only — no disk rewrite needed.
             {
                 let mut pseudonyms = self.pseudonym_keys.lock().await;
                 if pseudonyms.remove(&key_id).is_some() {
@@ -644,15 +651,57 @@ impl KeyCustody for FileKeyCustody {
             }
 
             let mut map = self.handle_map.lock().await;
-            if map.entries.remove(&key_id).is_none() {
+            let Some((_, removed_index)) = map.entries.remove(&key_id) else {
                 return Err(PlatformError::KeyNotFound);
+            };
+
+            // Rewrite the key file without the destroyed entry (#1469).
+            // This ensures key material is removed from disk, not just from
+            // the in-memory handle map.
+            let _lock = self
+                .file_write_lock
+                .lock()
+                .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+
+            let data = self.read_file()?;
+
+            // Reconstruct the file: copy header, skip the destroyed entry,
+            // decrement the entry count.
+            let count_offset = 1 + SALT_LEN;
+            let current_count = u32::from_le_bytes(
+                data[count_offset..count_offset + 4]
+                    .try_into()
+                    .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
+            );
+
+            let new_count = current_count.saturating_sub(1);
+            let mut new_data = Vec::with_capacity(HEADER_SIZE + (new_count as usize) * ENTRY_SIZE);
+
+            // Copy header (version + salt).
+            new_data.extend_from_slice(&data[..count_offset]);
+            // Write updated entry count.
+            new_data.extend_from_slice(&new_count.to_le_bytes());
+
+            // Copy all entries except the removed one.
+            for i in 0..current_count as usize {
+                if i == removed_index {
+                    continue;
+                }
+                let entry_offset = HEADER_SIZE + i * ENTRY_SIZE;
+                new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
+            }
+
+            atomic_write(&self.path, &new_data)?;
+
+            // Update indices in handle_map: entries after the removed index
+            // shift down by one.
+            for (_key_type, entry_index) in map.entries.values_mut() {
+                if *entry_index > removed_index {
+                    *entry_index -= 1;
+                }
             }
             drop(map);
-            // Note: We remove the handle mapping but leave the encrypted entry
-            // in the file. The entry is unreachable and encrypted. A compaction
-            // step could be added in the future but is not required for
-            // correctness or security — the key material remains encrypted and
-            // the handle is invalidated.
+
             Ok(())
         }
     }
@@ -666,7 +715,14 @@ impl KeyCustody for FileKeyCustody {
         let peer = *peer_public;
         async move {
             let handle = KeyHandle::new(key_id);
-            let (key_type, entry_index) = self.lookup_handle(&handle).await?;
+            // Hold handle_map lock across lookup and file read to prevent
+            // a concurrent destroy_key from rewriting the file (TOCTOU).
+            let map = self.handle_map.lock().await;
+            let (key_type, entry_index) = map
+                .entries
+                .get(&handle.id())
+                .copied()
+                .ok_or(PlatformError::KeyNotFound)?;
 
             if key_type != StoredKeyType::X25519 {
                 return Err(PlatformError::WrongKeyType {
@@ -676,6 +732,7 @@ impl KeyCustody for FileKeyCustody {
             }
 
             let data = self.read_file()?;
+            drop(map);
             let key_bytes = self.decrypt_entry(&data, entry_index)?;
 
             let secret = StaticSecret::from(*key_bytes);
