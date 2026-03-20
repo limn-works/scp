@@ -410,11 +410,11 @@ async fn bootstrap_config() {
     let config = BootstrapConfig::with_defaults(vec![
         BootstrapContextEntry {
             context_id: "ctx-discovery-1".to_owned(),
-            expected_creator_did: "did:dht:z6MkOp1".to_owned(),
+            expected_creator_did: DID("did:dht:z6MkOp1".to_owned()),
         },
         BootstrapContextEntry {
             context_id: "ctx-discovery-2".to_owned(),
-            expected_creator_did: "did:dht:z6MkOp2".to_owned(),
+            expected_creator_did: DID("did:dht:z6MkOp2".to_owned()),
         },
     ]);
     assert_eq!(config.default_contexts.len(), 2);
@@ -424,7 +424,7 @@ async fn bootstrap_config() {
     let mut config = config;
     config.add_custom_context(BootstrapContextEntry {
         context_id: "ctx-custom-1".to_owned(),
-        expected_creator_did: "did:dht:z6MkC1".to_owned(),
+        expected_creator_did: DID("did:dht:z6MkC1".to_owned()),
     });
     assert_eq!(config.custom_contexts.len(), 1);
 
