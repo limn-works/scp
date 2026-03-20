@@ -2580,7 +2580,20 @@ async fn identity_create_link_attestation_impl(
         let len = registry.len();
         match registry.entry(identity.did.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                occ.insert((Arc::clone(custody), core_id.active_signing_key));
+                // TOCTOU guard: if a concurrent call (e.g., with a post-rotation
+                // Identity) already stored a different key handle, do NOT
+                // overwrite it — the attestation was signed with the old key
+                // and the registry should keep the latest.
+                let (_, existing_key) = occ.get();
+                if *existing_key != active_key {
+                    return Err(ScpError::Identity {
+                        msg: "active signing key was rotated during attestation creation — \
+                              please retry"
+                            .to_owned(),
+                        code: "SCP-IDENT-1041".to_owned(),
+                    });
+                }
+                occ.insert((Arc::clone(custody), active_key));
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
                 if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
@@ -2592,7 +2605,7 @@ async fn identity_create_link_attestation_impl(
                         code: "SCP-VALID-7403".to_owned(),
                     });
                 }
-                vac.insert((Arc::clone(custody), core_id.active_signing_key));
+                vac.insert((Arc::clone(custody), active_key));
             }
         }
     }
