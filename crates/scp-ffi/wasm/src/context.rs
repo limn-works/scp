@@ -3008,7 +3008,10 @@ fn canonical_template_name(template_id: &str) -> &str {
         "scp:template/tool-interface" | "ToolInterfaceTemplate" => "ToolInterfaceTemplate",
         "scp:template/paid-service" | "PaidService" => "PaidService",
         "scp:template/paid-broadcast" | "PaidBroadcast" => "PaidBroadcast",
-        "scp:template/handle-registry" | "HandleRegistry" => "HandleRegistry",
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => "HandleRegistry",
         other => other,
     }
 }

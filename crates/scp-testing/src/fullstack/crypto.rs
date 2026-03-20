@@ -125,12 +125,35 @@ impl E2eCryptoProvider {
         let group = join_group(&pending.welcome, pending.provider, pending.signer)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
+        // Extract member DIDs from the MLS group so regenerate_and_distribute_sender_key
+        // knows who to distribute to (the joiner's members map is otherwise empty).
+        let member_dids: Vec<String> = group
+            .members()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                ScpCredential::from_bytes(m.credential.serialized_content())
+                    .ok()
+                    .map(|c| c.did)
+            })
+            .collect();
+
         {
             let mut groups = self
                 .groups
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             groups.insert(*context_id, group);
+        }
+
+        // Populate the members map from the MLS group roster so that
+        // regenerate_and_distribute_sender_key can find existing members.
+        {
+            let mut members_guard = self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            members_guard.insert(*context_id, member_dids);
         }
 
         // Pick up any sender keys deposited for us.
