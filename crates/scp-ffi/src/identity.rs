@@ -1269,8 +1269,8 @@ fn py_create_identity_link_attestation(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationRevocation,
-        IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;

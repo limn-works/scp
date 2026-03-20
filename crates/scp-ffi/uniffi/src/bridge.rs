@@ -2462,8 +2462,8 @@ async fn identity_create_link_attestation_impl(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationRevocation,
-        IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
