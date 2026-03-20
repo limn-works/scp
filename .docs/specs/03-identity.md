@@ -201,8 +201,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   },
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
-    proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
-                                     // Verifiers MUST use this string as-is in signature scope — do not parse and re-serialize
+    proof:          AttestationProof,  // Method-specific proof data — typed discriminated union (see below)
     verified_at:    u64,         // Unix timestamp (s) of last verification
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
@@ -210,6 +209,17 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active or #agent key
 }
 ```
+
+**`AttestationProof` variants:** The `proof` field is a tagged union (discriminated by `"type"` in JSON/MessagePack) with four variants corresponding to the four verification methods:
+
+| Variant | `type` tag | Fields | Verification method |
+|---------|-----------|--------|---------------------|
+| `OauthVerified` | `"oauth_verified"` | `provider: String`, `subject_id: String`, `verified_at: u64` | `Oauth` |
+| `SignedPostVerified` | `"signed_post_verified"` | `post_url: String`, `nonce: String`, `posted_at: u64` | `SignedPost` |
+| `DnsRecordVerified` | `"dns_record_verified"` | `domain: String`, `record_name: String` | `DnsRecord` |
+| `ChallengeResponseVerified` | `"challenge_response_verified"` | `challenge: String`, `response_signature: String` | `ChallengeResponse` |
+
+The variant's `type` tag uses `snake_case` naming. Each variant carries only the fields necessary for its verification method. The proof is included in the signature scope as part of the `evidence` sub-structure (MessagePack sorted-key encoding).
 
 **Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
 

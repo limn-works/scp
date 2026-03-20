@@ -10899,6 +10899,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
     #[cfg(feature = "allow_in_memory_custody")]
     let in_memory = identity.in_memory_custody.as_ref();
 
+    let old_did = identity.did.clone();
     let old_identity = core_id.clone();
     let old_document = core_document.clone();
     let custody_type = identity.custody_type.clone();
@@ -10937,6 +10938,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .await
                     .map_err(ScpError::from)?;
 
+                let new_did = new_identity.did.clone();
                 let has_agent = new_document.has_agent_key();
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
@@ -10949,6 +10951,22 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 });
                 increment_handle_count();
                 let _ = has_agent; // suppress unused warning
+
+                // Migrate attestation and custody registries from old DID to new DID.
+                {
+                    let registry = identity_link_attestation_registry();
+                    if let Some((_, attestations)) = registry.remove(&old_did) {
+                        registry.insert(new_did.clone(), attestations);
+                    }
+                }
+                #[cfg(feature = "allow_in_memory_custody")]
+                {
+                    let registry = identity_custody_registry();
+                    if let Some((_, entry)) = registry.remove(&old_did) {
+                        registry.insert(new_did, entry);
+                    }
+                }
+
                 return Ok(handle);
             }
 
@@ -10978,6 +10996,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .await
                     .map_err(ScpError::from)?;
 
+                let new_did = new_identity.did.clone();
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
                     custody_type,
@@ -10988,6 +11007,22 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     callback_custody: Some(Arc::clone(cc)),
                 });
                 increment_handle_count();
+
+                // Migrate attestation and custody registries from old DID to new DID.
+                {
+                    let registry = identity_link_attestation_registry();
+                    if let Some((_, attestations)) = registry.remove(&old_did) {
+                        registry.insert(new_did.clone(), attestations);
+                    }
+                }
+                #[cfg(feature = "allow_in_memory_custody")]
+                {
+                    let registry = identity_custody_registry();
+                    if let Some((_, entry)) = registry.remove(&old_did) {
+                        registry.insert(new_did, entry);
+                    }
+                }
+
                 return Ok(handle);
             }
 

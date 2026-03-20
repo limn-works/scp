@@ -153,10 +153,13 @@ pub use bridge::{
     governance_withdraw,
     // Free functions — identity
     identity_create,
+    identity_create_link_attestation,
     identity_create_with_custody,
     identity_execute_custody_migration,
     identity_execute_recovery,
+    identity_link_attestations,
     identity_load,
+    identity_migrate,
     identity_resolve,
     is_local_did,
     // Free functions — MCP (#591)
