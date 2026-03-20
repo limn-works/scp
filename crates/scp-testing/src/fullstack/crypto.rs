@@ -28,7 +28,7 @@ use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
 use scp_core::crypto::mls::group::{
     ScpMlsGroup, add_member, create_group, destroy_group, generate_key_package, join_group,
 };
-use scp_core::crypto::mls::ratchet::{process_commit, propose_update, serialize_commit};
+use scp_core::crypto::mls::ratchet::{process_commit, propose_update, serialize_mls_message};
 use scp_core::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore, generate_sender_key};
 use scp_identity::SigningKeyId;
@@ -487,9 +487,9 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         };
 
         // Serialize the Welcome for cross-process delivery via AddMemberOutput.
-        let welcome_bytes = scp_core::crypto::mls::ratchet::serialize_commit(&result.welcome)
+        let welcome_bytes = scp_core::crypto::mls::ratchet::serialize_mls_message(&result.welcome)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        let commit_bytes = serialize_commit(&result.commit)
+        let commit_bytes = serialize_mls_message(&result.commit)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Read existing members before locking exchange (avoid nested locks).

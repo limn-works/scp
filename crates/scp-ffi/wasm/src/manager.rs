@@ -208,6 +208,19 @@ fn validate_revocation_scope(scope: &str) -> Result<&str, ScpWasmError> {
 // ContextEvent — mirrors scp_core::context::membership::ContextEvent
 // ---------------------------------------------------------------------------
 
+/// Hex-encoded sensitive bytes with redacted Debug output.
+///
+/// Prevents MLS key material from appearing in debug/log output
+/// while still allowing programmatic access via `.0` field.
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RedactedHex(pub String);
+
+impl std::fmt::Debug for RedactedHex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{} hex chars, REDACTED]", self.0.len())
+    }
+}
+
 /// An event emitted by the context manager and stored in the receive buffer.
 ///
 /// Mirrors `scp_core::context::membership::ContextEvent`.
@@ -248,6 +261,24 @@ pub enum WasmContextEvent {
     GovernanceExecuted {
         action_type: String,
         proposal_id: String,
+    },
+    /// An MLS Welcome was generated for a newly added member.
+    ///
+    /// Mirrors `scp_core::context::membership::ContextEvent::WelcomeGenerated`.
+    /// The application layer must ECIES-encrypt and deliver these bytes to the
+    /// joiner's personal routing ID (spec §5.12.3, issue #1311).
+    ///
+    /// # Security
+    ///
+    /// `welcome_bytes_hex` and `commit_bytes_hex` contain sensitive MLS key
+    /// material (tree secrets, epoch keys). Treat them as secret: do not log,
+    /// persist to unencrypted storage, or expose in user-facing output.
+    WelcomeGenerated {
+        context_id: String,
+        creator_did: String,
+        member_did: String,
+        welcome_bytes_hex: RedactedHex,
+        commit_bytes_hex: RedactedHex,
     },
 }
 

@@ -125,7 +125,9 @@ pub fn ecies_seal(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did, &ephemeral_pub_bytes);
 
-    // x25519-dalek v2 SharedSecret does NOT implement ZeroizeOnDrop.
+    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
+    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
+    // defense-in-depth — ensures zeroing even if the feature is ever removed.
     let shared_bytes = Zeroizing::new(*shared_secret.as_bytes());
     let aes_key = hkdf_derive_key(shared_bytes.as_ref(), &info)
         .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
@@ -161,7 +163,9 @@ pub fn ecies_open(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did, ephemeral_pub);
 
-    // x25519-dalek v2 SharedSecret does NOT implement ZeroizeOnDrop.
+    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
+    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
+    // defense-in-depth — ensures zeroing even if the feature is ever removed.
     let shared_bytes = Zeroizing::new(*shared_secret.as_bytes());
     let aes_key = hkdf_derive_key(shared_bytes.as_ref(), &info)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))?;

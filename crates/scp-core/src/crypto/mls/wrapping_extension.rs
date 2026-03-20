@@ -359,7 +359,7 @@ mod tests {
             &wrapping_key,
         )
         .unwrap();
-        let commit_bytes = super::super::ratchet::serialize_commit(&commit).unwrap();
+        let commit_bytes = super::super::ratchet::serialize_mls_message(&commit).unwrap();
 
         // Bob processes Alice's commit.
         let mut grace_store = super::super::epoch_grace::EpochGraceStore::new();
