@@ -1415,80 +1415,88 @@ pub async fn identity_create_link_attestation(
         })
     })?;
 
-    crate::runtime::with_identity_mut(&did, |entry| {
-        let issuer = DID::from(did.as_str());
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| ScpNapiError::Identity {
+    // Phase 1: read custody + key handle (under DashMap lock, then drop).
+    let (custody, key_handle) = crate::runtime::with_identity(&did, |entry| {
+        Ok((
+            Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })?;
+
+    let issuer = DID::from(did.as_str());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            NapiError::from(ScpNapiError::Identity {
                 message: "system clock is before UNIX epoch".to_owned(),
                 code: "SCP-IDENT-1042".to_owned(),
-            })?
-            .as_secs();
+            })
+        })?
+        .as_secs();
 
-        let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
+    let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
 
-        let mut attestation = IdentityLinkAttestation {
-            id,
-            attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
-            issuer: issuer.clone(),
-            subject: issuer,
-            issued_at: now_secs,
-            expires_at: None,
-            claim: AttestationClaim::new(platform, handle, platform_id),
-            evidence: AttestationEvidence {
-                method,
-                proof,
-                verified_at: now_secs,
-                verifier_did: None,
-            },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
-            revocation_status: RevocationStatus::Active,
-            signature: Vec::new(),
-        };
+    let mut attestation = IdentityLinkAttestation {
+        id,
+        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+        issuer: issuer.clone(),
+        subject: issuer,
+        issued_at: now_secs,
+        expires_at: None,
+        claim: AttestationClaim::new(platform, handle, platform_id),
+        evidence: AttestationEvidence {
+            method,
+            proof,
+            verified_at: now_secs,
+            verifier_did: None,
+        },
+        revocation: AttestationRevocation::new("/revocations".to_owned()),
+        revocation_status: RevocationStatus::Active,
+        signature: Vec::new(),
+    };
 
-        // Structural validation before signing.
-        let structure_errors = attestation.validate_structure();
-        if !structure_errors.is_empty() {
-            return Err(ScpNapiError::Identity {
-                message: format!(
-                    "attestation structure validation failed: {}",
-                    structure_errors
-                        .iter()
-                        .map(AsRef::as_ref)
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                ),
-                code: "SCP-IDENT-1041".to_owned(),
-            });
-        }
+    // Structural validation before signing.
+    let structure_errors = attestation.validate_structure();
+    if !structure_errors.is_empty() {
+        return Err(NapiError::from(ScpNapiError::Identity {
+            message: format!(
+                "attestation structure validation failed: {}",
+                structure_errors
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            code: "SCP-IDENT-1041".to_owned(),
+        }));
+    }
 
-        let canonical =
-            attestation
-                .canonical_signing_bytes()
-                .map_err(|e| ScpNapiError::Identity {
-                    message: format!("attestation signing failed: {e}"),
-                    code: "SCP-IDENT-1041".to_owned(),
-                })?;
+    let canonical = attestation.canonical_signing_bytes().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("attestation signing failed: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })
+    })?;
 
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| ScpNapiError::Identity {
+    // Phase 2: sign (no DashMap lock held — safe to block_in_place).
+    let rt = tokio::runtime::Handle::try_current().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
             message: format!("no tokio runtime: {e}"),
             code: "SCP-IDENT-1041".to_owned(),
-        })?;
-
-        let sig = tokio::task::block_in_place(|| {
-            rt.block_on(
-                entry
-                    .custody
-                    .0
-                    .sign(&entry.identity.active_signing_key, &canonical),
-            )
         })
-        .map_err(|e| ScpNapiError::Identity {
-            message: format!("Ed25519 signing failed: {e}"),
-            code: "SCP-IDENT-1041".to_owned(),
-        })?;
-        attestation.signature = sig.as_bytes().to_vec();
+    })?;
 
+    let sig = tokio::task::block_in_place(|| rt.block_on(custody.0.sign(&key_handle, &canonical)))
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("Ed25519 signing failed: {e}"),
+                code: "SCP-IDENT-1041".to_owned(),
+            })
+        })?;
+    attestation.signature = sig.as_bytes().to_vec();
+
+    // Phase 3: store attestation (re-acquire DashMap lock).
+    crate::runtime::with_identity_mut(&did, |entry| {
         if entry.identity_link_attestations.len() >= NAPI_LINK_ATTESTATION_PER_DID_CAP {
             return Err(ScpNapiError::Identity {
                 message: format!(
@@ -1499,13 +1507,16 @@ pub async fn identity_create_link_attestation(
             });
         }
         entry.identity_link_attestations.push(attestation.clone());
+        Ok(())
+    })
+    .map_err(NapiError::from)?;
 
-        serde_json::to_string(&attestation).map_err(|e| ScpNapiError::Identity {
+    serde_json::to_string(&attestation).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
             message: format!("failed to serialize attestation: {e}"),
             code: "SCP-IDENT-1042".to_owned(),
         })
     })
-    .map_err(NapiError::from)
 }
 
 /// Lists all identity link attestations for an identity.
@@ -1581,27 +1592,34 @@ pub async fn identity_verify_link_attestation(
         use scp_platform::traits::KeyCustody;
 
         let issuer_did: &str = &attestation.issuer;
-        crate::runtime::with_identity(issuer_did, |entry| {
-            let rt = tokio::runtime::Handle::try_current().map_err(|e| ScpNapiError::Identity {
+
+        // Phase 1: extract custody + key handle (under DashMap lock, then drop).
+        let (custody, key_handle) = crate::runtime::with_identity(issuer_did, |entry| {
+            Ok((
+                Arc::clone(&entry.custody),
+                entry.identity.active_signing_key,
+            ))
+        })
+        .map_err(NapiError::from)?;
+
+        // Phase 2: get public key (no DashMap lock held — safe to block_in_place).
+        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
                 message: format!("no tokio runtime: {e}"),
                 code: "SCP-IDENT-1044".to_owned(),
-            })?;
-
-            let pub_key = tokio::task::block_in_place(|| {
-                rt.block_on(
-                    entry
-                        .custody
-                        .0
-                        .public_key(&entry.identity.active_signing_key),
-                )
             })
-            .map_err(|e| ScpNapiError::Identity {
-                message: format!("failed to get public key: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            })?;
-            Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
-        })
-        .map_err(NapiError::from)
+        })?;
+
+        let pub_key =
+            tokio::task::block_in_place(|| rt.block_on(custody.0.public_key(&key_handle)))
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Identity {
+                        message: format!("failed to get public key: {e}"),
+                        code: "SCP-IDENT-1044".to_owned(),
+                    })
+                })?;
+
+        Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
     }
 }
 
