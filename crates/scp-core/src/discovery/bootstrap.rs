@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::well_known::{WellKnownScp, WellKnownValidationError};
-use scp_identity::DidMethod;
+use scp_identity::{DID, DidMethod};
 
 use super::{ContextId, DiscoveryError};
 
@@ -26,14 +26,24 @@ use super::{ContextId, DiscoveryError};
 /// The `expected_creator_did` enables the SDK to verify that the context was
 /// indeed created by the expected operator (spec §22.13), preventing a
 /// hijacked context ID from impersonating a bootstrap context.
+///
+/// **Caller responsibility:** The bootstrap resolver does not enforce creator
+/// DID verification automatically — the creator DID is only available after
+/// joining the context (from the creation event in the event log). Callers
+/// MUST verify that the resolved context's creator DID matches
+/// `expected_creator_did` after joining. If the creator DID does not match,
+/// the caller MUST leave the context and treat the entry as compromised
+/// (spec §22.13.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapContextEntry {
     /// The context ID to bootstrap from.
     pub context_id: ContextId,
 
     /// The expected DID of the context creator. The SDK MUST verify this
-    /// against the actual context creator before trusting bootstrap data.
-    pub expected_creator_did: String,
+    /// against the actual context creator after joining, before trusting any
+    /// bootstrap data. See spec §22.13.2 for the post-join verification
+    /// protocol.
+    pub expected_creator_did: DID,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +144,14 @@ impl BootstrapConfig {
     }
 
     /// Returns all context entries (defaults + custom) as a combined list.
+    ///
+    /// Each entry carries an `expected_creator_did` that callers MUST verify
+    /// after joining the context. The bootstrap resolver itself does NOT
+    /// perform this verification — the creator DID is only available from
+    /// the context's creation event in the event log. Without post-join
+    /// verification, a hijacked context ID could impersonate a bootstrap
+    /// context. See [`BootstrapContextEntry`] for the full verification
+    /// protocol and spec §22.13.2.
     #[must_use]
     pub fn all_entries(&self) -> Vec<&BootstrapContextEntry> {
         self.default_contexts
@@ -306,7 +324,7 @@ mod tests {
     fn entry(id: &str, did: &str) -> BootstrapContextEntry {
         BootstrapContextEntry {
             context_id: id.to_owned(),
-            expected_creator_did: did.to_owned(),
+            expected_creator_did: DID(did.to_owned()),
         }
     }
 
