@@ -165,13 +165,24 @@ pub enum RevocationStatus {
         /// Unix timestamp (seconds) when the revocation occurred.
         revoked_at: u64,
         /// Reason for revocation (empty string if no reason provided).
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_string_or_null")]
         reason: String,
         /// DID that performed the revocation. Must equal the attestation's
         /// issuer — only the issuer can revoke their own attestation (§7.4.1).
         #[serde(default = "default_revoked_by")]
         revoked_by: DID,
     },
+}
+
+/// Deserializes a `String` field that may be `null` in JSON. Returns the string
+/// value when present, or an empty string for both missing keys and explicit
+/// `null` values. `#[serde(default)]` alone only handles missing keys — an
+/// explicit `"reason": null` would fail deserialization without this.
+fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Default `revoked_by` DID for pre-migration attestations that were serialized

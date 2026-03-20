@@ -421,7 +421,7 @@ export class Identity {
       }
       const json = await fn(this.did);
       const items = JSON.parse(json) as Record<string, unknown>[];
-      return items.map((item) => IdentityAttestation._fromRecord(item));
+      return items.map((item) => IdentityAttestation._fromRecord(item, JSON.stringify(item)));
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }

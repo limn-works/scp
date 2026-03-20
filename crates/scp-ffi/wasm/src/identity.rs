@@ -132,11 +132,19 @@ mod canonical_attestation {
         Active,
         Revoked {
             revoked_at: u64,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_string_or_null")]
             reason: String,
             #[serde(default = "default_revoked_by")]
             revoked_by: String,
         },
+    }
+
+    /// Deserializes a `String` field that may be `null` in JSON.
+    fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
     }
 
     /// Default `revoked_by` DID for pre-migration attestations that were serialized
@@ -1301,11 +1309,27 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
         })
         .map_err(|e| JsError::new(&format!("{e:?}")))?;
 
+    // Derive agent key state from the registry entry (authoritative) rather
+    // than copying from the input handle, which may be stale.
+    let (has_agent, agent_multibase) = IDENTITY_REGISTRY.with(|reg| {
+        let map = reg.borrow();
+        map.get(&new_did).map_or((false, None), |entry| {
+            entry
+                .agent_signing_key_bytes
+                .as_ref()
+                .map_or((false, None), |sk_bytes| {
+                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                    let pub_bytes = sk.verifying_key().to_bytes();
+                    (true, Some(format!("z{}", zbase32_encode(&pub_bytes))))
+                })
+        })
+    });
+
     Ok(WasmIdentity {
         did: new_did,
         custody_type: custody,
-        has_agent_key: identity.has_agent_key,
-        agent_public_key_multibase: identity.agent_public_key_multibase.clone(),
+        has_agent_key: has_agent,
+        agent_public_key_multibase: agent_multibase,
     })
 }
 
@@ -2421,13 +2445,32 @@ pub fn identity_verify_link_attestation_signature(
                 .into()
             })?
             .iter()
-            .filter_map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
-            .collect();
+            .map(|v| {
+                v.as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or("invalid signature byte")
+            })
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("signature contains invalid bytes: {e}"),
+                    code: "SCP-IDENT-1045".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
 
         if sig_array.len() != 64 {
             return Ok(JsValue::from_bool(false));
         }
-        let sig_bytes: [u8; 64] = sig_array.try_into().unwrap_or([0u8; 64]);
+        let sig_bytes: [u8; 64] = sig_array.try_into().map_err(|_| -> JsValue {
+            ScpWasmError::Identity {
+                message: "signature must be exactly 64 bytes".to_owned(),
+                code: "SCP-IDENT-1045".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
 
         let canonical = compute_attestation_canonical_bytes(&attestation)?;
 
