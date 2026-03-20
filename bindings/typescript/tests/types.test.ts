@@ -242,7 +242,7 @@ describe("type definitions", () => {
       trustLevel: { kind: "HandleRegistryVerified" },
       resolutionPath: {
         layer: "HandleRegistry",
-        source: "discovery_context",
+        source: "handle_registry",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,
       },

@@ -255,7 +255,7 @@ fn discovery_result_to_dict<'py>(
 /// - `relay_urls` (list[str]): Relay URLs where the context is reachable.
 /// - `publisher_did` (str): The DID that published this context.
 /// - `discovery_source` (str): One of `"dht_did_document"`, `"well_known"`,
-///   `"discovery_context"`, `"context_uri"`.
+///   `"handle_registry"`, `"context_uri"`.
 /// - `mode` (str | None): Advisory context mode (e.g., `"broadcast"`).
 /// - `metadata_summary` (str | None): Human-readable summary.
 /// - `trust_level` (dict): `{"kind": str}` per §22.7.
@@ -1276,7 +1276,7 @@ mod tests {
         let json = discovery_result_to_json(&result);
         assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
         assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
-        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["resolution_path"]["source"], "handle_registry");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");
     }

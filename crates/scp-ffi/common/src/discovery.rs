@@ -32,10 +32,10 @@ pub const fn map_discovery_source(
             ("well_known", "DomainVerified", "Domain", "well-known", None)
         }
         ContextDiscoverySource::HandleRegistry { context_id } => (
-            "discovery_context",
+            "handle_registry",
             "HandleRegistryVerified",
             "HandleRegistry",
-            "discovery_context",
+            "handle_registry",
             Some(context_id.as_str()),
         ),
         // §22.7: An scp:// URI is shared out-of-band, so the trust level is
@@ -142,10 +142,10 @@ mod tests {
             context_id: "disc-1".to_owned(),
         };
         let (src, trust, layer, source, source_id) = map_discovery_source(&disc_source);
-        assert_eq!(src, "discovery_context");
+        assert_eq!(src, "handle_registry");
         assert_eq!(trust, "HandleRegistryVerified");
         assert_eq!(layer, "HandleRegistry");
-        assert_eq!(source, "discovery_context");
+        assert_eq!(source, "handle_registry");
         assert_eq!(source_id, Some("disc-1"));
     }
 
@@ -185,7 +185,7 @@ mod tests {
 
         assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
         assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
-        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["resolution_path"]["source"], "handle_registry");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");
     }
