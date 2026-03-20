@@ -1269,7 +1269,7 @@ fn py_create_identity_link_attestation(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationRevocation,
         IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
@@ -1324,6 +1324,7 @@ fn py_create_identity_link_attestation(
                 verified_at: now_secs,
                 verifier_did: None,
             },
+            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: RevocationStatus::Active,
             signature: Vec::new(),
         };
