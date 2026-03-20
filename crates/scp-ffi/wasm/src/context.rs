@@ -2475,7 +2475,10 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
         ),
         // F1: HandleRegistry is separate from PublicBroadcast — Encrypted mode,
         // messaging_tool_invoke_ban ceiling, no projection (matches scp-core)
-        "scp:template/handle-registry" | "HandleRegistry" => make(
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => make(
             "Encrypted",
             &caps.msg_tools_invoke_ban,
             "SingleAdmin",
@@ -2532,7 +2535,8 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
                      BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
                      GatedBroadcast, scp:template/tool-interface, \
                      scp:template/paid-service, scp:template/paid-broadcast, \
-                     scp:template/handle-registry"
+                     scp:template/handle-registry (alias: scp:template/discovery-context, \
+                     DiscoveryContext)"
                 ),
                 code: "SCP-VALID-7001".to_owned(),
             }
@@ -2555,9 +2559,10 @@ fn wasm_template_params(template_id: &str) -> Result<serde_json::Value, JsError>
         "scp:template/paid-broadcast" | "PaidBroadcast" => {
             serde_json::json!("scp:template/paid-broadcast")
         }
-        "scp:template/handle-registry" | "HandleRegistry" => {
-            serde_json::json!("scp:template/handle-registry")
-        }
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => serde_json::json!("scp:template/handle-registry"),
         other => serde_json::Value::String(other.to_owned()),
     };
     obj.insert("template_id".to_owned(), tid_value);
