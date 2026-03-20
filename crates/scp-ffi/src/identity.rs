@@ -1269,8 +1269,8 @@ fn py_create_identity_link_attestation(
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationProof,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
@@ -1289,9 +1289,8 @@ fn py_create_identity_link_attestation(
     py.allow_threads(move || {
         let method: VerificationMethod = method_owned.parse().map_err(ScpPyError::identity)?;
 
-        // Parse the proof JSON string into a typed AttestationProof.
-        let proof: AttestationProof = serde_json::from_str(&proof_owned)
-            .map_err(|e| ScpPyError::identity(format!("invalid proof JSON: {e}")))?;
+        // Proof is an opaque string per §3.5.2 — pass through as-is.
+        // Do not parse and re-serialize.
 
         // Phase 1: read custody + key handle (under DashMap lock, then drop).
         let (custody, key_handle) = crate::runtime::with_identity(&did_owned, |entry| {
@@ -1321,11 +1320,10 @@ fn py_create_identity_link_attestation(
             claim: AttestationClaim::new(platform_owned, handle_owned, platform_id_owned),
             evidence: AttestationEvidence {
                 method,
-                proof,
+                proof: proof_owned,
                 verified_at: now_secs,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: RevocationStatus::Active,
             signature: Vec::new(),
         };

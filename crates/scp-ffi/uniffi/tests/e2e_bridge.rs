@@ -271,7 +271,7 @@ async fn identity_migrate_preserves_attestations() {
             assert_ne!(new_did, original_did, "Migration should produce a new DID");
 
             // Attestations should have migrated to the new DID.
-            let after = identity_link_attestations(new_did.clone()).unwrap();
+            let after = identity_link_attestations(new_did).unwrap();
             let after_vec: Vec<serde_json::Value> = serde_json::from_str(&after).unwrap();
             assert_eq!(
                 after_vec.len(),

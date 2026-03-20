@@ -937,13 +937,13 @@ fn vector_24_25_sender_and_access_info_differ() {
 #[test]
 fn vector_26_identity_link_attestation() {
     use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence, AttestationProof,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use std::borrow::Cow;
 
-    println!("=== Vector 26: Identity Link Attestation Signature (V2) ===");
+    println!("=== Vector 26: Identity Link Attestation Signature (V1) ===");
 
     // Construct the attestation per §25.13 spec inputs.
     let issuer: DID = "did:dht:z6MkIssuer".into();
@@ -957,15 +957,10 @@ fn vector_26_identity_link_attestation() {
         claim: AttestationClaim::new("google.com".to_owned(), "alice@gmail.com".to_owned(), None),
         evidence: AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: AttestationProof::OauthVerified {
-                provider: "google.com".to_owned(),
-                subject_id: "12345".to_owned(),
-                verified_at: 1_700_000_000,
-            },
+            proof: r#"{"type":"oauth_verified","provider":"google.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
             verified_at: 1_700_000_000,
             verifier_did: None,
         },
-        revocation: AttestationRevocation::new(String::new()),
         revocation_status: RevocationStatus::Active,
         signature: Vec::new(),
     };
@@ -984,7 +979,7 @@ fn vector_26_identity_link_attestation() {
     let revocation_status_bytes = rmp_serde::to_vec_named(&signed.revocation_status).unwrap();
 
     let canonical = canonical_hash_bytes(
-        b"SCP-IDENTITY-LINK-ATTESTATION-V2:",
+        b"SCP-IDENTITY-LINK-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(signed.id.as_bytes()),
             CanonicalField::VarBytes(signed.attestation_type.as_bytes()),
@@ -999,7 +994,7 @@ fn vector_26_identity_link_attestation() {
     );
 
     let hash: [u8; 32] = Sha256::digest(&canonical).into();
-    print_vec("Identity link attestation canonical hash (V2)", &hash);
+    print_vec("Identity link attestation canonical hash (V1)", &hash);
 
     let signature = signing_key.sign(&hash);
     signed.signature = signature.to_bytes().to_vec();
@@ -1009,7 +1004,7 @@ fn vector_26_identity_link_attestation() {
     // the internal canonical_signing_bytes matches our manual construction.
     signed
         .verify_signature(&pubkey_bytes)
-        .expect("identity link attestation V2 signature must verify");
+        .expect("identity link attestation V1 signature must verify");
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,7 +1180,7 @@ fn domain_separators_are_all_unique() {
         "SCP-KEY-CONTINUITY-V1:",
         "SCP-CLAIM-V1:",
         "SCP-PROPOSAL-V1:",
-        "SCP-ATTESTATION-V2:",
+        "SCP-ATTESTATION-V1:",
         "SCP-PSEUDONYM-V1:",
         "SCP-OFFER-ID-V1:",
         "SCP-ATTESTATION-ID-V1:",
@@ -1198,7 +1193,7 @@ fn domain_separators_are_all_unique() {
         "SCP-PRIVATE-LOG-V1:",
         "SCP-BROADCAST-ENVELOPE-V1:",
         "SCP-PARTICIPATION-V1:",
-        "SCP-IDENTITY-LINK-ATTESTATION-V2:",
+        "SCP-IDENTITY-LINK-ATTESTATION-V1:",
         "SCP-ACCESS-KEY-REQUEST-V1:",
         "SCP-TOOL-REGISTRATION-V1:",
         "SCP-FORK-ID-V1:",

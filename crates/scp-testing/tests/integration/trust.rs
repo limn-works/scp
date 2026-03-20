@@ -173,7 +173,7 @@ fn make_signed_attestation(
     let revocation_bytes = rmp_serde::to_vec_named(&att.revocation_status).unwrap();
 
     let canonical = canonical_hash(
-        "SCP-ATTESTATION-V2:",
+        "SCP-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(att.id.as_bytes()),
             CanonicalField::U16(att_type_tag),

@@ -598,16 +598,19 @@ impl DidDocument {
         Ok(())
     }
 
-    /// Returns all identity link attestations from this DID document.
+    /// Returns all identity link attestation IDs from this DID document.
     ///
     /// Searches the service entries for those with type
-    /// `ScpIdentityLinkAttestation` and parses each one. Returns an empty
-    /// `Vec` if none exist. Malformed entries are silently skipped — a single
-    /// corrupt entry should not prevent reading the others.
+    /// `ScpIdentityLinkAttestation` and extracts the attestation ID (hex string)
+    /// from each `serviceEndpoint`. Returns an empty `Vec` if none exist.
+    /// Malformed entries are silently skipped.
+    ///
+    /// Callers use these IDs to look up the full `IdentityLinkAttestation` from
+    /// the identity's attestation store (via relay or DHT).
     ///
     /// See spec §3.5.3.
     #[must_use]
-    pub fn identity_link_attestations(&self) -> Vec<ScpIdentityLinkService> {
+    pub fn identity_link_attestation_ids(&self) -> Vec<String> {
         self.service
             .iter()
             .filter(|s| s.service_type == "ScpIdentityLinkAttestation")
@@ -620,6 +623,10 @@ impl DidDocument {
     /// If an existing entry with the same `attestation_id` exists, it is
     /// replaced. Otherwise the new entry is appended. Other service entries
     /// are preserved.
+    ///
+    /// The service entry fragment uses `attestation-<platform>--<index>` per
+    /// spec §3.5.3, where `<index>` is the zero-based position among entries
+    /// of the same platform type.
     ///
     /// See spec §3.5.3.
     ///
@@ -635,15 +642,13 @@ impl DidDocument {
         let target_id = &attestation.attestation_id;
         let had_existing = self.service.iter().any(|s| {
             s.service_type == "ScpIdentityLinkAttestation"
-                && ScpIdentityLinkService::from_service_entry(s)
-                    .is_ok_and(|parsed| parsed.attestation_id == *target_id)
+                && ScpIdentityLinkService::from_service_entry(s).is_ok_and(|id| id == *target_id)
         });
         self.service.retain(|s| {
             if s.service_type != "ScpIdentityLinkAttestation" {
                 return true;
             }
-            ScpIdentityLinkService::from_service_entry(s)
-                .map_or(true, |parsed| parsed.attestation_id != *target_id)
+            ScpIdentityLinkService::from_service_entry(s).map_or(true, |id| id != *target_id)
         });
 
         // Enforce 10-attestation-per-DID-document cap (§3.5.3).
@@ -661,7 +666,17 @@ impl DidDocument {
             }
         }
 
-        let service = attestation.to_service_entry(&self.id)?;
+        // Compute the zero-based index for this platform among existing
+        // attestation service entries.
+        let platform_str = attestation.platform.as_str();
+        let prefix = format!("#attestation-{platform_str}--");
+        let index = self
+            .service
+            .iter()
+            .filter(|s| s.service_type == "ScpIdentityLinkAttestation" && s.id.contains(&prefix))
+            .count();
+
+        let service = attestation.to_service_entry(&self.id, index)?;
         self.service.push(service);
         Ok(())
     }
@@ -678,8 +693,7 @@ impl DidDocument {
             if s.service_type != "ScpIdentityLinkAttestation" {
                 return true;
             }
-            ScpIdentityLinkService::from_service_entry(s)
-                .map_or(true, |parsed| parsed.attestation_id != attestation_id)
+            ScpIdentityLinkService::from_service_entry(s).map_or(true, |id| id != attestation_id)
         });
         self.service.len() < before
     }
@@ -2177,9 +2191,9 @@ mod tests {
     }
 
     #[test]
-    fn identity_link_attestations_empty_by_default() {
+    fn identity_link_attestation_ids_empty_by_default() {
         let doc = DidDocument::new("did:dht:zNoLinks", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
-        assert!(doc.identity_link_attestations().is_empty());
+        assert!(doc.identity_link_attestation_ids().is_empty());
     }
 
     #[test]
@@ -2189,9 +2203,9 @@ mod tests {
             test_link_attestation(crate::attestation::IdentityLinkPlatform::Github, "abcdef01");
         doc.set_identity_link_attestation(&att).unwrap();
 
-        let links = doc.identity_link_attestations();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0], att);
+        let ids = doc.identity_link_attestation_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "abcdef01");
     }
 
     #[test]
@@ -2219,10 +2233,10 @@ mod tests {
         };
         doc.set_identity_link_attestation(&att2).unwrap();
 
-        let links = doc.identity_link_attestations();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].platform_handle, "@alice_updated");
-        assert_eq!(links[0].verified_at, 1_700_000_001);
+        // Same attestation ID, so still only 1 entry.
+        let ids = doc.identity_link_attestation_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "aa00bb0012345678");
     }
 
     #[test]
@@ -2245,8 +2259,17 @@ mod tests {
         doc.set_identity_link_attestation(&att1).unwrap();
         doc.set_identity_link_attestation(&att2).unwrap();
 
-        let links = doc.identity_link_attestations();
-        assert_eq!(links.len(), 2);
+        let ids = doc.identity_link_attestation_ids();
+        assert_eq!(ids.len(), 2);
+
+        // Verify the service entry fragments use double-dash index format.
+        let link_services: Vec<_> = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == "ScpIdentityLinkAttestation")
+            .collect();
+        assert!(link_services[0].id.contains("#attestation-mastodon--0"));
+        assert!(link_services[1].id.contains("#attestation-mastodon--1"));
     }
 
     #[test]
@@ -2259,7 +2282,7 @@ mod tests {
         doc.set_identity_link_attestation(&att).unwrap();
 
         assert!(doc.remove_identity_link_attestation("ddcc001100001234"));
-        assert!(doc.identity_link_attestations().is_empty());
+        assert!(doc.identity_link_attestation_ids().is_empty());
     }
 
     #[test]
@@ -2285,11 +2308,11 @@ mod tests {
         assert_eq!(doc.service.len(), 3);
         assert!(doc.pre_rotation_service().is_some());
         assert_eq!(doc.relay_service_urls().len(), 1);
-        assert_eq!(doc.identity_link_attestations().len(), 1);
+        assert_eq!(doc.identity_link_attestation_ids().len(), 1);
     }
 
     #[test]
-    fn identity_link_attestations_skip_malformed() {
+    fn identity_link_attestation_ids_skip_malformed() {
         let did = "did:dht:zLinks7";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
@@ -2300,17 +2323,17 @@ mod tests {
         );
         doc.set_identity_link_attestation(&att).unwrap();
 
-        // Manually add a malformed one.
+        // Manually add a malformed one (non-hex endpoint).
         doc.service.push(Service {
             id: format!("{did}#attestation-bad-entry"),
             service_type: "ScpIdentityLinkAttestation".to_owned(),
-            service_endpoint: "not valid json".to_owned(),
+            service_endpoint: "not-valid-hex!@#$".to_owned(),
         });
 
         // Should return only the valid one, silently skipping the malformed.
-        let links = doc.identity_link_attestations();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].attestation_id, "aa0012345678ccdd");
+        let ids = doc.identity_link_attestation_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "aa0012345678ccdd");
     }
 
     #[test]
@@ -2332,8 +2355,54 @@ mod tests {
         let json = doc.to_json().unwrap();
         let parsed = DidDocument::from_json(&json).unwrap();
 
-        let links = parsed.identity_link_attestations();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0], att);
+        // After JSON roundtrip, the endpoint contains the attestation ID.
+        let ids = parsed.identity_link_attestation_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "ff0011223344aabb");
+    }
+
+    #[test]
+    fn service_entry_endpoint_is_just_attestation_id() {
+        let did = "did:dht:zLinks9";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let att = test_link_attestation(
+            crate::attestation::IdentityLinkPlatform::Github,
+            "abcdef0123456789",
+        );
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        // Find the service entry and verify the endpoint is just the hex ID.
+        let entry = doc
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpIdentityLinkAttestation")
+            .unwrap();
+        assert_eq!(entry.service_endpoint, "abcdef0123456789");
+        // Should NOT be JSON.
+        assert!(!entry.service_endpoint.starts_with('{'));
+    }
+
+    #[test]
+    fn service_entry_fragment_uses_double_dash_index() {
+        let did = "did:dht:zLinks10";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let att = test_link_attestation(
+            crate::attestation::IdentityLinkPlatform::Github,
+            "abcdef0123456789",
+        );
+        doc.set_identity_link_attestation(&att).unwrap();
+
+        let entry = doc
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpIdentityLinkAttestation")
+            .unwrap();
+        assert_eq!(
+            entry.id,
+            format!("{did}#attestation-github.com--0"),
+            "Fragment should use double-dash and zero-based index"
+        );
     }
 }

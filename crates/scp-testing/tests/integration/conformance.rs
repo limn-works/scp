@@ -232,7 +232,7 @@ fn conf_004_agent_binding_attestation() {
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.
     let attestation_payload = canonical_hash_bytes(
-        b"SCP-ATTESTATION-V2:",
+        b"SCP-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(b"agent-binding-001"),
             CanonicalField::U16(0x0000), // IdentityLink = tag 0

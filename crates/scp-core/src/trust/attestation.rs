@@ -1075,7 +1075,7 @@ pub fn check_threshold_attestation(
 /// Computes the canonical byte representation of an attestation for signing.
 ///
 /// ```text
-/// "SCP-ATTESTATION-V2:" || len(id) || id || attestation_type_tag_BE
+/// "SCP-ATTESTATION-V1:" || len(id) || id || attestation_type_tag_BE
 ///     || len(issuer) || issuer || len(subject) || subject
 ///     || len(claim_json) || claim_json || len(evidence_msgpack) || evidence_msgpack
 ///     || issued_at_BE || expires_at_BE || len(revocation_status_msgpack) || revocation_status_msgpack
@@ -1132,7 +1132,7 @@ pub(crate) fn canonical_attestation_bytes(
         }
     })?;
     Ok(canonical_hash(
-        "SCP-ATTESTATION-V2:",
+        "SCP-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(attestation.id.as_bytes()),
             CanonicalField::U16(super::attestation_type_tag(&attestation.attestation_type)),

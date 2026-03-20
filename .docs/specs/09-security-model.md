@@ -346,7 +346,7 @@ The signature is verified by subscribers against the author's Active Signing Key
 
 Note: `context_id` is not in the current signed hash (the request struct does not carry it). Adding it is tracked by #346.
 
-**Attestation** — domain: `"SCP-ATTESTATION-V2:"`
+**Attestation** — domain: `"SCP-ATTESTATION-V1:"`
 
 | Order | Field | Encoding |
 |-------|-------|----------|
@@ -1464,7 +1464,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-BROADCAST-ENVELOPE-V1:"` | BroadcastEnvelope signing | §9.5.2 |
 | `"SCP-EPOCH-ADVANCE-V1:"` | SenderKeyEpochAdvance signing | §9.5.2 |
 | `"SCP-KEY-REQUEST-V1:"` | SenderKeyRequest signing | §9.5.2 |
-| `"SCP-ATTESTATION-V2:"` | Attestation signing | §9.5.2 |
+| `"SCP-ATTESTATION-V1:"` | Attestation signing | §9.5.2 |
 | `"SCP-PARTICIPATION-V1:"` | ParticipationProfile signing | §9.5.2 |
 | `"SCP-PARTICIPATION-PROFILE-V1:"` | ParticipationProfile canonical hash | §9.5.2 |
 | `"SCP-BLOCK-NOTIFICATION-V1:"` | BlockNotification signing | §9.5.2 |

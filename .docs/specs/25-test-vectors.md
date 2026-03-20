@@ -488,11 +488,11 @@ Note: Both the sender key and access key info strings use 4-byte BE length-prefi
 
 ## 25.13 Attestation Signing Vectors (§3.5.2, §9.5.1)
 
-Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`
+Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
 
 ### Vector 26: Identity Link Attestation Signature
 
-The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation_status`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
+The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation_status`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
 
 Note: this is the *signature* construction (used by `verify_signature`). The *attestation ID* uses a different domain separator (`"SCP-ATTESTATION-ID-V1:"`) and different fields — see `compute_id()` in `attestation.rs`.
 
@@ -511,7 +511,7 @@ Input:
   revocation_status: RevocationStatus::Active
 
 Canonical hash input:
-  "SCP-IDENTITY-LINK-ATTESTATION-V2:"         (33 bytes, no length prefix)
+  "SCP-IDENTITY-LINK-ATTESTATION-V1:"         (33 bytes, no length prefix)
   || BE32(7)   || "att-001"                    (4 + 7 = 11 bytes — id)
   || BE32(13)  || "identity_link"              (4 + 13 = 17 bytes — attestation_type)
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)

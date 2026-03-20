@@ -350,25 +350,21 @@ impl AttestationClaim {
 
 /// Evidence supporting an identity link attestation (§3.5.1).
 ///
-/// Contains the verification method, typed proof data, the timestamp of
+/// Contains the verification method, proof data, the timestamp of
 /// last verification, and an optional third-party verifier DID.
-///
-/// The `proof` field is a discriminated union ([`AttestationProof`]) whose
-/// variant MUST match the `method` field. Use [`AttestationEvidence::validate_proof_method`]
-/// to check this invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationEvidence {
     /// Verification method used to establish the link.
     pub method: VerificationMethod,
 
-    /// Typed, method-specific proof data (§3.5.2).
+    /// Method-specific proof data as an OPAQUE STRING (spec §3.5.2).
     ///
-    /// The variant MUST correspond to `method`:
-    /// - `Oauth` → [`AttestationProof::OauthVerified`]
-    /// - `SignedPost` → [`AttestationProof::SignedPostVerified`]
-    /// - `DnsRecord` → [`AttestationProof::DnsRecordVerified`]
-    /// - `ChallengeResponse` → [`AttestationProof::ChallengeResponseVerified`]
-    pub proof: AttestationProof,
+    /// Verifiers MUST use this string as-is in signature scope — do not parse
+    /// and re-serialize. Three reasons:
+    /// 1. Forward compatibility — new methods without wire format changes
+    /// 2. Cross-implementation determinism — no serialization ambiguity
+    /// 3. No parsing requirement — verifiers only need Ed25519 signature check
+    pub proof: String,
 
     /// Unix timestamp (seconds) of last verification.
     pub verified_at: u64,
@@ -389,62 +385,8 @@ impl AttestationEvidence {
     pub const fn is_expired(&self, now_secs: u64) -> bool {
         now_secs.saturating_sub(self.verified_at) > self.method.renewal_interval_secs()
     }
-
-    /// Validates that the proof variant matches the declared verification method.
-    ///
-    /// Returns `Ok(())` if the proof variant corresponds to `self.method`,
-    /// or an error describing the mismatch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error string if `proof.expected_method() != method`.
-    pub fn validate_proof_method(&self) -> Result<(), Cow<'static, str>> {
-        let expected = self.proof.expected_method();
-        if expected == self.method {
-            Ok(())
-        } else {
-            Err(Cow::Owned(format!(
-                "proof variant expects method {:?}, but evidence declares {:?}",
-                expected, self.method,
-            )))
-        }
-    }
 }
 
-// ---------------------------------------------------------------------------
-// AttestationRevocation (§3.5.1)
-// ---------------------------------------------------------------------------
-
-/// Revocation metadata for an identity link attestation (§3.5.1).
-///
-/// Specifies how verifiers check whether this attestation has been revoked.
-/// The canonical method is `"did_document"` — verifiers resolve the issuer's
-/// DID document and check the `AttestationRevocations` service endpoint
-/// (§18.2.2) for the attestation's ID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttestationRevocation {
-    /// Revocation check method. Currently always `"did_document"`.
-    pub method: Cow<'static, str>,
-
-    /// DID document service endpoint path for revocation status.
-    pub endpoint: String,
-}
-
-impl AttestationRevocation {
-    /// The canonical revocation method value.
-    pub const DID_DOCUMENT: &'static str = "did_document";
-
-    /// Creates a new revocation entry with the canonical method.
-    #[must_use]
-    pub const fn new(endpoint: String) -> Self {
-        Self {
-            method: Cow::Borrowed(Self::DID_DOCUMENT),
-            endpoint,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // IdentityLinkAttestation (§3.5.1)
 // ---------------------------------------------------------------------------
 
@@ -492,9 +434,6 @@ pub struct IdentityLinkAttestation {
 
     /// Evidence supporting the claim.
     pub evidence: AttestationEvidence,
-
-    /// Revocation metadata.
-    pub revocation: AttestationRevocation,
 
     /// Revocation status: `Active` or `Revoked` (§7.4.1). Included in
     /// the signed scope to prevent replay of revoked attestations.
@@ -579,7 +518,7 @@ impl IdentityLinkAttestation {
     /// using the domain-separated canonical hash construction per §9.5.1), then
     /// verifies the signature against the provided public key bytes.
     ///
-    /// The canonical form uses domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`
+    /// The canonical form uses domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
     /// with fields in a fixed order: `id`, `attestation_type`, `issuer`, `subject`,
     /// `issued_at`, `expires_at` (or absent sentinel), `claim` (`MessagePack`),
     /// `evidence` (`MessagePack`), `revocation_status` (`MessagePack`).
@@ -612,7 +551,7 @@ impl IdentityLinkAttestation {
     /// # Errors
     ///
     /// Returns [`AttestationSignatureError::SerializationFailed`] if any
-    /// sub-struct (`claim`, `evidence`, `revocation`) cannot be serialized
+    /// sub-struct (`claim`, `evidence`, `revocation_status`) cannot be serialized
     /// to `MessagePack`.
     pub fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AttestationSignatureError> {
         use crate::crypto::canonical::{CanonicalField, canonical_hash};
@@ -635,7 +574,7 @@ impl IdentityLinkAttestation {
             })?;
 
         Ok(canonical_hash(
-            "SCP-IDENTITY-LINK-ATTESTATION-V2:",
+            "SCP-IDENTITY-LINK-ATTESTATION-V1:",
             &[
                 CanonicalField::VarBytes(self.id.as_bytes()),
                 CanonicalField::VarBytes(self.attestation_type.as_bytes()),
@@ -662,7 +601,6 @@ impl IdentityLinkAttestation {
     /// - `claim.link_type` is `"self_attestation"`.
     /// - If revoked, `revoked_by` equals `issuer` (§7.4.1: only the issuer
     ///   can revoke their own attestation).
-    /// - `evidence.proof` variant matches `evidence.method`.
     ///
     /// Returns a list of validation errors. Empty list means structurally valid.
     #[must_use]
@@ -725,10 +663,6 @@ impl IdentityLinkAttestation {
             )));
         }
 
-        if let Err(e) = self.evidence.validate_proof_method() {
-            errors.push(e);
-        }
-
         errors
     }
 }
@@ -783,15 +717,10 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: AttestationProof::OauthVerified {
-                    provider: "github.com".to_owned(),
-                    subject_id: "12345".to_owned(),
-                    verified_at: 1_700_000_000,
-                },
+                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         }
@@ -893,11 +822,7 @@ mod tests {
     fn attestation_evidence_not_expired() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: AttestationProof::OauthVerified {
-                provider: "github.com".to_owned(),
-                subject_id: "12345".to_owned(),
-                verified_at: 1_700_000_000,
-            },
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -910,11 +835,7 @@ mod tests {
     fn attestation_evidence_expired() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: AttestationProof::OauthVerified {
-                provider: "github.com".to_owned(),
-                subject_id: "12345".to_owned(),
-                verified_at: 1_700_000_000,
-            },
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -927,11 +848,7 @@ mod tests {
     fn attestation_evidence_exactly_at_boundary() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::SignedPost,
-            proof: AttestationProof::SignedPostVerified {
-                post_url: "https://x.com/alice/123".to_owned(),
-                nonce: "abc123".to_owned(),
-                posted_at: 1_700_000_000,
-            },
+            proof: r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/123","nonce":"abc123","posted_at":1700000000}"#.to_owned(),
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -944,35 +861,13 @@ mod tests {
     fn attestation_evidence_serialization_roundtrip() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::ChallengeResponse,
-            proof: AttestationProof::ChallengeResponseVerified {
-                challenge: "abc".to_owned(),
-                response_signature: "def".to_owned(),
-            },
+            proof: r#"{"type":"challenge_response_verified","challenge":"abc","response_signature":"def"}"#.to_owned(),
             verified_at: 1_700_000_000,
             verifier_did: Some(did("did:dht:z6MkVerifier")),
         };
         let json = serde_json::to_string(&evidence).unwrap();
         let deserialized: AttestationEvidence = serde_json::from_str(&json).unwrap();
         assert_eq!(evidence, deserialized);
-    }
-
-    // -----------------------------------------------------------------------
-    // AttestationRevocation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn attestation_revocation_construction() {
-        let rev = AttestationRevocation::new("/revocations/v1".to_owned());
-        assert_eq!(rev.method, "did_document");
-        assert_eq!(rev.endpoint, "/revocations/v1");
-    }
-
-    #[test]
-    fn attestation_revocation_serialization_roundtrip() {
-        let rev = AttestationRevocation::new("/attestation-revocations".to_owned());
-        let json = serde_json::to_string(&rev).unwrap();
-        let deserialized: AttestationRevocation = serde_json::from_str(&json).unwrap();
-        assert_eq!(rev, deserialized);
     }
 
     // -----------------------------------------------------------------------
@@ -1198,11 +1093,7 @@ mod tests {
     fn attestation_evidence_ignores_unknown_fields() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: AttestationProof::OauthVerified {
-                provider: "github.com".to_owned(),
-                subject_id: "12345".to_owned(),
-                verified_at: 1_700_000_000,
-            },
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
             verified_at: 1_700_000_000_000,
             verifier_did: None,
         };
@@ -1218,23 +1109,6 @@ mod tests {
         let decoded = result.unwrap();
         assert_eq!(decoded.method, VerificationMethod::Oauth);
         assert_eq!(decoded.verified_at, 1_700_000_000_000);
-    }
-
-    #[test]
-    fn attestation_revocation_ignores_unknown_fields() {
-        let revocation = AttestationRevocation::new("/revocations".to_owned());
-        let mut map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(&revocation).unwrap()).unwrap();
-        map.insert("future_field".into(), "v2-data".into());
-        let result =
-            serde_json::from_value::<AttestationRevocation>(serde_json::Value::Object(map));
-        assert!(
-            result.is_ok(),
-            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
-            result.unwrap_err()
-        );
-        let decoded = result.unwrap();
-        assert_eq!(decoded.endpoint, "/revocations");
     }
 
     // -----------------------------------------------------------------------
@@ -1267,15 +1141,10 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: AttestationProof::OauthVerified {
-                    provider: "github.com".to_owned(),
-                    subject_id: "12345".to_owned(),
-                    verified_at: 1_700_000_000,
-                },
+                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(), // placeholder — will be replaced
         };
@@ -1356,22 +1225,6 @@ mod tests {
         let vk = sk.verifying_key();
         let result = attestation.verify_signature(vk.as_bytes());
         assert!(result.is_err(), "should fail with tampered evidence");
-    }
-
-    #[test]
-    fn verify_signature_revocation_metadata_not_in_signed_scope() {
-        // `revocation` (metadata about how to check revocation) is NOT in the
-        // signed scope per §3.5.2. Only `revocation_status` is signed.
-        // Tampering with `revocation.endpoint` should NOT invalidate the signature.
-        let sk = test_signing_key(0xAA);
-        let mut attestation = make_signed_attestation(&sk);
-        attestation.revocation.endpoint = "/evil".to_owned();
-        let vk = sk.verifying_key();
-        let result = attestation.verify_signature(vk.as_bytes());
-        assert!(
-            result.is_ok(),
-            "revocation metadata is not in signed scope: {result:?}"
-        );
     }
 
     #[test]
@@ -1464,15 +1317,10 @@ mod tests {
             claim: AttestationClaim::new(platform.to_owned(), handle.to_owned(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::SignedPost,
-                proof: AttestationProof::SignedPostVerified {
-                    post_url: "https://x.com/alice/123".to_owned(),
-                    nonce: "abc".to_owned(),
-                    posted_at: 1_700_000_000,
-                },
+                proof: r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/123","nonce":"abc","posted_at":1700000000}"#.to_owned(),
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(),
         };
@@ -1540,9 +1388,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AttestationProof
+    // AttestationProof (deprecated — kept for SDK-side parsing tests)
     // -----------------------------------------------------------------------
 
+    #[allow(deprecated)]
     #[test]
     fn attestation_proof_expected_method() {
         let oauth = AttestationProof::OauthVerified {
@@ -1575,6 +1424,7 @@ mod tests {
         assert_eq!(cr.expected_method(), VerificationMethod::ChallengeResponse);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn attestation_proof_attestation_class() {
         let oauth = AttestationProof::OauthVerified {
@@ -1591,6 +1441,7 @@ mod tests {
         assert_eq!(dns.attestation_class(), AttestationClass::Reference);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn attestation_proof_serialization_roundtrip_all_variants() {
         let proofs = [
@@ -1630,6 +1481,7 @@ mod tests {
         }
     }
 
+    #[allow(deprecated)]
     #[test]
     fn attestation_proof_json_has_type_tag() {
         let proof = AttestationProof::OauthVerified {
@@ -1655,105 +1507,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Proof-method validation
+    // Proof is opaque string — no proof-method validation
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_proof_method_matching() {
-        let evidence = AttestationEvidence {
-            method: VerificationMethod::Oauth,
-            proof: AttestationProof::OauthVerified {
-                provider: "g".to_owned(),
-                subject_id: "1".to_owned(),
-                verified_at: 0,
-            },
-            verified_at: 0,
-            verifier_did: None,
-        };
-        assert!(evidence.validate_proof_method().is_ok());
-    }
-
-    #[test]
-    fn validate_proof_method_mismatched() {
-        let evidence = AttestationEvidence {
-            method: VerificationMethod::DnsRecord,
-            proof: AttestationProof::OauthVerified {
-                provider: "g".to_owned(),
-                subject_id: "1".to_owned(),
-                verified_at: 0,
-            },
-            verified_at: 0,
-            verifier_did: None,
-        };
-        let err = evidence.validate_proof_method().unwrap_err();
-        assert!(
-            err.contains("Oauth") && err.contains("DnsRecord"),
-            "error should mention both methods: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_structure_catches_proof_method_mismatch() {
+    fn validate_structure_does_not_check_proof_content() {
+        // Proof is an opaque string per §3.5.2. validate_structure does not
+        // inspect its content, even if it doesn't match the method.
         let mut attestation = make_attestation();
-        // Method is Oauth from make_attestation; change method to DnsRecord to create mismatch
-        attestation.evidence.method = VerificationMethod::DnsRecord;
+        attestation.evidence.proof = "arbitrary-non-json-string".to_owned();
         let errors = attestation.validate_structure();
         assert!(
-            errors.iter().any(|e| e.contains("proof variant expects")),
-            "validate_structure should catch proof-method mismatch: {errors:?}"
+            !errors.iter().any(|e| e.contains("proof")),
+            "validate_structure must not inspect proof content: {errors:?}"
         );
-    }
-
-    #[test]
-    fn all_verification_methods_have_matching_proof_variant() {
-        let pairs: [(VerificationMethod, AttestationProof); 4] = [
-            (
-                VerificationMethod::Oauth,
-                AttestationProof::OauthVerified {
-                    provider: "p".to_owned(),
-                    subject_id: "s".to_owned(),
-                    verified_at: 0,
-                },
-            ),
-            (
-                VerificationMethod::SignedPost,
-                AttestationProof::SignedPostVerified {
-                    post_url: "u".to_owned(),
-                    nonce: "n".to_owned(),
-                    posted_at: 0,
-                },
-            ),
-            (
-                VerificationMethod::DnsRecord,
-                AttestationProof::DnsRecordVerified {
-                    domain: "d".to_owned(),
-                    record_name: "r".to_owned(),
-                },
-            ),
-            (
-                VerificationMethod::ChallengeResponse,
-                AttestationProof::ChallengeResponseVerified {
-                    challenge: "c".to_owned(),
-                    response_signature: "s".to_owned(),
-                },
-            ),
-        ];
-        for (method, proof) in &pairs {
-            assert_eq!(
-                proof.expected_method(),
-                *method,
-                "proof {proof:?} should map to {method:?}"
-            );
-            let evidence = AttestationEvidence {
-                method: *method,
-                proof: proof.clone(),
-                verified_at: 0,
-                verifier_did: None,
-            };
-            assert!(
-                evidence.validate_proof_method().is_ok(),
-                "expected valid for method {method:?}"
-            );
-        }
     }
 }

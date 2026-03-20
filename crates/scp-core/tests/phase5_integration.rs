@@ -218,7 +218,7 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
         .expect("RevocationStatus serialization is infallible");
 
     canonical_hash(
-        "SCP-ATTESTATION-V2:",
+        "SCP-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(attestation.id.as_bytes()),
             CanonicalField::U16(scp_core::trust::attestation_type_tag(

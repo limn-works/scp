@@ -39,15 +39,10 @@ export interface IdentityLinkAttestation {
   /** Evidence supporting the claim. */
   evidence: {
     method: string;
-    /** Tagged enum matching scp-core's `AttestationProof` (e.g., `{ type: "oauth_verified", ... }`). */
-    proof: Record<string, unknown>;
+    /** Opaque proof string per spec §3.5.2 — verifiers MUST use as-is in signature scope. */
+    proof: string;
     verified_at: number;
     verifier_did?: string;
-  };
-  /** Revocation metadata. */
-  revocation: {
-    method: string;
-    endpoint: string;
   };
   /** Revocation status: `"Active"` or `{ "Revoked": { ... } }`. */
   revocation_status: string;

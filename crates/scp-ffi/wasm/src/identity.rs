@@ -81,26 +81,26 @@ mod canonical_attestation {
 
     /// Mirrors `scp_core::identity::attestation::AttestationEvidence` field order:
     /// `method`, `proof`, `verified_at`, `verifier_did`.
+    ///
+    /// The `proof` field is an opaque string per §3.5.2 — verifiers MUST use
+    /// this string as-is in signature scope, do not parse and re-serialize.
     #[derive(Serialize, Deserialize)]
     pub(super) struct Evidence {
         pub method: String,
-        pub proof: Proof,
+        pub proof: String,
         pub verified_at: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub verifier_did: Option<String>,
     }
 
-    /// Mirrors `scp_core::identity::attestation::AttestationProof` (§3.5.2).
+    /// **Deprecated**: Typed proof data (§3.5.2). Retained for reference only.
     ///
-    /// Uses `#[serde(tag = "type")]` with `rename_all = "snake_case"` to match
-    /// scp-core's wire format. This ensures `rmp_serde::to_vec_named` produces
-    /// keys in the same order as scp-core, producing byte-identical msgpack.
-    ///
-    /// Variant names intentionally mirror scp-core's `AttestationProof` enum
-    /// (all end in `Verified`), so we suppress the clippy lint.
+    /// The wire format uses an opaque `String` for the `proof` field in
+    /// [`Evidence`]. This enum is kept for informational purposes and
+    /// internal validation tooling.
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
-    #[allow(clippy::enum_variant_names)]
+    #[allow(clippy::enum_variant_names, dead_code)]
     pub(super) enum Proof {
         OauthVerified {
             provider: String,
@@ -1992,65 +1992,9 @@ pub fn identity_create_link_attestation(
         hasher.update(now_secs.to_be_bytes());
         let id = hex::encode(hasher.finalize());
 
-        // Parse the proof JSON string into a typed proof structure, matching
-        // the PyO3/NAPI/UniFFI bridges. The caller provides a JSON-serialized
-        // `AttestationProof` variant (e.g., `{"type":"oauth_verified","provider":"github.com",...}`).
-        let proof_value: serde_json::Value =
-            serde_json::from_str(&proof).map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!(
-                        "proof must be a JSON-serialized AttestationProof variant: {e}"
-                    ),
-                    code: "SCP-IDENT-1040".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-
-        // Validate that the parsed proof is a valid AttestationProof variant
-        // by deserializing into our local canonical type.
-        let typed_proof: canonical_attestation::Proof = serde_json::from_value(proof_value.clone())
-            .map_err(|e| -> JsValue {
-                ScpWasmError::Identity {
-                    message: format!(
-                        "proof JSON does not match any AttestationProof variant \
-                         (oauth_verified, signed_post_verified, dns_record_verified, \
-                         challenge_response_verified): {e}"
-                    ),
-                    code: "SCP-IDENT-1040".to_owned(),
-                }
-                .into_js()
-                .into()
-            })?;
-
-        // Validate variant-specific fields: ChallengeResponseVerified must have
-        // a non-empty response_signature, SignedPostVerified must have a non-empty
-        // post_url.
-        match &typed_proof {
-            canonical_attestation::Proof::ChallengeResponseVerified {
-                response_signature, ..
-            } if response_signature.is_empty() => {
-                return Err(ScpWasmError::Validation {
-                    message: "challenge_response_verified proof requires a non-empty \
-                              response_signature"
-                        .to_owned(),
-                    code: "SCP-VALID-7035".to_owned(),
-                }
-                .into_js()
-                .into());
-            }
-            canonical_attestation::Proof::SignedPostVerified { post_url, .. }
-                if post_url.is_empty() =>
-            {
-                return Err(ScpWasmError::Validation {
-                    message: "signed_post_verified proof requires a non-empty post_url".to_owned(),
-                    code: "SCP-VALID-7036".to_owned(),
-                }
-                .into_js()
-                .into());
-            }
-            _ => {}
-        }
+        // Proof is an opaque string per §3.5.2 — pass through as-is.
+        // Do not parse and re-serialize. Verifiers MUST use this string
+        // as-is in signature scope.
 
         // Build the attestation JSON.
         let mut attestation = serde_json::json!({
@@ -2066,12 +2010,8 @@ pub fn identity_create_link_attestation(
             },
             "evidence": {
                 "method": method_str,
-                "proof": proof_value,
+                "proof": proof,
                 "verified_at": now_secs,
-            },
-            "revocation": {
-                "method": "did_document",
-                "endpoint": "/revocations",
             },
             "revocation_status": "Active",
             "signature": [],
@@ -2119,20 +2059,8 @@ pub fn identity_create_link_attestation(
                     ));
                 }
             }
-            // proof variant matches verification method.
-            let expected_method = match &typed_proof {
-                canonical_attestation::Proof::OauthVerified { .. } => "oauth",
-                canonical_attestation::Proof::SignedPostVerified { .. } => "signed_post",
-                canonical_attestation::Proof::DnsRecordVerified { .. } => "dns_record",
-                canonical_attestation::Proof::ChallengeResponseVerified { .. } => {
-                    "challenge_response"
-                }
-            };
-            if method_str != expected_method {
-                errors.push(format!(
-                    "proof variant ({expected_method}) does not match evidence.method ({method_str})",
-                ));
-            }
+            // Note: proof is an opaque string per §3.5.2 — no structural
+            // validation of proof contents at the wire-format level.
             if !errors.is_empty() {
                 return Err(ScpWasmError::Validation {
                     message: format!(
@@ -2327,7 +2255,7 @@ fn compute_attestation_canonical_bytes(
         .map_err(|e| attestation_err(format!("revocation_status serialization failed: {e}")))?;
 
     let mut h = Sha256::new();
-    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V2:");
+    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
     for field in &[
         id.as_bytes().to_vec(),
         atype.as_bytes().to_vec(),
