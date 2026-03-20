@@ -356,17 +356,17 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .rotate_active_key(&scp_identity, &document, &custody.0)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            // Preserve existing attestations across key rotation.
-            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
-                Ok(e.identity_link_attestations.clone())
-            })
-            .unwrap_or_default();
 
             // Update the identity registry with the rotated key handles.
             crate::runtime::register_identity(
@@ -423,17 +423,17 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .add_agent_key(&scp_identity, &document, &custody.0)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            // Preserve existing attestations across agent key addition.
-            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
-                Ok(e.identity_link_attestations.clone())
-            })
-            .unwrap_or_default();
 
             // Update the identity registry with the new key state so that
             // bridge functions (ucan_delegate, etc.) see the updated identity.
@@ -492,17 +492,17 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("rotateAgentKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .rotate_agent_key(&scp_identity, &document, &custody.0)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            // Preserve existing attestations across agent key rotation.
-            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
-                Ok(e.identity_link_attestations.clone())
-            })
-            .unwrap_or_default();
 
             // Update the identity registry with the rotated key state.
             crate::runtime::register_identity(
@@ -560,17 +560,17 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("removeAgentKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .remove_agent_key(&scp_identity, &document)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            // Preserve existing attestations across agent key removal.
-            let existing_attestations = crate::runtime::with_identity(&new_identity.did, |e| {
-                Ok(e.identity_link_attestations.clone())
-            })
-            .unwrap_or_default();
 
             // Update the identity registry with the post-removal key state.
             crate::runtime::register_identity(
@@ -638,6 +638,12 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist now).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Spec §9.12 (Compromise Recovery Protocol) requires using the
             // pre-rotation key from cold storage — the pre-rotation commitment
             // in the old DID document proves the legitimate owner is rotating,
@@ -677,12 +683,6 @@ impl NapiIdentity {
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
             let new_did = new_identity.did.clone();
-
-            // Preserve existing attestations from the old DID across migration.
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
-                Ok(e.identity_link_attestations.clone())
-            })
-            .unwrap_or_default();
 
             // Remove the old identity and register the new one.
             crate::runtime::remove_identity(&self.inner.did);
