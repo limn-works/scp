@@ -11,8 +11,6 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use zeroize::Zeroizing;
-
 use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpWasmError;
@@ -2115,13 +2113,13 @@ pub fn metadata_record_to_json(
         .into_js()
     })?;
 
-    let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
+    let signature = hex::decode(&signature_hex).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid signature hex: {e}"),
             code: "SCP-VALID-7001".to_owned(),
         }
         .into_js()
-    })?);
+    })?;
     if signature.len() != 64 {
         return Err(ScpWasmError::Validation {
             message: format!("signature must be 64 bytes (got {})", signature.len()),
@@ -2139,7 +2137,7 @@ pub fn metadata_record_to_json(
         timestamp: ts,
         structural,
         operational,
-        signature: (*signature).clone(),
+        signature,
     };
 
     serde_json::to_string(&record).map_err(|e| {
