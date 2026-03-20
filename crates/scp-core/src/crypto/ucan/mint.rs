@@ -277,14 +277,21 @@ pub async fn mint_ucan(
         .collect();
 
     // Enforce ceiling compliance before doing any work (§5.3, #339).
-    if let Some(ref ceiling) = params.ceiling {
+    // Defense-in-depth: when no explicit ceiling is provided, apply the
+    // protocol default ceiling so that capabilities outside the standard
+    // set are always rejected at the core layer.
+    let effective_ceiling = params
+        .ceiling
+        .clone()
+        .unwrap_or_else(|| crate::context::roles::default_ceiling().to_ucan_string_set());
+    {
         let cap_uris: Vec<CapabilityUri> = parsed_caps
             .iter()
             .map(|(resource, action)| {
                 CapabilityUri::new(params.context_id, resource.as_str(), action.as_str())
             })
             .collect();
-        verify_ceiling_compliance(&cap_uris, ceiling)?;
+        verify_ceiling_compliance(&cap_uris, &effective_ceiling)?;
     }
 
     let now = now_secs()?;
@@ -534,9 +541,14 @@ pub async fn delegate_ucan(
     }
 
     // Step 2b: Enforce ceiling compliance on delegated capabilities (#339).
-    if let Some(ref ceiling) = params.ceiling {
-        verify_attestation_ceiling_compliance(params.attenuated_capabilities, ceiling)?;
-    }
+    // Defense-in-depth: when no explicit ceiling is provided, apply the
+    // protocol default ceiling so that capabilities outside the standard
+    // set are always rejected at the core layer.
+    let effective_ceiling = params
+        .ceiling
+        .clone()
+        .unwrap_or_else(|| crate::context::roles::default_ceiling().to_ucan_string_set());
+    verify_attestation_ceiling_compliance(params.attenuated_capabilities, &effective_ceiling)?;
 
     // Step 3: Enforce 24-hour maximum expiry.
     if params.lifetime_secs > MAX_EXPIRY_SECS {
@@ -2722,8 +2734,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_ucan_no_ceiling_allows_any_capability() {
+    async fn mint_ucan_no_ceiling_applies_default_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
+        // These capabilities are within the default ceiling:
+        // tool_invoke:assistant is covered by ToolInvokeAll (tool_invoke:*),
+        // messages:write is exact match.
         let caps = vec![
             "tool_invoke:assistant".to_owned(),
             "messages:write".to_owned(),
@@ -2746,7 +2761,38 @@ mod tests {
 
         assert!(
             mint_ucan(&params, &custody).await.is_ok(),
-            "minting with ceiling: None must succeed regardless of capabilities"
+            "minting with ceiling: None must succeed for capabilities within the default ceiling"
+        );
+    }
+
+    /// When `ceiling` is `None`, the default ceiling is applied as defense-in-depth.
+    /// Capabilities outside the default ceiling must be rejected.
+    #[tokio::test]
+    async fn mint_ucan_no_ceiling_rejects_capability_outside_default() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        // "custom:exotic" is NOT in the default ceiling (which contains only
+        // standard SCP capabilities like messages:*, tool_invoke:*, etc.).
+        let caps = vec!["custom:exotic".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-default-ceiling",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+
+        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityOutsideCeiling(_)),
+            "ceiling: None must apply default ceiling and reject non-standard capabilities, got: {err:?}"
         );
     }
 
@@ -2920,6 +2966,10 @@ mod tests {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         let caps = vec!["context:child:create".to_owned()];
 
+        // context:child:create is NOT in the default ceiling, so provide an
+        // explicit ceiling that includes it for this URI format test.
+        let ceiling: HashSet<String> = std::iter::once("context_child:create".to_owned()).collect();
+
         let params = MintParams {
             issuer_did: &issuer_did,
             issuer_key: &key_handle,
@@ -2932,7 +2982,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
-            ceiling: None,
+            ceiling: Some(ceiling),
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
