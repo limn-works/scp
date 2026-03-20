@@ -274,6 +274,7 @@ impl NativeRelayClient {
 
     /// Background task that reads from the WebSocket and dispatches relay
     /// messages to pending requests or subscription channels.
+    #[tracing::instrument(skip_all)]
     async fn reader_loop(
         mut source: WsSource,
         inner: Arc<RwLock<ClientInner>>,
@@ -481,6 +482,7 @@ impl NativeRelayClient {
     /// Returns [`TransportError::SendFailed`] if the WebSocket send fails.
     /// Returns [`TransportError::Timeout`] if no response is received within
     /// 30 seconds.
+    #[tracing::instrument(skip_all)]
     pub async fn send_request(
         &self,
         mut msg: ClientMessage,

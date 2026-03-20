@@ -37,11 +37,11 @@ import asyncio
 from types import TracebackType
 from typing import TYPE_CHECKING
 
-import _scp_core
-
 from scp_sdk.context import validate_admission, validate_broadcast_key_hex
 
 if TYPE_CHECKING:
+    import _scp_core
+
     from scp_sdk.context import SiteConfig
     from scp_sdk.identity import Identity
 
@@ -81,6 +81,8 @@ class Relay:
         Returns a :class:`Relay` whose :attr:`relay_url` property contains
         the WebSocket URL for clients.
         """
+        import _scp_core
+
         handle = await asyncio.to_thread(_scp_core.py_relay_start_in_memory)
         return Relay(handle)
 
@@ -93,6 +95,8 @@ class Relay:
         Args:
             data_dir: Directory for persistent blob storage.
         """
+        import _scp_core
+
         handle = await asyncio.to_thread(_scp_core.py_relay_start_local, data_dir)
         return Relay(handle)
 
@@ -179,6 +183,8 @@ class Node:
                 via :meth:`~scp_sdk.identity.Identity.create` in the same
                 process (it must exist in the bridge identity registry).
         """
+        import _scp_core
+
         did = identity.did if identity is not None else None
         handle = await asyncio.to_thread(_scp_core.py_node_start_in_memory, did)
         return Node(handle)
@@ -215,6 +221,8 @@ class Node:
                 key file at rest).  Falls back to ``SCP_KEY_PASSPHRASE`` env
                 var when ``None``.
         """
+        import _scp_core
+
         did = identity.did if identity is not None else None
         handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did, passphrase)
         return Node(handle)
