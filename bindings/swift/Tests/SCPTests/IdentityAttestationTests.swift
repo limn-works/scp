@@ -24,7 +24,7 @@ final class IdentityAttestationTests: XCTestCase {
         XCTAssertEqual(att.platformHandle, "alice")
         XCTAssertEqual(att.verificationMethod, "did:dht:z6Mk...#active")
         XCTAssertEqual(att.verifiedAt, 1_700_000_000.0)
-        XCTAssertEqual(att.revocationStatus, "active")
+        XCTAssertEqual(att.revocationStatus, .active)
         XCTAssertNil(att.platformId)
     }
 
@@ -35,11 +35,40 @@ final class IdentityAttestationTests: XCTestCase {
             platformHandle: "bob",
             verificationMethod: "did:dht:z6Mk...#agent",
             verifiedAt: 1_700_000_000.0,
-            revocationStatus: "revoked",
+            revocationStatus: .revoked(revokedAt: 1_700_000_100.0, reason: "compromised"),
             platformId: "12345"
         )
-        XCTAssertEqual(att.revocationStatus, "revoked")
+        XCTAssertEqual(att.revocationStatus, .revoked(revokedAt: 1_700_000_100.0, reason: "compromised"))
+        XCTAssertEqual(att.revocationStatus.status, "revoked")
+        XCTAssertEqual(att.revocationStatus.revokedAt, 1_700_000_100.0)
+        XCTAssertEqual(att.revocationStatus.reason, "compromised")
         XCTAssertEqual(att.platformId, "12345")
+    }
+
+    func testRevocationStatusActive() {
+        let status = RevocationStatus.active
+        XCTAssertEqual(status.status, "active")
+        XCTAssertNil(status.revokedAt)
+        XCTAssertNil(status.reason)
+    }
+
+    func testRevocationStatusRevoked() {
+        let status = RevocationStatus.revoked(revokedAt: 1_700_000_100.0, reason: "test")
+        XCTAssertEqual(status.status, "revoked")
+        XCTAssertEqual(status.revokedAt, 1_700_000_100.0)
+        XCTAssertEqual(status.reason, "test")
+    }
+
+    func testRevocationStatusEquality() {
+        XCTAssertEqual(RevocationStatus.active, RevocationStatus.active)
+        XCTAssertNotEqual(
+            RevocationStatus.active,
+            RevocationStatus.revoked(revokedAt: 1_700_000_100.0)
+        )
+        XCTAssertEqual(
+            RevocationStatus.revoked(revokedAt: 1_700_000_100.0, reason: "test"),
+            RevocationStatus.revoked(revokedAt: 1_700_000_100.0, reason: "test")
+        )
     }
 
     func testEquality() {

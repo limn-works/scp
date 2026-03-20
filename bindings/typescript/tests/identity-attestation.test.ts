@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { IdentityAttestation } from "../src/identity";
+import { IdentityAttestation, RevocationStatus } from "../src/identity";
 
 // ---------------------------------------------------------------------------
 // IdentityAttestation class tests
@@ -21,7 +21,7 @@ describe("IdentityAttestation", () => {
     platformHandle: "alice",
     verificationMethod: "did:dht:z6Mk...#active",
     verifiedAt: 1700000000,
-    revocationStatus: "active",
+    revocationStatus: RevocationStatus.active(),
   };
 
   it("constructs with all required fields", () => {
@@ -31,7 +31,7 @@ describe("IdentityAttestation", () => {
     expect(att.platformHandle).toBe("alice");
     expect(att.verificationMethod).toBe("did:dht:z6Mk...#active");
     expect(att.verifiedAt).toBe(1700000000);
-    expect(att.revocationStatus).toBe("active");
+    expect(att.revocationStatus.status).toBe("active");
     expect(att.platformId).toBeUndefined();
   });
 
@@ -64,11 +64,11 @@ describe("IdentityAttestation", () => {
       platformHandle: "alice",
       verificationMethod: "did:dht:z6Mk...#active",
       verifiedAt: 1700000000,
-      revocationStatus: "active",
+      revocationStatus: "Active",
     };
     const att = IdentityAttestation._fromRecord(record);
     expect(att.platformHandle).toBe("alice");
-    expect(att.revocationStatus).toBe("active");
+    expect(att.revocationStatus.status).toBe("active");
   });
 
   it("_fromRecord defaults revocationStatus to active", () => {
@@ -80,21 +80,23 @@ describe("IdentityAttestation", () => {
       verified_at: 1700000000,
     };
     const att = IdentityAttestation._fromRecord(record);
-    expect(att.revocationStatus).toBe("active");
+    expect(att.revocationStatus.status).toBe("active");
   });
 
-  it("_fromJson parses JSON string", () => {
+  it("_fromJson parses JSON string with Revoked status", () => {
     const json = JSON.stringify({
       id: "abc123",
       platform: "github.com",
       platform_handle: "alice",
       verification_method: "did:dht:z6Mk...#active",
       verified_at: 1700000000,
-      revocation_status: "revoked",
+      revocation_status: { Revoked: { revoked_at: 1700000100, reason: "test" } },
     });
     const att = IdentityAttestation._fromJson(json);
     expect(att.id).toBe("abc123");
-    expect(att.revocationStatus).toBe("revoked");
+    expect(att.revocationStatus.status).toBe("revoked");
+    expect(att.revocationStatus.revokedAt).toBe(1700000100);
+    expect(att.revocationStatus.reason).toBe("test");
   });
 
   it("_toBridgeRecord produces snake_case keys", () => {
@@ -105,7 +107,7 @@ describe("IdentityAttestation", () => {
     expect(rec.platform_handle).toBe("alice");
     expect(rec.verification_method).toBe("did:dht:z6Mk...#active");
     expect(rec.verified_at).toBe(1700000000);
-    expect(rec.revocation_status).toBe("active");
+    expect(rec.revocation_status).toBe("Active");
     expect(rec.platform_id).toBeUndefined();
   });
 
@@ -124,7 +126,33 @@ describe("IdentityAttestation", () => {
     expect(roundtrip.platformHandle).toBe(att.platformHandle);
     expect(roundtrip.verificationMethod).toBe(att.verificationMethod);
     expect(roundtrip.verifiedAt).toBe(att.verifiedAt);
-    expect(roundtrip.revocationStatus).toBe(att.revocationStatus);
+    expect(roundtrip.revocationStatus.status).toBe(att.revocationStatus.status);
     expect(roundtrip.platformId).toBe(att.platformId);
+  });
+
+  it("RevocationStatus.active() creates active status", () => {
+    const rs = RevocationStatus.active();
+    expect(rs.status).toBe("active");
+    expect(rs.revokedAt).toBeUndefined();
+    expect(rs.reason).toBeUndefined();
+  });
+
+  it("RevocationStatus.revoked() creates revoked status", () => {
+    const rs = RevocationStatus.revoked(1700000100, "compromised");
+    expect(rs.status).toBe("revoked");
+    expect(rs.revokedAt).toBe(1700000100);
+    expect(rs.reason).toBe("compromised");
+  });
+
+  it("RevocationStatus round-trips through bridge value", () => {
+    const active = RevocationStatus.active();
+    const activeRt = RevocationStatus._fromBridgeValue(active._toBridgeValue());
+    expect(activeRt.status).toBe("active");
+
+    const revoked = RevocationStatus.revoked(1700000100, "test");
+    const revokedRt = RevocationStatus._fromBridgeValue(revoked._toBridgeValue());
+    expect(revokedRt.status).toBe("revoked");
+    expect(revokedRt.revokedAt).toBe(1700000100);
+    expect(revokedRt.reason).toBe("test");
   });
 });

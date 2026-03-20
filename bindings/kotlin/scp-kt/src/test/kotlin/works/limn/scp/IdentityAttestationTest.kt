@@ -32,7 +32,8 @@ class IdentityAttestationTest {
         assertEquals("alice", att.platformHandle)
         assertEquals("did:dht:z6Mk...#active", att.verificationMethod)
         assertEquals(1_700_000_000.0, att.verifiedAt)
-        assertEquals("active", att.revocationStatus)
+        assertEquals(RevocationStatus.Active, att.revocationStatus)
+        assertEquals("active", att.revocationStatus.status)
         assertNull(att.platformId)
     }
 
@@ -44,11 +45,47 @@ class IdentityAttestationTest {
             platformHandle = "bob",
             verificationMethod = "did:dht:z6Mk...#agent",
             verifiedAt = 1_700_000_000.0,
-            revocationStatus = "revoked",
+            revocationStatus = RevocationStatus.Revoked(
+                revokedAt = 1_700_000_100.0,
+                reason = "compromised",
+            ),
             platformId = "12345",
         )
-        assertEquals("revoked", att.revocationStatus)
+        assertEquals("revoked", att.revocationStatus.status)
         assertEquals("12345", att.platformId)
+        val revoked = att.revocationStatus as RevocationStatus.Revoked
+        assertEquals(1_700_000_100.0, revoked.revokedAt)
+        assertEquals("compromised", revoked.reason)
+    }
+
+    @Test
+    fun `RevocationStatus Active`() {
+        val rs = RevocationStatus.Active
+        assertEquals("active", rs.status)
+    }
+
+    @Test
+    fun `RevocationStatus Revoked`() {
+        val rs = RevocationStatus.Revoked(
+            revokedAt = 1_700_000_100.0,
+            reason = "test",
+        )
+        assertEquals("revoked", rs.status)
+        assertEquals(1_700_000_100.0, rs.revokedAt)
+        assertEquals("test", rs.reason)
+    }
+
+    @Test
+    fun `RevocationStatus equality`() {
+        assertEquals(RevocationStatus.Active, RevocationStatus.Active)
+        assertEquals(
+            RevocationStatus.Revoked(revokedAt = 1.0, reason = "a"),
+            RevocationStatus.Revoked(revokedAt = 1.0, reason = "a"),
+        )
+        assertNotEquals(
+            RevocationStatus.Active as RevocationStatus,
+            RevocationStatus.Revoked(revokedAt = 1.0) as RevocationStatus,
+        )
     }
 
     @Test

@@ -525,6 +525,62 @@ public func executeCustodyMigration(
     try await executeCustodyMigrationFn(did, target, contextIds)
 }
 
+// MARK: - RevocationStatus
+
+/// Revocation status for an identity attestation (§3.5).
+///
+/// Mirrors the Rust `RevocationStatus` enum:
+///
+/// - `Active` -> `.active`
+/// - `Revoked { revoked_at, reason }` -> `.revoked(revokedAt:reason:)`
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public enum RevocationStatus: Sendable, Equatable {
+    /// The attestation is active and valid.
+    case active
+
+    /// The attestation has been revoked.
+    ///
+    /// - Parameters:
+    ///   - revokedAt: Unix timestamp (seconds) when the attestation was revoked.
+    ///   - reason: Optional human-readable revocation reason.
+    case revoked(revokedAt: Double, reason: String? = nil)
+
+    /// The status string: `"active"` or `"revoked"`.
+    public var status: String {
+        switch self {
+        case .active:
+            return "active"
+        case .revoked:
+            return "revoked"
+        }
+    }
+
+    /// Unix timestamp (seconds) when the attestation was revoked.
+    /// Returns `nil` for active attestations.
+    public var revokedAt: Double? {
+        switch self {
+        case .active:
+            return nil
+        case let .revoked(revokedAt, _):
+            return revokedAt
+        }
+    }
+
+    /// Optional human-readable revocation reason.
+    /// Returns `nil` for active attestations.
+    public var reason: String? {
+        switch self {
+        case .active:
+            return nil
+        case let .revoked(_, reason):
+            return reason
+        }
+    }
+}
+
 // MARK: - IdentityAttestation
 
 /// An identity link attestation binding a DID to an external platform (§3.5).
@@ -550,8 +606,8 @@ public struct IdentityAttestation: Sendable, Equatable {
     /// Unix timestamp (seconds) when the evidence was last verified.
     public let verifiedAt: Double
 
-    /// Revocation status: `"active"`, `"revoked"`, or `"expired"`.
-    public let revocationStatus: String
+    /// Revocation status.
+    public let revocationStatus: RevocationStatus
 
     /// Optional platform-assigned unique identifier.
     public let platformId: String?
@@ -563,7 +619,7 @@ public struct IdentityAttestation: Sendable, Equatable {
         platformHandle: String,
         verificationMethod: String,
         verifiedAt: Double,
-        revocationStatus: String = "active",
+        revocationStatus: RevocationStatus = .active,
         platformId: String? = nil
     ) {
         self.id = id

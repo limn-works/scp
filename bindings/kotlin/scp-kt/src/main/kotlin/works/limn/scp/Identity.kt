@@ -262,6 +262,39 @@ class IdentityAdvancedBridge internal constructor(
 // ---------------------------------------------------------------------------
 
 /**
+ * Revocation status for an identity attestation (§3.5).
+ *
+ * Mirrors the Rust `RevocationStatus` enum:
+ *
+ * - `Active` -> [RevocationStatus.Active]
+ * - `Revoked { revoked_at, reason }` -> [RevocationStatus.Revoked]
+ *
+ * Provenance: §3.5 (Identity Link Attestations)
+ */
+sealed class RevocationStatus {
+    /** The status string: `"active"` or `"revoked"`. */
+    abstract val status: String
+
+    /** The attestation is active and valid. */
+    data object Active : RevocationStatus() {
+        override val status: String = "active"
+    }
+
+    /**
+     * The attestation has been revoked.
+     *
+     * @property revokedAt Unix timestamp (seconds) when revoked.
+     * @property reason Optional human-readable revocation reason.
+     */
+    data class Revoked(
+        val revokedAt: Double,
+        val reason: String? = null,
+    ) : RevocationStatus() {
+        override val status: String = "revoked"
+    }
+}
+
+/**
  * An identity link attestation binding a DID to an external platform (§3.5).
  *
  * Represents a cryptographically signed claim that the DID owner also
@@ -277,7 +310,7 @@ class IdentityAdvancedBridge internal constructor(
  * @property platformHandle Platform handle or username.
  * @property verificationMethod DID verification method that signed this attestation.
  * @property verifiedAt Unix timestamp (seconds) when the evidence was last verified.
- * @property revocationStatus Revocation status: `"active"`, `"revoked"`, or `"expired"`.
+ * @property revocationStatus Revocation status.
  * @property platformId Optional platform-assigned unique identifier.
  */
 data class IdentityAttestation(
@@ -286,7 +319,7 @@ data class IdentityAttestation(
     val platformHandle: String,
     val verificationMethod: String,
     val verifiedAt: Double,
-    val revocationStatus: String = "active",
+    val revocationStatus: RevocationStatus = RevocationStatus.Active,
     val platformId: String? = null,
 )
 
