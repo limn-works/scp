@@ -1495,8 +1495,18 @@ pub async fn identity_create_link_attestation(
         })?;
     attestation.signature = sig.as_bytes().to_vec();
 
-    // Phase 3: store attestation (re-acquire DashMap lock).
+    // Phase 3: store attestation (re-acquire DashMap lock, TOCTOU guard).
     crate::runtime::with_identity_mut(&did, |entry| {
+        // Verify the active signing key has not been rotated between Phase 1 and Phase 3.
+        if entry.identity.active_signing_key != key_handle {
+            return Err(ScpNapiError::Identity {
+                message: "active signing key was rotated during attestation creation — \
+                         please retry"
+                    .to_owned(),
+                code: "SCP-IDENT-1041".to_owned(),
+            });
+        }
+
         if entry.identity_link_attestations.len() >= NAPI_LINK_ATTESTATION_PER_DID_CAP {
             return Err(ScpNapiError::Identity {
                 message: format!(
