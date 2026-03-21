@@ -44,8 +44,10 @@ export interface IdentityLinkAttestation {
     verified_at: number;
     verifier_did?: string;
   };
-  /** Revocation status: `"Active"` or `{ "Revoked": { ... } }`. */
-  revocation_status: string;
+  /** Revocation status: `"Active"` or `{ Revoked: { revoked_at, reason, revoked_by } }`. */
+  revocation_status:
+    | "Active"
+    | { Revoked: { revoked_at: number; reason: string; revoked_by: string } };
   /** Ed25519 signature bytes. */
   signature: number[];
 }

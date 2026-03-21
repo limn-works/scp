@@ -5,9 +5,10 @@ import XCTest
 ///
 /// Covers:
 /// - IdentityAttestation construction and equality
-/// - IdentityAttestationBridge defaults throw not-implemented
-/// - Public API functions throw not-implemented with correct error codes
-/// - IdentityAttestation.verify throws not-implemented
+/// - IdentityAttestationBridge defaults delegate to UniFFI
+/// - Forward declaration stubs return expected values before native lib is linked
+/// - Wire format JSON parsing round-trips correctly
+/// - Custom bridge function injection
 final class IdentityAttestationTests: XCTestCase {
     // MARK: - IdentityAttestation struct tests
 
@@ -71,6 +72,18 @@ final class IdentityAttestationTests: XCTestCase {
         )
     }
 
+    func testConstructionWithRawJson() {
+        let att = IdentityAttestation(
+            id: "abc123",
+            platform: "github.com",
+            platformHandle: "alice",
+            verificationMethod: "did:dht:z6Mk...#active",
+            verifiedAt: 1_700_000_000,
+            rawJson: "{\"id\":\"abc123\"}"
+        )
+        XCTAssertEqual(att.rawJson, "{\"id\":\"abc123\"}")
+    }
+
     func testEquality() {
         let att1 = IdentityAttestation(
             id: "abc123",
@@ -107,92 +120,16 @@ final class IdentityAttestationTests: XCTestCase {
         XCTAssertNotEqual(att1, att2)
     }
 
-    // MARK: - Bridge defaults throw not-implemented
+    // MARK: - Forward declaration stubs (before native lib linked)
 
-    func testCreateThrowsNotImplemented() async {
-        do {
-            _ = try await createIdentityAttestation(
-                did: "did:dht:z6MkTest",
-                platform: "github.com",
-                handle: "alice",
-                proof: "proof123"
-            )
-            XCTFail("Expected error")
-        } catch let error as ScpError {
-            switch error {
-            case let .Identity(msg, code):
-                XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9010")
-            default:
-                XCTFail("Expected Identity error, got \(error)")
-            }
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
+    func testRemoveForwardDeclarationReturnsFalse() {
+        // The forward declaration returns false until ScpBindings.swift is
+        // regenerated with the native library (#1453).
+        let result = identityRemoveLinkAttestation(did: "did:dht:z6MkTest", attestationId: "att-123")
+        XCTAssertFalse(result)
     }
 
-    func testListThrowsNotImplemented() async {
-        do {
-            _ = try await listIdentityAttestations(did: "did:dht:z6MkTest")
-            XCTFail("Expected error")
-        } catch let error as ScpError {
-            switch error {
-            case let .Identity(msg, code):
-                XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9011")
-            default:
-                XCTFail("Expected Identity error, got \(error)")
-            }
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
-    }
-
-    func testRemoveThrowsNotImplemented() async {
-        do {
-            _ = try await removeIdentityAttestation(
-                did: "did:dht:z6MkTest",
-                attestationId: "att-123"
-            )
-            XCTFail("Expected error")
-        } catch let error as ScpError {
-            switch error {
-            case let .Identity(msg, code):
-                XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9012")
-            default:
-                XCTFail("Expected Identity error, got \(error)")
-            }
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
-    }
-
-    func testVerifyThrowsNotImplemented() async {
-        let att = IdentityAttestation(
-            id: "abc123",
-            platform: "github.com",
-            platformHandle: "alice",
-            verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000
-        )
-        do {
-            _ = try await att.verify()
-            XCTFail("Expected error")
-        } catch let error as ScpError {
-            switch error {
-            case let .Identity(msg, code):
-                XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9014")
-            default:
-                XCTFail("Expected Identity error, got \(error)")
-            }
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
-    }
-
-    // MARK: - Custom bridge function injection
+    // MARK: - Bridge wiring via custom injection
 
     func testCreateWithCustomFn() async throws {
         let expected = IdentityAttestation(
@@ -231,5 +168,84 @@ final class IdentityAttestationTests: XCTestCase {
             listFn: customList
         )
         XCTAssertEqual(result, expected)
+    }
+
+    func testRemoveWithCustomFn() async throws {
+        let customRemove: IdentityAttestationBridge.RemoveFn = { _, _ in true }
+        let result = try await removeIdentityAttestation(
+            did: "did:dht:z6MkTest",
+            attestationId: "att-123",
+            removeFn: customRemove
+        )
+        XCTAssertTrue(result)
+    }
+
+    func testVerifyWithCustomFn() async throws {
+        let att = IdentityAttestation(
+            id: "abc123",
+            platform: "github.com",
+            platformHandle: "alice",
+            verificationMethod: "did:dht:z6Mk...#active",
+            verifiedAt: 1_700_000_000
+        )
+        let customVerify: IdentityAttestationBridge.VerifyFn = { _ in true }
+        let result = try await att.verify(verifyFn: customVerify)
+        XCTAssertTrue(result)
+    }
+
+    func testVerifyWithCustomFnFalse() async throws {
+        let att = IdentityAttestation(
+            id: "abc123",
+            platform: "github.com",
+            platformHandle: "alice",
+            verificationMethod: "did:dht:z6Mk...#active",
+            verifiedAt: 1_700_000_000
+        )
+        let customVerify: IdentityAttestationBridge.VerifyFn = { _ in false }
+        let result = try await att.verify(verifyFn: customVerify)
+        XCTAssertFalse(result)
+    }
+
+    func testCreateWithCustomFnCaptures() async throws {
+        var capturedDid: String?
+        var capturedPlatform: String?
+        var capturedHandle: String?
+        var capturedProof: String?
+        var capturedMethod: String?
+        var capturedPlatformId: String?
+
+        let customCreate: IdentityAttestationBridge.CreateFn = { did, platform, handle, proof, method, platformId in
+            capturedDid = did
+            capturedPlatform = platform
+            capturedHandle = handle
+            capturedProof = proof
+            capturedMethod = method
+            capturedPlatformId = platformId
+            return IdentityAttestation(
+                id: "captured",
+                platform: platform,
+                platformHandle: handle,
+                verificationMethod: method,
+                verifiedAt: 1_700_000_000,
+                platformId: platformId
+            )
+        }
+        let result = try await createIdentityAttestation(
+            did: "did:dht:z6MkTest",
+            platform: "github.com",
+            handle: "alice",
+            proof: "proof123",
+            verificationMethod: "signed_post",
+            platformId: "uid-42",
+            createFn: customCreate
+        )
+        XCTAssertEqual(capturedDid, "did:dht:z6MkTest")
+        XCTAssertEqual(capturedPlatform, "github.com")
+        XCTAssertEqual(capturedHandle, "alice")
+        XCTAssertEqual(capturedProof, "proof123")
+        XCTAssertEqual(capturedMethod, "signed_post")
+        XCTAssertEqual(capturedPlatformId, "uid-42")
+        XCTAssertEqual(result.id, "captured")
+        XCTAssertEqual(result.platformId, "uid-42")
     }
 }

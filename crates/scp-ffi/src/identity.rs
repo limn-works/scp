@@ -1470,7 +1470,6 @@ fn py_verify_identity_link_attestation(
 
     let json_owned = attestation_json.to_owned();
     let hex_key_owned = issuer_public_key_hex.map(ToOwned::to_owned);
-    let rt = crate::runtime()?;
 
     py.allow_threads(move || -> Result<bool, ScpPyError> {
         let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
@@ -1482,24 +1481,21 @@ fn py_verify_identity_link_attestation(
                 .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
             Ok(attestation.verify_signature(&pub_bytes).is_ok())
         } else {
-            // Fall back to the identity registry.
-            use scp_platform::traits::KeyCustody;
-
+            // Extract the public key directly from the issuer DID string.
+            // For did:dht:z... DIDs the Ed25519 identity key is embedded in the
+            // DID itself (z-base-32 encoded). This is rotation-safe: the identity
+            // key (#0) is the canonical attestation signing key per ADR-017 and
+            // never goes stale, unlike the active signing key stored in the
+            // custody registry.
             let issuer_did: &str = &attestation.issuer;
-
-            // Phase 1: extract custody + key handle (under DashMap lock, then drop).
-            let (custody, key_handle) = crate::runtime::with_identity(issuer_did, |entry| {
-                Ok((
-                    Arc::clone(&entry.custody),
-                    entry.identity.active_signing_key,
-                ))
-            })?;
-
-            // Phase 2: get public key (no DashMap lock held — safe to block_on).
-            let pub_key = rt
-                .block_on(custody.public_key(&key_handle))
-                .map_err(|e| ScpPyError::identity(format!("failed to get public key: {e}")))?;
-            Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
+            let pub_bytes =
+                scp_ffi_common::validate::extract_public_key_from_did(issuer_did)
+                    .map_err(|e| {
+                        ScpPyError::identity(format!(
+                            "failed to extract public key from issuer DID '{issuer_did}': {e}"
+                        ))
+                    })?;
+            Ok(attestation.verify_signature(&pub_bytes).is_ok())
         }
     })
     .map_err(PyErr::from)

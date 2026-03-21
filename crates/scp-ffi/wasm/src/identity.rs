@@ -2284,7 +2284,7 @@ fn compute_attestation_canonical_bytes(
 /// Resolves the Ed25519 public key for attestation verification.
 ///
 /// If `issuer_public_key_hex` is provided, decodes and returns it. Otherwise
-/// falls back to the WASM-local identity registry.
+/// extracts the Ed25519 identity key from the issuer's `did:dht:z...` string.
 fn resolve_attestation_public_key(
     issuer: &str,
     issuer_public_key_hex: Option<&str>,
@@ -2305,10 +2305,23 @@ fn resolve_attestation_public_key(
         arr.copy_from_slice(&decoded);
         Ok(Some(arr))
     } else {
-        Ok(IDENTITY_REGISTRY.with(|reg| {
-            let map = reg.borrow();
-            map.get(issuer).map(|entry| entry.public_key_bytes)
-        }))
+        // Extract the public key directly from the issuer DID string.
+        // For did:dht:z... DIDs the Ed25519 identity key is embedded in the
+        // DID itself (z-base-32 encoded). This is rotation-safe: the identity
+        // key (#0) is the canonical attestation signing key per ADR-017 and
+        // never goes stale, unlike the active signing key stored in the
+        // custody registry.
+        match scp_ffi_common::validate::extract_public_key_from_did(issuer) {
+            Ok(key) => Ok(Some(key)),
+            Err(e) => Err(ScpWasmError::Identity {
+                message: format!(
+                    "failed to extract public key from issuer DID '{issuer}': {e}"
+                ),
+                code: "SCP-IDENT-1044".to_owned(),
+            }
+            .into_js()
+            .into()),
+        }
     }
 }
 

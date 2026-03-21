@@ -2713,6 +2713,7 @@ pub async fn identity_verify_link_attestation(
 }
 
 #[cfg(feature = "allow_in_memory_custody")]
+#[allow(clippy::unused_async)]
 async fn identity_verify_link_attestation_impl(
     attestation_json: String,
     issuer_public_key_hex: Option<String>,
@@ -2733,33 +2734,19 @@ async fn identity_verify_link_attestation_impl(
         })?;
         Ok(attestation.verify_signature(&pub_bytes).is_ok())
     } else {
-        // Fall back to the identity custody registry.
-        use scp_platform::traits::KeyCustody;
-
+        // Extract the public key directly from the issuer DID string.
+        // For did:dht:z... DIDs the Ed25519 identity key is embedded in the
+        // DID itself (z-base-32 encoded). This is rotation-safe: the identity
+        // key (#0) is the canonical attestation signing key per ADR-017 and
+        // never goes stale, unlike the active signing key stored in the
+        // custody registry.
         let issuer_did = attestation.issuer.to_string();
-        let entry = identity_custody_registry()
-            .get(&issuer_did)
-            .ok_or_else(|| ScpError::Identity {
-                msg: format!(
-                    "issuer identity '{issuer_did}' not found — verify requires the issuer \
-                     to have created an attestation via identity_create_link_attestation"
-                ),
+        let pub_bytes =
+            scp_identity::extract_public_key(&issuer_did).map_err(|e| ScpError::Identity {
+                msg: format!("failed to extract public key from issuer DID '{issuer_did}': {e}"),
                 code: "SCP-IDENT-1044".to_owned(),
             })?;
-        let (custody, active_key) = entry.value().clone();
-
-        let pub_key = runtime()
-            .spawn(async move { custody.0.public_key(&active_key).await })
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("tokio join error: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            })?
-            .map_err(|e| ScpError::Identity {
-                msg: format!("failed to get public key: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            })?;
-        Ok(attestation.verify_signature(pub_key.as_bytes()).is_ok())
+        Ok(attestation.verify_signature(&pub_bytes).is_ok())
     }
 }
 

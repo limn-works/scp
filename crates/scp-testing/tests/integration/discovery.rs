@@ -410,7 +410,8 @@ async fn bootstrap_config() {
     let config = BootstrapConfig::with_defaults(vec![
         BootstrapContextEntry::new("ctx-discovery-1".to_owned(), DID::from("did:dht:zCreator1")),
         BootstrapContextEntry::new("ctx-discovery-2".to_owned(), DID::from("did:dht:zCreator2")),
-    ]);
+    ])
+    .unwrap();
     assert_eq!(config.default_contexts.len(), 2);
     assert!(config.custom_contexts.is_empty());
 

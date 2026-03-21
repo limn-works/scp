@@ -93,6 +93,16 @@ pub enum BootstrapVerificationError {
     /// [`MAX_CUSTOM_CONTEXTS`].
     #[error("custom contexts list has reached maximum capacity ({MAX_CUSTOM_CONTEXTS})")]
     TooManyCustomContexts,
+
+    /// The default contexts list exceeds the maximum allowed size.
+    ///
+    /// Prevents unbounded growth of the default contexts list. The limit is
+    /// [`MAX_DEFAULT_CONTEXTS`].
+    #[error("default contexts list length {count} exceeds maximum of {MAX_DEFAULT_CONTEXTS}")]
+    TooManyDefaultContexts {
+        /// The number of entries that were provided.
+        count: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +112,8 @@ pub enum BootstrapVerificationError {
 /// Maximum number of default bootstrap context entries allowed in a [`BootstrapConfig`].
 ///
 /// Prevents unbounded growth of the default contexts list. Callers passing
-/// more entries to [`BootstrapConfig::with_defaults`] will trigger a panic.
+/// more entries to [`BootstrapConfig::with_defaults`] will receive a
+/// [`BootstrapVerificationError::TooManyDefaultContexts`] error.
 pub const MAX_DEFAULT_CONTEXTS: usize = 100;
 
 /// Maximum number of custom context entries allowed in a [`BootstrapConfig`].
@@ -228,20 +239,22 @@ impl BootstrapConfig {
     ///
     /// * `contexts` -- Default bootstrap context entries to query on bootstrap.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `contexts.len()` exceeds [`MAX_DEFAULT_CONTEXTS`].
-    #[must_use]
-    pub fn with_defaults(contexts: Vec<BootstrapContextEntry>) -> Self {
-        assert!(
-            contexts.len() <= MAX_DEFAULT_CONTEXTS,
-            "too many default contexts: {} exceeds limit of {MAX_DEFAULT_CONTEXTS}",
-            contexts.len()
-        );
-        Self {
+    /// Returns [`BootstrapVerificationError::TooManyDefaultContexts`] if
+    /// `contexts.len()` exceeds [`MAX_DEFAULT_CONTEXTS`].
+    pub fn with_defaults(
+        contexts: Vec<BootstrapContextEntry>,
+    ) -> Result<Self, BootstrapVerificationError> {
+        if contexts.len() > MAX_DEFAULT_CONTEXTS {
+            return Err(BootstrapVerificationError::TooManyDefaultContexts {
+                count: contexts.len(),
+            });
+        }
+        Ok(Self {
             default_contexts: contexts,
             ..Self::default()
-        }
+        })
     }
 
     /// Adds a custom context entry.
@@ -549,7 +562,7 @@ mod tests {
             entry("ctx-discovery-1", "did:dht:zCreator1"),
             entry("ctx-discovery-2", "did:dht:zCreator2"),
         ];
-        let config = BootstrapConfig::with_defaults(entries.clone());
+        let config = BootstrapConfig::with_defaults(entries.clone()).unwrap();
 
         assert_eq!(config.default_contexts, entries);
         assert!(config.custom_contexts.is_empty());
@@ -579,7 +592,7 @@ mod tests {
     #[test]
     fn all_contexts_combines_defaults_and_custom() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]).unwrap();
         config
             .add_custom_context(entry("ctx-custom-1", "did:dht:zC1"))
             .unwrap();
@@ -595,7 +608,8 @@ mod tests {
         let mut config = BootstrapConfig::with_defaults(vec![
             entry("ctx-d1", "did:dht:zD1"),
             entry("ctx-d2", "did:dht:zD2"),
-        ]);
+        ])
+        .unwrap();
         config
             .add_custom_context(entry("ctx-c1", "did:dht:zC1"))
             .unwrap();
@@ -630,7 +644,8 @@ mod tests {
     #[test]
     fn bootstrap_config_serialization_roundtrip() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")])
+                .unwrap();
         config
             .add_custom_context(entry("ctx-custom-1", "did:dht:zCustom1"))
             .unwrap();
@@ -647,7 +662,8 @@ mod tests {
     #[test]
     fn verify_context_creator_success() {
         let config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")])
+                .unwrap();
 
         let result = config
             .verify_context_creator(
@@ -661,7 +677,8 @@ mod tests {
     #[test]
     fn verify_context_creator_not_found() {
         let config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")])
+                .unwrap();
 
         let result = config
             .verify_context_creator(&"ctx-unknown".to_owned(), &DID::from("did:dht:zCreator1"))
@@ -672,7 +689,8 @@ mod tests {
     #[test]
     fn verify_context_creator_mismatch() {
         let config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")])
+                .unwrap();
 
         let err = config
             .verify_context_creator(
@@ -712,7 +730,8 @@ mod tests {
         // When the same context_id exists in both default and custom lists,
         // the custom entry's expected_creator_did should win.
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zDefaultCreator")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zDefaultCreator")])
+                .unwrap();
         config
             .add_custom_context(entry("ctx-shared", "did:dht:zCustomCreator"))
             .unwrap();
@@ -744,7 +763,7 @@ mod tests {
     #[test]
     fn resolver_returns_all_context_ids() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-default-1", "did:dht:zD1")]).unwrap();
         config
             .add_custom_context(entry("ctx-custom-1", "did:dht:zC1"))
             .unwrap();
@@ -760,7 +779,7 @@ mod tests {
     #[test]
     fn resolver_deduplicates_context_ids() {
         let mut config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zCreator")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-shared", "did:dht:zCreator")]).unwrap();
         config
             .add_custom_context(entry("ctx-shared", "did:dht:zCreator"))
             .unwrap();
@@ -785,14 +804,14 @@ mod tests {
 
     #[test]
     fn resolver_config_accessor_returns_config() {
-        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:zC1")]);
+        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:zC1")]).unwrap();
         let resolver = BootstrapResolver::new(config.clone());
         assert_eq!(resolver.config(), &config);
     }
 
     #[test]
     fn resolver_from_config() {
-        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:zC1")]);
+        let config = BootstrapConfig::with_defaults(vec![entry("ctx-1", "did:dht:zC1")]).unwrap();
         let resolver: BootstrapResolver = config.into();
         assert_eq!(resolver.resolve_contexts(), vec!["ctx-1"]);
     }
@@ -802,7 +821,8 @@ mod tests {
     #[test]
     fn resolve_with_fallback_returns_contexts_when_available() {
         let config =
-            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")]);
+            BootstrapConfig::with_defaults(vec![entry("ctx-discovery-1", "did:dht:zCreator1")])
+                .unwrap();
         let resolver = BootstrapResolver::new(config);
 
         let result = resolver.resolve_with_fallback("did:dht:zTestDid").unwrap();
@@ -842,17 +862,23 @@ mod tests {
         let entries: Vec<_> = (0..MAX_DEFAULT_CONTEXTS)
             .map(|i| entry(&format!("ctx-{i}"), &format!("did:dht:zCreator{i}")))
             .collect();
-        let config = BootstrapConfig::with_defaults(entries);
+        let config = BootstrapConfig::with_defaults(entries).unwrap();
         assert_eq!(config.default_contexts.len(), MAX_DEFAULT_CONTEXTS);
     }
 
     #[test]
-    #[should_panic(expected = "too many default contexts")]
-    fn with_defaults_panics_over_max_default_contexts() {
+    fn with_defaults_rejects_over_max_default_contexts() {
         let entries: Vec<_> = (0..=MAX_DEFAULT_CONTEXTS)
             .map(|i| entry(&format!("ctx-{i}"), &format!("did:dht:zCreator{i}")))
             .collect();
-        let _ = BootstrapConfig::with_defaults(entries);
+        let err = BootstrapConfig::with_defaults(entries).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BootstrapVerificationError::TooManyDefaultContexts { .. }
+            ),
+            "expected TooManyDefaultContexts, got: {err:?}"
+        );
     }
 
     // -- add_custom_context capacity limit --------------------------------

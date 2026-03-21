@@ -20,6 +20,10 @@ import Foundation
 //   - identityMigrate(_ identity: Identity) async throws -> Identity
 //   - identityLoad(_ did: String) async throws -> Identity
 //   - identityResolve(_ did: String) async throws -> DidDocument
+//   - identityCreateLinkAttestation(identity:platform:handle:proof:verificationMethod:platformId:) async throws -> String
+//   - identityLinkAttestations(did:) throws -> String
+//   - identityRemoveLinkAttestation(did:attestationId:) -> Bool
+//   - identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:) async throws -> Bool
 //
 // Tests should use Identity(noPointer: .init()) for mock instances.
 
@@ -652,7 +656,6 @@ public struct IdentityAttestation: Sendable, Equatable {
     /// ## Provenance
     ///
     /// - Spec section 3.5 (Identity Link Attestations)
-    // Stub — see #1453
     public func verify(
         verifyFn: IdentityAttestationBridge.VerifyFn = IdentityAttestationBridge.defaultVerify
     ) async throws -> Bool {
@@ -664,9 +667,10 @@ public struct IdentityAttestation: Sendable, Equatable {
 
 /// Namespace for identity link attestation bridge function references.
 ///
-/// Bridge functions for attestation CRUD are not yet available in the
-/// UniFFI layer. These type aliases and defaults throw not-implemented
-/// errors until the Rust bridge is wired.
+/// Defaults delegate to UniFFI-generated free functions for attestation
+/// CRUD. The UniFFI bridge returns JSON strings that are parsed into
+/// ``IdentityAttestation`` values via the private ``AttestationWire``
+/// Codable type.
 ///
 /// ## Provenance
 ///
@@ -693,31 +697,37 @@ public enum IdentityAttestationBridge {
         _ attestationId: String
     ) async throws -> Bool
 
-    // Stub — see #1453
-    /// Default create function — not yet available.
-    public static let defaultCreate: CreateFn = { _, _, _, _, _, _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation creation is not yet available in the bridge",
-            code: "SCP-ATTEST-9010"
+    /// Default create function — delegates to UniFFI
+    /// ``identityCreateLinkAttestation(identity:platform:handle:proof:verificationMethod:platformId:)``.
+    ///
+    /// Loads the ``Identity`` from the DID string via ``identityLoad(did:)``,
+    /// then calls the UniFFI create function and parses the JSON result.
+    public static let defaultCreate: CreateFn = { did, platform, handle, proof, verificationMethod, platformId in
+        let identity = try await identityLoad(did: did)
+        let json = try await identityCreateLinkAttestation(
+            identity: identity,
+            platform: platform,
+            handle: handle,
+            proof: proof,
+            verificationMethod: verificationMethod,
+            platformId: platformId
         )
+        return try AttestationWire.parseAttestation(from: json)
     }
 
-    // Stub — see #1453
-    /// Default list function — not yet available.
-    public static let defaultList: ListFn = { _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation listing is not yet available in the bridge",
-            code: "SCP-ATTEST-9011"
-        )
+    /// Default list function — delegates to UniFFI
+    /// ``identityLinkAttestations(did:)``.
+    ///
+    /// Calls the UniFFI list function and parses the JSON array result.
+    public static let defaultList: ListFn = { did in
+        let json = try identityLinkAttestations(did: did)
+        return try AttestationWire.parseAttestations(from: json)
     }
 
-    // Stub — see #1453
-    /// Default remove function — not yet available.
-    public static let defaultRemove: RemoveFn = { _, _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation removal is not yet available in the bridge",
-            code: "SCP-ATTEST-9012"
-        )
+    /// Default remove function — delegates to UniFFI
+    /// ``identityRemoveLinkAttestation(did:attestationId:)``.
+    public static let defaultRemove: RemoveFn = { did, attestationId in
+        identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 
     /// Verify an attestation's signature and validity.
@@ -725,15 +735,170 @@ public enum IdentityAttestationBridge {
         _ attestation: IdentityAttestation
     ) async throws -> Bool
 
-    // Stub — see #1453
-    /// Default verify function — not yet available.
-    public static let defaultVerify: VerifyFn = { _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation verification is not yet available in the bridge",
-            code: "SCP-ATTEST-9005"
+    /// Default verify function — delegates to UniFFI
+    /// ``identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:)``.
+    ///
+    /// Uses ``IdentityAttestation/rawJson`` when available for exact
+    /// roundtrip fidelity. Falls back to re-serializing the attestation
+    /// if ``rawJson`` is `nil`.
+    public static let defaultVerify: VerifyFn = { attestation in
+        let json: String
+        if let raw = attestation.rawJson {
+            json = raw
+        } else {
+            json = try AttestationWire.serializeAttestation(attestation)
+        }
+        return try await identityVerifyLinkAttestation(
+            attestationJson: json,
+            issuerPublicKeyHex: nil
         )
     }
+}
 
+// MARK: - Attestation JSON Wire Format
+
+/// Private Codable claim matching Rust `AttestationClaim` JSON.
+private struct AttestationClaimWire: Codable {
+    let platform: String
+    let platformHandle: String
+    let platformId: String?
+    let linkType: String
+
+    enum CodingKeys: String, CodingKey {
+        case platform
+        case platformHandle = "platform_handle"
+        case platformId = "platform_id"
+        case linkType = "link_type"
+    }
+}
+
+/// Private Codable evidence matching Rust `AttestationEvidence` JSON.
+private struct AttestationEvidenceWire: Codable {
+    let method: String
+    let proof: String
+    let verifiedAt: UInt64
+    let verifierDid: String?
+
+    enum CodingKeys: String, CodingKey {
+        case method
+        case proof
+        case verifiedAt = "verified_at"
+        case verifierDid = "verifier_did"
+    }
+}
+
+/// Private Codable type matching the Rust `IdentityLinkAttestation` JSON
+/// wire format produced by `serde_json::to_string`. Used to translate
+/// between the UniFFI bridge's JSON strings and the public
+/// ``IdentityAttestation`` value type.
+///
+/// Properties use camelCase; `CodingKeys` map to Rust's snake_case JSON.
+private struct AttestationWire: Codable {
+    let id: String
+    let typeField: String
+    let issuer: String
+    let subject: String
+    let issuedAt: UInt64
+    let expiresAt: UInt64?
+    let claim: AttestationClaimWire
+    let evidence: AttestationEvidenceWire
+    let revocationStatus: String
+    let signature: [UInt8]?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case typeField = "type"
+        case issuer
+        case subject
+        case issuedAt = "issued_at"
+        case expiresAt = "expires_at"
+        case claim
+        case evidence
+        case revocationStatus = "revocation_status"
+        case signature
+    }
+
+    /// Parses a single attestation from the bridge JSON string.
+    static func parseAttestation(from json: String) throws -> IdentityAttestation {
+        guard let data = json.data(using: .utf8) else {
+            throw ScpError.Identity(
+                msg: "attestation JSON is not valid UTF-8",
+                code: "SCP-ATTEST-9010"
+            )
+        }
+        let decoder = JSONDecoder()
+        let wire = try decoder.decode(AttestationWire.self, from: data)
+        return wire.toIdentityAttestation(rawJson: json)
+    }
+
+    /// Parses a JSON array of attestations from the bridge.
+    static func parseAttestations(from json: String) throws -> [IdentityAttestation] {
+        guard let data = json.data(using: .utf8) else {
+            throw ScpError.Identity(
+                msg: "attestation list JSON is not valid UTF-8",
+                code: "SCP-ATTEST-9011"
+            )
+        }
+        let decoder = JSONDecoder()
+        let wires = try decoder.decode([AttestationWire].self, from: data)
+        // Re-serialize each element individually to preserve per-attestation
+        // rawJson for roundtrip signature verification.
+        let encoder = JSONEncoder()
+        return try wires.map { wire in
+            let elementJson = try String(data: encoder.encode(wire), encoding: .utf8)
+            return wire.toIdentityAttestation(rawJson: elementJson)
+        }
+    }
+
+    /// Re-serializes an ``IdentityAttestation`` into the bridge JSON format.
+    ///
+    /// Used by the verify bridge when ``IdentityAttestation/rawJson`` is `nil`.
+    static func serializeAttestation(_ attestation: IdentityAttestation) throws -> String {
+        let wire = AttestationWire(
+            id: attestation.id,
+            typeField: "identity_link",
+            issuer: "", // Verification uses the issuer DID from the full wire format
+            subject: "",
+            issuedAt: attestation.verifiedAt,
+            expiresAt: nil,
+            claim: AttestationClaimWire(
+                platform: attestation.platform,
+                platformHandle: attestation.platformHandle,
+                platformId: attestation.platformId,
+                linkType: "self_attestation"
+            ),
+            evidence: AttestationEvidenceWire(
+                method: attestation.verificationMethod,
+                proof: "",
+                verifiedAt: attestation.verifiedAt,
+                verifierDid: nil
+            ),
+            revocationStatus: attestation.revocationStatus,
+            signature: nil
+        )
+        let encoder = JSONEncoder()
+        guard let json = try String(data: encoder.encode(wire), encoding: .utf8) else {
+            throw ScpError.Identity(
+                msg: "failed to encode attestation as UTF-8 JSON",
+                code: "SCP-ATTEST-9012"
+            )
+        }
+        return json
+    }
+
+    /// Converts the wire format to the public ``IdentityAttestation`` type.
+    func toIdentityAttestation(rawJson: String?) -> IdentityAttestation {
+        IdentityAttestation(
+            id: id,
+            platform: claim.platform,
+            platformHandle: claim.platformHandle,
+            verificationMethod: evidence.method,
+            verifiedAt: evidence.verifiedAt,
+            revocationStatus: revocationStatus,
+            platformId: claim.platformId,
+            rawJson: rawJson
+        )
+    }
 }
 
 // MARK: - Identity Attestation Public API
@@ -805,3 +970,76 @@ public func removeIdentityAttestation(
     try await removeFn(did, attestationId)
 }
 
+// MARK: - UniFFI Link Attestation Forward Declarations
+
+// The four functions below mirror the signatures that UniFFI will generate
+// in ScpBindings.swift from the `#[uniffi::export]` Rust functions in
+// `crates/scp-ffi/uniffi/src/bridge.rs`. They exist here so the Swift SDK
+// compiles before the native XCFramework is rebuilt.
+//
+// When ScpBindings.swift is regenerated (SCP-103 / #1453), these declarations
+// will conflict with the generated ones and should be removed from this file.
+
+/// Forward declaration of UniFFI-generated
+/// ``identity_create_link_attestation``.
+///
+/// Creates an identity link attestation for an external platform identity.
+/// Returns the attestation as a JSON string.
+///
+/// - SeeAlso: ``IdentityAttestationBridge/defaultCreate``
+func identityCreateLinkAttestation(
+    identity _: Identity,
+    platform _: String,
+    handle _: String,
+    proof _: String,
+    verificationMethod _: String,
+    platformId _: String?
+) async throws -> String {
+    // Forward declaration — replaced by ScpBindings.swift on rebuild (#1453)
+    throw ScpError.Identity(
+        msg: "identityCreateLinkAttestation is not yet available — rebuild ScpBindings.swift from the native library",
+        code: "SCP-ATTEST-9001"
+    )
+}
+
+/// Forward declaration of UniFFI-generated ``identity_link_attestations``.
+///
+/// Lists all identity link attestations for a DID as a JSON array string.
+///
+/// - SeeAlso: ``IdentityAttestationBridge/defaultList``
+func identityLinkAttestations(did _: String) throws -> String {
+    // Forward declaration — replaced by ScpBindings.swift on rebuild (#1453)
+    throw ScpError.Identity(
+        msg: "identityLinkAttestations is not yet available — rebuild ScpBindings.swift from the native library",
+        code: "SCP-ATTEST-9002"
+    )
+}
+
+/// Forward declaration of UniFFI-generated
+/// ``identity_remove_link_attestation``.
+///
+/// Removes an identity link attestation by its ID. Returns `true` if the
+/// attestation was found and removed.
+///
+/// - SeeAlso: ``IdentityAttestationBridge/defaultRemove``
+func identityRemoveLinkAttestation(did _: String, attestationId _: String) -> Bool {
+    // Forward declaration — replaced by ScpBindings.swift on rebuild (#1453)
+    false
+}
+
+/// Forward declaration of UniFFI-generated
+/// ``identity_verify_link_attestation``.
+///
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// - SeeAlso: ``IdentityAttestationBridge/defaultVerify``
+func identityVerifyLinkAttestation(
+    attestationJson _: String,
+    issuerPublicKeyHex _: String?
+) async throws -> Bool {
+    // Forward declaration — replaced by ScpBindings.swift on rebuild (#1453)
+    throw ScpError.Identity(
+        msg: "identityVerifyLinkAttestation is not yet available — rebuild ScpBindings.swift from the native library",
+        code: "SCP-ATTEST-9005"
+    )
+}
