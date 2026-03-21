@@ -2950,10 +2950,17 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(&context_id);
 
         // Phase 1 (under lock): State checks, capability check, membership
-        // verification, assign sequence number, produce broadcast envelope if
-        // applicable. Do NOT push to receive_buffer yet — transport may fail.
-        // See #1420 (phantom events) and #1422 (AAD zeros).
-        let (broadcast_envelope, seq) = {
+        // verification, produce broadcast envelope if applicable. Sequence
+        // assignment is deferred to Phase 3 so transport failures don't burn
+        // sequence numbers. Do NOT push to receive_buffer yet — transport may
+        // fail. See #1420 (phantom events) and #1422 (AAD zeros).
+        //
+        // NOTE: For the broadcast path, `BroadcastContext::publish()` internally
+        // increments the broadcast-level per-author sequence (part of the wire
+        // format, AAD, and signature). That sequence burn is unavoidable — it's
+        // committed to the envelope before transport. The membership-level
+        // sequence (used in the `MessageSent` event) is separate and IS deferred.
+        let broadcast_envelope = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -3002,15 +3009,9 @@ impl ContextManager {
                 let envelope =
                     bc.publish(sender_did, payload, timestamp, signature, &nonce, None)?;
 
-                // Assign per-sender monotonic sequence number.
-                let seq = ctx
-                    .membership
-                    .next_sequence_number(sender_did)
-                    .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
-
-                (Some(envelope), seq)
+                Some(envelope)
             } else {
-                // Encrypted path: role-based capability check + seq under lock.
+                // Encrypted path: role-based capability check under lock.
                 if !ctx
                     .role_state
                     .member_has_capability(sender_did, &Capability::MessagesWrite)
@@ -3020,19 +3021,14 @@ impl ContextManager {
                     )));
                 }
 
-                let seq = ctx
-                    .membership
-                    .next_sequence_number(sender_did)
-                    .ok_or_else(|| ContextError::MemberNotFound(sender_did.to_string()))?;
-
-                (None, seq)
+                None
             }
         };
         // Lock dropped before crypto/transport/event-log calls.
 
         // Phase 2 (no lock): Encrypt + send via transport.
-        // If either fails, return error — no phantom MessageSent in buffer.
-        // Sequence number is burned on failure (gaps are harmless).
+        // If either fails, return error — no phantom MessageSent in buffer
+        // and no membership-level sequence number burned.
         let encrypted = if let Some(ref envelope) = broadcast_envelope {
             // Broadcast: serialize envelope for transport.
             envelope.encrypted_content.clone()
@@ -3051,8 +3047,9 @@ impl ContextManager {
         self.transport.send_message(&context_id_bytes, &encrypted)?;
 
         // Phase 3 (re-acquire lock): Re-check context active + membership,
-        // then push MessageSent event to receive buffer. Only reached on
-        // successful transport send — no phantom events (#1420).
+        // assign sequence number NOW (post-transport), then push MessageSent
+        // event to receive buffer. Only reached on successful transport send —
+        // no phantom events (#1420), no burned sequence numbers.
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
@@ -3060,6 +3057,7 @@ impl ContextManager {
                 // skip the event push. The message was still sent on the wire,
                 // but the local context is no longer active.
                 if require_active(&ctx.handle).is_ok() {
+                    let seq = ctx.membership.next_sequence_number(sender_did).unwrap_or(0);
                     ctx.receive_buffer.push(ContextEvent::MessageSent {
                         sender_did: sender_did.clone(),
                         sequence_number: seq,
@@ -9355,7 +9353,8 @@ mod tests {
     }
 
     /// When transport fails, no phantom `MessageSent` event must appear in
-    /// the receive buffer. Fixes #1420.
+    /// the receive buffer, and the membership-level sequence number must be
+    /// unchanged. Fixes #1420 (phantom events), sequence burn on failure.
     #[tokio::test]
     async fn send_message_transport_failure_no_phantom_event() {
         let manager = ContextManager::new(
@@ -9398,10 +9397,28 @@ mod tests {
             msg_events.is_empty(),
             "no MessageSent event should be emitted when transport fails (#1420)"
         );
+
+        // Verify sequence number was NOT burned: a subsequent successful send
+        // on a working transport should get sequence 1, not 2.
+        // We can't retry with a different transport on the same manager, but
+        // we CAN verify the internal state via the membership sequence counter.
+        // The membership sequence should still be 0 (never incremented).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx-fail").unwrap();
+        let member = ctx
+            .membership
+            .members()
+            .find(|m| m.did == "did:key:creator")
+            .unwrap();
+        assert_eq!(
+            member.sequence_number, 0,
+            "sequence number must not be burned on transport failure"
+        );
     }
 
     /// When transport succeeds, `MessageSent` event must be present in the
-    /// receive buffer. Validates the positive path after the #1420 restructure.
+    /// receive buffer with the correct sequence number. Validates the positive
+    /// path after the #1420 restructure and Phase 3 sequence assignment.
     #[tokio::test]
     async fn send_message_transport_success_emits_event() {
         let (manager, handle) = setup_active_context().await;
@@ -9427,12 +9444,16 @@ mod tests {
 
         if let ContextEvent::MessageSent {
             sender_did,
+            sequence_number,
             payload,
-            ..
         } = &msg_events[0]
         {
             assert_eq!(sender_did, "did:key:creator");
             assert_eq!(payload, b"positive-path");
+            assert_eq!(
+                *sequence_number, 1,
+                "first successful send must have sequence_number 1"
+            );
         }
     }
 
