@@ -95,7 +95,7 @@ describe("ScpError hierarchy", () => {
   });
 
   it("AttestationError extends ScpError", () => {
-    const err = new AttestationError("attestation failed", "SCP-ATTEST-9001");
+    const err = new AttestationError("attestation failed", "SCP-ATTEST-9010");
     expect(err).toBeInstanceOf(ScpError);
     expect(err).toBeInstanceOf(AttestationError);
     expect(err.name).toBe("AttestationError");
@@ -171,9 +171,9 @@ describe("mapBridgeError", () => {
   });
 
   it("maps attestation error codes to AttestationError", () => {
-    const err = mapBridgeError(new Error("[SCP-ATTEST-9001] attestation error: failed"));
+    const err = mapBridgeError(new Error("[SCP-ATTEST-9010] attestation error: failed"));
     expect(err).toBeInstanceOf(AttestationError);
-    expect(err.code).toBe("SCP-ATTEST-9001");
+    expect(err.code).toBe("SCP-ATTEST-9010");
   });
 
   it("maps MCP error codes to McpError", () => {

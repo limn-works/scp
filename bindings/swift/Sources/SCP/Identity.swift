@@ -604,7 +604,7 @@ public struct IdentityAttestation: Sendable, Equatable {
     public let verificationMethod: String
 
     /// Unix timestamp (seconds) when the evidence was last verified.
-    public let verifiedAt: Double
+    public let verifiedAt: Int
 
     /// Revocation status.
     public let revocationStatus: RevocationStatus
@@ -618,7 +618,7 @@ public struct IdentityAttestation: Sendable, Equatable {
         platform: String,
         platformHandle: String,
         verificationMethod: String,
-        verifiedAt: Double,
+        verifiedAt: Int,
         revocationStatus: RevocationStatus = .active,
         platformId: String? = nil
     ) {
@@ -645,7 +645,7 @@ public struct IdentityAttestation: Sendable, Equatable {
         // Bridge function not yet available — throw not-implemented
         throw ScpError.Identity(
             msg: "Attestation verification is not yet available in the bridge",
-            code: "SCP-ATTEST-9005"
+            code: "SCP-ATTEST-9014"
         )
     }
 }
@@ -692,7 +692,7 @@ public enum IdentityAttestationBridge {
     public static let defaultCreate: CreateFn = { _, _, _, _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation creation is not yet available in the bridge",
-            code: "SCP-ATTEST-9001"
+            code: "SCP-ATTEST-9010"
         )
     }
 
@@ -700,7 +700,7 @@ public enum IdentityAttestationBridge {
     public static let defaultList: ListFn = { _ in
         throw ScpError.Identity(
             msg: "Identity link attestation listing is not yet available in the bridge",
-            code: "SCP-ATTEST-9002"
+            code: "SCP-ATTEST-9011"
         )
     }
 
@@ -708,7 +708,7 @@ public enum IdentityAttestationBridge {
     public static let defaultRemove: RemoveFn = { _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation removal is not yet available in the bridge",
-            code: "SCP-ATTEST-9003"
+            code: "SCP-ATTEST-9012"
         )
     }
 
@@ -716,7 +716,7 @@ public enum IdentityAttestationBridge {
     public static let defaultRenew: RenewFn = { _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation renewal is not yet available in the bridge",
-            code: "SCP-ATTEST-9004"
+            code: "SCP-ATTEST-9013"
         )
     }
 }

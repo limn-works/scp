@@ -17,13 +17,13 @@ final class IdentityAttestationTests: XCTestCase {
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         XCTAssertEqual(att.id, "abc123")
         XCTAssertEqual(att.platform, "github.com")
         XCTAssertEqual(att.platformHandle, "alice")
         XCTAssertEqual(att.verificationMethod, "did:dht:z6Mk...#active")
-        XCTAssertEqual(att.verifiedAt, 1_700_000_000.0)
+        XCTAssertEqual(att.verifiedAt, 1_700_000_000)
         XCTAssertEqual(att.revocationStatus, .active)
         XCTAssertNil(att.platformId)
     }
@@ -34,13 +34,13 @@ final class IdentityAttestationTests: XCTestCase {
             platform: "x.com",
             platformHandle: "bob",
             verificationMethod: "did:dht:z6Mk...#agent",
-            verifiedAt: 1_700_000_000.0,
+            verifiedAt: 1_700_000_000,
             revocationStatus: .revoked(revokedAt: 1_700_000_100, reason: "compromised"),
             platformId: "12345"
         )
         XCTAssertEqual(att.revocationStatus, .revoked(revokedAt: 1_700_000_100, reason: "compromised"))
         XCTAssertEqual(att.revocationStatus.status, "revoked")
-        XCTAssertEqual(att.revocationStatus.revokedAt, 1_700_000_100.0)
+        XCTAssertEqual(att.revocationStatus.revokedAt, 1_700_000_100)
         XCTAssertEqual(att.revocationStatus.reason, "compromised")
         XCTAssertEqual(att.platformId, "12345")
     }
@@ -55,7 +55,7 @@ final class IdentityAttestationTests: XCTestCase {
     func testRevocationStatusRevoked() {
         let status = RevocationStatus.revoked(revokedAt: 1_700_000_100, reason: "test")
         XCTAssertEqual(status.status, "revoked")
-        XCTAssertEqual(status.revokedAt, 1_700_000_100.0)
+        XCTAssertEqual(status.revokedAt, 1_700_000_100)
         XCTAssertEqual(status.reason, "test")
     }
 
@@ -77,14 +77,14 @@ final class IdentityAttestationTests: XCTestCase {
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         let att2 = IdentityAttestation(
             id: "abc123",
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         XCTAssertEqual(att1, att2)
     }
@@ -95,14 +95,14 @@ final class IdentityAttestationTests: XCTestCase {
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         let att2 = IdentityAttestation(
             id: "def456",
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         XCTAssertNotEqual(att1, att2)
     }
@@ -122,7 +122,7 @@ final class IdentityAttestationTests: XCTestCase {
             switch error {
             case let .Identity(msg, code):
                 XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9001")
+                XCTAssertEqual(code, "SCP-ATTEST-9010")
             default:
                 XCTFail("Expected Identity error, got \(error)")
             }
@@ -139,7 +139,7 @@ final class IdentityAttestationTests: XCTestCase {
             switch error {
             case let .Identity(msg, code):
                 XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9002")
+                XCTAssertEqual(code, "SCP-ATTEST-9011")
             default:
                 XCTFail("Expected Identity error, got \(error)")
             }
@@ -159,7 +159,7 @@ final class IdentityAttestationTests: XCTestCase {
             switch error {
             case let .Identity(msg, code):
                 XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9003")
+                XCTAssertEqual(code, "SCP-ATTEST-9012")
             default:
                 XCTFail("Expected Identity error, got \(error)")
             }
@@ -179,7 +179,7 @@ final class IdentityAttestationTests: XCTestCase {
             switch error {
             case let .Identity(msg, code):
                 XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9004")
+                XCTAssertEqual(code, "SCP-ATTEST-9013")
             default:
                 XCTFail("Expected Identity error, got \(error)")
             }
@@ -194,7 +194,7 @@ final class IdentityAttestationTests: XCTestCase {
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         do {
             _ = try await att.verify()
@@ -203,7 +203,7 @@ final class IdentityAttestationTests: XCTestCase {
             switch error {
             case let .Identity(msg, code):
                 XCTAssertTrue(msg.contains("not yet available"))
-                XCTAssertEqual(code, "SCP-ATTEST-9005")
+                XCTAssertEqual(code, "SCP-ATTEST-9014")
             default:
                 XCTFail("Expected Identity error, got \(error)")
             }
@@ -220,7 +220,7 @@ final class IdentityAttestationTests: XCTestCase {
             platform: "github.com",
             platformHandle: "alice",
             verificationMethod: "did:dht:z6Mk...#active",
-            verifiedAt: 1_700_000_000.0
+            verifiedAt: 1_700_000_000
         )
         let customCreate: IdentityAttestationBridge.CreateFn = { _, _, _, _, _ in
             expected
@@ -242,7 +242,7 @@ final class IdentityAttestationTests: XCTestCase {
                 platform: "github.com",
                 platformHandle: "alice",
                 verificationMethod: "did:dht:z6Mk...#active",
-                verifiedAt: 1_700_000_000.0
+                verifiedAt: 1_700_000_000
             )
         ]
         let customList: IdentityAttestationBridge.ListFn = { _ in expected }

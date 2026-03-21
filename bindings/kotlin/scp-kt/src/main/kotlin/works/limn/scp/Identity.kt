@@ -325,7 +325,7 @@ data class IdentityAttestation(
     val platform: String,
     val platformHandle: String,
     val verificationMethod: String,
-    val verifiedAt: Double,
+    val verifiedAt: Long,
     val revocationStatus: RevocationStatus = RevocationStatus.Active,
     val platformId: String? = null,
 ) {
@@ -349,7 +349,7 @@ data class IdentityAttestation(
                 platform = obj["platform"]!!.jsonPrimitive.content,
                 platformHandle = obj["platform_handle"]!!.jsonPrimitive.content,
                 verificationMethod = obj["verification_method"]!!.jsonPrimitive.content,
-                verifiedAt = obj["verified_at"]!!.jsonPrimitive.content.toDouble(),
+                verifiedAt = obj["verified_at"]!!.jsonPrimitive.content.toLong(),
                 revocationStatus = revocationStatus,
                 platformId = obj["platform_id"]?.jsonPrimitive?.content,
             )

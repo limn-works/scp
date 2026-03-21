@@ -340,7 +340,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation creation is not yet available in the bridge",
-          "SCP-ATTEST-9001",
+          "SCP-ATTEST-9010",
         );
       }
       const json = await fn(
@@ -371,7 +371,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation listing is not yet available in the bridge",
-          "SCP-ATTEST-9002",
+          "SCP-ATTEST-9011",
         );
       }
       const json = await fn(this.did);
@@ -398,7 +398,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation removal is not yet available in the bridge",
-          "SCP-ATTEST-9003",
+          "SCP-ATTEST-9012",
         );
       }
       return await fn(this.did, attestationId);
@@ -423,7 +423,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation renewal is not yet available in the bridge",
-          "SCP-ATTEST-9004",
+          "SCP-ATTEST-9013",
         );
       }
       const json = await fn(this.did, attestation.id);
@@ -607,7 +607,7 @@ export class IdentityAttestation implements IdentityAttestationData {
       if (!fn) {
         throw new IdentityError(
           "Attestation verification is not yet available in the bridge",
-          "SCP-ATTEST-9005",
+          "SCP-ATTEST-9014",
         );
       }
       const resultJson = await fn(JSON.stringify(this._toBridgeRecord()));
