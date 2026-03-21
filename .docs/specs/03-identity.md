@@ -267,7 +267,9 @@ Service {
 - `type`: `ScpIdentityLinkAttestation` (constant). Consumers filter DID document services by this type to discover identity link attestations.
 - `serviceEndpoint`: The attestation ID (hex string). Consumers use this to look up the full `IdentityLinkAttestation` from the identity's attestation store (via relay or DHT).
 
-**Maximum attestations per DID document:** 10. This prevents DID document bloat — each service entry adds to the DID document size, which is replicated across resolvers. A user with more than 10 platform identities must choose which 10 to publish. The limit applies to service entries of type `ScpIdentityLinkAttestation` only; other service types have their own limits.
+**Maximum attestations per DID document:** 64. This prevents DID document bloat — each service entry adds to the DID document size, which is replicated across resolvers — while providing enough headroom for users with many platform identities. The limit applies to service entries of type `ScpIdentityLinkAttestation` only; other service types have their own limits.
+
+**Bridge-layer attestation store limit:** Implementations MUST enforce the same 64-attestation-per-DID cap as the DID document layer. This unified limit ensures consistent behavior across all layers — the DID document and the bridge attestation store share a single bound. The constant `MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID` (defined in `scp-ffi-common`) is the single source of truth for all bridge implementations.
 
 **Lifecycle:** When an attestation is revoked, the corresponding service entry MUST be removed from the DID document. When an attestation is renewed (re-verified), the service entry is unchanged — it still points to the same attestation ID. When an attestation is replaced (new attestation for the same platform+handle), the service entry's `serviceEndpoint` is updated to the new attestation ID.
 

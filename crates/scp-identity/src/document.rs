@@ -205,7 +205,8 @@ const MAX_RETIRED_AGENT_KEYS: usize = 2;
 const IDENTITY_LINK_ATTESTATION_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
 
 /// Maximum number of identity link attestation service entries per DID document (§3.5.3).
-const MAX_IDENTITY_LINK_ATTESTATIONS: usize = 10;
+/// Unified at 64 across the DID document layer and all FFI bridge attestation stores.
+const MAX_IDENTITY_LINK_ATTESTATIONS: usize = 64;
 
 impl DidDocument {
     /// Constructs a new DID Document for an SCP identity.
@@ -2274,17 +2275,17 @@ mod tests {
     fn identity_link_max_limit_enforced() {
         let mut doc = DidDocument::new("did:dht:zIdLink8", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        // Add 10 entries (the maximum).
-        for i in 0..10 {
+        // Add 64 entries (the maximum).
+        for i in 0..64 {
             doc.set_identity_link_attestation(&format!("platform-{i}.com"), &format!("attest-{i}"))
                 .unwrap();
         }
-        assert_eq!(doc.identity_link_attestation_count(), 10);
+        assert_eq!(doc.identity_link_attestation_count(), 64);
 
-        // The 11th should fail.
-        let result = doc.set_identity_link_attestation("one-too-many.com", "attest-10");
+        // The 65th should fail.
+        let result = doc.set_identity_link_attestation("one-too-many.com", "attest-64");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("maximum of 10"));
+        assert!(result.unwrap_err().to_string().contains("maximum of 64"));
     }
 
     #[test]

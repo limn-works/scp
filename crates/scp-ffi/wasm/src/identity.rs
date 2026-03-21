@@ -237,8 +237,7 @@ const WASM_MIGRATION_LINKS_CAP: usize = 10_000;
 /// WASM-local attestation registry.
 const WASM_LINK_ATTESTATIONS_CAP: usize = 1_000;
 
-/// Maximum number of attestations per DID in the WASM-local attestation registry.
-const WASM_LINK_ATTESTATIONS_PER_DID_CAP: usize = 1_000;
+use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
 thread_local! {
     /// Maps DID strings to identity state. WASM is single-threaded, so
@@ -2112,12 +2111,12 @@ pub fn identity_create_link_attestation(
                 "SCP-VALID-7402",
             )?;
             let entry = map.entry(did).or_default();
-            if entry.len() >= WASM_LINK_ATTESTATIONS_PER_DID_CAP {
+            if entry.len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
                 return Err(JsValue::from(
                     ScpWasmError::Validation {
                         message: format!(
                             "DID has reached the per-identity attestation limit \
-                             ({WASM_LINK_ATTESTATIONS_PER_DID_CAP}) — cannot store additional attestations"
+                             ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                         ),
                         code: "SCP-VALID-7403".to_owned(),
                     }

@@ -52,9 +52,8 @@ use scp_platform::traits::KeyCustody;
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
 
-/// Maximum number of identity link attestations per DID in the NAPI bridge.
 #[cfg(feature = "allow_in_memory_custody")]
-const NAPI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
 /// Ensures the global production DID resolver is initialized (idempotent). #311
 ///
@@ -1502,11 +1501,11 @@ pub async fn identity_create_link_attestation(
             });
         }
 
-        if entry.identity_link_attestations.len() >= NAPI_LINK_ATTESTATION_PER_DID_CAP {
+        if entry.identity_link_attestations.len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
             return Err(ScpNapiError::Identity {
                 message: format!(
                     "DID has reached the per-identity attestation limit \
-                     ({NAPI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                     ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                 ),
                 code: "SCP-VALID-7403".to_owned(),
             });

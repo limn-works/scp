@@ -100,6 +100,13 @@ pub const MAX_ATTESTATION_HANDLE_LEN: usize = 256;
 /// Maximum length for an attestation proof JSON string.
 pub const MAX_ATTESTATION_PROOF_LEN: usize = 65_536;
 
+/// Maximum number of identity link attestations per DID (spec §3.5.3).
+///
+/// Unified across the DID document layer (`scp-identity`) and all FFI bridge
+/// attestation stores. A single constant ensures consistent enforcement
+/// everywhere — no divergent limits.
+pub const MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID: usize = 64;
+
 // ---------------------------------------------------------------------------
 // String emptiness and length
 // ---------------------------------------------------------------------------
