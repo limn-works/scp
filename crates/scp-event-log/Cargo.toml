@@ -19,7 +19,6 @@ testing = ["dep:rand"]
 
 [dependencies]
 scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1" }
 sha2 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
