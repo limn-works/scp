@@ -9,6 +9,8 @@
 //! `SystemTime::now()` calls. The error type [`ClockError`] deliberately hides
 //! raw system error details to avoid leaking internal state.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -69,6 +71,101 @@ pub fn now_millis() -> Result<u64, ClockError> {
 }
 
 // ---------------------------------------------------------------------------
+// Clock trait
+// ---------------------------------------------------------------------------
+
+/// Trait for obtaining the current time. Implementations must be thread-safe.
+///
+/// Unlike the fallible [`now_secs`] / [`now_millis`] functions, the trait
+/// methods are infallible.  A system clock before the Unix epoch is an
+/// unrecoverable environment failure; implementations should panic rather
+/// than silently return 0 (which would bypass UCAN expiry and nonce
+/// freshness checks).
+pub trait Clock: Send + Sync {
+    /// Current time in seconds since the Unix epoch.
+    fn now_secs(&self) -> u64;
+
+    /// Current time in milliseconds since the Unix epoch.
+    fn now_millis(&self) -> u64;
+}
+
+/// Production clock backed by [`SystemTime`].
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    #[allow(clippy::expect_used)]
+    fn now_secs(&self) -> u64 {
+        now_secs().expect("system clock is unavailable or before Unix epoch")
+    }
+
+    #[allow(clippy::expect_used)]
+    fn now_millis(&self) -> u64 {
+        now_millis().expect("system clock is unavailable or before Unix epoch")
+    }
+}
+
+/// Test clock with manual time control.
+///
+/// Time is stored internally in milliseconds. The [`advance`](TestClock::advance)
+/// and [`set`](TestClock::set) methods operate in seconds for convenience;
+/// use [`advance_millis`](TestClock::advance_millis) when sub-second precision
+/// is needed.
+pub struct TestClock {
+    current_millis: AtomicU64,
+}
+
+impl TestClock {
+    /// Create a new test clock starting at the given seconds.
+    #[must_use]
+    pub const fn new(start_secs: u64) -> Self {
+        Self {
+            current_millis: AtomicU64::new(start_secs.saturating_mul(1000)),
+        }
+    }
+
+    /// Advance time by the given number of seconds.
+    pub fn advance(&self, secs: u64) {
+        self.current_millis
+            .fetch_add(secs.saturating_mul(1000), Ordering::Release);
+    }
+
+    /// Advance time by the given number of milliseconds.
+    pub fn advance_millis(&self, ms: u64) {
+        self.current_millis.fetch_add(ms, Ordering::Release);
+    }
+
+    /// Set the clock to a specific timestamp in seconds.
+    pub fn set(&self, timestamp_secs: u64) {
+        self.current_millis
+            .store(timestamp_secs.saturating_mul(1000), Ordering::Release);
+    }
+}
+
+impl Clock for TestClock {
+    fn now_secs(&self) -> u64 {
+        self.current_millis.load(Ordering::Acquire) / 1000
+    }
+
+    fn now_millis(&self) -> u64 {
+        self.current_millis.load(Ordering::Acquire)
+    }
+}
+
+/// Blanket implementation so `Arc<T: Clock>` is itself a `Clock`.
+///
+/// This allows clocks to be shared between production code and test code
+/// that needs to advance time.
+impl<T: Clock> Clock for Arc<T> {
+    fn now_secs(&self) -> u64 {
+        (**self).now_secs()
+    }
+
+    fn now_millis(&self) -> u64 {
+        (**self).now_millis()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -119,5 +216,57 @@ mod tests {
         // Should be within 2 seconds of each other.
         let diff = ms.saturating_sub(secs * 1000);
         assert!(diff < 2000, "millis and secs should agree within 2s");
+    }
+
+    // -----------------------------------------------------------------------
+    // Clock trait tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn system_clock_returns_reasonable_values() {
+        let clock = SystemClock;
+        let secs = clock.now_secs();
+        assert!(secs > 1_577_836_800, "timestamp should be after 2020");
+        let ms = clock.now_millis();
+        assert!(ms > 1_577_836_800_000, "millis should be after 2020");
+    }
+
+    #[test]
+    fn test_clock_starts_at_given_time() {
+        let clock = TestClock::new(100);
+        assert_eq!(clock.now_secs(), 100);
+        assert_eq!(clock.now_millis(), 100_000);
+    }
+
+    #[test]
+    fn test_clock_advance_by_seconds() {
+        let clock = TestClock::new(0);
+        clock.advance(5);
+        assert_eq!(clock.now_secs(), 5);
+        assert_eq!(clock.now_millis(), 5000);
+    }
+
+    #[test]
+    fn test_clock_advance_by_millis() {
+        let clock = TestClock::new(0);
+        clock.advance_millis(1500);
+        assert_eq!(clock.now_millis(), 1500);
+        assert_eq!(clock.now_secs(), 1);
+    }
+
+    #[test]
+    fn test_clock_set() {
+        let clock = TestClock::new(10);
+        clock.set(20);
+        assert_eq!(clock.now_secs(), 20);
+        assert_eq!(clock.now_millis(), 20_000);
+    }
+
+    #[test]
+    fn arc_clock_delegates_to_inner() {
+        let clock = Arc::new(TestClock::new(42));
+        assert_eq!(clock.now_secs(), 42);
+        clock.advance(1);
+        assert_eq!(clock.now_secs(), 43);
     }
 }

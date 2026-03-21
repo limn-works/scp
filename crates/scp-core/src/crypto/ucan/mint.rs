@@ -30,6 +30,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyHandle};
+use scp_primitives::Clock;
 
 use std::collections::HashSet;
 
@@ -212,16 +213,6 @@ pub struct MintParams<'a> {
     pub ceiling: Option<HashSet<String>>,
 }
 
-/// Returns the current Unix timestamp in seconds.
-///
-/// # Errors
-///
-/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
-/// epoch. Defaulting to zero would silently produce expired tokens.
-fn now_secs() -> Result<u64, UcanError> {
-    crate::time::now_secs().map_err(UcanError::from)
-}
-
 /// Mints a new UCAN token with Ed25519 signature.
 ///
 /// Creates a complete UCAN token from the provided parameters: constructs
@@ -249,6 +240,7 @@ fn now_secs() -> Result<u64, UcanError> {
 pub async fn mint_ucan(
     params: &MintParams<'_>,
     custody: &impl KeyCustody,
+    clock: &dyn Clock,
 ) -> Result<UcanToken, UcanError> {
     validate_key_scope(params.key_scope.as_ref())?;
     reject_self_delegation_without_scope(
@@ -294,7 +286,7 @@ pub async fn mint_ucan(
         verify_ceiling_compliance(&cap_uris, &effective_ceiling)?;
     }
 
-    let now = now_secs()?;
+    let now = clock.now_secs();
     let exp = now + params.lifetime_secs;
 
     // Build attestations from capabilities, scoped to the context.
@@ -332,7 +324,7 @@ pub async fn mint_ucan(
         aud: params.audience_did.to_owned(),
         exp,
         nbf: params.not_before,
-        nnc: generate_nonce()?,
+        nnc: generate_nonce(clock),
         att,
         prf: params.proofs.clone(),
         fct,
@@ -489,6 +481,7 @@ pub struct DelegateParams<'a> {
 pub async fn delegate_ucan(
     params: &DelegateParams<'_>,
     custody: &impl KeyCustody,
+    clock: &dyn Clock,
 ) -> Result<UcanToken, UcanError> {
     validate_key_scope(params.key_scope.as_ref())?;
     reject_self_delegation_without_scope(
@@ -555,7 +548,7 @@ pub async fn delegate_ucan(
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
     }
 
-    let now = now_secs()?;
+    let now = clock.now_secs();
     let exp = now + params.lifetime_secs;
 
     // Step 4: Compute the parent token's CID for the proof chain.
@@ -586,7 +579,7 @@ pub async fn delegate_ucan(
         aud: params.delegatee_did.to_owned(),
         exp,
         nbf: None,
-        nnc: generate_nonce()?,
+        nnc: generate_nonce(clock),
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
         fct,
@@ -658,7 +651,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Verify JWT has three segments.
         assert_eq!(
@@ -708,7 +703,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Reconstruct signing input from encoded token.
         let parts: Vec<&str> = token.encoded.split('.').collect();
@@ -750,7 +747,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         let nonce = &token.payload.nnc;
 
         // Nonce format: {unix_millis_timestamp}-{32_hex_chars}
@@ -788,8 +787,12 @@ mod tests {
             ceiling: None,
         };
 
-        let token1 = mint_ucan(&params, &custody).await.unwrap();
-        let token2 = mint_ucan(&params, &custody).await.unwrap();
+        let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
+        let token2 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_ne!(
             token1.payload.nnc, token2.payload.nnc,
@@ -817,7 +820,9 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, UcanError::ExpiryTooFar(_)));
     }
 
@@ -841,7 +846,11 @@ mod tests {
             ceiling: None,
         };
 
-        assert!(mint_ucan(&params, &custody).await.is_ok());
+        assert!(
+            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -868,7 +877,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(token.payload.att.len(), 3);
         assert_eq!(token.payload.att[0].with, "scp:ctx:ctx-multi/messages:read");
@@ -905,7 +916,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(token.payload.nbf, Some(1_700_000_000));
         assert_eq!(token.payload.prf, vec!["bafyreiabc123"]);
@@ -935,7 +948,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Decode the JWT parts and verify they match the struct fields.
         let parts: Vec<&str> = token.encoded.split('.').collect();
@@ -973,7 +988,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         let cid = compute_cid(&token);
 
         assert!(
@@ -1002,7 +1019,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         let cid1 = compute_cid(&token);
         let cid2 = compute_cid(&token);
 
@@ -1029,8 +1048,12 @@ mod tests {
             ceiling: None,
         };
 
-        let token1 = mint_ucan(&params, &custody).await.unwrap();
-        let token2 = mint_ucan(&params, &custody).await.unwrap();
+        let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
+        let token2 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let cid1 = compute_cid(&token1);
         let cid2 = compute_cid(&token2);
@@ -1061,7 +1084,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         let cid = compute_cid(&token);
 
         // "bafyrei" (7 chars) + 64 hex chars (SHA-256) = 71 chars total.
@@ -1102,7 +1127,9 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        mint_ucan(&params, custody).await.unwrap()
+        mint_ucan(&params, custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1142,7 +1169,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Verify structure.
         assert_eq!(delegated.payload.iss, bob_did);
@@ -1198,7 +1227,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // The proof chain must include the parent CID.
         assert!(
@@ -1241,7 +1272,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Verify signature with Bob's public key.
         let bob_pubkey = bob_custody.public_key(&bob_key).await.unwrap();
@@ -1298,7 +1331,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert_eq!(delegated.payload.att.len(), 3);
     }
 
@@ -1341,7 +1376,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert_eq!(delegated.payload.att.len(), 1);
         assert_eq!(delegated.payload.att[0].with, "scp:ctx:ctx-1/messages:read");
     }
@@ -1380,7 +1417,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert_eq!(
             delegated.payload.fct,
             Some(serde_json::json!({"delegated_by": "bob"}))
@@ -1421,8 +1460,12 @@ mod tests {
             ceiling: None,
         };
 
-        let d1 = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
-        let d2 = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let d1 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
+        let d2 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_ne!(
             d1.payload.nnc, d2.payload.nnc,
@@ -1481,9 +1524,13 @@ mod tests {
             ceiling: None,
         };
 
-        let bob_to_carol = delegate_ucan(&bob_delegate_params, &bob_custody)
-            .await
-            .unwrap();
+        let bob_to_carol = delegate_ucan(
+            &bob_delegate_params,
+            &bob_custody,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
         let bob_to_carol_cid = compute_cid(&bob_to_carol);
 
         // Bob's delegated token should have root CID in proof chain.
@@ -1509,9 +1556,13 @@ mod tests {
             ceiling: None,
         };
 
-        let carol_to_dave = delegate_ucan(&carol_delegate_params, &carol_custody)
-            .await
-            .unwrap();
+        let carol_to_dave = delegate_ucan(
+            &carol_delegate_params,
+            &carol_custody,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         // Carol's delegated token should have root CID AND Bob-to-Carol CID.
         assert_eq!(carol_to_dave.payload.prf.len(), 2);
@@ -1560,7 +1611,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &eve_custody)
+        let err = delegate_ucan(&delegate_params, &eve_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1605,7 +1656,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1655,7 +1706,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1699,7 +1750,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1742,7 +1793,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1785,7 +1836,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1826,7 +1877,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert!(delegated.payload.att.is_empty());
     }
 
@@ -1857,7 +1910,9 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let mut root_token = mint_ucan(&params, &alice_custody).await.unwrap();
+        let mut root_token = mint_ucan(&params, &alice_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         // Overwrite att to use the explicitly wildcard form.
         root_token.payload.att = wildcard_caps;
 
@@ -1880,7 +1935,9 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert_eq!(
             delegated.payload.att[0].with,
             "scp:ctx:ctx-specific/messages:write"
@@ -1911,7 +1968,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Header must not have kid.
         assert!(
@@ -1955,7 +2014,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Header must have kid="#agent".
         assert_eq!(
@@ -1997,7 +2058,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(
             token.header.kid,
@@ -2039,7 +2102,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Verify self-delegation fields.
         assert_eq!(token.payload.iss, issuer_did);
@@ -2077,7 +2142,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Decode the header segment from the JWT.
         let parts: Vec<&str> = token.encoded.split('.').collect();
@@ -2115,7 +2182,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Decode the payload segment from the JWT and verify fct.scp_key_scope.
         let parts: Vec<&str> = token.encoded.split('.').collect();
@@ -2152,7 +2221,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Round-trip: serialize the token, then parse header and payload back.
         let parts: Vec<&str> = token.encoded.split('.').collect();
@@ -2199,7 +2270,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let fct = token.payload.fct.as_ref().expect("fct must be present");
 
@@ -2235,7 +2308,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let fct = token.payload.fct.as_ref().expect("fct must be present");
         assert!(
@@ -2270,7 +2345,9 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("conflicts")),
             "conflicting scp_key_scope must be rejected: {err:?}"
@@ -2298,7 +2375,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         let fct = token.payload.fct.as_ref().expect("fct must be present");
         assert_eq!(
             fct.get("scp_key_scope").and_then(|v| v.as_str()),
@@ -2326,7 +2405,9 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("self-delegation")),
             "self-delegation without key_scope must be rejected: {err:?}"
@@ -2353,7 +2434,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert_eq!(token.payload.iss, token.payload.aud);
     }
 
@@ -2377,7 +2460,9 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("'#'")),
             "key_scope without '#' prefix must be rejected: {err:?}"
@@ -2407,6 +2492,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -2425,6 +2511,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2456,6 +2543,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -2474,6 +2562,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2505,6 +2594,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -2523,6 +2613,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2556,7 +2647,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Header must have kid="#agent" from signing_key_id.
         assert_eq!(
@@ -2586,7 +2679,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Header must have kid="#active" from signing_key_id.
         assert_eq!(
@@ -2619,7 +2714,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // kid header comes from signing_key_id, not key_scope.
         assert_eq!(
@@ -2657,7 +2754,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Without signing_key_id or key_scope, kid must be absent.
         assert_eq!(
@@ -2693,7 +2792,9 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UcanError::CapabilityOutsideCeiling(_)),
             "expected CapabilityOutsideCeiling, got: {err:?}"
@@ -2728,7 +2829,9 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody).await.is_ok(),
+            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+                .await
+                .is_ok(),
             "minting with capabilities within the ceiling must succeed"
         );
     }
@@ -2760,7 +2863,9 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody).await.is_ok(),
+            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+                .await
+                .is_ok(),
             "minting with ceiling: None must succeed for capabilities within the default ceiling"
         );
     }
@@ -2789,7 +2894,9 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UcanError::CapabilityOutsideCeiling(_)),
             "ceiling: None must apply default ceiling and reject non-standard capabilities, got: {err:?}"
@@ -2841,7 +2948,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2891,7 +2998,9 @@ mod tests {
         };
 
         assert!(
-            delegate_ucan(&delegate_params, &bob_custody).await.is_ok(),
+            delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+                .await
+                .is_ok(),
             "delegation narrowing within ceiling must succeed"
         );
     }
@@ -2922,7 +3031,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // The attestation URI must use underscore format.
         assert_eq!(
@@ -2952,7 +3063,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(
             token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:calculator",
@@ -2985,7 +3098,9 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(
             token.payload.att[0].with, "scp:ctx:ctx-1293/context_child:create",
@@ -3015,7 +3130,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(
             token.payload.att[0].with, "scp:ctx:ctx-1293/messages:write",
@@ -3049,7 +3166,9 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody).await.is_ok(),
+            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+                .await
+                .is_ok(),
             "tool:invoke:* must pass ceiling check with tool_invoke:* in ceiling"
         );
     }
@@ -3077,7 +3196,9 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UcanError::CapabilityOutsideCeiling(_)),
             "tool:invoke:* must be rejected when not in ceiling: {err:?}"

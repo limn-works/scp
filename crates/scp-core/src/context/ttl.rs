@@ -51,7 +51,7 @@ use super::params::GovernanceModel;
 use super::roles::{self, ContextRoleState};
 use super::{ContextError, ContextHandle, ContextState, MemoryScope};
 use scp_identity::DID;
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // context_id_to_bytes helper (mirrors manager.rs)
@@ -305,7 +305,7 @@ impl TtlEnforcer {
             self.created_at,
             self.ttl_policy,
             self.extended_until,
-            clock.now(),
+            clock.now_secs(),
         );
         if result.is_err() {
             self.expired = true;
@@ -351,7 +351,7 @@ impl TtlEnforcer {
             return Err(TtlError::NoTtlPolicy);
         }
         self.extended_until = Some(new_deadline);
-        if new_deadline > clock.now() {
+        if new_deadline > clock.now_secs() {
             self.expired = false;
         }
         Ok(())
@@ -367,7 +367,7 @@ impl TtlEnforcer {
                 let deadline = self
                     .extended_until
                     .unwrap_or_else(|| self.created_at.saturating_add(duration.as_secs()));
-                let now = clock.now();
+                let now = clock.now_secs();
                 if now >= deadline {
                     Some(0)
                 } else {
@@ -2105,7 +2105,7 @@ mod tests {
         proposal.record_consent("did:key:alice".into());
         proposal.record_consent("did:key:bob".into());
         assert!(proposal.is_approved());
-        let new_deadline = proposal.compute_new_deadline(clock.now());
+        let new_deadline = proposal.compute_new_deadline(clock.now_secs());
         enforcer.apply_extension(new_deadline, &clock).unwrap();
         clock.set(5000);
         assert!(enforcer.check(&clock).is_ok());
@@ -2126,7 +2126,7 @@ mod tests {
         proposal.record_consent("did:key:admin".into());
         assert!(proposal.is_approved());
         enforcer
-            .apply_extension(proposal.compute_new_deadline(clock.now()), &clock)
+            .apply_extension(proposal.compute_new_deadline(clock.now_secs()), &clock)
             .unwrap();
         clock.set(5000);
         assert!(enforcer.check(&clock).is_ok());

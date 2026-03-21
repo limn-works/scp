@@ -183,6 +183,7 @@ async fn test_agent_binding_full_flow() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("minting scoped UCAN must succeed");

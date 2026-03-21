@@ -1037,7 +1037,9 @@ async fn conf_023_ucan_issuance() {
         signing_key_id: None,
         ceiling: None,
     };
-    let token = mint_ucan(&params, &custody).await.expect("mint_ucan");
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .expect("mint_ucan");
 
     print_step(2, "Verify UCAN header fields");
     assert_eq!(token.header.alg, "EdDSA");
@@ -1099,6 +1101,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("mint root UCAN A→B");
@@ -1123,6 +1126,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("mint delegated UCAN B→C");
@@ -1173,6 +1177,7 @@ async fn conf_025_ucan_revocation() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("mint UCAN");

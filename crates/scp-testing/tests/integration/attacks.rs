@@ -895,6 +895,7 @@ async fn ucan_expired_token_rejected() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .unwrap();
@@ -922,6 +923,7 @@ async fn ucan_expired_token_rejected() {
         context_creator_did: issuer_did,
         presenting_agent_did: audience_did,
         clock_skew_tolerance_secs: 0, // No tolerance to ensure expiry is detected
+        clock: &scp_primitives::SystemClock,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -986,6 +988,7 @@ async fn ucan_nonce_replay_rejected() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .unwrap();
@@ -1016,6 +1019,7 @@ async fn ucan_nonce_replay_rejected() {
             context_creator_did: issuer_did,
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
+            clock: &scp_primitives::SystemClock,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
@@ -1035,6 +1039,7 @@ async fn ucan_nonce_replay_rejected() {
             context_creator_did: issuer_did,
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
+            clock: &scp_primitives::SystemClock,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(result.is_err(), "replayed nonce should be rejected");
@@ -1435,7 +1440,7 @@ async fn self_delegation_without_key_scope_rejected() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let result = mint_ucan(&params, &custody).await;
+    let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
     assert!(
         result.is_err(),
         "self-delegation without key_scope must be rejected at mint time"
@@ -1461,7 +1466,7 @@ async fn self_delegation_without_key_scope_rejected() {
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
     };
-    let ok_token = mint_ucan(&params_with_scope, &custody).await;
+    let ok_token = mint_ucan(&params_with_scope, &custody, &scp_primitives::SystemClock).await;
     assert!(
         ok_token.is_ok(),
         "self-delegation WITH key_scope should succeed: {:?}",
@@ -1508,7 +1513,9 @@ async fn ucan_kid_scope_mismatch_rejected() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let mut token = mint_ucan(&params, &custody).await.unwrap();
+    let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
 
     // Tamper: set kid to "#agent" while fct still says "#active".
     token.header.kid = Some("#agent".to_owned());
@@ -1542,6 +1549,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         context_creator_did: &issuer_did,
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
+        clock: &scp_primitives::SystemClock,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1595,6 +1603,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         context_creator_did: &issuer_did,
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
+        clock: &scp_primitives::SystemClock,
     };
 
     let result_2 = validate_ucan(&token, &required_cap_2, &mut ctx_2);

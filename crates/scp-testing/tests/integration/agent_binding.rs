@@ -103,7 +103,7 @@ async fn self_delegation_ucan_with_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody)
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
         .await
         .expect("mint self-delegation UCAN");
 
@@ -144,7 +144,7 @@ async fn self_delegation_without_key_scope_fails() {
         ceiling: None,
     };
 
-    let result = mint_ucan(&params, &custody).await;
+    let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
     assert!(
         result.is_err(),
         "self-delegation without key_scope must fail"
@@ -182,7 +182,7 @@ async fn key_scope_mismatch_fails() {
     };
 
     // Minting itself should succeed — the mismatch is detected at validation time.
-    let token = mint_ucan(&params, &custody)
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
         .await
         .expect("mint should succeed");
 

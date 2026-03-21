@@ -1076,7 +1076,9 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Build validation context.
         let resolver = InMemoryDidResolver {
@@ -1102,6 +1104,7 @@ mod tests {
             context_creator_did: &issuer_did,
             presenting_agent_did: "did:dht:z6MkMember",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
         };
 
         // validate_tool_invocation_ucan expects tool_invoke:calculator,

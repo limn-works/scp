@@ -30,6 +30,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use scp_identity::SigningKeyId;
+use scp_primitives::Clock;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
 use super::revoke::compute_revocation_cid;
@@ -427,21 +428,19 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     /// - `exp` check: token accepted if `exp + tolerance >= now`
     /// - `nbf` check: token accepted if `nbf - tolerance <= now`
     pub clock_skew_tolerance_secs: u64,
+    /// Clock for time-dependent checks (steps 3, 11).
+    ///
+    /// Accepts `&dyn Clock` to support both production ([`SystemClock`]) and
+    /// test ([`TestClock`]) clocks.
+    ///
+    /// [`SystemClock`]: scp_primitives::SystemClock
+    /// [`TestClock`]: scp_primitives::TestClock
+    pub clock: &'a dyn Clock,
 }
 
 // ---------------------------------------------------------------------------
 // Main validation function
 // ---------------------------------------------------------------------------
-
-/// Returns the current Unix timestamp in seconds.
-///
-/// # Errors
-///
-/// Returns [`UcanError::ClockError`] if the system clock is before the Unix
-/// epoch. Defaulting to zero would silently bypass all `nbf`/`exp` checks.
-fn now_secs() -> Result<u64, UcanError> {
-    crate::time::now_secs().map_err(UcanError::from)
-}
 
 /// Validates a UCAN token using the 11-step pipeline from ADR-016.
 ///
@@ -495,6 +494,7 @@ where
         ctx.proof_resolver,
         ctx.revocation_checker,
         ctx.clock_skew_tolerance_secs,
+        ctx.clock,
     )?;
 
     // Step 4: Root issuer — verify root token's iss is context creator.
@@ -562,7 +562,7 @@ where
 
     // Step 11: Expiry — verify exp > now and nbf <= now (with clock skew
     // tolerance).
-    verify_expiry(token, ctx.clock_skew_tolerance_secs)?;
+    verify_expiry(token, ctx.clock_skew_tolerance_secs, ctx.clock)?;
 
     Ok(())
 }
@@ -643,8 +643,12 @@ where
     // Step 8: Ceiling.
     verify_ceiling_compliance(std::slice::from_ref(required_capability), ceiling)?;
 
-    // Step 11: Expiry (with default clock skew tolerance).
-    verify_expiry(token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS)?;
+    // Step 11: Expiry (with default clock skew tolerance, system clock).
+    verify_expiry(
+        token,
+        DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        &scp_primitives::SystemClock,
+    )?;
 
     Ok(())
 }
@@ -827,6 +831,7 @@ fn verify_delegation_chain(
     proof_resolver: &impl ProofResolver,
     revocation_checker: &impl RevocationChecker,
     clock_skew_tolerance_secs: u64,
+    clock: &dyn Clock,
 ) -> Result<String, UcanError> {
     if token.payload.prf.is_empty() {
         return Ok(token.payload.iss.clone());
@@ -842,6 +847,7 @@ fn verify_delegation_chain(
         0,
         &mut seen_issuers,
         clock_skew_tolerance_secs,
+        clock,
     )
 }
 
@@ -857,6 +863,7 @@ fn verify_delegation_chain(
 ///
 /// `seen_issuers` tracks all issuer DIDs encountered during the chain walk
 /// to detect circular delegations (e.g., A->B->A).
+#[allow(clippy::too_many_arguments)]
 fn verify_chain_recursive(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
@@ -865,6 +872,7 @@ fn verify_chain_recursive(
     depth: usize,
     seen_issuers: &mut HashSet<String>,
     clock_skew_tolerance_secs: u64,
+    clock: &dyn Clock,
 ) -> Result<String, UcanError> {
     if depth > MAX_CHAIN_DEPTH {
         return Err(UcanError::DelegationChainBroken(
@@ -914,7 +922,7 @@ fn verify_chain_recursive(
         // from leaf-token failures.  Without this, TokenExpired from a parent is
         // indistinguishable from TokenExpired on the leaf, causing optimistic
         // reporting of checks that never ran on the leaf (see issue #1026).
-        verify_expiry(&parent, clock_skew_tolerance_secs)
+        verify_expiry(&parent, clock_skew_tolerance_secs, clock)
             .map_err(|e| UcanError::DelegationChainBroken(format!("parent token failed: {e}")))?;
 
         // Verify parent token has not been revoked (spec 7.2).
@@ -935,6 +943,7 @@ fn verify_chain_recursive(
             depth + 1,
             seen_issuers,
             clock_skew_tolerance_secs,
+            clock,
         )?;
 
         // All proof chains must converge to the same root issuer.
@@ -1027,7 +1036,11 @@ fn verify_attenuation(
 /// Returns [`UcanError::TokenExpired`] if the token has expired beyond tolerance.
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
 /// Returns [`UcanError::TokenNotYetValid`] if `nbf > now + tolerance`.
-fn verify_expiry(token: &UcanToken, clock_skew_tolerance_secs: u64) -> Result<(), UcanError> {
+fn verify_expiry(
+    token: &UcanToken,
+    clock_skew_tolerance_secs: u64,
+    clock: &dyn Clock,
+) -> Result<(), UcanError> {
     // Check nbf < exp first — a token with nbf >= exp is inherently invalid
     // regardless of the current time or tolerance.
     if let Some(nbf) = token.payload.nbf
@@ -1039,7 +1052,7 @@ fn verify_expiry(token: &UcanToken, clock_skew_tolerance_secs: u64) -> Result<()
         });
     }
 
-    let now = now_secs()?;
+    let now = clock.now_secs();
 
     // exp check with tolerance: allow tokens that expired within the
     // tolerance window. `exp + tolerance > now` is equivalent to
@@ -1094,6 +1107,9 @@ mod tests {
         (custody, handle, did, pk_bytes)
     }
 
+    /// Production system clock for tests that validate against real time.
+    static SYSTEM_CLOCK: scp_primitives::SystemClock = scp_primitives::SystemClock;
+
     /// Build a [`ValidationContext`] with in-memory implementations.
     fn build_context<'a, S: BuildHasher>(
         did_resolver: &'a InMemoryDidResolver,
@@ -1120,6 +1136,7 @@ mod tests {
             context_creator_did,
             presenting_agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &SYSTEM_CLOCK,
         }
     }
 
@@ -1182,7 +1199,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -1229,7 +1248,9 @@ mod tests {
             ceiling: None,
         };
 
-        let mut token = mint_ucan(&params, &custody).await.unwrap();
+        let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Tamper with the signature.
         token.signature[0] ^= 0xFF;
@@ -1302,6 +1323,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_creator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1326,6 +1348,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_delegator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1393,6 +1416,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_creator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1417,6 +1441,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1476,6 +1501,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1533,7 +1559,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -1595,6 +1623,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_non_creator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1619,6 +1648,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_delegator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1684,7 +1714,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -1739,7 +1771,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -1791,7 +1825,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Verify the attenuation uses wildcard context.
         assert_eq!(token.payload.att[0].with, "scp:ctx:*/messages:write");
@@ -1856,6 +1892,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_creator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1880,6 +1917,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_delegator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1944,7 +1982,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -2002,7 +2042,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -2068,7 +2110,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -2124,7 +2168,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         let revocation_cid = compute_revocation_cid(&token.encoded);
 
         let resolver = InMemoryDidResolver {
@@ -2182,7 +2228,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Wait for the token to expire.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2219,7 +2267,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_token_with_exp_beyond_24h() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2236,7 +2284,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         assert!(
             matches!(result, Err(UcanError::ExpiryTooFar(_))),
             "exp beyond 24h must be rejected: {result:?}"
@@ -2261,13 +2309,13 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         assert!(matches!(result, Err(UcanError::TokenExpired)));
     }
 
     #[test]
     fn verify_expiry_rejects_not_yet_valid() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2284,13 +2332,13 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         assert!(matches!(result, Err(UcanError::TokenNotYetValid)));
     }
 
     #[test]
     fn verify_expiry_accepts_valid_token() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2307,12 +2355,12 @@ mod tests {
             encoded: String::new(),
         };
 
-        assert!(verify_expiry(&token, 0).is_ok());
+        assert!(verify_expiry(&token, 0, &SYSTEM_CLOCK).is_ok());
     }
 
     #[test]
     fn verify_expiry_rejects_nbf_greater_than_exp() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2329,7 +2377,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         assert!(
             matches!(result, Err(UcanError::InvalidTimeRange { nbf, exp }) if nbf == now + 7200 && exp == now + 3600),
             "nbf > exp must return InvalidTimeRange: {result:?}"
@@ -2338,7 +2386,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_nbf_equal_to_exp() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let exp_time = now + 3600;
         let token = UcanToken {
             header: UcanHeader::new(),
@@ -2356,7 +2404,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         assert!(
             matches!(result, Err(UcanError::InvalidTimeRange { .. })),
             "nbf == exp must return InvalidTimeRange: {result:?}"
@@ -2365,7 +2413,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_accepts_nbf_less_than_exp() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2383,7 +2431,7 @@ mod tests {
         };
 
         assert!(
-            verify_expiry(&token, 0).is_ok(),
+            verify_expiry(&token, 0, &SYSTEM_CLOCK).is_ok(),
             "nbf < exp must pass time range validation"
         );
     }
@@ -2398,7 +2446,7 @@ mod tests {
         let now_millis = crate::time::now_millis().expect("clock unavailable in test");
 
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
-        let expiry = now_secs().unwrap() + 3600;
+        let expiry = crate::time::now_secs().unwrap() + 3600;
 
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         let result = tracker.check_and_record(&nonce, expiry);
@@ -2411,7 +2459,7 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_malformed_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let expiry = now_secs().unwrap() + 3600;
+        let expiry = crate::time::now_secs().unwrap() + 3600;
 
         // No separator.
         let result = tracker.check_and_record("nohyphen", expiry);
@@ -2452,7 +2500,9 @@ mod tests {
             ceiling: None,
         };
 
-        let minted = mint_ucan(&params, &custody).await.unwrap();
+        let minted = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Parse the encoded token back.
         let parsed = parse_ucan(&minted.encoded).unwrap();
@@ -2509,7 +2559,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -2568,6 +2620,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_creator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -2598,6 +2651,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_delegator,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -2687,11 +2741,11 @@ mod tests {
     // Clock error / epoch-0 bypass prevention (SCP-173)
     // -----------------------------------------------------------------------
 
-    /// Verify that `now_secs()` returns `Ok` on a normal system (Result
-    /// signature works correctly after the `unwrap_or_default()` removal).
+    /// Verify that `crate::time::now_secs()` returns `Ok` on a normal system
+    /// (Result signature works correctly after the `unwrap_or_default()` removal).
     #[test]
     fn now_secs_returns_ok_on_normal_system() {
-        let result = now_secs();
+        let result = crate::time::now_secs();
         assert!(
             result.is_ok(),
             "now_secs() should succeed on a normal system"
@@ -2729,7 +2783,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         // nbf == exp triggers InvalidTimeRange before TokenExpired.
         assert!(
             matches!(result, Err(UcanError::InvalidTimeRange { nbf: 0, exp: 0 })),
@@ -2760,7 +2814,7 @@ mod tests {
             encoded: String::new(),
         };
 
-        let result = verify_expiry(&token, 0);
+        let result = verify_expiry(&token, 0, &SYSTEM_CLOCK);
         assert!(
             matches!(result, Err(UcanError::TokenExpired)),
             "near-epoch token (exp=1) must be rejected: {result:?}"
@@ -2807,6 +2861,7 @@ mod tests {
                 ceiling: None,
             },
             custody,
+            &SYSTEM_CLOCK,
         )
         .await
         .unwrap()
@@ -2894,6 +2949,7 @@ mod tests {
             &proof_resolver,
             &revocation_checker,
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            &SYSTEM_CLOCK,
         );
         assert!(
             matches!(result, Err(UcanError::CircularDelegation(_))),
@@ -2929,6 +2985,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_a,
+            &SYSTEM_CLOCK,
         )
         .await
         .unwrap();
@@ -2951,6 +3008,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -2973,6 +3031,7 @@ mod tests {
             &proof_resolver,
             &revocation_checker,
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            &SYSTEM_CLOCK,
         );
         assert!(result.is_ok(), "linear chain A->B->C must pass: {result:?}");
         assert_eq!(result.unwrap(), did_a);
@@ -2985,8 +3044,6 @@ mod tests {
     /// verify the validation layer also catches it independently.
     #[tokio::test]
     async fn validate_ucan_rejects_self_delegation_a_to_a() {
-        use crate::crypto::ucan::nonce::generate_nonce;
-
         let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
 
         // Manually build a self-delegation root token (iss == aud, no key_scope)
@@ -2998,7 +3055,7 @@ mod tests {
             aud: did_a.clone(),
             exp: now + 3600,
             nbf: None,
-            nnc: generate_nonce().unwrap(),
+            nnc: crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![crate::crypto::ucan::Attenuation {
                 with: "scp:ctx:ctx-self/messages:write".to_owned(),
                 can: "write".to_owned(),
@@ -3032,7 +3089,7 @@ mod tests {
             aud: "did:dht:z6MkSomeone".to_owned(),
             exp: now + 3600,
             nbf: None,
-            nnc: generate_nonce().unwrap(),
+            nnc: crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![crate::crypto::ucan::Attenuation {
                 with: "scp:ctx:ctx-self/messages:write".to_owned(),
                 can: "write".to_owned(),
@@ -3077,6 +3134,7 @@ mod tests {
             &proof_resolver,
             &revocation_checker,
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            &SYSTEM_CLOCK,
         );
         assert!(
             matches!(result, Err(UcanError::CircularDelegation(_))),
@@ -3092,7 +3150,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkA".into(),
                 aud: "did:dht:z6MkB".into(),
-                exp: now_secs().unwrap() + 3600,
+                exp: crate::time::now_secs().unwrap() + 3600,
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
                 att: vec![],
@@ -3119,6 +3177,7 @@ mod tests {
             MAX_CHAIN_DEPTH + 1,
             &mut seen,
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            &SYSTEM_CLOCK,
         );
 
         assert!(
@@ -3147,7 +3206,7 @@ mod tests {
     /// 5-minute tolerance (300 seconds).
     #[test]
     fn verify_expiry_tolerates_recently_expired_token() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3166,13 +3225,16 @@ mod tests {
 
         // With 300s tolerance: exp (now - 30) + 300 = now + 270 > now. Accepted.
         assert!(
-            verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS).is_ok(),
+            verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, &SYSTEM_CLOCK).is_ok(),
             "token expired 30s ago must be accepted with 5-min tolerance"
         );
 
         // With 0 tolerance: exp (now - 30) + 0 <= now. Rejected.
         assert!(
-            matches!(verify_expiry(&token, 0), Err(UcanError::TokenExpired)),
+            matches!(
+                verify_expiry(&token, 0, &SYSTEM_CLOCK),
+                Err(UcanError::TokenExpired)
+            ),
             "token expired 30s ago must be rejected with 0 tolerance"
         );
     }
@@ -3181,7 +3243,7 @@ mod tests {
     /// default 5-minute tolerance.
     #[test]
     fn verify_expiry_rejects_token_expired_beyond_tolerance() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3201,7 +3263,7 @@ mod tests {
         // exp (now - 360) + 300 = now - 60 <= now. Rejected.
         assert!(
             matches!(
-                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, &SYSTEM_CLOCK),
                 Err(UcanError::TokenExpired)
             ),
             "token expired 6 min ago must be rejected even with 5-min tolerance"
@@ -3212,7 +3274,7 @@ mod tests {
     /// default 5-minute tolerance.
     #[test]
     fn verify_expiry_tolerates_slightly_future_nbf() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3231,13 +3293,16 @@ mod tests {
 
         // With 300s tolerance: nbf (now + 30) - 300 = now - 270 <= now. Accepted.
         assert!(
-            verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS).is_ok(),
+            verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, &SYSTEM_CLOCK).is_ok(),
             "nbf 30s in the future must be accepted with 5-min tolerance"
         );
 
         // With 0 tolerance: nbf (now + 30) - 0 = now + 30 > now. Rejected.
         assert!(
-            matches!(verify_expiry(&token, 0), Err(UcanError::TokenNotYetValid)),
+            matches!(
+                verify_expiry(&token, 0, &SYSTEM_CLOCK),
+                Err(UcanError::TokenNotYetValid)
+            ),
             "nbf 30s in the future must be rejected with 0 tolerance"
         );
     }
@@ -3246,7 +3311,7 @@ mod tests {
     /// the default 5-minute tolerance.
     #[test]
     fn verify_expiry_rejects_nbf_beyond_tolerance() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3266,7 +3331,7 @@ mod tests {
         // nbf (now + 360) - 300 = now + 60 > now. Rejected.
         assert!(
             matches!(
-                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, &SYSTEM_CLOCK),
                 Err(UcanError::TokenNotYetValid)
             ),
             "nbf 6 min in the future must be rejected even with 5-min tolerance"
@@ -3277,7 +3342,7 @@ mod tests {
     /// exactly at the 24h limit is valid; tolerance doesn't extend this bound.
     #[test]
     fn verify_expiry_too_far_ignores_tolerance() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3297,7 +3362,7 @@ mod tests {
         // Even with large tolerance, ExpiryTooFar is not affected.
         assert!(
             matches!(
-                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, &SYSTEM_CLOCK),
                 Err(UcanError::ExpiryTooFar(_))
             ),
             "exp beyond 24h must be rejected regardless of tolerance"
@@ -3308,7 +3373,7 @@ mod tests {
     /// tolerance. It is a structural token error, not a clock drift issue.
     #[test]
     fn verify_expiry_invalid_time_range_ignores_tolerance() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3328,7 +3393,7 @@ mod tests {
         // Even with large tolerance, InvalidTimeRange fires first.
         assert!(
             matches!(
-                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS),
+                verify_expiry(&token, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, &SYSTEM_CLOCK),
                 Err(UcanError::InvalidTimeRange { .. })
             ),
             "nbf > exp must return InvalidTimeRange regardless of tolerance"
@@ -3340,7 +3405,7 @@ mod tests {
     /// it's expired.
     #[test]
     fn verify_expiry_boundary_expired_at_exact_tolerance() {
-        let now = now_secs().unwrap();
+        let now = crate::time::now_secs().unwrap();
         let tolerance = 60u64;
         let token = UcanToken {
             header: UcanHeader::new(),
@@ -3361,7 +3426,7 @@ mod tests {
         // exp + tolerance == now. Uses `<=` so this is rejected.
         assert!(
             matches!(
-                verify_expiry(&token, tolerance),
+                verify_expiry(&token, tolerance, &SYSTEM_CLOCK),
                 Err(UcanError::TokenExpired)
             ),
             "token at exact tolerance boundary must be rejected"
@@ -3380,8 +3445,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_ucan_rejects_self_delegation_without_key_scope() {
-        use crate::crypto::ucan::nonce::generate_nonce;
-
         // iss == aud without scp_key_scope must be rejected at validation level.
         // mint_ucan now also rejects this at mint time, so we construct the
         // invalid token manually to verify the validation layer independently.
@@ -3394,7 +3457,7 @@ mod tests {
             aud: issuer_did.clone(),
             exp: now + 3600,
             nbf: None,
-            nnc: generate_nonce().unwrap(),
+            nnc: crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![crate::crypto::ucan::Attenuation {
                 with: "scp:ctx:ctx-self/messages:write".to_owned(),
                 can: "write".to_owned(),
@@ -3470,7 +3533,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // The default key IS the #active key, so register it under both
         // the default and the kid_keys paths.
@@ -3535,7 +3600,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // kid should be "#agent" in the header.
         assert_eq!(token.header.kid, Some("#agent".to_owned()));
@@ -3604,7 +3671,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Register both keys. The #agent key is different from #active.
         let resolver = InMemoryDidResolver {
@@ -3673,7 +3742,9 @@ mod tests {
             ceiling: None,
         };
 
-        let base_token = mint_ucan(&base_params, &custody).await.unwrap();
+        let base_token = mint_ucan(&base_params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Tamper: change fct.scp_key_scope to "#agent" while keeping
         // kid="#active".
@@ -3767,7 +3838,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -3827,7 +3900,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // The resolver maps #agent to the REAL agent key (different from #active).
         let resolver = InMemoryDidResolver {
@@ -3942,7 +4017,6 @@ mod tests {
         //
         // We verify that the chain is rejected (either SelfDelegationWithoutKeyScope
         // or CircularDelegation) — both are correct rejections.
-        use crate::crypto::ucan::nonce::generate_nonce;
 
         let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
         let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
@@ -3957,7 +4031,7 @@ mod tests {
             aud: creator_did.clone(), // iss == aud, no key_scope
             exp: now + 3600,
             nbf: None,
-            nnc: generate_nonce().unwrap(),
+            nnc: crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![crate::crypto::ucan::Attenuation {
                 with: "scp:ctx:ctx-chain/messages:write".to_owned(),
                 can: "write".to_owned(),
@@ -4000,7 +4074,13 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let child_token = mint_ucan(&child_params, &custody_creator).await.unwrap();
+        let child_token = mint_ucan(
+            &child_params,
+            &custody_creator,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((creator_did.clone(), pk_creator)).collect(),
@@ -4091,7 +4171,6 @@ mod tests {
         // kid="#active" must cause the chain to be rejected with
         // KeyScopeMismatch. This is the primary exploit path that was not
         // caught before adding validate_key_scope to verify_chain_recursive.
-        use crate::crypto::ucan::nonce::generate_nonce;
 
         // Three identities: creator (root), delegator (middle), agent (leaf).
         let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
@@ -4110,7 +4189,7 @@ mod tests {
             aud: delegator_did.clone(), // iss != aud, normal delegation
             exp: now + 3600,
             nbf: None,
-            nnc: generate_nonce().unwrap(),
+            nnc: crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![crate::crypto::ucan::Attenuation {
                 with: "scp:ctx:ctx-chain/messages:write".to_owned(),
                 can: "write".to_owned(),
@@ -4153,7 +4232,13 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
+        let child_token = mint_ucan(
+            &child_params,
+            &custody_delegator,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: [
@@ -4199,7 +4284,6 @@ mod tests {
     async fn chain_accepts_parent_with_valid_key_scope() {
         // A parent token with a valid key_scope (matching kid) must be accepted
         // in the delegation chain.
-        use crate::crypto::ucan::nonce::generate_nonce;
 
         // Three identities: creator (root), delegator (middle), agent (leaf).
         let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
@@ -4218,7 +4302,7 @@ mod tests {
             aud: delegator_did.clone(),
             exp: now + 3600,
             nbf: None,
-            nnc: generate_nonce().unwrap(),
+            nnc: crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![crate::crypto::ucan::Attenuation {
                 with: "scp:ctx:ctx-chain/messages:write".to_owned(),
                 can: "write".to_owned(),
@@ -4261,7 +4345,13 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
+        let child_token = mint_ucan(
+            &child_params,
+            &custody_delegator,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: [

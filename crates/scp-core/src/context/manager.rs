@@ -1126,8 +1126,7 @@ fn mint_governance_tokens(
             // static nonce (acceptable for governance tokens minted at creation
             // time — replay prevention is handled by the engine's proposal-ID
             // scheme).
-            let nonce = crate::crypto::ucan::nonce::generate_nonce()
-                .unwrap_or_else(|_| "gov-init-0".to_owned());
+            let nonce = crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
             tokens.push(UcanToken {
                 iss: creator_did.to_string(),
                 aud: voter.to_string(),
@@ -6055,8 +6054,8 @@ impl ContextManager {
                     with: format!("scp:ctx:{context_id}/{cap}"),
                     can: "invoke".to_owned(),
                 };
-                let nonce = crate::crypto::ucan::nonce::generate_nonce()
-                    .unwrap_or_else(|_| "gov-signer-add-0".to_owned());
+                let nonce =
+                    crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
                 let token = roles::UcanToken {
                     iss: creator_did.clone(),
                     aud: did.to_string(),

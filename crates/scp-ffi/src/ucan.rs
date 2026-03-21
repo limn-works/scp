@@ -203,6 +203,7 @@ pub fn py_ucan_validate(
             context_creator_did: &rt.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
         };
 
         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
@@ -264,7 +265,7 @@ pub fn py_ucan_mint(
 
     let rt = crate::runtime()?;
     let context_id_owned = context_id.to_owned();
-    let _nonce = scp_core::crypto::ucan::nonce::generate_nonce();
+    let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
 
     // Mint using real scp_core::mint_ucan with Ed25519 signing via
     // the retained KeyCustody. See SCP-214 criterion 7.
@@ -288,7 +289,14 @@ pub fn py_ucan_mint(
             ceiling: Some(ceiling_strings),
         };
 
-        let result = rt.block_on(async { mint_ucan(&params, entry.custody.as_ref()).await });
+        let result = rt.block_on(async {
+            mint_ucan(
+                &params,
+                entry.custody.as_ref(),
+                &scp_primitives::SystemClock,
+            )
+            .await
+        });
         result.map_err(ScpPyError::from)
     })?;
 
@@ -403,7 +411,14 @@ pub fn py_ucan_delegate(
             ceiling: Some(ceiling_strings.clone()),
         };
 
-        let result = rt.block_on(async { delegate_ucan(&params, entry.custody.as_ref()).await });
+        let result = rt.block_on(async {
+            delegate_ucan(
+                &params,
+                entry.custody.as_ref(),
+                &scp_primitives::SystemClock,
+            )
+            .await
+        });
         result.map_err(ScpPyError::from)
     })?;
 

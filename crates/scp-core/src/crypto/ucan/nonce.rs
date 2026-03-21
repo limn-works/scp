@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::UcanError;
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
@@ -65,18 +65,15 @@ const DEFAULT_MAX_CAPACITY: usize = 100_000;
 /// Uses `OsRng` for cryptographic randomness.
 ///
 /// See ADR-009 acceptance criterion 7 and ADR-016 acceptance criterion 6.
-///
-/// # Errors
-///
-/// Returns [`crate::time::ClockError`] if the system clock is unavailable.
-pub fn generate_nonce() -> Result<String, crate::time::ClockError> {
-    let now_millis = crate::time::now_millis()?;
+#[must_use]
+pub fn generate_nonce(clock: &dyn Clock) -> String {
+    let now_millis = clock.now_millis();
 
     let mut random_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random_bytes);
 
     let hex_suffix = hex::encode(random_bytes);
-    Ok(format!("{now_millis}-{hex_suffix}"))
+    format!("{now_millis}-{hex_suffix}")
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +144,7 @@ impl<C: Clock> NonceTracker<C> {
     /// deployment context.
     #[must_use]
     pub fn with_max_capacity(context_id: String, clock: C, max_capacity: usize) -> Self {
-        let now = clock.now();
+        let now = clock.now_secs();
         Self {
             seen: HashMap::new(),
             context_id,
@@ -215,7 +212,7 @@ impl<C: Clock> NonceTracker<C> {
         }
 
         // 2. Freshness check: timestamp within now +/- 5 minutes.
-        let now_secs = self.clock.now();
+        let now_secs = self.clock.now_secs();
         let now_millis = u128::from(now_secs) * 1000;
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
@@ -263,7 +260,7 @@ impl<C: Clock> NonceTracker<C> {
     /// This ensures nonces are retained for at least 5 minutes past token
     /// expiry or 24 hours past first observation, whichever is longer.
     pub fn prune(&mut self) {
-        let now = self.clock.now();
+        let now = self.clock.now_secs();
         self.seen.retain(|_, (first_seen, token_expiry)| {
             let expiry_deadline = token_expiry.saturating_add(PRUNE_EXPIRY_GRACE_SECS);
             let retention_deadline = first_seen.saturating_add(PRUNE_MIN_RETENTION_SECS);
@@ -321,7 +318,7 @@ impl<C: Clock> NonceTracker<C> {
             UcanError::MalformedToken(format!("nonce tracker deserialization: {e}"))
         })?;
 
-        let now = clock.now();
+        let now = clock.now_secs();
         let mut tracker = Self {
             seen: state.seen,
             context_id: state.context_id,
@@ -385,7 +382,7 @@ mod tests {
 
     /// Creates a valid nonce at the tracker's current time.
     fn make_nonce_now(clock: &TestClock) -> String {
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         make_nonce(millis, "aabbccdd11223344aabbccdd11223344")
     }
 
@@ -417,7 +414,7 @@ mod tests {
     #[test]
     fn check_rejects_nonce_hex_too_short() {
         let (mut tracker, clock) = setup();
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         let nonce = format!("{millis}-aabbccdd112233");
         let result = tracker.check_and_record(&nonce, 0);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
@@ -426,7 +423,7 @@ mod tests {
     #[test]
     fn check_rejects_nonce_hex_too_long() {
         let (mut tracker, clock) = setup();
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         let nonce = format!("{millis}-aabbccdd11223344aabbccdd11223344ff");
         let result = tracker.check_and_record(&nonce, 0);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn check_rejects_nonce_hex_with_non_hex_chars() {
         let (mut tracker, clock) = setup();
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         let nonce = format!("{millis}-gghhiidd11223344aabbccdd11223344");
         let result = tracker.check_and_record(&nonce, 0);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
@@ -445,7 +442,7 @@ mod tests {
     fn check_accepts_valid_nonce_format() {
         let (mut tracker, clock) = setup();
         let nonce = make_nonce_now(&clock);
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
     }
 
@@ -457,7 +454,7 @@ mod tests {
     fn check_rejects_nonce_too_old() {
         let (mut tracker, clock) = setup();
         // 6 minutes in the past (> 5 minute tolerance).
-        let old_millis = u128::from(clock.now()) * 1000 - 6 * 60 * 1000;
+        let old_millis = u128::from(clock.now_secs()) * 1000 - 6 * 60 * 1000;
         let nonce = make_nonce(old_millis, "aabbccdd11223344aabbccdd11223344");
         let result = tracker.check_and_record(&nonce, 0);
         assert!(matches!(result, Err(UcanError::NonceTooOld(_))));
@@ -467,7 +464,7 @@ mod tests {
     fn check_rejects_nonce_from_future() {
         let (mut tracker, clock) = setup();
         // 6 minutes in the future (> 5 minute tolerance).
-        let future_millis = u128::from(clock.now()) * 1000 + 6 * 60 * 1000;
+        let future_millis = u128::from(clock.now_secs()) * 1000 + 6 * 60 * 1000;
         let nonce = make_nonce(future_millis, "aabbccdd11223344aabbccdd11223344");
         let result = tracker.check_and_record(&nonce, 0);
         assert!(matches!(result, Err(UcanError::NonceFuture(_))));
@@ -477,9 +474,9 @@ mod tests {
     fn check_accepts_nonce_within_tolerance() {
         let (mut tracker, clock) = setup();
         // 4 minutes in the past (within 5 minute tolerance).
-        let millis = u128::from(clock.now()) * 1000 - 4 * 60 * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000 - 4 * 60 * 1000;
         let nonce = make_nonce(millis, "aabbccdd11223344aabbccdd11223344");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
     }
 
@@ -487,9 +484,9 @@ mod tests {
     fn check_accepts_nonce_at_exact_tolerance_boundary() {
         let (mut tracker, clock) = setup();
         // Exactly 5 minutes in the past.
-        let millis = u128::from(clock.now()) * 1000 - NONCE_FRESHNESS_TOLERANCE_MS;
+        let millis = u128::from(clock.now_secs()) * 1000 - NONCE_FRESHNESS_TOLERANCE_MS;
         let nonce = make_nonce(millis, "aabbccdd11223344aabbccdd11223344");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
     }
 
@@ -497,9 +494,9 @@ mod tests {
     fn check_accepts_nonce_at_future_tolerance_boundary() {
         let (mut tracker, clock) = setup();
         // Exactly 5 minutes in the future.
-        let millis = u128::from(clock.now()) * 1000 + NONCE_FRESHNESS_TOLERANCE_MS;
+        let millis = u128::from(clock.now_secs()) * 1000 + NONCE_FRESHNESS_TOLERANCE_MS;
         let nonce = make_nonce(millis, "aabbccdd11223344aabbccdd11223344");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
     }
 
@@ -511,7 +508,7 @@ mod tests {
     fn check_rejects_duplicate_nonce() {
         let (mut tracker, clock) = setup();
         let nonce = make_nonce_now(&clock);
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         let result = tracker.check_and_record(&nonce, expiry);
         assert!(matches!(result, Err(UcanError::NonceReused(_))));
@@ -520,10 +517,10 @@ mod tests {
     #[test]
     fn check_records_distinct_nonces() {
         let (mut tracker, clock) = setup();
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         let nonce_a = make_nonce(millis, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1");
         let nonce_b = make_nonce(millis, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce_a, expiry).is_ok());
         assert!(tracker.check_and_record(&nonce_b, expiry).is_ok());
         assert_eq!(tracker.len(), 2);
@@ -538,7 +535,7 @@ mod tests {
         let (mut tracker, clock) = setup();
         let nonce = make_nonce_now(&clock);
         // Token expires in 1 hour.
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         tracker.check_and_record(&nonce, expiry).unwrap();
         assert_eq!(tracker.len(), 1);
 
@@ -555,7 +552,7 @@ mod tests {
     fn prune_retains_entry_within_retention_window() {
         let (mut tracker, clock) = setup();
         let nonce = make_nonce_now(&clock);
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         tracker.check_and_record(&nonce, expiry).unwrap();
 
         // Advance 12 hours — still within 24-hour retention.
@@ -571,7 +568,7 @@ mod tests {
         // Token expires 25 hours from now (90000s). The expiry + 300 deadline
         // (90300s) exceeds the first_seen + 86400 deadline (86400s), so the
         // expiry grace period should keep the entry alive past 24 hours.
-        let expiry = clock.now() + 25 * 3600;
+        let expiry = clock.now_secs() + 25 * 3600;
         tracker.check_and_record(&nonce, expiry).unwrap();
 
         // Advance 24h + 1s past first_seen. The first_seen deadline has passed
@@ -593,10 +590,10 @@ mod tests {
 
         // Record 999 nonces (below threshold).
         for i in 0..999 {
-            let millis = u128::from(clock.now()) * 1000;
+            let millis = u128::from(clock.now_secs()) * 1000;
             let hex = format!("{i:032x}");
             let nonce = make_nonce(millis, &hex);
-            let expiry = clock.now() + 1; // Very short expiry.
+            let expiry = clock.now_secs() + 1; // Very short expiry.
             tracker.check_and_record(&nonce, expiry).unwrap();
         }
 
@@ -604,9 +601,9 @@ mod tests {
         clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
 
         // The 1000th check should trigger auto-prune.
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         let nonce = make_nonce(millis, "ff00ff00ff00ff00ff00ff00ff00ff00");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         tracker.check_and_record(&nonce, expiry).unwrap();
 
         // After auto-prune, only the last nonce should remain (the other 999
@@ -619,7 +616,7 @@ mod tests {
         let (mut tracker, clock) = setup();
 
         let nonce = make_nonce_now(&clock);
-        let expiry = clock.now() + 1; // Very short expiry.
+        let expiry = clock.now_secs() + 1; // Very short expiry.
         tracker.check_and_record(&nonce, expiry).unwrap();
         assert_eq!(tracker.len(), 1);
 
@@ -628,7 +625,7 @@ mod tests {
 
         // Next check should trigger time-based auto-prune.
         let nonce2 = make_nonce_now(&clock);
-        let expiry2 = clock.now() + 3600;
+        let expiry2 = clock.now_secs() + 3600;
         tracker.check_and_record(&nonce2, expiry2).unwrap();
 
         // The first nonce should have been pruned.
@@ -643,7 +640,7 @@ mod tests {
     fn serialize_deserialize_roundtrip() {
         let (mut tracker, clock) = setup();
         let nonce = make_nonce_now(&clock);
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         tracker.check_and_record(&nonce, expiry).unwrap();
 
         let bytes = tracker.to_bytes().unwrap();
@@ -657,7 +654,7 @@ mod tests {
     fn deserialize_prunes_expired_entries() {
         let (mut tracker, clock) = setup();
         let nonce = make_nonce_now(&clock);
-        let expiry = clock.now() + 1;
+        let expiry = clock.now_secs() + 1;
         tracker.check_and_record(&nonce, expiry).unwrap();
 
         let bytes = tracker.to_bytes().unwrap();
@@ -712,10 +709,10 @@ mod tests {
     #[test]
     fn nonce_with_uppercase_hex_is_rejected() {
         let (mut tracker, clock) = setup();
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
         // Uppercase hex chars — format expects lowercase.
         let nonce = format!("{millis}-AABBCCDD11223344AABBCCDD11223344");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         // Uppercase hex is valid hex, so this should be accepted
         // (is_ascii_hexdigit covers both upper and lower).
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
@@ -752,8 +749,8 @@ mod tests {
         let clock = Arc::new(TestClock::new(BASE_SECS));
         let mut tracker =
             NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 5);
-        let millis = u128::from(clock.now()) * 1000;
-        let expiry = clock.now() + 3600;
+        let millis = u128::from(clock.now_secs()) * 1000;
+        let expiry = clock.now_secs() + 3600;
 
         for i in 0..5 {
             let hex = format!("{i:032x}");
@@ -768,8 +765,8 @@ mod tests {
         let clock = Arc::new(TestClock::new(BASE_SECS));
         let mut tracker =
             NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 3);
-        let millis = u128::from(clock.now()) * 1000;
-        let expiry = clock.now() + 3600;
+        let millis = u128::from(clock.now_secs()) * 1000;
+        let expiry = clock.now_secs() + 3600;
 
         // Fill to capacity.
         for i in 0..3 {
@@ -792,13 +789,13 @@ mod tests {
         let clock = Arc::new(TestClock::new(BASE_SECS));
         let mut tracker =
             NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 3);
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
 
         // Fill to capacity with short-lived entries.
         for i in 0..3 {
             let hex = format!("{i:032x}");
             let nonce = make_nonce(millis, &hex);
-            let expiry = clock.now() + 1; // Very short expiry.
+            let expiry = clock.now_secs() + 1; // Very short expiry.
             assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         }
         assert_eq!(tracker.len(), 3);
@@ -808,9 +805,9 @@ mod tests {
 
         // Now a new nonce should succeed: the capacity check triggers prune,
         // freeing all 3 expired entries.
-        let new_millis = u128::from(clock.now()) * 1000;
+        let new_millis = u128::from(clock.now_secs()) * 1000;
         let nonce = make_nonce(new_millis, "ff00ff00ff00ff00ff00ff00ff00ff00");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         assert_eq!(tracker.len(), 1);
     }
@@ -820,19 +817,19 @@ mod tests {
         let clock = Arc::new(TestClock::new(BASE_SECS));
         let mut tracker =
             NonceTracker::with_max_capacity("ctx-cap".to_owned(), Arc::clone(&clock), 3);
-        let millis = u128::from(clock.now()) * 1000;
+        let millis = u128::from(clock.now_secs()) * 1000;
 
         // Insert 2 entries with short expiry.
         for i in 0..2 {
             let hex = format!("{i:032x}");
             let nonce = make_nonce(millis, &hex);
-            let expiry = clock.now() + 1;
+            let expiry = clock.now_secs() + 1;
             assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         }
 
         // Insert 1 entry with long expiry.
         let nonce_long = make_nonce(millis, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3");
-        let long_expiry = clock.now() + PRUNE_MIN_RETENTION_SECS + 3600;
+        let long_expiry = clock.now_secs() + PRUNE_MIN_RETENTION_SECS + 3600;
         assert!(tracker.check_and_record(&nonce_long, long_expiry).is_ok());
         assert_eq!(tracker.len(), 3);
 
@@ -840,9 +837,9 @@ mod tests {
         clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
 
         // New nonce should succeed: prune removes the 2 expired entries.
-        let new_millis = u128::from(clock.now()) * 1000;
+        let new_millis = u128::from(clock.now_secs()) * 1000;
         let nonce = make_nonce(new_millis, "ff00ff00ff00ff00ff00ff00ff00ff00");
-        let expiry = clock.now() + 3600;
+        let expiry = clock.now_secs() + 3600;
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         // 1 old long-lived + 1 new = 2
         assert_eq!(tracker.len(), 2);

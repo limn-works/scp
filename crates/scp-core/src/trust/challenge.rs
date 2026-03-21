@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::ed25519::verify_ed25519_signature;
 use scp_event_log::Ed25519Signature;
 use scp_identity::DID;
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
@@ -667,7 +667,7 @@ pub fn verify_challenge_response(
     //    deadline. We define the deadline as now (verification time).
     //    The completed_at must be within the timeout window relative to the
     //    current time, i.e., completed_at >= (now - timeout_secs).
-    let now = clock.now();
+    let now = clock.now_secs();
     let timeout_secs = request.timeout.as_secs();
     if now > timeout_secs && response.completed_at < (now - timeout_secs) {
         return Err(TrustError::ChallengeTimeout {

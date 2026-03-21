@@ -33,6 +33,7 @@ pyo3 = { version = "0.24.1", features = ["experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
+scp-primitives = { path = "../scp-primitives" }
 scp-event-log = { path = "../scp-event-log" }
 scp-ffi-common = { path = "common" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"], optional = true }
