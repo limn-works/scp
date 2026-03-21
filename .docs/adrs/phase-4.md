@@ -1436,6 +1436,8 @@ The re-implementation is NOT a fork — it is a second implementation of the sam
 
 2. **Extracting `scp-core-portable`.** A hypothetical refactoring that strips scp-core into a platform-agnostic core with no tokio or OpenMLS dependency. The remaining functionality would be too thin to be useful — most protocol logic requires crypto and async I/O. Rejected because the extraction boundary does not exist at a useful abstraction layer.
 
+   **Update (2026-03-21):** The "too thin to be useful" rationale is now empirically false. Dependency traces (4 agents, 2026-03-18) confirmed ~92K lines of pure sync protocol logic in scp-core (trust, governance, UCAN validation, envelope verification, provenance, capability matching, discovery registries, economy policy, sync algorithms) with zero tokio, zero async, zero OpenMLS, and zero scp-platform dependencies — roughly 47% of scp-core's 195K total lines. The extraction boundary became viable as scp-core grew from its original size to its current scale. See #1446 for the detailed extraction plan (`scp-protocol` + `scp-runtime`). The core ADR-034 decision (WASM bridge as separate re-implementation) remains correct and unchanged; this alternative is now viable but has not yet been executed.
+
 3. **Emscripten compilation.** Emscripten can compile C/C++ dependencies (ring, OpenMLS's C backend) to WASM, but produces significantly larger binaries, requires manual JavaScript glue, and does not integrate with wasm-bindgen's type system. Rejected because it trades one set of problems for a worse set.
 
 ### Risk Profile
