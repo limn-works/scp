@@ -14,11 +14,11 @@ categories = ["network-programming", "asynchronous"]
 sqlite-blob = ["dep:rusqlite"]
 redb-blob = ["dep:redb"]
 local-cache = []
-combined = ["dep:rusqlite", "dep:scp-platform", "dep:zeroize"]
+combined = ["dep:rusqlite", "dep:scp-platform"]
 relay-persistence = ["dep:scp-platform"]
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:http-body"]
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:zeroize"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
@@ -50,7 +50,7 @@ rand = { workspace = true }
 subtle = "2"
 rusqlite = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
-zeroize = { workspace = true, optional = true }
+zeroize = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }

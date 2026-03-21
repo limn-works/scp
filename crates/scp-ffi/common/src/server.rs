@@ -498,6 +498,33 @@ impl RunningNode {
         }
     }
 
+    /// Returns the internal relay WebSocket URL for in-process connections.
+    ///
+    /// Unlike [`relay_url`](Self::relay_url) (which returns the advertised URL
+    /// for external clients, e.g. `wss://localhost/scp/v1`), this returns
+    /// `ws://127.0.0.1:{port}/scp/v1` — suitable for in-process relay
+    /// connections that bypass TLS. The port is the actual OS-assigned port
+    /// the relay is bound to.
+    #[must_use]
+    pub fn internal_relay_url(&self) -> String {
+        format!("ws://127.0.0.1:{}/scp/v1", self.relay_port())
+    }
+
+    /// Returns the hex-encoded bridge token for relay authentication.
+    ///
+    /// This token must be included as an `Authorization: Bearer <hex>` header
+    /// when connecting directly to the relay's bound address. The
+    /// `ApplicationNode` relay enforces this for all WebSocket connections.
+    ///
+    /// **Security:** This value is a secret. Do not log or expose it.
+    #[must_use]
+    pub fn bridge_token_hex(&self) -> String {
+        match self {
+            Self::InMemory(n) => n.bridge_token_hex(),
+            Self::Filesystem(n) => n.bridge_token_hex(),
+        }
+    }
+
     /// Returns `true` if shutdown has already been signaled.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {

@@ -38,6 +38,8 @@ use scp_core::envelope::OuterEnvelope;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+use zeroize::Zeroizing;
+
 use super::protocol::{ClientMessage, RelayMessage};
 use crate::backoff::ReconnectBackoff;
 use crate::error::TransportError;
@@ -164,6 +166,12 @@ struct ClientInner {
 pub struct NativeRelayClient {
     /// The relay URL (e.g., `ws://127.0.0.1:9000/scp/v1`).
     url: String,
+    /// Optional bearer token for `Authorization: Bearer <token>` header.
+    ///
+    /// When `Some`, the token is included in the WebSocket upgrade request
+    /// headers. Used for connecting to relay endpoints that require
+    /// authentication (e.g., bridge token on `ApplicationNode` relays).
+    bearer_token: Option<Arc<Zeroizing<String>>>,
     /// Shared mutable inner state.
     inner: Arc<RwLock<ClientInner>>,
     /// The WebSocket sink (write half), protected by a mutex for exclusive
@@ -200,6 +208,25 @@ impl NativeRelayClient {
     /// Returns [`TransportError::ConnectionFailed`] if the initial connection
     /// cannot be established.
     pub async fn connect(url: &str) -> Result<Self, TransportError> {
+        Self::connect_with_bearer(url, None).await
+    }
+
+    /// Creates a new client targeting the given relay URL with an optional
+    /// bearer token and immediately connects.
+    ///
+    /// When `bearer_token` is `Some`, the token is included as an
+    /// `Authorization: Bearer <token>` header in the WebSocket upgrade
+    /// request. This is required for connecting to relay endpoints that
+    /// enforce bridge token authentication (e.g., `ApplicationNode` relays).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ConnectionFailed`] if the initial connection
+    /// cannot be established (including authentication rejection).
+    pub async fn connect_with_bearer(
+        url: &str,
+        bearer_token: Option<Zeroizing<String>>,
+    ) -> Result<Self, TransportError> {
         let inner = Arc::new(RwLock::new(ClientInner {
             pending: HashMap::new(),
             next_ref_id: 1,
@@ -214,6 +241,7 @@ impl NativeRelayClient {
 
         let client = Self {
             url: url.to_string(),
+            bearer_token: bearer_token.map(Arc::new),
             inner,
             ws_sink: Arc::new(Mutex::new(None)),
             reader_handle: Arc::new(Mutex::new(None)),
@@ -226,10 +254,36 @@ impl NativeRelayClient {
     }
 
     /// Establishes (or re-establishes) the WebSocket connection.
+    ///
+    /// When a bearer token is configured, builds an `http::Request` with the
+    /// `Authorization: Bearer <token>` header before upgrading the connection.
     async fn establish_connection(&self) -> Result<(), TransportError> {
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(&self.url)
-            .await
-            .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
+        let (ws_stream, _response) = if let Some(ref token) = self.bearer_token {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+            let mut request = self
+                .url
+                .as_str()
+                .into_client_request()
+                .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", token.as_str()).parse().map_err(
+                    |e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+                        TransportError::ConnectionFailed(format!(
+                            "invalid bearer token header value: {e}"
+                        ))
+                    },
+                )?,
+            );
+            tokio_tungstenite::connect_async(request)
+                .await
+                .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?
+        } else {
+            tokio_tungstenite::connect_async(&self.url)
+                .await
+                .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?
+        };
 
         let (sink, source) = ws_stream.split();
 

@@ -41,22 +41,58 @@ fn node_err(e: NodeError) -> NapiError {
 /// Auto-wires the global [`ContextManager`] with relay transport after
 /// node startup.
 ///
-/// Connects to the node's local relay and initializes the `ContextManager`
-/// with `RelayTransportProvider` so that context operations (create, join,
-/// send) work immediately. If the `ContextManager` was already initialized
-/// (e.g., by a prior `configureLocalTransport` or `contextCreate` call),
-/// this is a no-op — the `OnceLock` ensures first-writer-wins semantics.
+/// Connects to the node's local relay (with bearer token authentication)
+/// and initializes the `ContextManager` with `RelayTransportProvider` so
+/// that context operations (create, join, send) work immediately. If the
+/// `ContextManager` was already initialized (e.g., by a prior
+/// `configureLocalTransport` or `contextCreate` call), this is a no-op —
+/// the `OnceLock` ensures first-writer-wins semantics.
+///
+/// The `bridge_token` is required because `ApplicationNode` relays enforce
+/// `Authorization: Bearer <token>` on all WebSocket connections.
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
-async fn auto_wire_context_manager(did: &str, relay_url: &str) {
+async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: &str) {
     let sourced = scp_transport::relay::connection::SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
-    match scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced).await {
+    let token = Zeroizing::new(bridge_token.to_owned());
+    match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
+        &sourced,
+        Some(token),
+    )
+    .await
+    {
         Ok(adapter) => {
             crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+
+            // Also populate the RELAY_ADAPTER global so that broadcast
+            // publish, context subscribe, and discovery probing work without
+            // a separate `transportConnect` call. This requires a second
+            // WebSocket connection because NativeRelayAdapter is not Clone
+            // and the first was consumed by RelayTransportProvider.
+            let token2 = Zeroizing::new(bridge_token.to_owned());
+            match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
+                &sourced,
+                Some(token2),
+            )
+            .await
+            {
+                Ok(relay_adapter) => {
+                    let _ = crate::transport::set_relay_adapter(std::sync::Arc::new(relay_adapter));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        relay_url = %relay_url,
+                        "auto_wire_context_manager: ContextManager wired but failed to \
+                         populate RELAY_ADAPTER — broadcast publish and discovery may \
+                         require a manual transportConnect call"
+                    );
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -560,9 +596,15 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
 
     // Auto-wire the ContextManager with relay transport so that
     // context operations work immediately after node startup.
+    // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
+    // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
+    // that requires TLS and lacks the actual bound port.
+    // The bridge token is required because ApplicationNode relays enforce
+    // Authorization: Bearer <token> on all WebSocket connections.
     let did = node.identity().did().to_owned();
-    let relay_url = node.relay_url().to_owned();
-    auto_wire_context_manager(&did, &relay_url).await;
+    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+    let bridge_token = node.bridge_token_hex();
+    auto_wire_context_manager(&did, &relay_url, &bridge_token).await;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
@@ -617,9 +659,11 @@ pub async fn node_start_local(
     .map_err(server_err)?;
 
     // Auto-wire the ContextManager with relay transport.
+    // Use the internal loopback URL — see comment in node_start_in_memory.
     let did = node.identity().did().to_owned();
-    let relay_url = node.relay_url().to_owned();
-    auto_wire_context_manager(&did, &relay_url).await;
+    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+    let bridge_token = node.bridge_token_hex();
+    auto_wire_context_manager(&did, &relay_url, &bridge_token).await;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
