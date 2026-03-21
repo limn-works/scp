@@ -899,9 +899,9 @@ mod tests {
         };
 
         let json = discovery_result_to_json(&result).unwrap();
-        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
-        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
+        assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
+        assert_eq!(json["resolution_path"]["source"], "handle_registry");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");
     }
