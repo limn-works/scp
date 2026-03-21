@@ -884,7 +884,7 @@ private struct AttestationWire: Codable {
                 verifiedAt: attestation.verifiedAt,
                 verifierDid: nil
             ),
-            revocationStatus: attestation.revocationStatus,
+            revocationStatus: attestation.revocationStatus == .active ? "Active" : "Revoked",
             signature: nil
         )
         let encoder = JSONEncoder()
@@ -899,13 +899,16 @@ private struct AttestationWire: Codable {
 
     /// Converts the wire format to the public ``IdentityAttestation`` type.
     func toIdentityAttestation(rawJson: String?) -> IdentityAttestation {
-        IdentityAttestation(
+        let status: RevocationStatus = revocationStatus == "Active"
+            ? .active
+            : .revoked(revokedAt: Int(issuedAt), reason: nil)
+        return IdentityAttestation(
             id: id,
             platform: claim.platform,
             platformHandle: claim.platformHandle,
             verificationMethod: evidence.method,
             verifiedAt: evidence.verifiedAt,
-            revocationStatus: revocationStatus,
+            revocationStatus: status,
             platformId: claim.platformId,
             rawJson: rawJson
         )
