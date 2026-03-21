@@ -546,10 +546,10 @@ public enum RevocationStatus: Sendable, Equatable {
     /// - Parameters:
     ///   - revokedAt: Unix timestamp (seconds) when the attestation was revoked.
     ///   - reason: Optional human-readable revocation reason.
-    case revoked(revokedAt: Double, reason: String? = nil)
+    case revoked(revokedAt: Int, reason: String? = nil)
 
-    /// The status string: `"active"` or `"revoked"`.
-    public var status: String {
+    /// The status string: `"active"` or `"revoked"`. Internal — use pattern matching.
+    internal var status: String {
         switch self {
         case .active:
             return "active"
@@ -560,7 +560,7 @@ public enum RevocationStatus: Sendable, Equatable {
 
     /// Unix timestamp (seconds) when the attestation was revoked.
     /// Returns `nil` for active attestations.
-    public var revokedAt: Double? {
+    public var revokedAt: Int? {
         switch self {
         case .active:
             return nil

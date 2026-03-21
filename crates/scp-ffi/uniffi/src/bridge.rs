@@ -12054,13 +12054,17 @@ fn parse_template_id_uniffi(
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
-        "HandleRegistry" => Ok(TemplateId::HandleRegistry),
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => Ok(TemplateId::HandleRegistry),
         _ => Err(ScpError::Validation {
             msg: format!(
                 "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
                  BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
                  GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
-                 HandleRegistry"
+                 HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
+                 scp:template/discovery-context"
             ),
             code: "SCP-VALID-7001".to_owned(),
         }),

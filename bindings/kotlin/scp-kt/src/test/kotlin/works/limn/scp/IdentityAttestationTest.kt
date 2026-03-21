@@ -46,7 +46,7 @@ class IdentityAttestationTest {
             verificationMethod = "did:dht:z6Mk...#agent",
             verifiedAt = 1_700_000_000.0,
             revocationStatus = RevocationStatus.Revoked(
-                revokedAt = 1_700_000_100.0,
+                revokedAt = 1_700_000_100L,
                 reason = "compromised",
             ),
             platformId = "12345",
@@ -54,7 +54,7 @@ class IdentityAttestationTest {
         assertEquals("revoked", att.revocationStatus.status)
         assertEquals("12345", att.platformId)
         val revoked = att.revocationStatus as RevocationStatus.Revoked
-        assertEquals(1_700_000_100.0, revoked.revokedAt)
+        assertEquals(1_700_000_100L, revoked.revokedAt)
         assertEquals("compromised", revoked.reason)
     }
 
@@ -67,11 +67,11 @@ class IdentityAttestationTest {
     @Test
     fun `RevocationStatus Revoked`() {
         val rs = RevocationStatus.Revoked(
-            revokedAt = 1_700_000_100.0,
+            revokedAt = 1_700_000_100L,
             reason = "test",
         )
         assertEquals("revoked", rs.status)
-        assertEquals(1_700_000_100.0, rs.revokedAt)
+        assertEquals(1_700_000_100L, rs.revokedAt)
         assertEquals("test", rs.reason)
     }
 
@@ -79,12 +79,12 @@ class IdentityAttestationTest {
     fun `RevocationStatus equality`() {
         assertEquals(RevocationStatus.Active, RevocationStatus.Active)
         assertEquals(
-            RevocationStatus.Revoked(revokedAt = 1.0, reason = "a"),
-            RevocationStatus.Revoked(revokedAt = 1.0, reason = "a"),
+            RevocationStatus.Revoked(revokedAt = 1L, reason = "a"),
+            RevocationStatus.Revoked(revokedAt = 1L, reason = "a"),
         )
         assertNotEquals(
             RevocationStatus.Active as RevocationStatus,
-            RevocationStatus.Revoked(revokedAt = 1.0) as RevocationStatus,
+            RevocationStatus.Revoked(revokedAt = 1L) as RevocationStatus,
         )
     }
 

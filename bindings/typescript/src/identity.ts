@@ -473,7 +473,7 @@ export class RevocationStatus {
    */
   readonly reason: string | undefined;
 
-  constructor(data: RevocationStatusData) {
+  private constructor(data: RevocationStatusData) {
     this.status = data.status;
     if (data.status === "revoked") {
       this.revokedAt = data.revokedAt;

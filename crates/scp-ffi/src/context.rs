@@ -363,6 +363,10 @@ const VALID_TEMPLATE_IDS: &[&str] = &[
     "scp:template/tool-interface",
     "scp:template/paid-service",
     "scp:template/paid-broadcast",
+    "HandleRegistry",
+    "scp:template/handle-registry",
+    "DiscoveryContext",
+    "scp:template/discovery-context",
 ];
 
 impl PyContextParams {
@@ -1488,6 +1492,10 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         "scp:template/tool-interface" => Some(TemplateId::ToolInterfaceTemplate),
         "scp:template/paid-service" => Some(TemplateId::PaidService),
         "scp:template/paid-broadcast" => Some(TemplateId::PaidBroadcast),
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => Some(TemplateId::HandleRegistry),
         _ => None,
     });
 
@@ -3797,12 +3805,16 @@ fn parse_template_id(
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
-        "HandleRegistry" => Ok(TemplateId::HandleRegistry),
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => Ok(TemplateId::HandleRegistry),
         _ => Err(crate::error::ScpPyError::validation(format!(
             "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
              BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
              GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
-             HandleRegistry"
+             HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
+             scp:template/discovery-context"
         ))),
     }
 }

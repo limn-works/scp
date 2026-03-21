@@ -35,10 +35,10 @@ final class IdentityAttestationTests: XCTestCase {
             platformHandle: "bob",
             verificationMethod: "did:dht:z6Mk...#agent",
             verifiedAt: 1_700_000_000.0,
-            revocationStatus: .revoked(revokedAt: 1_700_000_100.0, reason: "compromised"),
+            revocationStatus: .revoked(revokedAt: 1_700_000_100, reason: "compromised"),
             platformId: "12345"
         )
-        XCTAssertEqual(att.revocationStatus, .revoked(revokedAt: 1_700_000_100.0, reason: "compromised"))
+        XCTAssertEqual(att.revocationStatus, .revoked(revokedAt: 1_700_000_100, reason: "compromised"))
         XCTAssertEqual(att.revocationStatus.status, "revoked")
         XCTAssertEqual(att.revocationStatus.revokedAt, 1_700_000_100.0)
         XCTAssertEqual(att.revocationStatus.reason, "compromised")
@@ -53,7 +53,7 @@ final class IdentityAttestationTests: XCTestCase {
     }
 
     func testRevocationStatusRevoked() {
-        let status = RevocationStatus.revoked(revokedAt: 1_700_000_100.0, reason: "test")
+        let status = RevocationStatus.revoked(revokedAt: 1_700_000_100, reason: "test")
         XCTAssertEqual(status.status, "revoked")
         XCTAssertEqual(status.revokedAt, 1_700_000_100.0)
         XCTAssertEqual(status.reason, "test")
@@ -63,11 +63,11 @@ final class IdentityAttestationTests: XCTestCase {
         XCTAssertEqual(RevocationStatus.active, RevocationStatus.active)
         XCTAssertNotEqual(
             RevocationStatus.active,
-            RevocationStatus.revoked(revokedAt: 1_700_000_100.0)
+            RevocationStatus.revoked(revokedAt: 1_700_000_100)
         )
         XCTAssertEqual(
-            RevocationStatus.revoked(revokedAt: 1_700_000_100.0, reason: "test"),
-            RevocationStatus.revoked(revokedAt: 1_700_000_100.0, reason: "test")
+            RevocationStatus.revoked(revokedAt: 1_700_000_100, reason: "test"),
+            RevocationStatus.revoked(revokedAt: 1_700_000_100, reason: "test")
         )
     }
 
