@@ -980,4 +980,3 @@ public func removeIdentityAttestation(
 ) async throws -> Bool {
     try await removeFn(did, attestationId)
 }
-
