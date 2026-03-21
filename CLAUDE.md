@@ -143,6 +143,28 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 
 **Take every finding seriously.** Only dismiss things that are categorically, objectively false or truly non-issues. Even slight suggestions — defense in depth, cleanup, clarity, incorrect comments, spec gaps, learnings — if there's any merit to them at all, whether in literal content or in spirit, take them seriously and use them to improve the code. Don't dismiss things because they seem out of scope, are nits, or appear generally not actionable. Only dismiss things that are absolutely not actionable because they are wrong.
 
+### Orchestration protocol (MANDATORY)
+
+The orchestrator never writes code. It manages execution, maintains plan alignment, and triages review feedback.
+
+**For every work item:**
+
+1. **Plan first.** Send a Plan agent with full context: master plan excerpts, file references, issue numbers, code to read. Instruct agents to READ CODE — not just grep. Use Explore agents too if needed. Use Vestige memory. Do not authorize execution until the plan is reviewed and signed off.
+2. **Execute with isolation.** Send coder agents with worktree isolation (`isolation: "worktree"`). Provide all context from the approved plan. Monitor the main worktree — if dirty changes appear on main, investigate before any destructive action.
+3. **Review thoroughly.** After coder completes, review changes with subagents. Give reviewers full context: what was intended, what to look for, what to read. When triaging feedback: real issues are real regardless of "pre-existing" or "out of scope" — but stay focused. If unsure whether a finding is actionable, escalate to the human. Never silently discard findings.
+4. **Fix and re-review.** Actionable findings go back to coder agents. After fixes, re-review. Repeat until zero findings twice in a row (double-zero rule).
+
+**Parallelization rules:**
+- **Planning agents in parallel: OK.** Planning large swaths keeps work aligned across implementation agents.
+- **Coder agents: conservative.** Max 2-3 coding agents at once.
+- **Never mix phases.** Don't run planners, explorers, and coders simultaneously. Plan fully → review plans → then code.
+- Doing fewer things right > doing more things fast.
+
+**Orchestrator responsibilities:**
+- Maintain coherence across chunked work items — ensure consistency between chunks.
+- Validate that agent output aligns with the plan and referenced issues.
+- Keep context lean — delegate, don't accumulate.
+
 ## Scope discipline
 
 **When asked to verify, audit, or review "everything," enumerate the full scope FIRST:**

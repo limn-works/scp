@@ -198,12 +198,7 @@ Notes:
 - TLS enforced on all transports (QUIC/rustls, WASM/wss:// or https://)
 - Connection tracking on QUIC and WebTransport listeners (per-IP + total)
 
-## Patterns Confirmed Working (prior PRs)
-- Ceiling inheritance in nesting is sound
-- Template spoofing detection works correctly
-- Shadow capability restrictions (VERIFIED_IDENTITY_CAPABILITIES) solid
-- Auto-accept hard rules (tools, payment) non-bypassable
-- Budget tracker uses saturating arithmetic throughout
-- UCAN attenuation validation is thorough
-- ASCII-only local-part blocks Unicode homoglyph attacks
-- DID canonical identity + MLS binding = resolution hijack cannot forge messages
+## Refactoring Plan Adversarial Analysis (2026-03-21)
+- See [refactor-plan-adversarial-analysis.md](refactor-plan-adversarial-analysis.md)
+- BLACK-301 through BLACK-311: facade divergence, Phase B TOCTOU, asymmetric wiring, BridgeInstance split-brain
+- Key mitigations: generation counter, atomic send+receive wiring, CI mod/re-export check, feature-flagged BridgeInstance

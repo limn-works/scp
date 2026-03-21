@@ -1,1 +1,0 @@
-# Dependency Safety Reviewer Memory
